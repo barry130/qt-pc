@@ -1,0 +1,41 @@
+# 依赖
+node_modules/
+
+# 前端构建产物（由 beforeBuildCommand 生成）
+dist/
+
+# Rust / Tauri 构建产物
+src-tauri/target/
+
+# 项目内 Cargo home（含 registry 源码缓存，体积大且每次 build 都会变动）
+.cargo-home/
+
+# 本机构建绕行配置：把 crates-io 指向 127.0.0.1 的本地 HTTP 镜像，
+# 只在开发这台机器上成立，提交会让别人的 cargo 构建直接失败
+src-tauri/.cargo/
+
+# Tauri CLI 生成，构建时自动重建
+src-tauri/gen/schemas/
+
+# 包管理器 / 构建缓存（含本机绝对路径与数十 MB 缓存，不入库）
+.npm-cache/
+.pnpm-store/
+.vite-cache/
+qtMusicqt-pc.npm-cache/
+# 只写了本机 cache/store 绝对路径
+.npmrc
+
+# 临时脚本与临时目录
+tmp/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 日志与临时文件
+*.log
+*.tmp
+nul
