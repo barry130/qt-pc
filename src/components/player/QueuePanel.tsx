@@ -1,0 +1,141 @@
+import { useEffect, useRef } from "react";
+import { ListMusic, Trash2, X } from "lucide-react";
+import * as ipc from "@/services/ipc";
+import { usePlayerStore } from "@/stores/player";
+import { qtresCoverUrl, formatTime } from "@/lib/lrc";
+import { cn } from "@/lib/utils";
+
+/**
+ * 播放队列面板（DESIGN §5.5 QueueButton / §11.5）。
+ *
+ * 这是挂在 AppShell 主区右侧的**布局级面板**（不再是播放条内的绝对定位浮层），
+ * 所以高度撑满内容区、宽度固定 320px，主内容区会相应收缩。
+ * 当前曲高亮，点击行 play_at 跳曲。
+ */
+export function QueuePanel(): React.JSX.Element | null {
+  const queue = usePlayerStore((s) => s.queue);
+  const queueIndex = usePlayerStore((s) => s.queueIndex);
+  const currentTrackId = usePlayerStore((s) => s.state?.trackId ?? null);
+  const playAt = usePlayerStore((s) => s.playAt);
+  const open = usePlayerStore((s) => s.queueOpen);
+  const setQueueOpen = usePlayerStore((s) => s.setQueueOpen);
+
+  // 当前曲下标：优先用 Rust 给的 queueIndex；它为 null 时（队列事件还没同步、
+  // 或播的是没走队列的曲子）按当前曲目 id 在队列里回退查找，保证高亮与定位都能命中
+  const fallbackIndex = queue.findIndex((t) => t.id === currentTrackId);
+  const activeIndex = queueIndex ?? (fallbackIndex >= 0 ? fallbackIndex : null);
+  const currentRef = useRef<HTMLButtonElement | null>(null);
+  const listRef = useRef<HTMLDivElement | null>(null);
+
+  // 打开面板时把当前曲目滚到列表可视区中央（队列长的时候不定位就得手动翻找）。
+  // 这里直接算 scrollTop，而不用 scrollIntoView —— 后者会连带滚动所有可滚动祖先，
+  // 在这套嵌套布局里行为不好预期。
+  // 只在 open 变化时触发：面板已打开时用户可能在自己浏览，切歌就别抢滚动条了。
+  useEffect(() => {
+    if (!open) return;
+    const scrollToCurrent = (): void => {
+      const box = listRef.current;
+      const el = currentRef.current;
+      if (!box) return;
+      if (!el) {
+        box.scrollTop = 0; // 没有当前曲（未播放）就回到顶部
+        return;
+      }
+      const boxRect = box.getBoundingClientRect();
+      const elRect = el.getBoundingClientRect();
+      box.scrollTop +=
+        elRect.top - boxRect.top - (box.clientHeight - el.clientHeight) / 2;
+    };
+    // 两帧：第一帧等列表 DOM 插入并完成布局，第二帧等行高（封面占位）稳定
+    let raf2 = 0;
+    const raf1 = window.requestAnimationFrame(() => {
+      raf2 = window.requestAnimationFrame(scrollToCurrent);
+    });
+    return () => {
+      window.cancelAnimationFrame(raf1);
+      window.cancelAnimationFrame(raf2);
+    };
+  }, [open]);
+
+  if (!open) return null;
+
+  return (
+    <aside className="flex h-full w-[320px] shrink-0 flex-col border-l border-border bg-card/60 backdrop-blur-sm">
+      <div className="flex h-11 shrink-0 items-center justify-between border-b border-border px-3">
+        <div className="flex items-center gap-2 text-sm font-medium">
+          <ListMusic className="h-4 w-4" />
+          播放队列（{queue.length}）
+        </div>
+        <div className="flex items-center gap-1">
+          {queue.length > 0 && (
+            <button
+              type="button"
+              aria-label="清空队列"
+              onClick={() => void ipc.clearQueue()}
+              className="rounded p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+            >
+              <Trash2 className="h-4 w-4" />
+            </button>
+          )}
+          <button
+            type="button"
+            aria-label="关闭队列"
+            onClick={() => setQueueOpen(false)}
+            className="rounded p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      </div>
+      <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto">
+        {queue.length === 0 ? (
+          <p className="p-6 text-center text-sm text-muted-foreground">
+            队列为空
+          </p>
+        ) : (
+          queue.map((t, i) => (
+            <button
+              type="button"
+              key={`${t.id}-${i}`}
+              ref={i === activeIndex ? currentRef : null}
+              onClick={() => void playAt(i)}
+              className={cn(
+                "flex w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-secondary",
+                i === activeIndex && "bg-secondary/60",
+              )}
+            >
+              <div className="h-8 w-8 shrink-0 overflow-hidden rounded bg-secondary">
+                {qtresCoverUrl(t.picUrl) && (
+                  <img
+                    src={qtresCoverUrl(t.picUrl) as string}
+                    alt=""
+                    className="h-full w-full object-cover"
+                    loading="lazy"
+                  />
+                )}
+              </div>
+              <div className="min-w-0 flex-1">
+                <div
+                  className={cn(
+                    "truncate text-xs",
+                    i === activeIndex ? "text-primary" : "text-foreground",
+                  )}
+                >
+                  {t.title}
+                </div>
+                <div className="truncate text-[11px] text-muted-foreground">
+                  {t.singer}
+                </div>
+              </div>
+              {t.duration > 0 && (
+                <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
+                  {formatTime(t.duration * 1000)}
+                </span>
+              )}
+            </button>
+          ))
+        )}
+      </div>
+    </aside>
+  );
+}

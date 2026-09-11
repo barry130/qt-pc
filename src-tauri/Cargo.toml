@@ -1,0 +1,50 @@
+[package]
+name = "lightlisten"
+version = "0.1.2"
+description = "轻听 PC 版 - 轻量级桌面聚合音乐播放器"
+authors = ["LightListen"]
+edition = "2021"
+# rodio 0.22.2 的 MSRV 为 1.87；MSRV 感知解析器会据此挑选依赖版本，必须同步抬高
+rust-version = "1.87"
+
+[lib]
+name = "lightlisten_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "blocking"] }
+# 0.22 起 Decoder::builder().with_byte_len() 会把总字节数透传给 symphonia 的
+# MediaSource，FLAC 的二分定位不再因 byte_len 缺失而报 Unseekable（进度条拖拽修复）
+rodio = { version = "0.22.2", features = ["symphonia-all"] }
+# 音频输出设备枚举 / 默认设备变化检测（与 rodio 0.22.2 内置的 cpal 0.17 对齐，不引入新副本）
+cpal = "0.17"
+# 本地音乐库元数据读取（DESIGN §13）：与 rodio 0.22.2 内置的 symphonia 0.5.5 同版本，不引入新副本
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "wav", "ogg", "aac", "isomp4", "vorbis"] }
+sha1 = "0.10"
+md-5 = "0.10"
+base64 = "0.23"
+fastrand = "2"
+log = "0.4"
+env_logger = "0.11"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+tauri-plugin-global-shortcut = "2.3.2"
+tauri-plugin-dialog = "2.7"
+
+[profile.dev]
+incremental = true
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
