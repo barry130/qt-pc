@@ -24,6 +24,8 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => vi.fn(),
+  // BackButton（反馈页等页面内返回入口）用 router.history 做返回
+  useRouter: () => ({ history: { canGoBack: () => false, back: vi.fn() } }),
 }));
 
 async function renderAfterEffects(node: React.ReactElement): Promise<HTMLElement> {
