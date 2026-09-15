@@ -89,6 +89,8 @@ impl KgProvider {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(10))
+            // 禁用连接池：休眠唤醒后 keep-alive 连接变半死，复用会挂满超时
+            .pool_max_idle_per_host(0)
             .build()
             .expect("reqwest client init");
         Self { http }
@@ -1093,11 +1095,13 @@ impl MusicProvider for KgProvider {
             }
         }
         let kw = super::KwProvider::new();
-        if let Some(u) = super::play_via_source(&kw, &track.title, &track.singer, quality).await {
+        if let Some((u, matched)) = super::play_via_source(&kw, &track.title, &track.singer, quality).await {
+            super::record_source_fallback(&u, &matched);
             return Ok(u);
         }
         let wyy = super::WyyProvider::new();
-        if let Some(u) = super::play_via_source(&wyy, &track.title, &track.singer, quality).await {
+        if let Some((u, matched)) = super::play_via_source(&wyy, &track.title, &track.singer, quality).await {
+            super::record_source_fallback(&u, &matched);
             return Ok(u);
         }
         Err(ProviderError::NoPlayableUrl)

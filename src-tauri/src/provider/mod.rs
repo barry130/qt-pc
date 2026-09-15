@@ -91,12 +91,16 @@ pub(crate) async fn check_status(resp: reqwest::Response) -> ProviderResult<reqw
 /// 跨源播放兜底（移动端 `playFromSource` 移植）：按 歌名+歌手 在目标源搜 3 首，
 /// 逐个取可播放地址，全部失败返回 None（不抛错）。
 /// 只允许对 kw / wyy 调用（两者的 `play_url` 是无兜底的核心实现，不会递归）。
+///
+/// 返回命中曲目而不只是 URL：换源后歌词要跟着新源走（目标源按歌名搜到的可能
+/// 是不同录音版本，歌词按原源取会对不上），由 `record_source_fallback` 记录
+/// 「实际播放地址 → 命中曲目」，get_lyric 据此换源取词。
 pub(crate) async fn play_via_source(
     provider: &dyn MusicProvider,
     title: &str,
     singer: &str,
     quality: Quality,
-) -> Option<String> {
+) -> Option<(String, Track)> {
     let keyword = if singer.is_empty() {
         title.to_string()
     } else {
@@ -107,10 +111,32 @@ pub(crate) async fn play_via_source(
     };
     for track in &tracks {
         if let Ok(url) = provider.play_url(track, quality).await {
-            return Some(url);
+            return Some((url, track.clone()));
         }
     }
     None
+}
+
+/// 换源记录：实际播放地址 → 命中的曲目（目标源）。
+/// URL 作键天然区分同名曲目的不同取址结果；表满清空重来（正常播放远达不到上限）。
+fn source_fallbacks() -> &'static std::sync::Mutex<std::collections::HashMap<String, Track>> {
+    static MAP: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Track>>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 换源兜底命中时调用（play_via_source 的调用方负责记录）
+pub(crate) fn record_source_fallback(url: &str, matched: &Track) {
+    let mut map = source_fallbacks().lock().unwrap();
+    if map.len() >= 128 {
+        map.clear();
+    }
+    map.insert(url.to_string(), matched.clone());
+}
+
+/// 查「这个播放地址实际是换源到哪首歌」。None = 原生源，无需换源取词
+pub(crate) fn source_fallback_for(url: &str) -> Option<Track> {
+    source_fallbacks().lock().unwrap().get(url).cloned()
 }
 
 #[async_trait]

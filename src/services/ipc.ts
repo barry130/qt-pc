@@ -191,12 +191,87 @@ export async function getTrackCover(track: Track): Promise<string> {
 // 本地曲目的 Track.id 就是文件绝对路径，平台固定 "local"；
 // 播放时 Rust 侧 engine 会特判 Local 直接按路径解码，不走 Provider 取址。
 
-export async function scanLibrary(dirs: string[]): Promise<Track[]> {
-  return invoke("scan_library", { dirs });
+/** 扫描本地目录。`minDurationSecs > 0` 时忽略时长不足该值的音频，
+ *  `minSizeBytes > 0` 时忽略体积小于该值的文件（均为 0 = 不过滤） */
+export async function scanLibrary(
+  dirs: string[],
+  minDurationSecs = 0,
+  minSizeBytes = 0,
+): Promise<Track[]> {
+  return invoke("scan_library", { dirs, minDurationSecs, minSizeBytes });
+}
+
+/** 扫描配置：忽略短音频的时长下限（秒）在 settings 表里的键，0 表示关闭过滤 */
+export const SCAN_MIN_DURATION_KEY = "scanMinDurationSecs";
+
+/** 读扫描时长下限（缺省 60 秒；0 表示用户关掉了过滤） */
+export async function getScanMinDuration(): Promise<number> {
+  const raw = await getSetting(SCAN_MIN_DURATION_KEY).catch(() => null);
+  const n = raw === null ? NaN : Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : 60;
+}
+
+/** 写扫描时长下限（0 = 关闭过滤） */
+export async function setScanMinDuration(secs: number): Promise<void> {
+  return setSetting(
+    SCAN_MIN_DURATION_KEY,
+    String(Math.max(0, Math.floor(secs))),
+  );
+}
+
+/** 扫描配置：忽略过小文件的体积下限（字节）在 settings 表里的键，0 表示关闭过滤 */
+export const SCAN_MIN_SIZE_KEY = "scanMinSizeBytes";
+
+/** 体积下限默认值：1 MiB，即「小于 1M 的不扫描」 */
+export const DEFAULT_SCAN_MIN_SIZE = 1024 * 1024;
+
+/** 读扫描体积下限（缺省 1 MiB；0 表示用户关掉了过滤） */
+export async function getScanMinSize(): Promise<number> {
+  const raw = await getSetting(SCAN_MIN_SIZE_KEY).catch(() => null);
+  const n = raw === null ? NaN : Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_SCAN_MIN_SIZE;
+}
+
+/** 写扫描体积下限（字节，0 = 关闭过滤） */
+export async function setScanMinSize(bytes: number): Promise<void> {
+  return setSetting(
+    SCAN_MIN_SIZE_KEY,
+    String(Math.max(0, Math.floor(bytes))),
+  );
 }
 
 export async function getLocalTracks(): Promise<Track[]> {
   return invoke("get_local_tracks");
+}
+
+/** 缺失的本地曲目（扫描后文件已不在），供本地曲库体检用 */
+export async function getMissingLocalTracks(): Promise<Track[]> {
+  return invoke("get_missing_local_tracks");
+}
+
+/** 清理所有缺失的本地记录，返回删除条数 */
+export async function purgeMissingLocalTracks(): Promise<number> {
+  return invoke("purge_missing_local_tracks");
+}
+
+/** 读本地音频的内嵌封面（data URL）；没有封面返回 null。path 即本地 Track.id */
+export async function getLocalCover(path: string): Promise<string | null> {
+  return invoke("get_local_cover", { path });
+}
+
+/** 本地曲目在线元数据（酷我按歌名 + 歌手匹配）：歌词 + 翻译 + 封面 URL */
+export interface LocalOnlineMeta {
+  lrc: string;
+  translation: string;
+  picUrl: string;
+}
+
+/** 按歌名 + 歌手在酷我匹配歌词与封面；匹配不到返回空结构（不抛错） */
+export async function getLocalOnlineMeta(
+  title: string,
+  singer: string,
+): Promise<LocalOnlineMeta> {
+  return invoke("get_local_online_meta", { title, singer });
 }
 
 export async function getScanDirs(): Promise<string[]> {
@@ -209,6 +284,61 @@ export async function addScanDir(path: string): Promise<void> {
 
 export async function removeScanDir(path: string): Promise<void> {
   return invoke("remove_scan_dir", { path });
+}
+
+/** 在系统文件管理器中定位本地曲目文件（path 即本地 Track.id） */
+export async function revealLocalTrack(path: string): Promise<void> {
+  return invoke("reveal_local_track", { path });
+}
+
+/**
+ * 删除本地曲目。`deleteFile = true` 时连磁盘文件一起删；
+ * 否则只删库内记录（文件保留）。记录删除会级联清掉歌单归属 / 收藏 / 历史。
+ */
+export async function deleteLocalTrack(
+  path: string,
+  deleteFile: boolean,
+): Promise<void> {
+  return invoke("delete_local_track", { path, deleteFile });
+}
+
+/**
+ * 批量删除本地曲目（列表多选后用）。`deleteFile = true` 时连同磁盘文件一起删，
+ * 返回删除的记录条数。
+ */
+export async function deleteLocalTracks(
+  paths: string[],
+  deleteFile: boolean,
+): Promise<number> {
+  return invoke("delete_local_tracks", { paths, deleteFile });
+}
+
+/** 可扫描的盘符根目录（如 `C:\`、`D:\`），用于「扫描整个磁盘」 */
+export async function listDrives(): Promise<string[]> {
+  return invoke("list_drives");
+}
+
+/** 打开系统原生「选择文件夹」对话框；用户取消返回 null */
+export async function pickFolder(title = "选择音乐文件夹"): Promise<string | null> {
+  const result = await invoke<string | string[] | null>("plugin:dialog|open", {
+    options: { directory: true, multiple: false, title },
+  });
+  return Array.isArray(result) ? (result[0] ?? null) : result;
+}
+
+/** 本地扫描进度：visited 已访问条目数，found 命中音频数，current 当前路径 */
+export interface LibraryScanProgress {
+  visited: number;
+  found: number;
+  current: string;
+}
+
+export function onLibraryScanProgress(
+  handler: (p: LibraryScanProgress) => void,
+): Promise<() => void> {
+  return listen<LibraryScanProgress>("library-scan-progress", (e) =>
+    handler(e.payload),
+  );
 }
 
 // ---------- 用户数据：收藏 / 播放历史（DESIGN §5.3） ----------
@@ -330,8 +460,9 @@ export async function removeTrackFromPlaylist(
   return invoke("remove_track_from_playlist", { id, track });
 }
 
-// ---------- 下载管理（DESIGN §5.3） ----------
-// start_download 只负责发起（返回任务 id），进度在后台写入库，前端轮询 listDownloads。
+// ---------- 下载管理（DESIGN §5.3 下载 2.0） ----------
+// start_download 只负责发起（返回任务 id），真正下载在 Rust 后台；
+// 任务状态变化会广播 downloads-changed，前端据此刷新列表与「已下载」标记。
 
 /** 「默认下载音质」在 settings 表里的键 */
 const DOWNLOAD_QUALITY_KEY = "downloadQuality";
@@ -347,12 +478,55 @@ export async function listDownloads(): Promise<DownloadTask[]> {
   return invoke("list_downloads");
 }
 
+/** 已下载完成的曲目 db 主键集合（形如 `wyy:123`），给列表打「已下载」标 */
+export async function listDownloadedTrackIds(): Promise<string[]> {
+  return invoke("list_downloaded_track_ids");
+}
+
 /** deleteFile=true 时连同已下载的文件一起删除 */
 export async function deleteDownload(
   id: string,
   deleteFile: boolean,
 ): Promise<void> {
   return invoke("delete_download", { id, deleteFile });
+}
+
+/** 批量删除下载任务（多选后用）。`deleteFile=true` 时连文件一起删，返回删除条数 */
+export async function deleteDownloads(
+  ids: string[],
+  deleteFile: boolean,
+): Promise<number> {
+  return invoke("delete_downloads", { ids, deleteFile });
+}
+
+/** 暂停下载（保留已下载部分，可继续） */
+export async function pauseDownload(id: string): Promise<void> {
+  return invoke("pause_download", { id });
+}
+
+/** 继续暂停中的下载（断点续传） */
+export async function resumeDownload(id: string): Promise<void> {
+  return invoke("resume_download", { id });
+}
+
+/** 重试失败 / 已取消的下载 */
+export async function retryDownload(id: string): Promise<void> {
+  return invoke("retry_download", { id });
+}
+
+/** 取消下载（丢弃已下载的临时内容） */
+export async function cancelDownload(id: string): Promise<void> {
+  return invoke("cancel_download", { id });
+}
+
+/** 在资源管理器中定位已下载的文件 */
+export async function revealDownload(id: string): Promise<void> {
+  return invoke("reveal_download", { id });
+}
+
+/** 下载任务状态变化事件（新增 / 完成 / 失败 / 暂停…） */
+export function onDownloadsChanged(handler: () => void): Promise<() => void> {
+  return listen("downloads-changed", () => handler());
 }
 
 export async function getDownloadDir(): Promise<string> {
@@ -405,10 +579,10 @@ export async function astralLogin(
 export async function astralRegister(
   username: string,
   password: string,
+  passwordConfirm: string,
   email?: string,
-  code?: string,
 ): Promise<AuthSession> {
-  return invoke("astral_register", { username, password, email, code });
+  return invoke("astral_register", { username, password, passwordConfirm, email });
 }
 
 export async function astralLogout(): Promise<void> {
@@ -551,6 +725,26 @@ export async function likeApply(changes: LikeChange[]): Promise<number> {
   return invoke("like_apply", { changes });
 }
 
+/** 重放收藏推送离线队列（断网期间失败的操作，启动/登录后补推） */
+export async function likeFlushPending(): Promise<number> {
+  return invoke("like_flush_pending");
+}
+
+/** 启动对账：本地有而云端没有的收藏补推（存在性 diff，不是版本比较） */
+export async function likeReconcile(): Promise<number> {
+  return invoke("like_reconcile");
+}
+
+/** 换账号登录：清空本地收藏/队列/游标（归属检测到变化时调用） */
+export async function likeClearLocal(): Promise<number> {
+  return invoke("like_clear_local");
+}
+
+/** 退出登录：清离线队列与游标，保留收藏数据和归属标记 */
+export async function likeResetSync(): Promise<void> {
+  return invoke("like_reset_sync");
+}
+
 // ---------- 通用设置项（settings 表） ----------
 
 export async function getSetting(key: string): Promise<string | null> {
@@ -598,6 +792,33 @@ export async function getQueue(): Promise<QueueChanged> {
 
 export async function clearQueue(): Promise<void> {
   return invoke("clear_queue");
+}
+
+// ---------- 队列编辑（DESIGN §11.5 队列 2.0） ----------
+
+/** 下一首播放：插到当前曲目之后，不打断当前播放 */
+export async function queueAddNext(track: Track): Promise<void> {
+  return invoke("queue_add_next", { track });
+}
+
+/** 加入队尾（不打断当前播放） */
+export async function queueAppend(tracks: Track[]): Promise<void> {
+  return invoke("queue_append", { tracks });
+}
+
+/** 移除队列中的某一项 */
+export async function queueRemoveAt(index: number): Promise<void> {
+  return invoke("queue_remove_at", { index });
+}
+
+/** 拖动排序：把 from 位置的曲目移到 to */
+export async function queueMove(from: number, to: number): Promise<void> {
+  return invoke("queue_move", { from, to });
+}
+
+/** 清空当前曲目之后的所有曲目 */
+export async function queueClearAfter(): Promise<void> {
+  return invoke("queue_clear_after");
 }
 
 export async function pause(): Promise<void> {
@@ -700,9 +921,14 @@ export function onUpdateDownloadProgress(
   );
 }
 
+/** 用系统默认浏览器打开外部链接（更新页 / 消息正文等共用） */
+export async function openExternalUrl(url: string): Promise<void> {
+  return invoke("run_update_browser", { url });
+}
+
 /** 用系统默认浏览器打开更新页（browserUrl 兜底） */
 export async function runUpdateBrowser(url: string): Promise<void> {
-  return invoke("run_update_browser", { url });
+  return openExternalUrl(url);
 }
 
 export async function astralActiveMessages(versionCode?: number): Promise<unknown> {
@@ -771,6 +997,11 @@ export async function resetDesktopLyric(): Promise<DesktopLyricState> {
   return invoke("reset_desktop_lyric");
 }
 
+/** 歌词工具条「打开歌词设置」：唤起主窗口并跳到桌面歌词设置页 */
+export async function openLyricSettings(): Promise<void> {
+  return invoke("open_lyric_settings");
+}
+
 // ---------- 事件 ----------
 
 export function onPositionChanged(
@@ -805,4 +1036,9 @@ export function onLyricWindowChanged(
   return listen<DesktopLyricState>("lyric-window-changed", (e) =>
     handler(e.payload),
   );
+}
+
+/** 歌词工具条请求打开主窗口的「设置 · 桌面歌词」页（Rust 唤起主窗口后发出） */
+export function onLyricOpenSettings(handler: () => void): Promise<() => void> {
+  return listen("lyric-open-settings", () => handler());
 }

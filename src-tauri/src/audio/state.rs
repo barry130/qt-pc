@@ -74,6 +74,9 @@ pub struct PlaybackStateSnapshot {
     pub queue_len: usize,
     pub is_local: bool,
     pub url_fetched_at: Option<u64>,
+    /// 当前实际播放地址（在线曲目才有）。换源兜底后它指向目标源 —
+    /// get_lyric 据此换源取词，否则歌词与原曲对不上
+    pub play_url: Option<String>,
     pub error: Option<String>,
     pub sleep_timer_ms: Option<u64>,
     /// 当前曲目（渲染播放条直接用，避免前端二次查询）
@@ -99,6 +102,7 @@ impl Default for PlaybackStateSnapshot {
             queue_len: 0,
             is_local: false,
             url_fetched_at: None,
+            play_url: None,
             error: None,
             sleep_timer_ms: None,
             track: None,

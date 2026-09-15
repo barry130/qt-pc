@@ -1,6 +1,6 @@
 [package]
 name = "lightlisten"
-version = "0.1.2"
+version = "1.0.2"
 description = "轻听 PC 版 - 轻量级桌面聚合音乐播放器"
 authors = ["LightListen"]
 edition = "2021"
@@ -38,6 +38,9 @@ env_logger = "0.11"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 tauri-plugin-global-shortcut = "2.3.2"
 tauri-plugin-dialog = "2.7"
+# Windows 系统媒体控制（SMTC）：系统媒体面板 + 硬件媒体键 / 蓝牙耳机按键。
+# 只有 Windows 会编译到 windows crate；Linux 的 dbus 后端用不到，关掉默认特性。
+souvlaki = { version = "0.8.3", default-features = false }
 
 [profile.dev]
 incremental = true

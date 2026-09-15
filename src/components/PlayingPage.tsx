@@ -2,9 +2,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import { ChevronDown } from "lucide-react";
 import type { Track } from "@/types";
-import * as ipc from "@/services/ipc";
 import { usePlayerStore } from "@/stores/player";
 import { useInterpolatedPosition } from "@/hooks/useInterpolatedPosition";
+import { getPlaybackLyric } from "@/lib/localOnline";
 import { findActiveIndex, mergeTranslation, parseLrc, qtresCoverUrl } from "@/lib/lrc";
 import { cn , errMsg } from "@/lib/utils";
 
@@ -36,8 +36,7 @@ export function PlayingPage(): React.JSX.Element {
     setTranslation("");
     setError(null);
     setLoading(true);
-    ipc
-      .getLyric(track)
+    getPlaybackLyric(track)
       .then((lyr) => {
         setLrc(lyr.lrc);
         setTranslation(lyr.translation);
@@ -95,7 +94,9 @@ export function PlayingPage(): React.JSX.Element {
             ) : loading ? (
               <CenterText text="歌词加载中…" />
             ) : lines.length === 0 ? (
-              <CenterText text="暂无歌词" />
+              <CenterText
+                text={track?.platform === "local" ? "没有歌词" : "暂无歌词"}
+              />
             ) : (
               <LyricScroller lines={lines} activeIndex={activeIndex} />
             )}

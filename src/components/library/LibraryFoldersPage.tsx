@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { errMsg } from "@/lib/utils";
-import { invoke } from "@tauri-apps/api/core";
-import { FolderPlus, RefreshCw, Trash2 } from "lucide-react";
+import { RefreshCw, Trash2 } from "lucide-react";
 import * as ipc from "@/services/ipc";
 import { BackButton } from "@/components/layout/BackButton";
+import { AddDirButtons } from "./AddDirButtons";
 
 /**
  * 本地音乐文件夹管理（路由 /library/folders，DESIGN §13）。
@@ -49,29 +49,6 @@ export function LibraryFoldersPage(): React.JSX.Element {
     }
   };
 
-  /** 打开系统目录选择器（tauri-plugin-dialog） */
-  const pick = async (): Promise<void> => {
-    setTip(null);
-    let picked: string | null = null;
-    try {
-      const result = await invoke<string | string[] | null>(
-        "plugin:dialog|open",
-        {
-          options: {
-            directory: true,
-            multiple: false,
-            title: "选择音乐文件夹",
-          },
-        },
-      );
-      picked = Array.isArray(result) ? (result[0] ?? null) : result;
-    } catch (err) {
-      setTip(errMsg(err));
-      return;
-    }
-    if (picked) await add(picked);
-  };
-
   const remove = async (path: string): Promise<void> => {
     setBusy(true);
     try {
@@ -93,7 +70,12 @@ export function LibraryFoldersPage(): React.JSX.Element {
     setBusy(true);
     setTip("扫描中…");
     try {
-      const tracks = await ipc.scanLibrary(dirs);
+      // 与本地音乐页共用同一份扫描配置（忽略短音频 / 过小文件），避免两个入口行为不一致
+      const [minSecs, minSize] = await Promise.all([
+        ipc.getScanMinDuration().catch(() => 60),
+        ipc.getScanMinSize().catch(() => ipc.DEFAULT_SCAN_MIN_SIZE),
+      ]);
+      const tracks = await ipc.scanLibrary(dirs, minSecs, minSize);
       setTip(`扫描完成，共 ${tracks.length} 首`);
     } catch (err) {
       setTip(errMsg(err));
@@ -113,16 +95,8 @@ export function LibraryFoldersPage(): React.JSX.Element {
         增删文件夹后点「立即扫描」刷新。
       </p>
 
-      <div className="mt-4 flex gap-2">
-        <button
-          type="button"
-          onClick={() => void pick()}
-          disabled={busy}
-          className="flex h-9 items-center gap-1.5 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
-        >
-          <FolderPlus className="h-3.5 w-3.5" />
-          添加文件夹
-        </button>
+      <div className="mt-4 flex flex-wrap items-center gap-2">
+        <AddDirButtons onPick={(p) => void add(p)} disabled={busy} />
         <button
           type="button"
           onClick={() => void rescan()}

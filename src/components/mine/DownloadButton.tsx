@@ -1,14 +1,16 @@
 import { useState } from "react";
-import { Download } from "lucide-react";
+import { Check, Download, Loader2 } from "lucide-react";
 import { errMsg } from "@/lib/utils";
 import type { Quality, Track } from "@/types";
 import * as ipc from "@/services/ipc";
+import { useDownloadsStore } from "@/stores/downloads";
 
 /**
  * 下载一首歌（DESIGN §5.3）。命令只负责发起，实际下载与进度写库都在 Rust 后台。
  *
  * 音质不传时取设置里的「默认下载音质」（下载与播放音质互相独立）。
  * 本地曲目本来就在磁盘上，不给下载入口。
+ * 已下载 / 正在下载的曲目按钮变成状态提示，避免重复点击（后端也会去重）。
  */
 export function DownloadButton(props: {
   track: Track;
@@ -20,6 +22,8 @@ export function DownloadButton(props: {
   const { track, quality, variant = "text" } = props;
   const [tip, setTip] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const isDownloaded = useDownloadsStore((s) => s.isDownloaded(track));
+  const isActive = useDownloadsStore((s) => s.isActive(track));
 
   const start = async (): Promise<void> => {
     if (busy) return;
@@ -42,6 +46,22 @@ export function DownloadButton(props: {
       <></>
     ) : (
       <span className="shrink-0 px-2 text-xs text-muted-foreground">本地</span>
+    );
+  }
+
+  // 已下载 / 下载中：只做状态提示，不可再点
+  if (isDownloaded || isActive) {
+    const label = isDownloaded ? "已下载" : "下载中";
+    return variant === "icon" ? (
+      <span
+        title={label}
+        aria-label={label}
+        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-secondary/40 text-primary"
+      >
+        {isDownloaded ? <Check className="h-4 w-4" /> : <Loader2 className="h-4 w-4 animate-spin" />}
+      </span>
+    ) : (
+      <span className="shrink-0 px-2 text-xs text-primary">{label}</span>
     );
   }
 

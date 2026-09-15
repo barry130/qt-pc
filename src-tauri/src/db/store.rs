@@ -352,6 +352,64 @@ pub fn query_local_tracks(conn: &Connection) -> Result<Vec<Track>, rusqlite::Err
     Ok(out)
 }
 
+/// 读缺失的本地曲目（扫描时未命中、文件已不在），供本地曲库「体检」列表用。
+/// `Track.id` 仍是原文件路径，前端可直接展示。
+pub fn query_missing_local_tracks(conn: &Connection) -> Result<Vec<Track>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT id, title, singer, album, duration_ms, music_id
+         FROM tracks
+         WHERE platform = 'local' AND missing = 1
+         ORDER BY title COLLATE NOCASE, singer COLLATE NOCASE",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let db_id: String = row.get(0)?;
+        out.push(Track {
+            id: strip_local_prefix(&db_id),
+            platform: SourceId::Local,
+            title: row.get(1)?,
+            singer: row.get(2)?,
+            album: row.get(3)?,
+            pic_url: String::new(),
+            duration: row.get::<_, Option<i64>>(4)?.unwrap_or(0) as f64 / 1000.0,
+            music_id: row.get(5)?,
+        });
+    }
+    Ok(out)
+}
+
+/// 清理所有缺失的本地记录（连带级联删除歌单归属等关联行）。返回删除条数。
+pub fn purge_missing_local_tracks(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    conn.execute("DELETE FROM tracks WHERE platform = 'local' AND missing = 1", [])
+}
+
+/// 删本地记录的 SQL：优先按 `local_path` 匹配，老数据没写 `local_path` 时回退到主键
+/// `local:<path>`。本地曲目的 `local_path` 与 `id` 都唯一，不会误伤其它行。
+const DELETE_LOCAL_TRACK_SQL: &str =
+    "DELETE FROM tracks WHERE platform = 'local' AND (local_path = ?1 OR id = ?2)";
+
+/// 删除一条本地曲目记录（连带级联删除歌单归属 / 收藏 / 历史等关联行）。
+/// 返回删除条数（0 表示该路径不在库里）。**不动磁盘文件**。
+pub fn delete_local_track(conn: &Connection, path: &str) -> Result<usize, rusqlite::Error> {
+    conn.execute(DELETE_LOCAL_TRACK_SQL, params![path, format!("local:{path}")])
+}
+
+/// 批量删除本地记录（单事务，返回删除条数），供列表多选删除用。
+/// 语义与 `delete_local_track` 一致：只删记录，不动磁盘文件。
+pub fn delete_local_tracks(conn: &Connection, paths: &[String]) -> Result<usize, rusqlite::Error> {
+    if paths.is_empty() {
+        return Ok(0);
+    }
+    let tx = conn.unchecked_transaction()?;
+    let mut removed = 0usize;
+    for path in paths {
+        removed += tx.execute(DELETE_LOCAL_TRACK_SQL, params![path, format!("local:{path}")])?;
+    }
+    tx.commit()?;
+    Ok(removed)
+}
+
 /// 扫描目录清单（scan_dirs 表，§13.1「读取启用目录」）。
 pub fn list_scan_dirs(conn: &Connection) -> Result<Vec<String>, rusqlite::Error> {
     let mut stmt = conn.prepare("SELECT path FROM scan_dirs ORDER BY created_at, path")?;
@@ -626,6 +684,37 @@ fn track_from_row(row: &rusqlite::Row<'_>) -> Result<Option<Track>, rusqlite::Er
         duration: row.get::<_, Option<i64>>(6)?.unwrap_or(0) as f64 / 1000.0,
         music_id: row.get(7)?,
     }))
+}
+
+/// 启动对账用：未删除收藏的原始行（含主归属 pid），字段全量带出，
+/// 补推 /like/song 的请求体需要这些。返回
+/// (sid, platform, name, singer, album, hash, pic_url, 主归属 pid)。
+pub(crate) fn list_liked_songs_raw(
+    conn: &Connection,
+) -> Result<Vec<(String, String, String, String, String, String, String, String)>, rusqlite::Error>
+{
+    let mut stmt = conn.prepare(
+        "SELECT l.sid, l.platform, l.name, l.singer, l.album,
+                COALESCE(t.pic_url, ''), l.hash, COALESCE(l.pid, '')
+           FROM liked_songs l
+           LEFT JOIN tracks t ON t.id = l.id
+          WHERE l.deleted_at IS NULL",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get::<_, Option<String>>(6)?.unwrap_or_default(),
+            row.get(5)?,
+            row.get(7)?,
+        ));
+    }
+    Ok(out)
 }
 
 /// 记录一次播放（同一首歌只保留最近一条：先删旧记录再插入）。
@@ -1019,6 +1108,9 @@ pub(crate) fn rename_playlist(
 
 /// 删除歌单（按 pid 定位）：摘掉该歌单下所有归属；
 /// 一首歌若因此失去全部歌单，才跟着下线（软删，保留同步语义）。
+/// 同步回来的同 pid 云端卡片一并清掉：登录状态下建单会收到服务器的
+/// add 回声，`liked_playlists` 里因此留有同 pid 行，不清的话歌单会以
+/// 0 首的幽灵卡片残留在「我的歌单」里（合并视图按 pid 去重掩盖了它）。
 pub(crate) fn delete_playlist(conn: &Connection, pid: &str) -> Result<(), rusqlite::Error> {
     // 老关系表外键是本地 id，先按 pid 换算出来
     conn.execute(
@@ -1031,7 +1123,17 @@ pub(crate) fn delete_playlist(conn: &Connection, pid: &str) -> Result<(), rusqli
         "DELETE FROM liked_song_playlists WHERE pid = ?1",
         params![pid],
     )?;
-    // 失去全部归属的歌下线；还有别的归属的保留
+    // 主归属恰好挂在被删歌单、但还有别的归属的歌：重绑到剩余任一归属
+    //（云端按主归属单值建模，摘空会让下线误伤多归属歌）
+    conn.execute(
+        "UPDATE liked_songs
+            SET pid = (SELECT lsp.pid FROM liked_song_playlists lsp
+                        WHERE lsp.song_id = liked_songs.id LIMIT 1)
+          WHERE deleted_at IS NULL AND pid = ?1
+            AND id IN (SELECT song_id FROM liked_song_playlists)",
+        params![pid],
+    )?;
+    // 失去全部归属的歌下线（软删，保留同步语义）
     conn.execute(
         "UPDATE liked_songs SET deleted_at = ?1
           WHERE deleted_at IS NULL
@@ -1039,7 +1141,54 @@ pub(crate) fn delete_playlist(conn: &Connection, pid: &str) -> Result<(), rusqli
         params![now_ms()],
     )?;
     conn.execute("DELETE FROM playlists WHERE pid = ?1", params![pid])?;
+    // 同 pid 的云端卡片一并清理（幽灵歌单根因，见函数 doc）
+    conn.execute(
+        "DELETE FROM liked_playlists WHERE pid = ?1",
+        params![pid],
+    )?;
     Ok(())
+}
+
+// ---------- 歌单的云端确认点（LIKE_SYNC_DESIGN.md §5 机制 B，v8） ----------
+//
+// `playlists.cloud_seq` = 该歌单在云端被确认存在的最后 updated_seq。
+// 没有它，对账无法区分「从未上送」（该补推）和「他端已删」（本地该跟随删），
+// 本机建、他端删的歌单会被启动对账无限复活。
+
+/// 对账用的自建歌单行：pid + 云端确认点。
+/// `cloud_seq IS NULL` 表示从未被云端确认过。
+pub(crate) fn list_playlist_sync_rows(
+    conn: &Connection,
+) -> Result<Vec<(String, Option<i64>)>, rusqlite::Error> {
+    let mut stmt =
+        conn.prepare("SELECT pid, cloud_seq FROM playlists ORDER BY created_at ASC")?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push((row.get(0)?, row.get(1)?));
+    }
+    Ok(out)
+}
+
+/// 记录歌单的云端确认点（推送成功 / 对账、拉取见到云端有它时调用）。
+/// 取更大值单调推进：确认点只涨不跌，避免乱序回退。
+pub(crate) fn mark_playlist_cloud_seq(
+    conn: &Connection,
+    pid: &str,
+    seq: i64,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE playlists SET cloud_seq = ?2
+          WHERE pid = ?1 AND (cloud_seq IS NULL OR cloud_seq < ?2)",
+        params![pid, seq],
+    )?;
+    Ok(())
+}
+
+/// 他端删除、本地跟随：按 pid 删自建行 + 摘归属 + 下线孤儿歌 + 清云端卡片。
+/// 与用户手动删除（`delete_playlist`）同构，只是入口在对账 / apply 链路。
+pub(crate) fn delete_playlist_follow_cloud(conn: &Connection, pid: &str) -> Result<(), rusqlite::Error> {
+    delete_playlist(conn, pid)
 }
 
 /// 本地自建歌单列表（按更新时间倒序），附带曲目数。
@@ -1203,6 +1352,175 @@ pub(crate) fn remove_track_from_playlist(
     remove_liked_song(conn, track, Some(pid))
 }
 
+// ---------- 收藏推送离线队列（LIKE_SYNC_DESIGN.md §3 pendingOps 的 PC 版） ----------
+//
+// v1 建表时就预留了 pending_like_ops（当时未启用）：本地收藏写库成功、
+// 云端推送失败（断网 / 后端不可达）的操作落在这里，登录后或网络恢复时
+// 由 flush_pending_like_ops 按序重放。云端按 (sid,pid)/(uid,pid,platform)
+// upsert 幂等，重复执行安全。
+// 去重规则：同一目标键的最新操作胜出 —— 新 add 覆盖旧 remove、
+// 新 remove 覆盖旧 add（重放后到者生效，等价移动端队列的顺序语义）。
+
+/// 账号切换时清空本地收藏（LIKE_SYNC_DESIGN.md §6 的 PC 版）：
+/// 收藏歌曲 / 歌单卡片 / 自建歌单 / 多归属关联 / 离线队列全清，
+/// 游标与全量导入标记复位（下次登录自动全量拉取新账号数据）。
+/// 播放历史、下载等设备级数据不动。返回清掉的行数（诊断用）。
+pub(crate) fn clear_like_local(conn: &Connection) -> Result<i64, rusqlite::Error> {
+    ensure_pending_like_ops_table(conn)?;
+    let mut n = 0i64;
+    for sql in [
+        "DELETE FROM liked_song_playlists",
+        "DELETE FROM liked_songs",
+        "DELETE FROM liked_playlists",
+        "DELETE FROM playlists",
+        "DELETE FROM pending_like_ops",
+        "DELETE FROM pending_like_targets",
+    ] {
+        n += conn.execute(sql, [])? as i64;
+    }
+    set_setting(conn, "like.sync.seq", "")?;
+    set_setting(conn, "like.imported", "")?;
+    Ok(n)
+}
+
+/// 退出登录时重置收藏同步状态（保留收藏数据与账号归属标记，同账号重登无缝）：
+/// 清离线队列 + 游标 + 全量导入标记，下次登录自动走全量拉取合并。
+pub(crate) fn reset_like_sync_state(conn: &Connection) -> Result<(), rusqlite::Error> {
+    ensure_pending_like_ops_table(conn)?;
+    conn.execute("DELETE FROM pending_like_ops", [])?;
+    conn.execute("DELETE FROM pending_like_targets", [])?;
+    set_setting(conn, "like.sync.seq", "")?;
+    set_setting(conn, "like.imported", "")?;
+    Ok(())
+}
+
+/// 推送队列条目。payload_json 是 `/like/song` 或 `/like/playlist` 的请求体。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingLikeOp {
+    pub id: String,
+    /// "song" | "playlist"
+    pub kind: String,
+    pub action: String,
+    pub payload_json: String,
+    pub retry_count: i64,
+    pub next_retry_at: Option<i64>,
+    pub created_at: i64,
+}
+
+/// 入队（或覆盖同目标键的旧操作）。`target_key` 是去重键：
+/// song 用 `song:{platform}:{sid}`，playlist 用 `playlist:{platform}:{pid}`。
+pub(crate) fn enqueue_pending_like_op(
+    conn: &Connection,
+    kind: &str,
+    action: &str,
+    target_key: &str,
+    payload_json: &str,
+) -> Result<(), rusqlite::Error> {
+    // 历史版本建库可能没有这张表（v1 schema 只在全新库完整执行）
+    ensure_pending_like_ops_table(conn)?;
+    let now = now_ms();
+    let id = super::migrations::new_uuid_v4();
+    // 同键旧操作直接作废（新操作重放后就是最终状态）
+    conn.execute(
+        "DELETE FROM pending_like_ops WHERE id IN (SELECT target_id FROM pending_like_targets WHERE target_key = ?1)",
+        params![target_key],
+    )?;
+    conn.execute(
+        "INSERT INTO pending_like_ops (id, uid, type, action, payload_json, retry_count, created_at)
+         VALUES (?1, 0, ?2, ?3, ?4, 0, ?5)",
+        params![id, kind, action, payload_json, now],
+    )?;
+    conn.execute(
+        "INSERT INTO pending_like_targets (target_key, target_id) VALUES (?1, ?2)
+         ON CONFLICT(target_key) DO UPDATE SET target_id = excluded.target_id",
+        params![target_key, id],
+    )?;
+    Ok(())
+}
+
+/// 取待重放的操作（按入队顺序）。为空返回空 Vec。
+pub(crate) fn list_pending_like_ops(
+    conn: &Connection,
+) -> Result<Vec<PendingLikeOp>, rusqlite::Error> {
+    ensure_pending_like_ops_table(conn)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, type, action, payload_json, retry_count, next_retry_at, created_at
+           FROM pending_like_ops ORDER BY created_at ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        out.push(PendingLikeOp {
+            id: row.get(0)?,
+            kind: row.get(1)?,
+            action: row.get(2)?,
+            payload_json: row.get(3)?,
+            retry_count: row.get(4)?,
+            next_retry_at: row.get(5)?,
+            created_at: row.get(6)?,
+        });
+    }
+    Ok(out)
+}
+
+/// 重放成功：删除队列条目和它的去重键。
+pub(crate) fn ack_pending_like_op(conn: &Connection, id: &str) -> Result<(), rusqlite::Error> {
+    conn.execute("DELETE FROM pending_like_ops WHERE id = ?1", params![id])?;
+    conn.execute(
+        "DELETE FROM pending_like_targets WHERE target_id = ?1",
+        params![id],
+    )?;
+    Ok(())
+}
+
+/// 重放失败：记次数并退避（1/2/4/8…分钟，封顶 30 分钟）。
+pub(crate) fn defer_pending_like_op(
+    conn: &Connection,
+    id: &str,
+    retries: i64,
+) -> Result<(), rusqlite::Error> {
+    let backoff_ms = std::cmp::min(60_000i64 * (1 << retries.min(5)), 30 * 60_000).max(60_000);
+    conn.execute(
+        "UPDATE pending_like_ops
+            SET retry_count = ?2, next_retry_at = ?3
+          WHERE id = ?1",
+        params![id, retries + 1, now_ms() + backoff_ms],
+    )?;
+    Ok(())
+}
+
+/// 队列条目数（诊断用）。
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn count_pending_like_ops(conn: &Connection) -> Result<i64, rusqlite::Error> {
+    ensure_pending_like_ops_table(conn)?;
+    conn.query_row("SELECT COUNT(*) FROM pending_like_ops", [], |r| r.get(0))
+}
+
+/// 老库兜底建表（与 v1 schema 同构；幂等）。
+/// v1 的 CREATE TABLE 只在全新库执行，老库若因故缺表，这里补上。
+fn ensure_pending_like_ops_table(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pending_like_ops (
+           id TEXT PRIMARY KEY,
+           uid INTEGER NOT NULL,
+           type TEXT NOT NULL,
+           action TEXT NOT NULL,
+           payload_json TEXT NOT NULL,
+           retry_count INTEGER NOT NULL DEFAULT 0,
+           next_retry_at INTEGER,
+           created_at INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_pending_like_ops_retry
+           ON pending_like_ops(uid, next_retry_at);
+         CREATE TABLE IF NOT EXISTS pending_like_targets (
+           target_key TEXT PRIMARY KEY,
+           target_id  TEXT NOT NULL
+         );",
+    )?;
+    Ok(())
+}
+
 // ---------- 下载管理（DESIGN §5.3） ----------
 
 /// 下载任务。曲目信息由 download_tasks.track_id JOIN tracks 得到。
@@ -1212,31 +1530,39 @@ pub struct DownloadTask {
     pub id: String,
     pub track: Track,
     pub quality: String,
-    /// pending / downloading / done / failed
+    /// pending / downloading / paused / done / failed / canceled
     pub status: String,
     /// 0.0 ~ 1.0
     pub progress: f64,
     pub file_path: Option<String>,
     pub file_size: Option<i64>,
     pub error: Option<String>,
+    /// 断点续传的临时文件路径（`.part`），完成后被重命名为 `file_path`
+    #[serde(default)]
+    pub part_path: Option<String>,
+    /// 服务端声明的总字节数（Content-Length），用于写完后校验
+    #[serde(default)]
+    pub total_bytes: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
 
 /// 建任务，返回任务 id。曲目本体先入库（本地曲目由扫描器负责）。
+/// `part_path` 由调用方按「任务 id 唯一」生成，暂停 / 继续 / 重试都复用它。
 pub(crate) fn create_download_task(
     conn: &Connection,
     track: &Track,
     quality: &str,
+    part_path: &str,
 ) -> Result<String, rusqlite::Error> {
     upsert_tracks(conn, &[track])?;
     let now = now_ms();
     let id = format!("dl_{}_{}", now, fastrand::u64(..));
     conn.execute(
         "INSERT INTO download_tasks (id, track_id, platform, quality, status, progress,
-                                     created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?5)",
-        params![id, db_track_id(track), track.platform.to_string(), quality, now],
+                                     part_path, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?6)",
+        params![id, db_track_id(track), track.platform.to_string(), quality, part_path, now],
     )?;
     Ok(id)
 }
@@ -1254,6 +1580,19 @@ pub(crate) fn update_download_progress(
     Ok(())
 }
 
+/// 记录服务端声明的总字节数（每次成功建连后写一次，供写完后校验）。
+pub(crate) fn set_download_total_bytes(
+    conn: &Connection,
+    id: &str,
+    total: i64,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE download_tasks SET total_bytes = ?1, updated_at = ?2 WHERE id = ?3",
+        params![total, now_ms(), id],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn finish_download_task(
     conn: &Connection,
     id: &str,
@@ -1263,7 +1602,7 @@ pub(crate) fn finish_download_task(
     conn.execute(
         "UPDATE download_tasks
             SET status = 'done', progress = 1, file_path = ?1, file_size = ?2,
-                error = NULL, updated_at = ?3
+                part_path = NULL, error = NULL, updated_at = ?3
           WHERE id = ?4",
         params![file_path, file_size, now_ms(), id],
     )?;
@@ -1283,45 +1622,175 @@ pub(crate) fn fail_download_task(
     Ok(())
 }
 
+/// 下载任务的公共查询列（`list` / `by_id` / `by_track` 共用，保证映射口径一致）。
+const DOWNLOAD_SELECT_COLUMNS: &str = "d.id, d.quality, d.status, d.progress, d.file_path, d.file_size,
+            d.error, d.part_path, d.total_bytes, d.created_at, d.updated_at,
+            t.id, t.platform, t.title, t.singer, t.album, t.duration_ms, t.music_id";
+
+/// 把一行下载任务映射成 `DownloadTask`。轨道主键解析失败返回 None（脏数据跳过）。
+fn map_download_row(row: &rusqlite::Row<'_>) -> Result<Option<DownloadTask>, rusqlite::Error> {
+    let db_id: String = row.get(11)?;
+    let Some((platform, track_id)) = split_db_track_id(&db_id) else {
+        return Ok(None);
+    };
+    Ok(Some(DownloadTask {
+        id: row.get(0)?,
+        quality: row.get(1)?,
+        status: row.get(2)?,
+        progress: row.get(3)?,
+        file_path: row.get(4)?,
+        file_size: row.get(5)?,
+        error: row.get(6)?,
+        part_path: row.get(7)?,
+        total_bytes: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+        track: Track {
+            id: track_id,
+            platform,
+            title: row.get(13)?,
+            singer: row.get(14)?,
+            album: row.get(15)?,
+            pic_url: String::new(),
+            duration: row.get::<_, Option<i64>>(16)?.unwrap_or(0) as f64 / 1000.0,
+            music_id: row.get(17)?,
+        },
+    }))
+}
+
 /// 下载列表（按创建时间倒序）。
 pub(crate) fn list_download_tasks(conn: &Connection) -> Result<Vec<DownloadTask>, rusqlite::Error> {
-    let mut stmt = conn.prepare(
-        "SELECT d.id, d.quality, d.status, d.progress, d.file_path, d.file_size, d.error,
-                d.created_at, d.updated_at,
-                t.id, t.platform, t.title, t.singer, t.album, t.duration_ms, t.music_id
+    let sql = format!(
+        "SELECT {DOWNLOAD_SELECT_COLUMNS}
            FROM download_tasks d
            JOIN tracks t ON t.id = d.track_id
-          ORDER BY d.created_at DESC",
-    )?;
+          ORDER BY d.created_at DESC"
+    );
+    let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
-        let db_id: String = row.get(9)?;
-        let Some((platform, track_id)) = split_db_track_id(&db_id) else {
-            continue;
-        };
-        out.push(DownloadTask {
-            id: row.get(0)?,
-            quality: row.get(1)?,
-            status: row.get(2)?,
-            progress: row.get(3)?,
-            file_path: row.get(4)?,
-            file_size: row.get(5)?,
-            error: row.get(6)?,
-            created_at: row.get(7)?,
-            updated_at: row.get(8)?,
-            track: Track {
-                id: track_id,
-                platform,
-                title: row.get(11)?,
-                singer: row.get(12)?,
-                album: row.get(13)?,
-                pic_url: String::new(),
-                duration: row.get::<_, Option<i64>>(14)?.unwrap_or(0) as f64 / 1000.0,
-                music_id: row.get(15)?,
-            },
-        });
+        if let Some(t) = map_download_row(row)? {
+            out.push(t);
+        }
     }
+    Ok(out)
+}
+
+/// 按任务 id 取单条（重试 / 继续前读原参数用）。
+pub(crate) fn download_task_by_id(
+    conn: &Connection,
+    id: &str,
+) -> Result<Option<DownloadTask>, rusqlite::Error> {
+    let sql = format!(
+        "SELECT {DOWNLOAD_SELECT_COLUMNS}
+           FROM download_tasks d
+           JOIN tracks t ON t.id = d.track_id
+          WHERE d.id = ?1"
+    );
+    conn.query_row(&sql, params![id], |row| map_download_row(row))
+        .optional()
+        .map(Option::flatten)
+}
+
+/// 同一曲目 + 音质是否已有任务（去重）。已完成 / 进行中 / 暂停都算命中，
+/// 只有失败 / 取消的任务不挡新任务。
+pub(crate) fn find_download_task(
+    conn: &Connection,
+    db_track_id: &str,
+    quality: &str,
+) -> Result<Option<DownloadTask>, rusqlite::Error> {
+    let sql = format!(
+        "SELECT {DOWNLOAD_SELECT_COLUMNS}
+           FROM download_tasks d
+           JOIN tracks t ON t.id = d.track_id
+          WHERE d.track_id = ?1 AND d.quality = ?2
+            AND d.status IN ('pending', 'downloading', 'paused', 'done')
+          LIMIT 1"
+    );
+    conn.query_row(&sql, params![db_track_id, quality], |row| map_download_row(row))
+        .optional()
+        .map(Option::flatten)
+}
+
+/// 通用状态更新（暂停 / 取消 / 重试 / 失败共用）。`error = None` 时清空错误。
+pub(crate) fn set_download_status(
+    conn: &Connection,
+    id: &str,
+    status: &str,
+    error: Option<&str>,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE download_tasks SET status = ?1, error = ?2, updated_at = ?3 WHERE id = ?4",
+        params![status, error, now_ms(), id],
+    )?;
+    Ok(())
+}
+
+/// 重试前重置：回到 pending、清进度与错误（文件由下载器按 `.part` 续传决定去留）。
+pub(crate) fn reset_download_for_retry(
+    conn: &Connection,
+    id: &str,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE download_tasks
+            SET status = 'pending', progress = 0, error = NULL, updated_at = ?1
+          WHERE id = ?2",
+        params![now_ms(), id],
+    )?;
+    Ok(())
+}
+
+/// 记录 / 更新临时文件路径（续传、重试都复用同一个 `.part`）。
+pub(crate) fn set_download_part_path(
+    conn: &Connection,
+    id: &str,
+    part_path: &str,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE download_tasks SET part_path = ?1, updated_at = ?2 WHERE id = ?3",
+        params![part_path, now_ms(), id],
+    )?;
+    Ok(())
+}
+
+/// 应用启动时清理：上次退出时仍在 pending / downloading 的任务已无工作线程，
+/// 统一落成 paused，避免界面永远显示「下载中」。
+pub(crate) fn mark_stale_downloads_paused(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    conn.execute(
+        "UPDATE download_tasks
+            SET status = 'paused', error = '上次未完成，点击「继续」接着下载', updated_at = ?1
+          WHERE status IN ('pending', 'downloading')",
+        params![now_ms()],
+    )
+}
+
+/// 离线播放用：该曲目是否有已下载完成且文件路径在库的任务。
+/// 返回文件路径（是否仍存在由调用方确认）。
+pub(crate) fn downloaded_file_for(
+    conn: &Connection,
+    db_track_id: &str,
+) -> Result<Option<String>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT file_path FROM download_tasks
+          WHERE track_id = ?1 AND status = 'done' AND file_path IS NOT NULL
+          ORDER BY updated_at DESC LIMIT 1",
+        params![db_track_id],
+        |r| r.get::<_, String>(0),
+    )
+    .optional()
+}
+
+/// 已下载完成的曲目 db 主键集合（前端给「已下载」打标用）。
+pub(crate) fn downloaded_track_ids(conn: &Connection) -> Result<Vec<String>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT track_id FROM download_tasks
+          WHERE status = 'done' AND file_path IS NOT NULL",
+    )?;
+    let out = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .filter_map(Result::ok)
+        .collect();
     Ok(out)
 }
 
@@ -1340,6 +1809,27 @@ pub(crate) fn delete_download_task(
         .flatten();
     conn.execute("DELETE FROM download_tasks WHERE id = ?1", params![id])?;
     Ok(path)
+}
+
+/// 批量删除任务记录（单事务），返回被删任务的 `(成品路径, 临时路径)`，
+/// 供调用方在事务外决定删哪些文件。语义与 `delete_download_task` 一致。
+pub(crate) fn delete_download_tasks(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<Vec<(Option<String>, Option<String>)>, rusqlite::Error> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let tx = conn.unchecked_transaction()?;
+    let mut out = Vec::with_capacity(ids.len());
+    for id in ids {
+        if let Some(t) = download_task_by_id(&tx, id)? {
+            out.push((t.file_path, t.part_path));
+        }
+        tx.execute("DELETE FROM download_tasks WHERE id = ?1", params![id])?;
+    }
+    tx.commit()?;
+    Ok(out)
 }
 
 // ---------- 听歌统计（DESIGN §5.3） ----------
@@ -1512,6 +2002,82 @@ mod tests {
         }
     }
 
+    /// 离线队列：入队去重（同目标键新操作覆盖旧操作）、ack、退避、计数。
+    /// LIKE_SYNC_DESIGN.md §3 的 PC 版语义。
+    #[test]
+    fn pending_like_ops_queue_roundtrip() {
+        let conn = test_conn();
+        enqueue_pending_like_op(&conn, "song", "add", "song:wyy:1001", r#"{"sid":"1001"}"#)
+            .expect("enqueue add");
+        // 同键第二条（remove）覆盖第一条：重放后只有 remove 生效
+        enqueue_pending_like_op(&conn, "song", "remove", "song:wyy:1001", r#"{"sid":"1001","action":"remove"}"#)
+            .expect("enqueue remove");
+        enqueue_pending_like_op(&conn, "playlist", "add", "playlist:local:p1", r#"{"pid":"p1"}"#)
+            .expect("enqueue playlist");
+
+        let ops = list_pending_like_ops(&conn).expect("list");
+        assert_eq!(ops.len(), 2, "同键去重后应只剩 2 条");
+        assert_eq!(count_pending_like_ops(&conn).expect("count"), 2);
+        // 同键留下的那条必须是后入队的 remove（新操作覆盖旧操作）
+        let song_op = ops.iter().find(|o| o.kind == "song").expect("song op");
+        assert_eq!(song_op.action, "remove");
+
+        // ack 歌单条目：队列和去重键一起清理
+        let pl_op = ops.iter().find(|o| o.kind == "playlist").expect("playlist op");
+        ack_pending_like_op(&conn, &pl_op.id).expect("ack");
+        assert_eq!(count_pending_like_ops(&conn).expect("count"), 1);
+
+        // 再入同键操作不会复活已 ack 的条目，而是新起一条
+        enqueue_pending_like_op(&conn, "playlist", "add", "playlist:local:p1", r#"{"pid":"p1"}"#)
+            .expect("re-enqueue");
+        assert_eq!(count_pending_like_ops(&conn).expect("count"), 2);
+        // 歌单键现在只有新条目，旧的不会出现两次
+        let pl_ops: Vec<_> = list_pending_like_ops(&conn)
+            .expect("list")
+            .into_iter()
+            .filter(|o| o.kind == "playlist")
+            .collect();
+        assert_eq!(pl_ops.len(), 1);
+
+        // 退避：retry_count 递增，next_retry_at 写入未来时间
+        defer_pending_like_op(&conn, &pl_ops[0].id, pl_ops[0].retry_count).expect("defer");
+        let deferred = list_pending_like_ops(&conn).expect("list");
+        let d = deferred.iter().find(|o| o.id == pl_ops[0].id).expect("deferred");
+        assert_eq!(d.retry_count, pl_ops[0].retry_count + 1);
+        assert!(d.next_retry_at.is_some());
+    }
+
+    /// 账号切换清库：收藏歌曲/歌单卡片/自建歌单/多归属/离线队列全清 + 游标复位；
+    /// 登出重置：只清队列和游标，收藏数据保留（LIKE_SYNC_DESIGN §6）。
+    #[test]
+    fn like_clear_local_vs_reset_sync() {
+        let conn = test_conn();
+        let t = track("1001", "晴天");
+        let pid = create_playlist(&conn, "换号测试").expect("create");
+        add_liked_song(&conn, &t, &pid).expect("add");
+        add_liked_playlist(&conn, "wyy", "pl1", "云卡", "", "").expect("pl");
+        enqueue_pending_like_op(&conn, "song", "add", "song:wyy:1001", "{}").expect("enqueue");
+        set_setting(&conn, "like.sync.seq", "42").expect("set seq");
+        set_setting(&conn, "like.imported", "1").expect("set imported");
+
+        // 登出：数据保留，队列/游标清掉
+        reset_like_sync_state(&conn).expect("reset");
+        assert!(is_liked_song(&conn, &t).expect("song kept"));
+        assert_eq!(list_liked_playlists(&conn).expect("pl kept").len(), 1);
+        assert_eq!(count_pending_like_ops(&conn).expect("count"), 0);
+        assert_eq!(get_setting(&conn, "like.sync.seq").expect("seq").unwrap(), "");
+
+        // 换号：全清
+        let n = clear_like_local(&conn).expect("clear");
+        assert!(n > 0, "应清掉至少一行");
+        assert!(!is_liked_song(&conn, &t).expect("song gone"));
+        assert!(list_liked_playlists(&conn).expect("pl gone").is_empty());
+        let pls = list_my_playlists(&conn).expect("my pls");
+        assert!(pls.is_empty(), "自建歌单也应清掉");
+        assert_eq!(get_setting(&conn, "like.imported").expect("imported").unwrap(), "");
+        assert_eq!(count_pending_like_ops(&conn).expect("count"), 0);
+    }
+
     /// 收藏：写入 / 幂等 / 查询 / 取消（DESIGN §5.3）
     #[test]
     fn favorite_roundtrip_is_idempotent() {
@@ -1536,6 +2102,85 @@ mod tests {
         assert!(list_liked_songs(&conn, Some(&pid))
             .expect("list after remove")
             .is_empty());
+    }
+
+    /// 删除歌单必须把同 pid 的云端卡片一并清掉：
+    /// 登录建单会收到服务器 add 回声（liked_playlists 同 pid 行），
+    /// 不清的话歌单以 0 首幽灵卡片残留在「我的歌单」合并视图里
+    #[test]
+    fn delete_playlist_removes_ghost_cloud_card() {
+        let conn = test_conn();
+        let pid = create_playlist(&conn, "被删的歌单").expect("create");
+        // 模拟服务器回声：同步回来一张同 pid 的 local 卡片
+        add_liked_playlist(&conn, "local", &pid, "被删的歌单", "", "")
+            .expect("echo card");
+
+        delete_playlist(&conn, &pid).expect("delete");
+
+        let mine = list_my_playlists(&conn).expect("list");
+        assert!(
+            mine.iter().all(|p| p.pid != pid),
+            "删除后同 pid 的幽灵卡片不能留在列表里"
+        );
+    }
+
+    /// 多归属歌在主归属歌单被删后必须活着且主归属重绑：
+    /// 云端按 (sid,pid) 行建模，主归属挂在被删歌单上时整首下线会误伤
+    #[test]
+    fn delete_playlist_rebinds_main_pid_of_survivors() {
+        let conn = test_conn();
+        let t = track("3101", "多归属歌");
+        let dying = create_playlist(&conn, "被删的").expect("create");
+        let alive = create_playlist(&conn, "幸存的").expect("create");
+        add_liked_song(&conn, &t, &dying).expect("add dying");
+        add_liked_song(&conn, &t, &alive).expect("add alive");
+
+        delete_playlist(&conn, &dying).expect("delete");
+
+        assert!(is_liked_song(&conn, &t).expect("歌必须活着"));
+        assert_eq!(
+            list_liked_songs(&conn, Some(&alive)).expect("幸存歌单").len(),
+            1
+        );
+        // 主归属重绑到幸存歌单
+        assert_eq!(list_track_playlists(&conn, &t).expect("归属"), vec![alive]);
+    }
+
+    /// 云端确认点（v8 cloud_seq，机制 B 的界尺）：
+    /// NULL → 从未上送；mark 单调推进不回退
+    #[test]
+    fn playlist_cloud_seq_marks_monotonically() {
+        let conn = test_conn();
+        let pid = create_playlist(&conn, "确认点").expect("create");
+        let rows = list_playlist_sync_rows(&conn).expect("rows");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, pid);
+        assert!(rows[0].1.is_none(), "新歌单从未上送，确认点为 NULL");
+
+        mark_playlist_cloud_seq(&conn, &pid, 42).expect("mark");
+        mark_playlist_cloud_seq(&conn, &pid, 7).expect("mark lower");
+        let rows = list_playlist_sync_rows(&conn).expect("rows");
+        assert_eq!(rows[0].1, Some(42), "确认点只涨不跌");
+
+        // 不存在的 pid 静默无操作
+        mark_playlist_cloud_seq(&conn, "no-such-pid", 99).expect("mark unknown");
+    }
+
+    /// 跟随云端删除：与手动删除同构（自建行、归属、卡片全清）
+    #[test]
+    fn follow_cloud_delete_cleans_everything() {
+        let conn = test_conn();
+        let t = track("3201", "随歌单走的歌");
+        let pid = create_playlist(&conn, "他端删的").expect("create");
+        add_liked_song(&conn, &t, &pid).expect("add");
+        add_liked_playlist(&conn, "local", &pid, "他端删的", "", "")
+            .expect("echo card");
+
+        delete_playlist_follow_cloud(&conn, &pid).expect("follow delete");
+
+        assert!(!is_liked_song(&conn, &t).expect("失去唯一归属，歌下线"));
+        let mine = list_my_playlists(&conn).expect("list");
+        assert!(mine.iter().all(|p| p.pid != pid), "歌单行和卡片都得清");
     }
 
     /// 一首歌可以同时挂在多个歌单（多归属），从其中一个摘除不影响其他
@@ -1704,12 +2349,13 @@ mod tests {
         let conn = test_conn();
         let t = track("5001", "下载用歌");
 
-        let id = create_download_task(&conn, &t, "320").expect("create task");
+        let id = create_download_task(&conn, &t, "320", "D:\\dl\\a.mp3.part").expect("create task");
         let tasks = list_download_tasks(&conn).expect("list");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].status, "pending");
         assert_eq!(tasks[0].track.title, "下载用歌");
         assert_eq!(tasks[0].quality, "320");
+        assert_eq!(tasks[0].part_path.as_deref(), Some("D:\\dl\\a.mp3.part"));
 
         update_download_progress(&conn, &id, 0.5).expect("progress");
         let tasks = list_download_tasks(&conn).expect("list");
@@ -1721,9 +2367,12 @@ mod tests {
         assert_eq!(tasks[0].status, "done");
         assert_eq!(tasks[0].file_path.as_deref(), Some("D:\\dl\\a.mp3"));
         assert_eq!(tasks[0].file_size, Some(12345));
+        // 完成即清掉临时路径，避免看起来还有半截文件
+        assert!(tasks[0].part_path.is_none());
 
         // 失败态单独走一条
-        let id2 = create_download_task(&conn, &track("5002", "另一首"), "128").expect("create 2");
+        let id2 = create_download_task(&conn, &track("5002", "另一首"), "128", "p2.part")
+            .expect("create 2");
         fail_download_task(&conn, &id2, "网络错误").expect("fail");
         let tasks = list_download_tasks(&conn).expect("list");
         let failed = tasks.iter().find(|x| x.id == id2).expect("找到失败任务");
@@ -1736,6 +2385,78 @@ mod tests {
             Some("D:\\dl\\a.mp3")
         );
         assert_eq!(list_download_tasks(&conn).expect("list").len(), 1);
+    }
+
+    /// 批量删除：单事务删多条并回传各自文件路径，未选中的保留
+    #[test]
+    fn delete_download_tasks_batch_returns_paths_of_selected_only() {
+        let conn = test_conn();
+        let a = create_download_task(&conn, &track("7001", "甲"), "320", "a.part").expect("a");
+        let b = create_download_task(&conn, &track("7002", "乙"), "320", "b.part").expect("b");
+        let c = create_download_task(&conn, &track("7003", "丙"), "320", "c.part").expect("c");
+        finish_download_task(&conn, &a, "D:\\dl\\a.mp3", 10).expect("finish a");
+        finish_download_task(&conn, &b, "D:\\dl\\b.mp3", 20).expect("finish b");
+
+        // 空选：不动任何数据
+        assert!(delete_download_tasks(&conn, &[]).expect("empty").is_empty());
+        assert_eq!(list_download_tasks(&conn).expect("list").len(), 3);
+
+        let removed = delete_download_tasks(&conn, &[a.clone(), b.clone()]).expect("batch");
+        assert_eq!(removed.len(), 2);
+        // 完成的回传成品路径；未完成的回传临时路径
+        let files: Vec<Option<String>> = removed.iter().map(|(f, _)| f.clone()).collect();
+        assert!(files.contains(&Some("D:\\dl\\a.mp3".to_string())));
+        assert!(files.contains(&Some("D:\\dl\\b.mp3".to_string())));
+        let parts: Vec<Option<String>> = removed.iter().map(|(_, p)| p.clone()).collect();
+        assert!(parts.iter().all(Option::is_none), "完成后临时路径应为空");
+
+        let left = list_download_tasks(&conn).expect("list");
+        assert_eq!(left.len(), 1, "只删选中的两条");
+        assert_eq!(left[0].id, c);
+
+        // 再删一次：已删的 id 不再返回，也不报错
+        assert!(delete_download_tasks(&conn, &[a, b]).expect("again").is_empty());
+        assert_eq!(list_download_tasks(&conn).expect("list").len(), 1);
+    }
+
+    /// 下载 2.0：去重命中范围、离线文件查找、启动时中断任务落成 paused（§5.3）
+    #[test]
+    fn download_dedupe_offline_lookup_and_stale_cleanup() {
+        let conn = test_conn();
+        let t = track("6001", "去重歌");
+        let db_id = db_track_id(&t);
+
+        // 没有任务时查不到
+        assert!(find_download_task(&conn, &db_id, "320").expect("find").is_none());
+        assert!(downloaded_file_for(&conn, &db_id).expect("offline").is_none());
+
+        let id = create_download_task(&conn, &t, "320", "p.part").expect("create");
+        // 进行中的任务算去重命中
+        let hit = find_download_task(&conn, &db_id, "320").expect("find").expect("命中");
+        assert_eq!(hit.id, id);
+        // 音质不同不算命中
+        assert!(find_download_task(&conn, &db_id, "flac").expect("find").is_none());
+
+        // 下载中断（downloading）→ 启动清理落成 paused
+        update_download_progress(&conn, &id, 0.3).expect("progress");
+        let n = mark_stale_downloads_paused(&conn).expect("stale");
+        assert_eq!(n, 1);
+        let task = download_task_by_id(&conn, &id).expect("by id").expect("存在");
+        assert_eq!(task.status, "paused");
+        assert!(task.error.is_some(), "应给出中断原因");
+
+        // 完成后：去重仍命中（done），离线查找能拿到文件路径
+        finish_download_task(&conn, &id, "D:\\dl\\x.flac", 999).expect("finish");
+        assert!(find_download_task(&conn, &db_id, "320").expect("find").is_some());
+        assert_eq!(
+            downloaded_file_for(&conn, &db_id).expect("offline").as_deref(),
+            Some("D:\\dl\\x.flac")
+        );
+        assert_eq!(downloaded_track_ids(&conn).expect("ids"), vec![db_id.clone()]);
+
+        // 取消态不再挡新任务
+        set_download_status(&conn, &id, "canceled", None).expect("cancel");
+        assert!(find_download_task(&conn, &db_id, "320").expect("find").is_none());
     }
 
     /// 听歌统计：多次播放累计 / 概览 / 排名（DESIGN §5.3）

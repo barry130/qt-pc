@@ -87,6 +87,8 @@ impl KwProvider {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(10))
+            // 禁用连接池：休眠唤醒后 keep-alive 连接变半死，复用会挂满超时
+            .pool_max_idle_per_host(0)
             .build()
             .expect("reqwest client init");
         Self {

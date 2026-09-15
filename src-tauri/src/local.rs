@@ -15,7 +15,9 @@ use std::path::{Path, PathBuf};
 
 use symphonia::core::formats::FormatOptions;
 use symphonia::core::io::{MediaSourceStream, MediaSourceStreamOptions};
-use symphonia::core::meta::{MetadataOptions, MetadataRevision, StandardTagKey, Value};
+use symphonia::core::meta::{
+    MetadataOptions, MetadataRevision, StandardTagKey, StandardVisualKey, Value,
+};
 use symphonia::core::probe::Hint;
 
 use crate::db::store::LocalTrackRow;
@@ -55,15 +57,78 @@ pub fn parse_file_stem(stem: &str) -> (String, String) {
     }
 }
 
+/// 扫描进度事件名（整盘扫描可能上万文件，前端据此显示进度）。
+pub const EVENT_LIBRARY_SCAN_PROGRESS: &str = "library-scan-progress";
+
+/// 递归遍历时跳过的目录名（大小写不敏感）。整盘扫描遇到这些目录既不会有音乐，
+/// 又往往极大或有权限问题，跳过可显著提速并避免噪声。
+///
+/// 刻意**不**跳过 `target` / `build` / `dist` 这类通用词——它们有可能被用户
+/// 用来存放音乐（下载目录也常在 `target` 下），宁可多走几层也不误伤。
+const SKIP_DIR_NAMES: &[&str] = &[
+    // 系统 / 权限受限目录
+    "$recycle.bin",
+    "system volume information",
+    "$winreagent",
+    "$sysreset",
+    "$windows.~bt",
+    "$windows.~ws",
+    "recovery",
+    "perflogs",
+    "windows",
+    "program files",
+    "program files (x86)",
+    "programdata",
+    "appdata",
+    // 版本控制 / 依赖缓存（不会有音乐，却可能有海量小文件）
+    ".git",
+    ".svn",
+    ".hg",
+    "node_modules",
+    ".cargo",
+    ".cargo-home",
+    ".gradle",
+    ".m2",
+    ".nuget",
+    ".npm",
+    ".pnpm-store",
+    ".cache",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".tox",
+    ".next",
+];
+
+/// 递归深度上限：防御 junction / symlink 造成的异常层级或环。
+const MAX_DEPTH: usize = 64;
+
+/// 该目录名是否在跳过清单中（大小写不敏感）。
+fn should_skip_dir(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    SKIP_DIR_NAMES.contains(&lower.as_str())
+}
+
 /// 递归收集目录下的音频文件（§13.1）。
 /// 无法读取的目录（权限不足 / 已失效的链接等）直接跳过，不中断整次扫描。
 pub fn collect_audio_files(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    collect_into(root, &mut out);
+    let mut noop = |_: &Path| {};
+    collect_into(root, &mut out, 0, &mut noop);
     out
 }
 
-fn collect_into(dir: &Path, out: &mut Vec<PathBuf>) {
+/// 递归实现。`on_entry` 每访问一个目录条目回调一次（整盘扫描的进度用）。
+fn collect_into(
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    depth: usize,
+    on_entry: &mut dyn FnMut(&Path),
+) {
+    if depth > MAX_DEPTH {
+        log::warn!("[local] 目录层级超过 {MAX_DEPTH}，已停止深入: {}", dir.display());
+        return;
+    }
     // 目录读不了（权限 / 被删除 / 设备未就绪）→ 记日志并跳过，不让扫描整体失败
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
@@ -74,37 +139,136 @@ fn collect_into(dir: &Path, out: &mut Vec<PathBuf>) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_dir() {
-            collect_into(&path, out);
-        } else if path.is_file() && is_audio_file(&path) {
-            out.push(path);
+        // file_type() 不跟随链接：junction / symlink 一律跳过。整盘扫描时
+        // Windows 的「All Users」这类联接会导致重复遍历甚至成环。
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_dir() {
+            if should_skip_dir(&entry.file_name().to_string_lossy()) {
+                continue;
+            }
+            collect_into(&path, out, depth + 1, on_entry);
+        } else if file_type.is_file() {
+            on_entry(&path);
+            if is_audio_file(&path) {
+                out.push(path);
+            }
         }
     }
+}
+
+/// 扫描过滤条件。两个阈值都为 0 时不过滤，与前端「扫描配置」语义一致。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ScanFilter {
+    /// 时长下限（秒）：已知时长且不高于该值的音频跳过
+    pub min_duration_secs: u64,
+    /// 体积下限（字节）：文件小于该值的跳过
+    pub min_size_bytes: u64,
 }
 
 /// 扫描若干目录，产出入库行（不触碰数据库，便于单测）。
 /// 目录不存在时静默跳过；同一路径只会产出一条（多目录重叠时去重）。
 pub fn scan_dirs(dirs: &[String]) -> Vec<LocalTrackRow> {
+    scan_dirs_with_progress(dirs, ScanFilter::default(), |_, _, _| {})
+}
+
+/// 时长过滤：仅当**时长已知**（`> 0`）且不高于阈值时判为过短。
+/// 时长读不到的（0，通常是元数据解析失败的正常歌曲）一律保留，避免误伤。
+pub fn is_too_short(row: &LocalTrackRow, min_duration_secs: u64) -> bool {
+    min_duration_secs > 0
+        && row.duration_ms > 0
+        && row.duration_ms <= (min_duration_secs as i64) * 1000
+}
+
+/// 体积过滤：仅当文件存在且读得到大小时才比较，小于阈值判为过小。
+/// 读不到大小的（权限 / 竞态删除）一律保留，与时长过滤同一口径。
+pub fn is_too_small(path: &Path, min_size_bytes: u64) -> bool {
+    min_size_bytes > 0
+        && std::fs::metadata(path)
+            .map(|m| m.len() < min_size_bytes)
+            .unwrap_or(false)
+}
+
+/// 带进度与时长 / 体积过滤的扫描。
+///
+/// `filter.min_duration_secs > 0` 时丢弃时长不足该值的音频（用于整盘扫描时滤掉
+/// 系统提示音、测试样本这类短文件）；`filter.min_size_bytes > 0` 时丢弃小于该
+/// 体积的文件（滤掉广告音效、空壳文件）。两者为 0 均表示不过滤。
+/// `on_progress(已访问条目数, 命中音频数, 当前路径)`，进度按目录条目回调（含非音频）。
+pub fn scan_dirs_with_progress(
+    dirs: &[String],
+    filter: ScanFilter,
+    mut on_progress: impl FnMut(usize, usize, &Path),
+) -> Vec<LocalTrackRow> {
     let mut rows = Vec::new();
     let mut seen = HashSet::new();
+    let mut visited = 0usize;
+    let mut found = 0usize;
     for dir in dirs {
         let root = Path::new(dir);
         if !root.exists() {
             log::warn!("[local] 目录不存在，已跳过: {dir}");
             continue;
         }
-        for path in collect_audio_files(root) {
+        let mut files = Vec::new();
+        {
+            let mut tick = |path: &Path| {
+                visited += 1;
+                if is_audio_file(path) {
+                    found += 1;
+                }
+                on_progress(visited, found, path);
+            };
+            collect_into(root, &mut files, 0, &mut tick);
+        }
+        for path in files {
             let Some(path_str) = path.to_str().map(str::to_string) else {
                 continue;
             };
             if !seen.insert(path_str.clone()) {
                 continue;
             }
-            rows.push(build_row(&path, path_str));
+            // 体积过滤放在读元数据之前：整盘扫描时能省下大量解码开销
+            if is_too_small(&path, filter.min_size_bytes) {
+                log::debug!(
+                    "[local] 体积小于 {} 字节，已跳过: {path_str}",
+                    filter.min_size_bytes
+                );
+                continue;
+            }
+            let row = build_row(&path, path_str);
+            if is_too_short(&row, filter.min_duration_secs) {
+                log::debug!(
+                    "[local] 时长短于 {}s，已跳过: {}",
+                    filter.min_duration_secs,
+                    row.path
+                );
+                continue;
+            }
+            rows.push(row);
         }
     }
     rows.sort_by(|a, b| a.path.cmp(&b.path));
     rows
+}
+
+/// 可扫描的盘符根目录（Windows 枚举 A:–Z: 中真实存在的盘；其他平台给出根目录）。
+/// 用于本地曲库的「扫描整个磁盘」入口。
+#[cfg(target_os = "windows")]
+pub fn list_drives() -> Vec<String> {
+    ('A'..='Z')
+        .map(|c| format!("{c}:\\"))
+        .filter(|root| Path::new(root).exists())
+        .collect()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn list_drives() -> Vec<String> {
+    vec!["/".to_string()]
 }
 
 /// 组装入库行：优先 symphonia 元数据，缺失字段回落到文件名解析。
@@ -213,9 +377,58 @@ fn pick_tags(rev: &MetadataRevision, meta: &mut FileMeta) {
     }
 }
 
+/// 读取内嵌封面（ID3v2 APIC / FLAC PICTURE / Vorbis METADATA_BLOCK_PICTURE）。
+/// 优先 FrontCover，否则取第一张图片。返回 `(mime, 原始字节)`。
+/// 读不到封面不是错误：本地曲目本来就可能没有封面，返回 None。
+pub fn read_cover(path: &Path) -> Option<(String, Vec<u8>)> {
+    let file = std::fs::File::open(path).ok()?;
+    let mss = MediaSourceStream::new(Box::new(file), MediaSourceStreamOptions::default());
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+    let mut probed = symphonia::default::get_probe()
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .ok()?;
+
+    let mut best: Option<(String, Vec<u8>)> = None;
+    if let Some(mut md) = probed.metadata.get() {
+        if let Some(rev) = md.skip_to_latest() {
+            pick_cover(rev, &mut best);
+        }
+    }
+    {
+        let mut md = probed.format.metadata();
+        if let Some(rev) = md.skip_to_latest() {
+            pick_cover(rev, &mut best);
+        }
+    }
+    best
+}
+
+/// 从一版元数据里挑封面：先到先得，但遇到 FrontCover 会覆盖前者并立即收工。
+fn pick_cover(rev: &MetadataRevision, best: &mut Option<(String, Vec<u8>)>) {
+    for v in rev.visuals() {
+        if !v.media_type.starts_with("image/") {
+            continue;
+        }
+        let is_front = matches!(v.usage, Some(StandardVisualKey::FrontCover));
+        if best.is_none() || is_front {
+            *best = Some((v.media_type.clone(), v.data.to_vec()));
+            if is_front {
+                return;
+            }
+        }
+    }
+}
+
 /// 标签值转字符串；二进制等不可展示的类型直接丢弃。
-fn tag_string(value: &Value) -> Option<String> {
-    match value {
+fn tag_string(value: &Value) -> Option<String> {    match value {
         Value::String(s) => Some(s.clone()),
         Value::Flag | Value::Binary(_) => None,
         other => Some(other.to_string()),
@@ -257,8 +470,8 @@ mod tests {
     use super::*;
     use crate::db::migrations;
     use crate::db::store::{
-        add_scan_dir, list_scan_dirs, mark_missing_local_tracks, query_local_tracks,
-        remove_scan_dir, upsert_local_tracks,
+        add_scan_dir, delete_local_track, delete_local_tracks, list_scan_dirs,
+        mark_missing_local_tracks, query_local_tracks, remove_scan_dir, upsert_local_tracks,
     };
     use rusqlite::Connection;
 
@@ -322,6 +535,127 @@ mod tests {
         assert!(collect_audio_files(&root).is_empty());
         // 扫描入口同样静默跳过
         assert!(scan_dirs(&[root.to_string_lossy().to_string()]).is_empty());
+    }
+
+    #[test]
+    fn scan_skips_system_and_noise_dirs() {
+        let root = temp_dir("skip-dirs");
+        touch(&root, "keep.mp3");
+        touch(&root, "node_modules/a.mp3");
+        touch(&root, "$RECYCLE.BIN/b.mp3");
+        touch(&root, "System Volume Information/c.mp3");
+        touch(&root, ".git/d.mp3");
+        touch(&root, ".cargo-home/e.mp3");
+
+        let found = collect_audio_files(&root);
+        assert_eq!(found.len(), 1, "系统/噪声目录应被跳过: {found:?}");
+        assert!(found[0].ends_with("keep.mp3"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn skip_dir_names_are_case_insensitive() {
+        assert!(should_skip_dir("Windows"));
+        assert!(should_skip_dir("$RECYCLE.BIN"));
+        assert!(should_skip_dir("Program Files (x86)"));
+        assert!(should_skip_dir("AppData"));
+        assert!(should_skip_dir(".cargo-home"));
+        assert!(should_skip_dir("Node_Modules"));
+        // 通用词不跳过：可能被用户用来放音乐
+        assert!(!should_skip_dir("Music"));
+        assert!(!should_skip_dir("我的音乐"));
+        assert!(!should_skip_dir("target"));
+        assert!(!should_skip_dir("build"));
+    }
+
+    #[test]
+    fn scan_progress_reports_visited_and_found() {
+        let root = temp_dir("progress");
+        touch(&root, "a.mp3");
+        touch(&root, "b.flac");
+        touch(&root, "c.txt");
+
+        let mut last = (0usize, 0usize);
+        let rows = scan_dirs_with_progress(
+            &[root.to_string_lossy().to_string()],
+            ScanFilter::default(),
+            |v, f, _| {
+                last = (v, f);
+            },
+        );
+        assert_eq!(rows.len(), 2, "只应产出两条音频记录");
+        assert_eq!(last.0, 3, "共访问 3 个文件条目");
+        assert_eq!(last.1, 2, "命中 2 首音频");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn duration_filter_only_drops_known_short_tracks() {
+        let row = |duration_ms: i64| LocalTrackRow {
+            path: "x.mp3".to_string(),
+            title: "x".to_string(),
+            singer: String::new(),
+            album: String::new(),
+            duration_ms,
+            file_size: 0,
+            mtime: 0,
+            format: "mp3".to_string(),
+        };
+        // 关闭过滤：一律保留
+        assert!(!is_too_short(&row(1_000), 0));
+        // 开启 60s：已知且 <= 60s 丢弃，> 60s 保留
+        assert!(is_too_short(&row(12_000), 60), "12s 应被丢弃");
+        assert!(is_too_short(&row(60_000), 60), "整 60s 按「大于 60s」应丢弃");
+        assert!(!is_too_short(&row(60_001), 60), "60s 出头应保留");
+        assert!(!is_too_short(&row(240_000), 60), "长曲应保留");
+        // 时长未知（读不到元数据）：保留，避免误伤
+        assert!(!is_too_short(&row(0), 60), "时长未知不应被丢弃");
+    }
+
+    #[test]
+    fn size_filter_drops_tiny_files_before_metadata() {
+        let root = temp_dir("min-size");
+        touch(&root, "small.mp3"); // 21 字节
+        let big = root.join("big.mp3");
+        std::fs::write(&big, vec![0u8; 4096]).expect("写入大文件");
+
+        let dirs = [root.to_string_lossy().to_string()];
+        // 不过滤：两条都在
+        let all = scan_dirs_with_progress(&dirs, ScanFilter::default(), |_, _, _| {});
+        assert_eq!(all.len(), 2, "不过滤时应保留两条: {all:?}");
+
+        // 1 KiB 下限：只留大文件
+        let kept = scan_dirs_with_progress(
+            &dirs,
+            ScanFilter {
+                min_duration_secs: 0,
+                min_size_bytes: 1024,
+            },
+            |_, _, _| {},
+        );
+        assert_eq!(kept.len(), 1, "小文件应被跳过: {kept:?}");
+        assert!(kept[0].path.ends_with("big.mp3"));
+
+        // 读不到文件大小：保留，避免误伤
+        assert!(!is_too_small(Path::new("does-not-exist.mp3"), 1024));
+        // 阈值为 0：关闭过滤
+        assert!(!is_too_small(Path::new("does-not-exist.mp3"), 0));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn list_drives_returns_windows_roots() {
+        let drives = list_drives();
+        assert!(!drives.is_empty(), "至少应枚举到一个盘符");
+        assert!(drives.iter().all(|d| d.ends_with(":\\")), "{drives:?}");
+        assert!(
+            drives.iter().any(|d| d.eq_ignore_ascii_case("c:\\")),
+            "系统盘 C: 应被枚举到: {drives:?}"
+        );
     }
 
     // ---------- 文件名降级解析 ----------
@@ -486,6 +820,83 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&in_scope);
         let _ = std::fs::remove_dir_all(&out_scope);
+    }
+
+    // ---------- 删除单条本地记录（§13 本地曲库管理） ----------
+
+    #[test]
+    fn delete_local_track_removes_one_row_and_cascades() {
+        let conn = test_conn();
+        let root = temp_dir("delete-one");
+        let keep = touch(&root, "A - keep.mp3");
+        let drop_one = touch(&root, "B - drop.mp3");
+
+        let dirs = vec![root.to_string_lossy().to_string()];
+        upsert_local_tracks(&conn, &scan_dirs(&dirs)).expect("upsert");
+
+        // 挂进歌单：删除曲目记录应连带清掉 playlist_tracks 关联行
+        let drop_db_id = format!("local:{}", drop_one.to_string_lossy());
+        conn.execute(
+            "INSERT INTO playlists (id, name, created_at, updated_at) VALUES ('p1','歌单',0,0)",
+            [],
+        )
+        .expect("insert playlist");
+        conn.execute(
+            "INSERT INTO playlist_tracks (playlist_id, track_id, position, added_at)
+             VALUES ('p1', ?1, 0, 0)",
+            rusqlite::params![drop_db_id],
+        )
+        .expect("insert playlist track");
+
+        let path = drop_one.to_string_lossy().to_string();
+        assert_eq!(delete_local_track(&conn, &path).expect("delete"), 1);
+
+        let left = query_local_tracks(&conn).expect("query");
+        assert_eq!(left.len(), 1, "只该删掉指定的那一条");
+        assert_eq!(left[0].id, keep.to_string_lossy());
+        let links: i64 = conn
+            .query_row("SELECT COUNT(*) FROM playlist_tracks", [], |r| r.get(0))
+            .expect("count links");
+        assert_eq!(links, 0, "歌单关联行应被级联删除");
+
+        // 幂等：再删一次返回 0；删不在库里的路径同样不报错
+        assert_eq!(delete_local_track(&conn, &path).expect("delete again"), 0);
+        assert_eq!(
+            delete_local_track(&conn, r"D:\no\such\file.flac").expect("delete missing"),
+            0
+        );
+        // 磁盘文件不受影响（只删记录）
+        assert!(drop_one.exists(), "只删记录不应动磁盘文件");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_local_tracks_batch_removes_selected_only() {
+        let conn = test_conn();
+        let root = temp_dir("delete-batch");
+        let first = touch(&root, "A - one.mp3");
+        let second = touch(&root, "B - two.mp3");
+        let keep = touch(&root, "C - keep.mp3");
+
+        let dirs = vec![root.to_string_lossy().to_string()];
+        upsert_local_tracks(&conn, &scan_dirs(&dirs)).expect("upsert");
+
+        let paths = vec![
+            first.to_string_lossy().to_string(),
+            second.to_string_lossy().to_string(),
+        ];
+        assert_eq!(delete_local_tracks(&conn, &paths).expect("batch"), 2);
+
+        let left = query_local_tracks(&conn).expect("query");
+        assert_eq!(left.len(), 1, "只该删掉选中的两条");
+        assert_eq!(left[0].id, keep.to_string_lossy());
+
+        // 幂等；空列表直接返回 0
+        assert_eq!(delete_local_tracks(&conn, &paths).expect("again"), 0);
+        assert_eq!(delete_local_tracks(&conn, &[]).expect("empty"), 0);
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ---------- 扫描目录清单（scan_dirs 表） ----------

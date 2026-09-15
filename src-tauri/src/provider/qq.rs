@@ -66,6 +66,8 @@ impl QqProvider {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(10))
+            // 禁用连接池：休眠唤醒后 keep-alive 连接变半死，复用会挂满超时
+            .pool_max_idle_per_host(0)
             .build()
             .expect("reqwest client init");
         Self { http }
@@ -138,13 +140,15 @@ impl QqProvider {
     /// 跨源兜底：kw → wyy（与移动端 resolvePlayUrl 的 qq 分支一致）
     async fn cross_fallback(&self, track: &Track, quality: Quality) -> ProviderResult<String> {
         let kw = super::KwProvider::new();
-        if let Some(url) = super::play_via_source(&kw, &track.title, &track.singer, quality).await {
+        if let Some((url, matched)) = super::play_via_source(&kw, &track.title, &track.singer, quality).await {
+            super::record_source_fallback(&url, &matched);
             return Ok(url);
         }
         let wyy = super::WyyProvider::new();
-        if let Some(url) =
+        if let Some((url, matched)) =
             super::play_via_source(&wyy, &track.title, &track.singer, quality).await
         {
+            super::record_source_fallback(&url, &matched);
             return Ok(url);
         }
         Err(ProviderError::NoPlayableUrl)

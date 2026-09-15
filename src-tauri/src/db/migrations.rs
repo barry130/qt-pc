@@ -91,8 +91,30 @@ CREATE TABLE IF NOT EXISTS liked_song_playlists (
 CREATE INDEX IF NOT EXISTS idx_lsp_pid ON liked_song_playlists(pid);
 "#;
 
+/// v7：下载 2.0 —— 断点续传所需的 `.part` 临时路径与文件总字节数。
+///
+/// 有这两列，暂停 / 继续 / 重试才能在应用重启后接着写同一个临时文件：
+/// `part_path` 在任务创建时定档（含任务 id，天然唯一），`total_bytes` 用于
+/// 校验「写完的字节数 == 服务端声明的长度」，避免把半截文件或错误页当作成品。
+const V7: &str = r#"
+ALTER TABLE download_tasks ADD COLUMN part_path TEXT;
+ALTER TABLE download_tasks ADD COLUMN total_bytes INTEGER;
+"#;
+
+/// v8：歌单的「云端确认点」（LIKE_SYNC_DESIGN.md §5 机制 B）。
+///
+/// `cloud_seq` = 该歌单在云端被确认存在的最后 updated_seq：
+/// 推送 add 成功 / 对账、拉取见到云端有它时记录。启动对账据此三分：
+/// NULL → 从未上送，补推；有值但游标已越过它而云端集合没有 → 他端已删，
+/// 本地跟随删除（否则本机建、他端删的歌单会被对账无限复活）。
+/// 老库回填规则：自建歌单一律置 NULL（宁可多补推一次，upsert 幂等无害），
+/// 服务器见过它们与否本地无从考证，补推后即拿到真实确认点。
+const V8: &str = r#"
+ALTER TABLE playlists ADD COLUMN cloud_seq INTEGER;
+"#;
+
 pub(crate) const MIGRATIONS: &[(i64, &str)] =
-  &[(1, V1), (2, V2), (3, V3), (4, V4), (5, V5), (6, V6)];
+  &[(1, V1), (2, V2), (3, V3), (4, V4), (5, V5), (6, V6), (7, V7), (8, V8)];
 
 const V1: &str = r#"
 CREATE TABLE tracks (
@@ -306,7 +328,7 @@ CREATE TABLE stat_queue (
 "#;
 
 /// 当前程序支持的最新 schema 版本。
-pub(crate) const CURRENT_VERSION: i64 = 6;
+pub(crate) const CURRENT_VERSION: i64 = 8;
 
 /// 建表 schema_migrations 并把所有未应用版本按序执行。
 pub(crate) fn run(conn: &Connection) -> Result<(), rusqlite::Error> {

@@ -56,6 +56,8 @@ impl WyyProvider {
             // 单音源请求默认超时 10s（REQUIREMENTS §4.1）
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(10))
+            // 禁用连接池：休眠唤醒后 keep-alive 连接变半死，复用会挂满超时
+            .pool_max_idle_per_host(0)
             .build()
             .expect("reqwest client init");
         Self { http }
@@ -791,7 +793,8 @@ impl MusicProvider for WyyProvider {
 
         // 3) 兜底：酷我（与移动端 fetchWyyUrl 一致，网易云失败仅兜酷我）
         let kw = super::KwProvider::new();
-        if let Some(u) = super::play_via_source(&kw, &track.title, &track.singer, quality).await {
+        if let Some((u, matched)) = super::play_via_source(&kw, &track.title, &track.singer, quality).await {
+            super::record_source_fallback(&u, &matched);
             return Ok(u);
         }
         Err(ProviderError::NoPlayableUrl)

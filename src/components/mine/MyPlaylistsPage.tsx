@@ -4,6 +4,7 @@ import { useNavigate } from "@tanstack/react-router";
 import type { MyPlaylistSummary, SourceId } from "@/types";
 import { SOURCE_DISPLAY } from "@/types";
 import * as ipc from "@/services/ipc";
+import { pullLikes } from "@/stores/auth";
 import { qtresCoverUrl } from "@/lib/lrc";
 
 /**
@@ -29,6 +30,9 @@ export function MyPlaylistsPage(): React.JSX.Element {
   const load = useCallback(async (): Promise<void> => {
     setLoading(true);
     try {
+      // 打开时先把云端收藏拉回来（未登录 / 后端不可达由 pullLikes 内部吞掉），
+      // 别端的建单/删单/改名才能反映到这个列表 —— 对齐 FavoritesPage
+      await pullLikes().catch(() => {});
       const l = await ipc
         .listMyPlaylists()
         .catch(() => [] as MyPlaylistSummary[]);

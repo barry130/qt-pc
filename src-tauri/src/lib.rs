@@ -4,12 +4,14 @@ pub mod audio;
 pub mod astral;
 pub mod commands;
 pub mod db;
+pub mod download;
 pub mod local;
 pub mod lyric_window;
 pub mod media;
 pub mod provider;
 pub mod qtres;
 pub mod shortcuts;
+pub mod smtc;
 pub mod tray;
 
 use std::path::PathBuf;
@@ -21,7 +23,7 @@ use db::Database;
 use provider::registry::{PlayUrlCache, ProviderRegistry};
 use provider::types::{Quality, SourceId, Track};
 use provider::ProviderError;
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 /// 全局应用状态
 pub struct AppState {
@@ -33,6 +35,8 @@ pub struct AppState {
     pub db: Option<Arc<Database>>,
     /// Astral 后端 HTTP 客户端（更新 / 消息 / 统计 / 反馈，§2.3.4）
     pub astral: Arc<astral::AstralClient>,
+    /// 下载任务登记表（暂停 / 取消时置停止旗标，§5.3 下载 2.0）
+    pub downloads: Arc<download::DownloadManager>,
 }
 
 type CmdResult<T> = Result<T, ProviderError>;
@@ -84,6 +88,9 @@ pub fn run() {
             // §4 关闭行为：点关闭 = 最小化到托盘，退出走托盘菜单
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main" {
+                    // 统计（STATS_DESIGN §4.1）：收进托盘 = 一轮 show→hide 结束，
+                    // 让前端结算停留时长并冲队列
+                    let _ = window.emit("stat_window_hidden", ());
                     api.prevent_close();
                     let _ = window.hide();
                 }
@@ -124,6 +131,24 @@ pub fn run() {
                 db.clone(),
             );
 
+            // 系统媒体控制（Windows SMTC）：系统媒体面板 + 硬件媒体键 / 蓝牙耳机按键。
+            // 需要主窗口 HWND；取不到（异常环境）就静默降级，不影响播放。
+            #[cfg(target_os = "windows")]
+            {
+                let hwnd = handle
+                    .get_webview_window("main")
+                    .and_then(|w| w.hwnd().ok())
+                    .map(|h| h.0 as isize);
+                match hwnd {
+                    Some(raw) => {
+                        if let Some(h) = smtc::init(raw, handle.clone(), engine.clone()) {
+                            engine.set_smtc(Some(h));
+                        }
+                    }
+                    None => log::warn!("[smtc] 取不到主窗口句柄，系统媒体控制未启用"),
+                }
+            }
+
             // 托盘 + 全局快捷键（§14.1 / §14.2；自定义快捷键从 settings 表读）
             let keymap = shortcuts::load_shortcuts(db.as_deref());
 
@@ -156,7 +181,18 @@ pub fn run() {
                 audio_cache_dir,
                 db,
                 astral,
+                downloads: Arc::new(download::DownloadManager::new()),
             });
+
+            // 下载 2.0 收尾：上次退出时还在 pending / downloading 的任务已无工作线程，
+            // 统一落成 paused（可「继续」），避免界面永远停在「下载中」
+            if let Some(db) = &app.state::<AppState>().db {
+                match db.with(crate::db::store::mark_stale_downloads_paused) {
+                    Ok(n) if n > 0 => log::info!("[download] {n} 个中断任务已置为暂停"),
+                    Err(e) => log::warn!("[download] 中断任务清理失败: {e}"),
+                    _ => {}
+                }
+            }
 
             tray::create_tray(&handle);
             shortcuts::register_shortcuts(&handle, &keymap);
@@ -207,6 +243,11 @@ pub fn run() {
             cmd_set_play_mode,
             cmd_get_queue,
             cmd_clear_queue,
+            cmd_queue_add_next,
+            cmd_queue_append,
+            cmd_queue_remove_at,
+            cmd_queue_move,
+            cmd_queue_clear_after,
             cmd_pause,
             cmd_resume,
             cmd_stop,
@@ -233,6 +274,7 @@ pub fn run() {
             cmd_set_desktop_lyric_style,
             cmd_set_desktop_lyric_bounds,
             cmd_reset_desktop_lyric,
+            cmd_open_lyric_settings,
             cmd_astral_app_update,
             cmd_astral_check_official_version,
             cmd_astral_github_accels,
@@ -271,12 +313,24 @@ pub fn run() {
             cmd_like_pull,
             cmd_like_pull_all,
             cmd_like_apply,
+            cmd_like_flush_pending,
+            cmd_like_reconcile,
+            cmd_like_clear_local,
+            cmd_like_reset_sync,
             // 本地音乐库（DESIGN §13）
             cmd_scan_library,
+            cmd_list_drives,
             cmd_get_local_tracks,
             cmd_get_scan_dirs,
             cmd_add_scan_dir,
             cmd_remove_scan_dir,
+            cmd_reveal_local_track,
+            cmd_delete_local_track,
+            cmd_delete_local_tracks,
+            cmd_get_missing_local_tracks,
+            cmd_purge_missing_local_tracks,
+            cmd_get_local_cover,
+            cmd_get_local_online_meta,
             // 收藏 / 播放历史（DESIGN §5.3）
             cmd_add_favorite,
             cmd_remove_favorite,
@@ -300,7 +354,14 @@ pub fn run() {
             // 下载管理（DESIGN §5.3）
             cmd_start_download,
             cmd_list_downloads,
+            cmd_list_downloaded_track_ids,
             cmd_delete_download,
+            cmd_delete_downloads,
+            cmd_pause_download,
+            cmd_resume_download,
+            cmd_retry_download,
+            cmd_cancel_download,
+            cmd_reveal_download,
             cmd_get_download_dir,
             cmd_choose_download_dir,
             cmd_reset_download_dir,

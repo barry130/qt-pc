@@ -1,7 +1,6 @@
 import { useState } from "react";
 import { errMsg } from "@/lib/utils";
 import { useNavigate } from "@tanstack/react-router";
-import * as ipc from "@/services/ipc";
 import { useAuthStore } from "@/stores/auth";
 
 /**
@@ -9,6 +8,29 @@ import { useAuthStore } from "@/stores/auth";
  * 接口契约与 qt-uniappx 一致：app/user/login 与 app/user/register，
  * 成功后后端直接返回 token（satoken），Rust 侧负责存会话并在启动时恢复。
  */
+
+/**
+ * 错误提示：不把服务端地址、内部实现细节抛到界面上。
+ * Rust 侧错误串形如「Astral 业务错误(500): 用户名或密码错误」或
+ * 「Astral 请求失败: error sending request for url (http://…)」——
+ * 前者只保留业务文案，后者统一成网络提示（reqwest 的错误串里带 URL）。
+ */
+function authTip(err: unknown): string {
+  const raw = errMsg(err);
+  const biz = /业务错误\(\d+\)[:：]\s*(.+)$/.exec(raw);
+  if (biz && biz[1].trim().length > 0) return biz[1].trim();
+  if (/https?:\/\//i.test(raw) || /请求失败|响应解析失败|error sending request/i.test(raw)) {
+    return "网络异常，请稍后重试";
+  }
+  return raw;
+}
+/** 注册校验规则：用户名 5-18 位英文/数字；密码 6-18 位（上限对齐后端 QtRegisterDto） */
+const USERNAME_RE = /^[A-Za-z0-9]{5,18}$/;
+const PASSWORD_MIN = 6;
+const PASSWORD_MAX = 18;
+/** 邮箱格式：够用即可，不做 RFC 级别的严格匹配 */
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 export function LoginPage(): React.JSX.Element {
   const navigate = useNavigate();
   const session = useAuthStore((s) => s.session);
@@ -19,45 +41,55 @@ export function LoginPage(): React.JSX.Element {
   const [mode, setMode] = useState<"login" | "register">("login");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
   const [email, setEmail] = useState("");
-  const [code, setCode] = useState("");
   const [tip, setTip] = useState<string | null>(null);
 
   const submit = async (): Promise<void> => {
     setTip(null);
-    if (!username.trim() || !password) {
+    const name = username.trim();
+    if (!name || !password) {
       setTip("请填写用户名和密码");
       return;
     }
-    try {
-      if (mode === "login") {
-        await login(username.trim(), password);
-      } else {
-        await register(
-          username.trim(),
-          password,
-          email.trim() || undefined,
-          code.trim() || undefined,
-        );
+    if (mode === "register") {
+      // 注册规则本地先挡一遍，不用等后端往返
+      if (!USERNAME_RE.test(name)) {
+        setTip("用户名需为 5-18 位英文或数字");
+        return;
       }
-      await navigate({ to: "/profile" });
-    } catch (err) {
-      setTip(errMsg(err));
+      if (password.length < PASSWORD_MIN || password.length > PASSWORD_MAX) {
+        setTip(`密码需为 ${PASSWORD_MIN}-${PASSWORD_MAX} 位`);
+        return;
+      }
+      if (password !== confirm) {
+        setTip("两次输入的密码不一致");
+        return;
+      }
+      const mail = email.trim();
+      if (!mail) {
+        setTip("请填写邮箱");
+        return;
+      }
+      if (!EMAIL_RE.test(mail)) {
+        setTip("邮箱格式不正确");
+        return;
+      }
+      try {
+        await register(name, password, confirm, mail);
+      } catch (err) {
+        setTip(authTip(err));
+        return;
+      }
+    } else {
+      try {
+        await login(name, password);
+      } catch (err) {
+        setTip(authTip(err));
+        return;
+      }
     }
-  };
-
-  const sendCode = async (): Promise<void> => {
-    if (!email.trim()) {
-      setTip("请先填写邮箱");
-      return;
-    }
-    setTip(null);
-    try {
-      await ipc.astralSendEmailCode(email.trim());
-      setTip("验证码已发送，请查收邮件");
-    } catch (err) {
-      setTip(errMsg(err));
-    }
+    await navigate({ to: "/profile" });
   };
 
   if (session) {
@@ -109,7 +141,7 @@ export function LoginPage(): React.JSX.Element {
           <input
             value={username}
             onChange={(e) => setUsername(e.target.value)}
-            placeholder="用户名"
+            placeholder={mode === "login" ? "用户名" : "用户名（5-18 位英文或数字）"}
             autoComplete="username"
             className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
           />
@@ -117,7 +149,7 @@ export function LoginPage(): React.JSX.Element {
             value={password}
             onChange={(e) => setPassword(e.target.value)}
             type="password"
-            placeholder="密码"
+            placeholder={mode === "login" ? "密码" : "密码（至少 6 位）"}
             autoComplete={mode === "login" ? "current-password" : "new-password"}
             onKeyDown={(e) => {
               if (e.key === "Enter") void submit();
@@ -127,25 +159,23 @@ export function LoginPage(): React.JSX.Element {
 
           {mode === "register" && (
             <>
-              <div className="flex gap-2">
-                <input
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  placeholder="邮箱（可选）"
-                  className="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 text-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
-                />
-                <button
-                  type="button"
-                  onClick={() => void sendCode()}
-                  className="h-9 shrink-0 rounded-md border border-border px-3 text-xs transition-colors hover:bg-secondary"
-                >
-                  发验证码
-                </button>
-              </div>
               <input
-                value={code}
-                onChange={(e) => setCode(e.target.value)}
-                placeholder="邮箱验证码（可选）"
+                value={confirm}
+                onChange={(e) => setConfirm(e.target.value)}
+                type="password"
+                placeholder="确认密码"
+                autoComplete="new-password"
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void submit();
+                }}
+                className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
+              />
+              <input
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                type="email"
+                placeholder="邮箱"
+                autoComplete="email"
                 className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
               />
             </>
@@ -164,12 +194,6 @@ export function LoginPage(): React.JSX.Element {
             <p className="text-center text-xs text-destructive">{tip}</p>
           )}
         </div>
-
-        <p className="mt-6 text-center text-[11px] leading-relaxed text-muted-foreground">
-          账号服务由 Astral 后端提供（开发环境 http://localhost:27000）。
-          <br />
-          后端未启动时登录会失败，不影响本地音乐与在线试听。
-        </p>
       </div>
     </div>
   );

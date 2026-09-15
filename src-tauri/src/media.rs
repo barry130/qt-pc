@@ -19,6 +19,8 @@ pub enum MediaAction {
     Mute,
     /// 显示 / 隐藏桌面歌词窗口（窗口本体在桌面歌词单元落地，先广播事件）
     DesktopLyric,
+    /// 锁定 / 解锁桌面歌词（锁定后不能拖动、工具条隐藏）
+    LockLyric,
 }
 
 impl MediaAction {
@@ -32,6 +34,7 @@ impl MediaAction {
             MediaAction::VolumeDown => "volume_down",
             MediaAction::Mute => "mute",
             MediaAction::DesktopLyric => "desktop_lyric",
+            MediaAction::LockLyric => "lock_lyric",
         }
     }
 
@@ -44,6 +47,7 @@ impl MediaAction {
             "volume_down" => Some(MediaAction::VolumeDown),
             "mute" => Some(MediaAction::Mute),
             "desktop_lyric" => Some(MediaAction::DesktopLyric),
+            "lock_lyric" => Some(MediaAction::LockLyric),
             _ => None,
         }
     }
@@ -85,6 +89,14 @@ pub fn dispatch_media_action(app: &AppHandle, action: MediaAction) {
         MediaAction::DesktopLyric => {
             // 直接由 Rust 切换窗口（主窗口隐藏/最小化时依然可用，§10.7）
             crate::lyric_window::toggle(app);
+        }
+        MediaAction::LockLyric => {
+            // 锁定 = 禁止拖动 + 隐藏工具条；锁定后这是最可靠的解锁入口之一
+            // （另外两个是托盘勾选与设置页），所以它必须是全局快捷键。
+            let locked = crate::lyric_window::get_state(app).locked;
+            if let Err(e) = crate::lyric_window::set_locked(app, !locked) {
+                log::error!("[media] 切换歌词锁定失败: {e}");
+            }
         }
     }
 }
