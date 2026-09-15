@@ -3,12 +3,14 @@
 //! M2 范围：Load / Play / Pause / Stop / Seek / SetVolume / SetMuted / Shutdown
 //! + 播放队列（SetQueue / PlayAt / Next / Previous / SetPlayMode）与自然播完自动切歌。
 //!
-//! 队列推进的纯逻辑见 `queue.rs`；引擎线程独占处理，自动切歌的取址在 tokio 任务里
-//! 异步完成后再回发 Load（音频线程不做网络 IO 等待）。
+//! 队列推进的纯逻辑见 `queue.rs`；引擎线程独占处理，取址与解码器构建
+//! （网络 IO）都在 tokio / blocking 线程池异步完成，回发 LoadReady 后
+//! 引擎线程只做纯内存挂载 —— 命令通道永不被网络阻塞。
 //!
 //! 位置口径：`sink.get_pos()` 是 rodio 对当前源的真实播放位置（暂停时冻结），
 //! tick 时以它为准并回写快照，避免自增累计漂移。
 
+use std::collections::HashSet;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
@@ -41,11 +43,22 @@ pub enum PlaySource {
 
 /// 音频命令（DESIGN §7.4 AudioCmd 的 M2 子集）。
 pub enum AudioCmd {
-    Load {
+    /// 解码器已构建完成，可以挂载播放。构建（HTTP open + 首包探测）在
+    /// blocking 线程池完成 —— 引擎线程全程不做网络 IO。
+    LoadReady {
         track: Box<Track>,
-        source: Box<PlaySource>,
+        decoder: Box<dyn Source + Send>,
+        shared: Option<Arc<RangeShared>>,
+        duration_ms: u64,
         start_at: Option<u64>,
         autoplay: bool,
+        is_local: bool,
+        url_fetched_at: Option<u64>,
+        /// 当前实际播放地址（在线源才有）。换源兜底后它指向目标源，
+        /// 歌词按它查换源记录换源取词（DESIGN 换源一致性）
+        play_url: Option<String>,
+        /// 加载代次：与引擎当前代次不一致说明等待期间用户又切了歌，结果丢弃
+        gen: u64,
     },
     Play,
     Pause,
@@ -55,6 +68,16 @@ pub enum AudioCmd {
     SetMuted(bool),
     /// 整表替换队列并从 index 开始播放
     SetQueue { tracks: Vec<Track>, index: usize },
+    /// 下一首播放：插到当前曲目之后（不打断当前播放）
+    AddNext(Box<Track>),
+    /// 加入队尾（不打断当前播放）
+    Append(Vec<Track>),
+    /// 移除队列中某一项（不打断当前播放）
+    RemoveAt(usize),
+    /// 拖动排序：把 from 位置的曲目移到 to
+    MoveItem { from: usize, to: usize },
+    /// 清空当前曲目之后的所有曲目
+    ClearAfter,
     PlayAt(usize),
     Next,
     Previous,
@@ -79,6 +102,17 @@ pub enum AudioCmd {
     SetDefaultQuality { quality: Quality },
     /// 只改当前这首的音质（播放条入口）：不写 settings，切到别的歌自动回到默认。
     SetTrackQuality { quality: Quality },
+    /// 取址 / 打开流失败的回执：统一置错误态，并决定是否自动跳过（§7.3 恢复策略）。
+    LoadFailed {
+        track_id: String,
+        message: String,
+        /// 触发时是否处于「应当继续播放」的语义（自动切歌 / 在播时换曲）
+        autoplay: bool,
+        /// 加载代次：过期的失败回执直接丢弃（用户早已切到别的歌）
+        gen: u64,
+    },
+    /// 装配 / 卸载系统媒体控制（SMTC）。启动时由 lib.rs 注入。
+    SetSmtc(Option<crate::smtc::SmtcHandle>),
     Shutdown,
 }
 
@@ -143,6 +177,11 @@ impl AudioEngine {
     pub fn queue_snapshot(&self) -> Queue {
         self.queue.lock().unwrap().clone()
     }
+
+    /// 注入系统媒体控制句柄（Windows SMTC；不可用时传 None）。
+    pub fn set_smtc(&self, handle: Option<crate::smtc::SmtcHandle>) {
+        self.send(AudioCmd::SetSmtc(handle));
+    }
 }
 
 struct EngineInner {
@@ -169,6 +208,15 @@ struct EngineInner {
     current_shared: Option<Arc<RangeShared>>,
     volume_before_mute: f32,
     tick_anchor: Option<std::time::Instant>,
+    /// 本轮队列里已经播放失败过的曲目（自动跳过用；换队列时清空）。
+    /// 有它才能保证「队列全挂」时不会无限互相跳过。
+    failed_tracks: HashSet<String>,
+    /// 系统媒体控制（SMTC）句柄；None = 不可用（非 Windows / 初始化失败）
+    smtc: Option<crate::smtc::SmtcHandle>,
+    /// 加载代次：每次发起新的「取址+构建解码器」链就 +1。LoadReady /
+    /// LoadFailed 回执带的代次与当前不一致 → 等待期间用户又切了歌，丢弃。
+    /// 没有它，连点切歌后旧歌的加载结果会把新歌顶掉。
+    load_gen: u64,
     /// 上次把 position 持久化到 settings 的时刻（5s 节流）
     last_persist: Option<std::time::Instant>,
     /// 引擎启动时刻，monotonicMs 以此为原点（DESIGN §7.11）
@@ -180,6 +228,8 @@ impl EngineInner {
     fn publish(&self) {
         let snap = self.state.read().unwrap().clone();
         let _ = self.app.emit("playback-state-changed", &snap);
+        // 顺带把当前曲目 / 播放状态投到系统媒体面板（Windows SMTC）
+        crate::smtc::sync(&self.smtc, &snap);
     }
 
     fn mutate(&self, f: impl FnOnce(&mut PlaybackStateSnapshot)) {
@@ -374,8 +424,13 @@ fn run_engine(deps: EngineDeps) {
 
     let http = reqwest::blocking::Client::builder()
         .user_agent("Mozilla/5.0")
-        // 假死防护由 range_reader 的 per-request 15s 总超时承担（超时→重试→重连）
-        // 这里禁用 client 级整体超时（流式读取不能整体超时）
+        // 禁用连接池：休眠唤醒后池里的 keep-alive 连接是半死的（进程冻结期间
+        // pool_idle_timeout 计时器不走，醒来后池仍认为连接"新鲜"），新请求复用
+        // 它们就挂满超时才报错。pool_max_idle_per_host(0) 让每个请求建新连接，
+        // 醒来后要么立刻连成功、要么 connect_timeout 快速失败 —— 不再复用死连接。
+        // 假死防护另由 range_reader 的 per-request 8s 总超时兜底（超时→重试→重连）。
+        .pool_max_idle_per_host(0)
+        .connect_timeout(Duration::from_secs(8))
         .build()
         .expect("blocking http client init");
 
@@ -399,6 +454,9 @@ fn run_engine(deps: EngineDeps) {
         current_shared: None,
         volume_before_mute: 0.8,
         tick_anchor: None,
+        failed_tracks: HashSet::new(),
+        smtc: None,
+        load_gen: 0,
         last_persist: None,
         epoch: std::time::Instant::now(),
         db,
@@ -517,8 +575,39 @@ fn run_engine(deps: EngineDeps) {
 
 fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
     match cmd {
-        AudioCmd::Load { track, source, start_at, autoplay } => {
-            handle_load(inner, &track, &source, start_at, autoplay);
+        AudioCmd::LoadReady {
+            track,
+            decoder,
+            shared,
+            duration_ms,
+            start_at,
+            autoplay,
+            is_local,
+            url_fetched_at,
+            play_url,
+            gen,
+        } => {
+            // 过期结果丢弃：等待取址/构建期间用户又切了歌，这条是旧歌的
+            if gen != inner.load_gen {
+                log::info!(
+                    "[queue] 丢弃过期的加载结果 track={} (gen={gen} != {})",
+                    track.id,
+                    inner.load_gen
+                );
+            } else {
+                mount_decoder(
+                    inner,
+                    &track,
+                    decoder,
+                    shared,
+                    duration_ms,
+                    start_at,
+                    autoplay,
+                    is_local,
+                    url_fetched_at,
+                    play_url,
+                );
+            }
         }
         AudioCmd::Play => {
             inner.sink.play();
@@ -595,8 +684,10 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             inner.persist_state();
         }
         AudioCmd::SetQueue { tracks, index } => {
-            // 播放新列表 = 新一轮播放：上一首的临时音质作废，回到默认音质
+            // 播放新列表 = 新一轮播放：上一首的临时音质作废，回到默认音质；
+            // 失败跳过记录也清空，新的队列重新给每首歌机会
             inner.track_quality = None;
+            inner.failed_tracks.clear();
             let mut q = inner.queue.lock().unwrap();
             q.set(tracks, index);
             let current = q.current().cloned();
@@ -625,8 +716,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             }
             inner.persist_queue();
         }
-        AudioCmd::Next => advance(inner, false),
-        AudioCmd::Previous => go_previous(inner),
+        AudioCmd::Next => advance(inner, false),        AudioCmd::Previous => go_previous(inner),
         AudioCmd::SetPlayMode(mode) => {
             inner.mutate(|st| st.play_mode = mode);
             inner.persist_state();
@@ -649,6 +739,44 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             });
             inner.persist_queue();
         }
+        AudioCmd::AddNext(track) => {
+            inner.queue.lock().unwrap().insert_next(*track);
+            inner.sync_queue_to_snapshot();
+            inner.queue_emit();
+            inner.persist_queue();
+        }
+        AudioCmd::Append(tracks) => {
+            if !tracks.is_empty() {
+                inner.queue.lock().unwrap().append(tracks);
+                inner.sync_queue_to_snapshot();
+                inner.queue_emit();
+                inner.persist_queue();
+            }
+        }
+        AudioCmd::RemoveAt(index) => {
+            let removed = inner.queue.lock().unwrap().remove_at(index).is_some();
+            if removed {
+                inner.sync_queue_to_snapshot();
+                inner.queue_emit();
+                inner.persist_queue();
+            }
+        }
+        AudioCmd::MoveItem { from, to } => {
+            let moved = inner.queue.lock().unwrap().move_item(from, to);
+            if moved {
+                inner.sync_queue_to_snapshot();
+                inner.queue_emit();
+                inner.persist_queue();
+            }
+        }
+        AudioCmd::ClearAfter => {
+            let removed = inner.queue.lock().unwrap().clear_after_current();
+            if removed > 0 {
+                inner.sync_queue_to_snapshot();
+                inner.queue_emit();
+                inner.persist_queue();
+            }
+        }
         AudioCmd::RestoreSession {
             tracks,
             index,
@@ -662,6 +790,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                 let mut q = inner.queue.lock().unwrap();
                 q.set(tracks, index);
             }
+            inner.failed_tracks.clear();
             inner.sync_queue_to_snapshot();
             inner.queue_emit();
             inner.mutate(|st| {
@@ -721,6 +850,30 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                 load_queue_track(inner, track, autoplay, pos);
             }
         }
+        AudioCmd::LoadFailed {
+            track_id,
+            message,
+            autoplay,
+            gen,
+        } => {
+            if gen != inner.load_gen {
+                // 过期的失败回执：用户已切到别的歌，不能把当前状态置错
+                log::info!("[queue] 丢弃过期的失败回执 track={track_id}");
+            } else {
+                log::error!("[queue] 曲目 {track_id} 播放失败: {message}");
+                inner.mutate(|st| {
+                    st.status = PlaybackStatus::Error;
+                    st.error = Some(message);
+                });
+                // 事件已由取址方（含原消息）发出，这里只负责状态与跳过决策
+                skip_if_recoverable(inner, &track_id, autoplay);
+            }
+        }
+        AudioCmd::SetSmtc(handle) => {
+            inner.smtc = handle;
+            // 立即把当前状态推给系统面板，避免注入前已播的曲目信息缺失
+            inner.publish();
+        }
         AudioCmd::Shutdown => return true,
     }
     false
@@ -737,7 +890,7 @@ fn playback_resume_point(inner: &EngineInner) -> (bool, u64) {
     (autoplay, st.position_ms)
 }
 
-/// 播放队列中的指定曲目：置 Loading 后异步取址，成功回发 Load。
+/// 播放队列中的指定曲目：置 Loading 后异步取址+构建，成功回发 LoadReady。
 fn play_queue_track(inner: &mut EngineInner, track: Track) {
     load_queue_track(inner, track, true, 0);
 }
@@ -749,6 +902,9 @@ fn load_queue_track(inner: &mut EngineInner, track: Track, autoplay: bool, start
         Some((id, q)) if *id == track.id => *q,
         _ => inner.default_quality,
     };
+    // 每次新加载推进代次：在途的旧加载结果回来时据此丢弃
+    inner.load_gen += 1;
+    let gen = inner.load_gen;
     inner.mutate(|st| {
         st.quality = quality;
         st.status = PlaybackStatus::Loading;
@@ -760,7 +916,7 @@ fn load_queue_track(inner: &mut EngineInner, track: Track, autoplay: bool, start
         st.buffered_ms = 0;
         st.is_local = false;
     });
-    spawn_resolve_and_load(inner, track, autoplay, start_ms);
+    spawn_resolve_and_load(inner, track, autoplay, start_ms, gen);
 }
 
 /// 按播放模式切到下一首。`auto` = 自然播完触发。
@@ -800,8 +956,64 @@ fn advance(inner: &mut EngineInner, auto: bool) {
     }
 }
 
-fn go_previous(inner: &mut EngineInner) {
-    let mode = inner.state.read().unwrap().play_mode;
+/// 播放失败后的恢复策略：仍处于「应当继续播放」的语义（自动切歌 / 在播时换曲）
+/// 且队列里还有没失败过的曲目，就跳过当前这首继续播；全部失败则停下 ——
+/// 否则整个队列都播不出来时会无限互相跳过。
+///
+/// 这里刻意不走 `advance`：单曲循环 / 列表循环会算回当前这首，
+/// 对一首坏歌会形成「失败 → 重试同一首」的死循环。改成向前扫描第一个
+/// 没失败过的曲目；找不到就停。
+fn skip_if_recoverable(inner: &mut EngineInner, track_id: &str, autoplay: bool) {
+    inner.failed_tracks.insert(track_id.to_string());
+    let (len, cur) = {
+        let q = inner.queue.lock().unwrap();
+        (q.len(), q.index)
+    };
+    if !autoplay || len <= 1 {
+        return;
+    }
+    let Some(cur) = cur else {
+        return;
+    };
+
+    let mut target: Option<usize> = None;
+    for offset in 1..=len {
+        let i = (cur + offset) % len;
+        let id = inner
+            .queue
+            .lock()
+            .unwrap()
+            .tracks
+            .get(i)
+            .map(|t| t.id.clone());
+        if let Some(id) = id {
+            if !inner.failed_tracks.contains(&id) {
+                target = Some(i);
+                break;
+            }
+        }
+    }
+
+    let Some(i) = target else {
+        log::warn!("[queue] 队列内 {len} 首均播放失败，停止自动跳过");
+        return;
+    };
+    log::info!("[queue] 曲目 {track_id} 失败，跳过到队列第 {} 首", i + 1);
+
+    let track = {
+        let mut q = inner.queue.lock().unwrap();
+        q.index = Some(i);
+        q.current().cloned()
+    };
+    inner.sync_queue_to_snapshot();
+    inner.queue_emit();
+    if let Some(track) = track {
+        play_queue_track(inner, track);
+    }
+    inner.persist_queue();
+}
+
+fn go_previous(inner: &mut EngineInner) {    let mode = inner.state.read().unwrap().play_mode;
     let prev = {
         let mut q = inner.queue.lock().unwrap();
         q.previous_index(mode).map(|i| {
@@ -841,69 +1053,37 @@ fn record_play_start(db: Option<Arc<Database>>, track: Track) {
     });
 }
 
-/// 异步取播放地址（内存缓存 10 分钟），成功后回发 Load 到音频线程。
-/// 失败：作废缓存重取一次（§7.3），仍失败则置 Error 并广播 audio-error。
+/// 异步取播放地址（内存缓存 10 分钟）+ 构建解码器，完成后回发 LoadReady。
+///
+/// 取址在 tokio 任务、构建（HTTP open + 首包探测）在 blocking 线程池：
+/// 引擎线程不做任何网络/阻塞 IO。休眠唤醒后旧 TCP 连接是半死的，每个
+/// 请求都要挂满超时才报错 —— 若让引擎线程亲自 open，所有播放控制命令
+/// （切歌/暂停）会排队等到超时链走完，表现为「卡死几分钟」。
+///
+/// 失败：取址失败作废缓存重取一次（§7.3）；打开流失败同样作废缓存重开一次
+/// （休眠唤醒后缓存的签名 URL 过期 / 半死连接是常态）；仍失败回发 LoadFailed。
 fn spawn_resolve_and_load(
     inner: &EngineInner,
     track: Track,
     autoplay: bool,
     start_ms: u64,
+    gen: u64,
 ) {
-    let app = inner.app.clone();
-    let tx = inner.tx.clone();
-    let registry = Arc::clone(&inner.registry);
-    let cache = Arc::clone(&inner.url_cache);
-    let quality = inner
-        .state
-        .read()
-        .unwrap()
-        .quality
-        .into_provider();
-    // 播放历史（§5.3）：取址成功后写入，db 不可用时静默跳过
-    let history_db = inner.db.clone();
-
-    tauri::async_runtime::spawn(async move {
-        // 本地曲目：Track.id 即文件绝对路径，无需 Provider 取址（DESIGN §13）
-        if track.platform == types::SourceId::Local {
-            log::info!("[queue] local track path={}", track.id);
-            let _ = tx.send(AudioCmd::Load {
-                track: Box::new(track.clone()),
-                source: Box::new(PlaySource::Local { path: track.id.clone() }),
-                start_at: if start_ms > 0 { Some(start_ms) } else { None },
-                autoplay,
-            });
-            record_play_start(history_db, track);
-            return;
-        }
-        let resolved = resolve_with_retry(&registry, &cache, &track, quality).await;
-        match resolved {
-            Ok((url, fetched_at)) => {
-                log::info!(
-                    "[queue] resolve ok track={} url_host={}",
-                    track.id,
-                    url.split("//").nth(1).unwrap_or("").split('/').next().unwrap_or("")
-                );
-                let _ = tx.send(AudioCmd::Load {
-                    track: Box::new(track.clone()),
-                    source: Box::new(PlaySource::Online { url, fetchedAt: fetched_at }),
-                    start_at: Some(start_ms),
-                    autoplay,
-                });
-                record_play_start(history_db, track);
-            }
-            Err(e) => {
-                log::error!("自动取址失败: {e}");
-                let _ = app.emit(
-                    "audio-error",
-                    serde_json::json!({
-                        "trackId": track.id,
-                        "kind": "resolve",
-                        "message": format!("该歌曲暂时无法播放（{e}）"),
-                    }),
-                );
-            }
-        }
-    });
+    let job = LoadJob {
+        app: inner.app.clone(),
+        tx: inner.tx.clone(),
+        registry: Arc::clone(&inner.registry),
+        cache: Arc::clone(&inner.url_cache),
+        http: inner.http.clone(),
+        cache_dir: inner.cache_dir.clone(),
+        history_db: inner.db.clone(),
+        quality: inner.state.read().unwrap().quality.into_provider(),
+        track,
+        autoplay,
+        start_ms,
+        gen,
+    };
+    tauri::async_runtime::spawn(job.run());
 }
 
 async fn resolve_with_retry(
@@ -927,87 +1107,235 @@ async fn resolve_with_retry(
     }
 }
 
-fn handle_load(
-    inner: &mut EngineInner,
-    track: &Track,
-    source: &PlaySource,
-    start_at: Option<u64>,
+/// 一次「取址 → 构建解码器 → 回发引擎」的全部上下文。
+struct LoadJob {
+    app: tauri::AppHandle,
+    tx: Sender<AudioCmd>,
+    registry: Arc<ProviderRegistry>,
+    cache: Arc<PlayUrlCache>,
+    http: reqwest::blocking::Client,
+    cache_dir: PathBuf,
+    history_db: Option<Arc<Database>>,
+    quality: types::Quality,
+    track: Track,
     autoplay: bool,
-) {
-    inner.mutate(|st| {
-        st.status = PlaybackStatus::Loading;
-        st.error = None;
-        st.track_id = Some(track.id.clone());
-        st.track = Some(track.clone());
-        st.buffered_ms = 0;
-        st.position_ms = start_at.unwrap_or(0);
-        st.is_local = matches!(source, PlaySource::Local { .. });
-        st.url_fetched_at = match &source {
-            PlaySource::Online { fetchedAt, .. } => Some(*fetchedAt),
-            PlaySource::Local { .. } => None,
-        };
-    });
+    start_ms: u64,
+    gen: u64,
+}
 
-    match build_decoder(source, &inner.http, &inner.cache_dir, track) {
-        Ok((decoder, shared, duration_ms)) => {
-            inner.sink.clear();
-            inner.sink.append(decoder);
-            inner.sink.set_volume(inner.effective_volume());
-            // 恢复现场：加载后先定位到上次进度（暂停态下 try_seek 同样有效）
-            if let Some(start) = start_at.filter(|s| *s > 0) {
-                if let Err(e) = inner.sink.try_seek(Duration::from_millis(start)) {
-                    log::warn!("[queue] 恢复定位到 {start}ms 失败: {e:?}，从头播放");
+impl LoadJob {
+    async fn run(self) {
+        // 本地曲目：Track.id 即文件绝对路径，无需 Provider 取址（DESIGN §13）
+        if self.track.platform == types::SourceId::Local {
+            log::info!("[queue] local track path={}", self.track.id);
+            let path = self.track.id.clone();
+            self.build_and_dispatch(PlaySource::Local { path }, true, None).await;
+            return;
+        }
+
+        // 离线优先：这首歌若已下载完成且文件还在，直接当本地文件播放。
+        // 断网、播放地址失效都不影响，下载功能才算真正闭环（§5.3 下载 2.0）。
+        if let Some(db) = self.history_db.clone() {
+            let db_id = crate::db::store::db_track_id(&self.track);
+            let found = tauri::async_runtime::spawn_blocking(move || {
+                db.with(|c| crate::db::store::downloaded_file_for(c, &db_id))
+            })
+            .await;
+            if let Ok(Ok(Some(path))) = found {
+                if std::path::Path::new(&path).exists() {
+                    log::info!("[queue] 命中已下载文件，离线播放: {path}");
+                    self.build_and_dispatch(PlaySource::Local { path }, true, None).await;
+                    return;
+                }
+                log::warn!("[queue] 已下载文件已不存在，回落在线取址: {path}");
+            }
+        }
+
+        let resolved =
+            resolve_with_retry(&self.registry, &self.cache, &self.track, self.quality).await;
+        match resolved {
+            Ok((url, fetched_at)) => {
+                log::info!(
+                    "[queue] resolve ok track={} url_host={}",
+                    self.track.id,
+                    url.split("//").nth(1).unwrap_or("").split('/').next().unwrap_or("")
+                );
+                let play_url = url.clone();
+                let source = PlaySource::Online { url, fetchedAt: fetched_at };
+                match self.try_build(&source).await {
+                    Ok(built) => self.dispatch_ready(built, false, Some(fetched_at), Some(play_url)),
+                    Err(first_err) => {
+                        // 打开流失败最常见两种：休眠唤醒后的半死连接、缓存的
+                        // 签名 URL 已过期 —— 作废缓存重取一次再打开，仍失败才算真失败
+                        log::warn!("[queue] 打开音频流失败（{first_err}），作废缓存 URL 重取一次");
+                        let key = PlayUrlCache::cache_key(
+                            &self.track.platform.to_string(),
+                            &self.track.id,
+                            crate::quality_str(self.quality),
+                        );
+                        self.cache.invalidate(&key);
+                        match resolve_with_retry(&self.registry, &self.cache, &self.track, self.quality).await {
+                            Ok((url2, fetched_at2)) => {
+                                let source2 = PlaySource::Online { url: url2.clone(), fetchedAt: fetched_at2 };
+                                match self.try_build(&source2).await {
+                                    Ok(built2) => self.dispatch_ready(built2, false, Some(fetched_at2), Some(url2)),
+                                    Err(e2) => self.dispatch_load_failed(
+                                        "load",
+                                        &format!("打开音频流失败: {first_err}；重取后仍失败: {e2}"),
+                                    ),
+                                }
+                            }
+                            Err(e2) => self.dispatch_load_failed(
+                                "load",
+                                &format!("打开音频流失败: {first_err}；重取播放地址失败: {e2}"),
+                            ),
+                        }
+                    }
                 }
             }
-            if autoplay {
-                inner.sink.play();
-            } else {
-                inner.sink.pause();
+            Err(e) => {
+                log::error!("自动取址失败: {e}");
+                self.dispatch_load_failed("resolve", &format!("{e}"));
             }
-            inner.current_shared = shared;
+        }
+    }
 
-            inner.mutate(|st| {
-                st.status = if autoplay {
-                    PlaybackStatus::Playing
-                } else {
-                    PlaybackStatus::Paused
-                };
-                st.duration_ms = duration_ms;
-                st.position_ms = start_at.unwrap_or(0);
-            });
-            inner.tick_anchor = None;
-            emit_position_tick(inner);
-            inner.persist_state();
+    /// 在 blocking 线程池里构建解码器（HTTP open + 首包探测都是阻塞 IO）。
+    async fn try_build(&self, source: &PlaySource) -> Result<BuiltDecoder, String> {
+        let http = self.http.clone();
+        let cache_dir = self.cache_dir.clone();
+        let track = self.track.clone();
+        let source = source.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            build_decoder(&source, &http, &cache_dir, &track)
+        })
+        .await
+        .map_err(|e| format!("构建任务异常: {e}"))?
+    }
+
+    /// 构建并回发（本地/离线文件路径，不重试）。
+    async fn build_and_dispatch(
+        self,
+        source: PlaySource,
+        is_local: bool,
+        fetched_at: Option<u64>,
+    ) {
+        match self.try_build(&source).await {
+            Ok(built) => self.dispatch_ready(built, is_local, fetched_at, None),
+            Err(e) => self.dispatch_load_failed("load", &e),
         }
-        Err(e) => {
-            log::error!("load 失败: {e}");
-            inner.current_shared = None;
-            inner.mutate(|st| {
-                st.status = PlaybackStatus::Error;
-                st.error = Some(format!("该歌曲暂时无法播放（{e}）"));
-            });
-            let _ = inner.app.emit(
-                "audio-error",
-                serde_json::json!({
-                    "trackId": track.id,
-                    "kind": "load",
-                    "message": format!("该歌曲暂时无法播放（{e}）"),
-                }),
-            );
-        }
+    }
+
+    /// 回发构建好的解码器。gen 与引擎当前代次不一致时引擎侧丢弃。
+    fn dispatch_ready(
+        self,
+        built: BuiltDecoder,
+        is_local: bool,
+        fetched_at: Option<u64>,
+        play_url: Option<String>,
+    ) {
+        let (decoder, shared, duration_ms) = built;
+        let _ = self.tx.send(AudioCmd::LoadReady {
+            track: Box::new(self.track.clone()),
+            decoder,
+            shared,
+            duration_ms,
+            start_at: if self.start_ms > 0 { Some(self.start_ms) } else { None },
+            autoplay: self.autoplay,
+            is_local,
+            url_fetched_at: fetched_at,
+            play_url,
+            gen: self.gen,
+        });
+        record_play_start(self.history_db.clone(), self.track.clone());
+    }
+
+    /// 回发失败：广播 audio-error + LoadFailed，由引擎统一置错误态并决定跳过。
+    fn dispatch_load_failed(self, kind: &'static str, detail: &str) {
+        let message = format!("该歌曲暂时无法播放（{detail}）");
+        let _ = self.app.emit(
+            "audio-error",
+            serde_json::json!({
+                "trackId": self.track.id,
+                "kind": kind,
+                "message": message,
+            }),
+        );
+        let _ = self.tx.send(AudioCmd::LoadFailed {
+            track_id: self.track.id.clone(),
+            message,
+            autoplay: self.autoplay,
+            gen: self.gen,
+        });
     }
 }
 
+/// 挂载已构建好的解码器（LoadReady 到达时调用）。
+/// 网络 IO（打开流 + 首包探测）已在 blocking 线程池完成，这里只剩纯内存
+/// 操作 —— 引擎线程绝不能阻塞，否则休眠唤醒后的死连接会卡死整个控制面。
+#[allow(clippy::too_many_arguments)]
+fn mount_decoder(
+    inner: &mut EngineInner,
+    track: &Track,
+    decoder: Box<dyn Source + Send>,
+    shared: Option<Arc<RangeShared>>,
+    duration_ms: u64,
+    start_at: Option<u64>,
+    autoplay: bool,
+    is_local: bool,
+    url_fetched_at: Option<u64>,
+    play_url: Option<String>,
+) {
+    inner.failed_tracks.remove(&track.id);
+    inner.sink.clear();
+    inner.sink.append(decoder);
+    inner.sink.set_volume(inner.effective_volume());
+    // 恢复现场：加载后先定位到上次进度（暂停态下 try_seek 同样有效）
+    if let Some(start) = start_at.filter(|s| *s > 0) {
+        if let Err(e) = inner.sink.try_seek(Duration::from_millis(start)) {
+            log::warn!("[queue] 恢复定位到 {start}ms 失败: {e:?}，从头播放");
+        }
+    }
+    if autoplay {
+        inner.sink.play();
+    } else {
+        inner.sink.pause();
+    }
+    inner.current_shared = shared;
+
+    inner.mutate(|st| {
+        st.status = if autoplay {
+            PlaybackStatus::Playing
+        } else {
+            PlaybackStatus::Paused
+        };
+        st.track_id = Some(track.id.clone());
+        st.track = Some(track.clone());
+        st.duration_ms = duration_ms;
+        st.position_ms = start_at.unwrap_or(0);
+        st.error = None;
+        st.is_local = is_local;
+        st.url_fetched_at = url_fetched_at;
+        st.play_url = play_url;
+    });
+    inner.tick_anchor = None;
+    emit_position_tick(inner);
+    inner.persist_state();
+}
+
+/// 构建好的解码器三元组：(boxed source, range 共享态, 时长 ms)。
+type BuiltDecoder = (Box<dyn Source + Send>, Option<Arc<RangeShared>>, u64);
+
 /// 构建 Decoder：在线走 HttpRangeReader（磁盘缓冲 + Range 下载线程），
 /// 本地直接 File::open。返回 (boxed source, range_shared, duration_ms)。
-/// 注意：Decoder::new 探针首包可能阻塞至多 FIRST_PACKET_TIMEOUT(8s)。
-#[allow(clippy::type_complexity)]
+/// 只允许在 blocking 线程池里调用 —— HTTP open 最多阻塞一个请求超时，
+/// Decoder::build 探针首包最多再阻塞 FIRST_PACKET_TIMEOUT(8s)。
 fn build_decoder(
     source: &PlaySource,
     http: &reqwest::blocking::Client,
     cache_dir: &Path,
     track: &Track,
-) -> Result<(Box<dyn Source + Send>, Option<Arc<RangeShared>>, u64), String> {
+) -> Result<BuiltDecoder, String> {
     match source {
         PlaySource::Local { path } => {
             let file =

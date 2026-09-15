@@ -121,6 +121,7 @@ fn seq_of(data: &Value) -> i64 {
 /// - `pid` / `picUrl` 仅 `add` 且非空时上送 —— 空值不上送，
 ///   后端 `COALESCE(NULLIF(EXCLUDED.pic_url,''), qt_like_song.pic_url)` 会保留云端已有图片；
 /// - `remove` 既不带 pid 也不带 picUrl。
+///
 /// 抽成纯函数便于网络无关的单测（§11.3-6）。
 fn like_song_body(p: &LikeSongPayload<'_>) -> serde_json::Value {
     let mut body = serde_json::json!({
@@ -143,6 +144,11 @@ fn like_song_body(p: &LikeSongPayload<'_>) -> serde_json::Value {
         }
     }
     body
+}
+
+/// 离线队列用的请求体序列化（与 like_song 上送内容一字不差）。
+pub(crate) fn like_song_body_for_queue(p: &LikeSongPayload<'_>) -> String {
+    like_song_body(p).to_string()
 }
 
 pub fn now_ms() -> i64 {
@@ -185,9 +191,9 @@ fn parse_session(data: &Value) -> Result<AuthSession, String> {
 pub const PROD_BASE_URL: &str = "http://astral.canace.cn/api/v1/";
 /// 本地开发后端（本机 astral 服务，qt-uniappx services/config.local.ts API_BASE_URL_DEV 同源）
 pub const DEV_BASE_URL: &str = "http://localhost:27000/api/v1/";
-/// 当前生效的后端地址。
-/// 现在指向开发环境（localhost:27000）；**发布安装包前切回 `PROD_BASE_URL`**。
-pub const DEFAULT_BASE_URL: &str = DEV_BASE_URL;
+/// 当前生效的后端地址：生产环境。发版构建一律指向这里；
+/// 本地调试要连开发后端时临时改回 `DEV_BASE_URL`（别忘了发版前改回来）。
+pub const DEFAULT_BASE_URL: &str = PROD_BASE_URL;
 
 /// 更新 / 消息 / 统计的平台固定参数（§15.2）
 pub const UPDATE_TYPE: &str = "1103";
@@ -195,10 +201,22 @@ pub const MESSAGE_CHANNEL: &str = "pc";
 pub const STAT_UT: &str = "app-windows";
 pub const FEEDBACK_PLATFORM: &str = "windows";
 
+/// 会话被服务端否认时统一的错误文案。
+/// HTTP 401 和业务码 401 都归一成这一条，调用方（如 `cmd_astral_me`）据此
+/// 判断"确实失效"从而清掉本地会话——网络不可达是另一类错误，不能混用，
+/// 否则断网时会把用户登出。
+pub const ERR_UNAUTHORIZED: &str = "登录状态已失效，请重新登录";
+
+/// 错误串是否表示"服务端明确否认这个 token"（区别于网络不可达）
+pub fn is_auth_error(msg: &str) -> bool {
+    msg == ERR_UNAUTHORIZED
+}
+
 /// HEAD 探测用独立小函数（无 satoken 依赖，失败返回 None）
 async fn self_http_get_head(url: &str) -> Option<reqwest::Response> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
+        .pool_max_idle_per_host(0)
         .build()
         .ok()?;
     client
@@ -222,6 +240,7 @@ impl AstralClient {
         Self {
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
+                .pool_max_idle_per_host(0)
                 .build()
                 .expect("reqwest client"),
             base_url: base_url.trim_end_matches('/').to_string(),
@@ -278,9 +297,14 @@ impl AstralClient {
         let status = resp.status();
         let body: Value = resp.json().await.map_err(|e| format!("Astral 响应解析失败({status}): {e}"))?;
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err("登录状态已失效，请重新登录".to_string());
+            return Err(ERR_UNAUTHORIZED.to_string());
         }
         let code = body.get("code").and_then(Value::as_i64).unwrap_or(200);
+        // 有的后端把 token 失效放在业务码里回（HTTP 200 + code 401），
+        // 一并归一，免得调用方要认两种判据。
+        if code == 401 {
+            return Err(ERR_UNAUTHORIZED.to_string());
+        }
         if code != 0 && code != 200 {
             let msg = body
                 .get("msg")
@@ -322,20 +346,23 @@ impl AstralClient {
         Ok(session)
     }
 
-    /// 注册并登录（后端注册成功后直接返回 token）。email / code 可选，看后端是否要求邮箱验证。
+    /// 注册并登录（后端注册成功后直接返回 token）。
+    /// 后端的 QtRegisterDto 把 passwordConfirm 标了 @NotBlank，且会比对两次密码，
+    /// 所以必须原样上送；注册接口没有验证码字段，前端不再传 code。
     pub async fn register(
         &self,
         username: &str,
         password: &str,
+        password_confirm: &str,
         email: Option<&str>,
-        code: Option<&str>,
     ) -> Result<AuthSession, String> {
-        let mut body = json!({ "username": username, "password": password });
+        let mut body = json!({
+            "username": username,
+            "password": password,
+            "passwordConfirm": password_confirm,
+        });
         if let Some(e) = email.filter(|s| !s.is_empty()) {
             body["email"] = json!(e);
-        }
-        if let Some(c) = code.filter(|s| !s.is_empty()) {
-            body["code"] = json!(c);
         }
         let data = self
             .post_json("app/user/register", body, &[], false)
@@ -443,6 +470,13 @@ impl AstralClient {
         .await
     }
 
+    /// 离线队列重放：payload 是入队时序列化好的请求体，直接上送。
+    pub async fn post_like_raw(&self, path: &str, payload_json: &str) -> Result<Value, String> {
+        let body: Value = serde_json::from_str(payload_json)
+            .map_err(|e| format!("离线队列 payload 解析失败: {e}"))?;
+        self.post_json(path, body, &[], true).await
+    }
+
     /// 更新个人资料（昵称 / 头像等字段由后端约定，这里原样透传）
     pub async fn update_profile(&self, patch: Value) -> Result<Value, String> {
         self.post_json("app/user/update", patch, &[], true).await
@@ -492,17 +526,47 @@ impl AstralClient {
         url.contains("github.com/") || url.contains("githubusercontent.com/")
     }
 
-    /// 探测单个加速前缀是否可用：Range 0-0 请求 前缀+目标，2xx 视为可用。
+    /// 从加速拼接链接还原原始 GitHub 直链：
+    /// `https://ghproxy.cn/https://github.com/...` → `https://github.com/...`。
+    /// 找不到 `https://github.com/` 时原样返回（说明本来就是直链）。
+    pub fn strip_accel_prefix(url: &str) -> String {
+        match url.find("https://github.com/") {
+            Some(i) => url[i..].to_string(),
+            None => url.to_string(),
+        }
+    }
+
+    /// 加速前缀 + 目标直链的拼接。核心是保证前缀和 `https://` 之间
+    /// 恰好一个 `/`：前缀带不带尾斜杠都要出
+    /// `https://ghproxy.cn/https://github.com/...`。
+    /// 直接 `format!("{}{}", trim_end /, target)` 会把目标开头的
+    /// `https://` 压成 `https//`（曾导致所有节点探测必失败）。
+    fn join_accel_url(prefix: &str, target: &str) -> String {
+        format!("{}/{}", prefix.trim_end_matches('/'), target)
+    }
+
+    /// 探测单个加速前缀是否可用：Range 0-0 请求 前缀+目标，
+    /// 2xx 且响应体不是文本（HTML 广告页 / 封禁提示页也常回 200）。
     /// 与后端管理端探活同口径；5 秒超时。
     async fn probe_accel(prefix: &str, target: &str) -> Option<u128> {
-        let url = format!("{}{}", prefix.trim_end_matches('/'), target);
+        let url = Self::join_accel_url(prefix, target);
         let started = std::time::Instant::now();
         let resp = self_http_get_head(&url).await?;
-        if resp.status().is_success() {
-            Some(started.elapsed().as_millis())
-        } else {
-            None
+        if !resp.status().is_success() {
+            return None;
         }
+        // 垃圾节点治理：部分节点对任意路径都回 200 的 HTML 广告页 /
+        // text/plain 封禁提示（如「Suspend due to abuse report」），
+        // 只认二进制流（octet-stream / application/*）为可用
+        let ct = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if ct.starts_with("text/") {
+            return None;
+        }
+        Some(started.elapsed().as_millis())
     }
 
     /// 按 UPDATE_DESIGN.md §2.2 组装下载地址：
@@ -544,7 +608,7 @@ impl AstralClient {
         }
         match best {
             Some((prefix, latency)) => {
-                let url = format!("{}{}", prefix.trim_end_matches('/'), download_url);
+                let url = Self::join_accel_url(&prefix, download_url);
                 serde_json::json!({
                     "downloadUrl": url,
                     "accelUsed": true,
@@ -558,13 +622,25 @@ impl AstralClient {
 
     /// 下载更新包到临时目录，通过事件 `update-download-progress` 上报进度。
     /// 完成后返回落盘路径（校验由调用方做）。
+    ///
+    /// 用独立的下载专用 client：API client 有 15s 总超时（`Self::new`），
+    /// 几 MB 的安装包在慢网络下必然超 15s，超时会中断流式读取并报成
+    /// 「下载中断: error decoding response body」——下载要的是「连得上」
+    /// 而不是「限时完成」，这里只留 10s 连接超时，不限总时长。
     pub async fn download_update_file(
-        http: &reqwest::Client,
+        _http: &reqwest::Client,
         url: &str,
         app: &tauri::AppHandle,
     ) -> Result<std::path::PathBuf, String> {
         use std::io::Write;
         use tauri::Emitter;
+
+        // 专用下载 client（理由见方法注释）；参数保留以兼容现有调用方
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .pool_max_idle_per_host(0)
+            .build()
+            .map_err(|e| format!("下载客户端初始化失败: {e}"))?;
 
         let dir = std::env::temp_dir().join("lightlisten-update");
         std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
@@ -587,11 +663,19 @@ impl AstralClient {
         let mut written: u64 = 0;
         let mut last_report = 0u64;
         let mut stream = resp;
-        while let Some(chunk) = stream
-            .chunk()
-            .await
-            .map_err(|e| format!("下载中断: {e}"))?
-        {
+        while let Some(chunk) = match stream.chunk().await {
+            Ok(c) => c,
+            Err(e) => {
+                // reqwest 把超时/连接中断都包成 decoding 错误，把源错误拼上才好排查
+                use std::error::Error as _;
+                let src = e.source().map(|s| s.to_string()).unwrap_or_default();
+                return Err(if src.is_empty() {
+                    format!("下载中断: {e}")
+                } else {
+                    format!("下载中断: {e}（{src}）")
+                });
+            }
+        } {
             file.write_all(&chunk).map_err(|e| format!("写入失败: {e}"))?;
             written += chunk.len() as u64;
             let percent = if total > 0 {
@@ -685,6 +769,8 @@ impl AstralClient {
                 obj.insert("ut".to_string(), Value::String(STAT_UT.to_string()));
             }
         }
+        // App 端上报走 AppStatController：/api/v1/app/stat/report（旧 /api/v1/stat/report
+        // 已废弃，见该控制器注释）。base_url 已含 /api/v1/，拼相对路径 app/stat/report
         self.post_json("app/stat/report", serde_json::json!({ "events": events }), &[], false)
             .await
             .map(|_| ())
@@ -754,16 +840,13 @@ pub fn version_name() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// versionCode = major*10000 + minor*100 + patch（§15.7），0.1.0 → 100
+/// versionCode：发版时手动维护的整数（与移动端 manifest.json 的 versionCode 同一约定），
+/// 必须和后端 qt_app_update 表里对应版本的记录一致——更新检查就是拿它比大小。
+/// 1.0.0 → 100；1.0.1 → 101；1.0.2 → 102；下次发版记得同步 +1。
+pub const VERSION_CODE: i64 = 102;
+
 pub fn version_code() -> i64 {
-    let parts: Vec<i64> = version_name()
-        .split('.')
-        .filter_map(|p| p.parse().ok())
-        .collect();
-    match parts.as_slice() {
-        [major, minor, patch] => major * 10000 + minor * 100 + patch,
-        _ => 0,
-    }
+    VERSION_CODE
 }
 
 #[cfg(test)]
@@ -771,16 +854,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn version_code_follows_design_rule() {
-        // 版本号以 Cargo.toml 为单一真值（§15.7）：当前 0.1.2 → 102
-        let expected = version_name()
-            .split('.')
-            .filter_map(|p| p.parse::<i64>().ok())
-            .collect::<Vec<_>>();
-        if let [major, minor, patch] = expected.as_slice() {
-            assert_eq!(version_code(), major * 10000 + minor * 100 + patch);
-        }
+    fn version_code_is_the_manual_release_constant() {
+        // versionCode 不再从版本号推导（旧公式 1.0.0 会算出 10000），
+        // 而是与后端 qt_app_update 记录对齐的手动常量：1.0.0 → 100，1.0.1 → 101，1.0.2 → 102
+        assert_eq!(VERSION_CODE, 102);
+        assert_eq!(version_code(), VERSION_CODE);
         assert_eq!(version_name(), env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn strip_accel_prefix_recovers_original_github_url() {
+        // 加速拼接链接还原直链（下载失败降级用）
+        let accel = "https://ghproxy.cn/https://github.com/barry130/x/releases/download/v1/L.exe";
+        assert_eq!(
+            AstralClient::strip_accel_prefix(accel),
+            "https://github.com/barry130/x/releases/download/v1/L.exe"
+        );
+        // 直链原样返回
+        let direct = "https://github.com/barry130/x/releases/download/v1/L.exe";
+        assert_eq!(AstralClient::strip_accel_prefix(direct), direct);
+        // 非 GitHub 链接（后端自托管等）原样返回
+        let other = "https://astral.canace.cn/files/L.exe";
+        assert_eq!(AstralClient::strip_accel_prefix(other), other);
+    }
+
+    #[test]
+    fn join_accel_url_keeps_exactly_one_slash() {
+        // 前缀带/不带尾斜杠，拼出的都是「前缀/https://目标」，
+        // 目标开头的 https:// 必须原样保留（历史 bug：拼成 https// 后探测全挂）
+        assert_eq!(
+            AstralClient::join_accel_url("https://ghproxy.cn/", "https://github.com/a/b.exe"),
+            "https://ghproxy.cn/https://github.com/a/b.exe"
+        );
+        assert_eq!(
+            AstralClient::join_accel_url("https://ghproxy.cn", "https://github.com/a/b.exe"),
+            "https://ghproxy.cn/https://github.com/a/b.exe"
+        );
     }
 
     #[test]
@@ -884,6 +993,16 @@ mod tests {
     #[test]
     fn parse_session_rejects_missing_token() {
         assert!(parse_session(&serde_json::json!({ "msg": "ok" })).is_err());
+    }
+
+    #[test]
+    fn auth_error_predicate_only_matches_server_denial() {
+        assert!(is_auth_error(ERR_UNAUTHORIZED));
+        // 网络不可达不能算"会话失效"，否则断网就会把用户登出
+        assert!(!is_auth_error(
+            "Astral 请求失败: error sending request for url (http://localhost:27000/api/v1/app/user/me)"
+        ));
+        assert!(!is_auth_error("Astral 业务错误(500): 服务器开小差"));
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! 桌面歌词窗口管理（DESIGN §4.2 / §10）：
 //! - 首次开启时动态创建（不进 tauri.conf.json），透明 + 置顶 + 不进任务栏
 //! - 状态存 settings 表 "lyric.window" 键（§10 位置与样式不与主窗口混存）
-//! - 锁定 = 鼠标穿透（set_ignore_cursor_events），解锁只能托盘/快捷键/主窗口
+//! - 锁定 = 禁止拖动 + 鼠标穿透（set_ignore_cursor_events）：锁定时窗口对
+//!   鼠标完全透明，解锁走主窗口 / 托盘 / Ctrl+Alt+K
 //! - 恢复位置前校验落点在某个显示器可见区域内（§4.2 注意 4）
 
 use serde::{Deserialize, Serialize};
@@ -16,24 +17,48 @@ use crate::AppState;
 pub const LYRIC_WINDOW_LABEL: &str = "lyrics";
 
 /// 桌面歌词窗口状态（§4.2 配置结构；存 settings 表 lyric.window 键）。
-/// 手写 Default + serde(default)：旧存档缺字段时自动回落 §4.2 默认值。
+/// 手写 Default + serde(default)：旧存档缺字段时自动回落 §4.2 默认值
+/// （旧存档里多余的 click_through 字段会被 serde 直接忽略）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct LyricWindowState {
     pub visible: bool,
+    /// 锁定 = 禁止拖动 + 鼠标穿透（锁定时窗口对鼠标透明，
+    /// 解锁走主窗口 / 托盘 / Ctrl+Alt+K）
     pub locked: bool,
     pub x: i32,
     pub y: i32,
     pub width: u32,
     pub height: u32,
+    /// 置顶开关（总在最前 / 不置顶）
+    pub always_on_top: bool,
+    /// 字体家族，空串 = 跟随系统默认
+    pub font_family: String,
     pub font_size: u32,
     pub font_weight: u32,
-    pub opacity: f64,
-    pub background_opacity: f64,
-    pub stroke: bool,
-    pub shadow: bool,
+    /// 字间距（px）
+    pub letter_spacing: f64,
+    /// 行间距（倍数，1.0–2.5）
+    pub line_gap: f64,
+    /// 当前行高亮渐变色（两端）
     pub gradient: [String; 2],
-    /// single / two-lines
+    /// 非当前行文字颜色（css 颜色串）
+    pub inactive_color: String,
+    pub opacity: f64,
+    pub stroke: bool,
+    /// 描边宽度（px），stroke 为 false 时忽略
+    pub stroke_width: f64,
+    pub shadow: bool,
+    /// none / mask（半透明蒙版）/ solid（纯色）
+    pub background_mode: String,
+    /// 纯色模式的背景色（css 颜色串）
+    pub background_color: String,
+    pub background_opacity: f64,
+    /// 窗口圆角（px，0 = 直角）
+    pub border_radius: u32,
+    /// left / center / right
+    pub align: String,
+    /// single / two-lines / three-lines
     pub line_mode: String,
 }
 
@@ -45,29 +70,45 @@ impl Default for LyricWindowState {
             x: 120,
             y: 940,
             width: 900,
-            height: 140,
+            // 180 = 顶部工具条占位(44) + 三行歌词（当前行 24px 行距 1.35）的舒适高度
+            height: 180,
+            always_on_top: true,
+            font_family: String::new(),
             font_size: 24,
             font_weight: 700,
-            opacity: 0.9,
-            background_opacity: 0.0,
-            stroke: false,
-            shadow: true,
+            letter_spacing: 0.0,
+            line_gap: 1.35,
             gradient: ["#5b8cff".to_string(), "#b18cff".to_string()],
+            inactive_color: "rgba(255,255,255,0.65)".to_string(),
+            opacity: 0.9,
+            stroke: false,
+            stroke_width: 1.0,
+            shadow: true,
+            background_mode: "none".to_string(),
+            background_color: "#000000".to_string(),
+            background_opacity: 0.0,
+            border_radius: 12,
+            align: "center".to_string(),
             line_mode: "two-lines".to_string(),
         }
     }
 }
 
-/// 从 settings 表读状态；无存档 / 解析失败返回默认
+/// 从 settings 表读状态；无存档 / 解析失败返回默认。
+/// 旧存档高度 140 是「工具条独立占位」改版前的默认值，装不下三行 + 工具条，升级到 180。
 fn load_state(db: Option<&Database>) -> LyricWindowState {
     let Some(db) = db else {
         return LyricWindowState::default();
     };
     let saved = db.with(|c| get_setting(c, "lyric.window"));
-    match saved {
-        Ok(Some(json)) => serde_json::from_str(&json).unwrap_or_default(),
+    let mut state = match saved {
+        Ok(Some(json)) => serde_json::from_str::<LyricWindowState>(&json).unwrap_or_default(),
         _ => LyricWindowState::default(),
+    };
+    if state.height == 140 {
+        state.height = 180;
     }
+    state
 }
 
 fn save_state(db: Option<&Database>, state: &LyricWindowState) {
@@ -135,6 +176,8 @@ pub fn show(app: &AppHandle) -> Result<LyricWindowState, String> {
     let win = build_window(app, &state).map_err(|e| format!("歌词窗口创建失败: {e}"))?;
     let _ = win.set_position(PhysicalPosition::new(state.x, state.y));
     let _ = win.set_size(PhysicalSize::new(state.width, state.height));
+    let _ = win.set_always_on_top(state.always_on_top);
+    // 锁定即穿透：窗口恢复显示时按锁定态应用鼠标穿透
     let _ = win.set_ignore_cursor_events(state.locked);
     let _ = win.show();
     state.visible = true;
@@ -175,7 +218,8 @@ pub fn toggle(app: &AppHandle) {
     }
 }
 
-/// 锁定 / 解锁（§10.7 Ctrl+Alt+K；锁定 = 鼠标穿透）
+/// 锁定 / 解锁（§10.7 Ctrl+Alt+K）。锁定 = 禁止拖动 + 鼠标穿透
+///（锁定时整个窗口对鼠标透明，解锁从这里回不来，要走主窗口/托盘/快捷键）。
 pub fn set_locked(app: &AppHandle, locked: bool) -> Result<LyricWindowState, String> {
     let state_guard = app.try_state::<AppState>();
     let db = state_guard.as_ref().and_then(|s| s.db.clone());
@@ -189,17 +233,44 @@ pub fn set_locked(app: &AppHandle, locked: bool) -> Result<LyricWindowState, Str
     Ok(state)
 }
 
-/// 样式补丁（字号 / 描边 / 单双行 / 渐变等，字段级合并）
+/// css 颜色串基本校验：#hex / rgb()/rgba()/hsl() / 具名色，长度封顶
+fn valid_color(v: &str) -> bool {
+    let v = v.trim();
+    !v.is_empty() && v.len() <= 64 && (v.starts_with('#') || v.contains('(') || v.chars().all(|c| c.is_ascii_alphanumeric()))
+}
+
+/// 样式补丁（字段级合并；置顶即时应用到窗口；穿透跟随锁定，不再单独设）
 pub fn set_style(app: &AppHandle, patch: Value) -> Result<LyricWindowState, String> {
     let state_guard = app.try_state::<AppState>();
     let db = state_guard.as_ref().and_then(|s| s.db.clone());
     let mut state = load_state(db.as_deref());
+    let mut apply_always_on_top: Option<bool> = None;
     if let Some(obj) = patch.as_object() {
         if let Some(v) = obj.get("fontSize").and_then(Value::as_u64) {
             state.font_size = v.clamp(12, 96) as u32;
         }
         if let Some(v) = obj.get("fontWeight").and_then(Value::as_u64) {
             state.font_weight = v.clamp(300, 900) as u32;
+        }
+        if let Some(v) = obj.get("fontFamily").and_then(Value::as_str) {
+            let name = v.trim();
+            if name.chars().count() <= 64 {
+                state.font_family = name.to_string();
+            }
+        }
+        if let Some(v) = obj.get("letterSpacing").and_then(Value::as_f64) {
+            state.letter_spacing = v.clamp(0.0, 20.0);
+        }
+        if let Some(v) = obj.get("lineGap").and_then(Value::as_f64) {
+            state.line_gap = v.clamp(1.0, 2.5);
+        }
+        if let Some(v) = obj.get("inactiveColor").and_then(Value::as_str) {
+            if valid_color(v) {
+                state.inactive_color = v.trim().to_string();
+            }
+        }
+        if let Some(v) = obj.get("strokeWidth").and_then(Value::as_f64) {
+            state.stroke_width = v.clamp(0.5, 4.0);
         }
         if let Some(v) = obj.get("opacity").and_then(Value::as_f64) {
             state.opacity = v.clamp(0.2, 1.0);
@@ -213,8 +284,30 @@ pub fn set_style(app: &AppHandle, patch: Value) -> Result<LyricWindowState, Stri
         if let Some(v) = obj.get("shadow").and_then(Value::as_bool) {
             state.shadow = v;
         }
+        if let Some(v) = obj.get("alwaysOnTop").and_then(Value::as_bool) {
+            state.always_on_top = v;
+            apply_always_on_top = Some(v);
+        }
+        if let Some(v) = obj.get("backgroundMode").and_then(Value::as_str) {
+            if matches!(v, "none" | "mask" | "solid") {
+                state.background_mode = v.to_string();
+            }
+        }
+        if let Some(v) = obj.get("backgroundColor").and_then(Value::as_str) {
+            if valid_color(v) {
+                state.background_color = v.trim().to_string();
+            }
+        }
+        if let Some(v) = obj.get("borderRadius").and_then(Value::as_u64) {
+            state.border_radius = v.clamp(0, 40) as u32;
+        }
+        if let Some(v) = obj.get("align").and_then(Value::as_str) {
+            if matches!(v, "left" | "center" | "right") {
+                state.align = v.to_string();
+            }
+        }
         if let Some(v) = obj.get("lineMode").and_then(Value::as_str) {
-            if v == "single" || v == "two-lines" {
+            if matches!(v, "single" | "two-lines" | "three-lines") {
                 state.line_mode = v.to_string();
             }
         }
@@ -224,9 +317,14 @@ pub fn set_style(app: &AppHandle, patch: Value) -> Result<LyricWindowState, Stri
                 .filter_map(Value::as_str)
                 .map(String::from)
                 .collect();
-            if colors.len() == 2 {
+            if colors.len() == 2 && valid_color(&colors[0]) && valid_color(&colors[1]) {
                 state.gradient = [colors[0].clone(), colors[1].clone()];
             }
+        }
+    }
+    if let Some(win) = app.get_webview_window(LYRIC_WINDOW_LABEL) {
+        if let Some(v) = apply_always_on_top {
+            let _ = win.set_always_on_top(v);
         }
     }
     save_state(db.as_deref(), &state);
@@ -251,27 +349,66 @@ pub fn set_bounds(
     state.x = x;
     state.y = y;
     state.width = width.clamp(300, 4000);
-    state.height = height.clamp(60, 600);
+    // 最小 100：再小连单行 + 工具条占位都放不下
+    state.height = height.clamp(100, 600);
     save_state(db.as_deref(), &state);
     emit_state(app, &state);
     Ok(state)
 }
 
+/// 一键复位歌词位置：保留样式，把窗口放回主屏底部居中（拖丢时找回）
 pub fn reset(app: &AppHandle) -> Result<LyricWindowState, String> {
     let state_guard = app.try_state::<AppState>();
     let db = state_guard.as_ref().and_then(|s| s.db.clone());
-    let visible = load_state(db.as_deref()).visible;
-    let state = LyricWindowState {
-        visible,
-        ..LyricWindowState::default()
-    };
+    let mut state = load_state(db.as_deref());
+    if let Ok(Some(primary)) = app.primary_monitor() {
+        let PhysicalSize { width, height } = *primary.size();
+        state.x = ((width as i32) - state.width as i32) / 2;
+        state.y = (height as i32) - state.height as i32 - 120;
+    }
+    if let Some(win) = app.get_webview_window(LYRIC_WINDOW_LABEL) {
+        let _ = win.set_position(PhysicalPosition::new(state.x, state.y));
+        let _ = win.set_size(PhysicalSize::new(state.width, state.height));
+    }
     save_state(db.as_deref(), &state);
     emit_state(app, &state);
     Ok(state)
+}
+
+/// 从歌词窗口工具条打开主窗口的「设置 · 桌面歌词」页：
+/// 唤起主窗口并发事件，由主窗口前端负责导航
+pub fn open_main_settings(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window("main") {
+        let _ = win.show();
+        let _ = win.unminimize();
+        let _ = win.set_focus();
+    }
+    let _ = app.emit_to("main", "lyric-open-settings", ());
 }
 
 pub fn get_state(app: &AppHandle) -> LyricWindowState {
     let state_guard = app.try_state::<AppState>();
     let db = state_guard.as_ref().and_then(|s| s.db.clone());
     load_state(db.as_deref())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_color;
+
+    #[test]
+    fn valid_color_accepts_css_colors() {
+        assert!(valid_color("#5b8cff"));
+        assert!(valid_color("rgba(255,255,255,0.65)"));
+        assert!(valid_color("rgb(0 0 0)"));
+        assert!(valid_color("white"));
+    }
+
+    #[test]
+    fn valid_color_rejects_garbage() {
+        assert!(!valid_color(""));
+        assert!(!valid_color("   "));
+        // 超长串（可能是粘贴进来的非法负载）拒收
+        assert!(!valid_color(&"x".repeat(65)));
+    }
 }

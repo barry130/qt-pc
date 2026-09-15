@@ -37,13 +37,17 @@ export interface DownloadTask {
   id: string;
   track: Track;
   quality: Quality;
-  /** pending / downloading / done / failed */
-  status: "pending" | "downloading" | "done" | "failed";
+  /** pending / downloading / paused / done / failed / canceled */
+  status: "pending" | "downloading" | "paused" | "done" | "failed" | "canceled";
   /** 0 ~ 1 */
   progress: number;
   filePath: string | null;
   fileSize: number | null;
   error: string | null;
+  /** 断点续传的临时文件路径（`.part`） */
+  partPath?: string | null;
+  /** 服务端声明的总字节数（写完后校验用） */
+  totalBytes?: number | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -195,6 +199,8 @@ export interface PlaybackState {
   queueLen: number;
   isLocal: boolean;
   urlFetchedAt: number | null;
+  /** 当前实际播放地址（在线曲目才有）。换源兜底后指向目标源，歌词按它换源取词 */
+  playUrl: string | null;
   error: string | null;
   sleepTimerMs: number | null;
   /** 当前曲目（Rust 侧冗余携带，前端渲染播放条直接用） */
@@ -294,30 +300,61 @@ export interface AppVersion {
 /** 桌面歌词窗口状态（对齐 Rust LyricWindowState，§4.2） */
 export interface DesktopLyricState {
   visible: boolean;
+  /** 锁定 = 禁止拖动 + 鼠标穿透（锁定时窗口对鼠标透明，解锁走主窗口/托盘/快捷键） */
   locked: boolean;
   x: number;
   y: number;
   width: number;
   height: number;
+  /** 总在最前 */
+  alwaysOnTop: boolean;
+  /** 字体家族，空串 = 系统默认 */
+  fontFamily: string;
   fontSize: number;
   fontWeight: number;
-  opacity: number;
-  backgroundOpacity: number;
-  stroke: boolean;
-  shadow: boolean;
+  /** 字间距（px） */
+  letterSpacing: number;
+  /** 行间距（倍数） */
+  lineGap: number;
+  /** 当前行高亮渐变（两端色） */
   gradient: [string, string];
-  /** single / two-lines */
-  lineMode: "single" | "two-lines";
+  /** 非当前行文字颜色（css 颜色串） */
+  inactiveColor: string;
+  opacity: number;
+  stroke: boolean;
+  /** 描边宽度（px） */
+  strokeWidth: number;
+  shadow: boolean;
+  /** none / mask（半透明蒙版）/ solid（纯色） */
+  backgroundMode: "none" | "mask" | "solid";
+  backgroundColor: string;
+  backgroundOpacity: number;
+  /** 窗口圆角（px） */
+  borderRadius: number;
+  /** left / center / right */
+  align: "left" | "center" | "right";
+  /** single / two-lines / three-lines */
+  lineMode: "single" | "two-lines" | "three-lines";
 }
 
 /** 桌面歌词样式补丁（字段级合并，Rust 侧逐字段校验夹紧） */
 export interface DesktopLyricStylePatch {
   fontSize?: number;
   fontWeight?: number;
+  fontFamily?: string;
+  letterSpacing?: number;
+  lineGap?: number;
   opacity?: number;
   backgroundOpacity?: number;
   stroke?: boolean;
+  strokeWidth?: number;
   shadow?: boolean;
-  lineMode?: "single" | "two-lines";
+  alwaysOnTop?: boolean;
+  backgroundMode?: "none" | "mask" | "solid";
+  backgroundColor?: string;
+  borderRadius?: number;
+  align?: "left" | "center" | "right";
+  lineMode?: "single" | "two-lines" | "three-lines";
   gradient?: [string, string];
+  inactiveColor?: string;
 }

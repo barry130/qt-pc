@@ -1,6 +1,7 @@
 //! 全局快捷键（DESIGN §14.2）。
 //! 默认值：播放/暂停 Ctrl+Alt+P、上一首 Ctrl+Alt+Left、下一首 Ctrl+Alt+Right、
-//! 音量加 Ctrl+Alt+Up、音量减 Ctrl+Alt+Down、静音 Ctrl+Alt+M、桌面歌词 Ctrl+Alt+L。
+//! 音量加 Ctrl+Alt+Up、音量减 Ctrl+Alt+Down、静音 Ctrl+Alt+M、桌面歌词 Ctrl+Alt+L、
+//! 锁定/解锁桌面歌词 Ctrl+Alt+K。
 //! 搜索 Ctrl+F 不注册全局（应用内焦点由前端处理，见修订约束）。
 //!
 //! 自定义值存 settings 表 "shortcuts" 键：`{ 动作ID: { key: 加速键, enabled: bool } }`。
@@ -41,6 +42,8 @@ pub fn default_shortcuts() -> Vec<(MediaAction, &'static str)> {
         (MediaAction::VolumeDown, "Ctrl+Alt+Down"),
         (MediaAction::Mute, "Ctrl+Alt+M"),
         (MediaAction::DesktopLyric, "Ctrl+Alt+L"),
+        // 锁定后不能拖动、工具条也隐藏，必须有键盘入口才能解锁（§10.7）
+        (MediaAction::LockLyric, "Ctrl+Alt+K"),
     ]
 }
 
@@ -128,7 +131,7 @@ mod tests {
     #[test]
     fn defaults_cover_all_actions_and_exclude_ctrl_f() {
         let defaults = default_shortcuts();
-        assert_eq!(defaults.len(), 7, "§14.2 默认表 7 项（搜索 Ctrl+F 不注册全局）");
+        assert_eq!(defaults.len(), 8, "§14.2 默认表 8 项（搜索 Ctrl+F 不注册全局）");
         for (_, accel) in &defaults {
             assert!(!accel.contains('F'), "不得注册 Ctrl+F: {accel}");
         }

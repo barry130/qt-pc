@@ -187,6 +187,7 @@ fn handle_mv(request: Request<Vec<u8>>, url: &str) -> Response<Vec<u8>> {
         // 视频分块较大；连接/响应 20s 足够，避免假死占线程
         .timeout(std::time::Duration::from_secs(60))
         .connect_timeout(std::time::Duration::from_secs(10))
+        .pool_max_idle_per_host(0)
         .build()
     {
         Ok(c) => c,
@@ -272,6 +273,7 @@ fn handle_cover(original_url: String) -> Response<Vec<u8>> {
     let client = match reqwest::blocking::Client::builder()
         .user_agent("Mozilla/5.0")
         .timeout(std::time::Duration::from_secs(10))
+        .pool_max_idle_per_host(0)
         .build()
     {
         Ok(c) => c,

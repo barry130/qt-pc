@@ -38,6 +38,7 @@ function playingSnapshot(positionMs: number): PlaybackState {
     queueLen: 1,
     isLocal: false,
     urlFetchedAt: null,
+    playUrl: null,
     error: null,
     sleepTimerMs: null,
     track,

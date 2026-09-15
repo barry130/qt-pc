@@ -77,6 +77,7 @@ const initialSnapshot: PlaybackState = {
   queueLen: 0,
   isLocal: false,
   urlFetchedAt: null,
+  playUrl: null,
   error: null,
   sleepTimerMs: null,
   track: null,
@@ -99,6 +100,17 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
     // 但测试 mock / 异常负载缺字段时不能把 store 打残
     const incoming = { ...initialSnapshot, ...s };
     const cur = get().state;
+    // 本地曲目封面由前端在线匹配后写回（useLocalTrackOnlineMeta）：同一曲目的后续
+    // 快照 picUrl 仍为空，这里保留已补全的值，避免暂停 / 继续时封面闪一下。
+    if (
+      incoming.track &&
+      cur?.track &&
+      incoming.track.id === cur.track.id &&
+      !incoming.track.picUrl &&
+      cur.track.picUrl
+    ) {
+      incoming.track = { ...incoming.track, picUrl: cur.track.picUrl };
+    }
     // 降级保护：当前已有曲目、来的快照却没带（极端竞态/异常负载）→
     // 忽略这次快照。真有切歌引擎随后会推带曲目的事件，
     // 而一个"空快照"会把播放条打回「未在播放」而音频其实在响。

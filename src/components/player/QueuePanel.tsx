@@ -1,16 +1,18 @@
-import { useEffect, useRef } from "react";
-import { ListMusic, Trash2, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { GripVertical, ListMusic, Trash2, X } from "lucide-react";
 import * as ipc from "@/services/ipc";
 import { usePlayerStore } from "@/stores/player";
 import { qtresCoverUrl, formatTime } from "@/lib/lrc";
 import { cn } from "@/lib/utils";
+import { LocalCover } from "@/components/library/LocalCover";
 
 /**
- * 播放队列面板（DESIGN §5.5 QueueButton / §11.5）。
+ * 播放队列面板（DESIGN §5.5 QueueButton / §11.5 队列 2.0）。
  *
- * 这是挂在 AppShell 主区右侧的**布局级面板**（不再是播放条内的绝对定位浮层），
- * 所以高度撑满内容区、宽度固定 320px，主内容区会相应收缩。
- * 当前曲高亮，点击行 play_at 跳曲。
+ * 挂在 AppShell 主区右侧的布局级面板：高度撑满内容区、宽度固定 320px，
+ * 主内容区相应收缩。当前曲高亮，点击行 play_at 跳曲。
+ *
+ * 队列 2.0 新增：单曲移除、拖动排序、下一首播放、清空后续。
  */
 export function QueuePanel(): React.JSX.Element | null {
   const queue = usePlayerStore((s) => s.queue);
@@ -24,8 +26,12 @@ export function QueuePanel(): React.JSX.Element | null {
   // 或播的是没走队列的曲子）按当前曲目 id 在队列里回退查找，保证高亮与定位都能命中
   const fallbackIndex = queue.findIndex((t) => t.id === currentTrackId);
   const activeIndex = queueIndex ?? (fallbackIndex >= 0 ? fallbackIndex : null);
-  const currentRef = useRef<HTMLButtonElement | null>(null);
+  const currentRef = useRef<HTMLDivElement | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
+
+  // 拖动排序：dragIndex 为被拖的行，overIndex 为当前悬停的行
+  const [dragIndex, setDragIndex] = useState<number | null>(null);
+  const [overIndex, setOverIndex] = useState<number | null>(null);
 
   // 打开面板时把当前曲目滚到列表可视区中央（队列长的时候不定位就得手动翻找）。
   // 这里直接算 scrollTop，而不用 scrollIntoView —— 后者会连带滚动所有可滚动祖先，
@@ -59,6 +65,14 @@ export function QueuePanel(): React.JSX.Element | null {
 
   if (!open) return null;
 
+  const dropAt = (to: number): void => {
+    if (dragIndex !== null && to >= 0 && to < queue.length && dragIndex !== to) {
+      void ipc.queueMove(dragIndex, to);
+    }
+    setDragIndex(null);
+    setOverIndex(null);
+  };
+
   return (
     <aside className="flex h-full w-[320px] shrink-0 flex-col border-l border-border bg-card/60 backdrop-blur-sm">
       <div className="flex h-11 shrink-0 items-center justify-between border-b border-border px-3">
@@ -67,10 +81,22 @@ export function QueuePanel(): React.JSX.Element | null {
           播放队列（{queue.length}）
         </div>
         <div className="flex items-center gap-1">
+          {activeIndex !== null && activeIndex < queue.length - 1 && (
+            <button
+              type="button"
+              aria-label="清空后续"
+              title="清空后续"
+              onClick={() => void ipc.queueClearAfter()}
+              className="rounded px-1.5 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+            >
+              清空后续
+            </button>
+          )}
           {queue.length > 0 && (
             <button
               type="button"
               aria-label="清空队列"
+              title="清空队列"
               onClick={() => void ipc.clearQueue()}
               className="rounded p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
             >
@@ -94,24 +120,57 @@ export function QueuePanel(): React.JSX.Element | null {
           </p>
         ) : (
           queue.map((t, i) => (
-            <button
-              type="button"
+            <div
               key={`${t.id}-${i}`}
               ref={i === activeIndex ? currentRef : null}
+              role="button"
+              tabIndex={0}
+              draggable
+              onDragStart={() => setDragIndex(i)}
+              onDragEnd={() => {
+                setDragIndex(null);
+                setOverIndex(null);
+              }}
+              onDragOver={(e) => {
+                e.preventDefault();
+                if (overIndex !== i) setOverIndex(i);
+              }}
+              onDrop={(e) => {
+                e.preventDefault();
+                dropAt(i);
+              }}
               onClick={() => void playAt(i)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  void playAt(i);
+                }
+              }}
               className={cn(
-                "flex w-full items-center gap-2 px-3 py-2 text-left transition-colors hover:bg-secondary",
+                "group flex w-full cursor-pointer items-center gap-2 px-2 py-2 text-left transition-colors hover:bg-secondary",
                 i === activeIndex && "bg-secondary/60",
+                dragIndex === i && "opacity-50",
+                overIndex === i && dragIndex !== null && dragIndex !== i
+                  ? "border-t-2 border-primary"
+                  : "border-t-2 border-transparent",
               )}
             >
+              <GripVertical
+                className="h-3.5 w-3.5 shrink-0 cursor-grab text-muted-foreground/40"
+                aria-hidden
+              />
               <div className="h-8 w-8 shrink-0 overflow-hidden rounded bg-secondary">
-                {qtresCoverUrl(t.picUrl) && (
-                  <img
-                    src={qtresCoverUrl(t.picUrl) as string}
-                    alt=""
-                    className="h-full w-full object-cover"
-                    loading="lazy"
-                  />
+                {t.platform === "local" ? (
+                  <LocalCover path={t.id} className="h-full w-full object-cover" />
+                ) : (
+                  qtresCoverUrl(t.picUrl) && (
+                    <img
+                      src={qtresCoverUrl(t.picUrl) as string}
+                      alt=""
+                      className="h-full w-full object-cover"
+                      loading="lazy"
+                    />
+                  )
                 )}
               </div>
               <div className="min-w-0 flex-1">
@@ -132,7 +191,36 @@ export function QueuePanel(): React.JSX.Element | null {
                   {formatTime(t.duration * 1000)}
                 </span>
               )}
-            </button>
+              {/* 行内操作：悬停才出现，避免平时干扰阅读 */}
+              <div className="flex shrink-0 items-center opacity-0 transition-opacity group-hover:opacity-100">
+                <button
+                  type="button"
+                  title="下一首播放"
+                  aria-label="下一首播放"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    const target =
+                      activeIndex === null ? 0 : Math.min(activeIndex + 1, queue.length - 1);
+                    void ipc.queueMove(i, target);
+                  }}
+                  className="rounded px-1 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-background hover:text-foreground"
+                >
+                  下一首
+                </button>
+                <button
+                  type="button"
+                  title="从队列移除"
+                  aria-label="从队列移除"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void ipc.queueRemoveAt(i);
+                  }}
+                  className="rounded p-1 text-muted-foreground transition-colors hover:bg-background hover:text-destructive"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            </div>
           ))
         )}
       </div>

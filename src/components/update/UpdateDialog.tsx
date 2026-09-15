@@ -57,7 +57,7 @@ export function UpdateDialog(): React.JSX.Element | null {
         info.fileSize || undefined,
       );
       setPercent(100);
-      // 3) 启动安装器（用户点完成时退出应用走安装）
+      // 3) 启动安装器（带 /UPDATE 就地覆盖），随后应用自动退出交给安装器
       await ipc.runUpdateInstaller(path);
       setPhase("done");
     } catch (err) {
@@ -108,7 +108,7 @@ export function UpdateDialog(): React.JSX.Element | null {
         )}
         {phase === "done" && (
           <p className="mt-4 text-sm text-[var(--primary)]">
-            安装器已启动，关闭本应用后按安装向导完成升级。
+            安装器已启动，应用即将自动退出并就地覆盖安装，无需手动卸载。
           </p>
         )}
         {error && <p className="mt-3 text-xs text-destructive">{error}</p>}

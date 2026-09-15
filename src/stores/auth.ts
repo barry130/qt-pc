@@ -22,8 +22,8 @@ interface AuthStore {
   register: (
     username: string,
     password: string,
+    passwordConfirm: string,
     email?: string,
-    code?: string,
   ) => Promise<void>;
   logout: () => Promise<void>;
 }
@@ -55,6 +55,9 @@ export const LIKE_SEQ_KEY = "like.sync.seq";
 /** 是否已做过全量导入。和游标分开记，见 pullLikes 里的说明 */
 export const LIKE_IMPORTED_KEY = "like.imported";
 
+/** 本地收藏的账号归属标记（user.id）。退出不清除，供换号登录时检测 */
+export const LIKE_OWNER_KEY = "like.sync.owner";
+
 const LIKE_PAGE_SIZE = 200;
 
 /**
@@ -78,45 +81,104 @@ export async function pullLikes(): Promise<void> {
   }
 
   const raw = await ipc.getSetting("like.sync.seq").catch(() => null);
-  const since = Number(raw ?? 0);
-  const result = await ipc.likePull(Number.isFinite(since) ? since : 0);
-  // 增量接口的字段可能带 null（album/hash/pid…），直接透传会让 Rust 反序列化整条失败
-  // （invalid type: null, expected a string），所以这里和全量一样先归一。
-  const changes = Array.isArray(result?.changes)
-    ? (result.changes as unknown as RawLike[]).map((c) =>
-        toChange(c?.type === "playlist" ? "playlist" : "song", c ?? {}),
-      )
-    : [];
-  if (changes.length > 0) {
-    await ipc.likeApply(changes);
-  }
-  if (typeof result?.maxSeq === "number" && result.maxSeq > since) {
-    await ipc.setSetting("like.sync.seq", String(result.maxSeq)).catch(
-      () => {},
-    );
+  let since = Number(raw ?? 0);
+  // 循环拉到没有新变更为止（对齐 uniappx pullChanges）：
+  // 后端单页 500 条上限，之前只拉一次就把游标推到 maxSeq，
+  // 第 501 条之后的变更（如删大歌单时同 seq 级联软删的全部成员行）永久丢失
+  for (let round = 0; round < 50; round++) {
+    const result = await ipc.likePull(Number.isFinite(since) ? since : 0);
+    // 增量接口的字段可能带 null（album/hash/pid…），直接透传会让 Rust 反序列化整条失败
+    // （invalid type: null, expected a string），所以这里和全量一样先归一。
+    const changes = Array.isArray(result?.changes)
+      ? (result.changes as unknown as RawLike[]).map((c) =>
+          toChange(c?.type === "playlist" ? "playlist" : "song", c ?? {}),
+        )
+      : [];
+    // 服务器 maxSeq 比本地游标还小：云端整库重建过（seq 从 1 重计），
+    // 旧游标已失效。对齐到新库 maxSeq，缺失数据交给启动对账补推，
+    // 不能再把旧游标写回去（否则永远追不上新库）
+    const maxSeq = typeof result?.maxSeq === "number" ? result.maxSeq : since;
+    if (maxSeq < since) {
+      await ipc.setSetting("like.sync.seq", String(maxSeq)).catch(() => {});
+      return;
+    }
+    if (changes.length > 0) {
+      await ipc.likeApply(changes);
+    }
+    if (maxSeq <= since) return;
+    since = maxSeq;
+    await ipc.setSetting("like.sync.seq", String(maxSeq)).catch(() => {});
+    if (changes.length === 0) return;
   }
 }
 
 /** 全量分页导入，导完把游标推到后端的 maxSeq */
 async function importAllLikes(): Promise<void> {
-  let page = 1;
+  // 两阶段（对齐 uniappx doFullPull「先收齐再合并」）：歌曲行的 pid
+  // 归属依赖歌单先落地，DESC 分页里歌常在歌单前面的页 —— 逐页应用会因
+  // 「歌单不存在」跳过歌曲，且 imported=1 后永不再重试
+  const allPlaylists: ipc.LikeChange[] = [];
+  const allSongs: ipc.LikeChange[] = [];
   let maxSeq = 0;
+  let page = 1;
   for (;;) {
     const { songs, playlists, maxSeq: seq } = normalizeLikeList(
       await ipc.likePullAll(page, LIKE_PAGE_SIZE),
     );
     if (songs.length === 0 && playlists.length === 0) break;
-    const changes: ipc.LikeChange[] = [
-      ...songs.map((s) => toChange("song", s)),
-      ...playlists.map((p) => toChange("playlist", p)),
-    ];
-    await ipc.likeApply(changes);
+    allPlaylists.push(...playlists.map((p) => toChange("playlist", p)));
+    allSongs.push(...songs.map((s) => toChange("song", s)));
     if (seq > maxSeq) maxSeq = seq;
     page += 1;
   }
+  // 先歌单后歌曲：歌单卡片全部就位，歌曲的 pid 准入检查才都能过
+  if (allPlaylists.length > 0) await ipc.likeApply(allPlaylists);
+  if (allSongs.length > 0) await ipc.likeApply(allSongs);
   if (maxSeq > 0) {
     await ipc.setSetting("like.sync.seq", String(maxSeq)).catch(() => {});
   }
+}
+
+/**
+ * 启动 / 登录后的完整同步（LIKE_SYNC_DESIGN.md §3 / §5 的 PC 版）：
+ * 1. 先重放离线队列（断网期间没推上去的操作）——拉取之前推，
+ *    否则队列里的 remove 会被拉下来的旧状态重新加回本地，来回震荡；
+ * 2. 增量拉取（游标缺失转全量）——其他端的删除先在本地生效；
+ * 3. 启动对账：全量拉云端做存在性 diff，本地有而云端没有的补推。
+ */
+export async function syncLikesWithReconcile(): Promise<void> {
+  await ipc.likeFlushPending().catch(() => {});
+  await pullLikes();
+  await ipc.likeReconcile().catch(() => {});
+}
+
+/** 从 me 响应里取当前账号 uid（兼容 user 嵌套与平铺两种形状） */
+function profileUid(profile: Record<string, unknown> | null): string {
+  if (!profile) return "";
+  const user = profile.user as Record<string, unknown> | null | undefined;
+  for (const v of [profile.id, profile.uid, user?.id, user?.uid]) {
+    if (v != null && String(v).length > 0) return String(v);
+  }
+  return "";
+}
+
+/**
+ * 登录成功后的收藏归属检查（LIKE_SYNC_DESIGN.md §6 的 PC 版）。
+ * 本地库不分账号（uid 固定 0），换号登录必须先清库 —— A 的数据只留在
+ * A 的服务器账号里，清完游标自动复位，随后的 pullLikes 全量拉取恢复 B 的数据。
+ * 同账号重登（或 token 过期自动恢复，不走登录页）什么都不动，本地秒恢复。
+ * 登录响应的 user.id 记入 like.sync.owner，退出登录不清除。
+ */
+async function handleLikeOwnerSwitch(
+  profile: Record<string, unknown> | null,
+): Promise<void> {
+  const uid = profileUid(profile);
+  if (!uid) return;
+  const prev = await ipc.getSetting(LIKE_OWNER_KEY).catch(() => null);
+  if (prev && prev !== uid) {
+    await ipc.likeClearLocal().catch(() => {});
+  }
+  await ipc.setSetting(LIKE_OWNER_KEY, uid).catch(() => {});
 }
 
 type RawLike = Record<string, unknown>;
@@ -158,6 +220,28 @@ function toChange(kind: "song" | "playlist", item: RawLike): ipc.LikeChange {
   };
 }
 
+/**
+ * 向服务端确认本地这个会话是否还认。
+ *
+ * 本地没过期 ≠ 服务端还认：后端重启、会话被撤销后，token 在本地可能还剩好几天
+ * （后端不给 expiresIn 时按 7 天兜底），界面就会一直显示「已登录」而接口全 401。
+ *
+ * 返回用户信息表示有效；返回 null 表示服务端明确否认；抛错表示网络不可达。
+ * Rust 侧遇到 401 会顺手清掉本地会话，所以失败后再读一次即可分辨：
+ * 会话被清了就是确实失效，还在就是网络问题（不能登出用户）。
+ */
+async function confirmSession(
+  session: AuthSession,
+): Promise<Record<string, unknown> | null> {
+  try {
+    return await ipc.astralMe();
+  } catch (err) {
+    const still = await ipc.astralSession().catch(() => session);
+    if (!still) return null;
+    throw err;
+  }
+}
+
 export const useAuthStore = create<AuthStore>((set) => ({
   session: null,
   profile: null,
@@ -172,13 +256,24 @@ export const useAuthStore = create<AuthStore>((set) => ({
         return;
       }
       set({ session });
-      const profile = await ipc.astralMe().catch(() => null);
+
+      // 再向服务端确认一次：本地没过期不代表服务端还认这个 token
+      const profile = await confirmSession(session);
+      if (!profile) {
+        // 服务端明确否认 → 回到未登录（Rust 侧 401 时已清过一遍，这里兜底清本地行）
+        set({ session: null, profile: null, error: null });
+        await ipc.astralLogout().catch(() => {});
+        return;
+      }
       set({ profile });
-      // 登录态就绪后把云端的收藏变更拉回本地。同步失败不该影响使用，
-      // 所以只记错误不抛（本地收藏本身是权威数据）。
-      void pullLikes().catch((err) => {
+      // 登录态就绪后把云端的收藏变更拉回本地，再补两件事（LIKE_SYNC_DESIGN §3/§5）：
+      // 1) 重放离线队列（断网期间失败的收藏推送）；
+      // 2) 启动对账：本地有而云端没有的收藏补推上去。
+      // 顺序保证「增量拉取在前，对账在后」——其他端删除的收藏先在本地移除，
+      // 不会被对账误复活。同步失败不影响使用，只记错误不抛。
+      void syncLikesWithReconcile().catch((err) => {
         const msg = errMsg(err);
-        console.warn("[like] 拉取云端收藏失败", err);
+        console.warn("[like] 收藏同步失败", err);
         // 同步失败不该打断登录流程，但得留下线索：错误写进 settings 表，
         // 桌面端没有顺手的 devtools，从库里能直接读到。
         // 用字面量而不是模块常量：同步是启动早期跑的，万一模块还没初始化完，
@@ -186,8 +281,8 @@ export const useAuthStore = create<AuthStore>((set) => ({
         void ipc.setSetting("like.lastError", msg).catch(() => {});
       });
     } catch (err) {
-      // 后端没起 / 未授权都走未登录，不弹全局错误
-      set({ session: null, profile: null, error: null });
+      // 后端没起 / 网络不可达：保留本地登录态（离线容忍），只是暂时拿不到用户信息
+      set({ profile: null, error: null });
       void err;
     }
   },
@@ -198,6 +293,9 @@ export const useAuthStore = create<AuthStore>((set) => ({
       const session = await ipc.astralLogin(username, password);
       const profile = await ipc.astralMe().catch(() => null);
       set({ session, profile, loading: false });
+      // 收藏归属检查（换号清库）+ 新账号的收藏同步，失败不影响登录
+      await handleLikeOwnerSwitch(profile);
+      void syncLikesWithReconcile().catch(() => {});
     } catch (err) {
       set({
         loading: false,
@@ -207,12 +305,19 @@ export const useAuthStore = create<AuthStore>((set) => ({
     }
   },
 
-  register: async (username, password, email, code) => {
+  register: async (username, password, passwordConfirm, email) => {
     set({ loading: true, error: null });
     try {
-      const session = await ipc.astralRegister(username, password, email, code);
+      const session = await ipc.astralRegister(
+        username,
+        password,
+        passwordConfirm,
+        email,
+      );
       const profile = await ipc.astralMe().catch(() => null);
       set({ session, profile, loading: false });
+      await handleLikeOwnerSwitch(profile);
+      void syncLikesWithReconcile().catch(() => {});
     } catch (err) {
       set({
         loading: false,
@@ -224,11 +329,15 @@ export const useAuthStore = create<AuthStore>((set) => ({
 
   logout: async () => {
     set({ loading: true, error: null });
+    // 退出前把断网积压的收藏操作尽力推一把（token 还有效），丢队列前先补推；
+    // 收藏数据与归属标记保留 —— 同账号重登无缝恢复，换号由登录侧清库
+    await ipc.likeFlushPending().catch(() => {});
     try {
       await ipc.astralLogout();
     } catch {
       // 后端不可达也要清本地，否则用户退不出去
     } finally {
+      await ipc.likeResetSync().catch(() => {});
       set({ session: null, profile: null, loading: false });
     }
   },

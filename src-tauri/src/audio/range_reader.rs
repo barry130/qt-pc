@@ -191,11 +191,13 @@ pub fn open(
         let _ = std::fs::remove_file(&file_path);
     }
 
-    // 首个 Range 请求：bytes=0- 同时探测 Accept-Ranges 与总长
+    // 首个 Range 请求：bytes=0- 同时探测 Accept-Ranges 与总长。
+    // 超时与 FIRST_PACKET_TIMEOUT 对齐（8s）：休眠唤醒后的半死连接
+    // 要挂满超时才报错，超时越长失败链收敛越慢
     let resp = client
         .get(url)
         .header("Range", "bytes=0-")
-        .timeout(Duration::from_secs(15))
+        .timeout(FIRST_PACKET_TIMEOUT)
         .send()
         .map_err(|e| io::Error::other(format!("打开音频流失败: {url} ({e})")))?;
     let status = resp.status();
@@ -384,7 +386,8 @@ fn issue_range(
     client
         .get(url)
         .header("Range", format!("bytes={from}-"))
-        .timeout(Duration::from_secs(15))
+        // 与首包超时对齐：断流重连也要快速落定，拖长只会推迟失败判定
+        .timeout(FIRST_PACKET_TIMEOUT)
         .send()
         .map_err(|_| ())
 }

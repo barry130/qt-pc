@@ -1,22 +1,27 @@
 import { useCallback, useEffect, useState } from "react";
 import { errMsg } from "@/lib/utils";
-import { useNavigate } from "@tanstack/react-router";
-import { ArrowLeft, Bell } from "lucide-react";
+import { ArrowLeft } from "lucide-react";
 import * as ipc from "@/services/ipc";
 import { useAuthStore } from "@/stores/auth";
+import { RichText, htmlToText } from "@/lib/richText";
 
 /**
  * 消息中心（路由 /messages，DESIGN §15.4）。
  *
  * 与移动端对齐的几点：
- * - 后端 `app/message/center` 一次性返回完整正文，**没有单独的详情接口**，
- *   所以列表只截断显示摘要，点进去展示全文（前端切视图，不走路由）。
+ * - 未登录也能看：已登录走 `app/message/center`（含反馈 / 需求通知），未登录回退到
+ *   公开的 `app/message/active`，按展示位掩码取出「消息中心」那部分（后端 center
+ *   接口要求登录，active 游客可见）。
+ * - 后端一次性返回完整正文，**没有单独的详情接口**，所以列表只截断显示摘要，
+ *   点进去展示全文（前端切视图，不走路由）。
  * - 已读状态后端不返回，移动端也是前端缓存；这里存 localStorage，
  *   同时尝试调一次 read-ack，后端不认也不影响。
- * - 正文格式是「纯文本 + 换行 + 简单链接」（不是 HTML），所以直接分段渲染 +
- *   把 URL 摘出来做可点击，不需要 dangerouslySetInnerHTML。
+ * - 正文是富文本（HTML），交给 `lib/richText` 白名单解析渲染；纯文本正文兼容。
  */
 const READ_KEY = "lightlisten.messages.read";
+
+/** 展示位掩码：1 开屏 2 通告栏 4 消息中心（对齐后端 SysNotice.display） */
+const DISPLAY_MESSAGE_CENTER = 4;
 
 interface MessageItem {
   id: number;
@@ -28,7 +33,6 @@ interface MessageItem {
 }
 
 export function MessagesPage(): React.JSX.Element {
-  const navigate = useNavigate();
   const session = useAuthStore((s) => s.session);
 
   const [items, setItems] = useState<MessageItem[]>([]);
@@ -40,7 +44,10 @@ export function MessagesPage(): React.JSX.Element {
     setLoading(true);
     setError(null);
     try {
-      const data = await ipc.astralMessageCenter();
+      // 未登录时 center 接口会 401，改走公开的 active 并只取消息中心展示位
+      const data = session
+        ? await ipc.astralMessageCenter()
+        : messageCenterOfActive(await ipc.astralActiveMessages());
       const readIds = new Set(readReadIds());
       setItems(
         normalizeMessages(data).map((it) => ({
@@ -54,15 +61,11 @@ export function MessagesPage(): React.JSX.Element {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [session]);
 
   useEffect(() => {
-    if (!session) {
-      setLoading(false);
-      return;
-    }
     void load();
-  }, [session, load]);
+  }, [load]);
 
   const markRead = (id: number): void => {
     const ids = readReadIds();
@@ -84,22 +87,6 @@ export function MessagesPage(): React.JSX.Element {
     setItems((prev) => prev.map((it) => ({ ...it, read: true })));
     void ipc.astralAckMessages(unread).catch(() => {});
   };
-
-  if (!session) {
-    return (
-      <div className="flex h-full flex-col items-center justify-center px-6 text-center">
-        <Bell className="h-8 w-8 text-muted-foreground" />
-        <p className="mt-4 text-sm">消息需要登录后查看</p>
-        <button
-          type="button"
-          onClick={() => void navigate({ to: "/login" })}
-          className="mt-4 h-9 rounded-md bg-primary px-4 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90"
-        >
-          去登录
-        </button>
-      </div>
-    );
-  }
 
   const current =
     openId != null ? items.find((it) => it.id === openId) ?? null : null;
@@ -128,8 +115,11 @@ export function MessagesPage(): React.JSX.Element {
         {current.url && (
           <a
             href={current.url}
-            target="_blank"
-            rel="noreferrer"
+            onClick={(e) => {
+              e.preventDefault();
+              // Tauri 里 target=_blank 不生效，统一交系统浏览器打开
+              void ipc.openExternalUrl(current.url ?? "").catch(() => undefined);
+            }}
             className="mt-5 inline-block break-all text-xs text-primary underline underline-offset-2"
           >
             {current.url}
@@ -220,76 +210,22 @@ export function MessagesPage(): React.JSX.Element {
   );
 }
 
-/** 摘要：换行压成空格后截断 */
+/** 摘要：富文本去标签后压成单行并截断 */
 function summary(content: string): string {
-  const flat = content.replace(/\s+/g, " ").trim();
+  const flat = htmlToText(content).replace(/\s+/g, " ").trim();
   if (flat.length === 0) return "（无正文）";
   return flat.length > 80 ? `${flat.slice(0, 80)}…` : flat;
 }
 
-/**
- * 正文渲染：按换行分段，段落里的 URL 做成可点击。
- * 内容实际是「纯文本 + 换行 + 简单链接」，因此不需要 innerHTML，也就没有注入面。
- */
-function RichText(props: { text: string }): React.JSX.Element {
-  const paragraphs = props.text
-    .split(/\r?\n/)
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
-
-  if (paragraphs.length === 0) {
-    return (
-      <p className="text-sm text-muted-foreground">（这条消息没有正文）</p>
-    );
-  }
-
-  return (
-    <div className="space-y-3">
-      {paragraphs.map((p, i) => (
-        <p
-          key={i}
-          className="whitespace-pre-wrap break-words text-sm leading-relaxed"
-        >
-          {splitLinks(p).map((part, j) =>
-            part.type === "link" ? (
-              <a
-                key={j}
-                href={part.value}
-                target="_blank"
-                rel="noreferrer"
-                className="break-all text-primary underline underline-offset-2"
-              >
-                {part.value}
-              </a>
-            ) : (
-              <span key={j}>{part.value}</span>
-            ),
-          )}
-        </p>
-      ))}
-    </div>
-  );
-}
-
-function splitLinks(text: string): { type: "text" | "link"; value: string }[] {
-  const parts: { type: "text" | "link"; value: string }[] = [];
-  const re = /(https?:\/\/[^\s，。）)、】]+)/g;
-  let last = 0;
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) {
-    if (m.index > last) {
-      parts.push({ type: "text", value: text.slice(last, m.index) });
-    }
-    parts.push({ type: "link", value: m[1] });
-    last = m.index + m[1].length;
-  }
-  if (last < text.length) {
-    parts.push({ type: "text", value: text.slice(last) });
-  }
-  return parts;
-}
-
 // ---------- 后端结构宽松适配 ----------
+
+/** 公开接口 active 混了所有展示位，未登录时只挑出消息中心那部分 */
+function messageCenterOfActive(data: unknown): unknown[] {
+  return pickList(data).filter((it) => {
+    const o = (it ?? {}) as Record<string, unknown>;
+    return (num(o.display ?? o.type ?? 0) & DISPLAY_MESSAGE_CENTER) !== 0;
+  });
+}
 
 function normalizeMessages(data: unknown): MessageItem[] {
   return pickList(data).map((item, i) => {

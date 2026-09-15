@@ -12,10 +12,13 @@ import { usePlaybackEvents } from "@/hooks/usePlaybackEvents";
 import { useAppearanceEffect } from "@/hooks/useAppearanceEffect";
 import { useCoverColor } from "@/hooks/useCoverColor";
 import { usePlayingCoverBg } from "@/hooks/usePlayingCoverBg";
+import { useLocalTrackOnlineMeta } from "@/hooks/useLocalTrackOnlineMeta";
 import { useUpdateCheck } from "@/hooks/useUpdateCheck";
 import { useAppearanceStore } from "@/stores/appearance";
 import { usePlayerStore } from "@/stores/player";
+import { useDownloadsStore } from "@/stores/downloads";
 import { qtresCoverUrl } from "@/lib/lrc";
+import { initStat, trackStatPage } from "@/lib/stat";
 import { UpdateDialog } from "@/components/update/UpdateDialog";
 
 /**
@@ -28,6 +31,7 @@ export function AppShell(): React.JSX.Element {
   useAppearanceEffect();
   useCoverColor();
   usePlayingCoverBg();
+  useLocalTrackOnlineMeta();
   useUpdateCheck();
 
   const bgImage = useAppearanceStore((s) => s.preference.bgImage);
@@ -54,6 +58,52 @@ export function AppShell(): React.JSX.Element {
   useEffect(() => {
     void initAuth();
   }, [initAuth]);
+
+  // 使用统计（STATS_DESIGN §4.1/§7）：冷启动 launcher+show，路由变化记 page
+  useEffect(() => {
+    void initStat();
+  }, []);
+  useEffect(() => {
+    trackStatPage(pathname);
+  }, [pathname]);
+
+  // 桌面歌词工具条上的「歌词设置」：Rust 唤起主窗口后发事件，这里负责跳转
+  useEffect(() => {
+    let off: (() => void) | null = null;
+    let disposed = false;
+    void ipc.onLyricOpenSettings(() => {
+      void navigate({
+        to: "/settings/$section",
+        params: { section: "desktop-lyric" },
+      });
+    }).then((u) => {
+      if (disposed) u();
+      else off = u;
+    });
+    return () => {
+      disposed = true;
+      off?.();
+    };
+  }, [navigate]);
+
+  // 下载状态全局镜像（DESIGN §5.3 下载 2.0）：启动拉一次，
+  // 之后由 Rust 的 downloads-changed 事件驱动刷新，曲目行的「已下载」标随之更新
+  const refreshDownloads = useDownloadsStore((s) => s.refresh);
+  useEffect(() => {
+    void refreshDownloads();
+    let off: (() => void) | null = null;
+    let disposed = false;
+    void ipc.onDownloadsChanged(() => {
+      void refreshDownloads();
+    }).then((u) => {
+      if (disposed) u();
+      else off = u;
+    });
+    return () => {
+      disposed = true;
+      off?.();
+    };
+  }, [refreshDownloads]);
 
   return (
     <div className="relative flex h-screen w-screen flex-col overflow-hidden bg-background text-foreground">
