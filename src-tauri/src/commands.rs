@@ -138,6 +138,100 @@ pub async fn cmd_get_recommendations(
         .await
 }
 
+// ---------- 音源脚本内置方法（插件化方案 v3 · 试点） ----------
+//
+// 音源脚本包（src/source-scripts/）不含 HTTP 实现，由本命令作为唯一内置
+// request 执行：URL/请求头/请求体全由脚本拼装（对齐蓝本 http.ts 的
+// makeHeaders/directRequest 职责划分），本命令只负责发出请求并回传
+// 状态码/响应头/已解析的 body。前端不直接发外部网络（CSP 不变）。
+
+/// 音源脚本的请求选项（前端 host-request.ts 以 camelCase 传入）
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceRequestOptions {
+    pub method: Option<String>,
+    pub headers: Option<std::collections::HashMap<String, String>>,
+    pub body: Option<String>,
+    pub timeout_ms: Option<u64>,
+}
+
+/// 音源脚本的响应（契约见 src/source-scripts/contract.ts）
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceResponse {
+    pub status_code: u16,
+    pub headers: std::collections::HashMap<String, String>,
+    /// JSON 响应为已解析值；非 JSON 为字符串
+    pub body: serde_json::Value,
+}
+
+/// 内置 HTTP 客户端：桌面浏览器 UA 兜底（各平台特殊头由脚本按需覆盖）
+fn source_builtin_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+            .build()
+            .expect("source builtin client")
+    })
+}
+
+/// builtin_request 的可直调实现（供命令与测试共用）
+pub(crate) async fn source_builtin_request(
+    url: &str,
+    options: Option<&SourceRequestOptions>,
+) -> Result<SourceResponse, String> {
+    let method = options
+        .and_then(|o| o.method.as_deref())
+        .unwrap_or("GET")
+        .to_uppercase();
+    let timeout = std::time::Duration::from_millis(
+        options.and_then(|o| o.timeout_ms).unwrap_or(15_000),
+    );
+    let mut req = source_builtin_client()
+        .request(
+            reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?,
+            url,
+        )
+        .timeout(timeout);
+    if let Some(headers) = options.and_then(|o| o.headers.as_ref()) {
+        for (key, value) in headers {
+            req = req.header(key, value);
+        }
+    }
+    if let Some(body) = options.and_then(|o| o.body.as_deref()) {
+        req = req.body(body.to_string());
+    }
+    let res = req.send().await.map_err(|e| e.to_string())?;
+    let status = res.status().as_u16();
+    let mut headers = std::collections::HashMap::new();
+    for (name, value) in res.headers() {
+        if let Ok(v) = value.to_str() {
+            headers.insert(name.as_str().to_lowercase(), v.to_string());
+        }
+    }
+    // 上游 content-type 不可靠（网易歌单接口回 text/plain、QQ 回 x-javascript、
+    // 酷狗回 text/html），对齐蓝本 http.ts 的行为：不看 content-type 直接尝试
+    // JSON 解析，失败则原样字符串。
+    let text = res.text().await.map_err(|e| e.to_string())?;
+    let body = serde_json::from_str::<serde_json::Value>(&text)
+        .unwrap_or(serde_json::Value::String(text));
+    Ok(SourceResponse {
+        status_code: status,
+        headers,
+        body,
+    })
+}
+
+#[tauri::command(rename = "builtin_request")]
+pub async fn cmd_builtin_request(
+    url: String,
+    options: Option<SourceRequestOptions>,
+) -> Result<SourceResponse, String> {
+    source_builtin_request(&url, options.as_ref()).await
+}
+
+
 #[tauri::command(rename = "get_latest_songs")]
 pub async fn cmd_get_latest_songs(
     state: State<'_, AppState>,
@@ -3456,5 +3550,44 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 音源脚本内置 request 通路验证（真实网络，对齐脚本 wyy 分支的接口）：
+    /// 走 builtin_request 发网易歌单列表请求，断言 200 + JSON body 有 playlists。
+    /// 与前端 source-scripts/actions/recommendations.ts 的 wyy 分支共用同一上游。
+    #[tokio::test]
+    async fn builtin_request_fetches_wyy_playlist_list() {
+        let url = "https://music.163.com/api/playlist/list?cat=%E5%85%A8%E9%83%A8&limit=5&offset=0&total=true";
+        let res = super::source_builtin_request(
+            url,
+            Some(&super::SourceRequestOptions {
+                method: Some("GET".into()),
+                headers: Some(
+                    [
+                        ("Content-Type".to_string(), "application/json".to_string()),
+                        ("Referer".to_string(), "https://music.163.com/".to_string()),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
+                body: None,
+                timeout_ms: Some(15_000),
+            }),
+        )
+        .await
+        .expect("builtin_request 应成功");
+        assert_eq!(res.status_code, 200, "上游接口应返回 200");
+        assert!(
+            res.headers.contains_key("content-type"),
+            "响应头必须透传（酷我 Cookie 流程依赖）"
+        );
+        let playlists = res
+            .body
+            .get("playlists")
+            .and_then(|v| v.as_array())
+            .expect("JSON body 应包含 playlists 数组");
+        assert!(!playlists.is_empty(), "歌单列表不应为空");
+        let first = &playlists[0];
+        assert!(first.get("id").is_some(), "歌单应有 id 字段");
     }
 }

@@ -216,6 +216,7 @@ pub fn run() {
             cmd_get_lyric,
             cmd_get_video_url,
             cmd_get_track_cover,
+            cmd_builtin_request,
             cmd_get_playlist_categories,
             cmd_get_recommendations,
             cmd_get_latest_songs,

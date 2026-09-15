@@ -4,6 +4,7 @@ import { Disc3, FileMusic, Flame, Sparkles } from "lucide-react";
 import type { Chart, Playlist, Track } from "@/types";
 import { SOURCE_DISPLAY } from "@/types";
 import * as ipc from "@/services/ipc";
+import { getRecommendations } from "@/source-scripts";
 import { useMusicSourceStore } from "@/stores/musicSource";
 import { usePlayerStore } from "@/stores/player";
 import { CoverCard, CoverGrid, SectionTitle } from "./CoverCard";
@@ -59,9 +60,9 @@ export function DiscoverPage(): React.JSX.Element {
     void (async () => {
       const [s, p] = await Promise.all([
         ipc.getLatestSongs(activeSourceId, 20, 0).catch(() => [] as Track[]),
-        ipc
-          .getRecommendations(activeSourceId, null, 1)
-          .catch(() => [] as Playlist[]),
+        // 插件化试点：推荐歌单经 source-scripts 统一入口分发
+        // （scheme=script 走共享脚本包，否则原 Rust 通道），其余调用不变
+        getRecommendations(activeSourceId, null, 1).catch(() => [] as Playlist[]),
       ]);
       // IPC 在测试/异常环境下可能返回非数组，这里统一兜底（页面只做展示，允许区块为空）
       if (cancelled) return;
