@@ -237,7 +237,7 @@ async fn attempt_once(
     let resp = req
         .send()
         .await
-        .map_err(|e| AttemptError::Retryable(format!("请求失败: {e}")))?;
+        .map_err(|e| AttemptError::Retryable(format!("请求失败: {}", crate::astral::sanitize_err(e))))?;
 
     let code = resp.status().as_u16();
     if offset > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
@@ -302,7 +302,10 @@ async fn attempt_once(
             Ok(None) => break,
             Err(e) => {
                 let _ = file.flush();
-                return Err(AttemptError::Retryable(format!("下载中断: {e}")));
+                return Err(AttemptError::Retryable(format!(
+                    "下载中断: {}",
+                    crate::astral::sanitize_err(e)
+                )));
             }
         };
         file.write_all(&chunk).map_err(|e| {

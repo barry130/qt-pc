@@ -3,7 +3,7 @@ import { errMsg } from "@/lib/utils";
 import { useParams } from "@tanstack/react-router";
 import { Play } from "lucide-react";
 import type { SourceId, Track } from "@/types";
-import * as ipc from "@/services/ipc";
+import * as sourceApi from "@/source-scripts";
 import { usePlayerStore } from "@/stores/player";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { TrackList } from "./TrackList";
@@ -36,7 +36,7 @@ export function AlbumPage(): React.JSX.Element {
     setError(null);
     void (async () => {
       try {
-        const list = await ipc.searchMusic(name, platform, 1, 50);
+        const list = await sourceApi.searchMusic(name, platform, 1, 50);
         const all = Array.isArray(list) ? list : [];
         // 各源专辑名写法有差异（空格/大小写/后缀），严格相等经常一条都匹配不上，
         // 归一化后再比较；仍然匹配不上就退回展示搜索结果，不至于整页空白。

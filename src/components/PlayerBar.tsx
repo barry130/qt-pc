@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowRightToLine,
   Captions,
+  Check,
+  Link2,
   ListMusic,
   Pause,
   Play,
@@ -14,6 +16,7 @@ import {
 import { useNavigate, useRouter, useRouterState } from "@tanstack/react-router";
 import type { PointerEvent as ReactPointerEvent } from "react";
 import { usePlayerStore } from "@/stores/player";
+import { useAuthStore, isAdmin } from "@/stores/auth";
 import { CollectButton } from "@/components/player/CollectButton";
 import { DownloadButton } from "@/components/mine/DownloadButton";
 import { QUALITY_OPTIONS, qualityShort } from "@/lib/quality";
@@ -62,6 +65,9 @@ export function PlayerBar(): React.JSX.Element {
   const loading = state?.status === "loading" || state?.status === "buffering";
   const cover = track ? qtresCoverUrl(track.picUrl) : null;
   const shownPosition = dragPreviewMs ?? pendingSeekMs ?? position;
+  // qt_admin 专属：播放地址调试入口只向内部账号展示
+  const profile = useAuthStore((s) => s.profile);
+  const showPlayUrl = isAdmin(profile);
 
   // 自愈：状态不是"停止"却拿不到曲目（事件丢失/覆盖的兜底）——
   // 主动拉一次实时快照，拿到曲目为止；正常时这个 effect 空转
@@ -226,6 +232,8 @@ export function PlayerBar(): React.JSX.Element {
       {/* 控制 + 进度 */}
       <div className="flex min-w-0 flex-1 flex-col items-center gap-1">
         <div className="flex items-center gap-3">
+          {/* qt_admin 专属：播放地址入口（图标按钮，点击展开当前实际播放地址） */}
+          {showPlayUrl && <PlayUrlButton url={state?.playUrl ?? null} />}
           {/* 收藏：点开是本地歌单清单，勾上/取消即收藏/取消收藏 */}
           <CollectButton track={track} />
           <PlayModeButton mode={state?.playMode ?? "listLoop"} onCycle={() => void cyclePlayMode()} />
@@ -431,6 +439,93 @@ function PlayModeButton(props: {
     <ControlButton label={`播放模式：${label}`} onClick={props.onCycle} active={props.mode !== "listLoop"}>
       <Icon className="h-4 w-4" />
     </ControlButton>
+  );
+}
+
+/**
+ * 播放地址入口（qt_admin 专属）：图标按钮，点开向上弹面板展示**当前实际在播**
+ * 的地址（换源兜底后指向真正在播的源），点地址即复制。
+ * 与音质菜单同款：向上弹 + 点外面/Esc 收起。
+ */
+function PlayUrlButton(props: { url: string | null }): React.JSX.Element {
+  const [open, setOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const boxRef = useRef<HTMLDivElement | null>(null);
+
+  // 点外面 / Esc 收起
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent): void => {
+      if (boxRef.current && !boxRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("mousedown", onDown);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  // 收起时把「已复制」复位，下次打开是干净状态
+  useEffect(() => {
+    if (!open) setCopied(false);
+  }, [open]);
+
+  const copy = (): void => {
+    if (!props.url) return;
+    void navigator.clipboard
+      .writeText(props.url)
+      .then(() => {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1200);
+      })
+      .catch(() => {});
+  };
+
+  return (
+    <div ref={boxRef} className="relative">
+      <ControlButton
+        label="播放地址（仅管理员）"
+        active={open}
+        onClick={() => setOpen((v) => !v)}
+      >
+        <Link2 className="h-4 w-4" />
+      </ControlButton>
+      {open ? (
+        <div className="absolute bottom-full left-1/2 z-30 mb-2 w-[420px] max-w-[70vw] -translate-x-1/2 rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-lg">
+          <div className="mb-1.5 text-[10px] text-muted-foreground">
+            当前实际播放地址（换源后指向真正在播的源）
+          </div>
+          {props.url ? (
+            <button
+              type="button"
+              onClick={copy}
+              title="点击复制"
+              className="block max-h-24 w-full overflow-y-auto break-all rounded-md bg-secondary/60 px-2 py-1.5 text-left font-mono text-[11px] leading-relaxed transition-colors hover:bg-secondary"
+            >
+              {props.url}
+            </button>
+          ) : (
+            <div className="rounded-md bg-secondary/40 px-2 py-1.5 text-xs text-muted-foreground">
+              本地曲目，或尚未取到播放地址
+            </div>
+          )}
+          <div className="mt-1.5 flex items-center gap-1 text-[10px] text-muted-foreground">
+            {copied ? (
+              <>
+                <Check className="h-3 w-3 text-primary" />
+                已复制到剪贴板
+              </>
+            ) : (
+              props.url ? "点击地址可复制" : ""
+            )}
+          </div>
+        </div>
+      ) : null}
+    </div>
   );
 }
 

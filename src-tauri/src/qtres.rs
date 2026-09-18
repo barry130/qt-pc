@@ -6,12 +6,19 @@
 //! - `mv/`：MV/视频 Range 透传——把 `<video>` 的 Range 头原样转发给上游，
 //!   回传上游状态（200/206）与 Content-Range / Content-Length / Accept-Ranges，
 //!   否则 video 无法拖动进度。视频不缓存。
+//! - `/engine/index.html`：音源引擎页（source_window.rs 的隐藏窗口加载，
+//!   内嵌 HTML，无 CSP 注入 → 可自由动态 import 音源包脚本）
+//! - `/script/<code>/<file>`：只读分发已安装音源包文件（source-bundle/install/
+//!   目录；code/file 严格校验防路径穿越）
 //!
 //! 白名单：只允许已知音源 CDN 域名，防止歌词/皮肤数据把它当任意代理。
 
 use base64::Engine as _;
+use std::path::Path;
 use std::sync::Mutex;
 use tauri::http::{header, Request, Response, StatusCode};
+
+use crate::source_bundle;
 
 /// 允许代取的封面域名后缀（wyy + qq + kw + kg 的图片 CDN 及其通用回退）
 const ALLOWED_HOST_SUFFIXES: &[&str] = &[
@@ -95,6 +102,109 @@ fn placeholder() -> Response<Vec<u8>> {
         .unwrap()
 }
 
+/// 引擎页 HTML（内嵌编译；改页面要重编 Rust）
+const ENGINE_INDEX_HTML: &str = include_str!("source_engine_page.html");
+
+fn engine_page_response() -> Response<Vec<u8>> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        // 引擎页必须即时生效（音源包应用 = 重建窗口重新拉取）
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(ENGINE_INDEX_HTML.as_bytes().to_vec())
+        .unwrap()
+}
+
+/// /script/ 文件大小防呆（bundle 正常 ~1-2MB，给足余量）
+const SCRIPT_FILE_MAX: u64 = 64 * 1024 * 1024;
+
+/// 段名白名单：只允许字母数字与 . _ -，且不允许 "." / ".."（防路径穿越）。
+/// code（版本号目录）与 file（chain.json / source-bundle.js）共用。
+fn valid_path_segment(seg: &str) -> bool {
+    !seg.is_empty()
+        && seg != "."
+        && seg != ".."
+        && seg.len() <= 128
+        && seg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+}
+
+/// `/script/<code>/<file>`：只读分发 `%APPDATA%/LightListen/source-bundle/install/`
+/// 下的音源包文件。路径穿越在校验段名 + 规范化路径前缀双重拦截。
+fn handle_script_file<R: tauri::Runtime>(app: &tauri::AppHandle<R>, rest: &str) -> Response<Vec<u8>> {
+    let Some((code, file)) = rest.split_once('/') else {
+        return not_found();
+    };
+    // file 可能带查询串（模块缓存破坏参数等），剥掉
+    let file = file.split(['?', '#']).next().unwrap_or(file);
+    if !valid_path_segment(code) || !valid_path_segment(file) {
+        log::warn!("[qtres] /script 非法路径拒绝: code={code} file={file}");
+        return not_found();
+    }
+    let install_root = source_bundle::bundle_dir(app).join("install");
+    let target = install_root.join(code).join(file);
+    // 规范化前缀校验：兜底防符号链接/编码绕过
+    if !starts_with_canonical(&target, &install_root) {
+        log::warn!("[qtres] /script 规范化校验失败: {}", target.display());
+        return not_found();
+    }
+    match std::fs::metadata(&target) {
+        Ok(m) if m.is_file() && m.len() <= SCRIPT_FILE_MAX => {}
+        _ => return not_found(),
+    }
+    let Ok(bytes) = std::fs::read(&target) else {
+        return not_found();
+    };
+    let content_type = if file.ends_with(".json") {
+        "application/json; charset=utf-8"
+    } else if file.ends_with(".js") || file.ends_with(".mjs") {
+        "application/javascript; charset=utf-8"
+    } else {
+        "application/octet-stream"
+    };
+    log::info!("[qtres] /script 分发: {code}/{file} ({} bytes)", bytes.len());
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        // no-store：音源包「立即应用」靠重建窗口重新拉脚本，不能吃缓存
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(bytes)
+        .unwrap_or_else(|_| not_found())
+}
+
+fn not_found() -> Response<Vec<u8>> {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .body(b"not found".to_vec())
+        .unwrap()
+}
+
+/// 目标路径是否落在 root 之内：先词法规范化（消化 "." / ".." 段），
+/// 再与规范化后的 root 比对。目标不存在（canonicalize 失败）返回 false——
+/// 调用方（/script 分发）对不存在一律 not found，无需区分。
+fn starts_with_canonical(target: &Path, root: &Path) -> bool {
+    use std::path::Component;
+    let Ok(root_c) = root.canonicalize() else {
+        return false;
+    };
+    let mut normalized = Path::new("/").to_path_buf();
+    for comp in target.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            c => normalized.push(c),
+        }
+    }
+    match normalized.canonicalize() {
+        Ok(c) => c.starts_with(&root_c),
+        Err(_) => false,
+    }
+}
+
 /// 全局缓存（进程级；M0 简单实现）
 static COVER_CACHE: Mutex<Option<lru_simple::Lru<String, Vec<u8>>>> = Mutex::new(None);
 
@@ -141,21 +251,33 @@ mod lru_simple {
 
 /// 注册到 `register_asynchronous_uri_scheme_protocol` 的处理函数。
 pub fn handle_qtres<R: tauri::Runtime>(
-    _ctx: tauri::UriSchemeContext<'_, R>,
+    ctx: tauri::UriSchemeContext<'_, R>,
     request: Request<Vec<u8>>,
     responder: tauri::UriSchemeResponder,
 ) {
     // 阻塞部分放独立线程，避免卡 WebView 主线程
+    let app = ctx.app_handle().clone();
     std::thread::spawn(move || {
-        let response = handle_qtres_sync(request);
+        let response = handle_qtres_sync(&app, request);
         responder.respond(response);
     });
 }
 
-fn handle_qtres_sync(request: Request<Vec<u8>>) -> Response<Vec<u8>> {
+fn handle_qtres_sync<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    request: Request<Vec<u8>>,
+) -> Response<Vec<u8>> {
     // Windows/WebView2 下 URI 被规范化为 http://qtres.localhost/...，
     // 其余平台为 qtres://...；两者用 uri().path() 都得到 /cover|mv/<b64>
     let path = request.uri().path().to_string();
+    // 音源引擎路由（P1）：引擎页内嵌提供 + 安装目录脚本只读分发。
+    // 这些路径固定存在，放在 cover/mv 解码之前短路。
+    if path == "/engine/index.html" {
+        return engine_page_response();
+    }
+    if let Some(rest) = path.strip_prefix("/script/") {
+        return handle_script_file(app, rest);
+    }
     let Some((kind, original_url)) = decode_res_path(&path) else {
         log::warn!("[qtres] 无法解码封面路径: {path}");
         return placeholder();
@@ -327,6 +449,48 @@ mod tests {
 
     fn b64url(s: &str) -> String {
         base64::engine::general_purpose::URL_SAFE.encode(s)
+    }
+
+    #[test]
+    fn valid_path_segments() {
+        assert!(valid_path_segment("2026091801"));
+        assert!(valid_path_segment("chain.json"));
+        assert!(valid_path_segment("source-bundle.js"));
+        assert!(valid_path_segment("source_bundle-v2.js"));
+        assert!(!valid_path_segment(""));
+        assert!(!valid_path_segment("."));
+        assert!(!valid_path_segment(".."));
+        assert!(!valid_path_segment("a/b"));
+        assert!(!valid_path_segment("a\\b"));
+        assert!(!valid_path_segment("a b"));
+        assert!(!valid_path_segment("中文名"));
+        assert!(!valid_path_segment(&"x".repeat(129)));
+    }
+
+    #[test]
+    fn starts_with_canonical_blocks_traversal() {
+        let tmp = std::env::temp_dir().join(format!("ll-qtres-{}", std::process::id()));
+        let root = tmp.join("install");
+        std::fs::create_dir_all(root.join("2026091801")).unwrap();
+        std::fs::write(root.join("2026091801").join("chain.json"), "{}").unwrap();
+        let inside = root.join("2026091801").join("chain.json");
+        assert!(starts_with_canonical(&inside, &root));
+        // .. 拼接出的越界路径（即使段名校验被绕过也兜底）
+        let escape = root.join("2026091801").join("..").join("secret.txt");
+        assert!(!starts_with_canonical(&escape, &root));
+        std::fs::write(tmp.join("secret.txt"), "x").unwrap();
+        assert!(!starts_with_canonical(&escape, &root));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn engine_page_embedded() {
+        let resp = engine_page_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body();
+        let html = String::from_utf8(body).unwrap();
+        assert!(html.contains("source-engine-request"), "含取链 RPC 监听");
+        assert!(html.contains("createSourceLayer"), "调用 bundle 入口");
     }
 
     #[test]

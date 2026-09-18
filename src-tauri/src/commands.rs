@@ -8,135 +8,14 @@ use crate::astral::AuthSession;
 use crate::audio::engine::AudioCmd;
 use crate::audio::state::PlayMode;
 use crate::download::{self, DownloadJob, DownloadManager, DownloadOutcome};
-use crate::provider::registry::{PlayUrlCache, ProviderRegistry};
-use crate::provider::types::{
-    Album, Artist, Chart, Playlist, PlaylistCategory, Quality, SourceId, Track, Video,
-};
+use crate::provider::types::{Quality, SourceId, Track};
+use crate::provider::url_cache::PlayUrlCache;
 use crate::provider::ProviderError;
-use crate::{quality_str, resolve_play_url_with};
+use crate::{quality_str, resolve_play_url_script};
 use tauri::{Emitter, State};
 
 use crate::AppState;
 use crate::db::store::{DownloadTask, HistoryItem, PlaylistSummary};
-
-// ---------- 音源 ----------
-
-#[tauri::command(rename = "search_music")]
-pub async fn cmd_search_music(
-    state: State<'_, AppState>,
-    keyword: String,
-    source: SourceId,
-    page: u32,
-    size: u32,
-) -> Result<Vec<Track>, ProviderError> {
-    let provider = state.registry.get(source)?;
-    provider
-        .search_tracks(&keyword, page.max(1), size.clamp(1, 30))
-        .await
-}
-
-#[tauri::command(rename = "get_play_url")]
-pub async fn cmd_get_play_url(
-    state: State<'_, AppState>,
-    track: Track,
-    quality: Quality,
-) -> Result<crate::provider::types::PlayUrl, ProviderError> {
-    let (url, fetched_at) =
-        resolve_play_url_with(&state.registry, &state.url_cache, &track, quality).await?;
-    let ttl = 10 * 60 * 1000u64;
-    Ok(crate::provider::types::PlayUrl {
-        url,
-        quality,
-        fetched_at,
-        expires_at: fetched_at + ttl,
-    })
-}
-
-#[tauri::command(rename = "get_lyric")]
-pub async fn cmd_get_lyric(
-    state: State<'_, AppState>,
-    track: Track,
-) -> Result<crate::provider::types::Lyric, ProviderError> {
-    // 换源取词：当前播放地址若是跨源兜底来的，歌词必须跟着那个源走
-    //（目标源按歌名搜到的可能是不同录音版本，按原源取词会对不上）。
-    // 新源取词失败则回退原源 —— 有词总比没词强。
-    let snap = state.engine.snapshot();
-    if snap.track_id.as_deref() == Some(track.id.as_str()) {
-        if let Some(url) = snap.play_url.as_deref().filter(|u| !u.is_empty()) {
-            if let Some(actual) = crate::provider::source_fallback_for(url) {
-                log::info!(
-                    "[lyric] 歌曲换源到 {}，歌词跟着新源取",
-                    actual.platform
-                );
-                if let Ok(p) = state.registry.get(actual.platform) {
-                    if let Ok(l) = p.lyric(&actual).await {
-                        return Ok(l);
-                    }
-                }
-                log::warn!("[lyric] 换源取词失败，回退原源");
-            }
-        }
-    }
-    let provider = state.registry.get(track.platform)?;
-    provider.lyric(&track).await
-}
-
-/// MV/视频播放地址（quality：auto / hd / low）。前端用 qtres://mv/<base64url> 加载（§6.13 Range 透传）。
-#[tauri::command(rename = "get_video_url")]
-pub async fn cmd_get_video_url(
-    state: State<'_, AppState>,
-    source: SourceId,
-    video_id: String,
-    quality: String,
-) -> Result<String, ProviderError> {
-    let provider = state.registry.get(source)?;
-    provider.video_url(&video_id, &quality).await
-}
-
-// ---------- 发现类能力（DESIGN §6.5 IPC 名映射，M5 / M6） ----------
-//
-// 聚合命令（get_all_* / search_all_*）按 §6.4 要点 5：
-// 单源 Err 只记日志并跳过，全部失败才向前端返回 Empty。
-
-/// 聚合辅助：取单源 provider 并调用；失败只记日志（不向上抛）。
-async fn collect<T, F>(
-    source: SourceId,
-    fut: F,
-) -> Option<Vec<T>>
-where
-    F: std::future::Future<Output = Result<Vec<T>, ProviderError>>,
-{
-    match fut.await {
-        Ok(v) if !v.is_empty() => Some(v),
-        Ok(_) => None,
-        Err(e) => {
-            log::warn!("[discovery] {source} 聚合失败: {e}");
-            None
-        }
-    }
-}
-
-#[tauri::command(rename = "get_playlist_categories")]
-pub async fn cmd_get_playlist_categories(
-    state: State<'_, AppState>,
-    source: SourceId,
-) -> Result<Vec<PlaylistCategory>, ProviderError> {
-    let provider = state.registry.get(source)?;
-    provider.playlist_categories().await
-}
-
-#[tauri::command(rename = "get_recommendations")]
-pub async fn cmd_get_recommendations(
-    state: State<'_, AppState>,
-    source: SourceId,
-    category: Option<String>,
-    page: u32,
-) -> Result<Vec<Playlist>, ProviderError> {
-    let provider = state.registry.get(source)?;
-    provider
-        .recommendations(category.as_deref(), page.max(1))
-        .await
-}
 
 // ---------- 音源脚本内置方法（插件化方案 v3 · 试点） ----------
 //
@@ -202,7 +81,10 @@ pub(crate) async fn source_builtin_request(
     if let Some(body) = options.and_then(|o| o.body.as_deref()) {
         req = req.body(body.to_string());
     }
-    let res = req.send().await.map_err(|e| e.to_string())?;
+    let res = req
+        .send()
+        .await
+        .map_err(crate::astral::sanitize_err)?;
     let status = res.status().as_u16();
     let mut headers = std::collections::HashMap::new();
     for (name, value) in res.headers() {
@@ -213,7 +95,10 @@ pub(crate) async fn source_builtin_request(
     // 上游 content-type 不可靠（网易歌单接口回 text/plain、QQ 回 x-javascript、
     // 酷狗回 text/html），对齐蓝本 http.ts 的行为：不看 content-type 直接尝试
     // JSON 解析，失败则原样字符串。
-    let text = res.text().await.map_err(|e| e.to_string())?;
+    let text = res
+        .text()
+        .await
+        .map_err(crate::astral::sanitize_err)?;
     let body = serde_json::from_str::<serde_json::Value>(&text)
         .unwrap_or(serde_json::Value::String(text));
     Ok(SourceResponse {
@@ -231,268 +116,42 @@ pub async fn cmd_builtin_request(
     source_builtin_request(&url, options.as_ref()).await
 }
 
-
-#[tauri::command(rename = "get_latest_songs")]
-pub async fn cmd_get_latest_songs(
-    state: State<'_, AppState>,
-    source: SourceId,
-    limit: u32,
-    offset: u32,
-) -> Result<Vec<Track>, ProviderError> {
-    let provider = state.registry.get(source)?;
-    provider.latest(limit.clamp(1, 50), offset).await
-}
-
-/// 聚合：四源新歌速递
-#[tauri::command(rename = "get_all_latest_songs")]
-pub async fn cmd_get_all_latest_songs(
-    state: State<'_, AppState>,
-    limit: u32,
-    offset: u32,
-) -> Result<Vec<Track>, ProviderError> {
-    let limit = limit.clamp(1, 50);
-    let (a, b, c, d) = tokio::join!(
-        collect(SourceId::Wyy, call_latest(&state, SourceId::Wyy, limit, offset)),
-        collect(SourceId::Qq, call_latest(&state, SourceId::Qq, limit, offset)),
-        collect(SourceId::Kw, call_latest(&state, SourceId::Kw, limit, offset)),
-        collect(SourceId::Kg, call_latest(&state, SourceId::Kg, limit, offset)),
-    );
-    merge_all([a, b, c, d])
-}
-
-async fn call_latest(
-    state: &AppState,
-    source: SourceId,
-    limit: u32,
-    offset: u32,
-) -> Result<Vec<Track>, ProviderError> {
-    let provider = state.registry.get(source)?;
-    provider.latest(limit, offset).await
-}
-
-#[tauri::command(rename = "get_charts")]
-pub async fn cmd_get_charts(
-    state: State<'_, AppState>,
-    source: SourceId,
-) -> Result<Vec<Chart>, ProviderError> {
-    let provider = state.registry.get(source)?;
-    provider.charts().await
-}
-
-/// 聚合：四源排行榜
-#[tauri::command(rename = "get_all_charts")]
-pub async fn cmd_get_all_charts(
-    state: State<'_, AppState>,
-) -> Result<Vec<Chart>, ProviderError> {
-    let (a, b, c, d) = tokio::join!(
-        collect(SourceId::Wyy, call_charts(&state, SourceId::Wyy)),
-        collect(SourceId::Qq, call_charts(&state, SourceId::Qq)),
-        collect(SourceId::Kw, call_charts(&state, SourceId::Kw)),
-        collect(SourceId::Kg, call_charts(&state, SourceId::Kg)),
-    );
-    merge_all([a, b, c, d])
-}
-
-async fn call_charts(
-    state: &AppState,
-    source: SourceId,
-) -> Result<Vec<Chart>, ProviderError> {
-    let provider = state.registry.get(source)?;
-    provider.charts().await
-}
-
-/// 榜单详情：chart 携带 platform + id，据此分发到对应音源
-#[tauri::command(rename = "get_chart_detail")]
-pub async fn cmd_get_chart_detail(
-    state: State<'_, AppState>,
-    chart: Chart,
-    page: u32,
-    size: u32,
-) -> Result<Vec<Track>, ProviderError> {
-    let provider = state.registry.get(chart.platform)?;
-    provider
-        .chart_detail(&chart, page.max(1), size.clamp(1, 100))
-        .await
-}
-
-#[tauri::command(rename = "get_playlist_detail")]
-pub async fn cmd_get_playlist_detail(
-    state: State<'_, AppState>,
-    source: SourceId,
-    id: String,
-    page: u32,
-    size: u32,
-) -> Result<Playlist, ProviderError> {
-    let provider = state.registry.get(source)?;
-    provider.playlist(&id, page.max(1), size.clamp(1, 100)).await
-}
-
-#[tauri::command(rename = "get_hot_words")]
-pub async fn cmd_get_hot_words(
-    state: State<'_, AppState>,
-    source: SourceId,
-) -> Result<Vec<String>, ProviderError> {
-    let provider = state.registry.get(source)?;
-    provider.hot_words().await
-}
-
-/// 聚合：四源热词（字符串列表，去重保持顺序）
-#[tauri::command(rename = "get_all_hot_words")]
-pub async fn cmd_get_all_hot_words(
-    state: State<'_, AppState>,
-) -> Result<Vec<String>, ProviderError> {
-    let (a, b, c, d) = tokio::join!(
-        call_hot_words(&state, SourceId::Wyy),
-        call_hot_words(&state, SourceId::Qq),
-        call_hot_words(&state, SourceId::Kw),
-        call_hot_words(&state, SourceId::Kg),
-    );
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for r in [a, b, c, d] {
-        match r {
-            Ok(words) => {
-                for w in words {
-                    if seen.insert(w.clone()) {
-                        out.push(w);
-                    }
-                }
-            }
-            Err(e) => log::warn!("[discovery] 热词聚合失败: {e}"),
-        }
-    }
-    if out.is_empty() {
-        return Err(ProviderError::Empty);
-    }
-    Ok(out)
-}
-
-async fn call_hot_words(
-    state: &AppState,
-    source: SourceId,
-) -> Result<Vec<String>, ProviderError> {
-    let provider = state.registry.get(source)?;
-    provider.hot_words().await
-}
-
-#[tauri::command(rename = "search_playlists")]
-pub async fn cmd_search_playlists(
-    state: State<'_, AppState>,
-    source: SourceId,
-    keyword: String,
-    page: u32,
-    size: u32,
-) -> Result<Vec<Playlist>, ProviderError> {
-    let provider = state.registry.get(source)?;
-    provider
-        .search_playlists(&keyword, page.max(1), size.clamp(1, 30))
-        .await
-}
-
-#[tauri::command(rename = "search_artists")]
-pub async fn cmd_search_artists(
-    state: State<'_, AppState>,
-    source: SourceId,
-    keyword: String,
-    page: u32,
-    size: u32,
-) -> Result<Vec<Artist>, ProviderError> {
-    let provider = state.registry.get(source)?;
-    provider
-        .search_artists(&keyword, page.max(1), size.clamp(1, 30))
-        .await
-}
-
-#[tauri::command(rename = "search_albums")]
-pub async fn cmd_search_albums(
-    state: State<'_, AppState>,
-    source: SourceId,
-    keyword: String,
-    page: u32,
-    size: u32,
-) -> Result<Vec<Album>, ProviderError> {
-    let provider = state.registry.get(source)?;
-    provider
-        .search_albums(&keyword, page.max(1), size.clamp(1, 30))
-        .await
-}
-
-#[tauri::command(rename = "get_artist_songs")]
-pub async fn cmd_get_artist_songs(
-    state: State<'_, AppState>,
-    source: SourceId,
-    name: String,
-    page: u32,
-    size: u32,
-) -> Result<Vec<Track>, ProviderError> {
-    let provider = state.registry.get(source)?;
-    provider
-        .artist_songs(&name, page.max(1), size.clamp(1, 50))
-        .await
-}
-
-#[tauri::command(rename = "get_videos")]
-pub async fn cmd_get_videos(
-    state: State<'_, AppState>,
-    source: SourceId,
-    page: u32,
-    size: u32,
-) -> Result<Vec<Video>, ProviderError> {
-    let provider = state.registry.get(source)?;
-    provider.videos(page.max(1), size.clamp(1, 30)).await
-}
-
-/// 聚合：四源歌曲搜索（搜索页「全部」页签）
-#[tauri::command(rename = "search_all_music_sources")]
-pub async fn cmd_search_all_music_sources(
-    state: State<'_, AppState>,
-    keyword: String,
-    page: u32,
-    size: u32,
-) -> Result<Vec<Track>, ProviderError> {
-    let page = page.max(1);
-    let size = size.clamp(1, 30);
-    let (a, b, c, d) = tokio::join!(
-        collect(SourceId::Wyy, call_search(&state, SourceId::Wyy, &keyword, page, size)),
-        collect(SourceId::Qq, call_search(&state, SourceId::Qq, &keyword, page, size)),
-        collect(SourceId::Kw, call_search(&state, SourceId::Kw, &keyword, page, size)),
-        collect(SourceId::Kg, call_search(&state, SourceId::Kg, &keyword, page, size)),
-    );
-    merge_all([a, b, c, d])
-}
-
-async fn call_search(
-    state: &AppState,
-    source: SourceId,
-    keyword: &str,
-    page: u32,
-    size: u32,
-) -> Result<Vec<Track>, ProviderError> {
-    let provider = state.registry.get(source)?;
-    provider.search_tracks(keyword, page, size).await
-}
-
-/// 封面补全（picUrl 为空时按歌名 + 歌手搜索兜底，DESIGN §6.5 get_track_cover）
-#[tauri::command(rename = "get_track_cover")]
-pub async fn cmd_get_track_cover(
+/// 取链脚本化（方案 v3）：前端共享脚本包解析出的播放地址回填引擎缓存。
+///
+/// 引擎侧取链的缓存键为 `{platform}:{trackId}:{quality}`，
+/// 回填后播放/预取直接命中缓存；未回填（解析失败）时引擎经
+/// playurl_bridge 现问前端，仍失败则本次取链按失败处理。
+#[tauri::command(rename = "set_resolved_play_url")]
+pub async fn cmd_set_resolved_play_url(
     state: State<'_, AppState>,
     track: Track,
-) -> Result<String, ProviderError> {
-    let provider = state.registry.get(track.platform)?;
-    provider.cover(&track).await
+    quality: Quality,
+    url: String,
+) -> Result<(), ProviderError> {
+    if url.is_empty() {
+        return Ok(());
+    }
+    let key = PlayUrlCache::cache_key(
+        &track.platform.to_string(),
+        &track.id,
+        crate::quality_str(quality),
+    );
+    state.url_cache.set(key, url);
+    Ok(())
 }
 
-/// 把四个源的聚合结果合并；全空视为无结果（§6.4 要点 5）
-fn merge_all<T>(parts: [Option<Vec<T>>; 4]) -> Result<Vec<T>, ProviderError> {
-    let mut out = Vec::new();
-    for mut v in parts.into_iter().flatten() {
-        out.append(&mut v);
-    }
-    if out.is_empty() {
-        Err(ProviderError::Empty)
-    } else {
-        Ok(out)
-    }
+/// 引擎 → 前端取链桥（playurl_bridge）：主窗口挂载后置就绪标志。
+/// 未就绪期间引擎的取链不等待，直接按失败处理（前端未挂载时必然无答案）。
+#[tauri::command(rename = "script_bridge_ready")]
+pub async fn cmd_script_bridge_ready() {
+    crate::playurl_bridge::set_ready();
+}
+
+/// 引擎 → 前端取链桥（playurl_bridge）：前端脚本包按 requestId 应答播放地址；
+/// 空串 = 前端解析失败，引擎把本次取链按失败处理。
+#[tauri::command(rename = "resolve_play_url_reply")]
+pub async fn cmd_resolve_play_url_reply(request_id: u64, url: String) {
+    crate::playurl_bridge::reply(request_id, url);
 }
 
 #[tauri::command(rename = "invalidate_play_url")]
@@ -501,7 +160,7 @@ pub async fn cmd_invalidate_play_url(
     track: Track,
     quality: Quality,
 ) -> Result<(), String> {
-    let key = crate::provider::registry::PlayUrlCache::cache_key(
+    let key = crate::provider::url_cache::PlayUrlCache::cache_key(
         &track.platform.to_string(),
         &track.id,
         quality_str(quality),
@@ -1320,72 +979,6 @@ pub async fn cmd_get_local_cover(path: String) -> Result<Option<String>, String>
     })
     .await
     .map_err(|e| format!("读取封面失败: {e}"))
-}
-
-/// 本地曲目的在线元数据（酷我匹配）：歌词 + 翻译 + 封面。
-///
-/// 本地文件没有平台 id，直接按 id 取歌词只会得到 `unsupported`；这里改为按
-/// 「歌名 + 歌手」在酷我搜一次，取首个命中（同一首可能多个版本，取最相关的）。
-/// 匹配不到 / 音源不可用一律返回空结构，由前端显示「没有歌词」，不再向用户抛错。
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct LocalOnlineMeta {
-    pub lrc: String,
-    pub translation: String,
-    pub pic_url: String,
-}
-
-impl LocalOnlineMeta {
-    fn empty() -> Self {
-        Self {
-            lrc: String::new(),
-            translation: String::new(),
-            pic_url: String::new(),
-        }
-    }
-}
-
-#[tauri::command(rename = "get_local_online_meta")]
-pub async fn cmd_get_local_online_meta(
-    state: State<'_, AppState>,
-    title: String,
-    singer: String,
-) -> Result<LocalOnlineMeta, String> {
-    let title = title.trim();
-    if title.is_empty() {
-        return Ok(LocalOnlineMeta::empty());
-    }
-    let Ok(provider) = state.registry.get(SourceId::Kw) else {
-        return Ok(LocalOnlineMeta::empty());
-    };
-    let singer = singer.trim();
-    let keyword = if singer.is_empty() {
-        title.to_string()
-    } else {
-        format!("{title} {singer}")
-    };
-    let Ok(hits) = provider.search_tracks(&keyword, 1, 5).await else {
-        return Ok(LocalOnlineMeta::empty());
-    };
-    // 逐个命中取封面 / 歌词：多数情况第 1 条就齐了，歌词为空（纯音乐等）时才看下一条
-    let mut meta = LocalOnlineMeta::empty();
-    for hit in &hits {
-        if meta.pic_url.is_empty() && !hit.pic_url.is_empty() {
-            meta.pic_url = hit.pic_url.clone();
-        }
-        if meta.lrc.is_empty() {
-            if let Ok(lyric) = provider.lyric(hit).await {
-                if !lyric.lrc.trim().is_empty() {
-                    meta.lrc = lyric.lrc;
-                    meta.translation = lyric.translation;
-                }
-            }
-        }
-        if !meta.pic_url.is_empty() && !meta.lrc.is_empty() {
-            break;
-        }
-    }
-    Ok(meta)
 }
 
 /// 扫描目录清单（scan_dirs 表）。
@@ -2327,7 +1920,7 @@ pub async fn cmd_start_download(
 
     // 取址放在建任务之前：失败就干净报错，不留悬挂任务
     let (url, _fetched) =
-        resolve_play_url_with(&state.registry, &state.url_cache, &track, quality)
+        resolve_play_url_script(&app, &state.url_cache, &track, quality)
             .await
             .map_err(|e| format!("取播放地址失败: {e}"))?;
 
@@ -2539,7 +2132,6 @@ async fn relaunch_download(
     let app_for_job = app.clone();
     let db_for_job = Arc::clone(&db);
     let manager = Arc::clone(&state.downloads);
-    let registry = Arc::clone(&state.registry);
     let url_cache = Arc::clone(&state.url_cache);
     let track = task.track.clone();
     let existing_part = task.part_path.clone();
@@ -2550,7 +2142,6 @@ async fn relaunch_download(
             app_for_job,
             db_for_job,
             manager,
-            registry,
             url_cache,
             task_id,
             track,
@@ -2573,7 +2164,6 @@ async fn launch_download(
     app: tauri::AppHandle,
     db: Arc<crate::db::Database>,
     manager: Arc<DownloadManager>,
-    registry: Arc<ProviderRegistry>,
     url_cache: Arc<PlayUrlCache>,
     task_id: String,
     track: Track,
@@ -2581,7 +2171,7 @@ async fn launch_download(
     dir: PathBuf,
     existing_part: Option<String>,
 ) -> Result<(), String> {
-    let (url, _) = resolve_play_url_with(&registry, &url_cache, &track, quality)
+    let (url, _) = resolve_play_url_script(&app, &url_cache, &track, quality)
         .await
         .map_err(|e| format!("取播放地址失败: {e}"))?;
 

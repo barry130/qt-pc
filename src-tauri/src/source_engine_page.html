@@ -1,0 +1,212 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>轻听音源引擎</title>
+  </head>
+  <body>
+    <!--
+      音源引擎页（音源包热更新方案 P1）：
+      - 由 qtres:// 协议内嵌提供（无 CSP 注入 → 可自由动态 import 音源包脚本）；
+      - __TAURI_INTERNALS__ 由 Tauri 注入（withGlobalTauri 仍为 false，不用全局 API）；
+      - 职责：读安装状态 → import bundle → createSourceLayer(注入 builtin_request)
+        → 冒烟（编译级必做；?smoke=1 时追加真实取链）→ 监听主窗口取链 RPC。
+      - 主窗口侧封装见 src/source-engine/client.ts；任何失败都回退主窗口内置层。
+    -->
+    <script type="module">
+      "use strict";
+
+      const internals = await waitInternals();
+      const invoke = internals.invoke.bind(internals);
+      const transformCallback = internals.transformCallback.bind(internals);
+
+      /** 主窗口事件目标（emit_to 用 AnyLabel；对齐 @tauri-apps/api emitTo） */
+      const MAIN_TARGET = { kind: "AnyLabel", label: "main" };
+
+      /** 冒烟探针（§2.4：已知免费歌）——与 scripts/smoke-bundle.mjs 同一首 */
+      const SMOKE_SONG = {
+        id: "1901371647",
+        name: "孤勇者",
+        singer: "陈奕迅",
+        album: "",
+        picUrl: "",
+        interval: 0,
+      };
+
+      let layer = null;
+      let loadedCode = 0;
+      /** 页面生命周期：booting → builtin | ready | error（状态查询 RPC 回这个） */
+      let phase = "booting";
+      let phaseDetail = null;
+
+      async function waitInternals() {
+        for (let i = 0; i < 100; i++) {
+          const api = window.__TAURI_INTERNALS__;
+          if (api && typeof api.invoke === "function") return api;
+          await new Promise((r) => setTimeout(r, 50));
+        }
+        throw new Error("__TAURI_INTERNALS__ 注入失败");
+      }
+
+      async function emitToMain(event, payload) {
+        try {
+          await invoke("plugin:event|emit_to", {
+            target: MAIN_TARGET,
+            event,
+            payload,
+          });
+        } catch {
+          // 主窗口不在：无对策，引擎继续自持
+        }
+      }
+
+      function report(phase, extra) {
+        return emitToMain("source-engine-status", { phase, ...(extra || {}) });
+      }
+
+      /** 读安装状态并加载远程 bundle；无包 → 返回 null（主窗口走内置层） */
+      async function loadBundle() {
+        let state;
+        try {
+          state = await invoke("source_state");
+        } catch {
+          return null; // 宿主太老/状态读取失败：按无包处理
+        }
+        const installed = state && state.installed;
+        if (!installed || !installed.dir) return null;
+        const mod = await import(
+          "/script/" + encodeURIComponent(String(installed.dir)) + "/source-bundle.js"
+        );
+        if (!mod || typeof mod.createSourceLayer !== "function") {
+          throw new Error("bundle 缺少 createSourceLayer 导出");
+        }
+        // 编译级冒烟（§2.4 第 2 层）：链配置可完整解析
+        const cfg = mod.parseChainConfig(mod.defaultChainConfig());
+        if (!cfg || typeof cfg.chainRevision !== "number") {
+          throw new Error("bundle 链配置解析失败");
+        }
+        return { code: Number(installed.sourceVersionCode) || 0, mod };
+      }
+
+      /** 真实网络冒烟（§2.4 第 3 层，仅 ?smoke=1）：取链 + Range 预检 */
+      async function networkSmoke() {
+        const url = await layer.resolvePlayUrl("wyy", SMOKE_SONG, "128");
+        if (!url) throw new Error("冒烟取链返回空");
+        const res = await invoke("builtin_request", {
+          url,
+          options: {
+            method: "GET",
+            headers: { Range: "bytes=0-1" },
+            timeoutMs: 8000,
+          },
+        });
+        const status = Number(res.statusCode);
+        // 与 bundle 内 verifyPlayable 同口径：4xx 只放行 403/416
+        const statusOk = status < 400 || status === 403 || status === 416;
+        if (!statusOk) throw new Error("冒烟 Range 预检失败: HTTP " + status);
+        const contentType = String(
+          (res.headers && (res.headers["content-type"] || res.headers["Content-Type"])) || "",
+        ).toLowerCase();
+        if (/json|html|text\/plain/.test(contentType)) {
+          throw new Error("冒烟取到错误页: " + contentType);
+        }
+      }
+
+      async function boot() {
+        await report("booting");
+        let loaded = null;
+        try {
+          loaded = await loadBundle();
+        } catch (err) {
+          layer = null;
+          const detail = String((err && err.message) || err);
+          phase = "error";
+          phaseDetail = detail;
+          await report("error", { code: loadedCode || null, detail });
+          if (loadedCode) {
+            await invoke("source_mark_bad", { code: loadedCode, detail }).catch(() => {});
+          }
+          return;
+        }
+        if (!loaded) {
+          phase = "builtin";
+          await report("builtin");
+          return;
+        }
+        layer = loaded.mod.createSourceLayer({
+          request: (url, options) =>
+            invoke("builtin_request", { url, options: options || null }),
+          platform: (loaded.mod.PLATFORMS && loaded.mod.PLATFORMS.WINDOWS) || 1103,
+        });
+        loadedCode = loaded.code;
+        if (new URLSearchParams(location.search).get("smoke") === "1") {
+          try {
+            await networkSmoke();
+            await invoke("source_report", {
+              sourceVersionCode: loadedCode,
+              result: "ok",
+              detail: "",
+            }).catch(() => {});
+          } catch (err) {
+            layer = null;
+            const detail = String((err && err.message) || err);
+            phase = "error";
+            phaseDetail = detail;
+            await report("error", { code: loadedCode, detail });
+            await invoke("source_mark_bad", {
+              code: loadedCode,
+              detail,
+              result: "smoke_failed",
+            }).catch(() => {});
+            return;
+          }
+        }
+        phase = "ready";
+        await report("ready", { code: loadedCode });
+      }
+
+      /** 主窗口取链 RPC：source-engine-request → source-engine-response。
+       *  kind "status" = 查询当前生命周期（client 绑定晚于引擎启动也能对齐状态）；
+       *  kind "resolve" = 取链（url "" = 失败/无可用层）。 */
+      async function onRequest(event) {
+        const payload = (event && event.payload) || {};
+        const requestId = payload.requestId;
+        if (typeof requestId !== "number") return;
+        if (payload.kind === "status") {
+          await emitToMain("source-engine-response", {
+            requestId,
+            phase,
+            code: loadedCode || null,
+            detail: phaseDetail,
+          });
+          return;
+        }
+        let url = "";
+        try {
+          if (layer && typeof payload.source === "string") {
+            url = (await layer.resolvePlayUrl(
+              payload.source,
+              payload.song,
+              payload.quality,
+            )) || "";
+          }
+        } catch {
+          url = "";
+        }
+        await emitToMain("source-engine-response", { requestId, url });
+      }
+
+      await invoke("plugin:event|listen", {
+        event: "source-engine-request",
+        target: { kind: "Any" },
+        handler: transformCallback(onRequest),
+      }).catch(() => {});
+
+      try {
+        await boot();
+      } catch (err) {
+        await report("error", { detail: String((err && err.message) || err) }).catch(() => {});
+      }
+    </script>
+  </body>
+</html>

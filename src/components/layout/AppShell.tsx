@@ -5,15 +5,18 @@ import { ONBOARDING_KEY } from "@/components/onboarding/OnboardingPage";
 import { useAuthStore } from "@/stores/auth";
 import { TitleBar } from "@/components/TitleBar";
 import { Sidebar } from "@/components/layout/Sidebar";
+import { KeepAliveOutlet, isKeepAlivePath } from "@/components/layout/KeepAliveOutlet";
 import { PlayerBar } from "@/components/PlayerBar";
 import { QueuePanel } from "@/components/player/QueuePanel";
 import { useFramelessWindow } from "@/hooks/useFramelessWindow";
 import { usePlaybackEvents } from "@/hooks/usePlaybackEvents";
+import { usePlayUrlBridge } from "@/hooks/usePlayUrlBridge";
 import { useAppearanceEffect } from "@/hooks/useAppearanceEffect";
 import { useCoverColor } from "@/hooks/useCoverColor";
 import { usePlayingCoverBg } from "@/hooks/usePlayingCoverBg";
 import { useLocalTrackOnlineMeta } from "@/hooks/useLocalTrackOnlineMeta";
 import { useUpdateCheck } from "@/hooks/useUpdateCheck";
+import { useSourceUpdateCheck } from "@/hooks/useSourceUpdateCheck";
 import { useAppearanceStore } from "@/stores/appearance";
 import { usePlayerStore } from "@/stores/player";
 import { useDownloadsStore } from "@/stores/downloads";
@@ -28,11 +31,15 @@ import { UpdateDialog } from "@/components/update/UpdateDialog";
 export function AppShell(): React.JSX.Element {
   useFramelessWindow();
   usePlaybackEvents();
+  // 引擎→前端取链桥：聚合/脚本方案覆盖引擎主导的换歌（自动切歌/随机/重取）
+  usePlayUrlBridge();
   useAppearanceEffect();
   useCoverColor();
   usePlayingCoverBg();
   useLocalTrackOnlineMeta();
   useUpdateCheck();
+  // 音源包启动检查（静默，4h 节流；发现新包只落盘，设置页可立即应用）
+  useSourceUpdateCheck();
 
   const bgImage = useAppearanceStore((s) => s.preference.bgImage);
   // 无封面 URL 的曲目（部分 wyy 曲 picUrl 为空）不渲染背景，避免退化成固定 --primary 色
@@ -170,7 +177,9 @@ export function AppShell(): React.JSX.Element {
         {!isPlayingPage && <Sidebar />}
         <main className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
           <div className="relative z-10 h-full">
-            <Outlet />
+            {/* 一级页面常驻缓存（切 tab 不再整页重载）；其余路由仍走 Outlet */}
+            <KeepAliveOutlet pathname={pathname} />
+            {!isKeepAlivePath(pathname) && <Outlet />}
           </div>
         </main>
         {!isPlayingPage && <QueuePanel />}

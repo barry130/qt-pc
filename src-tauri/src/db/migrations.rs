@@ -113,8 +113,125 @@ const V8: &str = r#"
 ALTER TABLE playlists ADD COLUMN cloud_seq INTEGER;
 "#;
 
+/// 酷狗时长单位混乱（毫秒/秒混用）导致的历史脏数据修复。
+///
+/// 只处理 kg，`duration_ms` 正常落在 60000–3600000（1–60 分钟）。
+/// 值 < 3000 的属「秒被当成毫秒存」（如 214 实为 214 秒），×1000 还原；
+/// 值 > 20_000_000 的属「毫秒被当秒再 ×1000」（如 197098000），÷1000 还原。
+/// 两个区间与正常值都不重叠，幂等；修完的值不会再落进任一区间。
+const V9: &str = r#"
+UPDATE tracks
+   SET duration_ms = duration_ms * 1000
+ WHERE platform = 'kg'
+   AND duration_ms > 0
+   AND duration_ms < 3000;
+UPDATE tracks
+   SET duration_ms = duration_ms / 1000
+ WHERE platform = 'kg'
+   AND duration_ms > 20000000;
+"#;
+
+/// 补齐 V9：早期版本的 V9 用的是「> 5_000_000 才 ÷1000」的粗糙规则，
+/// 漏掉了「秒被当毫秒存」这一类（值落在 165–403，例如 214 实为 214 秒）。
+/// 这里按与 V9 相同的数量级规则重跑一遍——对已按新规则修过的库是空操作，
+/// 对只跑过旧 V9 的库则补上缺失的修正。幂等：修完的值不再落进这两个区间。
+const V10: &str = r#"
+UPDATE tracks
+   SET duration_ms = duration_ms * 1000
+ WHERE platform = 'kg'
+   AND duration_ms > 0
+   AND duration_ms < 3000;
+UPDATE tracks
+   SET duration_ms = duration_ms / 1000
+ WHERE platform = 'kg'
+   AND duration_ms > 20000000;
+"#;
+
+/// 酷狗 hash 大小写不敏感，但各接口回的大小写不一致（playInfo 回大写、
+/// 部分搜索接口回小写），同一首歌因此落成两条 `tracks`
+/// （`kg:37a8f50a…` 与 `kg:37A8F50A…`）。这里合并重复并把所有 kg id 统一大写。
+///
+/// 顺序：先合并大小写重复（引用改指保留行 → 删重复行），再把剩余小写 id 连同
+/// 引用一起改成大写。`track_id` 作主键的引用表（play_stats / lyrics /
+/// lyric_settings / playlist_tracks / liked_song_playlists）要先删掉「目标已存在」
+/// 的冲突行，否则 UPDATE 撞主键；liked_songs 存的是裸 hash，单独处理。
+/// 父行改 id 时子引用必须同时改，SQLite 的外键是即时校验，故用
+/// `defer_foreign_keys` 把校验推迟到 COMMIT（事务内该 pragma 才生效）。
+const V11: &str = r#"
+PRAGMA defer_foreign_keys = ON;
+
+CREATE TEMP TABLE kg_dup AS
+SELECT t.id AS dupe, u.id AS keep
+  FROM tracks t
+  JOIN tracks u
+    ON u.platform = 'kg'
+   AND u.id = 'kg:' || upper(substr(t.id, 4))
+ WHERE t.platform = 'kg'
+   AND t.id <> u.id;
+
+DELETE FROM playlist_tracks
+ WHERE track_id IN (SELECT dupe FROM kg_dup)
+   AND EXISTS (SELECT 1 FROM playlist_tracks k
+                WHERE k.playlist_id = playlist_tracks.playlist_id
+                  AND k.track_id = (SELECT keep FROM kg_dup WHERE dupe = playlist_tracks.track_id));
+DELETE FROM liked_song_playlists
+ WHERE song_id IN (SELECT dupe FROM kg_dup)
+   AND EXISTS (SELECT 1 FROM liked_song_playlists k
+                WHERE k.pid = liked_song_playlists.pid
+                  AND k.song_id = (SELECT keep FROM kg_dup WHERE dupe = liked_song_playlists.song_id));
+DELETE FROM play_stats
+ WHERE track_id IN (SELECT dupe FROM kg_dup)
+   AND EXISTS (SELECT 1 FROM play_stats k
+                WHERE k.track_id = (SELECT keep FROM kg_dup WHERE dupe = play_stats.track_id));
+DELETE FROM lyrics
+ WHERE track_id IN (SELECT dupe FROM kg_dup)
+   AND EXISTS (SELECT 1 FROM lyrics k
+                WHERE k.track_id = (SELECT keep FROM kg_dup WHERE dupe = lyrics.track_id));
+DELETE FROM lyric_settings
+ WHERE track_id IN (SELECT dupe FROM kg_dup)
+   AND EXISTS (SELECT 1 FROM lyric_settings k
+                WHERE k.track_id = (SELECT keep FROM kg_dup WHERE dupe = lyric_settings.track_id));
+
+UPDATE play_history   SET track_id = (SELECT keep FROM kg_dup WHERE dupe = play_history.track_id)   WHERE track_id IN (SELECT dupe FROM kg_dup);
+UPDATE play_stats     SET track_id = (SELECT keep FROM kg_dup WHERE dupe = play_stats.track_id)     WHERE track_id IN (SELECT dupe FROM kg_dup);
+UPDATE play_queue     SET track_id = (SELECT keep FROM kg_dup WHERE dupe = play_queue.track_id)     WHERE track_id IN (SELECT dupe FROM kg_dup);
+UPDATE download_tasks SET track_id = (SELECT keep FROM kg_dup WHERE dupe = download_tasks.track_id) WHERE track_id IN (SELECT dupe FROM kg_dup);
+UPDATE lyrics         SET track_id = (SELECT keep FROM kg_dup WHERE dupe = lyrics.track_id)         WHERE track_id IN (SELECT dupe FROM kg_dup);
+UPDATE lyric_settings SET track_id = (SELECT keep FROM kg_dup WHERE dupe = lyric_settings.track_id) WHERE track_id IN (SELECT dupe FROM kg_dup);
+UPDATE playlist_tracks SET track_id = (SELECT keep FROM kg_dup WHERE dupe = playlist_tracks.track_id) WHERE track_id IN (SELECT dupe FROM kg_dup);
+UPDATE liked_song_playlists SET song_id = (SELECT keep FROM kg_dup WHERE dupe = liked_song_playlists.song_id) WHERE song_id IN (SELECT dupe FROM kg_dup);
+UPDATE liked_songs SET sid = upper(sid)
+ WHERE platform = 'kg'
+   AND sid <> upper(sid)
+   AND NOT EXISTS (SELECT 1 FROM liked_songs k
+                    WHERE k.platform = 'kg' AND k.uid = liked_songs.uid
+                      AND k.sid = upper(liked_songs.sid) AND k.id <> liked_songs.id);
+
+DELETE FROM tracks WHERE id IN (SELECT dupe FROM kg_dup);
+DROP TABLE kg_dup;
+
+CREATE TEMP TABLE kg_rename AS
+SELECT t.id AS old_id, 'kg:' || upper(substr(t.id, 4)) AS new_id
+  FROM tracks t
+ WHERE t.platform = 'kg'
+   AND t.id <> 'kg:' || upper(substr(t.id, 4));
+
+UPDATE play_history   SET track_id = (SELECT new_id FROM kg_rename WHERE old_id = play_history.track_id)   WHERE track_id IN (SELECT old_id FROM kg_rename);
+UPDATE play_stats     SET track_id = (SELECT new_id FROM kg_rename WHERE old_id = play_stats.track_id)     WHERE track_id IN (SELECT old_id FROM kg_rename);
+UPDATE play_queue     SET track_id = (SELECT new_id FROM kg_rename WHERE old_id = play_queue.track_id)     WHERE track_id IN (SELECT old_id FROM kg_rename);
+UPDATE download_tasks SET track_id = (SELECT new_id FROM kg_rename WHERE old_id = download_tasks.track_id) WHERE track_id IN (SELECT old_id FROM kg_rename);
+UPDATE lyrics         SET track_id = (SELECT new_id FROM kg_rename WHERE old_id = lyrics.track_id)         WHERE track_id IN (SELECT old_id FROM kg_rename);
+UPDATE lyric_settings SET track_id = (SELECT new_id FROM kg_rename WHERE old_id = lyric_settings.track_id) WHERE track_id IN (SELECT old_id FROM kg_rename);
+UPDATE playlist_tracks SET track_id = (SELECT new_id FROM kg_rename WHERE old_id = playlist_tracks.track_id) WHERE track_id IN (SELECT old_id FROM kg_rename);
+UPDATE liked_song_playlists SET song_id = (SELECT new_id FROM kg_rename WHERE old_id = liked_song_playlists.song_id) WHERE song_id IN (SELECT old_id FROM kg_rename);
+UPDATE liked_songs SET sid = upper(sid) WHERE platform = 'kg' AND sid <> upper(sid);
+
+UPDATE tracks SET id = (SELECT new_id FROM kg_rename WHERE old_id = id) WHERE id IN (SELECT old_id FROM kg_rename);
+DROP TABLE kg_rename;
+"#;
+
 pub(crate) const MIGRATIONS: &[(i64, &str)] =
-  &[(1, V1), (2, V2), (3, V3), (4, V4), (5, V5), (6, V6), (7, V7), (8, V8)];
+  &[(1, V1), (2, V2), (3, V3), (4, V4), (5, V5), (6, V6), (7, V7), (8, V8), (9, V9), (10, V10), (11, V11)];
 
 const V1: &str = r#"
 CREATE TABLE tracks (
@@ -328,7 +445,7 @@ CREATE TABLE stat_queue (
 "#;
 
 /// 当前程序支持的最新 schema 版本。
-pub(crate) const CURRENT_VERSION: i64 = 8;
+pub(crate) const CURRENT_VERSION: i64 = 11;
 
 /// 建表 schema_migrations 并把所有未应用版本按序执行。
 pub(crate) fn run(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -631,6 +748,119 @@ mod tests {
             .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r.get(0))
             .unwrap();
         assert_eq!(v, CURRENT_VERSION);
+    }
+
+    /// V11：酷狗 hash 大小写重复行的合并（含引用重定向与主键冲突场景）
+    #[test]
+    fn v11_merges_case_variant_kg_tracks() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let lower = "kg:37a8f50a9ec3b267c3cc6bec633d9c4a";
+        let upper = "kg:37A8F50A9EC3B267C3CC6BEC633D9C4A";
+        let now = 1_700_000_000_000i64;
+        for id in [lower, upper] {
+            conn.execute(
+                "INSERT INTO tracks (id, platform, title, singer, album, created_at, updated_at)
+                 VALUES (?1, 'kg', '青花瓷', '周杰伦', '', ?2, ?2)",
+                rusqlite::params![id, now],
+            )
+            .unwrap();
+        }
+        // 引用：一条历史挂在小写行、一条队列挂在小写行、播放统计两行都有（撞主键场景）
+        conn.execute(
+            "INSERT INTO play_history (id, track_id, played_at, played_duration_ms, completed)
+             VALUES ('h1', ?1, ?2, 1000, 0)",
+            rusqlite::params![lower, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO play_queue (position, track_id) VALUES (0, ?1)",
+            rusqlite::params![lower],
+        )
+        .unwrap();
+        for id in [lower, upper] {
+            conn.execute(
+                "INSERT INTO play_stats (track_id, play_count, last_played_at, total_played_ms)
+                 VALUES (?1, 3, ?2, 9000)",
+                rusqlite::params![id, now],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(&format!("BEGIN;
+{V11}
+COMMIT;")).unwrap();
+
+        // 只剩大写那一条；引用全部改指过去，历史/队列没被级联删掉
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tracks WHERE platform='kg'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        let hist: String = conn
+            .query_row("SELECT track_id FROM play_history WHERE id='h1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(hist, upper);
+        let queued: String = conn
+            .query_row("SELECT track_id FROM play_queue WHERE position=0", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(queued, upper);
+        let stats: i64 = conn
+            .query_row("SELECT COUNT(*) FROM play_stats", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stats, 1);
+
+        // 幂等：再跑一次不报错、结果不变
+        conn.execute_batch(&format!("BEGIN;
+{V11}
+COMMIT;")).unwrap();
+        let n2: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tracks WHERE platform='kg'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n2, 1);
+    }
+
+    /// V11 第二步：只有小写形态、没有大写孪生的行也要连引用一起改成大写
+    /// （父行改 id 会即时触发外键校验，必须靠 defer_foreign_keys 推迟到 COMMIT）
+    #[test]
+    fn v11_uppercases_lone_kg_ids_with_references() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let lower = "kg:16c8ab298231370293d16bcf9e5ff9b6";
+        let upper = "kg:16C8AB298231370293D16BCF9E5FF9B6";
+        let now = 1_700_000_000_000i64;
+        conn.execute(
+            "INSERT INTO tracks (id, platform, title, singer, album, created_at, updated_at)
+             VALUES (?1, 'kg', '测试', '歌手', '', ?2, ?2)",
+            rusqlite::params![lower, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO play_history (id, track_id, played_at, played_duration_ms, completed)
+             VALUES ('h1', ?1, ?2, 1000, 0)",
+            rusqlite::params![lower, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO play_stats (track_id, play_count, last_played_at, total_played_ms)
+             VALUES (?1, 1, ?2, 100)",
+            rusqlite::params![lower, now],
+        )
+        .unwrap();
+        conn.execute_batch(&format!("BEGIN;
+{V11}
+COMMIT;")).unwrap();
+
+        let track_id: String = conn
+            .query_row("SELECT id FROM tracks WHERE platform='kg'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(track_id, upper);
+        let hist: String = conn
+            .query_row("SELECT track_id FROM play_history WHERE id='h1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(hist, upper);
+        let stat: String = conn
+            .query_row("SELECT track_id FROM play_stats", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stat, upper);
     }
 
     #[test]

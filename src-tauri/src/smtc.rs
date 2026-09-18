@@ -92,7 +92,7 @@ pub fn init(
 
             let mut controls = match souvlaki::MediaControls::new(souvlaki::PlatformConfig {
                 display_name: "轻听",
-                dbus_name: "com.qt.lightlisten",
+                dbus_name: "com.qt.quietmusic",
                 hwnd: Some(hwnd as *mut std::ffi::c_void),
             }) {
                 Ok(c) => c,

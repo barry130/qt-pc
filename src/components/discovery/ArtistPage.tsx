@@ -3,7 +3,7 @@ import { errMsg } from "@/lib/utils";
 import { useParams } from "@tanstack/react-router";
 import { Play } from "lucide-react";
 import type { SourceId, Track } from "@/types";
-import * as ipc from "@/services/ipc";
+import * as sourceApi from "@/source-scripts";
 import { usePlayerStore } from "@/stores/player";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { TrackList } from "./TrackList";
@@ -35,7 +35,7 @@ export function ArtistPage(): React.JSX.Element {
     setError(null);
     void (async () => {
       try {
-        const list = await ipc.searchMusic(name, platform, 1, 50);
+        const list = await sourceApi.searchMusic(name, platform, 1, 50);
         if (!cancelled) setSongs(Array.isArray(list) ? list : []);
       } catch (err) {
         if (!cancelled) {

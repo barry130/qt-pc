@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Play } from "lucide-react";
 import type { Track } from "@/types";
-import * as ipc from "@/services/ipc";
+import * as sourceApi from "@/source-scripts";
 import { useMusicSourceStore } from "@/stores/musicSource";
 import { usePlayerStore } from "@/stores/player";
 import { TrackList } from "./TrackList";
@@ -23,7 +23,7 @@ export function DailyPage(): React.JSX.Element {
     let cancelled = false;
     setLoading(true);
     void (async () => {
-      const s = await ipc
+      const s = await sourceApi
         .getLatestSongs(activeSourceId, 50, 0)
         .catch(() => [] as Track[]);
       if (cancelled) return;

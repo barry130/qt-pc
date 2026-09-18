@@ -3,6 +3,7 @@ node_modules/
 
 # 前端构建产物（由 beforeBuildCommand 生成）
 dist/
+dist-sources/
 
 # Rust / Tauri 构建产物
 src-tauri/target/

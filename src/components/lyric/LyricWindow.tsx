@@ -228,6 +228,16 @@ export function LyricWindow(): React.JSX.Element {
             positionMs: payload.positionMs,
             receivedAt: performance.now(),
           };
+          // 曲目以快照为准（与播放页同源）。queue-changed 在个别切歌路径下可能
+          // 滞后或缺失，只认它会让桌面歌词慢一拍 —— 表现是显示上一首的词。
+          const snapTrack = payload.track ?? null;
+          if (snapTrack) {
+            const key = trackKey(snapTrack);
+            if (key !== loadedTrackKey.current) {
+              loadedTrackKey.current = key;
+              void loadLyricFor(snapTrack);
+            }
+          }
         }),
       );
       unlisten.push(

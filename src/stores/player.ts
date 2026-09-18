@@ -6,6 +6,7 @@ import type {
   Track,
 } from "@/types";
 import * as ipc from "@/services/ipc";
+import { resolvePlayUrl as scriptResolvePlayUrl } from "@/source-scripts";
 
 /**
  * 播放状态store（DESIGN §12.1）。
@@ -13,6 +14,23 @@ import * as ipc from "@/services/ipc";
  * - queue / queueIndex：queue-changed 事件镜像，供队列面板渲染
  * - position：250ms tick + rAF 插值得到的展示位置（不触发 Rust 往返）
  */
+
+/**
+ * 取链脚本化：播放动作发起前用共享脚本包预解析目标曲目并回填 Rust 引擎的
+ * PlayUrl 缓存，引擎随后命中缓存直接播放。
+ * local 曲目 / 预解析失败时静默跳过（引擎侧本次取链失败，不再有原生兜底）。
+ */
+async function preResolvePlayUrl(
+  track: Track | undefined,
+  state: PlaybackState | null,
+): Promise<void> {
+  if (!track || track.platform === "local") return;
+  try {
+    await scriptResolvePlayUrl(track, state?.quality ?? "320");
+  } catch {
+    // 静默：引擎侧会再问一次脚本桥（playurl_bridge）
+  }
+}
 
 interface PlayerStore {
   state: PlaybackState | null;
@@ -201,22 +219,39 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
   },
 
   play: async (track) => {
+    await preResolvePlayUrl(track, get().state);
     await ipc.playQueue([track], 0);
   },
 
   playQueue: async (tracks, startIndex) => {
+    await preResolvePlayUrl(tracks[startIndex], get().state);
     await ipc.playQueue(tracks, startIndex);
   },
 
   playAt: async (index) => {
+    const { queue } = get();
+    await preResolvePlayUrl(queue[index], get().state);
     await ipc.playAt(index);
   },
 
   nextTrack: async () => {
+    // 顺序/循环模式可提前算出下一首并预解析；随机模式留给引擎自行解析
+    const st = get().state;
+    const { queue, queueIndex } = get();
+    if (st && queue.length > 0 && queueIndex !== null && st.playMode !== "random") {
+      const nextIndex = (queueIndex + 1) % queue.length;
+      await preResolvePlayUrl(queue[nextIndex], st);
+    }
     await ipc.next();
   },
 
   prevTrack: async () => {
+    const st = get().state;
+    const { queue, queueIndex } = get();
+    if (st && queue.length > 0 && queueIndex !== null) {
+      const prevIndex = (queueIndex - 1 + queue.length) % queue.length;
+      await preResolvePlayUrl(queue[prevIndex], st);
+    }
     await ipc.previous();
   },
 

@@ -191,8 +191,7 @@ fn parse_session(data: &Value) -> Result<AuthSession, String> {
 pub const PROD_BASE_URL: &str = "http://astral.canace.cn/api/v1/";
 /// 本地开发后端（本机 astral 服务，qt-uniappx services/config.local.ts API_BASE_URL_DEV 同源）
 pub const DEV_BASE_URL: &str = "http://localhost:27000/api/v1/";
-/// 当前生效的后端地址：生产环境。发版构建一律指向这里；
-/// 本地调试要连开发后端时临时改回 `DEV_BASE_URL`（别忘了发版前改回来）。
+/// 当前生效的后端地址：生产后端（音源包 P2 联调已完成；联调期间临时切 `DEV_BASE_URL`）。
 pub const DEFAULT_BASE_URL: &str = PROD_BASE_URL;
 
 /// 更新 / 消息 / 统计的平台固定参数（§15.2）
@@ -210,6 +209,35 @@ pub const ERR_UNAUTHORIZED: &str = "登录状态已失效，请重新登录";
 /// 错误串是否表示"服务端明确否认这个 token"（区别于网络不可达）
 pub fn is_auth_error(msg: &str) -> bool {
     msg == ERR_UNAUTHORIZED
+}
+
+/// 面向用户的报错不携带具体 URL：reqwest 的错误串会带上请求地址
+/// （含自家后端/存储域名），统一替换成 …，只留失败原因。
+pub(crate) fn sanitize_err(e: impl std::fmt::Display) -> String {
+    let s = e.to_string();
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s.as_str();
+    while !rest.is_empty() {
+        let scheme = if rest.starts_with("https://") {
+            8
+        } else if rest.starts_with("http://") {
+            7
+        } else {
+            0
+        };
+        if scheme > 0 {
+            let end = rest[scheme..]
+                .find([' ', '\t', '\r', '\n', '"', '\'', '(', ')', '<', '>', ',', '[', ']', '{', '}'])
+                .map_or(rest.len(), |p| p + scheme);
+            out.push('…');
+            rest = &rest[end..];
+        } else {
+            let ch = rest.chars().next().unwrap_or('\u{fffd}');
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    out
 }
 
 /// HEAD 探测用独立小函数（无 satoken 依赖，失败返回 None）
@@ -265,6 +293,11 @@ impl AstralClient {
         self.http.clone()
     }
 
+    /// 当前生效的后端基地址（音源包 manifest 直拼 URL 用）
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     fn token(&self) -> Option<String> {
         self.satoken.read().expect("satoken lock").clone()
     }
@@ -293,7 +326,7 @@ impl AstralClient {
         if let Some(body) = json_body {
             req = req.json(&body);
         }
-        let resp = req.send().await.map_err(|e| format!("Astral 请求失败: {e}"))?;
+        let resp = req.send().await.map_err(|e| format!("Astral 请求失败: {}", sanitize_err(e)))?;
         let status = resp.status();
         let body: Value = resp.json().await.map_err(|e| format!("Astral 响应解析失败({status}): {e}"))?;
         if status == reqwest::StatusCode::UNAUTHORIZED {
@@ -319,6 +352,12 @@ impl AstralClient {
 
     async fn get(&self, path: &str, query: &[(&str, &str)], auth: bool) -> Result<Value, String> {
         self.request(reqwest::Method::GET, path, query, None, &[], auth).await
+    }
+
+    /// 免认证 POST（音源包装载结果上报等公开端点）
+    pub async fn post_json_public(&self, path: &str, body: Value) -> Result<Value, String> {
+        self.request(reqwest::Method::POST, path, &[], Some(body), &[], false)
+            .await
     }
 
     async fn post_json(
@@ -655,9 +694,9 @@ impl AstralClient {
             .get(url)
             .send()
             .await
-            .map_err(|e| format!("下载请求失败: {e}"))?
+            .map_err(|e| format!("下载请求失败: {}", sanitize_err(e)))?
             .error_for_status()
-            .map_err(|e| format!("下载请求失败: {e}"))?;
+            .map_err(|e| format!("下载请求失败: {}", sanitize_err(e)))?;
         let total = resp.content_length().unwrap_or(0);
         let mut file = std::fs::File::create(&path).map_err(|e| format!("创建文件失败: {e}"))?;
         let mut written: u64 = 0;
@@ -668,11 +707,12 @@ impl AstralClient {
             Err(e) => {
                 // reqwest 把超时/连接中断都包成 decoding 错误，把源错误拼上才好排查
                 use std::error::Error as _;
-                let src = e.source().map(|s| s.to_string()).unwrap_or_default();
+                let msg = sanitize_err(&e);
+                let src = e.source().map(sanitize_err).unwrap_or_default();
                 return Err(if src.is_empty() {
-                    format!("下载中断: {e}")
+                    format!("下载中断: {msg}")
                 } else {
-                    format!("下载中断: {e}（{src}）")
+                    format!("下载中断: {msg}（{src}）")
                 });
             }
         } {
@@ -842,8 +882,8 @@ pub fn version_name() -> &'static str {
 
 /// versionCode：发版时手动维护的整数（与移动端 manifest.json 的 versionCode 同一约定），
 /// 必须和后端 qt_app_update 表里对应版本的记录一致——更新检查就是拿它比大小。
-/// 1.0.0 → 100；1.0.1 → 101；1.0.2 → 102；下次发版记得同步 +1。
-pub const VERSION_CODE: i64 = 102;
+/// 1.0.0 → 100；1.0.1 → 101；1.0.2 → 102；1.0.3 → 103；下次发版记得同步 +1。
+pub const VERSION_CODE: i64 = 103;
 
 pub fn version_code() -> i64 {
     VERSION_CODE
@@ -856,8 +896,8 @@ mod tests {
     #[test]
     fn version_code_is_the_manual_release_constant() {
         // versionCode 不再从版本号推导（旧公式 1.0.0 会算出 10000），
-        // 而是与后端 qt_app_update 记录对齐的手动常量：1.0.0 → 100，1.0.1 → 101，1.0.2 → 102
-        assert_eq!(VERSION_CODE, 102);
+        // 而是与后端 qt_app_update 记录对齐的手动常量：1.0.0 → 100 … 1.0.3 → 103
+        assert_eq!(VERSION_CODE, 103);
         assert_eq!(version_code(), VERSION_CODE);
         assert_eq!(version_name(), env!("CARGO_PKG_VERSION"));
     }
@@ -1075,5 +1115,17 @@ mod tests {
         assert_eq!(body["action"], "remove");
         assert!(body.get("pid").is_none(), "remove 不带 pid: {body}");
         assert!(body.get("picUrl").is_none(), "remove 不带 picUrl: {body}");
+    }
+
+    #[test]
+    fn sanitize_err_strips_urls_keeps_reason() {
+        // reqwest 网络错误的典型形态（带请求地址）
+        let e = "error sending request for url (http://astral.canace.cn/api/v1/app/source/manifest?platform=1103)";
+        assert_eq!(sanitize_err(e), "error sending request for url (…)");
+        let e2 = "Astral 请求失败: https://storage.canace.icu/p/xyz/1 超时";
+        assert_eq!(sanitize_err(e2), "Astral 请求失败: … 超时");
+        // 无 URL 原样通过；中文/尾部 URL 也能处理
+        assert_eq!(sanitize_err("manifest 解析失败: invalid type"), "manifest 解析失败: invalid type");
+        assert_eq!(sanitize_err("拉取 https://x.cn/a 失败"), "拉取 … 失败");
     }
 }

@@ -58,6 +58,40 @@ export const LIKE_IMPORTED_KEY = "like.imported";
 /** 本地收藏的账号归属标记（user.id）。退出不清除，供换号登录时检测 */
 export const LIKE_OWNER_KEY = "like.sync.owner";
 
+/**
+ * 当前登录账号是否拥有指定角色（默认 qt_admin）。
+ *
+ * 后端 `app/user/me` 回的是 QtUserInfoVo：`roles` / `permissions` 都是
+ * **顶层字符串数组**（角色编码如 ["qt_admin"]），`user` 是另一个嵌套对象。
+ * 移动端 hasRole 也是按这个口径存 `qt-roles` 再查的，两端保持一致。
+ * 未登录 / 拿不到角色一律 false（权限控件失败即隐藏）。
+ */
+export function hasRole(
+  profile: Record<string, unknown> | null,
+  role = "qt_admin",
+): boolean {
+  if (!profile) return false;
+  const lists: unknown[] = [profile.roles, profile.permissions];
+  // 兼容 roles 挂在 user 下的变体（移动端曾按 user.roles 取过）
+  const user = profile.user as Record<string, unknown> | null | undefined;
+  if (user) lists.push(user.roles);
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    if (list.some((r) => typeof r === "string" && r === role)) return true;
+  }
+  // 兜底：后端若把角色拍平成布尔标记/单值，也认
+  for (const key of ["qt_admin", "is_admin", "isAdmin"]) {
+    const v = profile[key];
+    if (v === true || v === "true" || v === 1 || v === "1") return true;
+  }
+  return false;
+}
+
+/** 是否 qt_admin 账号（权限控件用，如播放地址调试框） */
+export function isAdmin(profile: Record<string, unknown> | null): boolean {
+  return hasRole(profile, "qt_admin");
+}
+
 const LIKE_PAGE_SIZE = 200;
 
 /**

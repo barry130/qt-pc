@@ -199,7 +199,11 @@ pub fn open(
         .header("Range", "bytes=0-")
         .timeout(FIRST_PACKET_TIMEOUT)
         .send()
-        .map_err(|e| io::Error::other(format!("打开音频流失败: {url} ({e})")))?;
+        .map_err(|e| {
+            // 完整地址只进日志；抛给上层的错误不带 URL（含后端/存储域名）
+            log::warn!("[audio] 打开音频流失败: {url} ({e})");
+            io::Error::other(format!("打开音频流失败: {}", crate::astral::sanitize_err(e)))
+        })?;
     let status = resp.status();
     if !status.is_success() {
         return Err(io::Error::other(format!("音频流 HTTP {status}")));

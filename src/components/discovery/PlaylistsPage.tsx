@@ -3,7 +3,7 @@ import { ChevronDown } from "lucide-react";
 import { errMsg } from "@/lib/utils";
 import { useNavigate } from "@tanstack/react-router";
 import type { Playlist, PlaylistCategory } from "@/types";
-import * as ipc from "@/services/ipc";
+import * as sourceApi from "@/source-scripts";
 import { useMusicSourceStore } from "@/stores/musicSource";
 import { CoverCard, CoverGrid } from "./CoverCard";
 
@@ -38,7 +38,7 @@ export function PlaylistsPage(): React.JSX.Element {
     setHasMore(true);
     void (async () => {
       try {
-        const cats = await ipc.getPlaylistCategories(activeSourceId);
+        const cats = await sourceApi.getPlaylistCategories(activeSourceId);
         if (!cancelled) setCategories(Array.isArray(cats) ? cats : []);
       } catch {
         if (!cancelled) setCategories([]);
@@ -54,7 +54,7 @@ export function PlaylistsPage(): React.JSX.Element {
       setLoading(true);
       setError(null);
       try {
-        const list = await ipc.getRecommendations(activeSourceId, cat, p);
+        const list = await sourceApi.getRecommendations(activeSourceId, cat, p);
         const arr = Array.isArray(list) ? list : [];
         setItems((prev) => {
           if (p <= 1) return arr;
@@ -256,6 +256,7 @@ function CategoryChip(props: {
     <button
       type="button"
       onClick={props.onClick}
+      aria-pressed={props.active}
       className={`h-7 rounded-full border px-3 text-xs transition-colors ${
         props.active
           ? "border-primary bg-primary/10 text-primary"

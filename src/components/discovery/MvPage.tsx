@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { errMsg } from "@/lib/utils";
 import { useNavigate } from "@tanstack/react-router";
 import type { Video } from "@/types";
-import * as ipc from "@/services/ipc";
+import * as sourceApi from "@/source-scripts";
 import { useMusicSourceStore } from "@/stores/musicSource";
 import { CoverCard, CoverGrid } from "./CoverCard";
 
@@ -36,7 +36,7 @@ export function MvPage(): React.JSX.Element {
       setLoading(true);
       setError(null);
       try {
-        const list = await ipc.getVideos(activeSourceId, p, 30);
+        const list = await sourceApi.getVideos(activeSourceId, p, 30);
         const arr = Array.isArray(list) ? list : [];
         setItems((prev) => {
           if (p <= 1) return arr;

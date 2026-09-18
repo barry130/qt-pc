@@ -10,27 +10,14 @@ import { SearchPage } from "@/components/SearchPage";
 import { PlayingPage } from "@/components/PlayingPage";
 import { PlaceholderPage } from "@/components/layout/PlaceholderPage";
 import { SettingsPage } from "@/components/SettingsPage";
-import { DiscoverPage } from "@/components/discovery/DiscoverPage";
-import { PlaylistsPage } from "@/components/discovery/PlaylistsPage";
 import { PlaylistDetailPage } from "@/components/discovery/PlaylistDetailPage";
-import { ChartsPage } from "@/components/discovery/ChartsPage";
 import { ChartDetailPage } from "@/components/discovery/ChartDetailPage";
-import { MvPage } from "@/components/discovery/MvPage";
 import { MvDetailPage } from "@/components/discovery/MvDetailPage";
-import { LibraryPage } from "@/components/library/LibraryPage";
-import { DailyPage } from "@/components/discovery/DailyPage";
-import { FavoritesPage } from "@/components/mine/FavoritesPage";
-import { HistoryPage } from "@/components/mine/HistoryPage";
 import { FeedbackPage } from "@/components/mine/FeedbackPage";
-import { MyPlaylistsPage } from "@/components/mine/MyPlaylistsPage";
 import { MyPlaylistDetailPage } from "@/components/mine/MyPlaylistDetailPage";
-import { DownloadsPage } from "@/components/mine/DownloadsPage";
 import { LoginPage } from "@/components/mine/LoginPage";
 import { ProfilePage } from "@/components/mine/ProfilePage";
-import { LibraryFoldersPage } from "@/components/library/LibraryFoldersPage";
 import { OnboardingPage } from "@/components/onboarding/OnboardingPage";
-import { MessagesPage } from "@/components/mine/MessagesPage";
-import { StatsPage } from "@/components/mine/StatsPage";
 import { ArtistPage } from "@/components/discovery/ArtistPage";
 import { AlbumPage } from "@/components/discovery/AlbumPage";
 
@@ -45,13 +32,17 @@ const rootRoute = createRootRoute({ component: AppShell });
 const indexRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/",
-  component: DiscoverPage,
+  // 一级页面由 AppShell 的 KeepAliveOutlet 常驻渲染（切 tab 不重载），
+  // 这里只保留路由用于匹配与导航，组件渲染 null。
+  component: () => null,
 });
 
 const dailyRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/daily",
-  component: DailyPage,
+  // 一级页面由 AppShell 的 KeepAliveOutlet 常驻渲染（切 tab 不重载），
+  // 这里只保留路由用于匹配与导航，组件渲染 null。
+  component: () => null,
 });
 
 const searchRoute = createRoute({
@@ -66,7 +57,9 @@ const searchRoute = createRoute({
 const playlistsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/playlists",
-  component: PlaylistsPage,
+  // 一级页面由 AppShell 的 KeepAliveOutlet 常驻渲染（切 tab 不重载），
+  // 这里只保留路由用于匹配与导航，组件渲染 null。
+  component: () => null,
 });
 
 const playlistDetailRoute = createRoute({
@@ -84,7 +77,9 @@ const playlistDetailRoute = createRoute({
 const chartsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/charts",
-  component: ChartsPage,
+  // 一级页面由 AppShell 的 KeepAliveOutlet 常驻渲染（切 tab 不重载），
+  // 这里只保留路由用于匹配与导航，组件渲染 null。
+  component: () => null,
 });
 
 const chartDetailRoute = createRoute({
@@ -114,7 +109,9 @@ const albumRoute = createRoute({
 const mvRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/mv",
-  component: MvPage,
+  // 一级页面由 AppShell 的 KeepAliveOutlet 常驻渲染（切 tab 不重载），
+  // 这里只保留路由用于匹配与导航，组件渲染 null。
+  component: () => null,
 });
 
 const mvDetailRoute = createRoute({
@@ -132,19 +129,25 @@ const mvDetailRoute = createRoute({
 const libraryRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/library",
-  component: LibraryPage,
+  // 一级页面由 AppShell 的 KeepAliveOutlet 常驻渲染（切 tab 不重载），
+  // 这里只保留路由用于匹配与导航，组件渲染 null。
+  component: () => null,
 });
 
 const libraryFoldersRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/library/folders",
-  component: LibraryFoldersPage,
+  // 一级页面由 AppShell 的 KeepAliveOutlet 常驻渲染（切 tab 不重载），
+  // 这里只保留路由用于匹配与导航，组件渲染 null。
+  component: () => null,
 });
 
 const myPlaylistsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/my/playlists",
-  component: MyPlaylistsPage,
+  // 一级页面由 AppShell 的 KeepAliveOutlet 常驻渲染（切 tab 不重载），
+  // 这里只保留路由用于匹配与导航，组件渲染 null。
+  component: () => null,
 });
 
 const myPlaylistDetailRoute = createRoute({
@@ -156,19 +159,25 @@ const myPlaylistDetailRoute = createRoute({
 const favoritesRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/favorites",
-  component: FavoritesPage,
+  // 一级页面由 AppShell 的 KeepAliveOutlet 常驻渲染（切 tab 不重载），
+  // 这里只保留路由用于匹配与导航，组件渲染 null。
+  component: () => null,
 });
 
 const historyRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/history",
-  component: HistoryPage,
+  // 一级页面由 AppShell 的 KeepAliveOutlet 常驻渲染（切 tab 不重载），
+  // 这里只保留路由用于匹配与导航，组件渲染 null。
+  component: () => null,
 });
 
 const downloadsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/downloads",
-  component: DownloadsPage,
+  // 一级页面由 AppShell 的 KeepAliveOutlet 常驻渲染（切 tab 不重载），
+  // 这里只保留路由用于匹配与导航，组件渲染 null。
+  component: () => null,
 });
 
 const playingRoute = createRoute({
@@ -180,13 +189,17 @@ const playingRoute = createRoute({
 const statsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/stats",
-  component: StatsPage,
+  // 一级页面由 AppShell 的 KeepAliveOutlet 常驻渲染（切 tab 不重载），
+  // 这里只保留路由用于匹配与导航，组件渲染 null。
+  component: () => null,
 });
 
 const messagesRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/messages",
-  component: MessagesPage,
+  // 一级页面由 AppShell 的 KeepAliveOutlet 常驻渲染（切 tab 不重载），
+  // 这里只保留路由用于匹配与导航，组件渲染 null。
+  component: () => null,
 });
 
 const feedbackRoute = createRoute({

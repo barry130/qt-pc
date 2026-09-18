@@ -15,7 +15,7 @@ vi.mock("@/services/ipc", () => ({
 }));
 
 import * as ipc from "@/services/ipc";
-import { useAuthStore } from "@/stores/auth";
+import { useAuthStore, hasRole, isAdmin } from "@/stores/auth";
 import type { AuthSession } from "@/types";
 
 const ipcMock = vi.mocked(ipc);
@@ -70,5 +70,40 @@ describe("auth store 启动恢复", () => {
     expect(useAuthStore.getState().session?.token).toBe("stale-token");
     expect(useAuthStore.getState().profile).toEqual({ nickname: "轻听用户" });
     expect(ipcMock.astralLogout).not.toHaveBeenCalled();
+  });
+});
+
+// 角色判定回归：后端 /me 回的是 QtUserInfoVo，roles/permissions 是顶层字符串数组。
+// 曾经按布尔标记与单数 role 猜字段名，导致 qt_admin 账号也判定为非管理员。
+describe("hasRole / isAdmin（qt_admin 权限判定）", () => {
+  it("roles 数组含 qt_admin → true", () => {
+    expect(hasRole({ roles: ["qt_user", "qt_admin"] })).toBe(true);
+    expect(isAdmin({ roles: ["qt_admin"] })).toBe(true);
+  });
+
+  it("roles 数组不含 qt_admin → false", () => {
+    expect(hasRole({ roles: ["qt_user"] })).toBe(false);
+    expect(isAdmin({ roles: ["qt_user", "qt_vip"] })).toBe(false);
+  });
+
+  it("permissions 数组也算（后端可能只给权限编码）", () => {
+    expect(isAdmin({ permissions: ["qt_admin"] })).toBe(true);
+  });
+
+  it("roles 挂在 user 下也认（兼容变体）", () => {
+    expect(isAdmin({ user: { roles: ["qt_admin"] } })).toBe(true);
+  });
+
+  it("未登录 / 无角色数据 → false（失败即隐藏）", () => {
+    expect(isAdmin(null)).toBe(false);
+    expect(isAdmin({})).toBe(false);
+    expect(isAdmin({ roles: [] })).toBe(false);
+    expect(isAdmin({ roles: "qt_admin" })).toBe(false);
+  });
+
+  it("布尔标记兜底", () => {
+    expect(isAdmin({ qt_admin: true })).toBe(true);
+    expect(isAdmin({ is_admin: 1 })).toBe(true);
+    expect(isAdmin({ qt_admin: false })).toBe(false);
   });
 });

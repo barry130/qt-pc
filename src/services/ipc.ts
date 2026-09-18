@@ -1,13 +1,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
-  Album,
   AppearancePreference,
   AppUpdateInfo,
   AppVersion,
-  Artist,
   AudioError,
-  Chart,
   PlayOverview,
   PlayStatItem,
   SingerStat,
@@ -16,19 +13,13 @@ import type {
   DesktopLyricStylePatch,
   DownloadTask,
   HistoryItem,
-  Lyric,
   MyPlaylistSummary,
-  Playlist,
-  PlaylistCategory,
-  PlayUrl,
   PlaybackState,
   PositionChanged,
   QueueChanged,
   Quality,
-  SourceId,
   Track,
   UpdateDownloadProgress,
-  Video,
 } from "@/types";
 
 /**
@@ -36,156 +27,15 @@ import type {
  * 全部走 invoke，前端不直接发任何外部网络请求（CSP 不放开外部域名）。
  */
 
-// ---------- 音源 ----------
-
-export async function searchMusic(
-  keyword: string,
-  source: SourceId,
-  page: number,
-  size: number,
-): Promise<Track[]> {
-  return invoke("search_music", { keyword, source, page, size });
-}
-
-export async function getPlayUrl(
+/// 取链脚本化（方案 v3）：把共享脚本包解析出的地址回填 Rust 引擎缓存
+export async function setResolvedPlayUrl(
   track: Track,
   quality: Quality,
-): Promise<PlayUrl> {
-  return invoke("get_play_url", { track, quality });
+  url: string,
+): Promise<void> {
+  return invoke("set_resolved_play_url", { track, quality, url });
 }
 
-export async function getLyric(track: Track): Promise<Lyric> {
-  return invoke("get_lyric", { track });
-}
-
-/// MV/视频播放地址（quality：auto / hd / low）
-export async function getVideoUrl(
-  source: SourceId,
-  videoId: string,
-  quality: string,
-): Promise<string> {
-  return invoke("get_video_url", { source, videoId, quality });
-}
-
-// ---------- 发现类：歌单 / 榜单 / 新歌 / 热词 / 搜索（DESIGN §6.5） ----------
-
-export async function getPlaylistCategories(
-  source: SourceId,
-): Promise<PlaylistCategory[]> {
-  return invoke("get_playlist_categories", { source });
-}
-
-export async function getRecommendations(
-  source: SourceId,
-  category: string | null,
-  page: number,
-): Promise<Playlist[]> {
-  return invoke("get_recommendations", { source, category, page });
-}
-
-export async function getLatestSongs(
-  source: SourceId,
-  limit: number,
-  offset: number,
-): Promise<Track[]> {
-  return invoke("get_latest_songs", { source, limit, offset });
-}
-
-export async function getAllLatestSongs(
-  limit: number,
-  offset: number,
-): Promise<Track[]> {
-  return invoke("get_all_latest_songs", { limit, offset });
-}
-
-export async function getCharts(source: SourceId): Promise<Chart[]> {
-  return invoke("get_charts", { source });
-}
-
-export async function getAllCharts(): Promise<Chart[]> {
-  return invoke("get_all_charts");
-}
-
-export async function getChartDetail(
-  chart: Chart,
-  page: number,
-  size: number,
-): Promise<Track[]> {
-  return invoke("get_chart_detail", { chart, page, size });
-}
-
-export async function getPlaylistDetail(
-  source: SourceId,
-  id: string,
-  page: number,
-  size: number,
-): Promise<Playlist> {
-  return invoke("get_playlist_detail", { source, id, page, size });
-}
-
-export async function getHotWords(source: SourceId): Promise<string[]> {
-  return invoke("get_hot_words", { source });
-}
-
-export async function getAllHotWords(): Promise<string[]> {
-  return invoke("get_all_hot_words");
-}
-
-export async function searchPlaylists(
-  source: SourceId,
-  keyword: string,
-  page: number,
-  size: number,
-): Promise<Playlist[]> {
-  return invoke("search_playlists", { source, keyword, page, size });
-}
-
-export async function searchArtists(
-  source: SourceId,
-  keyword: string,
-  page: number,
-  size: number,
-): Promise<Artist[]> {
-  return invoke("search_artists", { source, keyword, page, size });
-}
-
-export async function searchAlbums(
-  source: SourceId,
-  keyword: string,
-  page: number,
-  size: number,
-): Promise<Album[]> {
-  return invoke("search_albums", { source, keyword, page, size });
-}
-
-export async function searchAllMusicSources(
-  keyword: string,
-  page: number,
-  size: number,
-): Promise<Track[]> {
-  return invoke("search_all_music_sources", { keyword, page, size });
-}
-
-export async function getArtistSongs(
-  source: SourceId,
-  name: string,
-  page: number,
-  size: number,
-): Promise<Track[]> {
-  return invoke("get_artist_songs", { source, name, page, size });
-}
-
-export async function getVideos(
-  source: SourceId,
-  page: number,
-  size: number,
-): Promise<Video[]> {
-  return invoke("get_videos", { source, page, size });
-}
-
-export async function getTrackCover(track: Track): Promise<string> {
-  return invoke("get_track_cover", { track });
-}
 
 // ---------- 本地音乐（DESIGN §13） ----------
 // 本地曲目的 Track.id 就是文件绝对路径，平台固定 "local"；
@@ -257,21 +107,6 @@ export async function purgeMissingLocalTracks(): Promise<number> {
 /** 读本地音频的内嵌封面（data URL）；没有封面返回 null。path 即本地 Track.id */
 export async function getLocalCover(path: string): Promise<string | null> {
   return invoke("get_local_cover", { path });
-}
-
-/** 本地曲目在线元数据（酷我按歌名 + 歌手匹配）：歌词 + 翻译 + 封面 URL */
-export interface LocalOnlineMeta {
-  lrc: string;
-  translation: string;
-  picUrl: string;
-}
-
-/** 按歌名 + 歌手在酷我匹配歌词与封面；匹配不到返回空结构（不抛错） */
-export async function getLocalOnlineMeta(
-  title: string,
-  singer: string,
-): Promise<LocalOnlineMeta> {
-  return invoke("get_local_online_meta", { title, singer });
 }
 
 export async function getScanDirs(): Promise<string[]> {
@@ -602,6 +437,28 @@ export async function astralRefresh(): Promise<AuthSession> {
 /** 本地保存的会话（可能已过期） */
 export async function astralSession(): Promise<AuthSession | null> {
   return invoke("astral_session");
+}
+
+// ---------- 音源包热更新（P1/P2；类型与流程见 source-scripts/source-update.ts） ----------
+
+export async function sourceState(): Promise<unknown> {
+  return invoke("source_state");
+}
+
+export async function sourceManifest(): Promise<unknown> {
+  return invoke("source_manifest");
+}
+
+export async function sourceInstall(release: unknown): Promise<unknown> {
+  return invoke("source_install", { release });
+}
+
+export async function sourceApply(smoke = true): Promise<void> {
+  return invoke("source_apply", { smoke });
+}
+
+export async function sourceRollbackBuiltin(): Promise<void> {
+  return invoke("source_rollback_builtin");
 }
 
 /** 发邮箱验证码（注册 / 找回密码共用） */

@@ -1,8 +1,11 @@
-import { useCallback, useEffect, useState } from "react";
-import { errMsg } from "@/lib/utils";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { errMsg, stripErrorUrls } from "@/lib/utils";
 import { useNavigate } from "@tanstack/react-router";
 import { PageContainer } from "@/components/layout/PageContainer";
 import * as ipc from "@/services/ipc";
+import { getScheme, setScheme } from "@/source-scripts/scheme";
+import { listSchemes } from "@/source-scripts/schemes/registry";
+import type { SchemeId } from "@/source-scripts/contract";
 import {
   getAppVersion,
   getDesktopLyricState,
@@ -15,7 +18,14 @@ import {
 } from "@/services/ipc";
 import { useAppearanceStore } from "@/stores/appearance";
 import { useUpdateStore } from "@/stores/update";
+import { useSourceUpdateStore } from "@/stores/source-update";
 import { runCheck } from "@/hooks/useUpdateCheck";
+import { checkAndDownload } from "@/hooks/useSourceUpdateCheck";
+import {
+  applySourceRelease,
+  BUILTIN_SOURCE_VERSION,
+  rollbackSourceBuiltin,
+} from "@/source-scripts/source-update";
 import { SKINS, getSkin } from "@/lib/skins";
 import { QUALITY_OPTIONS } from "@/lib/quality";
 import type {
@@ -44,13 +54,14 @@ function SettingRow(props: {
 }): React.JSX.Element {
   return (
     <div className="flex items-center justify-between gap-6 py-3">
-      <div className="min-w-0">
+      <div className="min-w-0 flex-1">
         <p className="text-sm">{props.title}</p>
         {props.description && (
           <p className="mt-0.5 text-xs text-muted-foreground">{props.description}</p>
         )}
       </div>
-      <div className="shrink-0">{props.children}</div>
+      {/* 右侧封顶 60%：否则长内容（如方案单选列表）会把左列压到一字一行 */}
+      <div className="min-w-0 max-w-[60%] shrink-0">{props.children}</div>
     </div>
   );
 }
@@ -588,6 +599,14 @@ function PlaybackSection(): React.JSX.Element {
   const [quality, setQuality] = useState<Quality>("320");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // 音源方案（2026-09-18）：只指定一个方案，方案内部自带多线路换源与跨源
+  // 兜底；localStorage 持久化，下一次取址生效，当前曲目不受影响
+  const [scheme, setSchemeState] = useState<SchemeId>(() => getScheme());
+  const schemes = useMemo(() => listSchemes(), []);
+  const chooseScheme = (id: string): void => {
+    setScheme(id as SchemeId);
+    setSchemeState(id as SchemeId);
+  };
 
   const load = useCallback(async (): Promise<void> => {
     try {
@@ -668,6 +687,33 @@ function PlaybackSection(): React.JSX.Element {
           onChange={(q) => void chooseQuality(q)}
         />
       </SettingRow>
+      <SettingRow
+        title="音源方案"
+        description="只能选一个；方案内部自带换源与跨源兜底。改动下一次取址生效。"
+      >
+        <div className="flex flex-col items-start gap-2" role="radiogroup" aria-label="音源方案">
+          {schemes.map((s) => (
+            <label key={s.id} className="flex cursor-pointer items-start gap-2 text-xs">
+              <input
+                type="radio"
+                name="source-scheme"
+                value={s.id}
+                checked={scheme === s.id}
+                onChange={() => chooseScheme(s.id)}
+                className="mt-0.5 accent-primary"
+              />
+              <span className="min-w-0">
+                <span className={scheme === s.id ? "text-primary" : ""}>{s.name}</span>
+                {s.description && (
+                  <span className="mt-0.5 block text-[10px] leading-4 text-muted-foreground">
+                    {s.description}
+                  </span>
+                )}
+              </span>
+            </label>
+          ))}
+        </div>
+      </SettingRow>
       {error && <p className="py-2 text-xs text-destructive">{error}</p>}
     </div>
   );
@@ -693,6 +739,124 @@ function QualitySelect(props: {
         </option>
       ))}
     </select>
+  );
+}
+
+/** 音源包设置（音源包热更新方案 P2）：当前/远端版本 + 立即检查/应用/回滚。
+ *  状态事实来源是 Rust state.json；「已就绪」= 下载完成待应用。 */
+function SourcePackageSection(): React.JSX.Element {
+  const local = useSourceUpdateStore((s) => s.local);
+  const remote = useSourceUpdateStore((s) => s.remote);
+  const ready = useSourceUpdateStore((s) => s.ready);
+  const message = useSourceUpdateStore((s) => s.message);
+  const busy = useSourceUpdateStore((s) => s.busy);
+  const setBusy = useSourceUpdateStore((s) => s.setBusy);
+  const setMessage = useSourceUpdateStore((s) => s.setMessage);
+  const setReady = useSourceUpdateStore((s) => s.setReady);
+
+  const run = async (action: () => Promise<string>): Promise<void> => {
+    setBusy(true);
+    try {
+      setMessage(await action());
+    } catch (e) {
+      setMessage(`操作失败：${stripErrorUrls(String(e))}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const check = (): Promise<string> => checkAndDownload();
+
+  // 应用成功后提示「应用成功」，随即收起应用按钮与更新说明（已装上就不占版面）
+  const apply = async (): Promise<void> => {
+    setBusy(true);
+    try {
+      await applySourceRelease(true);
+      setReady(null);
+      setMessage("应用成功");
+      window.setTimeout(() => {
+        if (useSourceUpdateStore.getState().message === "应用成功") setMessage("");
+      }, 5000);
+    } catch (e) {
+      setMessage(`操作失败：${stripErrorUrls(String(e))}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const rollback = async (): Promise<string> => {
+    await rollbackSourceBuiltin();
+    return "已回滚到内置版：引擎重启后生效";
+  };
+
+  const installed = local?.installed ?? null;
+  const installedCode = installed?.sourceVersionCode ?? BUILTIN_SOURCE_VERSION.code;
+  const pendingNotes =
+    remote?.notes && (ready !== null || remote.sourceVersionCode > installedCode);
+  return (
+    <div className="max-w-xl divide-y divide-border">
+      <SettingRow title="当前音源包" description="未安装远程包时使用随应用发布的内置版">
+        <span className="font-mono text-xs text-muted-foreground">
+          {installed
+            ? `${installed.sourceVersionName} (code ${installed.sourceVersionCode})`
+            : `内置版 ${BUILTIN_SOURCE_VERSION.name} (code ${BUILTIN_SOURCE_VERSION.code})`}
+        </span>
+      </SettingRow>
+      <SettingRow title="远端最新" description="检查后显示远端发布的音源包版本">
+        <span className="font-mono text-xs text-muted-foreground">
+          {remote ? `${remote.sourceVersionName} (code ${remote.sourceVersionCode})` : "未检查"}
+        </span>
+      </SettingRow>
+      <SettingRow title="更新检查" description="启动时也会静默检查（4 小时节流），只下载不自动生效">
+        <button
+          type="button"
+          onClick={() => void run(check)}
+          disabled={busy}
+          className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+        >
+          {busy ? "处理中…" : "立即检查"}
+        </button>
+      </SettingRow>
+      {installed && (
+        <SettingRow
+          title="回滚到内置版"
+          description="远程包出问题时先回内置版保播放可用（安装目录保留便于排查）"
+        >
+          <button
+            type="button"
+            onClick={() => void run(rollback)}
+            disabled={busy}
+            className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+          >
+            回滚
+          </button>
+        </SettingRow>
+      )}
+      {(ready !== null || message) && (
+        <div className="py-3 text-xs text-muted-foreground">
+          {ready !== null && (
+            <div className="mb-1">
+              <button
+                type="button"
+                onClick={() => void apply()}
+                disabled={busy}
+                className="rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground disabled:opacity-50"
+              >
+                立即应用
+              </button>
+              <span className="ml-2">音源包已就绪，应用后下一首起生效</span>
+            </div>
+          )}
+          {message && <div>{message}</div>}
+        </div>
+      )}
+      {pendingNotes && (
+        <div className="py-3 text-xs text-muted-foreground">
+          <p className="mb-1 font-medium text-foreground">更新说明</p>
+          <p className="whitespace-pre-wrap">{remote?.notes}</p>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -729,7 +893,7 @@ function AboutSection(): React.JSX.Element {
         setResult("当前已是最新版本");
       }
     } catch (e) {
-      setResult(`检查失败：${String(e)}`);
+      setResult(`检查失败：${stripErrorUrls(String(e))}`);
       setUpdate(null);
     } finally {
       setChecking(false);
@@ -1078,6 +1242,7 @@ const SECTION_TITLES: Record<string, string> = {
   "desktop-lyric": "桌面歌词",
   playback: "播放",
   download: "下载",
+  "source-package": "音源包",
   shortcut: "快捷键",
   about: "关于",
 };
@@ -1120,6 +1285,8 @@ export function SettingsPage(props: { section: string }): React.JSX.Element {
         <PlaybackSection />
       ) : props.section === "download" ? (
         <DownloadSection />
+      ) : props.section === "source-package" ? (
+        <SourcePackageSection />
       ) : props.section === "shortcut" ? (
         <ShortcutSection />
       ) : props.section === "about" ? (

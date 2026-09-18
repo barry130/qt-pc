@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { errMsg } from "@/lib/utils";
 import type { Chart, SourceId, Track } from "@/types";
-import * as ipc from "@/services/ipc";
+import * as sourceApi from "@/source-scripts";
 import { usePlayerStore } from "@/stores/player";
 import { TrackList } from "./TrackList";
 import { BackButton } from "@/components/layout/BackButton";
@@ -9,9 +9,10 @@ import { BackButton } from "@/components/layout/BackButton";
 /**
  * 榜单详情（路由 /chart/$platform/$id，DESIGN §5.2）。
  *
- * `get_chart_detail` 需要整个 Chart 对象（Rust 侧用 chart.platform + chart.id 分发音源），
- * 而路由只带 platform/id，因此先从聚合榜单列表里找回 Chart 补全标题与封面；
- * 列表不可用时退化为仅含 platform+id 的最小对象，详情照常加载。
+ * `getChartDetail` 需要整个 Chart 对象（脚本层按 chart.platform 路由平台模块、
+ * 用 chart.id 取榜单），而路由只带 platform/id，因此先从聚合榜单列表里找回
+ * Chart 补全标题与封面；列表不可用时退化为仅含 platform+id 的最小对象，
+ * 详情照常加载。
  */
 export function ChartDetailPage(props: {
   platform: string;
@@ -37,14 +38,14 @@ export function ChartDetailPage(props: {
         description: null,
       };
       try {
-        const all = await ipc.getAllCharts();
+        const all = await sourceApi.getAllCharts();
         const found = all.find((c) => c.platform === platform && c.id === id);
         if (!cancelled && found) chart = found;
       } catch {
         // 榜单列表失败不阻断详情：退化为最小 Chart 对象
       }
       try {
-        const list = await ipc.getChartDetail(chart, 1, 100);
+        const list = await sourceApi.getChartDetail(chart, 1, 100);
         if (cancelled) return;
         setTracks(Array.isArray(list) ? list : []);
         setTitle(chart.name || "榜单详情");

@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 use crate::db::store::{self, PlayState};
 use crate::db::Database;
-use crate::provider::registry::{PlayUrlCache, ProviderRegistry};
+use crate::provider::url_cache::PlayUrlCache;
 use crate::provider::types::{self, Track};
 
 use super::queue::Queue;
@@ -125,12 +125,11 @@ pub struct AudioEngine {
 }
 
 impl AudioEngine {
-    /// 启动专属音频线程。registry / url_cache 供自动切歌时异步取址；
+    /// 启动专属音频线程。url_cache 供自动切歌时异步取址；
     /// db 供队列/播放状态持久化（None = 数据库不可用，播放不受影响）。
     pub fn spawn(
         app: tauri::AppHandle,
         cache_dir: PathBuf,
-        registry: Arc<ProviderRegistry>,
         url_cache: Arc<PlayUrlCache>,
         db: Option<Arc<Database>>,
     ) -> Self {
@@ -150,7 +149,6 @@ impl AudioEngine {
                         rx,
                         state: state_clone,
                         cache_dir,
-                        registry,
                         url_cache,
                         tx: tx_thread,
                         queue: queue_thread,
@@ -191,7 +189,6 @@ struct EngineInner {
     queue: Arc<Mutex<Queue>>,
     cache_dir: PathBuf,
     http: reqwest::blocking::Client,
-    registry: Arc<ProviderRegistry>,
     url_cache: Arc<PlayUrlCache>,
     sink: Player,
     /// 持有输出流（丢掉它会立即关闭音频端点）
@@ -386,7 +383,6 @@ struct EngineDeps {
     rx: mpsc::Receiver<AudioCmd>,
     state: Arc<RwLock<PlaybackStateSnapshot>>,
     cache_dir: PathBuf,
-    registry: Arc<ProviderRegistry>,
     url_cache: Arc<PlayUrlCache>,
     tx: Sender<AudioCmd>,
     queue: Arc<Mutex<Queue>>,
@@ -399,7 +395,6 @@ fn run_engine(deps: EngineDeps) {
         rx,
         state,
         cache_dir,
-        registry,
         url_cache,
         tx,
         queue,
@@ -441,7 +436,6 @@ fn run_engine(deps: EngineDeps) {
         queue,
         cache_dir,
         http,
-        registry,
         url_cache,
         sink,
         _stream,
@@ -1072,7 +1066,6 @@ fn spawn_resolve_and_load(
     let job = LoadJob {
         app: inner.app.clone(),
         tx: inner.tx.clone(),
-        registry: Arc::clone(&inner.registry),
         cache: Arc::clone(&inner.url_cache),
         http: inner.http.clone(),
         cache_dir: inner.cache_dir.clone(),
@@ -1086,32 +1079,10 @@ fn spawn_resolve_and_load(
     tauri::async_runtime::spawn(job.run());
 }
 
-async fn resolve_with_retry(
-    registry: &ProviderRegistry,
-    cache: &PlayUrlCache,
-    track: &Track,
-    quality: types::Quality,
-) -> Result<(String, u64), types::ProviderError> {
-    match crate::resolve_play_url_with(registry, cache, track, quality).await {
-        Ok(pair) => Ok(pair),
-        Err(types::ProviderError::NoPlayableUrl) | Err(types::ProviderError::Empty) => {
-            let key = PlayUrlCache::cache_key(
-                &track.platform.to_string(),
-                &track.id,
-                crate::quality_str(quality),
-            );
-            cache.invalidate(&key);
-            crate::resolve_play_url_with(registry, cache, track, quality).await
-        }
-        Err(e) => Err(e),
-    }
-}
-
 /// 一次「取址 → 构建解码器 → 回发引擎」的全部上下文。
 struct LoadJob {
     app: tauri::AppHandle,
     tx: Sender<AudioCmd>,
-    registry: Arc<ProviderRegistry>,
     cache: Arc<PlayUrlCache>,
     http: reqwest::blocking::Client,
     cache_dir: PathBuf,
@@ -1151,8 +1122,12 @@ impl LoadJob {
             }
         }
 
+        // 取链（脚本线路）：缓存命中直接用（前端切歌时预解析回填）；未命中经
+        // playurl_bridge 问前端脚本包，前端按「换源顺序」跨源解析后回填缓存。
+        // 原生 Rust Provider 已删除，前端脚本线路是唯一的第三方取链路径。
         let resolved =
-            resolve_with_retry(&self.registry, &self.cache, &self.track, self.quality).await;
+            crate::resolve_play_url_script(&self.app, &self.cache, &self.track, self.quality)
+                .await;
         match resolved {
             Ok((url, fetched_at)) => {
                 log::info!(
@@ -1174,7 +1149,14 @@ impl LoadJob {
                             crate::quality_str(self.quality),
                         );
                         self.cache.invalidate(&key);
-                        match resolve_with_retry(&self.registry, &self.cache, &self.track, self.quality).await {
+                        match crate::resolve_play_url_script(
+                            &self.app,
+                            &self.cache,
+                            &self.track,
+                            self.quality,
+                        )
+                        .await
+                        {
                             Ok((url2, fetched_at2)) => {
                                 let source2 = PlaySource::Online { url: url2.clone(), fetchedAt: fetched_at2 };
                                 match self.try_build(&source2).await {
@@ -1327,6 +1309,36 @@ fn mount_decoder(
 type BuiltDecoder = (Box<dyn Source + Send>, Option<Arc<RangeShared>>, u64);
 
 /// 构建 Decoder：在线走 HttpRangeReader（磁盘缓冲 + Range 下载线程），
+/// 播放总时长（毫秒）：以解码器为准 —— 它才是真正在播的那条流。
+/// 解码器拿不到时长（流式 / 缺头部信息）时才回落到曲目元数据；
+/// 元数据单位在部分平台不可靠（酷狗曾出现毫秒被当秒用 → 时长暴涨成几十小时），
+/// 超过 6 小时的一律当脏数据丢弃：宁可显示 0（进度条按未知处理）也不让时长爆表。
+fn resolve_duration_ms<R: std::io::Read + std::io::Seek>(
+    decoder: &Decoder<R>,
+    track: &Track,
+) -> u64 {
+    let decoded = decoder
+        .total_duration()
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    if decoded > 0 {
+        return decoded;
+    }
+    meta_duration_ms(track)
+}
+
+/// 元数据兜底时长（毫秒）。曲目元数据的单位在部分平台不可靠
+/// （酷狗曾把毫秒当秒 → 197s 的曲子算出 197098s），超过 6 小时一律丢弃。
+fn meta_duration_ms(track: &Track) -> u64 {
+    const MAX_REASONABLE_MS: u64 = 6 * 60 * 60 * 1000;
+    let meta = (track.duration * 1000.0) as u64;
+    if meta > MAX_REASONABLE_MS {
+        0
+    } else {
+        meta
+    }
+}
+
 /// 本地直接 File::open。返回 (boxed source, range_shared, duration_ms)。
 /// 只允许在 blocking 线程池里调用 —— HTTP open 最多阻塞一个请求超时，
 /// Decoder::build 探针首包最多再阻塞 FIRST_PACKET_TIMEOUT(8s)。
@@ -1342,11 +1354,7 @@ fn build_decoder(
                 std::fs::File::open(path).map_err(|e| format!("打开本地文件失败: {e}"))?;
             // TryFrom<File> 会用文件长度自动填 byte_len，FLAC 的二分定位才可用
             let decoder = Decoder::try_from(file).map_err(|e| format!("解码失败: {e}"))?;
-            let duration = decoder
-                .total_duration()
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0)
-                .max((track.duration * 1000.0) as u64);
+            let duration = resolve_duration_ms(&decoder, track);
             Ok((Box::new(decoder), None, duration))
         }
         PlaySource::Online { url, .. } => {
@@ -1361,11 +1369,7 @@ fn build_decoder(
                 None => builder,
             };
             let decoder = builder.build().map_err(|e| format!("解码失败: {e}"))?;
-            let duration = decoder
-                .total_duration()
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0)
-                .max((track.duration * 1000.0) as u64);
+            let duration = resolve_duration_ms(&decoder, track);
             Ok((Box::new(decoder), Some(shared), duration))
         }
     }
@@ -1423,5 +1427,42 @@ fn emit_position_tick(inner: &mut EngineInner) {
     if due {
         inner.last_persist = Some(now);
         inner.persist_state();
+    }
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use super::meta_duration_ms;
+    use crate::provider::types::{SourceId, Track};
+
+    fn track_with_duration(seconds: f64) -> Track {
+        Track {
+            id: "1".into(),
+            platform: SourceId::Kg,
+            title: "测试".into(),
+            singer: "".into(),
+            album: "".into(),
+            pic_url: String::new(),
+            duration: seconds,
+            music_id: None,
+        }
+    }
+
+    #[test]
+    fn metadata_duration_uses_seconds() {
+        assert_eq!(meta_duration_ms(&track_with_duration(197.0)), 197_000);
+    }
+
+    /// 单位错的脏数据（毫秒被当秒）不能进进度条：曾显示成 3284:58
+    #[test]
+    fn metadata_duration_drops_absurd_values() {
+        assert_eq!(meta_duration_ms(&track_with_duration(197_098.0)), 0);
+        assert_eq!(meta_duration_ms(&track_with_duration(274_285.0)), 0);
+    }
+
+    #[test]
+    fn metadata_duration_keeps_long_tracks() {
+        // 3 小时的现场集：仍在合理范围内，保留
+        assert_eq!(meta_duration_ms(&track_with_duration(10_800.0)), 10_800_000);
     }
 }

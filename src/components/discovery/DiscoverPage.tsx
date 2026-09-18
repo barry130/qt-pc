@@ -3,7 +3,7 @@ import { useNavigate } from "@tanstack/react-router";
 import { Disc3, FileMusic, Flame, Sparkles } from "lucide-react";
 import type { Chart, Playlist, Track } from "@/types";
 import { SOURCE_DISPLAY } from "@/types";
-import * as ipc from "@/services/ipc";
+import * as sourceApi from "@/source-scripts";
 import { getRecommendations } from "@/source-scripts";
 import { useMusicSourceStore } from "@/stores/musicSource";
 import { usePlayerStore } from "@/stores/player";
@@ -59,7 +59,7 @@ export function DiscoverPage(): React.JSX.Element {
     setPlaylists([]);
     void (async () => {
       const [s, p] = await Promise.all([
-        ipc.getLatestSongs(activeSourceId, 20, 0).catch(() => [] as Track[]),
+        sourceApi.getLatestSongs(activeSourceId, 20, 0).catch(() => [] as Track[]),
         // 插件化试点：推荐歌单经 source-scripts 统一入口分发
         // （scheme=script 走共享脚本包，否则原 Rust 通道），其余调用不变
         getRecommendations(activeSourceId, null, 1).catch(() => [] as Playlist[]),
@@ -79,7 +79,7 @@ export function DiscoverPage(): React.JSX.Element {
   useEffect(() => {
     let cancelled = false;
     void (async () => {
-      const c = await ipc.getAllCharts().catch(() => [] as Chart[]);
+      const c = await sourceApi.getAllCharts().catch(() => [] as Chart[]);
       if (!cancelled) setCharts(Array.isArray(c) ? c.slice(0, 10) : []);
     })();
     return () => {

@@ -3,7 +3,7 @@ import { errMsg } from "@/lib/utils";
 import { Play, Search, SearchX } from "lucide-react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import type { Album, Artist, Playlist, Track } from "@/types";
-import * as ipc from "@/services/ipc";
+import * as sourceApi from "@/source-scripts";
 import { usePlayerStore } from "@/stores/player";
 import { useMusicSourceStore } from "@/stores/musicSource";
 import { qtresCoverUrl, formatTime } from "@/lib/lrc";
@@ -14,11 +14,11 @@ import { BackButton } from "@/components/layout/BackButton";
 /**
  * 搜索页（路由 /search?q=，DESIGN §5.2：关键字走 URL query，前进 / 后退可复现）。
  *
- * 四类结果对应四个 IPC（DESIGN §6.5）：
- * - 歌曲   search_music
- * - 歌单   search_playlists  → 跳歌单详情
- * - 歌手   search_artists    → 跳歌手详情
- * - 专辑   search_albums     → 跳专辑详情
+ * 四类结果对应脚本层四个动作（DESIGN §6.5）：
+ * - 歌曲   searchMusic
+ * - 歌单   searchPlaylists → 跳歌单详情
+ * - 歌手   searchArtists   → 跳歌手详情
+ * - 专辑   searchAlbums    → 跳专辑详情
  */
 type Tab = "song" | "playlist" | "artist" | "album";
 
@@ -55,22 +55,22 @@ export function SearchPage(): React.JSX.Element {
       try {
         switch (t) {
           case "song": {
-            const r = await ipc.searchMusic(trimmed, activeSourceId, 1, 30);
+            const r = await sourceApi.searchMusic(trimmed, activeSourceId, 1, 30);
             setSongs(Array.isArray(r) ? r : []);
             break;
           }
           case "playlist": {
-            const r = await ipc.searchPlaylists(activeSourceId, trimmed, 1, 20);
+            const r = await sourceApi.searchPlaylists(activeSourceId, trimmed, 1, 20);
             setPlaylists(Array.isArray(r) ? r : []);
             break;
           }
           case "artist": {
-            const r = await ipc.searchArtists(activeSourceId, trimmed, 1, 20);
+            const r = await sourceApi.searchArtists(activeSourceId, trimmed, 1, 20);
             setArtists(Array.isArray(r) ? r : []);
             break;
           }
           case "album": {
-            const r = await ipc.searchAlbums(activeSourceId, trimmed, 1, 20);
+            const r = await sourceApi.searchAlbums(activeSourceId, trimmed, 1, 20);
             setAlbums(Array.isArray(r) ? r : []);
             break;
           }

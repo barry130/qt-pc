@@ -9,9 +9,13 @@ pub mod local;
 pub mod lyric_window;
 pub mod media;
 pub mod provider;
+pub mod playurl_bridge;
 pub mod qtres;
 pub mod shortcuts;
 pub mod smtc;
+pub mod source_bundle;
+pub mod source_install;
+pub mod source_window;
 pub mod tray;
 
 use std::path::PathBuf;
@@ -20,14 +24,13 @@ use std::sync::Arc;
 use audio::engine::AudioEngine;
 use commands::*;
 use db::Database;
-use provider::registry::{PlayUrlCache, ProviderRegistry};
 use provider::types::{Quality, SourceId, Track};
+use provider::url_cache::PlayUrlCache;
 use provider::ProviderError;
 use tauri::{Emitter, Manager};
 
 /// 全局应用状态
 pub struct AppState {
-    pub registry: Arc<ProviderRegistry>,
     pub url_cache: Arc<PlayUrlCache>,
     pub engine: AudioEngine,
     pub audio_cache_dir: PathBuf,
@@ -41,10 +44,12 @@ pub struct AppState {
 
 type CmdResult<T> = Result<T, ProviderError>;
 
-/// 取播放地址：内存缓存（10 分钟）命中直接返回；未命中经 Provider 解析后写入缓存。
-/// R1：只进进程内存，不写 SQLite。
-pub(crate) async fn resolve_play_url_with(
-    registry: &ProviderRegistry,
+/// 取播放地址（脚本线路）：缓存（10 分钟）命中直接返回；未命中经 playurl_bridge
+/// 问前端脚本包（前端按「换源顺序」跨源解析），拿到后写入缓存。
+/// R1：只进进程内存，不写 SQLite。原生 Rust Provider 已删除，
+/// 前端脚本线路是唯一的第三方取链路径（未就绪 / 超时 / 空串 = 无地址）。
+pub(crate) async fn resolve_play_url_script(
+    app: &tauri::AppHandle,
     cache: &PlayUrlCache,
     track: &Track,
     quality: Quality,
@@ -57,8 +62,12 @@ pub(crate) async fn resolve_play_url_with(
     if let Some((url, fetched_at)) = cache.get(&key) {
         return Ok((url, fetched_at));
     }
-    let provider = registry.get(track.platform)?;
-    let url = provider.play_url(track, quality).await?;
+    let url = crate::playurl_bridge::ask_frontend(app, track, quality)
+        .await
+        .ok_or(ProviderError::NoPlayableUrl)?;
+    if url.is_empty() {
+        return Err(ProviderError::NoPlayableUrl);
+    }
     cache.set(key.clone(), url.clone());
     // fetched_at 由 set 写入当前时间；这里再读一次拿到真实时间戳
     let fetched_at = cache.get(&key).map(|(_, at)| at).unwrap_or(0);
@@ -103,7 +112,6 @@ pub fn run() {
                 .app_cache_dir()
                 .unwrap_or_else(|_| PathBuf::from("."));
             let audio_cache_dir = cache_base.join("audio");
-            let registry = Arc::new(ProviderRegistry::new());
             let url_cache = Arc::new(PlayUrlCache::new());
 
             // 数据库：DESIGN §8.1 %APPDATA%/LightListen/data/music.db
@@ -126,7 +134,6 @@ pub fn run() {
             let engine = AudioEngine::spawn(
                 handle.clone(),
                 audio_cache_dir.clone(),
-                Arc::clone(&registry),
                 Arc::clone(&url_cache),
                 db.clone(),
             );
@@ -175,7 +182,6 @@ pub fn run() {
             }
 
             app.manage(AppState {
-                registry,
                 url_cache,
                 engine,
                 audio_cache_dir,
@@ -204,6 +210,12 @@ pub fn run() {
                 }
             }
 
+            // 音源引擎窗口（音源包热更新 P1）：常驻隐藏 webview，加载远程
+            // 音源包跑取链；创建失败不影响主流程（主窗口有内置实现兜底）
+            if let Err(e) = source_window::create(&handle) {
+                log::warn!("[source-engine] 引擎窗口创建失败，取链走内置实现: {e}");
+            }
+
             // visible:false → 等前端首帧 show()，避免白屏闪烁（DESIGN §4.1）
             if let Some(win) = handle.get_webview_window("main") {
                 let _ = win.show();
@@ -211,29 +223,19 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            cmd_search_music,
-            cmd_get_play_url,
-            cmd_get_lyric,
-            cmd_get_video_url,
-            cmd_get_track_cover,
             cmd_builtin_request,
-            cmd_get_playlist_categories,
-            cmd_get_recommendations,
-            cmd_get_latest_songs,
-            cmd_get_all_latest_songs,
-            cmd_get_charts,
-            cmd_get_all_charts,
-            cmd_get_chart_detail,
-            cmd_get_playlist_detail,
-            cmd_get_hot_words,
-            cmd_get_all_hot_words,
-            cmd_search_playlists,
-            cmd_search_artists,
-            cmd_search_albums,
-            cmd_search_all_music_sources,
-            cmd_get_artist_songs,
-            cmd_get_videos,
+            cmd_set_resolved_play_url,
+            cmd_script_bridge_ready,
+            cmd_resolve_play_url_reply,
             cmd_invalidate_play_url,
+            source_bundle::cmd_source_chain_overlay,
+            source_install::cmd_source_state,
+            source_install::cmd_source_manifest,
+            source_install::cmd_source_install,
+            source_install::cmd_source_apply,
+            source_install::cmd_source_rollback_builtin,
+            source_install::cmd_source_mark_bad,
+            source_install::cmd_source_report,
             cmd_play_track,
             cmd_play_queue,
             cmd_set_default_quality,
@@ -331,7 +333,6 @@ pub fn run() {
             cmd_get_missing_local_tracks,
             cmd_purge_missing_local_tracks,
             cmd_get_local_cover,
-            cmd_get_local_online_meta,
             // 收藏 / 播放历史（DESIGN §5.3）
             cmd_add_favorite,
             cmd_remove_favorite,

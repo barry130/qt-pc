@@ -1,54 +1,11 @@
-//! Provider 注册表：`HashMap<SourceId, Arc<dyn MusicProvider>>` 运行时分发。
+//! 播放地址内存缓存（DESIGN §7.3）：键 `platform:trackId:quality`，10 分钟失效。
+//! R1：只进进程内存，不写 SQLite。
 //!
-//! 四大音源（wyy / qq / kw / kg）全部注册；各 Provider 的能力位见各自模块头注释。
+//! 前端脚本包解析出的地址经 `set_resolved_play_url` 写入本缓存，
+//! 引擎播放/预取命中缓存直接使用。
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use super::kg::KgProvider;
-use super::kw::KwProvider;
-use super::qq::QqProvider;
-use super::types::{ProviderError, ProviderResult, SourceId};
-use super::wyy::WyyProvider;
-use super::{MusicProvider, ProviderCapabilities};
-
-pub struct ProviderRegistry {
-    providers: HashMap<SourceId, Arc<dyn MusicProvider>>,
-}
-
-impl ProviderRegistry {
-    pub fn new() -> Self {
-        let mut providers: HashMap<SourceId, Arc<dyn MusicProvider>> = HashMap::new();
-        providers.insert(SourceId::Wyy, Arc::new(WyyProvider::new()));
-        providers.insert(SourceId::Qq, Arc::new(QqProvider::new()));
-        providers.insert(SourceId::Kw, Arc::new(KwProvider::new()));
-        providers.insert(SourceId::Kg, Arc::new(KgProvider::new()));
-        Self { providers }
-    }
-
-    pub fn get(&self, id: SourceId) -> ProviderResult<Arc<dyn MusicProvider>> {
-        self.providers
-            .get(&id)
-            .cloned()
-            .ok_or(ProviderError::Unsupported)
-    }
-
-    /// 前端能力位汇总（search/lyric/play_url 每源都有；其余能力后续单元打开）
-    pub fn capabilities(&self, id: SourceId) -> ProviderCapabilities {
-        self.get(id)
-            .map(|p| p.capabilities())
-            .unwrap_or(ProviderCapabilities::none())
-    }
-}
-
-impl Default for ProviderRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// 播放地址内存缓存（DESIGN §7.3）：键 `platform:trackId:quality`，10 分钟失效。
-/// R1：只进进程内存，不写 SQLite。
 pub struct PlayUrlCache {
     inner: std::sync::Mutex<HashMap<String, CachedUrl>>,
     ttl_ms: u64,
@@ -135,21 +92,5 @@ mod tests {
         assert_eq!(url, "https://example.com/a.mp3");
         cache.invalidate(&key);
         assert!(cache.get(&key).is_none());
-    }
-
-    #[test]
-    fn registry_has_all_four_sources() {
-        let reg = ProviderRegistry::new();
-        for id in [SourceId::Wyy, SourceId::Qq, SourceId::Kw, SourceId::Kg] {
-            let p = reg.get(id).expect("should register");
-            assert_eq!(p.id(), id);
-            let caps = p.capabilities();
-            assert!(caps.search_song && caps.play_url && caps.lyric);
-        }
-        // 本地源未注册（由本地扫描单元提供）
-        assert!(matches!(
-            reg.get(SourceId::Local),
-            Err(ProviderError::Unsupported)
-        ));
     }
 }

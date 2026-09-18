@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { errMsg } from "@/lib/utils";
 import type { SourceId } from "@/types";
-import * as ipc from "@/services/ipc";
+import * as sourceApi from "@/source-scripts";
 import { qtresMvUrl } from "@/lib/lrc";
 import { BackButton } from "@/components/layout/BackButton";
 
@@ -41,7 +41,7 @@ export function MvDetailPage(props: {
     setError(null);
     void (async () => {
       try {
-        const url = await ipc.getVideoUrl(platform as SourceId, id, "auto");
+        const url = await sourceApi.getVideoUrl(platform as SourceId, id, "auto");
         if (cancelled) return;
         setSrc(qtresMvUrl(url));
       } catch (err) {

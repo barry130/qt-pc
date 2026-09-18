@@ -2,12 +2,12 @@ import { useEffect, useState } from "react";
 import { errMsg } from "@/lib/utils";
 import { useNavigate } from "@tanstack/react-router";
 import type { Chart } from "@/types";
-import * as ipc from "@/services/ipc";
+import * as sourceApi from "@/source-scripts";
 import { CoverCard, CoverGrid } from "./CoverCard";
 
 /**
  * 排行榜（路由 /charts，DESIGN §5.2）。
- * 用四源聚合命令 get_all_charts：单源失败只记日志，其余源照常展示（§6.4 要点 5）。
+ * 用四源聚合动作 getAllCharts：单源失败只记日志，其余源照常展示（§6.4 要点 5）。
  */
 export function ChartsPage(): React.JSX.Element {
   const navigate = useNavigate();
@@ -20,7 +20,7 @@ export function ChartsPage(): React.JSX.Element {
     setLoading(true);
     void (async () => {
       try {
-        const list = await ipc.getAllCharts();
+        const list = await sourceApi.getAllCharts();
         if (!cancelled) setCharts(Array.isArray(list) ? list : []);
       } catch (err) {
         if (!cancelled) {

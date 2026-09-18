@@ -1,13 +1,12 @@
 /**
- * 音源访问层契约（插件化方案 v3 · 试点版）
+ * 音源访问层契约（插件化方案 v3 · 全量版）
  *
  * 本目录是「共享音源脚本包」在 qt-pc 内的落位（未来抽出为 packages/music-sources，
  * 供 qt-uniappx 以 uts 编译直接复用同一份源码）。规则（方案 v3）：
  * - 这里只放"调第三方源"的逻辑：编排、请求参数拼装、响应解析、回退；
  * - 不写任何 HTTP 执行实现 —— 由宿主注入 request builtin
  *   （PC：invoke → Rust reqwest；uniappx 未来：包装 http.ts directRequest）；
- * - 不写加密实现 —— 加密模块（kg-md5 / kw-des / 酷我 Cookie）后续以"原样文件"
- *   搬入本包；当前试点未含，kw 平台仍走 Rust 通道。
+ * - 加密模块以"原样文件"搬入本包（kg-md5 / kw-des / kw 鉴权）。
  *
  * 本文件是两端"方法名/模型/出入参完全一致"的唯一真源：
  * uniappx 接入时直接 import 本文件，禁止两端各写一份。
@@ -16,7 +15,7 @@
 /** 平台：沿用两端现有取值（qt-pc SourceId / qt-uniappx Source 同源），零映射成本 */
 export type Source = "wyy" | "qq" | "kw" | "kg";
 
-/** 音质：两端现值同口径 */
+/** 音质：两端现值同口径（"128"/"320"/"flac"） */
 export type Quality = "128" | "320" | "flac";
 
 /** 曲目：qt-pc Track / qt-uniappx Song 的公共超集（两端各写少量字段映射） */
@@ -26,18 +25,72 @@ export interface MusicInfo {
   singer: string;
   album: string;
   picUrl: string;
-  /** 秒（两端同口径） */
+  /** 秒（两端同口径；蓝本字段名 duration） */
   interval: number;
   musicId?: string | null;
 }
 
-/** 歌单（契约模型；宿主侧各自映射到 App 内的 Playlist 类型） */
+/** 歌单（广场卡片；契约模型） */
 export interface ContractPlaylist {
   id: string;
   platform: Source;
   name: string;
   picUrl: string;
   playCount: string;
+}
+
+/** 歌单详情（含曲目；蓝本 playlist() 返回结构） */
+export interface ContractPlaylistDetail extends ContractPlaylist {
+  description: string | null;
+  tracks: MusicInfo[];
+}
+
+/** 歌单广场分类 */
+export interface ContractPlaylistCategory {
+  id: string;
+  name: string;
+  group: string | null;
+}
+
+/** 歌手 */
+export interface ContractArtist {
+  id: string;
+  platform: Source;
+  name: string;
+  picUrl: string;
+}
+
+/** 专辑 */
+export interface ContractAlbum {
+  id: string;
+  platform: Source;
+  name: string;
+  artist: string;
+  picUrl: string;
+}
+
+/** 榜单 */
+export interface ContractChart {
+  id: string;
+  platform: Source;
+  name: string;
+  picUrl: string;
+  description: string | null;
+}
+
+/** MV / 视频 */
+export interface ContractVideo {
+  id: string;
+  platform: Source;
+  name: string;
+  picUrl: string;
+  singer: string;
+}
+
+/** 歌词（原文 + 翻译；qt-pc Lyric 同构） */
+export interface ContractLyric {
+  lyric: string;
+  translation: string;
 }
 
 // ---------- 宿主内置方法（注入；本期仅 request 一类） ----------
@@ -72,7 +125,19 @@ export type RequestBuiltin = (
 // ---------- 取链方案 ----------
 
 /**
- * "rust"   = 宿主内置实现（迁移基线/兜底，A/B 对拍基准）
- * "script" = 共享脚本包
+ * "script" = 内置脚本包（默认方案：官方接口 + 全部实测第三方线路的聚合链，
+ *            音质高→低、每档 ≤5 条、末级跨源，见 actions/play-url.ts）；
+ * 其余 id  = drop-in 方案（schemes/ 下的 scheme.ts 自注册，见 registry.ts），
+ *            目前仅 "premium"（优选聚合：脚本包每档 5 条上限放不下的剩余
+ *            线路——kw=墨澜 → 独家 v6 → 洛雪，kg=酷狗官方占位；音质高→低、
+ *            不跨源）。历史插件（world260809/裤佬/溯音/gdstudio/lx-host 插件
+ *            群等）已于 2026-09-17 去重并整体并入脚本包，见
+ *            schemes/lx-host/ 与《音源全量复测报告》。
+ *
+ * 原生 Rust Provider 已整体删除（历史存值 "rust" 读取时归一为 "script"），
+ * 第三方音源接口只由脚本层承担。
+ *
+ * 新增歌源 = schemes/ 下写一个 scheme.ts，无需改任何枚举/校验/路由/UI。
  */
-export type SchemeId = "rust" | "script";
+export type BuiltinSchemeId = "script";
+export type SchemeId = BuiltinSchemeId | (string & {});

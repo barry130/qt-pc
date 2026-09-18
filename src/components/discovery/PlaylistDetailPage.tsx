@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { errMsg } from "@/lib/utils";
 import type { Playlist, SourceId } from "@/types";
 import * as ipc from "@/services/ipc";
+import * as sourceApi from "@/source-scripts";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { usePlayerStore } from "@/stores/player";
 import { TrackList } from "./TrackList";
@@ -10,7 +11,7 @@ import { BackButton } from "@/components/layout/BackButton";
 
 /**
  * 歌单详情（路由 /playlist/$platform/$id，DESIGN §5.2）。
- * 歌曲来自 get_playlist_detail（wyy/qq 一次取全量；kw 内部分页），
+ * 歌曲来自 getPlaylistDetail（脚本层：wyy/qq 一次取全量；kw 内部分页），
  * 「播放全部」把整张歌单入队并从第 1 首开始播（DESIGN §11.2）。
  */
 export function PlaylistDetailPage(props: {
@@ -30,7 +31,7 @@ export function PlaylistDetailPage(props: {
     setError(null);
     void (async () => {
       try {
-        const pl = await ipc.getPlaylistDetail(platform as SourceId, id, 1, 100);
+        const pl = await sourceApi.getPlaylistDetail(platform as SourceId, id, 1, 100);
         if (!cancelled) setPlaylist(pl);
       } catch (err) {
         if (!cancelled) setError(errMsg(err));

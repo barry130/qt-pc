@@ -1,0 +1,12 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "source-engine-capability",
+  "description": "音源引擎窗口能力：只允许事件监听/发送（引擎页用底层 IPC 跑取链 RPC，网络请求由主窗口代发）",
+  "windows": [
+    "source-engine"
+  ],
+  "permissions": [
+    "core:default",
+    "core:event:default"
+  ]
+}
