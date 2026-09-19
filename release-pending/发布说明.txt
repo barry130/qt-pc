@@ -1,0 +1,21 @@
+音源包发布物（2026-09-19，歌词翻译版）
+====================================================
+chain.json       5 KB     内容与上一版完全相同（可不传，传了最稳）
+source-bundle.js 1.67 MB  新版：歌词翻译接入
+                           - qq：官方翻译（musicu.fcg PlayLyricInfo trans，
+                             过滤 kana 的 // 占位行）
+                           - kg：原生 krc 无翻译；仅网易云同名兜底词路径
+                             返回配对的 tlyric（译文与原文严格同曲）
+                           - wyy：tlyric（不变）；kw：官方接口无翻译字段
+                           - 按约定不做跨源/机器翻译兜底，无官方翻译即无双语
+
+管理端四步（astral-front → 仪表盘 → qt → 音源包）：
+① 新建 release（platforms 勾 1101+1103，channel stable，
+   准入 appVersionCodes 留空，notes 如「bundle：歌词官方翻译」）
+   → 记下后端生成的版本号
+② 上传本目录的两个文件，拿直链 URL
+③ 回填 artifacts（path=chain.json / source-bundle.js，version 留空）
+④ 点「发布」
+
+发布后：把版本号告诉 ZCode（镜像内置常量 + 同步 static + 重打基座）。
+详细流程见《音源包打包发布完整教程.md》§5 / §5.1。

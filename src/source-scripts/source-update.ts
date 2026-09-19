@@ -54,11 +54,21 @@ export type UpdateDecision =
 export const HOST_API_VERSION = 1;
 
 /**
- * 内置版音源包版本：随应用编译进前端的实现视为已安装该版本，
- * 更新判定以其为基线（≤ 该版本且未安装远程包时不再下载）。
- * 发版时与 build:sources 产物同步 +1。
+ * 内置版音源包版本：随应用内嵌打包的音源包（构建产物经 `npm run sync:builtin`
+ * 同步到 src-tauri/builtin-sources/，编译期打进二进制；引擎页在未安装远程包 /
+ * 远程包加载失败时经 qtres /builtin/ 加载）即该版本；更新判定也以它为无包
+ * 基线（decideUpdate：installed 为空时视同已装此版）。
+ *
+ * 号规则：**镜像「最新一次正式发布」的后端发号**（后端在「新建 release」时生成
+ * `yyyyMMddNN`，内置包随后同步为同号同物）——内置包内容一变就必须换号：
+ * 安卓端按版本目录「盘上优先」采用，同号换内容时设备上已解包的旧副本会一直
+ * 盖住新实现。
+ * 历史注：首版曾用 `yyyyMMdd00`（后端 seq 从 01 起、永不生成 00，保证严格小于
+ * 任何线上版）；2026091902 起改为镜像发布号。
+ * 这里与安卓端 `qt-uniappx/services/source-bundle-fs.uts` 的 BUILTIN_VERSION_CODE
+ * 同步更新（两端同号）。
  */
-export const BUILTIN_SOURCE_VERSION = { code: 2026091901, name: "2026.09.19.1" };
+export const BUILTIN_SOURCE_VERSION = { code: 2026091904, name: "2026.09.19.4" };
 
 /**
  * §2.3 判定 6 步（纯函数）：

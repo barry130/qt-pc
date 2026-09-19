@@ -4,12 +4,14 @@
  * 1. 真实网络：Node fetch 实现契约 RequestBuiltin（对齐 Rust builtin_request：
  *    小写响应头、无视 content-type 直接尝试 JSON 解析），驱动脚本层四平台的
  *    搜索 / 推荐歌单 / 取链 / 歌词——独立于 Tauri 验证脚本逻辑本身。
- * 2. dispatcher：scheme=script 走脚本包聚合链、premium 只承载剩余线路、
- *    local 源在 script 模式下回落内置通道、resolvePlayUrl 回填命令被调用。
- * 3. 方案收敛：第三方线路按「音质高→低、每档 ≤5 条、末级跨源」收进默认
- *    ChainConfig（chain.json 驱动，见 chain-config.ts），放不下的剩余线路进 premium；
- *    插件层已取消，**方案只指定一个**（2026-09-18 起取消方案间换源顺序）：
- *    选中方案不支持该平台或自身链全灭时返回空串由引擎兜底，不再横向切到别的方案。
+ * 2. dispatcher：app 侧已无内置音源实现——数据接口与取链只经音源引擎窗口
+ *    （本文件用引擎 mock 断言 payload 映射、无包/缺接口报错、resolvePlayUrl
+ *    回填命令被调用）；local 源第三方动作直接报错。
+ * 3. 方案收敛（bundle 取链层，layer.ts）：第三方线路按「音质高→低、每档 ≤5 条、
+ *    末级跨源」收进默认 ChainConfig（chain.json 驱动，见 chain-config.ts），
+ *    放不下的剩余线路进 premium；插件层已取消，**方案只指定一个**
+ *    （2026-09-18 起取消方案间换源顺序）：选中方案不支持该平台或自身链全灭时
+ *    返回空串由引擎兜底，不再横向切到别的方案。
  * 4. chain.json（音源包热更新 P0）：parseChainConfig 校验、本地 overlay 回退、
  *    声明式 http 线路契约（a.aa.cab / tang.api 的请求形态与取值路径）、
  *    行级 platforms 过滤与 enabled 停用。
@@ -44,6 +46,31 @@ vi.mock("@/source-scripts/host-request", () => ({
     }
     throw new Error("hostRequest 在未配置 mock 的用例中被调用");
   },
+}));
+
+/** 音源引擎 mock：index.ts 已不内置音源实现，app 层数据/取链只经引擎窗口 */
+const engineMock = vi.hoisted(() => ({
+  phase: "builtin" as string | null,
+  detail: null as string | null,
+  invokeResult: null as Record<string, unknown> | null,
+  resolveUrl: "",
+  resolveThrows: false,
+  calls: [] as Array<{ entry: string; args: Record<string, unknown> }>,
+}));
+vi.mock("@/source-engine/client", () => ({
+  engineInvoke: async (entry: string, args: Record<string, unknown>) => {
+    engineMock.calls.push({ entry, args });
+    return engineMock.invokeResult;
+  },
+  engineResolve: async () => {
+    if (engineMock.resolveThrows) throw new Error("引擎窗口不可用");
+    return engineMock.resolveUrl;
+  },
+  engineSnapshot: () => ({
+    phase: engineMock.phase,
+    code: null,
+    detail: engineMock.detail,
+  }),
 }));
 
 /** Node 版 request builtin：模拟 Rust builtin_request 的行为契约 */
@@ -586,43 +613,240 @@ describe("chain 行级 platforms 过滤与 enabled 停用（P0）", () => {
   });
 });
 
-describe("source-scripts dispatcher（scheme 分发）", () => {
+describe("安卓入口注册（__qtEntries，两端共用同一份 bundle）", () => {
+  type AndroidEntries = {
+    bundleInfo: () => string;
+    loadChain: (chainJson: string) => string;
+    getPlayUrl: (args: unknown) => Promise<string>;
+    verifyPlayable: (args: unknown) => Promise<string>;
+  };
+
+  /** 宿主 stub：Range 请求回音频头，其余回声明式线路要的 JSON 体（对齐 prelude 契约） */
+  const hostRequest: RequestBuiltin = async (url, options): Promise<SourceResponse> => {
+    if (options?.headers?.Range !== undefined) {
+      return {
+        statusCode: 206,
+        headers: { "content-type": "audio/mpeg", "content-length": "2" },
+        body: "",
+      };
+    }
+    return {
+      statusCode: 200,
+      headers: { "content-type": "application/json" },
+      body: { data: { url: "https://cdn.example/" + url.split("/").pop() + ".mp3" } },
+    };
+  };
+
+  const androidChain = {
+    chainRevision: 77,
+    maxLinesPerQuality: 5,
+    crossSources: {},
+    budget: { totalMs: 5000, lineMs: 2000 },
+    chains: {
+      kw: [
+        {
+          id: "pc-only", name: "PC 专属", kind: "http", qualities: ["128"], platforms: [PLATFORMS.WINDOWS],
+          request: { url: "https://pc.example/pc" }, pick: "data.url",
+        },
+        {
+          id: "android-only", name: "安卓专属", kind: "http", qualities: ["128"], platforms: [PLATFORMS.ANDROID],
+          request: { url: "https://android.example/android" }, pick: "data.url",
+        },
+      ],
+    },
+  };
+
+  function entriesOf(): AndroidEntries {
+    return (globalThis as unknown as { __qtEntries?: AndroidEntries }).__qtEntries as AndroidEntries;
+  }
+
+  afterEach(() => {
+    setChainConfigCache(null);
+    delete (globalThis as { __qtEntries?: unknown }).__qtEntries;
+    delete (globalThis as { __qtHost?: unknown }).__qtHost;
+  });
+
+  it("registerQtEntries：注册 25 个入口（4 取链 + 21 音源数据），bundleInfo 报平台 1101 / 契约 v1", async () => {
+    const { registerQtEntries } = await import("@/source-scripts/qt-entries");
+    registerQtEntries({ request: hostRequest, log: () => {} });
+    const entries = entriesOf();
+    expect(Object.keys(entries).sort()).toEqual([
+      "albumDetail",
+      "allCharts",
+      "allHotWords",
+      "allLatest",
+      "artistSongs",
+      "bundleInfo",
+      "chartDetail",
+      "charts",
+      "cover",
+      "getPlayUrl",
+      "hotWords",
+      "latest",
+      "loadChain",
+      "lyric",
+      "playlistCategories",
+      "playlistDetail",
+      "recommendations",
+      "search",
+      "searchAlbums",
+      "searchAll",
+      "searchArtists",
+      "searchPlaylists",
+      "verifyPlayable",
+      "videoUrl",
+      "videos",
+    ]);
+    const info = JSON.parse(entries.bundleInfo()) as {
+      name: string;
+      version: string;
+      platforms: number[];
+      hostApiVersion: number;
+    };
+    expect(info.name).toBe("source-bundle");
+    expect(info.platforms).toEqual([PLATFORMS.ANDROID]);
+    expect(info.hostApiVersion).toBe(1);
+    expect(info.version.startsWith("chain.")).toBe(true);
+  });
+
+  it("loadChain + getPlayUrl：按安卓平台过滤行级 platforms（PC 专属线不参与）", async () => {
+    const { registerQtEntries } = await import("@/source-scripts/qt-entries");
+    registerQtEntries({ request: hostRequest });
+    const entries = entriesOf();
+    const loaded = JSON.parse(entries.loadChain(JSON.stringify(androidChain))) as {
+      ok: boolean;
+      lines: number;
+    };
+    expect(loaded).toEqual({ ok: true, lines: 2 });
+
+    const out = JSON.parse(
+      await entries.getPlayUrl({
+        platform: "kw",
+        id: "u1",
+        name: "孤勇者",
+        singer: "陈奕迅",
+        album: "",
+        quality: "128",
+        duration: 0,
+      }),
+    ) as { url: string; source: string; quality: string };
+    expect(out.url).toBe("https://cdn.example/android.mp3");
+    expect(out.source).toBe("kw");
+    expect(out.quality).toBe("128");
+  });
+
+  it("chain 非法 / 无可用线路：loadChain 抛错、getPlayUrl 抛错（引擎侧据此回退内置）", async () => {
+    const { registerQtEntries } = await import("@/source-scripts/qt-entries");
+    registerQtEntries({ request: hostRequest });
+    const entries = entriesOf();
+    expect(() => entries.loadChain("{ 不是 JSON")).toThrow();
+    expect(() => entries.loadChain(JSON.stringify({ ...androidChain, chainRevision: -1 }))).toThrow();
+
+    // 只有 PC 专属线 → 安卓端全部被行级过滤 → 取链抛错（而不是返回死链）
+    const pcOnly = { ...androidChain, chains: { kw: [androidChain.chains.kw[0]] } };
+    entries.loadChain(JSON.stringify(pcOnly));
+    await expect(
+      entries.getPlayUrl({ platform: "kw", id: "u2", name: "x", singer: "y", quality: "128" }),
+    ).rejects.toThrow();
+  });
+
+  it("verifyPlayable：音频字节 ok、JSON/HTML 错误页不 ok（与 PC 判定同口径）", async () => {
+    const { registerQtEntries } = await import("@/source-scripts/qt-entries");
+    registerQtEntries({ request: hostRequest });
+    const ok = JSON.parse(await entriesOf().verifyPlayable({ url: "https://cdn.example/a.mp3" })) as {
+      ok: boolean;
+      status: number;
+    };
+    expect(ok.ok).toBe(true);
+    expect(ok.status).toBe(206);
+
+    const errorPage: RequestBuiltin = async () => ({
+      statusCode: 200,
+      headers: { "content-type": "text/html" },
+      body: "<html>404</html>",
+    });
+    registerQtEntries({ request: errorPage });
+    const bad = JSON.parse(await entriesOf().verifyPlayable({ url: "https://cdn.example/dead" })) as {
+      ok: boolean;
+    };
+    expect(bad.ok).toBe(false);
+  });
+
+  it("engine-entry：宿主提供 __qtHost 时 bundle 顶层自注册；PC 形态（无 __qtHost）不注册", async () => {
+    (globalThis as unknown as { __qtHost?: unknown }).__qtHost = { request: hostRequest };
+    vi.resetModules();
+    const mod = await import("@/source-scripts/engine-entry");
+    expect(typeof mod.createSourceLayer).toBe("function");
+    expect(Object.keys(entriesOf()).length).toBe(25);
+
+    // PC 形态：没有 __qtHost → 只导出命名符号，不写全局
+    delete (globalThis as { __qtEntries?: unknown }).__qtEntries;
+    delete (globalThis as { __qtHost?: unknown }).__qtHost;
+    vi.resetModules();
+    const pcMod = await import("@/source-scripts/engine-entry");
+    expect(typeof pcMod.createSourceLayer).toBe("function");
+    expect((globalThis as { __qtEntries?: unknown }).__qtEntries).toBeUndefined();
+  });
+});
+
+describe("source-scripts dispatcher（纯音源包：app 只经引擎调用）", () => {
   afterEach(() => {
     vi.resetModules();
     vi.clearAllMocks();
     hostRequestMock.active = false;
     hostRequestMock.impl = null;
+    engineMock.phase = "builtin";
+    engineMock.detail = null;
+    engineMock.invokeResult = null;
+    engineMock.resolveUrl = "";
+    engineMock.resolveThrows = false;
+    engineMock.calls.length = 0;
   });
 
-  it("script 方案：wyy 走脚本包并映射为 App Playlist 模型", async () => {
-    hostRequestMock.active = true;
-    hostRequestMock.impl = () => ({
-      statusCode: 200,
-      headers: { "content-type": "application/json" },
-      body: {
-        playlists: [
-          {
-            id: 12345,
-            name: "脚本通道歌单",
-            coverImgUrl: "https://p1.music.126.net/x.jpg",
-            playCount: 999,
-          },
-        ],
-      },
-    });
-    const schemeMod = await import("@/source-scripts/scheme");
-    schemeMod.setScheme("script");
+  it("数据接口：引擎 payload 映射为 App Playlist 模型", async () => {
+    engineMock.phase = "ready";
+    engineMock.invokeResult = {
+      list: [
+        {
+          id: "12345",
+          name: "脚本通道歌单",
+          platform: "wyy",
+          picUrl: "https://p1.music.126.net/x.jpg",
+          playCount: "999",
+        },
+      ],
+    };
     const mod = await import("@/source-scripts");
     const result = await mod.getRecommendations("wyy", null, 1);
     expect(result[0]?.id).toBe("12345");
     expect(result[0]?.name).toBe("脚本通道歌单");
     expect(result[0]?.platform).toBe("wyy");
     expect(result[0]?.description).toBeNull();
+    expect(engineMock.calls).toContainEqual({
+      entry: "recommendations",
+      args: { source: "wyy", category: null, page: 1 },
+    });
+  });
+
+  it("引擎报 builtin 兼容相位：数据接口抛可操作错误", async () => {
+    engineMock.phase = "builtin";
+    engineMock.invokeResult = null;
+    const mod = await import("@/source-scripts");
+    await expect(mod.getRecommendations("wyy", null, 1)).rejects.toThrow(
+      "内置包未加载",
+    );
+  });
+
+  it("音源包返回结构不符：抛错而不是静默空结果", async () => {
+    engineMock.phase = "ready";
+    engineMock.invokeResult = {};
+    const mod = await import("@/source-scripts");
+    await expect(mod.getRecommendations("wyy", null, 1)).rejects.toThrow(
+      "音源包返回结构不符",
+    );
   });
 
   it("local 源：第三方动作直接报错（本地路径由页面单独路由）", async () => {
-    const schemeMod = await import("@/source-scripts/scheme");
-    schemeMod.setScheme("script");
     const mod = await import("@/source-scripts");
     await expect(mod.getRecommendations("local", null, 1)).rejects.toThrow(
       "local 源不支持该动作",
@@ -632,27 +856,11 @@ describe("source-scripts dispatcher（scheme 分发）", () => {
     );
   });
 
-  it("resolvePlayUrl（预解析）：script 模式解析成功后回填引擎缓存", async () => {
-    hostRequestMock.active = true;
-    hostRequestMock.impl = (url: string) => {
-      // gdstudio 代理路径：直接返回可用 URL
-      if (String(url).includes("gdstudio")) {
-        return {
-          statusCode: 200,
-          headers: {},
-          body: { url: "http://dl.music.example/song.mp3" },
-        };
-      }
-      return {
-        statusCode: 200,
-        headers: {},
-        body: {},
-      };
-    };
+  it("resolvePlayUrl（预解析）：引擎解析成功后回填引擎缓存", async () => {
+    engineMock.phase = "ready";
+    engineMock.resolveUrl = "http://dl.music.example/song.mp3";
     const ipc = await import("@/services/ipc");
     const backfillSpy = vi.spyOn(ipc, "setResolvedPlayUrl").mockResolvedValue(undefined);
-    const schemeMod = await import("@/source-scripts/scheme");
-    schemeMod.setScheme("script");
     const mod = await import("@/source-scripts");
     const track = {
       id: "1901371647",
@@ -670,11 +878,31 @@ describe("source-scripts dispatcher（scheme 分发）", () => {
     backfillSpy.mockRestore();
   });
 
+  it("resolvePlayUrl（预解析）：引擎为空/抛错返回空串且不回填（无内置兜底）", async () => {
+    const ipc = await import("@/services/ipc");
+    const backfillSpy = vi.spyOn(ipc, "setResolvedPlayUrl").mockResolvedValue(undefined);
+    const mod = await import("@/source-scripts");
+    const track = {
+      id: "1901371647",
+      platform: "wyy" as const,
+      title: "孤勇者",
+      singer: "陈奕迅",
+      album: "",
+      picUrl: "",
+      duration: 260,
+      musicId: null,
+    };
+    engineMock.resolveUrl = "";
+    await expect(mod.resolvePlayUrl(track, "128")).resolves.toBe("");
+    engineMock.resolveThrows = true;
+    await expect(mod.resolvePlayUrl(track, "128")).resolves.toBe("");
+    expect(backfillSpy).not.toHaveBeenCalled();
+    backfillSpy.mockRestore();
+  });
+
   it("resolvePlayUrl（预解析）：local 源直接报错不预取链", async () => {
     const ipc = await import("@/services/ipc");
     const backfillSpy = vi.spyOn(ipc, "setResolvedPlayUrl").mockResolvedValue(undefined);
-    const schemeMod = await import("@/source-scripts/scheme");
-    schemeMod.setScheme("script");
     const mod = await import("@/source-scripts");
     const track = {
       id: "C:/music/a.flac",
@@ -693,26 +921,32 @@ describe("source-scripts dispatcher（scheme 分发）", () => {
     backfillSpy.mockRestore();
   });
 });
-describe("音源方案指定（单一选择，无方案间优先级）", () => {
+describe("音源方案指定（单一选择，无方案间优先级——bundle 取链层）", () => {
   const TEST_IDS = ["t-wyy-only", "t-kw-a", "t-kw-b", "t-fail"];
 
-  /** 注意：前面的 describe afterEach 里有 vi.resetModules()，会把模块注册表
-   *  清空重评估——本组测试必须全部用例内动态 import，保证与 dispatcher
-   *  （动态 import("@/source-scripts")）拿到同一个模块实例。 */
+  /** 方案指定语义活在 bundle 的取链层（layer.ts）；app 侧已无内置实现，
+   * 这里直接对 createSourceLayer 断言（注入不会成功的 request，纯 handler 用例） */
+  const makeLayer = async () => {
+    const { createSourceLayer } = await import("@/source-scripts/layer");
+    const { PLATFORMS } = await import("@/source-scripts/chain-config");
+    return createSourceLayer({
+      request: async () => {
+        throw new Error("request 在纯 handler 用例中不应被调用");
+      },
+      platform: PLATFORMS.WINDOWS,
+    });
+  };
 
-  const kwTrack = {
+  const kwSong = {
     id: "1",
-    platform: "kw" as const,
-    title: "x",
+    name: "x",
     singer: "y",
     album: "",
     picUrl: "",
-    duration: 0,
-    musicId: null,
+    interval: 0,
   };
 
   afterEach(async () => {
-    // 动态 import：与用例内注册的是同一个（未被重置的）模块实例
     const registry = await import("@/source-scripts/schemes/registry");
     const schemeMod = await import("@/source-scripts/scheme");
     for (const id of TEST_IDS) registry.unregisterScheme(id);
@@ -735,13 +969,8 @@ describe("音源方案指定（单一选择，无方案间优先级）", () => {
     });
     const schemeMod = await import("@/source-scripts/scheme");
     schemeMod.setScheme("t-kw-a");
-    const ipc = await import("@/services/ipc");
-    const backfillSpy = vi.spyOn(ipc, "setResolvedPlayUrl").mockResolvedValue(undefined);
-    const mod = await import("@/source-scripts");
-    const url = await mod.resolvePlayUrl(kwTrack, "128");
-    expect(url).toBe("http://t/a.mp3");
-    expect(backfillSpy).toHaveBeenCalledWith(kwTrack, "128", "http://t/a.mp3");
-    backfillSpy.mockRestore();
+    const layer = await makeLayer();
+    await expect(layer.resolvePlayUrl("kw", kwSong, "128")).resolves.toBe("http://t/a.mp3");
   });
 
   it("指定方案不支持该平台：返回空串，不再横向换源到别的方案", async () => {
@@ -758,13 +987,8 @@ describe("音源方案指定（单一选择，无方案间优先级）", () => {
     });
     const schemeMod = await import("@/source-scripts/scheme");
     schemeMod.setScheme("t-wyy-only");
-    const ipc = await import("@/services/ipc");
-    const backfillSpy = vi.spyOn(ipc, "setResolvedPlayUrl").mockResolvedValue(undefined);
-    const mod = await import("@/source-scripts");
-    const url = await mod.resolvePlayUrl(kwTrack, "128");
-    expect(url).toBe("");
-    expect(backfillSpy).not.toHaveBeenCalled();
-    backfillSpy.mockRestore();
+    const layer = await makeLayer();
+    await expect(layer.resolvePlayUrl("kw", kwSong, "128")).resolves.toBe("");
   });
 
   it("指定方案自身取链失败：返回空串，不再落到其他方案", async () => {
@@ -785,12 +1009,8 @@ describe("音源方案指定（单一选择，无方案间优先级）", () => {
     });
     const schemeMod = await import("@/source-scripts/scheme");
     schemeMod.setScheme("t-fail");
-    const ipc = await import("@/services/ipc");
-    const backfillSpy = vi.spyOn(ipc, "setResolvedPlayUrl").mockResolvedValue(undefined);
-    const mod = await import("@/source-scripts");
-    const url = await mod.resolvePlayUrl(kwTrack, "128");
-    expect(url).toBe("");
-    backfillSpy.mockRestore();
+    const layer = await makeLayer();
+    await expect(layer.resolvePlayUrl("kw", kwSong, "128")).resolves.toBe("");
   });
 
   it("切换指定方案后下一次取址走新方案", async () => {
@@ -806,14 +1026,11 @@ describe("音源方案指定（单一选择，无方案间优先级）", () => {
       playUrl: { kw: async () => "http://t/b.mp3" },
     });
     const schemeMod = await import("@/source-scripts/scheme");
-    const ipc = await import("@/services/ipc");
-    const backfillSpy = vi.spyOn(ipc, "setResolvedPlayUrl").mockResolvedValue(undefined);
-    const mod = await import("@/source-scripts");
+    const layer = await makeLayer();
     schemeMod.setScheme("t-kw-a");
-    await expect(mod.resolvePlayUrl(kwTrack, "128")).resolves.toBe("http://t/a.mp3");
+    await expect(layer.resolvePlayUrl("kw", kwSong, "128")).resolves.toBe("http://t/a.mp3");
     schemeMod.setScheme("t-kw-b");
-    await expect(mod.resolvePlayUrl(kwTrack, "128")).resolves.toBe("http://t/b.mp3");
-    backfillSpy.mockRestore();
+    await expect(layer.resolvePlayUrl("kw", kwSong, "128")).resolves.toBe("http://t/b.mp3");
   });
 
   it("方案内全灭：返回空串由引擎兜底（真实脚本包 qq 链 + 跨源全失败）", async () => {
@@ -824,14 +1041,19 @@ describe("音源方案指定（单一选择，无方案间优先级）", () => {
     hostRequestMock.impl = () => {
       throw new Error("mock 线路不可用");
     };
-    const qqTrack = { ...kwTrack, platform: "qq" as const };
-    const ipc = await import("@/services/ipc");
-    const backfillSpy = vi.spyOn(ipc, "setResolvedPlayUrl").mockResolvedValue(undefined);
-    const mod = await import("@/source-scripts");
-    const url = await mod.resolvePlayUrl(qqTrack, "128");
-    expect(url).toBe("");
-    expect(backfillSpy).not.toHaveBeenCalled();
-    backfillSpy.mockRestore();
+    const { createSourceLayer } = await import("@/source-scripts/layer");
+    const { PLATFORMS } = await import("@/source-scripts/chain-config");
+    const layer = createSourceLayer({
+      request: async (url: string): Promise<SourceResponse> => {
+        if (hostRequestMock.active && hostRequestMock.impl !== null) {
+          return hostRequestMock.impl(url) as SourceResponse;
+        }
+        throw new Error("hostRequest 在未配置 mock 的用例中被调用");
+      },
+      platform: PLATFORMS.WINDOWS,
+    });
+    const qqSong = { ...kwSong };
+    await expect(layer.resolvePlayUrl("qq", qqSong, "128")).resolves.toBe("");
   });
 });
 

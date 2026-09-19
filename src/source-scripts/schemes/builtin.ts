@@ -13,10 +13,15 @@ export const BUILTIN_SCHEMES: SourceScheme[] = [
     name: "脚本包",
     description: "官方接口 + 第三方线路聚合，自动换源与跨源兜底",
     playUrl: {
-      wyy: (request, song, quality) => resolvePlayUrlAction(request, "wyy", song, quality),
-      qq: (request, song, quality) => resolvePlayUrlAction(request, "qq", song, quality),
-      kw: (request, song, quality) => resolvePlayUrlAction(request, "kw", song, quality),
-      kg: (request, song, quality) => resolvePlayUrlAction(request, "kg", song, quality),
+      // platform 透传：安卓（1101）跑同一份 bundle 时，行级 platforms 过滤按本机平台生效
+      wyy: (request, song, quality, platform) =>
+        resolvePlayUrlAction(request, "wyy", song, quality, platform),
+      qq: (request, song, quality, platform) =>
+        resolvePlayUrlAction(request, "qq", song, quality, platform),
+      kw: (request, song, quality, platform) =>
+        resolvePlayUrlAction(request, "kw", song, quality, platform),
+      kg: (request, song, quality, platform) =>
+        resolvePlayUrlAction(request, "kg", song, quality, platform),
     },
   },
 ];

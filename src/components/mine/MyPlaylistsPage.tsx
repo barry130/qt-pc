@@ -6,6 +6,7 @@ import { SOURCE_DISPLAY } from "@/types";
 import * as ipc from "@/services/ipc";
 import { pullLikes } from "@/stores/auth";
 import { qtresCoverUrl } from "@/lib/lrc";
+import { ImportPlaylistDialog } from "./ImportPlaylistDialog";
 
 /**
  * 我的歌单（路由 /my/playlists，DESIGN §5.3）。
@@ -26,6 +27,7 @@ export function MyPlaylistsPage(): React.JSX.Element {
   const [editName, setEditName] = useState("");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
 
   const load = useCallback(async (): Promise<void> => {
     setLoading(true);
@@ -102,6 +104,16 @@ export function MyPlaylistsPage(): React.JSX.Element {
     }
   };
 
+  /** 导入完成：刷新列表并跳到该歌单详情（与移动端导入后跳转一致） */
+  const onImported = (playlist: { id: string; platform: string }): void => {
+    setImportOpen(false);
+    void load();
+    void navigate({
+      to: "/playlist/$platform/$id",
+      params: { platform: playlist.platform, id: playlist.id },
+    });
+  };
+
   const local = list.filter((p) => p.platform === ipc.LOCAL_PLATFORM);
   const online = list.filter((p) => p.platform !== ipc.LOCAL_PLATFORM);
 
@@ -126,6 +138,13 @@ export function MyPlaylistsPage(): React.JSX.Element {
             className="h-8 shrink-0 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
           >
             新建
+          </button>
+          <button
+            type="button"
+            onClick={() => setImportOpen(true)}
+            className="h-8 shrink-0 rounded-md border border-border px-3 text-xs hover:bg-accent"
+          >
+            导入
           </button>
         </div>
       </div>
@@ -166,7 +185,7 @@ export function MyPlaylistsPage(): React.JSX.Element {
             <Group
               title="收藏的在线歌单"
               items={online}
-              emptyHint="还没有收藏在线歌单，在歌单详情页点「收藏」"
+              emptyHint="还没有收藏在线歌单，点上方「导入」粘贴分享链接，或在歌单详情页点「收藏」"
               editingId={editingId}
               editName={editName}
               setEditName={setEditName}
@@ -181,6 +200,12 @@ export function MyPlaylistsPage(): React.JSX.Element {
           </>
         )}
       </div>
+      {importOpen && (
+        <ImportPlaylistDialog
+          onClose={() => setImportOpen(false)}
+          onImported={onImported}
+        />
+      )}
     </div>
   );
 }

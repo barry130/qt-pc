@@ -18,6 +18,7 @@
  * registry.ts 用 import.meta.glob 自动发现所有 scheme.ts，
  * 无需改枚举/校验/路由/UI 任何其它文件。
  */
+import type { PlatformId } from "../chain-config";
 import type { MusicInfo, Quality, RequestBuiltin, Source } from "../contract";
 
 /** 单平台取链接口：返回可播 URL；失败直接 throw（返回空串也按失败计）。 */
@@ -25,6 +26,11 @@ export type PlayUrlResolver = (
   request: RequestBuiltin,
   song: MusicInfo,
   quality: Quality,
+  /**
+   * 本机平台号（1101 安卓 / 1102 iOS / 1103 Windows）：行级 platforms 过滤基准。
+   * 缺省 = PC 主窗口（Windows）；安卓引擎侧由 layer 的 deps.platform 传入。
+   */
+  platform?: PlatformId,
 ) => string | Promise<string>;
 
 export interface SourceScheme {

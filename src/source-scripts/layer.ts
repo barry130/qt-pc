@@ -34,7 +34,12 @@ export function createSourceLayer(deps: SourceLayerDeps) {
       // LX 宿主挂死时也要在引擎应答预算内给出答复，否则引擎白等才判失败）
       const config = await getChainConfig();
       const budget = new ChainBudget(config.budget.totalMs, config.budget.lineMs);
-      return budget.run(Promise.resolve(handler(deps.request, song, quality)), "");
+      // deps.platform 透传给执行器：chain.json 的行级 platforms 过滤按本机平台生效
+      // （安卓 1101 与 PC 1103 共用同一份 bundle，这一步是两端唯一的平台差异入口）
+      return budget.run(
+        Promise.resolve(handler(deps.request, song, quality, deps.platform)),
+        "",
+      );
     },
   };
 }

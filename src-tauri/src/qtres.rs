@@ -10,6 +10,8 @@
 //!   内嵌 HTML，无 CSP 注入 → 可自由动态 import 音源包脚本）
 //! - `/script/<code>/<file>`：只读分发已安装音源包文件（source-bundle/install/
 //!   目录；code/file 严格校验防路径穿越）
+//! - `/builtin/<file>`：内嵌内置音源包（编译期打进二进制；引擎页在未安装
+//!   远程包 / 远程包加载失败时加载，保证开箱可用）
 //!
 //! 白名单：只允许已知音源 CDN 域名，防止歌词/皮肤数据把它当任意代理。
 
@@ -105,6 +107,23 @@ fn placeholder() -> Response<Vec<u8>> {
 /// 引擎页 HTML（内嵌编译；改页面要重编 Rust）
 const ENGINE_INDEX_HTML: &str = include_str!("source_engine_page.html");
 
+/// 内置音源包（音源包热更新 P2 补充）：随应用编译进二进制的 bundle，
+/// 引擎页在未安装远程包 / 远程包加载失败时加载，保证开箱可用。
+/// 产物由 `npm run sync:builtin` 从 dist-sources 同步（勿手改）；
+/// version.json 的 code/name 单源于前端 BUILTIN_SOURCE_VERSION。
+const BUILTIN_BUNDLE_JS: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/builtin-sources/source-bundle.js"
+));
+const BUILTIN_CHAIN_JSON: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/builtin-sources/chain.json"
+));
+const BUILTIN_VERSION_JSON: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/builtin-sources/version.json"
+));
+
 fn engine_page_response() -> Response<Vec<u8>> {
     Response::builder()
         .status(StatusCode::OK)
@@ -170,6 +189,27 @@ fn handle_script_file<R: tauri::Runtime>(app: &tauri::AppHandle<R>, rest: &str) 
         // no-store：音源包「立即应用」靠重建窗口重新拉脚本，不能吃缓存
         .header(header::CACHE_CONTROL, "no-store")
         .body(bytes)
+        .unwrap_or_else(|_| not_found())
+}
+
+/// `/builtin/<file>`：内嵌内置音源包分发。文件名白名单逐一匹配，
+/// 不落盘、无路径拼接，天然无穿越面。
+fn handle_builtin_file(rest: &str) -> Response<Vec<u8>> {
+    let file = rest.split(['?', '#']).next().unwrap_or(rest);
+    let (body, content_type): (&[u8], &str) = match file {
+        "source-bundle.js" => (BUILTIN_BUNDLE_JS, "application/javascript; charset=utf-8"),
+        "chain.json" => (BUILTIN_CHAIN_JSON.as_bytes(), "application/json; charset=utf-8"),
+        "version.json" => (BUILTIN_VERSION_JSON.as_bytes(), "application/json; charset=utf-8"),
+        _ => return not_found(),
+    };
+    // 与 /script 分发同款日志：排查「引擎到底在用哪个包」全靠它
+    log::info!("[qtres] /builtin 分发: {file} ({} bytes)", body.len());
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, content_type)
+        // no-store：内置包随应用升级而变，且「立即应用」靠重建窗口重拉
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(body.to_vec())
         .unwrap_or_else(|_| not_found())
 }
 
@@ -277,6 +317,9 @@ fn handle_qtres_sync<R: tauri::Runtime>(
     }
     if let Some(rest) = path.strip_prefix("/script/") {
         return handle_script_file(app, rest);
+    }
+    if let Some(rest) = path.strip_prefix("/builtin/") {
+        return handle_builtin_file(rest);
     }
     let Some((kind, original_url)) = decode_res_path(&path) else {
         log::warn!("[qtres] 无法解码封面路径: {path}");
@@ -491,6 +534,34 @@ mod tests {
         let html = String::from_utf8(body).unwrap();
         assert!(html.contains("source-engine-request"), "含取链 RPC 监听");
         assert!(html.contains("createSourceLayer"), "调用 bundle 入口");
+    }
+
+    #[test]
+    fn builtin_files_embedded() {
+        // bundle 非空且含关键导出；版本与链配置可达
+        let resp = handle_builtin_file("source-bundle.js");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body();
+        assert!(body.len() > 100 * 1024, "bundle 体积异常: {}", body.len());
+        let js = String::from_utf8(body).unwrap();
+        assert!(js.contains("createSourceLayer"));
+
+        let chain = handle_builtin_file("chain.json");
+        assert_eq!(chain.status(), StatusCode::OK);
+        let chain_json: serde_json::Value =
+            serde_json::from_slice(&chain.into_body()).unwrap();
+        assert!(chain_json.get("chains").is_some());
+
+        let version = handle_builtin_file("version.json");
+        assert_eq!(version.status(), StatusCode::OK);
+        let ver: serde_json::Value = serde_json::from_slice(&version.into_body()).unwrap();
+        assert!(ver.get("code").and_then(|c| c.as_u64()).unwrap_or(0) > 20_260_000_00);
+
+        assert_eq!(handle_builtin_file("evil.js").status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            handle_builtin_file("../secret.txt").status(),
+            StatusCode::NOT_FOUND
+        );
     }
 
     #[test]

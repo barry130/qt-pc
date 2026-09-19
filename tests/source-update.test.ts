@@ -4,6 +4,7 @@
 import { describe, expect, it } from "vitest";
 import {
   decideUpdate,
+  BUILTIN_SOURCE_VERSION,
   type SourceReleaseVo,
   type SourceStateVo,
 } from "@/source-scripts/source-update";
@@ -72,7 +73,8 @@ describe("source-update 判定（§2.3）", () => {
   });
 
   it("5b. 未安装任何包且远端 > 内置版 → 下载", () => {
-    const d = decideUpdate(release({ sourceVersionCode: 2026091902 }), local({ installed: null }));
+    // 字面量取「比当前内置版（2026091904）新一号」；内置版升级后这里要跟着挪
+    const d = decideUpdate(release({ sourceVersionCode: 2026091905 }), local({ installed: null }));
     expect(d.action).toBe("download");
   });
 
@@ -83,8 +85,9 @@ describe("source-update 判定（§2.3）", () => {
   });
 
   it("5d. 未装远程包且远端 == 内置版 → 内置已带，不下载", () => {
+    // 用常量而不是字面量：内置版号每次随 App 发版同步，字面量会悄悄过期
     const d = decideUpdate(
-      release({ sourceVersionCode: 2026091901 }),
+      release({ sourceVersionCode: BUILTIN_SOURCE_VERSION.code }),
       local({ installed: null }),
     );
     expect(d.action).toBe("none");

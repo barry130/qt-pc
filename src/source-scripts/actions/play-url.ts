@@ -147,6 +147,22 @@ export async function resolvePlayUrl(
   return resolvePlayUrlWithBudget(request, source, song, quality, budget, platform);
 }
 
+/** 最近一次整链全灭的逐线路追踪（诊断用；安卓端会随「未取到播放地址」一并上抛） */
+let lastMissTrace = "";
+
+/** 读走最近一次全灭追踪（读后即清，避免旧 trace 混进下一次失败） */
+export function consumeLastMissTrace(): string {
+  const t = lastMissTrace;
+  lastMissTrace = "";
+  return t;
+}
+
+/** 单条线路的追踪摘要：失败原因截断到 60 字符，防止错误消息撑爆引擎应答 */
+function traceEntry(lineId: string, detail: string): string {
+  const d = detail.length > 60 ? detail.slice(0, 60) + "…" : detail;
+  return `${lineId}=${d}`;
+}
+
 /**
  * 带预算的取链实现：整链总预算 + 单线路分片上限（金额来自 ChainConfig，
  * 测试可传自定义 budget 覆盖）。
@@ -163,43 +179,74 @@ export async function resolvePlayUrlWithBudget(
   const cacheKey = source + ":" + song.id + ":" + quality;
   const cached = urlCache.get(cacheKey);
   if (cached.length > 0) return cached;
+  lastMissTrace = "";
 
   // 档内线路：按音质过滤 → 行级 enabled/platforms 过滤 → 封顶 maxLinesPerQuality
   const runners = filterChainLines(config.chains[source] ?? [], platform)
     .filter((line) => line.qualities.includes(quality))
     .slice(0, config.maxLinesPerQuality)
-    .map((line) => ({ parallel: line.parallel === true, executor: lineExecutor(line, source) }))
-    .filter((runner): runner is { parallel: boolean; executor: LineExecutor } => runner.executor !== null);
+    .map((line) => ({
+      id: line.id,
+      parallel: line.parallel === true,
+      executor: lineExecutor(line, source),
+    }))
+    .filter((runner): runner is { id: string; parallel: boolean; executor: LineExecutor } => runner.executor !== null);
+  const trace: string[] = [];
 
   // parallel 线路提前起跑（失败按空串处理），到达序位时直接收割
   const started = new Map<LineExecutor, Promise<string>>();
   for (const runner of runners) {
     if (runner.parallel) {
-      started.set(runner.executor, runner.executor(request, song, quality).catch(() => ""));
+      started.set(
+        runner.executor,
+        runner.executor(request, song, quality).catch((e: unknown) => `err:${msgOf(e)}`),
+      );
     }
   }
   for (const runner of runners) {
-    if (budget.expired) break;
+    if (budget.expired) {
+      trace.push(traceEntry(runner.id, "预算耗尽未跑"));
+      continue;
+    }
     // 挂死的线路由分片上限切断，让后面的线路还有机会；整链总时长由预算兜底
-    let url = await budget.run(
-      started.get(runner.executor) ?? runner.executor(request, song, quality).catch(() => ""),
+    const raw = await budget.run(
+      started.get(runner.executor) ?? runner.executor(request, song, quality).catch((e: unknown) => `err:${msgOf(e)}`),
       "",
     );
+    let url = typeof raw === "string" ? raw : "";
+    if (typeof raw === "string" && raw.length > 6 && raw.startsWith("err:")) {
+      trace.push(traceEntry(runner.id, raw));
+      continue;
+    }
     // 每条线路的返回值都实测（见 verifyPlayable 注释）：死链按未命中继续换源
     if (url.length > 0 && !(await budget.run(verifyPlayable(request, url), false))) {
+      trace.push(traceEntry(runner.id, "死链（Range 预检不过）"));
       url = "";
     }
-    if (url.length > 0) return settle(cacheKey, url);
+    if (url.length > 0) {
+      trace.push(traceEntry(runner.id, "ok"));
+      return settle(cacheKey, url);
+    }
+    if (!trace.some((t) => t.startsWith(runner.id + "="))) trace.push(traceEntry(runner.id, "空"));
   }
   // 档内全灭 → 跨源兜底（同样受预算约束；只认 kw/wyy 互备）
   const keyword = song.name + " " + song.singer;
   for (const target of config.crossSources[source] ?? []) {
     if (target !== "kw" && target !== "wyy") continue;
-    if (budget.expired) break;
+    if (budget.expired) {
+      trace.push(traceEntry("cross:" + target, "预算耗尽未跑"));
+      continue;
+    }
     const url = await budget.run(playFromSource(request, keyword, target, quality), "");
+    trace.push(traceEntry("cross:" + target, url.length > 0 ? "ok" : "空"));
     if (url.length > 0) return settle(cacheKey, url);
   }
+  lastMissTrace = `${source}@${quality} ${trace.join("; ")}`;
   throw new Error("该歌曲暂时无法播放");
+}
+
+function msgOf(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
 }
 
 function settle(cacheKey: string, url: string): string {

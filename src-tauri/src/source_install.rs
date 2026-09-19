@@ -74,7 +74,7 @@ fn install_dir(dir: &Path, code: i64) -> PathBuf {
     dir.join("install").join(code.to_string())
 }
 
-// ---------- manifest 解析（裸 JSON 响应，字段与 QtSourceManifestVo 对齐） ----------
+// ---------- manifest 解析（QtRestResp 包装响应，data 字段与 QtSourceManifestVo 对齐） ----------
 
 /// 后端 VO 全是包装类型，可空列会序列化成 null；一个 null 不该让整个 manifest 解析失败。
 fn null_as_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
@@ -134,6 +134,33 @@ pub struct SourceManifest {
     pub release: Option<SourceRelease>,
 }
 
+/// QtRestResp 包装层（轻听后端统一响应：{code, msg, data}）。
+/// 不用 `#[serde(default)]`：serde derive 会借此给泛型 T 平添 `T: Default` bound。
+#[derive(Debug, Clone)]
+pub struct QtRestRespEnvelope<T> {
+    pub code: i64,
+    pub data: Option<T>,
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for QtRestRespEnvelope<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let raw = serde_json::Value::deserialize(deserializer)?;
+        let code = raw
+            .get("code")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| D::Error::missing_field("code"))?;
+        let data = match raw.get("data") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(T::deserialize(v.clone()).map_err(D::Error::custom)?),
+        };
+        Ok(QtRestRespEnvelope { code, data })
+    }
+}
+
 // ---------- 命令 ----------
 
 /// 当前音源包本地状态（引擎页与设置页共用）
@@ -149,7 +176,7 @@ fn app_version_code() -> i64 {
     astral::version_code()
 }
 
-/// 拉取 manifest（免认证裸 JSON；由 cmd_source_manifest 调用）
+/// 拉取 manifest（免认证；响应为 QtRestResp 包装：{code, data: SourceManifest}；由 cmd_source_manifest 调用）
 async fn fetch_manifest() -> Result<Option<SourceRelease>, String> {
     let client = astral::AstralClient::new(astral::DEFAULT_BASE_URL);
     let url = format!(
@@ -165,7 +192,7 @@ async fn fetch_manifest() -> Result<Option<SourceRelease>, String> {
     if res.status_code != 200 {
         return Err(format!("manifest 拉取失败: HTTP {}", res.status_code));
     }
-    // 裸 JSON 响应（非 QtRestResp 包装）；body 非 JSON 时是字符串
+    // QtRestResp 包装响应；body 非 JSON 时是字符串
     let text = match res.body {
         Value::String(s) => s,
         other => serde_json::to_string(&other).map_err(|e| e.to_string())?,
@@ -173,9 +200,13 @@ async fn fetch_manifest() -> Result<Option<SourceRelease>, String> {
     if text.trim().is_empty() {
         return Ok(None);
     }
-    let manifest: SourceManifest =
+    let wrapped: QtRestRespEnvelope<SourceManifest> =
         serde_json::from_str(&text).map_err(|e| format!("manifest 解析失败: {e}"))?;
-    Ok(manifest.release)
+    // 与安卓端 requestJson 同口径：code 0/200 算业务成功，其余按无包处理
+    if wrapped.code != 200 && wrapped.code != 0 {
+        return Ok(None);
+    }
+    Ok(wrapped.data.and_then(|m| m.release))
 }
 
 /// 手动/自动检查共用：拉 manifest 并返回远端 release（无发布 = null）
@@ -427,31 +458,37 @@ mod tests {
 
     #[test]
     fn manifest_parses_backend_shape() {
-        // 与 astral QtSourceManifestVo/QtSourceReleaseVo 字段对齐（camelCase）
+        // 响应外层是 QtRestResp 包装；data 才与 astral QtSourceManifestVo/QtSourceReleaseVo 对齐（camelCase）
         let raw = r#"{
-            "schema": 3,
-            "generatedAt": "2026-09-18T14:00:00Z",
-            "release": {
-                "id": 9,
-                "sourceVersionCode": 2026091801,
-                "sourceVersionName": "2026.09.18.1",
-                "platforms": [1101, 1103],
-                "hostApiVersion": 1,
-                "appVersionCodes": { "1101": [304], "1103": [102, 103] },
-                "channel": "stable",
-                "notes": "酷我母带接口修复",
-                "artifacts": [
-                    { "path": "chain.json", "version": 8, "url": "https://x/chain.json" },
-                    { "path": "source-bundle.js", "version": 3, "url": "https://x/bundle.js" }
-                ],
-                "rollbackTo": null,
-                "bad": false,
-                "published": true,
-                "publishedAt": "2026-09-18T14:00:00Z",
-                "createTime": "2026-09-18T13:00:00Z"
+            "code": 200,
+            "msg": "success",
+            "data": {
+                "schema": 3,
+                "generatedAt": "2026-09-18T14:00:00Z",
+                "release": {
+                    "id": 9,
+                    "sourceVersionCode": 2026091801,
+                    "sourceVersionName": "2026.09.18.1",
+                    "platforms": [1101, 1103],
+                    "hostApiVersion": 1,
+                    "appVersionCodes": { "1101": [304], "1103": [102, 103] },
+                    "channel": "stable",
+                    "notes": "酷我母带接口修复",
+                    "artifacts": [
+                        { "path": "chain.json", "version": 8, "url": "https://x/chain.json" },
+                        { "path": "source-bundle.js", "version": 3, "url": "https://x/bundle.js" }
+                    ],
+                    "rollbackTo": null,
+                    "bad": false,
+                    "published": true,
+                    "publishedAt": "2026-09-18T14:00:00Z",
+                    "createTime": "2026-09-18T13:00:00Z"
+                }
             }
         }"#;
-        let manifest: SourceManifest = serde_json::from_str(raw).unwrap();
+        let wrapped: QtRestRespEnvelope<SourceManifest> = serde_json::from_str(raw).unwrap();
+        assert_eq!(wrapped.code, 200);
+        let manifest = wrapped.data.unwrap();
         let release = manifest.release.unwrap();
         assert_eq!(manifest.schema, 3);
         assert_eq!(release.source_version_code, 2026091801);
@@ -466,34 +503,47 @@ mod tests {
         // 生产环境实测响应：公开 manifest 的 published/id/createTime 为 null，
         // rollbackTo 也可能为 null；可空列（notes/channel）同理，都不能让解析失败
         let raw = r#"{
-            "schema": 3,
-            "generatedAt": "2026-09-19T00:45:11Z",
-            "release": {
-                "id": null,
-                "sourceVersionCode": 2026091901,
-                "sourceVersionName": "2026.09.19.1",
-                "platforms": [1103],
-                "hostApiVersion": 1,
-                "appVersionCodes": { "1103": [102, 103] },
-                "channel": "stable",
-                "notes": null,
-                "artifacts": [
-                    { "path": "chain.json", "version": 1, "url": "https://x/1" }
-                ],
-                "rollbackTo": null,
-                "bad": false,
-                "published": null,
-                "publishedAt": "2026-09-19T00:42:32Z",
-                "createTime": null
+            "code": 200,
+            "msg": "success",
+            "data": {
+                "schema": 3,
+                "generatedAt": "2026-09-19T00:45:11Z",
+                "release": {
+                    "id": null,
+                    "sourceVersionCode": 2026091901,
+                    "sourceVersionName": "2026.09.19.1",
+                    "platforms": [1103],
+                    "hostApiVersion": 1,
+                    "appVersionCodes": { "1103": [102, 103] },
+                    "channel": "stable",
+                    "notes": null,
+                    "artifacts": [
+                        { "path": "chain.json", "version": 1, "url": "https://x/1" }
+                    ],
+                    "rollbackTo": null,
+                    "bad": false,
+                    "published": null,
+                    "publishedAt": "2026-09-19T00:42:32Z",
+                    "createTime": null
+                }
             }
         }"#;
-        let manifest: SourceManifest = serde_json::from_str(raw).unwrap();
+        let wrapped: QtRestRespEnvelope<SourceManifest> = serde_json::from_str(raw).unwrap();
+        let manifest = wrapped.data.unwrap();
         let release = manifest.release.unwrap();
         assert_eq!(release.source_version_code, 2026091901);
         // published=null 表示「公开接口不暴露该字段」，不是未发布
         assert!(release.published && !release.bad);
         assert_eq!(release.notes, "");
         assert_eq!(release.artifacts.len(), 1);
+    }
+
+    #[test]
+    fn manifest_wrapped_null_release_means_nothing_published() {
+        // 无可用包：data.release 为 null（data 本身仍在，schema 照常）
+        let raw = r#"{"code":200,"msg":"success","data":{"schema":3,"generatedAt":"x","release":null}}"#;
+        let wrapped: QtRestRespEnvelope<SourceManifest> = serde_json::from_str(raw).unwrap();
+        assert!(wrapped.data.unwrap().release.is_none());
     }
 
     #[test]

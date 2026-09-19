@@ -41,6 +41,32 @@ export async function requestJson(
   return body as Record<string, unknown>;
 }
 
+const B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/**
+ * base64 → UTF-8 字符串。QQ musicu.fcg 的 lyric/trans 是 base64 文本；
+ * 引擎环境（QuickJS）没有 atob/Buffer，按 RFC 4648 手写解码。
+ * TextDecoder 在引擎内已由 lx-host crypto.ts 使用，可用性已被现有功能验证。
+ */
+export function decodeBase64Utf8(value: string): string {
+  if (value.length === 0) return "";
+  const clean = value.replace(/[^A-Za-z0-9+/]/g, "");
+  const bytes: number[] = [];
+  let buffer = 0;
+  let bits = 0;
+  for (let i = 0; i < clean.length; i++) {
+    const idx = B64_CHARS.indexOf(clean.charAt(i));
+    if (idx < 0) continue;
+    buffer = (buffer << 6) | idx;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      bytes.push((buffer >> bits) & 0xff);
+    }
+  }
+  return new TextDecoder().decode(new Uint8Array(bytes));
+}
+
 /** JSON 读取工具（替代蓝本 UTSJSONObject.get 的判空语义） */
 export function asObject(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)

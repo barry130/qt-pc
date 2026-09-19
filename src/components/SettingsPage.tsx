@@ -1,11 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { errMsg, stripErrorUrls } from "@/lib/utils";
 import { useNavigate } from "@tanstack/react-router";
 import { PageContainer } from "@/components/layout/PageContainer";
 import * as ipc from "@/services/ipc";
-import { getScheme, setScheme } from "@/source-scripts/scheme";
-import { listSchemes } from "@/source-scripts/schemes/registry";
-import type { SchemeId } from "@/source-scripts/contract";
 import {
   getAppVersion,
   getDesktopLyricState,
@@ -599,14 +596,6 @@ function PlaybackSection(): React.JSX.Element {
   const [quality, setQuality] = useState<Quality>("320");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // 音源方案（2026-09-18）：只指定一个方案，方案内部自带多线路换源与跨源
-  // 兜底；localStorage 持久化，下一次取址生效，当前曲目不受影响
-  const [scheme, setSchemeState] = useState<SchemeId>(() => getScheme());
-  const schemes = useMemo(() => listSchemes(), []);
-  const chooseScheme = (id: string): void => {
-    setScheme(id as SchemeId);
-    setSchemeState(id as SchemeId);
-  };
 
   const load = useCallback(async (): Promise<void> => {
     try {
@@ -686,33 +675,6 @@ function PlaybackSection(): React.JSX.Element {
           disabled={busy}
           onChange={(q) => void chooseQuality(q)}
         />
-      </SettingRow>
-      <SettingRow
-        title="音源方案"
-        description="只能选一个；方案内部自带换源与跨源兜底。改动下一次取址生效。"
-      >
-        <div className="flex flex-col items-start gap-2" role="radiogroup" aria-label="音源方案">
-          {schemes.map((s) => (
-            <label key={s.id} className="flex cursor-pointer items-start gap-2 text-xs">
-              <input
-                type="radio"
-                name="source-scheme"
-                value={s.id}
-                checked={scheme === s.id}
-                onChange={() => chooseScheme(s.id)}
-                className="mt-0.5 accent-primary"
-              />
-              <span className="min-w-0">
-                <span className={scheme === s.id ? "text-primary" : ""}>{s.name}</span>
-                {s.description && (
-                  <span className="mt-0.5 block text-[10px] leading-4 text-muted-foreground">
-                    {s.description}
-                  </span>
-                )}
-              </span>
-            </label>
-          ))}
-        </div>
       </SettingRow>
       {error && <p className="py-2 text-xs text-destructive">{error}</p>}
     </div>

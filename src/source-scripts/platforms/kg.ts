@@ -6,7 +6,8 @@
  * - musicUrlCore      :3506 fetchNativeUrl kg 分支（m.kugou.com getSongInfo.php cmd=playInfo，
  *                      返回 url 或 throw "该歌曲暂时无法播放"；quality 不参与 kg 分支）
  * - lyric             :3067（酷狗官方歌词接口不稳定 → 直接用网易云搜索兜底取词，
- *                      失败返回空串）/ lyricTranslation :3178（kg 不在 wyy/local 之列，返回空串）
+ *                      失败返回空串）/ lyricTranslation（仅同名兜底词路径返回所配
+ *                      网易云 tlyric，原生 krc 无翻译字段恒空串）
  * - playlistCategories :571（yueku/v9/special/getSpecial?is_smarty=1 的 data.tagids 六组）
  * - playlistDetail    :2928（collection_ 收藏歌单 → song_v2 签名接口；gcid_ 全球歌单 →
  *                      m.kugou.com SSR 分享页；含字母短码 → zlist/list chain 接口；
@@ -104,14 +105,45 @@ async function kgNativeLyric(
     : "";
 }
 
+/** kg 歌词 + 翻译成对结果（kgLyricWithTranslation 的返回） */
+interface KgLyricPair {
+  lyric: string;
+  translation: string;
+}
+
+/**
+ * kg 歌词与翻译成对获取：原生 krc 优先（无翻译字段）；
+ * 取不到才回落网易云同名搜索，一次同时拿 lrc + tlyric。
+ * 结果按歌曲键缓存——lyric / lyricTranslation 两次入口调用走同一份结果，
+ * 保证译文与所显示原文严格配对，也避免搜索重复请求。
+ */
+let kgLyricPairCache: { key: string; pair: KgLyricPair } | null = null;
+
+async function kgLyricWithTranslation(
+  request: RequestBuiltin,
+  song: MusicInfo,
+): Promise<KgLyricPair> {
+  const key = song.id + ":" + song.name + ":" + song.singer;
+  const cached = kgLyricPairCache;
+  if (cached != null && cached.key === key) return cached.pair;
+  const native = await kgNativeLyric(request, song).catch(() => "");
+  const pair: KgLyricPair =
+    native.length > 0
+      ? { lyric: native, translation: "" }
+      : await wyyLyricPairBySearch(request, song).catch(() => ({ lyric: "", translation: "" }));
+  kgLyricPairCache = { key, pair };
+  return pair;
+}
+
 /**
  * 网易云搜索兜底（仅酷狗原生取不到时用）：**必须命中同名曲**才采纳。
  * 蓝本原样是取第一条，实测常命中同歌手的另一首，那种歌词比没有更糟。
+ * 一次请求同时取 lrc + tlyric 成对返回——译文与所显示的原文严格同曲。
  */
-async function wyyLyricBySearch(
+async function wyyLyricPairBySearch(
   request: RequestBuiltin,
   song: MusicInfo,
-): Promise<string> {
+): Promise<{ lyric: string; translation: string }> {
   const json = await requestJson(
     request,
     "https://music.163.com/api/search/get" +
@@ -135,10 +167,11 @@ async function wyyLyricBySearch(
         buildQuery({ id, lv: "-1", kv: "-1", tv: "-1" }),
       { headers: WYY_HEADERS },
     );
-    const text = asString(asObject(lyricJson["lrc"])["lyric"]);
-    if (text.length > 0) return text;
+    const lyric = asString(asObject(lyricJson["lrc"])["lyric"]);
+    if (lyric.length === 0) continue;
+    return { lyric, translation: asString(asObject(lyricJson["tlyric"])["lyric"]) };
   }
-  return "";
+  return { lyric: "", translation: "" };
 }
 
 /**
@@ -774,14 +807,16 @@ export const kg = {
    * 故改为：原生精确取词 → 取不到才回落网易云，且**必须命中同名曲**。
    */
   async lyric(request: RequestBuiltin, song: MusicInfo): Promise<string> {
-    const native = await kgNativeLyric(request, song).catch(() => "");
-    if (native.length > 0) return native;
-    return wyyLyricBySearch(request, song).catch(() => "");
+    return (await kgLyricWithTranslation(request, song)).lyric;
   },
 
-  /** 蓝本 lyricTranslation :3178（仅 wyy/local 有翻译，kg 直接返回空串） */
-  async lyricTranslation(_request: RequestBuiltin, _song: MusicInfo): Promise<string> {
-    return "";
+  /**
+   * 酷狗官方歌词接口（krc.php）没有翻译字段，原生词路径恒返回空串；
+   * 仅当歌词本文走了网易云同名兜底时，返回同一首的 tlyric——
+   * 译文与所显示的原文严格同源同曲，不是跨源兜底。按产品约定不做其他兜底。
+   */
+  async lyricTranslation(request: RequestBuiltin, song: MusicInfo): Promise<string> {
+    return (await kgLyricWithTranslation(request, song)).translation;
   },
 
   /** 蓝本 playlistCategories kg 分支 :571（tagids 固定六组，id 为数字字符串） */

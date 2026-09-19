@@ -10,7 +10,8 @@
     "tauri": "tauri",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "build:sources": "node scripts/build-sources.mjs"
+    "build:sources": "node scripts/build-sources.mjs",
+    "sync:builtin": "node scripts/sync-builtin-sources.mjs"
   },
   "dependencies": {
     "@tanstack/react-router": "1.170.32",

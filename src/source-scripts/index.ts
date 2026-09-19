@@ -1,16 +1,17 @@
 /**
- * 音源访问层统一入口（全量版）。
+ * 音源访问层统一入口（纯音源包版）。
  *
- * 页面一律从这里调"第三方源"动作，不直接 import ipc 里的对应命令：
- * - 第三方源（wyy/qq/kw/kg）→ 当前**指定方案**（内置 script = 官方接口 +
- *   实测第三方线路聚合链；schemes/ 下自注册的 premium = 剩余线路）；
- *   方案内部自带换源与跨源兜底，方案之间不再排优先级；
- * - local 源 → 本地扫描单元，这些第三方动作不适用（ensureScript 直接报错）。
+ * 页面一律从这里调"第三方源"动作，不直接 import ipc 里的对应命令。
+ * 应用**不再内置**第三方音源实现：wyy/qq/kw/kg 的一切数据接口与取链都由
+ * 引擎窗口加载的音源包（source-bundle.js，含全部第三方线路地址）承担，
+ * 应用侧只保留 astral 后端与音源包两条网络通道——平台官方接口、聚合线路
+ * 等 URL 只允许出现在音源包构建产物里（scripts/build-sources.mjs）。
  *
- * 原生 Rust Provider 已整体删除，脚本层是唯一的第三方实现。
- * 取链（playUrl）特殊：播放由 Rust 引擎主导，脚本路径通过
- * resolvePlayUrl() 预解析 + set_resolved_play_url 回填引擎缓存接入；
- * 引擎未命中缓存时经 playurl_bridge 再问一次前端。
+ * - local 源 → 本地扫描单元，第三方动作不适用（ensureScript 直接报错）；
+ * - 音源包未安装/未就绪/调用失败 → 抛出带原因的统一错误（engineError）；
+ * - 取链（playUrl）特殊：播放由 Rust 引擎主导，脚本路径通过
+ *   resolvePlayUrl() 预解析 + set_resolved_play_url 回填引擎缓存接入；
+ *   引擎未命中缓存时经 playurl_bridge 再问一次前端。失败返回空串。
  */
 import * as ipc from "@/services/ipc";
 import type {
@@ -25,32 +26,68 @@ import type {
   Track,
   Video,
 } from "@/types";
-import { allCharts, allHotWords, allLatestBatches, allSearchBatches, artistSongs, search } from "./actions/aggregate";
-import { songCover } from "./actions/cover";
-import { getLyric as getLyricAction } from "./actions/lyric";
-import { recommendations } from "./actions/recommendations";
 import type {
   ContractChart,
+  ContractPlaylistCategory,
   MusicInfo,
   Source,
 } from "./contract";
-import { hostRequest } from "./host-request";
-import { LOCAL_PLATFORM } from "./chain-config";
-import { createSourceLayer, type SourceLayerDeps } from "./layer";
-import { engineResolve } from "@/source-engine/client";
+import { engineInvoke, engineResolve, engineSnapshot } from "@/source-engine/client";
 
-// 平台无关入口由 layer.ts 提供（bundle 核心不含宿主实现）；主窗口层注入
-// hostRequest + Windows 平台，P1 引擎窗口用自建 request 另建一层
-export { createSourceLayer, type SourceLayerDeps };
-const mainLayer = createSourceLayer({ request: hostRequest, platform: LOCAL_PLATFORM });
-import { kg } from "./platforms/kg";
-import { kw } from "./platforms/kw";
-import { qq } from "./platforms/qq";
-import { wyy } from "./platforms/wyy";
+// ---------- 引擎调用 ----------
+
+/** 音源包不可用时抛的错：按引擎生命周期给出可操作的原因 */
+function engineError(entry: string): Error {
+  const snap = engineSnapshot();
+  switch (snap.phase) {
+    case null:
+    case "booting":
+      return new Error(`音源包正在启动，请稍后再试（${entry}）`);
+    case "builtin":
+      // 引擎页已不再上报 builtin（无包时加载应用内嵌内置包，成功即 ready）；
+      // 该值仅为兼容老宿主/异常态保留
+      return new Error("音源包引擎未就绪（内置包未加载），请重启应用再试");
+    case "error":
+      return new Error(
+        `音源包加载失败${snap.detail ? "：" + snap.detail : ""}，请到「设置 → 音源包」重新安装`,
+      );
+    default:
+      return new Error(`音源包接口调用失败或超时（${entry}）`);
+  }
+}
+
+/**
+ * 音源数据接口统一调用：全部经引擎窗口转给音源包入口（__qtEntries）。
+ * 引擎不可用 / 入口报错 / 超时 / 返回结构不符 → 抛 engineError 类错误。
+ *
+ * @param entry bundle 入口名（qt-entries.ts 的 __qtEntries 键）
+ * @param args 入口参数（JSON 可序列化）
+ * @param pick 从入口返回的 payload 里取本次结果；缺失/类型不符按失败处理
+ */
+async function sourceCall<T>(
+  entry: string,
+  args: Record<string, unknown>,
+  pick: (payload: Record<string, unknown>) => T | undefined,
+  timeoutMs?: number,
+): Promise<T> {
+  let payload: Record<string, unknown> | null;
+  try {
+    payload = await engineInvoke(entry, args, timeoutMs ?? 20_000);
+  } catch (err) {
+    // bundle 明确报错（入口不存在 / 入口内部失败）：带出原文，便于定位与提示更新
+    throw new Error(`音源包调用失败：${err instanceof Error ? err.message : String(err)}`);
+  }
+  if (payload === null) throw engineError(entry);
+  const picked = pick(payload);
+  if (picked === undefined || picked === null) {
+    throw new Error(`音源包返回结构不符（${entry}）`);
+  }
+  return picked;
+}
 
 // ---------- scheme 分发 ----------
 
-/** 第三方动作仅脚本层承担；local 源由本地路径单独处理，走到这里说明调用有误 */
+/** local 源由本地路径单独处理，走到这里说明调用有误 */
 function ensureScript(source: SourceId): void {
   if (source === "local") throw new Error("local 源不支持该动作");
 }
@@ -124,7 +161,11 @@ export async function searchMusic(
   size: number,
 ): Promise<Track[]> {
   ensureScript(source);
-  const list = await search(hostRequest, source as Source, keyword, page, size);
+  const list = await sourceCall<MusicInfo[]>(
+    "search",
+    { source, keyword, page, size },
+    (p) => p.list as MusicInfo[] | undefined,
+  );
   return list.map((m) => toAppTrack(m, source));
 }
 
@@ -133,7 +174,11 @@ export async function searchAllMusicSources(
   page: number,
   size: number,
 ): Promise<Track[]> {
-  const batches = await allSearchBatches(hostRequest, keyword, page, size);
+  const batches = await sourceCall<{ source: Source; list: MusicInfo[] }[]>(
+    "searchAll",
+    { keyword, page, size },
+    (p) => p.batches as { source: Source; list: MusicInfo[] }[] | undefined,
+  );
   const out: Track[] = [];
   for (const batch of batches) {
     for (const m of batch.list) out.push(toAppTrack(m, batch.source));
@@ -148,8 +193,11 @@ export async function searchPlaylists(
   size: number,
 ): Promise<Playlist[]> {
   ensureScript(source);
-  const platform = platformOf(source as Source);
-  const list = await platform.playlistSearch(hostRequest, keyword, page, size);
+  const list = await sourceCall<Parameters<typeof toAppPlaylist>[0][]>(
+    "searchPlaylists",
+    { source, keyword, page, size },
+    (p) => p.list as Parameters<typeof toAppPlaylist>[0][] | undefined,
+  );
   return list.map(toAppPlaylist);
 }
 
@@ -160,7 +208,11 @@ export async function searchArtists(
   size: number,
 ): Promise<Artist[]> {
   ensureScript(source);
-  const list = await platformOf(source as Source).artistSearch(hostRequest, keyword, page, size);
+  const list = await sourceCall<{ id: string; name: string; picUrl: string }[]>(
+    "searchArtists",
+    { source, keyword, page, size },
+    (p) => p.list as { id: string; name: string; picUrl: string }[] | undefined,
+  );
   return list.map((item) => ({
     id: item.id,
     platform: source,
@@ -176,7 +228,11 @@ export async function searchAlbums(
   size: number,
 ): Promise<Album[]> {
   ensureScript(source);
-  const list = await platformOf(source as Source).albumSearch(hostRequest, keyword, page, size);
+  const list = await sourceCall<{ id: string; name: string; artist: string; picUrl: string }[]>(
+    "searchAlbums",
+    { source, keyword, page, size },
+    (p) => p.list as { id: string; name: string; artist: string; picUrl: string }[] | undefined,
+  );
   return list.map((item) => ({
     id: item.id,
     platform: source,
@@ -195,7 +251,11 @@ export async function getAlbumDetail(
   id: string,
 ): Promise<Playlist> {
   ensureScript(source);
-  const detail = await platformOf(source as Source).albumDetail(hostRequest, id);
+  const detail = await sourceCall<Parameters<typeof toAppPlaylist>[0]>(
+    "albumDetail",
+    { source, id },
+    (p) => p.detail as Parameters<typeof toAppPlaylist>[0] | undefined,
+  );
   return toAppPlaylist(detail);
 }
 
@@ -206,46 +266,36 @@ export async function getArtistSongs(
   size: number,
 ): Promise<Track[]> {
   ensureScript(source);
-  const result = await artistSongs(hostRequest, source as Source, name, page, size);
-  return result.songs.map((m) => toAppTrack(m, source));
+  const songs = await sourceCall<MusicInfo[]>(
+    "artistSongs",
+    { source, name, page, size },
+    (p) => p.songs as MusicInfo[] | undefined,
+  );
+  return songs.map((m) => toAppTrack(m, source));
 }
 
 // ---------- 取链（脚本预解析 + 回填引擎缓存） ----------
 
 /**
  * 预解析播放地址（播放动作发起前调用）：
- * ① 音源引擎窗口（远程音源包，P1）——就绪才参与，超时/失败静默；
- * ② 主窗口**内置实现**回退（当前指定方案）——引擎不可用或空串时兜底。
+ * 只走音源引擎窗口（远程音源包）——就绪才参与，超时/失败静默。
  * 解析结果回填 Rust 引擎的 PlayUrl 缓存，引擎播放时命中缓存直接使用。
- * 方案内部自带多线路换源与跨源兜底；两路都空 = 本次取链失败（由引擎
- * 兜底/报错），不再横向切换其他方案（2026-09-18 起取消方案间优先级）。
+ * 包内自带多线路换源与跨源兜底；返回空串 = 本次取链失败（由引擎兜底/报错）。
  */
 export async function resolvePlayUrl(
   track: Track,
   quality: Quality,
 ): Promise<string> {
   ensureScript(track.platform);
-  const music = fromAppTrack(track);
   const source = track.platform as Source;
-  // ① 远程音源包（引擎窗口）：任何失败静默回退，不影响可用性
   try {
-    const engineUrl = await engineResolve(source, music, quality);
+    const engineUrl = await engineResolve(source, fromAppTrack(track), quality);
     if (engineUrl.length > 0) {
       await ipc.setResolvedPlayUrl(track, quality, engineUrl);
       return engineUrl;
     }
   } catch {
-    // 引擎层已尽力，转内置
-  }
-  // ② 内置实现（编译进应用的脚本包）
-  try {
-    const url = await mainLayer.resolvePlayUrl(source, music, quality);
-    if (url.length > 0) {
-      await ipc.setResolvedPlayUrl(track, quality, url);
-      return url;
-    }
-  } catch {
-    // 方案内已尽力换源，仍失败则本次播放失败
+    // 引擎层已尽力（多线路换源 + 跨源兜底）：本次播放失败
   }
   return "";
 }
@@ -254,13 +304,21 @@ export async function resolvePlayUrl(
 
 export async function getLyric(track: Track): Promise<Lyric> {
   ensureScript(track.platform);
-  const result = await getLyricAction(hostRequest, track.platform as Source, fromAppTrack(track));
+  const result = await sourceCall<{ lyric: string; translation: string }>(
+    "lyric",
+    { source: track.platform, song: fromAppTrack(track) },
+    (p) => p as { lyric: string; translation: string },
+  );
   return { lrc: result.lyric, translation: result.translation };
 }
 
 export async function getTrackCover(track: Track): Promise<string> {
   ensureScript(track.platform);
-  return songCover(hostRequest, track.platform as Source, fromAppTrack(track));
+  return sourceCall<string>(
+    "cover",
+    { source: track.platform, song: fromAppTrack(track) },
+    (p) => (typeof p.url === "string" ? p.url : undefined),
+  );
 }
 
 // ---------- 歌单 ----------
@@ -269,7 +327,11 @@ export async function getPlaylistCategories(
   source: SourceId,
 ): Promise<PlaylistCategory[]> {
   ensureScript(source);
-  const list = await platformOf(source as Source).playlistCategories(hostRequest);
+  const list = await sourceCall<ContractPlaylistCategory[]>(
+    "playlistCategories",
+    { source },
+    (p) => p.list as ContractPlaylistCategory[] | undefined,
+  );
   return list.map((item) => ({ id: item.id, name: item.name, group: item.group }));
 }
 
@@ -281,7 +343,11 @@ export async function getPlaylistDetail(
   _size: number,
 ): Promise<Playlist> {
   ensureScript(source);
-  const detail = await platformOf(source as Source).playlistDetail(hostRequest, id);
+  const detail = await sourceCall<Parameters<typeof toAppPlaylist>[0]>(
+    "playlistDetail",
+    { source, id },
+    (p) => p.detail as Parameters<typeof toAppPlaylist>[0] | undefined,
+  );
   return toAppPlaylist(detail);
 }
 
@@ -291,7 +357,11 @@ export async function getRecommendations(
   page: number,
 ): Promise<Playlist[]> {
   ensureScript(source);
-  const list = await recommendations(hostRequest, source as Source, category, page);
+  const list = await sourceCall<Parameters<typeof toAppPlaylist>[0][]>(
+    "recommendations",
+    { source, category, page },
+    (p) => p.list as Parameters<typeof toAppPlaylist>[0][] | undefined,
+  );
   return list.map(toAppPlaylist);
 }
 
@@ -299,12 +369,20 @@ export async function getRecommendations(
 
 export async function getCharts(source: SourceId): Promise<Chart[]> {
   ensureScript(source);
-  const list = await platformOf(source as Source).charts(hostRequest);
+  const list = await sourceCall<ContractChart[]>(
+    "charts",
+    { source },
+    (p) => p.list as ContractChart[] | undefined,
+  );
   return list.map(toAppChart);
 }
 
 export async function getAllCharts(): Promise<Chart[]> {
-  const list = await allCharts(hostRequest);
+  const list = await sourceCall<ContractChart[]>(
+    "allCharts",
+    {},
+    (p) => p.list as ContractChart[] | undefined,
+  );
   return list.map(toAppChart);
 }
 
@@ -315,7 +393,11 @@ export async function getChartDetail(
   _size: number,
 ): Promise<Track[]> {
   ensureScript(chart.platform);
-  const list = await platformOf(chart.platform as Source).chartDetail(hostRequest, fromAppChart(chart));
+  const list = await sourceCall<MusicInfo[]>(
+    "chartDetail",
+    { source: chart.platform, chart: fromAppChart(chart) },
+    (p) => p.list as MusicInfo[] | undefined,
+  );
   return list.map((m) => toAppTrack(m, chart.platform));
 }
 
@@ -325,7 +407,11 @@ export async function getLatestSongs(
   offset: number,
 ): Promise<Track[]> {
   ensureScript(source);
-  const list = await platformOf(source as Source).latest(hostRequest, limit, offset);
+  const list = await sourceCall<MusicInfo[]>(
+    "latest",
+    { source, limit, offset },
+    (p) => p.list as MusicInfo[] | undefined,
+  );
   return list.map((m) => toAppTrack(m, source));
 }
 
@@ -333,13 +419,25 @@ export async function getAllLatestSongs(
   limit: number,
   offset: number,
 ): Promise<Track[]> {
-  const batches = await allLatestBatches(hostRequest, limit, offset);
-  // 蓝本 allLatest 的交错合并：按索引轮流从四源取，凑满 limit
+  // 不走 bundle 的 allLatest 入口：它返回的 MusicInfo 不带 platform，四源混批后
+  // 无法归属（取链依赖 platform），安卓端同样绕过它。这里逐源调 latest 入口，
+  // 交错合并在宿主侧做（与蓝本同口径：wyy/kg 带 offset，单源失败跳过）。
   const perSource = Math.ceil(limit / 4) + 1;
+  const sources: SourceId[] = ["wyy", "qq", "kw", "kg"];
+  const batches = await Promise.all(
+    sources.map(async (source) => {
+      const pageOffset = source === "wyy" || source === "kg" ? offset : 0;
+      try {
+        return { source, list: await getLatestSongs(source, perSource, pageOffset) };
+      } catch {
+        return { source, list: [] as Track[] };
+      }
+    }),
+  );
   const out: Track[] = [];
   for (let index = 0; index < perSource && out.length < limit; index++) {
     for (const batch of batches) {
-      if (index < batch.list.length) out.push(toAppTrack(batch.list[index], batch.source));
+      if (index < batch.list.length) out.push(batch.list[index]);
       if (out.length >= limit) break;
     }
   }
@@ -348,11 +446,19 @@ export async function getAllLatestSongs(
 
 export async function getHotWords(source: SourceId): Promise<string[]> {
   ensureScript(source);
-  return platformOf(source as Source).hotWords(hostRequest);
+  return sourceCall<string[]>(
+    "hotWords",
+    { source },
+    (p) => p.list as string[] | undefined,
+  );
 }
 
 export async function getAllHotWords(): Promise<string[]> {
-  return allHotWords(hostRequest);
+  return sourceCall<string[]>(
+    "allHotWords",
+    {},
+    (p) => p.list as string[] | undefined,
+  );
 }
 
 // ---------- MV ----------
@@ -363,7 +469,11 @@ export async function getVideos(
   size: number,
 ): Promise<Video[]> {
   ensureScript(source);
-  const list = await platformOf(source as Source).videos(hostRequest, page, size);
+  const list = await sourceCall<{ id: string; name: string; picUrl: string; singer: string }[]>(
+    "videos",
+    { source, page, size },
+    (p) => p.list as { id: string; name: string; picUrl: string; singer: string }[] | undefined,
+  );
   return list.map((item) => ({
     id: item.id,
     platform: source,
@@ -379,14 +489,9 @@ export async function getVideoUrl(
   quality: string,
 ): Promise<string> {
   ensureScript(source);
-  return platformOf(source as Source).videoUrl(hostRequest, videoId, quality);
-}
-
-// ---------- 平台模块路由 ----------
-
-function platformOf(source: Source) {
-  if (source === "qq") return qq;
-  if (source === "kw") return kw;
-  if (source === "kg") return kg;
-  return wyy;
+  return sourceCall<string>(
+    "videoUrl",
+    { source, videoId, quality },
+    (p) => (typeof p.url === "string" ? p.url : undefined),
+  );
 }

@@ -10,8 +10,11 @@
       - 由 qtres:// 协议内嵌提供（无 CSP 注入 → 可自由动态 import 音源包脚本）；
       - __TAURI_INTERNALS__ 由 Tauri 注入（withGlobalTauri 仍为 false，不用全局 API）；
       - 职责：读安装状态 → import bundle → createSourceLayer(注入 builtin_request)
-        → 冒烟（编译级必做；?smoke=1 时追加真实取链）→ 监听主窗口取链 RPC。
-      - 主窗口侧封装见 src/source-engine/client.ts；任何失败都回退主窗口内置层。
+        → 冒烟（编译级必做；?smoke=1 时追加真实取链）→ 监听主窗口取链 RPC；
+      - 已装远程包与应用内嵌内置包（qtres /builtin/）**谁新用谁**：内置包镜像
+        最新发布号，已装包比它旧（后端还没发对应 release）时直接用内置包，
+        避免旧包缺数据接口；任一加载失败再回落另一个，保证开箱可用。
+      - 主窗口侧封装见 src/source-engine/client.ts。
     -->
     <script type="module">
       "use strict";
@@ -34,8 +37,10 @@
       };
 
       let layer = null;
+      let entries = null;
       let loadedCode = 0;
-      /** 页面生命周期：booting → builtin | ready | error（状态查询 RPC 回这个） */
+      /** 页面生命周期：booting → ready | error（状态查询 RPC 回这个）；
+       *  builtin 相位已不再上报（内置包加载成功即 ready），仅客户端保留兼容 */
       let phase = "booting";
       let phaseDetail = null;
 
@@ -64,19 +69,8 @@
         return emitToMain("source-engine-status", { phase, ...(extra || {}) });
       }
 
-      /** 读安装状态并加载远程 bundle；无包 → 返回 null（主窗口走内置层） */
-      async function loadBundle() {
-        let state;
-        try {
-          state = await invoke("source_state");
-        } catch {
-          return null; // 宿主太老/状态读取失败：按无包处理
-        }
-        const installed = state && state.installed;
-        if (!installed || !installed.dir) return null;
-        const mod = await import(
-          "/script/" + encodeURIComponent(String(installed.dir)) + "/source-bundle.js"
-        );
+      /** 校验 bundle 并注册数据入口（远程包与内置包共用同一套契约） */
+      function prepareBundle(mod) {
         if (!mod || typeof mod.createSourceLayer !== "function") {
           throw new Error("bundle 缺少 createSourceLayer 导出");
         }
@@ -85,7 +79,50 @@
         if (!cfg || typeof cfg.chainRevision !== "number") {
           throw new Error("bundle 链配置解析失败");
         }
-        return { code: Number(installed.sourceVersionCode) || 0, mod };
+        // 数据接口入口（搜索/歌单/歌词/榜单…）注册：主窗口经 kind=invoke 调用，
+        // 与安卓端 __qtEntries 同一契约，HTTP 能力同样由 builtin_request 提供
+        if (typeof mod.registerQtEntries !== "function") {
+          throw new Error("bundle 缺少 registerQtEntries 导出");
+        }
+        mod.registerQtEntries({
+          request: (url, options) =>
+            invoke("builtin_request", { url, options: options || null }),
+          platform: (mod.PLATFORMS && mod.PLATFORMS.WINDOWS) || 1103,
+        });
+        const registered = globalThis.__qtEntries || null;
+        if (!registered) throw new Error("bundle 数据接口注册失败");
+        return registered;
+      }
+
+      /** 读安装状态：返回 {code, dir} 或 null（无包 / 宿主太老 / 状态读取失败） */
+      async function readInstalled() {
+        try {
+          const state = await invoke("source_state");
+          const installed = state && state.installed;
+          if (!installed || !installed.dir) return null;
+          return {
+            code: Number(installed.sourceVersionCode) || 0,
+            dir: String(installed.dir),
+          };
+        } catch {
+          return null;
+        }
+      }
+
+      /** 加载已安装远程包（dir/code 由调用方给出） */
+      async function loadInstalled(dir, code) {
+        const mod = await import(
+          "/script/" + encodeURIComponent(dir) + "/source-bundle.js"
+        );
+        entries = prepareBundle(mod);
+        return { code, mod, builtin: false };
+      }
+
+      /** 加载应用内嵌内置包（qtres /builtin/，编译期打进二进制，必在） */
+      async function loadBuiltin(code) {
+        const mod = await import("/builtin/source-bundle.js");
+        entries = prepareBundle(mod);
+        return { code, mod, builtin: true };
       }
 
       /** 真实网络冒烟（§2.4 第 3 层，仅 ?smoke=1）：取链 + Range 预检 */
@@ -114,23 +151,52 @@
 
       async function boot() {
         await report("booting");
-        let loaded = null;
+        // 内置包版本：加载决策与上报 code 都用它（拿不到记 0，不影响功能）
+        let builtinCode = 0;
         try {
-          loaded = await loadBundle();
-        } catch (err) {
-          layer = null;
-          const detail = String((err && err.message) || err);
-          phase = "error";
-          phaseDetail = detail;
-          await report("error", { code: loadedCode || null, detail });
-          if (loadedCode) {
-            await invoke("source_mark_bad", { code: loadedCode, detail }).catch(() => {});
+          const meta = await (await fetch("/builtin/version.json")).json();
+          builtinCode = Number(meta && meta.code) || 0;
+        } catch {}
+        const installed = await readInstalled();
+        // 谁新用谁：内置包镜像最新发布号，已装包比它旧（后端还没发出对应
+        // release）时直接用内置包——旧包可能缺数据接口，不能让它盖住新实现。
+        // 任一加载失败回落另一个；两个都失败才进 error 终态。
+        const builtinFirst = !installed || installed.code < builtinCode;
+        let loaded = null;
+        let firstErr = null;
+        const tryLoad = async (fn, tag) => {
+          try {
+            return await fn();
+          } catch (err) {
+            const msg = tag + "：" + String((err && err.message) || err);
+            firstErr = firstErr ? firstErr + "；" + msg : msg;
+            return null;
           }
-          return;
+        };
+        if (builtinFirst) {
+          loaded = await tryLoad(() => loadBuiltin(builtinCode), "内置包");
+          if (!loaded && installed) {
+            loaded = await tryLoad(
+              () => loadInstalled(installed.dir, installed.code),
+              "远程包",
+            );
+          }
+        } else {
+          loaded = await tryLoad(
+            () => loadInstalled(installed.dir, installed.code),
+            "远程包",
+          );
+          if (!loaded) {
+            loaded = await tryLoad(() => loadBuiltin(builtinCode), "内置包");
+          }
         }
         if (!loaded) {
-          phase = "builtin";
-          await report("builtin");
+          // 这里才报 error——主窗口轮询把 error 当终态，中途报会错过随后的 ready
+          layer = null;
+          entries = null;
+          phase = "error";
+          phaseDetail = firstErr || "无可用音源包";
+          await report("error", { code: null, detail: phaseDetail });
           return;
         }
         layer = loaded.mod.createSourceLayer({
@@ -142,32 +208,49 @@
         if (new URLSearchParams(location.search).get("smoke") === "1") {
           try {
             await networkSmoke();
-            await invoke("source_report", {
-              sourceVersionCode: loadedCode,
-              result: "ok",
-              detail: "",
-            }).catch(() => {});
+            if (!loaded.builtin) {
+              await invoke("source_report", {
+                sourceVersionCode: loadedCode,
+                result: "ok",
+                detail: "",
+              }).catch(() => {});
+            }
           } catch (err) {
             layer = null;
+            entries = null;
             const detail = String((err && err.message) || err);
             phase = "error";
             phaseDetail = detail;
-            await report("error", { code: loadedCode, detail });
-            await invoke("source_mark_bad", {
-              code: loadedCode,
-              detail,
-              result: "smoke_failed",
-            }).catch(() => {});
+            await report("error", { code: loadedCode || null, detail });
+            // 内置包不计入发布状态（code 不对应任何 release）
+            if (!loaded.builtin) {
+              await invoke("source_mark_bad", {
+                code: loadedCode,
+                detail,
+                result: "smoke_failed",
+              }).catch(() => {});
+            }
             return;
           }
         }
         phase = "ready";
-        await report("ready", { code: loadedCode });
+        let note = null;
+        if (loaded.builtin) {
+          if (installed && installed.code > 0 && installed.code < builtinCode) {
+            note = `已装远程包 ${installed.code} 旧于内置包 ${builtinCode}，已使用内置包`;
+          } else if (firstErr) {
+            note = "远程包加载失败，已回落内置包：" + firstErr;
+          }
+        } else if (firstErr) {
+          note = "内置包加载失败，已用远程包：" + firstErr;
+        }
+        await report("ready", { code: loadedCode || null, detail: note });
       }
 
-      /** 主窗口取链 RPC：source-engine-request → source-engine-response。
+      /** 主窗口 RPC：source-engine-request → source-engine-response。
        *  kind "status" = 查询当前生命周期（client 绑定晚于引擎启动也能对齐状态）；
-       *  kind "resolve" = 取链（url "" = 失败/无可用层）。 */
+       *  kind "resolve" = 取链（url "" = 失败/无可用层）；
+       *  kind "invoke"  = 数据接口（搜索/歌单/歌词/榜单…走 bundle 入口，result 为 JSON 文本）。 */
       async function onRequest(event) {
         const payload = (event && event.payload) || {};
         const requestId = payload.requestId;
@@ -179,6 +262,20 @@
             code: loadedCode || null,
             detail: phaseDetail,
           });
+          return;
+        }
+        if (payload.kind === "invoke") {
+          let result = null;
+          let error = null;
+          try {
+            const name = payload.entry == null ? "" : String(payload.entry);
+            const fn = entries ? entries[name] : null;
+            if (typeof fn !== "function") throw new Error("入口不存在: " + name);
+            result = await fn(payload.args || {});
+          } catch (err) {
+            error = String((err && err.message) || err);
+          }
+          await emitToMain("source-engine-response", { requestId, result, error });
           return;
         }
         let url = "";

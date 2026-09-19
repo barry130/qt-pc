@@ -1,0 +1,115 @@
+/**
+ * 歌单导入链接解析单测（对齐 qt-uniappx parsePlaylistInput）。
+ */
+import { describe, expect, it } from "vitest";
+import {
+  extractLongestDigits,
+  lastPathSegment,
+  parsePlaylistInput,
+} from "@/lib/playlist-link";
+
+describe("parsePlaylistInput 四源链接识别", () => {
+  it("网易云：网页链接与分享文案都能解析", () => {
+    expect(parsePlaylistInput("https://music.163.com/#/playlist?id=123456")).toEqual({
+      platform: "wyy",
+      id: "123456",
+    });
+    expect(
+      parsePlaylistInput("分享歌单《夜曲》https://music.163.com/playlist?id=888（@网易云音乐）"),
+    ).toEqual({ platform: "wyy", id: "888" });
+  });
+
+  it("QQ音乐：y.qq.com 歌单链接取数字 id", () => {
+    expect(parsePlaylistInput("https://y.qq.com/n/ryqq/playlist/7011264340")).toEqual({
+      platform: "qq",
+      id: "7011264340",
+    });
+  });
+
+  it("酷我：kuwo.cn 链接取数字 id", () => {
+    expect(
+      parsePlaylistInput("https://www.kuwo.cn/playlist_detail/3197157406?share=1"),
+    ).toEqual({ platform: "kw", id: "3197157406" });
+  });
+
+  it("酷狗：网页歌单链接的 .html 去掉，还原成数字 id", () => {
+    expect(
+      parsePlaylistInput("https://www.kugou.com/yy/special/single/1234567.html"),
+    ).toEqual({ platform: "kg", id: "1234567" });
+  });
+
+  it("酷狗：分享短码（含字母）原样交给 chain 接口", () => {
+    expect(parsePlaylistInput("https://t1.kugou.com/tJnW20zxV3")).toEqual({
+      platform: "kg",
+      id: "tJnW20zxV3",
+    });
+    // 分享文案里短码后紧跟中文括号
+    expect(
+      parsePlaylistInput("分享歌单《测试》https://t1.kugou.com/tJnW20zxV3（@酷狗音乐）"),
+    ).toEqual({ platform: "kg", id: "tJnW20zxV3" });
+  });
+
+  it("酷狗：collection_/gcid_ 原生 ID 整段识别", () => {
+    expect(parsePlaylistInput("collection_3_1234567890_2_0")).toEqual({
+      platform: "kg",
+      id: "collection_3_1234567890_2_0",
+    });
+    expect(parsePlaylistInput("gcid_3za1lw0n2y4z0")).toEqual({
+      platform: "kg",
+      id: "gcid_3za1lw0n2y4z0",
+    });
+  });
+});
+
+describe("parsePlaylistInput 裸 ID 与失败分支", () => {
+  it("纯数字 ID + 指定平台 → 该平台", () => {
+    expect(parsePlaylistInput("123456789", "qq")).toEqual({
+      platform: "qq",
+      id: "123456789",
+    });
+    expect(parsePlaylistInput("  3197157406  ", "kw")).toEqual({
+      platform: "kw",
+      id: "3197157406",
+    });
+  });
+
+  it("纯数字 ID 未指定平台 → 无法识别", () => {
+    expect(parsePlaylistInput("123456789")).toBeNull();
+  });
+
+  it("指定酷狗时裸分享短码可用", () => {
+    expect(parsePlaylistInput("tJnW20zxV3", "kg")).toEqual({
+      platform: "kg",
+      id: "tJnW20zxV3",
+    });
+  });
+
+  it("非音乐链接 / 空输入 → 无法识别", () => {
+    expect(parsePlaylistInput("")).toBeNull();
+    expect(parsePlaylistInput("   ")).toBeNull();
+    expect(parsePlaylistInput("https://example.com/123456789")).toBeNull();
+    expect(parsePlaylistInput("随便一段话")).toBeNull();
+  });
+
+  it("链接里的平台优先于指定的 fallback", () => {
+    expect(parsePlaylistInput("https://y.qq.com/n/ryqq/playlist/7011264340", "kw")).toEqual({
+      platform: "qq",
+      id: "7011264340",
+    });
+  });
+});
+
+describe("解析辅助函数", () => {
+  it("lastPathSegment 去掉查询/锚点/尾斜杠", () => {
+    expect(lastPathSegment("https://a.com/x/abc123?p=1#h")).toBe("abc123");
+    expect(lastPathSegment("https://a.com/x/abc123/")).toBe("abc123");
+    expect(lastPathSegment("abc123")).toBe("");
+  });
+
+  it("extractLongestDigits 取最长连续数字段", () => {
+    expect(extractLongestDigits("https://music.163.com/playlist?id=88&x=1234567")).toBe(
+      "1234567",
+    );
+    expect(extractLongestDigits("no digits here")).toBe("");
+  });
+});

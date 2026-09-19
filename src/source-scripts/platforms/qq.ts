@@ -6,7 +6,7 @@
  * - musicUrlCore   :3463 fetchNativeUrl qq 分支（musicu.fcg vkey.GetVkeyServer/CgiGetVkey，
  *                    M500/M800/F000 音质前缀；拿不到 vkey 抛"该歌曲暂时无法播放"由调用方兜底）
  * - lyric          :3025（fcg_query_lyric_new.fcg nobase64=1，retcode!=0 返回空串）
- * - lyricTranslation :3173（蓝本仅 wyy/local 支持翻译，QQ 恒返回空串）
+ * - lyricTranslation    （musicu.fcg PlayLyricInfo.GetPlayLyricInfo 的 trans，官方翻译；无则空串）
  * - playlistCategories :512（fcg_get_diss_tag_conf.fcg，data.categories[].items[] 分组）
  * - playlistDetail :2826（fcg_ucc_getcdinfo_byids_cp.fcg）+ songFromQQDetail :1958
  *                    （封面读 logo 回退 dir_pic_url，playCount 读 listen_num）
@@ -42,6 +42,7 @@ import {
   asObject,
   asString,
   buildQuery,
+  decodeBase64Utf8,
   platformHeaders,
   requestJson,
 } from "./utils";
@@ -293,9 +294,33 @@ export const qq = {
     return asString(json["lyric"]);
   },
 
-  /** 蓝本 lyricTranslation :3173（仅 wyy/local 支持翻译，qq 直接返回空串） */
-  async lyricTranslation(_request: RequestBuiltin, _song: MusicInfo): Promise<string> {
-    return "";
+  /**
+   * QQ 官方翻译（musicu.fcg PlayLyricInfo.GetPlayLyricInfo 的 trans 字段，
+   * base64 LRC）。实测老 fcg_query_lyric_new 端点 trans 恒为空（2026-09-19），
+   * 该模块化端点才有官方翻译数据；国内歌多数无翻译 → 返回空串，不做跨源兜底。
+   */
+  async lyricTranslation(request: RequestBuiltin, song: MusicInfo): Promise<string> {
+    if (song.id.length === 0) return "";
+    const json = await requestJson(request, "https://u.y.qq.com/cgi-bin/musicu.fcg", {
+      method: "POST",
+      headers: { ...QQ_HEADERS, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        comm: { uin: 0, format: "json", ct: 24, cv: 0 },
+        request: {
+          module: "music.musichallSong.PlayLyricInfo",
+          method: "GetPlayLyricInfo",
+          param: { songMID: song.id, songID: 0, qrc: 1, ipc: 1, trans: 1 },
+        },
+      }),
+    });
+    const payload = asObject(json["request"]);
+    if (asNumber(payload["code"]) !== 0) return "";
+    const decoded = decodeBase64Utf8(asString(asObject(payload["data"])["trans"]));
+    // 官方 trans 里 kana 注音行的时间行内容是 "//"（无翻译价值），滤掉避免界面显示占位符
+    return decoded
+      .split("\n")
+      .filter((line) => line.replace(/^\[[^\]]*\]/, "").trim() !== "//")
+      .join("\n");
   },
 
   /** 蓝本 playlistCategories qq 分支 :512（categories 分组的 items，id=categoryId） */

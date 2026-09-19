@@ -129,6 +129,17 @@ export interface LxHost {
   claimedQualities(source: string): string[];
 }
 
+/** 已确认失效的脚本内第三方后端：快速失败，避免烧掉链路预算（2026-09 实测全部超时） */
+const DEAD_BACKEND_HOSTS = ["zrcdy.dpdns.org", "oiapi.net", "api.xcvts.cn"];
+
+function deadBackendOf(url: string): string | null {
+  const lower = url.toLowerCase();
+  for (const host of DEAD_BACKEND_HOSTS) {
+    if (lower.includes(host)) return host;
+  }
+  return null;
+}
+
 /** 单飞创建一个 LX 脚本宿主（每个 vendored 脚本一份） */
 export function createLxHost(spec: LxScriptSpec): LxHost {
   let readyPromise: Promise<void> | null = null;
@@ -152,6 +163,8 @@ export function createLxHost(spec: LxScriptSpec): LxHost {
       request: (url: string, options: LxRequestOptions | null, cb: (err: unknown, res?: unknown) => void) => {
         void (async () => {
           try {
+            const dead = deadBackendOf(url);
+            if (dead) throw new Error(`后端 ${dead} 已失效，跳过（剪线快速失败）`);
             const opts: LxRequestOptions = options ?? {};
             const method = typeof opts.method === "string" ? opts.method.toUpperCase() : "GET";
             const body =

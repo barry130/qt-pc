@@ -80,3 +80,6 @@ console.log(
   `[build-sources] source-bundle.js ${kb(fs.statSync(path.join(outDir, "source-bundle.js")).size)} KB；` +
     `chain.json ${kb(fs.statSync(path.join(outDir, "chain.json")).size)} KB（chainRevision=${chain.chainRevision}）`,
 );
+console.log(
+  "[build-sources] 要随应用内置的话：先在 source-update.ts 对齐 BUILTIN_SOURCE_VERSION（镜像发布号），再跑 npm run sync:builtin",
+);
