@@ -44,6 +44,13 @@ await viteBuild({
   },
 });
 
+// 关键后处理：把带源码自校验的混淆脚本体恢复为逐字节原文。
+// Rollup 会按自己的 AST 重打印脚本（解码 \xNN 转义、规范化数字进制、重命名遮蔽
+// 参数），对 jsjiami.cn.v7 / jsjiami.com.v7 / obfuscator.io strong 这类带自校验的
+// 混淆件会破坏其校验，使其字符串数组轮转永不收敛 → 同步忙循环冻结整个 JS 事件
+// 循环（2026091905 事故：PC 所有接口超时、安卓 QuickJS 线程卡死）。
+await import("./restore-lx-bodies.mjs").then((m) => m.restoreLxBodies(path.join(outDir, "source-bundle.js")));
+
 // chain.json：把 chain-config.ts 临时 CJS 化后取 defaultChainConfig()
 //（保证与代码同源，不存在手抄的第二份默认链）
 const chainTmp = path.join(outDir, "_chain-config.cjs");
@@ -73,6 +80,15 @@ for (const name of ["createSourceLayer", "defaultChainConfig", "parseChainConfig
 const remote = mod.parseChainConfig(JSON.parse(JSON.stringify(mod.defaultChainConfig())));
 if (remote.chainRevision !== chain.chainRevision) {
   throw new Error("bundle 内默认链与 chain.json 不一致");
+}
+
+// 守卫（必须）：在 worker 沙箱里逐个执行 LX 脚本体，看门狗拦下「同步忙循环挂死」。
+// 上面那条冒烟只验证「bundle 能被导入」，而挂死发生在**脚本初始化**时，导入阶段
+// 完全看不出来 —— 2026091905 就是这么过检并发布出去的（bad:[] 为空、无自动回滚）。
+const { checkLxBodies } = await import("./check-lx-bodies.mjs");
+const guard = await checkLxBodies(path.join(outDir, "source-bundle.js"), { timeoutMs: 20000 });
+if (guard.hung.length > 0) {
+  throw new Error(`构建中止：${guard.hung.join(", ")} 的脚本体在沙箱里同步忙循环挂死，会冻结宿主事件循环`);
 }
 
 const kb = (n) => (n / 1024).toFixed(0);

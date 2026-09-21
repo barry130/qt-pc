@@ -104,13 +104,6 @@ export function isLightColor(r: number, g: number, b: number): boolean {
 
 const coverColorCache = new Map<string, string | null>();
 
-/** 临时诊断：取色阶段上报（debug_log 命令写入 app 日志）。 */
-function debugLog(message: string): void {
-  void import("@tauri-apps/api/core")
-    .then(({ invoke }) => invoke("debug_log", { message }))
-    .catch(() => {});
-}
-
 /**
  * 从封面 URL 提取主色。
  * 通过 fetch → blob → canvas 采样，避免 CORS 问题。
@@ -123,14 +116,10 @@ export async function extractCoverColor(url: string): Promise<string | null> {
   try {
     const response = await fetch(url);
     if (!response.ok) {
-      debugLog(`extractCoverColor: fetch not-ok status=${response.status}`);
       coverColorCache.set(url, null);
       return null;
     }
     const blob = await response.blob();
-    debugLog(
-      `extractCoverColor: fetch ok type=${blob.type} size=${blob.size}`,
-    );
     const blobUrl = URL.createObjectURL(blob);
 
     const img = new Image();
@@ -146,7 +135,6 @@ export async function extractCoverColor(url: string): Promise<string | null> {
     canvas.height = size;
     const ctx = canvas.getContext("2d");
     if (!ctx) {
-      debugLog("extractCoverColor: no 2d ctx");
       URL.revokeObjectURL(blobUrl);
       coverColorCache.set(url, null);
       return null;
@@ -158,8 +146,8 @@ export async function extractCoverColor(url: string): Promise<string | null> {
     let data: Uint8ClampedArray;
     try {
       data = ctx.getImageData(0, 0, size, size).data;
-    } catch (err) {
-      debugLog(`extractCoverColor: getImageData threw ${String(err)}`);
+    } catch {
+      // 画布被跨源图污染时 getImageData 抛错：按取色失败处理，不拖垮调用方
       coverColorCache.set(url, null);
       return null;
     }
@@ -177,7 +165,6 @@ export async function extractCoverColor(url: string): Promise<string | null> {
     }
 
     if (count === 0) {
-      debugLog("extractCoverColor: count=0 (all transparent)");
       coverColorCache.set(url, null);
       return null;
     }
@@ -190,19 +177,14 @@ export async function extractCoverColor(url: string): Promise<string | null> {
     const max = Math.max(r, g, b);
     const min = Math.min(r, g, b);
     if (max === 0 || (max - min) / max < 0.15) {
-      debugLog(
-        `extractCoverColor: low saturation rgb(${r},${g},${b})`,
-      );
       coverColorCache.set(url, null);
       return null;
     }
 
     const color = `rgb(${r}, ${g}, ${b})`;
-    debugLog(`extractCoverColor: success ${color}`);
     coverColorCache.set(url, color);
     return color;
-  } catch (err) {
-    debugLog(`extractCoverColor: threw ${String(err)}`);
+  } catch {
     coverColorCache.set(url, null);
     return null;
   }

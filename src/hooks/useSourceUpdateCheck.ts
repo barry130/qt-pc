@@ -53,7 +53,9 @@ export async function checkAndDownload(): Promise<string> {
     const installed = await getSourceState();
     store.setLocal(installed);
     store.setReady(installed.installed?.sourceVersionCode ?? null);
-    store.setMessage(`音源包 ${decision.release.sourceVersionName} 已就绪，点击「立即应用」生效`);
+    store.setMessage(
+      `音源包 ${decision.release.sourceVersionName} 已就绪，点击「立即应用」后自动重启应用生效`,
+    );
     return store.message;
   } catch (e) {
     const msg = `下载失败：${stripErrorUrls(String(e))}`;

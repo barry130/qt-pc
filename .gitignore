@@ -40,3 +40,7 @@ Thumbs.db
 *.log
 *.tmp
 nul
+
+# tauri icon 生成的移动端图标（本项目为桌面 NSIS 打包，用不到）
+src-tauri/icons/android/
+src-tauri/icons/ios/

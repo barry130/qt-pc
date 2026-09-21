@@ -643,7 +643,7 @@ pub async fn cmd_download_update_file(
 /// - 传 `/UPDATE`：Tauri 的 NSIS 安装器识别到该参数后跳过「维护页」，
 ///   不再默认走「先卸载再安装」，而是就地覆盖（安装目录由安装器自己从注册表恢复）。
 ///   不加这个参数时，升级会停在“建议先卸载当前版本”的选项页。
-/// - 启动后延时退出：安装器会检测 `lightlisten.exe` 是否在运行，运行中就弹
+/// - 启动后延时退出：安装器会检测 `quietmusic.exe` 是否在运行，运行中就弹
 ///   「Click OK to kill it」；同时运行中的 exe 会锁住自己要覆盖的文件。
 ///   延时是为了让前端先把「正在退出」渲染出来，再走正常退出流程（含托盘/清理）。
 #[tauri::command(rename = "run_update_installer")]
@@ -2944,13 +2944,6 @@ pub async fn cmd_like_reset_sync(state: State<'_, AppState>) -> Result<(), Strin
 }
 
 // ---------- 通用设置项（settings 表，供引导、小开关等零散状态用） ----------
-
-/// 临时诊断：前端把关键路径（封面取色等）的阶段结果写入 app 日志。
-#[tauri::command(rename = "debug_log")]
-pub async fn cmd_debug_log(message: String) -> Result<(), String> {
-    log::info!("[frontend-debug] {message}");
-    Ok(())
-}
 
 #[tauri::command(rename = "get_setting")]
 pub async fn cmd_get_setting(

@@ -143,7 +143,7 @@ mod tests {
     #[test]
     fn custom_overrides_merge_with_defaults() {
         let dir = std::env::temp_dir().join(format!(
-            "lightlisten-sc-{}-{}",
+            "quietmusic-sc-{}-{}",
             std::process::id(),
             fastrand::u64(..)
         ));
@@ -180,7 +180,7 @@ mod tests {
     #[test]
     fn save_validates_and_reloads() {
         let dir = std::env::temp_dir().join(format!(
-            "lightlisten-sv-{}-{}",
+            "quietmusic-sv-{}-{}",
             std::process::id(),
             fastrand::u64(..)
         ));

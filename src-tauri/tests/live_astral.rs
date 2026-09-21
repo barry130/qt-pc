@@ -3,7 +3,7 @@
 //! `#[ignore]`：依赖外网与后端可达，常规 `cargo test` 不跑。手动执行：
 //! `cargo test --test live_astral -- --ignored --nocapture`
 
-use lightlisten_lib::astral::{version_code, version_name, AstralClient, DEFAULT_BASE_URL};
+use quietmusic_lib::astral::{version_code, version_name, AstralClient, DEFAULT_BASE_URL};
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()

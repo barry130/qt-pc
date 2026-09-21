@@ -408,7 +408,7 @@ describe("声明式 http 线路（chain.json kind:http）+ script qq 链", () =>
     });
     expect(cfg.chains.wyy!.map((line) => line.id)).toEqual(["wyy-core"]);
     expect(cfg.chains.qq!.map((line) => line.id)).toEqual([
-      "qq-world260809", "qq-stellarwave-tx", "qq-yuningxi-tang", "qq-native-vkey",
+      "qq-molan-tx", "qq-world260809", "qq-stellarwave-tx", "qq-yuningxi-tang",
     ]);
     expect(cfg.chains.kw!.map((line) => line.id)).toEqual([
       "kw-yuningxi-pro", "kw-yuxi", "kw-stellarwave", "kw-quandouyao", "kw-native-des",
@@ -416,12 +416,11 @@ describe("声明式 http 线路（chain.json kind:http）+ script qq 链", () =>
     expect(cfg.chains.kg!.map((line) => line.id)).toEqual([
       "kg-yuxi", "kg-stellarwave", "kg-molan", "kg-lxv6", "kg-yuningxi-pro",
     ]);
-    // kg 末位玉宁熙 Pro 只实测过 flac；QQ 原生 vkey 只有 128 且仅 Windows 参与
+    // kg 末位玉宁熙 Pro 只实测过 flac；QQ 链已移除 native-vkey（墨澜 tx 首位）
     const kgLast = cfg.chains.kg![cfg.chains.kg!.length - 1]!;
     expect(kgLast.qualities).toEqual(["flac"]);
     const qqLast = cfg.chains.qq![cfg.chains.qq!.length - 1]!;
-    expect(qqLast.qualities).toEqual(["128"]);
-    expect(qqLast.platforms).toEqual([PLATFORMS.WINDOWS]);
+    expect(qqLast.id).toBe("qq-yuningxi-tang");
     // 每音质档参与换源的线路 ≤上限（全灭耗时上限）
     for (const lines of Object.values(cfg.chains)) {
       for (const quality of ["128", "320", "flac"] as const) {

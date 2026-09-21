@@ -68,7 +68,7 @@ export const HOST_API_VERSION = 1;
  * 这里与安卓端 `qt-uniappx/services/source-bundle-fs.uts` 的 BUILTIN_VERSION_CODE
  * 同步更新（两端同号）。
  */
-export const BUILTIN_SOURCE_VERSION = { code: 2026091904, name: "2026.09.19.4" };
+export const BUILTIN_SOURCE_VERSION = { code: 2026092101, name: "2026.09.21.1" };
 
 /**
  * §2.3 判定 6 步（纯函数）：
@@ -145,7 +145,8 @@ export async function installSourceRelease(release: SourceReleaseVo): Promise<vo
   await ipc.sourceInstall(release);
 }
 
-/** 立即应用（重建引擎窗口；smoke=true 时引擎加载后跑真实网络冒烟） */
+/** 立即应用（重建引擎窗口；smoke=true 时引擎加载后跑真实网络冒烟，
+ *  冒烟通过由引擎页请求重启应用，让新包在主窗口侧也彻底生效） */
 export async function applySourceRelease(smoke = true): Promise<void> {
   await ipc.sourceApply(smoke);
 }

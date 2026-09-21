@@ -478,7 +478,7 @@ mod tests {
     /// 建一个进程唯一的临时目录（不联网、不依赖真实音乐目录）
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
-            "lightlisten-local-{tag}-{}-{}",
+            "quietmusic-local-{tag}-{}-{}",
             std::process::id(),
             fastrand::u64(..)
         ));

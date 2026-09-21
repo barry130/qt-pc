@@ -1,6 +1,6 @@
 {
-  "chainRevision": 1,
-  "maxLinesPerQuality": 5,
+  "chainRevision": 3,
+  "maxLinesPerQuality": 4,
   "crossSources": {
     "wyy": [
       "kw"
@@ -36,6 +36,17 @@
       }
     ],
     "qq": [
+      {
+        "id": "qq-molan-tx",
+        "name": "墨澜 tx（聚合内核）",
+        "kind": "lx",
+        "scriptId": "molan",
+        "qualities": [
+          "128",
+          "320",
+          "flac"
+        ]
+      },
       {
         "id": "qq-world260809",
         "name": "World 260809 a.aa.cab",
@@ -75,8 +86,7 @@
         "qualities": [
           "320",
           "flac"
-        ],
-        "parallel": true
+        ]
       },
       {
         "id": "qq-yuningxi-tang",
@@ -111,21 +121,20 @@
           "320": "song_play_url",
           "flac": "song_play_url_sq"
         }
-      },
-      {
-        "id": "qq-native-vkey",
-        "name": "QQ 原生 vkey",
-        "kind": "bundle",
-        "impl": "qqMusicUrlCore",
-        "qualities": [
-          "128"
-        ],
-        "platforms": [
-          1103
-        ]
       }
     ],
     "kw": [
+      {
+        "id": "kw-native-des",
+        "name": "酷我官方 DES",
+        "kind": "bundle",
+        "impl": "kwMusicUrlCore",
+        "qualities": [
+          "128",
+          "320",
+          "flac"
+        ]
+      },
       {
         "id": "kw-yuningxi-pro",
         "name": "玉宁熙 Pro",
@@ -149,17 +158,6 @@
         ]
       },
       {
-        "id": "kw-stellarwave",
-        "name": "Stellarwave",
-        "kind": "lx",
-        "scriptId": "stellarwave",
-        "qualities": [
-          "128",
-          "320",
-          "flac"
-        ]
-      },
-      {
         "id": "kw-quandouyao",
         "name": "全豆要",
         "kind": "lx",
@@ -171,31 +169,7 @@
         ]
       },
       {
-        "id": "kw-native-des",
-        "name": "酷我官方 DES",
-        "kind": "bundle",
-        "impl": "kwMusicUrlCore",
-        "qualities": [
-          "128",
-          "320",
-          "flac"
-        ]
-      }
-    ],
-    "kg": [
-      {
-        "id": "kg-yuxi",
-        "name": "屿溪 · 终章",
-        "kind": "lx",
-        "scriptId": "yuxi",
-        "qualities": [
-          "128",
-          "320",
-          "flac"
-        ]
-      },
-      {
-        "id": "kg-stellarwave",
+        "id": "kw-stellarwave",
         "name": "Stellarwave",
         "kind": "lx",
         "scriptId": "stellarwave",
@@ -204,7 +178,9 @@
           "320",
           "flac"
         ]
-      },
+      }
+    ],
+    "kg": [
       {
         "id": "kg-molan",
         "name": "墨澜",
@@ -228,11 +204,33 @@
         ]
       },
       {
+        "id": "kg-stellarwave",
+        "name": "Stellarwave",
+        "kind": "lx",
+        "scriptId": "stellarwave",
+        "qualities": [
+          "128",
+          "320",
+          "flac"
+        ]
+      },
+      {
         "id": "kg-yuningxi-pro",
         "name": "玉宁熙 Pro",
         "kind": "lx",
         "scriptId": "yuningxi-pro",
         "qualities": [
+          "flac"
+        ]
+      },
+      {
+        "id": "kg-yuxi",
+        "name": "屿溪 · 终章",
+        "kind": "lx",
+        "scriptId": "yuxi",
+        "qualities": [
+          "128",
+          "320",
           "flac"
         ]
       }

@@ -19,6 +19,7 @@ import { useMusicSourceStore } from "@/stores/musicSource";
 import { displayName, useAuthStore } from "@/stores/auth";
 import { SOURCE_DISPLAY } from "@/types";
 import { cn } from "@/lib/utils";
+import { migrateLegacyStorageKey } from "@/lib/legacy-storage";
 
 /**
  * 侧边栏（DESIGN §5.4）：四分组导航，可折叠为 64px 图标条（持久化）。
@@ -54,7 +55,9 @@ const BOTTOM_ITEMS: Item[] = [
   { label: "账号", to: "/login", icon: UserRound },
 ];
 
-const COLLAPSE_KEY = "lightlisten.sidebar-collapsed";
+/** 更名前的前缀是 lightlisten.*（见 lib/legacy-storage） */
+const COLLAPSE_KEY = "quietmusic.sidebar-collapsed";
+migrateLegacyStorageKey(COLLAPSE_KEY);
 
 function readCollapsed(): boolean {
   try {

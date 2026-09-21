@@ -34,7 +34,7 @@ const server = http.createServer(async (req, res) => {
     if (url.startsWith("/index/")) {
       const upstream = UPSTREAM_INDEX + url.slice("/index".length);
       const r = await fetch(upstream, {
-        headers: { "user-agent": "lightlisten-local-mirror/0.1" },
+        headers: { "user-agent": "quietmusic-local-mirror/0.1" },
       });
       const headers = { "content-type": r.headers.get("content-type") ?? "text/plain" };
       if (r.body) {
@@ -51,7 +51,7 @@ const server = http.createServer(async (req, res) => {
     if (url.startsWith("/api/v1/crates/")) {
       const upstream = UPSTREAM_API + url.slice("/api/v1/crates".length);
       const r = await fetch(upstream, {
-        headers: { "user-agent": "lightlisten-local-mirror/0.1" },
+        headers: { "user-agent": "quietmusic-local-mirror/0.1" },
       });
       if (!r.ok || !r.body) {
         res.writeHead(r.status);

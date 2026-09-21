@@ -8,15 +8,15 @@
 
 | 文件 | 路径 |
 |---|---|
-| NSIS 安装包 | `src-tauri/target/release/bundle/nsis/LightListen_<版本>_x64-setup.exe` |
-| 主程序 | `src-tauri/target/release/lightlisten.exe` |
+| NSIS 安装包 | `src-tauri/target/release/bundle/nsis/QuietMusic_<版本>_x64-setup.exe` |
+| 主程序 | `src-tauri/target/release/quietmusic.exe` |
 | 前端产物 | `dist/`（打进二进制，无需分发） |
 
 ## 前置检查
 
-1. **关掉正在运行的 LightListen**（含托盘），否则链接报 `os error 5 拒绝访问`：
+1. **关掉正在运行的 QuietMusic**（含托盘），否则链接报 `os error 5 拒绝访问`：
    ```powershell
-   Get-Process lightlisten -ErrorAction SilentlyContinue | Stop-Process -Force
+   Get-Process quietmusic -ErrorAction SilentlyContinue | Stop-Process -Force
    ```
 2. 版本号三处已同步（见《配置文档》§1）。
 3. 验证基线全绿（可选但建议）：
@@ -70,7 +70,7 @@ cargo build --release --features custom-protocol
 Get-ChildItem "F:\qtMusic\qt-pc\src-tauri\target\release\bundle\nsis"
 
 # 启动冒烟：release 版直接跑起来、能播一首歌、收藏同步正常
-Start-Process "F:\qtMusic\qt-pc\src-tauri\target\release\lightlisten.exe"
+Start-Process "F:\qtMusic\qt-pc\src-tauri\target\release\quietmusic.exe"
 ```
 
 冒烟清单：
@@ -78,7 +78,7 @@ Start-Process "F:\qtMusic\qt-pc\src-tauri\target\release\lightlisten.exe"
 - [ ] 播放一首歌，播放条显示曲名/进度
 - [ ] 收藏按钮弹出本地歌单，勾选生效
 - [ ] 收藏页「同步云端收藏」成功（连后端时）
-- [ ] 数据目录沿用 `%APPDATA%\LightListen`（升级覆盖后数据还在）
+- [ ] 数据目录沿用 `%APPDATA%\QuietMusic`（升级覆盖后数据还在）
 
 ## 常见失败
 

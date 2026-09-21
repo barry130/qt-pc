@@ -4,34 +4,14 @@
 //! 命令取原文；读取失败/文件不存在返回 null，由前端回退内置默认配置）。
 //! P2 起该目录扩展为安装根（state.json、source/<code>/* 下载落盘）。
 //!
-//! 目录口径与 lib.rs 的 db_root 一致：Windows = %APPDATA%/LightListen，
-//! 其他平台跟随 app_cache_dir。
+//! 目录口径与 lib.rs 的 db_root 一致：`app_paths::data_root`
+//! （Windows = %APPDATA%/QuietMusic，其他平台跟随 app_cache_dir）。
 
 use std::path::{Path, PathBuf};
-use tauri::Manager;
 
 /// 音源包本地根目录（<数据根>/source-bundle）
 pub(crate) fn bundle_dir<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> PathBuf {
-    #[cfg(target_os = "windows")]
-    {
-        let root = std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                app.path()
-                    .app_cache_dir()
-                    .unwrap_or_else(|_| PathBuf::from("."))
-            })
-            .join("LightListen");
-        root.join("source-bundle")
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        let _ = app;
-        app.path()
-            .app_cache_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("source-bundle")
-    }
+    crate::app_paths::data_root(app).join("source-bundle")
 }
 
 /// 读 chain.json overlay 原文；文件不存在/不可读/超 1 MiB（防呆）返回 None

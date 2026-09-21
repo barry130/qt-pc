@@ -149,7 +149,7 @@ fn valid_path_segment(seg: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
 }
 
-/// `/script/<code>/<file>`：只读分发 `%APPDATA%/LightListen/source-bundle/install/`
+/// `/script/<code>/<file>`：只读分发 `%APPDATA%/QuietMusic/source-bundle/install/`
 /// 下的音源包文件。路径穿越在校验段名 + 规范化路径前缀双重拦截。
 fn handle_script_file<R: tauri::Runtime>(app: &tauri::AppHandle<R>, rest: &str) -> Response<Vec<u8>> {
     let Some((code, file)) = rest.split_once('/') else {

@@ -56,7 +56,7 @@ mod tests {
 
     fn test_db() -> Database {
         let dir = std::env::temp_dir().join(format!(
-            "lightlisten-test-{}-{}",
+            "quietmusic-test-{}-{}",
             std::process::id(),
             fastrand::u64(..)
         ));

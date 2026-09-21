@@ -3,5 +3,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    lightlisten_lib::run()
+    quietmusic_lib::run()
 }

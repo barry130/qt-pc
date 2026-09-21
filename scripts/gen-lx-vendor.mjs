@@ -36,7 +36,7 @@ const MANIFEST = {
   "yuningxi-pro": "V260907/lx-玉宁熙V1.2.2.js",
   yuxi: "V260907/屿溪-终章.js",
   stellarwave: "V260907/stellarwave-v3.2.0.js",
-  molan: "V260907/墨澜音乐源v2.3.0.js",
+  molan: "V260917/V260917/墨澜音乐源v2.3.4.js",
   gdstudio: "V260907/gdstudio音乐源 v1.0.1（仅支持网易）.js",
   kulou: "V260907/(推荐)裤佬SVIP音源（酷狗挂了）.js",
   quandouyao: "V260907/全豆要-聚合音源-V4.1（酷狗挂了）.js",

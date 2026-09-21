@@ -1,21 +1,98 @@
-音源包发布物（2026-09-19，歌词翻译版）
+音源包发布物（2026-09-21，链路重排 + 修复 2026091905 全接口挂死）
 ====================================================
-chain.json       5 KB     内容与上一版完全相同（可不传，传了最稳）
-source-bundle.js 1.67 MB  新版：歌词翻译接入
-                           - qq：官方翻译（musicu.fcg PlayLyricInfo trans，
-                             过滤 kana 的 // 占位行）
-                           - kg：原生 krc 无翻译；仅网易云同名兜底词路径
-                             返回配对的 tlyric（译文与原文严格同曲）
-                           - wyy：tlyric（不变）；kw：官方接口无翻译字段
-                           - 按约定不做跨源/机器翻译兜底，无官方翻译即无双语
+chain.json       4.6 KB   新版（chainRevision 3）：链路重排 + 档内线路数封顶 4
+source-bundle.js 1.77 MB  与 2026092001 完全一致（哈希未变，无需重下）
 
-管理端四步（astral-front → 仪表盘 → qt → 音源包）：
-① 新建 release（platforms 勾 1101+1103，channel stable，
-   准入 appVersionCodes 留空，notes 如「bundle：歌词官方翻译」）
-   → 记下后端生成的版本号
+一、本次改什么（只改 chain.json，bundle 不动）
+----------------------------------------------------
+依据「逐线路全量重测」（每平台每条线路单独装链、每线路用不同歌曲绕过缓存）
+的真实耗时与命中率重排：
+
+qq：墨澜 tx → World260809 → Stellarwave tx → 玉宁熙 tang
+    - 墨澜 tx 实测 402-841ms，是 qq 链最快的一条（3 档全通），保持置首
+    - 移除 Stellarwave tx 的 parallel：它原本每次取链都并发起跑，
+      即使前面已命中也要白跑一遍（QuickJS 单线程上是纯浪费）
+    - 实测：12 首不同歌曲全部由墨澜首条命中，平均 542ms（旧链 1017ms）
+
+kw：酷我官方 DES → 玉宁熙 Pro → 屿溪 → 全豆要 → Stellarwave
+    - 官方 DES 是 bundle 实现（**不 init 任何混淆宿主**），实测 102-253ms 最快，置首
+    - Stellarwave 实测 320/128 档 4168/4701ms（yy.zddyr.top 单请求 4.6s），移到最后
+
+kg：墨澜 → 独家 v6 → Stellarwave → 玉宁熙 Pro → 屿溪
+    - 屿溪（原链首）128/320 档实测**死链**（返回地址 Range 预检不过），移到最后
+    - 墨澜 412-437ms、独家 v6 239-468ms 是 kg 最快的两条，提前
+
+档内线路数 maxLinesPerQuality：5 → 4
+    - 效果正好把两条问题线路挤出执行面：kw-Stellarwave（4.6s）、kg-屿溪（死链）
+    - 更重要的是**封住最坏情况**：每条线路都要 init 一个混淆宿主，5 条全跑
+      意味着单次取链叠 5 次混淆 init，安卓 QuickJS 上极易撞上引擎的 5s 停用闸门
+
+二、为什么要这样改（安卓「越切越失败」的机制）
+----------------------------------------------------
+qt-js-engine 的原生侧有一条**事后隔离闸门**（uni_modules/qt-js-engine
+utssdk/app-android/index.uts）：
+
+  STALL_MS = 5000        // 单次 evaluate 超过 5s 即判定脚本卡住
+  poison(reason)         // 引擎停用：gPoisoned = true
+  → 之后所有调用直接失败："引擎已停用，需重启音源引擎"
+  → 只能 stop + start 重建（= 用户说的「重启就又可以了」）
+
+而 prelude 的 `__qtPumpAsync()` 在求值 Promise 时会把**微任务队列跑干**——也就是
+链路上所有 await 续跑都算在同一次 evaluate 的耗时里。链路每多试一条 LX 线路，
+就多一次混淆宿主的同步 init 叠进同一次求值：qq 旧链首条墨澜失败后还有
+parallel 的 Stellarwave 并发起跑，kg 旧链 5 条全是混淆宿主 → 单次求值很容易破 5s
+→ 引擎停用 → 「QQ 链接经常加载失败」→「最终切换所有歌曲都失败」。
+
+重排后每次取链实际只 init 一个宿主（qq/kg 都是墨澜首条命中，kw 是 bundle 实现
+零 init），同步工作量大幅下降，同时整链耗时也从 1017ms 降到 542ms。
+
+三、修复 2026091905 挂死（上一版已修，本版沿用）
+----------------------------------------------------
+Rollup 重新打印混淆脚本（解码 \xNN 转义、0x2→2、重命名遮蔽参数）破坏了
+jsjiami / obfuscator.io 的**源码文本自校验**，字符串数组轮转循环永不收敛 →
+同步忙循环冻结事件循环。修复：构建后用 scripts/restore-lx-bodies.mjs 把带
+自校验指纹的 3 个脚本体（molan / luoxue / kulou）恢复为逐字节原文，并在
+scripts/check-lx-bodies.mjs 里加构建期守卫（worker 沙箱 + 20s 看门狗）。
+
+四、逐线路全量重测结果（本次，真实网络）
+----------------------------------------------------
+qq  qq-molan-tx       128✅841ms  320✅402ms  flac✅613ms
+    qq-world260809    128✅1824ms 320✅667ms  flac✅648ms
+    qq-stellarwave-tx            320✅863ms  flac✅782ms
+    qq-yuningxi-tang  128✅1331ms 320✅1065ms flac✅1251ms
+wyy wyy-core          128✅900ms  320✅526ms  flac✅583ms
+kw  kw-native-des     128✅253ms  320✅102ms  flac✅127ms
+    kw-yuningxi-pro   128✅372ms  320✅141ms  flac✅152ms
+    kw-yuxi           128✅302ms  320✅225ms  flac✅188ms
+    kw-quandouyao     128✅1440ms 320✅540ms  flac✅520ms
+    kw-stellarwave    128✅4701ms 320✅4168ms flac✅597ms   ← 慢，已移末位
+kg  kg-molan          128✅412ms  320✅437ms  flac✅419ms
+    kg-lxv6           128✅468ms  320✅262ms  flac✅239ms
+    kg-stellarwave    128✅377ms  320✅1255ms flac✅986ms
+    kg-yuningxi-pro                          flac✅332ms
+    kg-yuxi           128❌死链   320❌死链   flac✅514ms   ← 已移末位
+
+整链复测（新 chain.json）：4 平台 × 3 音质 × 2 样本（孤勇者免费 / 晴天 VIP）
+共 24 组，**全部返回可播地址**（Range 预检 206）；首页聚合接口
+allHotWords 757ms / allCharts 391ms / recommendations 122ms / allLatest 490ms /
+searchAll 666ms 全通。
+
+五、未改动的部分
+----------------------------------------------------
+  - PC 内置包仍为 2026091905（src-tauri/builtin-sources/，version.json 未变）
+  - 安卓 static 内置仍为 2026091903（BUILTIN_VERSION_CODE 未变）
+  - 引擎/基座代码未动（本版是纯线上音源包热更新）
+
+六、管理端四步（astral-front → 仪表盘 → qt → 音源包）
+----------------------------------------------------
+① 新建 release（platforms 勾 1101+1103，channel stable，准入 appVersionCodes
+   留空，notes 如「链路重排：qq/kg 墨澜置首、移除 parallel、档内封顶 4」）
+   → 记下后端生成的版本号（**必须 > 2026092001**）
 ② 上传本目录的两个文件，拿直链 URL
 ③ 回填 artifacts（path=chain.json / source-bundle.js，version 留空）
 ④ 点「发布」
 
-发布后：把版本号告诉 ZCode（镜像内置常量 + 同步 static + 重打基座）。
+注意：同号换内容不会被采用，务必用后端新生成的号（≥ 2026092002）。
+source-bundle.js 与 2026092001 完全相同，客户端会按逐文件版本只更新 chain.json。
+
 详细流程见《音源包打包发布完整教程.md》§5 / §5.1。

@@ -250,7 +250,7 @@ async fn self_http_get_head(url: &str) -> Option<reqwest::Response> {
     client
         .get(url)
         .header("Range", "bytes=0-0")
-        .header("User-Agent", "lightlisten-accel-probe")
+        .header("User-Agent", "quietmusic-accel-probe")
         .send()
         .await
         .ok()
@@ -681,13 +681,13 @@ impl AstralClient {
             .build()
             .map_err(|e| format!("下载客户端初始化失败: {e}"))?;
 
-        let dir = std::env::temp_dir().join("lightlisten-update");
+        let dir = std::env::temp_dir().join("quietmusic-update");
         std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
         let file_name = url
             .split('/')
             .next_back()
             .filter(|s| !s.is_empty() && !s.contains('?'))
-            .unwrap_or("lightlisten-setup.exe");
+            .unwrap_or("quietmusic-setup.exe");
         let path = dir.join(file_name);
 
         let resp = http
@@ -882,8 +882,8 @@ pub fn version_name() -> &'static str {
 
 /// versionCode：发版时手动维护的整数（与移动端 manifest.json 的 versionCode 同一约定），
 /// 必须和后端 qt_app_update 表里对应版本的记录一致——更新检查就是拿它比大小。
-/// 1.0.0 → 100；1.0.1 → 101；1.0.2 → 102；1.0.3 → 103；1.0.4 → 104；下次发版记得同步 +1。
-pub const VERSION_CODE: i64 = 104;
+/// 1.0.0 → 100；1.0.1 → 101；1.0.2 → 102；1.0.3 → 103；1.0.4 → 104；1.0.5 → 105；下次发版记得同步 +1。
+pub const VERSION_CODE: i64 = 105;
 
 pub fn version_code() -> i64 {
     VERSION_CODE
@@ -896,8 +896,8 @@ mod tests {
     #[test]
     fn version_code_is_the_manual_release_constant() {
         // versionCode 不再从版本号推导（旧公式 1.0.0 会算出 10000），
-        // 而是与后端 qt_app_update 记录对齐的手动常量：1.0.0 → 100 … 1.0.4 → 104
-        assert_eq!(VERSION_CODE, 104);
+        // 而是与后端 qt_app_update 记录对齐的手动常量：1.0.0 → 100 … 1.0.5 → 105
+        assert_eq!(VERSION_CODE, 105);
         assert_eq!(version_code(), VERSION_CODE);
         assert_eq!(version_name(), env!("CARGO_PKG_VERSION"));
     }

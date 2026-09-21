@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { errMsg } from "@/lib/utils";
+import { migrateLegacyStorageKey } from "@/lib/legacy-storage";
 import { ArrowLeft } from "lucide-react";
 import * as ipc from "@/services/ipc";
 import { useAuthStore } from "@/stores/auth";
@@ -18,7 +19,9 @@ import { RichText, htmlToText } from "@/lib/richText";
  *   同时尝试调一次 read-ack，后端不认也不影响。
  * - 正文是富文本（HTML），交给 `lib/richText` 白名单解析渲染；纯文本正文兼容。
  */
-const READ_KEY = "lightlisten.messages.read";
+/** 更名前的前缀是 lightlisten.*（见 lib/legacy-storage） */
+const READ_KEY = "quietmusic.messages.read";
+migrateLegacyStorageKey(READ_KEY);
 
 /** 展示位掩码：1 开屏 2 通告栏 4 消息中心（对齐后端 SysNotice.display） */
 const DISPLAY_MESSAGE_CENTER = 4;

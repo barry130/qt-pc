@@ -704,6 +704,9 @@ function QualitySelect(props: {
   );
 }
 
+/** 应用成功提示：冒烟通过后引擎页会请求重启，所以提示里带上重启口径 */
+const APPLY_OK_MESSAGE = "应用成功，正在重启应用…";
+
 /** 音源包设置（音源包热更新方案 P2）：当前/远端版本 + 立即检查/应用/回滚。
  *  状态事实来源是 Rust state.json；「已就绪」= 下载完成待应用。 */
 function SourcePackageSection(): React.JSX.Element {
@@ -729,16 +732,19 @@ function SourcePackageSection(): React.JSX.Element {
 
   const check = (): Promise<string> => checkAndDownload();
 
-  // 应用成功后提示「应用成功」，随即收起应用按钮与更新说明（已装上就不占版面）
+  // 应用成功后提示「应用成功」，随即收起应用按钮与更新说明（已装上就不占版面）。
+  // 真实冒烟由引擎页执行，通过后引擎页会请求重启应用，所以这里的提示带上重启口径。
   const apply = async (): Promise<void> => {
     setBusy(true);
     try {
       await applySourceRelease(true);
       setReady(null);
-      setMessage("应用成功");
+      setMessage(APPLY_OK_MESSAGE);
       window.setTimeout(() => {
-        if (useSourceUpdateStore.getState().message === "应用成功") setMessage("");
-      }, 5000);
+        if (useSourceUpdateStore.getState().message === APPLY_OK_MESSAGE) {
+          setMessage("");
+        }
+      }, 15000);
     } catch (e) {
       setMessage(`操作失败：${stripErrorUrls(String(e))}`);
     } finally {
@@ -806,7 +812,7 @@ function SourcePackageSection(): React.JSX.Element {
               >
                 立即应用
               </button>
-              <span className="ml-2">音源包已就绪，应用后下一首起生效</span>
+              <span className="ml-2">音源包已就绪，应用后自动重启应用生效</span>
             </div>
           )}
           {message && <div>{message}</div>}

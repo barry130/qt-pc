@@ -27,13 +27,6 @@ export function useCoverColor(): void {
     let cancelled = false;
     // picUrl 已由上方 early return 保证非 null
     const currentUrl = qtresCoverUrl(picUrl!);
-    void import("@tauri-apps/api/core")
-      .then(({ invoke }) =>
-        invoke("debug_log", {
-          message: `useCoverColor: follow=${followCoverColor} picLen=${picUrl!.length} url=${currentUrl ?? "null"}`,
-        }),
-      )
-      .catch(() => {});
     if (!currentUrl) return;
 
     extractCoverColor(currentUrl).then((color) => {

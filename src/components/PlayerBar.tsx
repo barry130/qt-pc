@@ -52,8 +52,6 @@ export function PlayerBar(): React.JSX.Element {
   const [dragPreviewMs, setDragPreviewMs] = useState<number | null>(null);
   // 松手后到 seek 生效前的乐观目标（store 侧），优先于插值位置展示
   const pendingSeekMs = usePlayerStore((s) => s.pendingSeekMs);
-  // 拖拽诊断用：down 后是否出现过 move（区分「按下即失败」和「拖动中取消」）
-  const movedRef = useRef(false);
   // 队列面板是布局级组件（挂在 AppShell 主区右侧），开关状态放 store 里共享
   const queueOpen = usePlayerStore((s) => s.queueOpen);
   const toggleQueue = usePlayerStore((s) => s.toggleQueue);
@@ -107,42 +105,24 @@ export function PlayerBar(): React.JSX.Element {
     return ratio * durationMs;
   };
 
-  // 临时诊断：进度条拖拽各阶段写入 app 日志
-  const dbg = useCallback((msg: string): void => {
-    void import("@tauri-apps/api/core")
-      .then(({ invoke }) => invoke("debug_log", { message: `progress: ${msg}` }))
-      .catch(() => {});
-  }, []);
-
   const onBarDown = useCallback(
     (e: ReactPointerEvent<HTMLDivElement>): void => {
-      const durationMs = usePlayerStore.getState().state?.durationMs ?? -1;
       const ms = ratioFromEvent(e);
-      dbg(
-        `down type=${e.pointerType} durationMs=${durationMs} ms=${ms}`,
-      );
       if (ms === null) return;
-      movedRef.current = false;
       e.currentTarget.setPointerCapture(e.pointerId);
       setDragging(true);
       setDragPreviewMs(ms);
     },
-    [setDragging, dbg],
+    [setDragging],
   );
 
   const onBarMove = useCallback(
     (e: ReactPointerEvent<HTMLDivElement>): void => {
       if (!usePlayerStore.getState().isDraggingProgress) return;
       const ms = ratioFromEvent(e);
-      if (ms !== null) {
-        if (!movedRef.current) {
-          movedRef.current = true;
-          dbg(`move ms=${ms}`);
-        }
-        setDragPreviewMs(ms);
-      }
+      if (ms !== null) setDragPreviewMs(ms);
     },
-    [dbg],
+    [],
   );
 
   const onBarUp = useCallback(
@@ -151,24 +131,21 @@ export function PlayerBar(): React.JSX.Element {
       const ms = ratioFromEvent(e);
       setDragging(false);
       setDragPreviewMs(null);
-      dbg(`up ms=${ms}`);
-      if (ms !== null) {
-        void seekTo(ms).catch((err: unknown) => dbg(`seek error ${String(err)}`));
-      }
+      if (ms !== null) void seekTo(ms);
       e.currentTarget.releasePointerCapture(e.pointerId);
     },
-    [seekTo, setDragging, dbg],
+    [seekTo, setDragging],
   );
 
+  /** 拖动被系统取消（触屏滚动手势等）：收尾但不 seek，避免位置错跳 */
   const onBarCancel = useCallback(
     (e: ReactPointerEvent<HTMLDivElement>): void => {
-      dbg(`pointercancel (isDragging=${usePlayerStore.getState().isDraggingProgress})`);
       if (!usePlayerStore.getState().isDraggingProgress) return;
       setDragging(false);
       setDragPreviewMs(null);
       e.currentTarget.releasePointerCapture(e.pointerId);
     },
-    [dbg],
+    [setDragging],
   );
 
   return (

@@ -114,7 +114,7 @@ pub fn create_tray(app: &AppHandle) {
     app.manage(DesktopLyricItem(desktop_lyric));
     app.manage(LockLyricItem(lock_lyric));
 
-    let builder = TrayIconBuilder::with_id("lightlisten-tray")
+    let builder = TrayIconBuilder::with_id("quietmusic-tray")
         .tooltip("轻听")
         .menu(&menu)
         .show_menu_on_left_click(false)

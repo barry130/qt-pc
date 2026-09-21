@@ -16,8 +16,8 @@
 
 | 字段 | 当前值 | 说明 | 何时改 |
 |---|---|---|---|
-| `productName` | `LightListen` | 安装包名、开始菜单名、进程名 | 品牌变更时 |
-| `identifier` | `com.qt.lightlisten` | 应用唯一 ID（Windows 注册表路径、数据目录派生） | **发布后不要改**，改了等于新应用 |
+| `productName` | `QuietMusic` | 安装包名、开始菜单名、进程名 | 品牌变更时 |
+| `identifier` | `com.qt.quietmusic` | 应用唯一 ID（Windows 注册表路径、数据目录派生） | **发布后不要改**，改了等于新应用 |
 | `app.windows[0].title` | `轻听` | 主窗口标题 | 随意 |
 
 > 注意：`tauri.conf.json` 里的 `title` 在仓库中显示为转义乱码（`杞诲惉`）时，
@@ -57,7 +57,7 @@
 
 ## 5. 数据目录与升级
 
-- 用户数据目录：`%APPDATA%\LightListen\`（music.db、astral.session、音频缓存、下载）
+- 用户数据目录：`%APPDATA%\QuietMusic\`（music.db、astral.session、音频缓存、下载）
 - `identifier` 不变的前提下，覆盖安装升级**不会**动用户数据；
   数据库 schema 由启动迁移自动升级（当前 v6），无需手工处理。
 - 安装器升级模式：NSIS `installMode: currentUser` 下直接覆盖安装即可。
@@ -67,7 +67,7 @@
 1. **`pnpm tauri build` / `pnpm tauri dev` 在本机不可用** ——
    Tauri CLI 会把 `process.argv[0]` 解析成 `DSH Desktop.exe`，报
    `unrecognized subcommand`。打包走**手动分步**（见《打包文档》）。
-2. 打包前**必须关掉正在运行的 LightListen 进程**，否则链接 `lightlisten.exe` 报
+2. 打包前**必须关掉正在运行的 QuietMusic 进程**，否则链接 `quietmusic.exe` 报
    `os error 5 拒绝访问`。
 3. cargo 命令统一加环境变量：
    `$env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"; $env:CARGO_HOME = "F:\qtMusic\qt-pc\.cargo-home"`

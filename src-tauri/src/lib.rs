@@ -1,5 +1,6 @@
 //! 轻听 PC 版 Tauri 入口（lib 形式，便于集成测试）。
 
+pub mod app_paths;
 pub mod audio;
 pub mod astral;
 pub mod commands;
@@ -114,15 +115,9 @@ pub fn run() {
             let audio_cache_dir = cache_base.join("audio");
             let url_cache = Arc::new(PlayUrlCache::new());
 
-            // 数据库：DESIGN §8.1 %APPDATA%/LightListen/data/music.db
-            // （identifier 是 com.qt.lightlisten，app_data_dir 与设计不一致，按设计拼）
-            #[cfg(target_os = "windows")]
-            let db_root = std::env::var_os("APPDATA")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| cache_base)
-                .join("LightListen");
-            #[cfg(not(target_os = "windows"))]
-            let db_root = cache_base;
+            // 数据库：DESIGN §8.1 %APPDATA%/QuietMusic/data/music.db
+            // 口径集中在 app_paths::data_root（含 LightListen 旧目录迁移）
+            let db_root = crate::app_paths::data_root(&handle);
             let db = match Database::open(&db_root.join("data").join("music.db")) {
                 Ok(db) => Some(Arc::new(db)),
                 Err(e) => {
@@ -233,6 +228,7 @@ pub fn run() {
             source_install::cmd_source_manifest,
             source_install::cmd_source_install,
             source_install::cmd_source_apply,
+            source_install::cmd_app_restart,
             source_install::cmd_source_rollback_builtin,
             source_install::cmd_source_mark_bad,
             source_install::cmd_source_report,
@@ -308,7 +304,6 @@ pub fn run() {
             cmd_get_top_singers,
             // 通用设置项
             cmd_get_setting,
-            cmd_debug_log,
             cmd_set_setting,
             // 收藏同步（DESIGN §5.3；契约同 qt-uniappx services/like.ts）
             cmd_like_push_song,

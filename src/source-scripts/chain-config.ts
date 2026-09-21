@@ -335,7 +335,7 @@ export function parseChainConfig(raw: unknown): ChainConfig {
 /** 内置默认 chain（line id 稳定，作为后续 chain.json 差异的锚点） */
 export function defaultChainConfig(): ChainConfig {
   return {
-    chainRevision: 1,
+    chainRevision: 2,
     maxLinesPerQuality: DEFAULT_MAX_LINES_PER_QUALITY,
     crossSources: { wyy: ["kw"], kw: ["wyy"], qq: ["kw", "wyy"], kg: ["kw", "wyy"] },
     budget: { totalMs: DEFAULT_CHAIN_BUDGET.totalMs, lineMs: DEFAULT_CHAIN_BUDGET.lineMs },
@@ -350,6 +350,13 @@ export function defaultChainConfig(): ChainConfig {
         },
       ],
       qq: [
+        {
+          id: "qq-molan-tx",
+          name: "墨澜 tx（聚合内核）",
+          kind: "lx",
+          scriptId: "molan",
+          qualities: ["128", "320", "flac"],
+        },
         {
           id: "qq-world260809",
           name: "World 260809 a.aa.cab",
@@ -386,14 +393,6 @@ export function defaultChainConfig(): ChainConfig {
           },
           require: { song_mid: "nonEmpty" },
           pick: { "128": "song_play_url_standard", "320": "song_play_url", flac: "song_play_url_sq" },
-        },
-        {
-          id: "qq-native-vkey",
-          name: "QQ 原生 vkey",
-          kind: "bundle",
-          impl: "qqMusicUrlCore",
-          qualities: ["128"],
-          platforms: [PLATFORMS.WINDOWS],
         },
       ],
       kw: [

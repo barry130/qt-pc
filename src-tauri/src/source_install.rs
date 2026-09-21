@@ -5,7 +5,8 @@
 //! - `source_install`：按 manifest artifacts 只下差异文件（version 比对），
 //!   落盘 `install/<code>/`，更新 state（installed → previous 平移）；
 //! - `source_apply`：重建引擎窗口（新包生效）+ 清主窗口取链缓存 + 触发
-//!   前端清 urlCache；
+//!   前端清 urlCache；真实冒烟通过后引擎页调 `app_restart` 重启应用，
+//!   让新包在主窗口侧也彻底生效（坏包冒烟失败则不重启，走回退）；
 //! - `source_rollback_builtin`：删除 installed 记录（目录保留作证据），
 //!   引擎页读不到 installed 即回退主窗口内置层；
 //! - `source_mark_bad` / `source_report`：冒烟失败登记 + 装载结果上报后端。
@@ -310,8 +311,30 @@ pub async fn cmd_source_install(app: AppHandle, release: SourceRelease) -> Resul
     Ok(installed)
 }
 
+/// 应用音源包后重启应用（引擎页在真实冒烟通过后调用）。
+///
+/// 只重建引擎窗口时，新包仅在引擎侧生效：主窗口的内嵌兜底层、已建立的
+/// 播放会话与各处内存缓存仍停在旧包上，用户看到的是「应用了但没完全生效」。
+/// 重启让新包从进程启动即生效，行为可预期。
+///
+/// 放在冒烟之后是刻意的：坏包会在引擎页走 `source_mark_bad` 回退，
+/// 那种情况下不重启，用户能看到失败原因而不是带着坏包重启。
+#[tauri::command(rename = "app_restart")]
+pub async fn cmd_app_restart(app: AppHandle) -> Result<(), String> {
+    // 独立线程 + 短暂延迟：先把 invoke 响应发回前端，再请求退出重启。
+    // request_restart 走 RunEvent::ExitRequested/Exit 正常退出流程
+    // （保存播放现场、清理托盘与歌词窗），再以原参数重启进程。
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        log::info!("[source-bundle] 音源包已应用，重启应用生效");
+        app.request_restart();
+    });
+    Ok(())
+}
+
 /// 音源包应用（生效）：重建引擎窗口 + 清引擎侧取链缓存。
 /// 正在播放不打断（PlayUrlCache 只影响后续取链）。
+/// 真实冒烟通过后由引擎页调 `app_restart` 重启应用（见上）。
 #[tauri::command(rename = "source_apply")]
 pub async fn cmd_source_apply(app: AppHandle, smoke: Option<bool>) -> Result<Value, String> {
     let dir = source_bundle::bundle_dir(&app);

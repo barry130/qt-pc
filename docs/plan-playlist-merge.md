@@ -137,7 +137,7 @@
    → 用 `node -e "fetch(...)"` 探活。
 
 6. **`cargo test` 前必须 kill 运行中的应用**
-   → 否则 `failed to remove ... lightlisten.exe`（os error 5）。
+   → 否则 `failed to remove ... quietmusic.exe`（os error 5）。
 
 ---
 

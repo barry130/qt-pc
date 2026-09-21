@@ -359,8 +359,8 @@ AstralClient
 
 ```json
 {
-  "productName": "LightListen",
-  "identifier": "com.qt.lightlisten",
+  "productName": "QuietMusic",
+  "identifier": "com.qt.quietmusic",
   "app": {
     "windows": [
       {
@@ -391,7 +391,7 @@ AstralClient
 
 说明：
 
-1. `identifier` 决定数据目录实际落点为 `%APPDATA%\com.qt.lightlisten\`，与 §8.1 的 `LightListen` 命名需二选一，**建议统一用 identifier**，文档中的 `%APPDATA%/LightListen/` 改为示意。
+1. `identifier` 决定数据目录实际落点为 `%APPDATA%\com.qt.quietmusic\`，与 §8.1 的 `QuietMusic` 命名需二选一，**建议统一用 identifier**，文档中的 `%APPDATA%/QuietMusic/` 改为示意。
 2. `visible: false` + 前端首帧渲染完成后 `show()`，避免白屏闪烁（§18.1 启动优化的必要条件）。
 3. `productName` 用 ASCII，避免安装路径与注册表键出现中文；界面标题用中文「轻听」。
 4. 网络请求全部在 Rust 侧发起，因此 `connect-src` 不需要放开任何外部域名，这是把 Provider 下沉 Rust 的额外收益。
@@ -1286,7 +1286,7 @@ struct PlayUrlKey { platform: SourceId, track_id: String, quality: Quality }
 ## 8.1 数据目录
 
 ```text
-%APPDATA%/LightListen/
+%APPDATA%/QuietMusic/
  ├─ data/
  │   └─ music.db
  ├─ cache/

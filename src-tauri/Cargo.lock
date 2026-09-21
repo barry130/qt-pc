@@ -2162,33 +2162,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lightlisten"
-version = "1.0.4"
-dependencies = [
- "async-trait",
- "base64 0.23.1",
- "cpal",
- "env_logger",
- "fastrand",
- "log",
- "md-5",
- "reqwest 0.12.28",
- "rodio",
- "rusqlite",
- "serde",
- "serde_json",
- "sha1",
- "souvlaki",
- "symphonia",
- "tauri",
- "tauri-build",
- "tauri-plugin-dialog",
- "tauri-plugin-global-shortcut",
- "thiserror 2.0.20",
- "tokio",
-]
-
-[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2984,6 +2957,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "quietmusic"
+version = "1.0.5"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "cpal",
+ "env_logger",
+ "fastrand",
+ "log",
+ "md-5",
+ "reqwest 0.12.28",
+ "rodio",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha1",
+ "souvlaki",
+ "symphonia",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-dialog",
+ "tauri-plugin-global-shortcut",
+ "thiserror 2.0.20",
+ "tokio",
 ]
 
 [[package]]

@@ -215,6 +215,10 @@
                 detail: "",
               }).catch(() => {});
             }
+            // 冒烟通过 = 新包可用：重启应用，让新包在主窗口侧也彻底生效
+            // （主窗口内嵌兜底层 / 取链缓存 / 播放会话都还挂在旧包上）。
+            // 冒烟失败走下面的 mark_bad 回退，那种情况不重启。
+            await invoke("app_restart").catch(() => {});
           } catch (err) {
             layer = null;
             entries = null;

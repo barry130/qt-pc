@@ -46,7 +46,7 @@ const { createSourceLayer, defaultChainConfig, parseChainConfig, PLATFORMS } = l
 // ---- 离线断言 ----
 const cfg = defaultChainConfig();
 const parsed = parseChainConfig(JSON.parse(JSON.stringify(cfg)));
-if (parsed.chainRevision !== 1 || parsed.chains.kw.length !== 5) {
+if (parsed.chainRevision !== 2 || parsed.chains.kw.length !== 5) {
   throw new Error("默认链断言失败");
 }
 const layer = createSourceLayer({
@@ -102,7 +102,11 @@ if (process.argv[2] === "net") {
 
 // ---- 安卓形态（__qtEntries；放在最后：loadChain 会覆盖 chain-store 缓存）----
 const entries = globalThis.__qtEntries;
-if (entries === undefined || entries === null || Object.keys(entries).length !== 4) {
+const CHAIN_ENTRY_NAMES = ["bundleInfo", "loadChain", "getPlayUrl", "verifyPlayable"];
+if (
+  entries === undefined || entries === null ||
+  CHAIN_ENTRY_NAMES.some((name) => typeof entries[name] !== "function")
+) {
   throw new Error("bundle 未注册 __qtEntries（安卓引擎装载会失败）");
 }
 const info = JSON.parse(entries.bundleInfo());

@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
+import { migrateLegacyStorageKey } from "@/lib/legacy-storage";
 import type { SourceId } from "@/types";
 
 /**
@@ -36,6 +37,10 @@ interface MusicSourceStore {
   setAggregateMode: (on: boolean) => void;
 }
 
+/** 更名前的前缀是 lightlisten.*（见 lib/legacy-storage） */
+const STORAGE_KEY = "quietmusic.music-source";
+migrateLegacyStorageKey(STORAGE_KEY);
+
 export const useMusicSourceStore = create<MusicSourceStore>()(
   persist(
     (set) => ({
@@ -44,6 +49,6 @@ export const useMusicSourceStore = create<MusicSourceStore>()(
       setActiveSource: (id) => set({ activeSourceId: id }),
       setAggregateMode: (on) => set({ aggregateMode: on }),
     }),
-    { name: "lightlisten.music-source", storage: createJSONStorage(safeStorage) },
+    { name: STORAGE_KEY, storage: createJSONStorage(safeStorage) },
   ),
 );
