@@ -102,6 +102,22 @@ export function isLightColor(r: number, g: number, b: number): boolean {
   return luminance > 0.6;
 }
 
+/**
+ * 解析 `#rgb` / `#rrggbb` 为 [r, g, b]。
+ * 解析失败（自定义色不是十六进制等）返回 null，由调用方回退默认前景色。
+ */
+export function hexToRgb(hex: string): [number, number, number] | null {
+  const m = hex.trim().match(/^#?([0-9a-f]{3}|[0-9a-f]{6})$/i);
+  if (!m) return null;
+  let h = m[1];
+  if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+  return [
+    parseInt(h.slice(0, 2), 16),
+    parseInt(h.slice(2, 4), 16),
+    parseInt(h.slice(4, 6), 16),
+  ];
+}
+
 const coverColorCache = new Map<string, string | null>();
 
 /**

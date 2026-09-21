@@ -1,6 +1,6 @@
 import { useEffect } from "react";
 import { useAppearanceStore } from "@/stores/appearance";
-import { getSkin } from "@/lib/skins";
+import { getSkin, hexToRgb, isLightColor } from "@/lib/skins";
 
 /**
  * 外观偏好应用（DESIGN §9.2 / R7）：
@@ -67,9 +67,16 @@ export function useAppearanceEffect(): void {
       root.style.setProperty("--sidebar-primary", primary);
       root.style.setProperty("--sidebar-primary-foreground", "#ffffff");
 
-      // 封面取色模式下由 useCoverColor 管理前景色，此处不覆盖
+      // 封面取色模式下由 useCoverColor 管理前景色，此处不覆盖。
+      // 皮肤主色同样要按明度翻转前景色：森林 #4ade80 / 暖阳 #fb923c / 深海 #38bdf8 /
+      // 樱花 #f472b6 这些亮主色配白字只有 1.7~2.3:1，主色实心按钮上的图标文字会糊掉，
+      // 也让「已开启」态失去对比。解析不出十六进制（非常规自定义色）时回退白字。
       if (!followCoverColor) {
-        root.style.setProperty("--primary-foreground", "#ffffff");
+        const rgb = hexToRgb(skinPrimary);
+        root.style.setProperty(
+          "--primary-foreground",
+          rgb && isLightColor(rgb[0], rgb[1], rgb[2]) ? "#1a1a1a" : "#ffffff",
+        );
       }
     };
 

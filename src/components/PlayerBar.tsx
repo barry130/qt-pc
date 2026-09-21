@@ -368,8 +368,12 @@ function QualityMenu(props: { current: Quality }): React.JSX.Element {
         disabled={busy}
         onClick={() => setOpen((v) => !v)}
         className={cn(
-          "flex h-9 min-w-12 items-center justify-center rounded-full bg-secondary/40 px-2.5 text-xs font-medium tabular-nums transition-all hover:bg-secondary/60 disabled:opacity-50",
-          props.current === "flac" ? "text-primary" : "text-foreground/80",
+          "flex h-9 min-w-12 items-center justify-center rounded-full px-2.5 text-xs font-medium tabular-nums transition-all disabled:opacity-50",
+          // 当前是 FLAC（无损）时用实心主色，和播放条的其它开启态保持一致；
+          // 只改文字颜色在浅底/封面色调底上会被背景吃掉
+          props.current === "flac"
+            ? "bg-primary text-primary-foreground shadow-[0_2px_10px_color-mix(in_srgb,var(--primary)_45%,transparent)] hover:brightness-110"
+            : "bg-secondary/40 text-foreground/80 hover:bg-secondary/60",
         )}
       >
         {qualityShort(props.current)}
@@ -387,10 +391,14 @@ function QualityMenu(props: { current: Quality }): React.JSX.Element {
               onClick={() => pick(o.value)}
               className={cn(
                 "flex w-full items-center justify-between rounded-md px-2.5 py-1.5 text-xs transition-colors hover:bg-secondary",
-                o.value === props.current ? "text-primary" : "",
+                o.value === props.current ? "bg-primary/10 text-primary" : "",
               )}
             >
-              <span>{o.label}</span>
+              {/* 选中项同时给出勾选图标：颜色之外多一个形状信号 */}
+              <span className="flex items-center gap-1.5">
+                {o.value === props.current ? <Check className="h-3 w-3" /> : null}
+                {o.label}
+              </span>
               <span className="text-[10px] text-muted-foreground">{o.short}</span>
             </button>
           ))}
@@ -517,10 +525,16 @@ function ControlButton(props: {
       type="button"
       aria-label={props.label}
       title={props.label}
+      aria-pressed={props.active}
       onClick={props.onClick}
       className={cn(
-        "flex h-9 w-9 items-center justify-center rounded-full bg-secondary/40 shadow-[0_2px_4px rgba(0,0,0,0.1),0_4px_8px rgba(0,0,0,0.05)] transition-all hover:bg-secondary/60 hover:shadow-[0_3px_6px rgba(0,0,0,0.12),0_6px_12px rgba(0,0,0,0.06)] active:shadow-[inset_0_2px_4px rgba(0,0,0,0.12)] dark:bg-card/15 dark:shadow-[0_2px_4px rgba(0,0,0,0.3),0_4px_8px rgba(0,0,0,0.2)] dark:hover:shadow-[0_3px_6px rgba(0,0,0,0.4),0_6px_12px rgba(0,0,0,0.3)] dark:active:shadow-[inset_0_2px_4px rgba(0,0,0,0.4)]",
-        props.active ? "text-primary" : "text-foreground/80",
+        "flex h-9 w-9 items-center justify-center rounded-full transition-all",
+        // 开启态用「实心主色 + 主色辉光」：以前只把图标改成 text-primary，
+        // 在亮主色皮肤（森林/暖阳/深海/樱花）和播放页的封面色调底上几乎看不出来。
+        // 填充 + 辉光是不依赖底色的明确信号，也和侧边栏选中项、播放键的视觉语言一致。
+        props.active
+          ? "bg-primary text-primary-foreground shadow-[0_2px_10px_color-mix(in_srgb,var(--primary)_45%,transparent)] hover:brightness-110 active:brightness-95"
+          : "bg-secondary/40 text-foreground/80 shadow-[0_2px_4px rgba(0,0,0,0.1),0_4px_8px rgba(0,0,0,0.05)] hover:bg-secondary/60 hover:shadow-[0_3px_6px rgba(0,0,0,0.12),0_6px_12px rgba(0,0,0,0.06)] active:shadow-[inset_0_2px_4px rgba(0,0,0,0.12)] dark:bg-card/15 dark:shadow-[0_2px_4px rgba(0,0,0,0.3),0_4px_8px rgba(0,0,0,0.2)] dark:hover:shadow-[0_3px_6px rgba(0,0,0,0.4),0_6px_12px rgba(0,0,0,0.3)] dark:active:shadow-[inset_0_2px_4px rgba(0,0,0,0.4)]",
       )}
     >
       {props.children}
