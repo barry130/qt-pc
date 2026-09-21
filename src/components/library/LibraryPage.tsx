@@ -224,6 +224,8 @@ export function LibraryPage(): React.JSX.Element {
       onChanged: () => void load(),
       onError: (msg: string) => setError(msg),
       selection: { ids: selected, onToggle: toggleSelect },
+      // 行模板对齐下载管理：本地行不带封面缩略图，也不显示「已下载」标记
+      plainRow: true,
     }),
     [load, selected, toggleSelect],
   );

@@ -32,6 +32,12 @@ export interface LocalListOptions {
     ids: Set<string>;
     onToggle: (trackId: string) => void;
   };
+  /**
+   * 行模板对齐「下载管理」：不显示行首封面缩略图，也不显示「已下载 / 下载中」标记。
+   * 本地曲库页专用 —— 本地行本身就是磁盘上的文件，「已下载」恒为真、纯噪声，
+   * 封面缩略图在这一屏也没有信息量（专辑分组视图已用分组标题表达）。
+   */
+  plainRow?: boolean;
 }
 
 export function TrackList(props: {
@@ -56,6 +62,8 @@ export function TrackList(props: {
     local,
   } = props;
   const selection = local?.selection;
+  // 本地曲库页的朴素行：无封面、无下载标记（对齐下载管理的行模板）
+  const plainRow = local?.plainRow === true;
   const playQueue = usePlayerStore((s) => s.playQueue);
   const navigate = useNavigate();
   const currentTrackId = usePlayerStore((s) => s.state?.trackId ?? null);
@@ -120,27 +128,29 @@ export function TrackList(props: {
                 ""
               )}
             </span>
-            <div className="h-9 w-9 shrink-0 overflow-hidden rounded bg-secondary">
-              {t.platform === "local" ? (
-                <LocalCover path={t.id} className="h-full w-full object-cover" />
-              ) : cover ? (
-                <img
-                  src={cover}
-                  alt=""
-                  className="h-full w-full object-cover"
-                  loading="lazy"
-                />
-              ) : null}
-            </div>
+            {!plainRow && (
+              <div className="h-9 w-9 shrink-0 overflow-hidden rounded bg-secondary">
+                {t.platform === "local" ? (
+                  <LocalCover path={t.id} className="h-full w-full object-cover" />
+                ) : cover ? (
+                  <img
+                    src={cover}
+                    alt=""
+                    className="h-full w-full object-cover"
+                    loading="lazy"
+                  />
+                ) : null}
+              </div>
+            )}
             <div className="min-w-0 flex-1">
               <div className="flex items-center gap-1.5">
                 <span className="truncate text-sm">{t.title}</span>
-                {isDownloaded && (
+                {!plainRow && isDownloaded && (
                   <span className="shrink-0 rounded bg-primary/15 px-1 py-px text-[10px] text-primary">
                     已下载
                   </span>
                 )}
-                {isDownloading && (
+                {!plainRow && isDownloading && (
                   <span className="shrink-0 rounded bg-secondary px-1 py-px text-[10px] text-muted-foreground">
                     下载中
                   </span>
