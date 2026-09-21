@@ -15,6 +15,7 @@
 
 #[cfg(target_os = "windows")]
 mod imp {
+    use std::time::Duration;
     use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
     use std::sync::{Mutex, OnceLock};
 
@@ -35,8 +36,8 @@ mod imp {
         THB_ICON, THB_TOOLTIP, THBF_ENABLED, THBN_CLICKED,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallWindowProcW, CreateIconIndirect, SetWindowLongPtrW, GWLP_WNDPROC, HICON, ICONINFO,
-        WM_COMMAND,
+        CallWindowProcW, CreateIconIndirect, IsWindowVisible, SetWindowLongPtrW, GWLP_WNDPROC,
+        HICON, ICONINFO, WM_COMMAND,
     };
 
     use crate::media::{dispatch_media_action, MediaAction};
@@ -72,82 +73,122 @@ mod imp {
     static LAST_PLAYING: AtomicBool = AtomicBool::new(false);
 
     /// 安装任务栏缩略图工具栏。失败只返回 Err 由调用方记日志，绝不影响主流程。
+    ///
+    /// 关键时序：init 在 setup 里跑，此刻窗口还没显示、任务栏按钮尚未创建 ——
+    /// 太早 ThumbBarAddButtons 会被 shell 静默丢掉（返回成功但按钮不渲染）。
+    /// 所以这里等窗口真正可见后再挂（最多等 10s），挂载动作扔回主线程。
     pub fn init(app: &AppHandle) -> Result<(), String> {
         let raw = app
             .get_webview_window("main")
             .and_then(|w| w.hwnd().ok())
             .map(|h| h.0 as isize)
             .ok_or_else(|| "取不到主窗口句柄".to_string())?;
-        let hwnd = HWND(raw as *mut core::ffi::c_void);
 
-        unsafe {
-            // tao 通常已为主线程初始化过 COM，重复初始化返回 RPC_E_CHANGED_MODE 属正常
-            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        // 按钮点击回调需要 AppHandle（窗口过程是自由函数，拿不到闭包捕获）
+        let _ = APP.set(app.clone());
 
-            // 缩略图预览底色跟随系统主题，图标颜色要反着来才看得见
-            let light = system_uses_light_theme();
-            let (r, g, b) = if light {
-                (0x1F, 0x1F, 0x1F)
-            } else {
-                (0xFF, 0xFF, 0xFF)
-            };
-            let dpi = {
-                let d = GetDpiForWindow(hwnd);
-                if d == 0 {
-                    96
-                } else {
-                    d
+        let app2 = app.clone();
+        let spawned = std::thread::Builder::new().name("taskbar".into()).spawn(move || {
+            let hwnd = HWND(raw as *mut core::ffi::c_void);
+            // 等窗口首次显示（任务栏按钮随之创建）再挂，太早会被 shell 静默丢掉
+            let mut visible = false;
+            for _ in 0..100 {
+                if unsafe { IsWindowVisible(hwnd).as_bool() } {
+                    visible = true;
+                    break;
                 }
-            };
-            // 缩略图工具栏图标基准 16px，按 DPI 放大渲染，避免被系统拉伸糊掉
-            let size = ((16 * dpi as i32) / 96).max(16);
-
-            let icons = Icons {
-                prev: make_icon(Glyph::Prev, size, r, g, b).0 as isize,
-                play: make_icon(Glyph::Play, size, r, g, b).0 as isize,
-                pause: make_icon(Glyph::Pause, size, r, g, b).0 as isize,
-                next: make_icon(Glyph::Next, size, r, g, b).0 as isize,
-            };
-
-            let buttons = [
-                thumb_button(BTN_PREV, icons.prev, "上一首"),
-                thumb_button(BTN_PLAY, icons.play, "播放 / 暂停"),
-                thumb_button(BTN_NEXT, icons.next, "下一首"),
-            ];
-
-            let taskbar: ITaskbarList3 =
-                CoCreateInstance(&TaskbarList, None, CLSCTX_INPROC_SERVER)
-                    .map_err(|e| format!("创建任务栏对象失败: {e}"))?;
-            // HrInit 定义在基接口上，windows-rs 不会自动继承，先 cast
-            let base: ITaskbarList = taskbar
-                .cast()
-                .map_err(|e| format!("获取 ITaskbarList 失败: {e}"))?;
-            base.HrInit()
-                .map_err(|e| format!("任务栏初始化失败: {e}"))?;
-            taskbar
-                .ThumbBarAddButtons(hwnd, &buttons)
-                .map_err(|e| format!("添加缩略图按钮失败: {e}"))?;
-
-            // 换窗口过程以接收按钮点击；失败也不回滚按钮（点了没反应而已）
-            let proc_ptr: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT = wnd_proc;
-            let old = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, proc_ptr as usize as isize);
-            if old == 0 {
-                log::warn!("[taskbar] 窗口过程替换失败，缩略图按钮点击不会生效");
+                std::thread::sleep(Duration::from_millis(100));
             }
-            OLD_PROC.store(old, Ordering::Release);
-
-            let _ = APP.set(app.clone());
-            if let Ok(mut guard) = STATE.lock() {
-                *guard = Some(Inner { hwnd: raw, icons });
+            if !visible {
+                log::warn!("[taskbar] 窗口 10s 内未显示，缩略图工具栏未挂载");
+                return;
             }
+            // 再留一小段缓冲：窗口标记可见与任务栏按钮注册之间可能差一拍
+            std::thread::sleep(Duration::from_millis(300));
+            let _ = app2.run_on_main_thread(move || unsafe { add_buttons(raw) });
+        });
+        if spawned.is_err() {
+            return Err(format!("等待线程创建失败: {:?}", spawned.err()));
+        }
+        Ok(())
+    }
 
-            log::info!(
-                "[taskbar] 任务栏缩略图工具栏已启用（上一首 / 播放暂停 / 下一首），图标 {size}px、{}主题",
-                if light { "浅色" } else { "深色" }
-            );
+    /// 在主线程上挂载缩略图工具栏（须等窗口可见后调用）
+    unsafe fn add_buttons(hwnd_raw: isize) {
+        let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+
+        // tao 通常已为主线程初始化过 COM，重复初始化返回 RPC_E_CHANGED_MODE 属正常
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+
+        // 缩略图预览底色跟随系统主题，图标颜色要反着来才看得见
+        let light = system_uses_light_theme();
+        let (r, g, b) = if light {
+            (0x1F, 0x1F, 0x1F)
+        } else {
+            (0xFF, 0xFF, 0xFF)
+        };
+        let dpi = {
+            let d = GetDpiForWindow(hwnd);
+            if d == 0 {
+                96
+            } else {
+                d
+            }
+        };
+        // 缩略图工具栏图标基准 16px，按 DPI 放大渲染，避免被系统拉伸糊掉
+        let size = ((16 * dpi as i32) / 96).max(16);
+
+        let icons = Icons {
+            prev: make_icon(Glyph::Prev, size, r, g, b).0 as isize,
+            play: make_icon(Glyph::Play, size, r, g, b).0 as isize,
+            pause: make_icon(Glyph::Pause, size, r, g, b).0 as isize,
+            next: make_icon(Glyph::Next, size, r, g, b).0 as isize,
+        };
+
+        // 初始播放/暂停图标按真实状态画（启动即恢复播放时 publish 已把 LAST_PLAYING 置真）
+        let playing = LAST_PLAYING.load(Ordering::Relaxed);
+        let buttons = [
+            thumb_button(BTN_PREV, icons.prev, "上一首"),
+            thumb_button(BTN_PLAY, play_icon(icons, playing), "播放 / 暂停"),
+            thumb_button(BTN_NEXT, icons.next, "下一首"),
+        ];
+
+        let Ok(taskbar) =
+            CoCreateInstance::<_, ITaskbarList3>(&TaskbarList, None, CLSCTX_INPROC_SERVER)
+        else {
+            log::warn!("[taskbar] 创建任务栏对象失败");
+            return;
+        };
+        // HrInit 定义在基接口上，windows-rs 不会自动继承，先 cast
+        let Ok(base) = taskbar.cast::<ITaskbarList>() else {
+            log::warn!("[taskbar] 获取 ITaskbarList 失败");
+            return;
+        };
+        if let Err(e) = base.HrInit() {
+            log::warn!("[taskbar] 任务栏初始化失败: {e}");
+            return;
+        }
+        if let Err(e) = taskbar.ThumbBarAddButtons(hwnd, &buttons) {
+            log::warn!("[taskbar] 添加缩略图按钮失败: {e}");
+            return;
         }
 
-        Ok(())
+        // 换窗口过程以接收按钮点击；失败也不回滚按钮（点了没反应而已）
+        let proc_ptr: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT = wnd_proc;
+        let old = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, proc_ptr as usize as isize);
+        if old == 0 {
+            log::warn!("[taskbar] 窗口过程替换失败，缩略图按钮点击不会生效");
+        }
+        OLD_PROC.store(old, Ordering::Release);
+
+        if let Ok(mut guard) = STATE.lock() {
+            *guard = Some(Inner { hwnd: hwnd_raw, icons });
+        }
+
+        log::info!(
+            "[taskbar] 任务栏缩略图工具栏已启用（上一首 / 播放暂停 / 下一首），图标 {size}px、{}主题",
+            if light { "浅色" } else { "深色" }
+        );
     }
 
     /// 播放状态同步：只在「播放 ↔ 暂停」翻转时更新按钮图标。
