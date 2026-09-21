@@ -194,14 +194,6 @@ const statsRoute = createRoute({
   component: () => null,
 });
 
-const messagesRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: "/messages",
-  // 一级页面由 AppShell 的 KeepAliveOutlet 常驻渲染（切 tab 不重载），
-  // 这里只保留路由用于匹配与导航，组件渲染 null。
-  component: () => null,
-});
-
 const feedbackRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/feedback",
@@ -267,7 +259,6 @@ const routeTree = rootRoute.addChildren([
   downloadsRoute,
   playingRoute,
   statsRoute,
-  messagesRoute,
   feedbackRoute,
   profileRoute,
   loginRoute,

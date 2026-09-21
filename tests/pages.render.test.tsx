@@ -36,10 +36,20 @@ async function renderAfterEffects(node: React.ReactElement): Promise<HTMLElement
 }
 
 describe("页面渲染冒烟", () => {
-  it("本地音乐页：渲染标题与目录引导", async () => {
+  it("本地音乐页：扫描设置默认收起，展开后显示目录引导", async () => {
     const { LibraryPage } = await import("@/components/library/LibraryPage");
+    const { fireEvent } = await import("@testing-library/react");
     const container = await renderAfterEffects(<LibraryPage />);
     expect(container.textContent).toContain("本地音乐");
+    // 扫描设置默认收起：右上只有「扫描设置 / 扫描」入口，目录引导藏起来
+    expect(container.textContent).toContain("扫描设置");
+    expect(container.textContent).not.toContain("还没有扫描目录");
+    // 点「扫描设置」展开 → 显示添加目录引导
+    const toggle = [...container.querySelectorAll("button")].find((b) =>
+      b.textContent?.includes("扫描设置"),
+    );
+    expect(toggle).toBeTruthy();
+    fireEvent.click(toggle!);
     expect(container.textContent).toContain("还没有扫描目录");
   });
 

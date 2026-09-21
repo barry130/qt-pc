@@ -159,8 +159,9 @@ export function PlaylistsPage(): React.JSX.Element {
 }
 
 /**
- * 分类筛选条：默认只露 1 行，右下角可展开查看全部。
- * 音源分类常有 50+ 个，全展开会占掉近三分之一屏幕，所以默认收起。
+ * 分类筛选条：一行分类 + 最右侧「更多」，点更多在下拉面板里展示全部分类。
+ * 音源分类常有 50+ 个，全展开会占掉近三分之一屏幕，所以行内只露一行，
+ * 剩余的收进面板（参考主流播放器歌单广场的交互）。
  *
  * 行高用**实测值**而不是写死像素：设置里的字体缩放（0.85–1.25）会等比放大
  * chip 高度，写死 px 会在缩放后裁掉半行或留出一条空白。
@@ -171,7 +172,8 @@ function CategoryFilter(props: {
   onPick: (cat: string | null) => void;
 }): React.JSX.Element {
   const { categories, category, onPick } = props;
-  const [expanded, setExpanded] = useState(false);
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
   const [rowHeight, setRowHeight] = useState(0);
   const [fullHeight, setFullHeight] = useState(0);
@@ -205,42 +207,76 @@ function CategoryFilter(props: {
     };
   }, [measure]);
 
-  // 只有一行时没必要给展开开关
+  // 点击面板外面收起（标准下拉行为）
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent): void => {
+      if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [open]);
+
+  // 只有一行时没有必要给「更多」
   const collapsible = rowHeight > 0 && fullHeight > rowHeight + 1;
 
-  return (
-    <div className="mt-2">
-      <div
-        ref={listRef}
-        className="flex flex-wrap gap-1.5 overflow-hidden"
-        style={expanded || !collapsible ? undefined : { maxHeight: rowHeight }}
-      >
+  const chips = (closeOnPick: boolean): React.JSX.Element => (
+    <>
+      <CategoryChip
+        active={category === null}
+        label="全部"
+        onClick={() => {
+          onPick(null);
+          if (closeOnPick) setOpen(false);
+        }}
+      />
+      {categories.map((c) => (
         <CategoryChip
-          active={category === null}
-          label="全部"
-          onClick={() => onPick(null)}
+          key={c.id}
+          active={category === c.id}
+          label={c.name}
+          onClick={() => {
+            onPick(c.id);
+            if (closeOnPick) setOpen(false);
+          }}
         />
-        {categories.map((c) => (
-          <CategoryChip
-            key={c.id}
-            active={category === c.id}
-            label={c.name}
-            onClick={() => onPick(c.id)}
-          />
-        ))}
-      </div>
-      {collapsible && (
-        <div className="mt-1.5 flex justify-end">
+      ))}
+    </>
+  );
+
+  return (
+    <div ref={rootRef} className="relative mt-2">
+      {/* 一行分类 + 最右「更多」：超出一行的部分被裁掉，点更多在下方面板看全部 */}
+      <div className="flex items-center gap-2">
+        <div
+          ref={listRef}
+          className="flex min-w-0 flex-1 flex-wrap gap-1.5 overflow-hidden"
+          style={collapsible ? { maxHeight: rowHeight } : undefined}
+        >
+          {chips(false)}
+        </div>
+        {collapsible && (
           <button
             type="button"
-            onClick={() => setExpanded((v) => !v)}
-            className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+            onClick={() => setOpen((v) => !v)}
+            aria-expanded={open}
+            aria-label={open ? "收起全部分类" : "展开全部分类"}
+            className="flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
           >
-            {expanded ? "收起" : "展开全部"}
+            更多
             <ChevronDown
-              className={`h-3.5 w-3.5 transition-transform ${expanded ? "rotate-180" : ""}`}
+              className={`h-3.5 w-3.5 transition-transform ${open ? "rotate-180" : ""}`}
             />
           </button>
+        )}
+      </div>
+
+      {/* 下拉面板：全部分类（含行里已露出的），点选即生效并收起 */}
+      {open && (
+        <div className="absolute left-0 right-0 top-full z-20 mt-1.5 max-h-80 overflow-y-auto rounded-xl border border-border bg-popover p-3 shadow-lg">
+          <div className="flex flex-wrap gap-1.5">{chips(true)}</div>
         </div>
       )}
     </div>

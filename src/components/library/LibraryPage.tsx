@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Trash2 } from "lucide-react";
+import { Trash2, ChevronDown } from "lucide-react";
 import { errMsg } from "@/lib/utils";
 import type { Track } from "@/types";
 import * as ipc from "@/services/ipc";
@@ -68,6 +68,8 @@ export function LibraryPage(): React.JSX.Element {
   const allRef = useRef<HTMLInputElement | null>(null);
   const [missing, setMissing] = useState<Track[]>([]);
   const [missingOpen, setMissingOpen] = useState(false);
+  /** 扫描设置面板默认收起：扫描按钮左侧的「扫描设置」下拉展开后才显示 */
+  const [scanOpen, setScanOpen] = useState(false);
 
   const load = useCallback(async (): Promise<void> => {
     setLoading(true);
@@ -309,16 +311,36 @@ export function LibraryPage(): React.JSX.Element {
               </span>
             )}
           </h1>
-          <button
-            type="button"
-            onClick={() => void runScan(dirs)}
-            disabled={scanning || dirs.length === 0}
-            className="h-8 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
-          >
-            {scanning ? "扫描中…" : "扫描"}
-          </button>
+          <div className="flex items-center gap-1.5">
+            {/* 扫描设置：下拉展开后显示添加目录 / 过滤规则 / 目录列表（默认收起） */}
+            <button
+              type="button"
+              onClick={() => setScanOpen((v) => !v)}
+              aria-expanded={scanOpen}
+              className="flex items-center gap-1 rounded-md px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+            >
+              扫描设置
+              <ChevronDown
+                className={`h-3.5 w-3.5 transition-transform ${scanOpen ? "rotate-180" : ""}`}
+              />
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                // 收起状态下点扫描自动展开，进度提示才看得见
+                setScanOpen(true);
+                void runScan(dirs);
+              }}
+              disabled={scanning || dirs.length === 0}
+              className="h-8 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
+            >
+              {scanning ? "扫描中…" : "扫描"}
+            </button>
+          </div>
         </div>
 
+        {scanOpen && (
+        <>
         <div className="mt-2">
           <AddDirButtons onPick={(p) => void addAndScan(p)} disabled={scanning} />
         </div>
@@ -428,6 +450,8 @@ export function LibraryPage(): React.JSX.Element {
           <p className="mt-2 text-xs text-muted-foreground">
             还没有扫描目录，添加一个后即可扫描本地歌曲
           </p>
+        )}
+        </>
         )}
 
         {/* 搜索 / 视图 / 排序 / 批量选择 */}

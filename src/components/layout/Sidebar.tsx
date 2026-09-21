@@ -8,22 +8,19 @@ import {
   Download,
   Heart,
   ListMusic,
-  MessageSquare,
   Mic2,
   Music,
   Radio,
-  Settings,
-  UserRound,
 } from "lucide-react";
 import { useMusicSourceStore } from "@/stores/musicSource";
-import { displayName, useAuthStore } from "@/stores/auth";
 import { SOURCE_DISPLAY } from "@/types";
 import { cn } from "@/lib/utils";
 import { migrateLegacyStorageKey } from "@/lib/legacy-storage";
 
 /**
- * 侧边栏（DESIGN §5.4）：四分组导航，可折叠为 64px 图标条（持久化）。
+ * 侧边栏（DESIGN §5.4）：两组导航，可折叠为 64px 图标条（持久化）。
  * 音源是全局状态，这里只展示当前音源名，不提供切换入口。
+ * 消息中心 / 设置 / 账号已上移到标题栏（DESIGN §5.3），不再放这里。
  */
 
 type Item = {
@@ -49,12 +46,6 @@ const MINE_ITEMS: Item[] = [
   { label: "听歌报告", to: "/stats", icon: BarChart3 },
 ];
 
-const BOTTOM_ITEMS: Item[] = [
-  { label: "消息中心", to: "/messages", icon: MessageSquare },
-  { label: "设置", to: "/settings/$section", icon: Settings, params: { section: "appearance" } },
-  { label: "账号", to: "/login", icon: UserRound },
-];
-
 /** 更名前的前缀是 lightlisten.*（见 lib/legacy-storage） */
 const COLLAPSE_KEY = "quietmusic.sidebar-collapsed";
 migrateLegacyStorageKey(COLLAPSE_KEY);
@@ -78,8 +69,6 @@ function writeCollapsed(collapsed: boolean): void {
 export function Sidebar(): React.JSX.Element {
   const [collapsed, setCollapsed] = useState(readCollapsed);
   const activeSourceId = useMusicSourceStore((s) => s.activeSourceId);
-  const session = useAuthStore((s) => s.session);
-  const profile = useAuthStore((s) => s.profile);
   const sourceName =
     activeSourceId === "local" ? "本地" : SOURCE_DISPLAY[activeSourceId];
 
@@ -110,25 +99,11 @@ export function Sidebar(): React.JSX.Element {
       </div>
 
       <div className="shrink-0 border-t border-border px-2 py-2">
-        {BOTTOM_ITEMS.map((item) => {
-          // 账号项随登录态变：未登录进登录页，已登录显示昵称并进个人中心
-          const resolved =
-            item.to === "/login"
-              ? {
-                  ...item,
-                  to: session ? "/profile" : "/login",
-                  label: session ? displayName(profile, "账号") : "登录",
-                }
-              : item;
-          return (
-            <NavLink key={resolved.to} item={resolved} collapsed={collapsed} />
-          );
-        })}
         <button
           type="button"
           onClick={() => setCollapsed((c) => !c)}
           aria-label={collapsed ? "展开侧边栏" : "折叠侧边栏"}
-          className="mt-1 flex w-full items-center gap-3 rounded-md px-2 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+          className="flex w-full items-center gap-3 rounded-md px-2 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
         >
           {collapsed ? (
             <ChevronsRight className="h-4 w-4 shrink-0" />

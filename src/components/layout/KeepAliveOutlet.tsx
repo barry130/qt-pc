@@ -22,7 +22,6 @@ import { LibraryFoldersPage } from "@/components/library/LibraryFoldersPage";
 import { DownloadsPage } from "@/components/mine/DownloadsPage";
 import { HistoryPage } from "@/components/mine/HistoryPage";
 import { StatsPage } from "@/components/mine/StatsPage";
-import { MessagesPage } from "@/components/mine/MessagesPage";
 import { MyPlaylistsPage } from "@/components/mine/MyPlaylistsPage";
 
 /** 一级页面清单：pathname → 页面元素工厂（新增一级页时在此登记） */
@@ -38,7 +37,6 @@ export const KEEP_ALIVE_PAGES: Record<string, () => React.JSX.Element> = {
   "/downloads": () => <DownloadsPage />,
   "/history": () => <HistoryPage />,
   "/stats": () => <StatsPage />,
-  "/messages": () => <MessagesPage />,
   "/my/playlists": () => <MyPlaylistsPage />,
 };
 

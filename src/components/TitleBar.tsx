@@ -1,15 +1,25 @@
 import { useEffect, useState } from "react";
-import { Minus, Square, X, Copy } from "lucide-react";
-import { useNavigate } from "@tanstack/react-router";
+import {
+  ArrowLeft,
+  Copy,
+  Minus,
+  Settings,
+  Square,
+  UserRound,
+  X,
+} from "lucide-react";
+import { Link, useRouter, useNavigate } from "@tanstack/react-router";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useTitleBarDrag } from "@/hooks/useFramelessWindow";
 import { MusicSourceSwitcher } from "@/components/music-source/MusicSourceSwitcher";
+import { MessagesPopover } from "@/components/mine/MessagesPopover";
+import { displayName, useAuthStore } from "@/stores/auth";
 import { cn } from "@/lib/utils";
 
 /**
  * 自定义标题栏（DESIGN §5.3）：
  * - 拖动区（按下即 startDragging）+ 双击最大化
- * - Logo / 全局搜索框 / 音源切换器 / 窗口控制
+ * - 返回 / Logo / 全局搜索框 / 音源切换器 / 消息中心·设置·账号 / 窗口控制
  * - 按钮区 stopPropagation 防止误触发拖动
  */
 export function TitleBar(): React.JSX.Element {
@@ -17,6 +27,9 @@ export function TitleBar(): React.JSX.Element {
   const [maximized, setMaximized] = useState(false);
   const [keyword, setKeyword] = useState("");
   const navigate = useNavigate();
+  const router = useRouter();
+  const session = useAuthStore((s) => s.session);
+  const profile = useAuthStore((s) => s.profile);
   const win = getCurrentWindow();
 
   useEffect(() => {
@@ -55,8 +68,20 @@ export function TitleBar(): React.JSX.Element {
         <span className="text-sm font-semibold">轻听</span>
       </div>
 
-      {/* 中：全局搜索框 + 音源切换器 */}
-      <div className="flex h-full min-w-0 flex-1 items-center justify-center gap-3 px-6">
+      {/* 中：返回 + 全局搜索框 + 音源切换器 */}
+      <div className="flex h-full min-w-0 flex-1 items-center justify-center gap-2 px-6">
+        {/* 返回：路由用的是 memory history，必须走 router.history（window.history 无效） */}
+        <button
+          type="button"
+          onClick={() => router.history.back()}
+          aria-label="返回上一步"
+          title="返回"
+          onMouseDown={(e) => e.stopPropagation()}
+          onDoubleClick={(e) => e.stopPropagation()}
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-foreground/80 transition-colors hover:bg-secondary hover:text-foreground"
+        >
+          <ArrowLeft className="h-4 w-4" />
+        </button>
         <input
           value={keyword}
           onChange={(e) => setKeyword(e.target.value)}
@@ -69,8 +94,30 @@ export function TitleBar(): React.JSX.Element {
         <MusicSourceSwitcher />
       </div>
 
-      {/* 右：窗口控制 */}
+      {/* 右：消息中心 / 设置 / 账号 + 窗口控制 */}
       <div className="flex h-full items-stretch">
+        <MessagesPopover />
+        <Link
+          to="/settings/$section"
+          params={{ section: "appearance" }}
+          title="设置"
+          aria-label="设置"
+          onMouseDown={(e) => e.stopPropagation()}
+          onDoubleClick={(e) => e.stopPropagation()}
+          className="flex w-11 items-center justify-center text-foreground/80 transition-colors hover:bg-secondary hover:text-foreground"
+        >
+          <Settings className="h-4 w-4" />
+        </Link>
+        <Link
+          to={session ? "/profile" : "/login"}
+          title={session ? displayName(profile, "账号") : "登录"}
+          aria-label={session ? "个人中心" : "登录"}
+          onMouseDown={(e) => e.stopPropagation()}
+          onDoubleClick={(e) => e.stopPropagation()}
+          className="flex w-11 items-center justify-center text-foreground/80 transition-colors hover:bg-secondary hover:text-foreground"
+        >
+          <UserRound className="h-4 w-4" />
+        </Link>
         <WindowButton onClick={() => void win.minimize()} label="最小化">
           <Minus className="h-4 w-4" />
         </WindowButton>
