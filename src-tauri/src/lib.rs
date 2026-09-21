@@ -17,6 +17,7 @@ pub mod smtc;
 pub mod source_bundle;
 pub mod source_install;
 pub mod source_window;
+pub mod taskbar;
 pub mod tray;
 
 use std::path::PathBuf;
@@ -149,6 +150,12 @@ pub fn run() {
                     }
                     None => log::warn!("[smtc] 取不到主窗口句柄，系统媒体控制未启用"),
                 }
+            }
+
+            // 任务栏缩略图工具栏：悬停任务栏图标时在预览下方给「上一首 / 播放暂停 / 下一首」。
+            // 与 SMTC 一样属于旁路能力，失败只记日志，不影响播放。
+            if let Err(e) = taskbar::init(&handle) {
+                log::warn!("[taskbar] 任务栏缩略图工具栏未启用: {e}");
             }
 
             // 托盘 + 全局快捷键（§14.1 / §14.2；自定义快捷键从 settings 表读）

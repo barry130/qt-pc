@@ -2984,6 +2984,7 @@ dependencies = [
  "tauri-plugin-global-shortcut",
  "thiserror 2.0.20",
  "tokio",
+ "windows 0.61.3",
 ]
 
 [[package]]

@@ -227,6 +227,8 @@ impl EngineInner {
         let _ = self.app.emit("playback-state-changed", &snap);
         // 顺带把当前曲目 / 播放状态投到系统媒体面板（Windows SMTC）
         crate::smtc::sync(&self.smtc, &snap);
+        // 任务栏缩略图工具栏的播放/暂停按钮图标跟着翻转
+        crate::taskbar::sync(snap.status == PlaybackStatus::Playing);
     }
 
     fn mutate(&self, f: impl FnOnce(&mut PlaybackStateSnapshot)) {
