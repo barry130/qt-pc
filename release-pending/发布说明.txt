@@ -1,4 +1,4 @@
-音源包发布物（2026092201 · 2026-09-22：新增歌手列表入口 + 执行层四处修复）
+音源包发布物（2026092202 · 2026-09-22：新增歌手列表入口 + 执行层四处修复）
 ====================================================
 chain.json          5 251 B      chainRevision 7（一个字节都没动，哈希与上一版相同）
 source-bundle.js    1 778 893 B  重新构建：新增 artistList 入口（26 个入口）+ 四处执行层修复
@@ -10,9 +10,14 @@ source-release.zip  609 632 B    两个文件的压缩包（已解包校验，�
   source-release.zip C5380B09984243CCBAB0D78B5F3FC9D1AA647BB46E948609CB9FCB51AAFC0809
   （上一版对照：bundle 7A7100786810F7F2…；内置旧版 072B2C7823131581…）
 
-内置包（src-tauri/builtin-sources/）已跑 `npm run sync:builtin` 同步为 **2026092201**
-（version.json = 2026092201 / 2026.09.22.1），bundle 与 chain.json 与本目录逐字节相同。
-客户端内置号 2026092101 < 2026092201 → 装上新基座即用这份包；线上按 2026092201 发布即同号同物。
+**版本号必须用 2026092202，不是 2026092201**：2026092201 已被线上占用（14:24 有客户端
+装过，bundle 是**不含 artistList** 的在飞版）。同号换内容会被盘上旧副本盖住（引擎按
+「谁新用谁」选包，但同号时盘上优先）——这就是内置包镜像「最新发布号」的规则要防的事。
+
+内置包（src-tauri/builtin-sources/）已跑 `npm run sync:builtin` 同步为 **2026092202**
+（version.json = 2026092202 / 2026.09.22.2），bundle 与 chain.json 与本目录逐字节相同。
+已装远程包 2026092201 < 内置 2026092202 → 引擎会优先用内置新包（含 artistList）；
+后端发布 2026092202 后客户端会自动下载。回滚语义不变。
 
 一、新增 artistList 入口（歌手列表 + 首字母索引）
 ----------------------------------------------------
@@ -139,12 +144,14 @@ lastMissTrace 时内层还没写回（你日志里三条不同歌曲的 trace �
   · 墨澜两条线路（qq/kg）保持 platforms:[1103]：它 init 在 QuickJS 上 6.3s，
     安卓任何合理预算都装不下。
 
-八、版本号（已按 2026092201 收口）
+八、版本号（已按 2026092202 收口）
 ----------------------------------------------------
-· 本产物按 **2026092201** 发布：source-update.ts 的 BUILTIN_SOURCE_VERSION 已同步为
-  2026092201 / 2026.09.22.1，内置包也跑过 `npm run sync:builtin` → 发布同号即同号同物。
-· 客户端内置号 2026092101 < 2026092201，装上新基座就会用这份包；只换链没换包的老客户端
-  也会因为内置号更小而去取线上这份。
+· 本产物按 **2026092202** 发布：source-update.ts 的 BUILTIN_SOURCE_VERSION 已同步为
+  2026092202 / 2026.09.22.2，内置包也跑过 `npm run sync:builtin` → 发布同号即同号同物。
+· **为什么不是 2026092201**：2201 已被线上占用（14:24 有客户端装过，bundle 不含
+  artistList）。同号换内容时设备上已解包的旧副本会一直盖住新实现（engine 页按
+  「谁新用谁」选包，同号时盘上优先）——正是同号同物规则要防的事。
+· 已装远程包 2026092201 < 内置 2026092202 → 新基座直接走内置新包；后端发布 2202 后下载覆盖。
 · **遗留账（下次构建前必须处理）**：src/source-scripts/chain-config.ts 里的默认链仍是
   chainRevision 2（maxLinesPerQuality 5 / totalMs 12000），比线上 chain.json 的 rev 7
   （3 / 5000 + 线路重排 + 平台白名单）旧。本次按「chain.json 一字节不动」处理，
@@ -155,9 +162,10 @@ lastMissTrace 时内层还没写回（你日志里三条不同歌曲的 trace �
 九、管理端四步（astral-front → 仪表盘 → qt → 音源包）
 ----------------------------------------------------
 ① 新建 release（platforms 勾 1101+1103，channel stable，准入 appVersionCodes 留空，
-   notes 如「音源包 2026092201：新增歌手列表/首字母索引入口 + 执行层预算/预检/trace 四处修复」）
-   → 版本号填 **2026092201**（与内置包同号同物；若已被占用则顺延一位并同步改
-   source-update.ts 的 BUILTIN_SOURCE_VERSION 后重跑 sync:builtin + 重打基座）
+   notes 如「音源包 2026092202：新增歌手列表/首字母索引入口 + 执行层预算/预检/trace 四处修复」）
+   → 版本号填 **2026092202**（与内置包同号同物；2201 已被占用，不要复用。
+   若 2202 也被占用则顺延一位并同步改 source-update.ts 的 BUILTIN_SOURCE_VERSION
+   后重跑 sync:builtin + 重打基座）
 ② 上传本目录的 chain.json / source-bundle.js（或直接传 source-release.zip），拿直链 URL
 ③ 回填 artifacts（path=chain.json / source-bundle.js，version 留空）
 ④ 点「发布」
