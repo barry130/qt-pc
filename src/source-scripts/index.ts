@@ -259,19 +259,30 @@ export async function getAlbumDetail(
   return toAppPlaylist(detail);
 }
 
+/**
+ * 歌手歌曲（分页，每页由调用方给 size）。
+ *
+ * 音源侧没有「按歌手 id 取歌」的免费接口，包里是**按歌手名搜索**；
+ * 第一页顺带返回歌手头像 picUrl（包内只查第一页）。
+ * 调用方必须翻页 —— 只取第一页会永远只有一页的量（曾写死 50 首）。
+ */
 export async function getArtistSongs(
   source: SourceId,
   name: string,
   page: number,
   size: number,
-): Promise<Track[]> {
+): Promise<{ songs: Track[]; picUrl: string }> {
   ensureScript(source);
-  const songs = await sourceCall<MusicInfo[]>(
+  const payload = await sourceCall<{ songs?: MusicInfo[]; picUrl?: string }>(
     "artistSongs",
     { source, name, page, size },
-    (p) => p.songs as MusicInfo[] | undefined,
+    (p) => p as { songs?: MusicInfo[]; picUrl?: string },
   );
-  return songs.map((m) => toAppTrack(m, source));
+  const songs = Array.isArray(payload.songs) ? payload.songs : [];
+  return {
+    songs: songs.map((m) => toAppTrack(m, source)),
+    picUrl: typeof payload.picUrl === "string" ? payload.picUrl : "",
+  };
 }
 
 // ---------- 取链（脚本预解析 + 回填引擎缓存） ----------
@@ -335,12 +346,13 @@ export async function getPlaylistCategories(
   return list.map((item) => ({ id: item.id, name: item.name, group: item.group }));
 }
 
-/** 蓝本歌单详情一次取全量曲目（trackIds 批量），分页参数由 UI 侧消化 */
+/**
+ * 歌单详情。**一次取全量曲目**（蓝本按 trackIds 批量取），包内不暴露分页，
+ * 因此没有 page/size 参数：UI 侧不需要翻页，也不该以为有 100 首上限。
+ */
 export async function getPlaylistDetail(
   source: SourceId,
   id: string,
-  _page: number,
-  _size: number,
 ): Promise<Playlist> {
   ensureScript(source);
   const detail = await sourceCall<Parameters<typeof toAppPlaylist>[0]>(
@@ -386,12 +398,11 @@ export async function getAllCharts(): Promise<Chart[]> {
   return list.map(toAppChart);
 }
 
-/** 蓝本榜单详情一次取全量（最多 200 条），分页参数由 UI 侧消化 */
-export async function getChartDetail(
-  chart: Chart,
-  _page: number,
-  _size: number,
-): Promise<Track[]> {
+/**
+ * 榜单详情。**一次取全量**（包内最多 200 条），没有 page/size 参数：
+ * 榜单本身有上限，UI 侧不需要翻页。
+ */
+export async function getChartDetail(chart: Chart): Promise<Track[]> {
   ensureScript(chart.platform);
   const list = await sourceCall<MusicInfo[]>(
     "chartDetail",

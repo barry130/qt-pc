@@ -1,20 +1,26 @@
-import { useEffect, useState } from "react";
-import { errMsg } from "@/lib/utils";
+import { useCallback, useState } from "react";
 import { useParams } from "@tanstack/react-router";
 import { Play } from "lucide-react";
 import type { SourceId, Track } from "@/types";
 import * as sourceApi from "@/source-scripts";
 import { usePlayerStore } from "@/stores/player";
+import { usePagedList } from "@/hooks/usePagedList";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { TrackList } from "./TrackList";
 import { ErrorRetry, TrackRowsSkeleton } from "./Skeletons";
 import { BackButton } from "@/components/layout/BackButton";
 
+/** 每页条数（蓝图歌手页为 30；这里 50，少翻几次页） */
+const PAGE_SIZE = 50;
+
 /**
  * 歌手页（路由 /artist/$platform/$id）。
  *
  * 音源侧没有「按歌手 id 取歌曲」的免费接口，所以这里用**歌手名搜索**来闭环：
- * URL 的 `$id` 位置放的是歌手名（encodeURIComponent 过），封面取列表首曲的封面近似。
+ * URL 的 `$id` 位置放的是歌手名（encodeURIComponent 过），头像取包内 artistSongs
+ * 第一页顺带返回的 picUrl，拿不到再退到首曲封面。
+ *
+ * **必须翻页**：接口一次只给一页，早先写死 page=1 + size=50，导致任何歌手都只有 50 首。
  */
 export function ArtistPage(): React.JSX.Element {
   const { platform, id } = useParams({ strict: false }) as {
@@ -23,34 +29,33 @@ export function ArtistPage(): React.JSX.Element {
   };
   const name = safeDecode(id);
   const playQueue = usePlayerStore((s) => s.playQueue);
+  const [avatar, setAvatar] = useState("");
 
-  const [songs, setSongs] = useState<Track[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [reload, setReload] = useState(0);
+  const fetchPage = useCallback(
+    async (page: number): Promise<Track[]> => {
+      const res = await sourceApi.getArtistSongs(platform, name, page, PAGE_SIZE);
+      // 头像只有第一页带（包内行为），顺路存下来
+      if (page <= 1) setAvatar(res.picUrl);
+      return res.songs;
+    },
+    [platform, name],
+  );
 
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
-    void (async () => {
-      try {
-        const list = await sourceApi.searchMusic(name, platform, 1, 50);
-        if (!cancelled) setSongs(Array.isArray(list) ? list : []);
-      } catch (err) {
-        if (!cancelled) {
-          setError(errMsg(err));
-        }
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [name, platform, reload]);
+  const {
+    items: songs,
+    loading,
+    loadingMore,
+    error,
+    hasMore,
+    sentinelRef,
+    reload,
+  } = usePagedList<Track>({
+    fetchPage,
+    keyOf: (t) => `${t.platform}:${t.id}`,
+    resetKey: `${platform}:${name}`,
+  });
 
-  const cover = songs.find((t) => t.picUrl)?.picUrl;
+  const cover = avatar || songs.find((t) => t.picUrl)?.picUrl || "";
   const coverUrl = cover ? qtresCoverUrl(cover) : null;
 
   return (
@@ -94,7 +99,9 @@ export function ArtistPage(): React.JSX.Element {
             </p>
             <h1 className="mt-0.5 truncate text-2xl font-bold tracking-tight">{name}</h1>
             <p className="mt-1 text-xs text-muted-foreground">
-              {songs.length} 首歌曲
+              {loading
+                ? "加载中…"
+                : `${songs.length} 首歌曲${hasMore ? "（继续下拉加载更多）" : ""}`}
             </p>
           </div>
           {songs.length > 0 && (
@@ -112,10 +119,7 @@ export function ArtistPage(): React.JSX.Element {
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         {error ? (
-          <ErrorRetry
-            message={`加载失败：${error}`}
-            onRetry={() => setReload((r) => r + 1)}
-          />
+          <ErrorRetry message={`加载失败：${error}`} onRetry={reload} />
         ) : loading ? (
           <TrackRowsSkeleton rows={8} />
         ) : songs.length === 0 ? (
@@ -123,7 +127,14 @@ export function ArtistPage(): React.JSX.Element {
             没有找到该歌手的歌曲
           </div>
         ) : (
-          <TrackList tracks={songs} showIndex showAddToPlaylist showDownload />
+          <>
+            <TrackList tracks={songs} showIndex showAddToPlaylist showDownload />
+            {/* 哨兵：进入视口就拉下一页 */}
+            <div ref={sentinelRef} className="h-1" />
+            <div className="py-4 text-center text-xs text-muted-foreground">
+              {loadingMore ? "加载中…" : hasMore ? "继续下拉加载更多" : "已经到底了"}
+            </div>
+          </>
         )}
       </div>
     </div>

@@ -1,14 +1,17 @@
-import { useEffect, useState } from "react";
-import { errMsg } from "@/lib/utils";
+import { useCallback, useRef } from "react";
 import { useParams } from "@tanstack/react-router";
 import { Play } from "lucide-react";
 import type { SourceId, Track } from "@/types";
 import * as sourceApi from "@/source-scripts";
 import { usePlayerStore } from "@/stores/player";
+import { usePagedList } from "@/hooks/usePagedList";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { TrackList } from "./TrackList";
 import { ErrorRetry, TrackRowsSkeleton } from "./Skeletons";
 import { BackButton } from "@/components/layout/BackButton";
+
+/** 每页条数 */
+const PAGE_SIZE = 50;
 
 /**
  * 专辑页（路由 /album/$platform/$id）。
@@ -16,6 +19,8 @@ import { BackButton } from "@/components/layout/BackButton";
  * 与歌手页同理：音源没有「按专辑 id 取歌曲」的免费接口，改用**专辑名搜索**，
  * 再把结果里 album 字段同名的挑出来。若一条都匹配不上（各源专辑名写法有差异），
  * 就退回展示搜索结果，不至于整页空白。
+ *
+ * **必须翻页**：接口一次只给一页，早先写死 page=1 + size=50，专辑永远只有 50 首。
  */
 export function AlbumPage(): React.JSX.Element {
   const { platform, id } = useParams({ strict: false }) as {
@@ -25,35 +30,37 @@ export function AlbumPage(): React.JSX.Element {
   const name = safeDecode(id);
   const playQueue = usePlayerStore((s) => s.playQueue);
 
-  const [songs, setSongs] = useState<Track[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [reload, setReload] = useState(0);
+  // 是否按专辑名过滤在**第一页**定一次，后续页沿用同一判断：
+  // 否则会出现「第 1 页全是搜索结果、第 2 页只剩匹配项」的前后不一致。
+  const useFilterRef = useRef<boolean | null>(null);
 
-  useEffect(() => {
-    let cancelled = false;
-    setLoading(true);
-    setError(null);
-    void (async () => {
-      try {
-        const list = await sourceApi.searchMusic(name, platform, 1, 50);
-        const all = Array.isArray(list) ? list : [];
-        // 各源专辑名写法有差异（空格/大小写/后缀），严格相等经常一条都匹配不上，
-        // 归一化后再比较；仍然匹配不上就退回展示搜索结果，不至于整页空白。
-        const matched = all.filter((t) => sameAlbum(t.album, name));
-        if (!cancelled) setSongs(matched.length > 0 ? matched : all);
-      } catch (err) {
-        if (!cancelled) {
-          setError(errMsg(err));
-        }
-      } finally {
-        if (!cancelled) setLoading(false);
+  const fetchPage = useCallback(
+    async (page: number): Promise<Track[]> => {
+      const list = await sourceApi.searchMusic(name, platform, page, PAGE_SIZE);
+      const arr = Array.isArray(list) ? list : [];
+      if (page <= 1) {
+        useFilterRef.current = arr.some((t) => sameAlbum(t.album, name));
       }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [name, platform, reload]);
+      return useFilterRef.current === true
+        ? arr.filter((t) => sameAlbum(t.album, name))
+        : arr;
+    },
+    [name, platform],
+  );
+
+  const {
+    items: songs,
+    loading,
+    loadingMore,
+    error,
+    hasMore,
+    sentinelRef,
+    reload,
+  } = usePagedList<Track>({
+    fetchPage,
+    keyOf: (t) => `${t.platform}:${t.id}`,
+    resetKey: `${platform}:${name}`,
+  });
 
   const cover = songs.find((t) => t.picUrl)?.picUrl;
   const coverUrl = cover ? qtresCoverUrl(cover) : null;
@@ -99,7 +106,9 @@ export function AlbumPage(): React.JSX.Element {
             </p>
             <h1 className="mt-1 truncate text-2xl font-bold tracking-tight">{name}</h1>
             <p className="mt-1 text-xs text-muted-foreground">
-              {songs.length} 首歌曲
+              {loading
+                ? "加载中…"
+                : `${songs.length} 首歌曲${hasMore ? "（继续下拉加载更多）" : ""}`}
             </p>
             {songs.length > 0 && (
               <div className="mt-3">
@@ -119,10 +128,7 @@ export function AlbumPage(): React.JSX.Element {
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         {error ? (
-          <ErrorRetry
-            message={`加载失败：${error}`}
-            onRetry={() => setReload((r) => r + 1)}
-          />
+          <ErrorRetry message={`加载失败：${error}`} onRetry={reload} />
         ) : loading ? (
           <TrackRowsSkeleton rows={8} />
         ) : songs.length === 0 ? (
@@ -130,7 +136,14 @@ export function AlbumPage(): React.JSX.Element {
             没有找到该专辑的歌曲
           </div>
         ) : (
-          <TrackList tracks={songs} showIndex showAddToPlaylist showDownload />
+          <>
+            <TrackList tracks={songs} showIndex showAddToPlaylist showDownload />
+            {/* 哨兵：进入视口就拉下一页 */}
+            <div ref={sentinelRef} className="h-1" />
+            <div className="py-4 text-center text-xs text-muted-foreground">
+              {loadingMore ? "加载中…" : hasMore ? "继续下拉加载更多" : "已经到底了"}
+            </div>
+          </>
         )}
       </div>
     </div>

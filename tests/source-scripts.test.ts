@@ -850,7 +850,7 @@ describe("source-scripts dispatcher（纯音源包：app 只经引擎调用）",
     await expect(mod.getRecommendations("local", null, 1)).rejects.toThrow(
       "local 源不支持该动作",
     );
-    await expect(mod.getPlaylistDetail("local", "1", 1, 30)).rejects.toThrow(
+    await expect(mod.getPlaylistDetail("local", "1")).rejects.toThrow(
       "local 源不支持该动作",
     );
   });

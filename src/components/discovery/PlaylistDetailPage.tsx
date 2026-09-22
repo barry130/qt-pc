@@ -31,7 +31,7 @@ export function PlaylistDetailPage(props: {
     setError(null);
     void (async () => {
       try {
-        const pl = await sourceApi.getPlaylistDetail(platform as SourceId, id, 1, 100);
+        const pl = await sourceApi.getPlaylistDetail(platform as SourceId, id);
         if (!cancelled) setPlaylist(pl);
       } catch (err) {
         if (!cancelled) setError(errMsg(err));

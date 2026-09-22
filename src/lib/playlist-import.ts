@@ -32,7 +32,7 @@ export async function importPlaylist(
     throw new Error("无法识别歌单链接或 ID，请检查输入或手动选择平台");
   }
   // 先取详情：既校验歌单存在，也拿到收藏要用的名称/封面/播放量
-  const playlist = await sourceApi.getPlaylistDetail(parsed.platform, parsed.id, 1, 100);
+  const playlist = await sourceApi.getPlaylistDetail(parsed.platform, parsed.id);
   if (!playlist || !playlist.name) {
     throw new Error("该歌单不存在或暂时无法访问");
   }

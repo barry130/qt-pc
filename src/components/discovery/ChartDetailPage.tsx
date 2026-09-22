@@ -45,7 +45,7 @@ export function ChartDetailPage(props: {
         // 榜单列表失败不阻断详情：退化为最小 Chart 对象
       }
       try {
-        const list = await sourceApi.getChartDetail(chart, 1, 100);
+        const list = await sourceApi.getChartDetail(chart);
         if (cancelled) return;
         setTracks(Array.isArray(list) ? list : []);
         setTitle(chart.name || "榜单详情");
