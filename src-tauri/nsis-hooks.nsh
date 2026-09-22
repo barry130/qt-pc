@@ -15,6 +15,9 @@
 ;      所以必须在这里显式重建，不能指望模板。
 ;   2) 全新安装时结束页的 CreateOrUpdateDesktopShortcut 在本钩子之后才执行，会再建一个
 ;      英文名快捷方式。故这里置 $NoShortcutMode=1 让它提前 return（中文名已由本钩子建好）。
+;   3) 开始菜单快捷方式的位置取决于 $AppStartMenuFolder：为空时模板建在 $SMPROGRAMS
+;      顶层，非空时建在子目录（模板自己 CreateDirectory）。本钩子必须跟随同一层级，
+;      否则 CreateShortcut 因目录不存在而静默失败，开始菜单只剩英文条目。
 ;
 ; 编码：本文件必须保存为 UTF-8 带 BOM，否则 makensis 读不到中文。
 
@@ -37,18 +40,30 @@
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
-  ; ---- 快捷方式改为中文「轻听」 ----
-  !insertmacro QuietMusic_MakeShortcut "$DESKTOP"
+  ; /NS（不建快捷方式）时与模板保持一致：只改显示名，不碰快捷方式
+  ${If} $NoShortcutMode <> 1
+    ; ---- 快捷方式改为中文「轻听」 ----
+    !insertmacro QuietMusic_MakeShortcut "$DESKTOP"
 
-  ; 开始菜单：$AppStartMenuFolder 由 MUI_STARTMENU_GETFOLDER 从注册表恢复
-  !insertmacro MUI_STARTMENU_GETFOLDER Application $AppStartMenuFolder
-  ${If} $AppStartMenuFolder == ""
-    StrCpy $AppStartMenuFolder "${PRODUCTNAME}"
+    ; 开始菜单：模板已在前面（CreateOrUpdateStartMenuShortcut）建好英文名快捷方式，
+    ; 层级取决于模板当时看到的 $AppStartMenuFolder——静默 / 更新安装下该变量为空，
+    ; 模板就把快捷方式建在 $SMPROGRAMS 顶层，且不建目录。
+    ;
+    ; 不能用 MUI_STARTMENU_GETFOLDER 的返回值判断层级：注册表为空时它会回落到
+    ; DEFAULTFOLDER（QuietMusic），于是被误判成「子目录」分支，CreateShortcut 因
+    ; 目录不存在而静默失败，开始菜单只剩英文条目（1.0.6 更新安装实测）。故按文件
+    ; 实际位置判断，保证中文名与模板落在同一层级。
+    !insertmacro MUI_STARTMENU_GETFOLDER Application $AppStartMenuFolder
+    ${If} $AppStartMenuFolder != ""
+    ${AndIf} ${FileExists} "$SMPROGRAMS\$AppStartMenuFolder\${PRODUCTNAME}.lnk"
+      !insertmacro QuietMusic_MakeShortcut "$SMPROGRAMS\$AppStartMenuFolder"
+    ${Else}
+      !insertmacro QuietMusic_MakeShortcut "$SMPROGRAMS"
+    ${EndIf}
+
+    ; 抑制结束页再建英文名桌面快捷方式（中文名已建好，避免桌面上出现两个图标）
+    StrCpy $NoShortcutMode 1
   ${EndIf}
-  !insertmacro QuietMusic_MakeShortcut "$SMPROGRAMS\$AppStartMenuFolder"
-
-  ; 抑制结束页再建英文名桌面快捷方式（中文名已建好，避免桌面上出现两个图标）
-  StrCpy $NoShortcutMode 1
 
   ; ---- 控制面板「程序和功能」显示名改为「轻听」 ----
   ; 注册表键名仍是 QuietMusic（UNINSTKEY 不可变），只覆盖对用户可见的 DisplayName
