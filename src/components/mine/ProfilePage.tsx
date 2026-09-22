@@ -15,9 +15,9 @@ import * as ipc from "@/services/ipc";
 /**
  * 个人中心（路由 /profile，DESIGN §5.3）。
  *
- * 视觉走「玻璃拟态 + 品牌渐变」：资料卡是半透明玻璃面，背后垫一层品牌渐变光晕，
- * 头像用渐变描边，下面是三格本地统计与常用入口卡片。
- * 颜色全部来自语义令牌（--brand-from/--brand-to 跟着运行时皮肤走），组件里不写死 hex。
+ * 表面语言跟全站一致：正文用实底卡片 + 极淡品牌色渐变（同首页 hero 卡），
+ * 玻璃态只留给标题栏 / 播放条 / 弹层这类「浮在内容之上」的层。
+ * 资料卡下面是三格本地统计与常用入口卡片网格，颜色全部走语义令牌。
  *
  * 未登录时同一张卡给登录入口；已登录显示账号与退出。
  * 登录依赖 Astral 后端，未启动也不影响统计与下面的本地功能入口。
@@ -81,92 +81,66 @@ export function ProfilePage(): React.JSX.Element {
   return (
     <div className="h-full min-w-0 overflow-y-auto">
       <div className="px-5 pb-2 pt-6">
-        <section className="relative">
-          {/* 卡背后垫一层品牌渐变光晕：纯装饰，不接收指针事件 */}
+        {/* 正文内容卡：实底 + 极淡品牌色渐变（同首页 hero 卡）。
+            玻璃态在本站是「浮在内容之上的层」的专属语言（标题栏/播放条/弹层），
+            正文卡片不用，避免和其余页面不一致。 */}
+        <section className="relative overflow-hidden rounded-2xl border border-border bg-card p-5">
           <div
             aria-hidden
-            className="pointer-events-none absolute -inset-x-4 -top-4 bottom-2 rounded-[32px] opacity-25 blur-2xl"
-            style={{
-              background:
-                "linear-gradient(120deg, var(--brand-from), var(--brand-to))",
-            }}
+            className="pointer-events-none absolute inset-0 bg-gradient-to-br from-primary/10 via-transparent to-transparent"
           />
 
-          <div className="relative overflow-hidden rounded-2xl border border-border/60 bg-card/70 p-5 shadow-xl shadow-black/5 backdrop-blur-xl">
-            {/* 顶边一道渐变高光，玻璃质感的点睛 */}
-            <div
-              aria-hidden
-              className="pointer-events-none absolute inset-x-10 top-0 h-px"
-              style={{
-                background:
-                  "linear-gradient(90deg, transparent, var(--brand-to), transparent)",
-              }}
-            />
+          <div className="relative flex items-center gap-4">
+            {/* 头像：真实头像优先，拿不到回退应用 logo（与标题栏口径一致） */}
+            <div className="shrink-0 rounded-full ring-1 ring-border">
+              <div className="flex h-16 w-16 items-center justify-center overflow-hidden rounded-full bg-secondary">
+                <img
+                  src={avatarSrc ?? "/app-icon.png"}
+                  alt=""
+                  className="h-full w-full object-cover"
+                  draggable={false}
+                />
+              </div>
+            </div>
 
-            <div className="flex items-center gap-4">
-              {/* 头像：渐变描边 + 玻璃底；有真实头像就用真图 */}
-              <div
-                className="shrink-0 rounded-full p-[2px] shadow-lg"
-                style={{
-                  background:
-                    "linear-gradient(135deg, var(--brand-from), var(--brand-to))",
-                }}
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-lg font-semibold tracking-tight">
+                {name}
+              </div>
+              <div className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+                {session && (
+                  <span className="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-primary" />
+                )}
+                <span className="truncate">{account}</span>
+              </div>
+            </div>
+
+            {session ? (
+              <button
+                type="button"
+                onClick={() => void doLogout()}
+                disabled={busy}
+                className="flex h-8 shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border border-border px-3 text-xs text-muted-foreground transition-colors hover:border-destructive/40 hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
               >
-                <div className="flex h-16 w-16 items-center justify-center overflow-hidden rounded-full bg-card">
-                  {/* 真实头像优先，拿不到回退应用 logo（与标题栏口径一致） */}
-                  <img
-                    src={avatarSrc ?? "/app-icon.png"}
-                    alt=""
-                    className="h-full w-full object-cover"
-                    draggable={false}
-                  />
-                </div>
-              </div>
+                <LogOut className="h-3.5 w-3.5" />
+                {busy ? "退出中…" : "退出登录"}
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => void navigate({ to: "/login" })}
+                className="h-8 shrink-0 cursor-pointer rounded-lg bg-primary px-4 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90"
+              >
+                登录 / 注册
+              </button>
+            )}
+          </div>
 
-              <div className="min-w-0 flex-1">
-                <div className="truncate text-lg font-semibold tracking-tight">
-                  {name}
-                </div>
-                <div className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
-                  {session && (
-                    // 在线态用主色点，不引硬编码的绿色
-                    <span className="inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-primary" />
-                  )}
-                  <span className="truncate">{account}</span>
-                </div>
-              </div>
-
-              {session ? (
-                <button
-                  type="button"
-                  onClick={() => void doLogout()}
-                  disabled={busy}
-                  className="flex h-8 shrink-0 cursor-pointer items-center gap-1.5 rounded-lg border border-border/60 bg-card/60 px-3 text-xs text-muted-foreground backdrop-blur transition-colors hover:border-destructive/40 hover:bg-destructive/10 hover:text-destructive disabled:cursor-not-allowed disabled:opacity-50"
-                >
-                  <LogOut className="h-3.5 w-3.5" />
-                  {busy ? "退出中…" : "退出登录"}
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  onClick={() => void navigate({ to: "/login" })}
-                  className="h-9 shrink-0 cursor-pointer rounded-lg px-4 text-xs font-medium text-primary-foreground shadow-lg transition-transform hover:-translate-y-0.5"
-                  style={{
-                    background:
-                      "linear-gradient(135deg, var(--brand-from), var(--brand-to))",
-                  }}
-                >
-                  登录 / 注册
-                </button>
-              )}
-            </div>
-
-            {/* 本地统计：登录与否都能看 */}
-            <div className="mt-5 grid grid-cols-3 gap-2.5">
-              <Stat label="歌单" value={stats.playlists} />
-              <Stat label="本地歌曲" value={stats.tracks} />
-              <Stat label="已下载" value={stats.downloads} />
-            </div>
+          {/* 本地统计：登录与否都能看 */}
+          <div className="relative mt-5 grid grid-cols-3 gap-2.5">
+            <Stat label="歌单" value={stats.playlists} />
+            <Stat label="本地歌曲" value={stats.tracks} />
+            <Stat label="已下载" value={stats.downloads} />
           </div>
         </section>
       </div>
@@ -183,9 +157,9 @@ export function ProfilePage(): React.JSX.Element {
                 key={item.to}
                 type="button"
                 onClick={() => void navigate({ to: item.to })}
-                className="group flex cursor-pointer items-center gap-3 rounded-xl border border-border/60 bg-card/60 p-3 text-left backdrop-blur-md transition-all hover:-translate-y-0.5 hover:border-primary/40 hover:bg-card hover:shadow-lg"
+                className="group flex cursor-pointer items-center gap-3 rounded-xl border border-border bg-card p-3 text-left transition-colors hover:border-primary/40 hover:bg-secondary/60"
               >
-                <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary transition-colors group-hover:bg-primary/15">
+                <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
                   <Icon className="h-4 w-4" />
                 </span>
                 <span className="min-w-0 flex-1">
@@ -196,7 +170,7 @@ export function ProfilePage(): React.JSX.Element {
                     {item.hint}
                   </span>
                 </span>
-                <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground transition-transform group-hover:translate-x-0.5 group-hover:text-primary" />
+                <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground transition-colors group-hover:text-primary" />
               </button>
             );
           })}
@@ -206,10 +180,10 @@ export function ProfilePage(): React.JSX.Element {
   );
 }
 
-/** 统计格：玻璃底 + 大号数字 */
+/** 统计格：实底次级面，跟全站卡片同一套表面语言 */
 function Stat(props: { label: string; value: number }): React.JSX.Element {
   return (
-    <div className="rounded-xl border border-border/50 bg-secondary/40 px-3 py-2.5 backdrop-blur">
+    <div className="rounded-xl bg-secondary px-3 py-2.5">
       <div className="text-lg font-semibold tabular-nums leading-tight">
         {props.value}
       </div>
