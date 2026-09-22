@@ -7,7 +7,6 @@ import {
   Clock,
   Download,
   ListMusic,
-  Mic2,
   Music,
   Radio,
 } from "lucide-react";
@@ -34,7 +33,6 @@ const ONLINE_ITEMS: Item[] = [
   { label: "每日新歌", to: "/daily", icon: Clock },
   { label: "歌单广场", to: "/playlists", icon: ListMusic },
   { label: "排行榜", to: "/charts", icon: BarChart3 },
-  { label: "歌手", to: "/artists", icon: Mic2 },
 ];
 
 const MINE_ITEMS: Item[] = [

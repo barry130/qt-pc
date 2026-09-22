@@ -15,7 +15,6 @@ import { DiscoverPage } from "@/components/discovery/DiscoverPage";
 import { DailyPage } from "@/components/discovery/DailyPage";
 import { PlaylistsPage } from "@/components/discovery/PlaylistsPage";
 import { ChartsPage } from "@/components/discovery/ChartsPage";
-import { ArtistsPage } from "@/components/discovery/ArtistsPage";
 import { LibraryPage } from "@/components/library/LibraryPage";
 import { LibraryFoldersPage } from "@/components/library/LibraryFoldersPage";
 import { DownloadsPage } from "@/components/mine/DownloadsPage";
@@ -29,7 +28,6 @@ export const KEEP_ALIVE_PAGES: Record<string, () => React.JSX.Element> = {
   "/daily": () => <DailyPage />,
   "/playlists": () => <PlaylistsPage />,
   "/charts": () => <ChartsPage />,
-  "/artists": () => <ArtistsPage />,
   "/library": () => <LibraryPage />,
   "/library/folders": () => <LibraryFoldersPage />,
   "/downloads": () => <DownloadsPage />,

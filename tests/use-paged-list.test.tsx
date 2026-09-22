@@ -38,11 +38,18 @@ type Probe = ReturnType<typeof usePagedList<string>>;
 
 let last: Probe;
 
-function Probe(props: { fetchPage: (p: number) => Promise<string[]>; resetKey: string }): React.JSX.Element {
+function Probe(props: {
+  fetchPage: (p: number) => Promise<string[]>;
+  resetKey: string;
+  mode?: "scroll" | "all";
+}): React.JSX.Element {
   last = usePagedList<string>({
     fetchPage: props.fetchPage,
     keyOf: (s) => s,
     resetKey: props.resetKey,
+    // 测试页固定 2 条/页：「满页 = 还有下一页」的推断按这个值走
+    pageSize: 2,
+    mode: props.mode,
   });
   return <div ref={last.sentinelRef} data-testid="sentinel" />;
 }
@@ -122,5 +129,44 @@ describe("usePagedList", () => {
     });
     expect(last.error).toBeNull();
     expect(last.items).toEqual(["ok"]);
+  });
+
+  it('all 模式：进页即并发拉完所有页，不满页收尾，不给滚动留 hasMore', async () => {
+    // 3 个满页 + 1 个不满页（第 4 页只有 1 条）
+    const fetchPage = vi.fn(async (p: number) => {
+      if (p <= 3) return [`p${p}-a`, `p${p}-b`];
+      if (p === 4) return ["p4-a"];
+      return [];
+    });
+    render(<Probe fetchPage={fetchPage} resetKey="k" mode="all" />);
+
+    await act(settle);
+    expect(last.items).toEqual([
+      "p1-a",
+      "p1-b",
+      "p2-a",
+      "p2-b",
+      "p3-a",
+      "p3-b",
+      "p4-a",
+    ]);
+    expect(last.loading).toBe(false);
+    // all 模式不做滚动续页：hasMore 恒 false
+    expect(last.hasMore).toBe(false);
+    // 进度：已拉页数有值，总数未知（接口不给 total）
+    expect(last.progress?.done).toBeGreaterThanOrEqual(4);
+    expect(last.progress?.total).toBe(null);
+    // 不满页即到底：不会再往后拉（并发批次里多探的几页都是空页）
+    expect(fetchPage.mock.calls.every(([p]) => p <= 8)).toBe(true);
+  });
+
+  it("all 模式：第一页就不满页时只发一次请求", async () => {
+    const fetchPage = vi.fn(async () => ["only"]);
+    render(<Probe fetchPage={fetchPage} resetKey="k" mode="all" />);
+    await act(settle);
+    expect(fetchPage).toHaveBeenCalledTimes(1);
+    expect(last.items).toEqual(["only"]);
+    expect(last.hasMore).toBe(false);
+    expect(last.progress).toEqual({ done: 1, total: 1 });
   });
 });

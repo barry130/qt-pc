@@ -10,9 +10,6 @@ import { TrackList } from "./TrackList";
 import { ErrorRetry, TrackRowsSkeleton } from "./Skeletons";
 import { BackButton } from "@/components/layout/BackButton";
 
-/** 每页条数（蓝图歌手页为 30；这里 50，少翻几次页） */
-const PAGE_SIZE = 50;
-
 /**
  * 歌手页（路由 /artist/$platform/$id）。
  *
@@ -20,7 +17,11 @@ const PAGE_SIZE = 50;
  * URL 的 `$id` 位置放的是歌手名（encodeURIComponent 过），头像取包内 artistSongs
  * 第一页顺带返回的 picUrl，拿不到再退到首曲封面。
  *
- * **必须翻页**：接口一次只给一页，早先写死 page=1 + size=50，导致任何歌手都只有 50 首。
+ * **进页一次拉完**（usePagedList 的 `all` 模式）：早先是滚动续页，短歌手页还行，
+ * 长歌手要一直下拉；现在并发把所有页取完再一次性列出，滚动条即全量。
+ *
+ * 每页条数必须走 `SEARCH_PAGE_MAX`：上游上限各不相同（qq 要 100 会返回 0 条、
+ * 酷狗恒给 30），传超限值会让「满页 = 还有下一页」的推断失效。
  */
 export function ArtistPage(): React.JSX.Element {
   const { platform, id } = useParams({ strict: false }) as {
@@ -30,33 +31,31 @@ export function ArtistPage(): React.JSX.Element {
   const name = safeDecode(id);
   const playQueue = usePlayerStore((s) => s.playQueue);
   const [avatar, setAvatar] = useState("");
+  const pageSize = sourceApi.SEARCH_PAGE_MAX[platform] ?? 50;
 
   const fetchPage = useCallback(
     async (page: number): Promise<Track[]> => {
-      const res = await sourceApi.getArtistSongs(platform, name, page, PAGE_SIZE);
+      const res = await sourceApi.getArtistSongs(platform, name, page, pageSize);
       // 头像只有第一页带（包内行为），顺路存下来
       if (page <= 1) setAvatar(res.picUrl);
       return res.songs;
     },
-    [platform, name],
+    [platform, name, pageSize],
   );
 
-  const {
-    items: songs,
-    loading,
-    loadingMore,
-    error,
-    hasMore,
-    sentinelRef,
-    reload,
-  } = usePagedList<Track>({
+  const { items: songs, loading, error, progress, reload } = usePagedList<Track>({
     fetchPage,
     keyOf: (t) => `${t.platform}:${t.id}`,
     resetKey: `${platform}:${name}`,
+    pageSize,
+    mode: "all",
+    // 歌手歌曲最多几千首（100/页 → 几十页），上限只是防上游 total 撒谎时打转
+    maxPages: 60,
   });
 
   const cover = avatar || songs.find((t) => t.picUrl)?.picUrl || "";
   const coverUrl = cover ? qtresCoverUrl(cover) : null;
+  const loadingAll = progress !== null;
 
   return (
     <div className="flex h-full min-w-0 flex-col">
@@ -101,7 +100,9 @@ export function ArtistPage(): React.JSX.Element {
             <p className="mt-1 text-xs text-muted-foreground">
               {loading
                 ? "加载中…"
-                : `${songs.length} 首歌曲${hasMore ? "（继续下拉加载更多）" : ""}`}
+                : loadingAll
+                  ? `已加载 ${songs.length} 首，正在取完其余…`
+                  : `全部 ${songs.length} 首歌曲`}
             </p>
           </div>
           {songs.length > 0 && (
@@ -115,6 +116,9 @@ export function ArtistPage(): React.JSX.Element {
             </button>
           )}
         </div>
+
+        {/* 全量拉取进度：歌手页是「进页即全部」，拉完前顶部显示一条进度带 */}
+        {loadingAll && !loading ? <LoadBar /> : null}
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
@@ -129,14 +133,31 @@ export function ArtistPage(): React.JSX.Element {
         ) : (
           <>
             <TrackList tracks={songs} showIndex showAddToPlaylist showDownload />
-            {/* 哨兵：进入视口就拉下一页 */}
-            <div ref={sentinelRef} className="h-1" />
-            <div className="py-4 text-center text-xs text-muted-foreground">
-              {loadingMore ? "加载中…" : hasMore ? "继续下拉加载更多" : "已经到底了"}
-            </div>
+            {loadingAll ? (
+              <div className="py-4 text-center text-xs text-muted-foreground">
+                正在加载其余歌曲… 已加载 {songs.length} 首
+              </div>
+            ) : null}
           </>
         )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * 全量拉取进度带：分母未知（搜索接口不回总数），所以是不定长流动条，
+ * 已有条数由头部/底部文字给出，不做假百分比。
+ */
+function LoadBar(): React.JSX.Element {
+  return (
+    <div
+      role="progressbar"
+      aria-label="正在加载全部歌曲"
+      aria-valuetext="加载中"
+      className="relative h-0.5 w-full overflow-hidden bg-secondary"
+    >
+      <div className="qm-progress-bar absolute inset-y-0 w-1/3 bg-primary" />
     </div>
   );
 }

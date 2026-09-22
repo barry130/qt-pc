@@ -58,29 +58,6 @@ export interface ContractArtist {
   platform: Source;
   name: string;
   picUrl: string;
-  /**
-   * 首字母（A-Z / #）。音源给了才填（qq 的 Findex），用于客户端分组；
-   * 拿不到就不填，不要在这里猜拼音。
-   */
-  initial?: string;
-}
-
-/**
- * 歌手列表一页（artistList 返回）。
- *
- * 四个音源的「歌手列表」能力差异很大，用 `initialSupported` 如实告诉 UI：
- * - kw   ：artistList 支持 prefix 按首字母筛选 → true
- * - wyy  ：artist/list 只有 initial=0（热门）有数据，字母档恒空 → false
- * - qq   ：v8.fcg 列表忽略字母参数，但每条带 Findex → false（条目带 initial 供分组）
- * - kg   ：singer/list 只有语言/性别维度 → false
- * 不支持时实现必须**忽略** initial 并返回热门列表，不能报错。
- */
-export interface ContractArtistPage {
-  list: ContractArtist[];
-  /** 该音源是否支持服务端按首字母筛选 */
-  initialSupported: boolean;
-  /** 是否还有下一页（按总数或音源自带的 more 标志判断） */
-  hasMore: boolean;
 }
 
 /** 专辑 */

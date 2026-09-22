@@ -73,20 +73,6 @@ describe("页面渲染冒烟", () => {
     expect(container.textContent).toContain("我的歌单");
   });
 
-  it("歌手页：真实歌手列表 + 首字母索引在位（不再是常听歌手占位）", async () => {
-    const { ArtistsPage } = await import("@/components/discovery/ArtistsPage");
-    const container = await renderAfterEffects(<ArtistsPage />);
-    expect(container.textContent).toContain("歌手");
-    // 索引档：热门 + A-Z + 非字母档 = 28 个
-    const chips = [...container.querySelectorAll("button")].filter((b) =>
-      /^(热门|[A-Z#])$/.test(b.textContent?.trim() ?? ""),
-    );
-    expect(chips.length).toBe(28);
-    // 常听歌手占位已由真实列表替代；页内搜索框也去掉了（搜索走顶部全局搜索的歌手 tab）
-    expect(container.textContent).not.toContain("常听歌手");
-    expect(container.querySelector('input[aria-label="搜索歌手"]')).toBeNull();
-  });
-
   it("最近播放页：空态提示", async () => {
     const { HistoryPage } = await import("@/components/mine/HistoryPage");
     const container = await renderAfterEffects(<HistoryPage />);

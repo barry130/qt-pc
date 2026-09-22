@@ -19,7 +19,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RequestBuiltin, SourceResponse } from "@/source-scripts/contract";
 import { recommendations } from "@/source-scripts/actions/recommendations";
-import { search, artistList } from "@/source-scripts/actions/aggregate";
+import { search } from "@/source-scripts/actions/aggregate";
 import { resolvePlayUrl } from "@/source-scripts/actions/play-url";
 import { resolvePlayUrlPremium } from "@/source-scripts/schemes/premium/play-url";
 import {
@@ -140,47 +140,6 @@ describe("source-scripts 四平台真实网络", () => {
       expect(first.name.length).toBeGreaterThan(0);
     });
   }
-
-  // ---------- 歌手列表（artistList）----------
-  // 能力差异是这一批的核心事实：只有 kw 支持服务端按首字母筛选，
-  // 其余三家必须「忽略 initial 且不报错」，否则 UI 的字母栏会点一次挂一次。
-
-  for (const source of ["wyy", "qq", "kw", "kg"] as const) {
-    it(`${source}：歌手列表返回结果且字段完整`, { timeout: 30000 }, async () => {
-      const page = await artistList(nodeRequest, source, "", 1, 10);
-      expect(page.list.length).toBeGreaterThan(0);
-      const first = page.list[0]!;
-      expect(first.platform).toBe(source);
-      expect(first.id.length).toBeGreaterThan(0);
-      expect(first.name.length).toBeGreaterThan(0);
-    });
-  }
-
-  for (const source of ["wyy", "qq", "kg"] as const) {
-    it(`${source}：不支持字母筛选时忽略 initial 并返回热门列表`, { timeout: 30000 }, async () => {
-      const hot = await artistList(nodeRequest, source, "", 1, 5);
-      const withLetter = await artistList(nodeRequest, source, "z", 1, 5);
-      expect(withLetter.initialSupported).toBe(false);
-      // 忽略而不是报错：同一页热门数据
-      expect(withLetter.list.map((a) => a.name)).toEqual(
-        hot.list.map((a) => a.name),
-      );
-    });
-  }
-
-  it("qq：列表条目带首字母（Findex，供客户端分组）", { timeout: 30000 }, async () => {
-    const page = await artistList(nodeRequest, "qq", "", 1, 10);
-    expect(page.list.some((a) => (a.initial ?? "").length === 1)).toBe(true);
-  });
-
-  it("kw：artistList 支持 prefix 按首字母筛选（四源里唯一）", { timeout: 30000 }, async () => {
-    const hot = await artistList(nodeRequest, "kw", "", 1, 10);
-    const z = await artistList(nodeRequest, "kw", "z", 1, 10);
-    expect(z.initialSupported).toBe(true);
-    expect(z.list.length).toBeGreaterThan(0);
-    // prefix 真生效：按 z 筛出来的首条与热门列表首条不是同一人
-    expect(z.list[0]!.name).not.toBe(hot.list[0]!.name);
-  });
 
   it("wyy：取链成功且 URL 实际可播放（免费歌）", { timeout: 45000 }, async () => {
     const url = await resolvePlayUrl(nodeRequest, "wyy", {
@@ -706,7 +665,7 @@ describe("安卓入口注册（__qtEntries，两端共用同一份 bundle）", (
     delete (globalThis as { __qtHost?: unknown }).__qtHost;
   });
 
-  it("registerQtEntries：注册 26 个入口（4 取链 + 22 音源数据），bundleInfo 报平台 1101 / 契约 v1", async () => {
+  it("registerQtEntries：注册 25 个入口（4 取链 + 21 音源数据），bundleInfo 报平台 1101 / 契约 v1", async () => {
     const { registerQtEntries } = await import("@/source-scripts/qt-entries");
     registerQtEntries({ request: hostRequest, log: () => {} });
     const entries = entriesOf();
@@ -715,7 +674,6 @@ describe("安卓入口注册（__qtEntries，两端共用同一份 bundle）", (
       "allCharts",
       "allHotWords",
       "allLatest",
-      "artistList",
       "artistSongs",
       "bundleInfo",
       "chartDetail",
@@ -818,7 +776,7 @@ describe("安卓入口注册（__qtEntries，两端共用同一份 bundle）", (
     vi.resetModules();
     const mod = await import("@/source-scripts/engine-entry");
     expect(typeof mod.createSourceLayer).toBe("function");
-    expect(Object.keys(entriesOf()).length).toBe(26);
+    expect(Object.keys(entriesOf()).length).toBe(25);
 
     // PC 形态：没有 __qtHost → 只导出命名符号，不写全局
     delete (globalThis as { __qtEntries?: unknown }).__qtEntries;

@@ -243,42 +243,6 @@ export async function searchAlbums(
 }
 
 /**
- * 歌手列表（热门 / 按首字母）。
- *
- * `initial` 传空串表示热门；不支持字母筛选的音源会忽略它并返回热门列表，
- * 能力由返回里的 `initialSupported` 如实告知 —— UI 据此决定字母栏是否可点。
- */
-export async function getArtistList(
-  source: SourceId,
-  initial: string,
-  page: number,
-  size: number,
-): Promise<{ list: Artist[]; initialSupported: boolean; hasMore: boolean }> {
-  ensureScript(source);
-  const payload = await sourceCall<{
-    list?: { id: string; name: string; picUrl: string; initial?: string }[];
-    initialSupported?: boolean;
-    hasMore?: boolean;
-  }>("artistList", { source, initial, page, size }, (p) => p as {
-    list?: { id: string; name: string; picUrl: string; initial?: string }[];
-    initialSupported?: boolean;
-    hasMore?: boolean;
-  });
-  const list = Array.isArray(payload.list) ? payload.list : [];
-  return {
-    list: list.map((item) => ({
-      id: item.id,
-      platform: source,
-      name: item.name,
-      picUrl: item.picUrl,
-      initial: typeof item.initial === "string" ? item.initial : undefined,
-    })),
-    initialSupported: payload.initialSupported === true,
-    hasMore: payload.hasMore === true,
-  };
-}
-
-/**
  * 专辑详情（蓝本 albumDetail :1758，四平台全量移植）：
  * 返回结构与歌单详情一致（Playlist + tracks），供 UI 以歌单详情形态打开专辑。
  */
@@ -296,11 +260,38 @@ export async function getAlbumDetail(
 }
 
 /**
+ * 搜索类接口的每页条数上限（2026-09-22 实测）。
+ *
+ * 上游对超限请求的处理方式完全不同，必须按音源取真实上限，
+ * 「满页 = 还有下一页」的推断才成立（否则详情页会少一大截或一页不返回）：
+ * - kw ：rn 无 100 上限（50/100/200 都给满）
+ * - qq ：n=50 正常，n≥100 **返回 0 条**（接口当参数错误，不是空结果）
+ * - kg ：pagesize 恒被截成 30（要 50/100/200 都只给 30）
+ * - wyy：limit=100 正常，limit=200 **返回 0 条**
+ *
+ * 本地源（local）不走这些网络接口，取 50 兜底。
+ */
+export const SEARCH_PAGE_MAX: Record<SourceId, number> = {
+  kw: 100,
+  qq: 50,
+  kg: 30,
+  wyy: 100,
+  local: 50,
+};
+
+/** 把调用方要的每页条数收敛到该音源的真实上限 */
+export function clampSearchPageSize(source: SourceId, size: number): number {
+  const max = SEARCH_PAGE_MAX[source];
+  return max != null && size > max ? max : size;
+}
+
+/**
  * 歌手歌曲（分页，每页由调用方给 size）。
  *
  * 音源侧没有「按歌手 id 取歌」的免费接口，包里是**按歌手名搜索**；
  * 第一页顺带返回歌手头像 picUrl（包内只查第一页）。
- * 调用方必须翻页 —— 只取第一页会永远只有一页的量（曾写死 50 首）。
+ * 调用方必须翻页 —— 只取第一页会永远只有一页的量（曾写死 50 首）；
+ * 且必须用 `SEARCH_PAGE_MAX` 里的每页上限，传超限值会静默截断甚至返回空。
  */
 export async function getArtistSongs(
   source: SourceId,
@@ -311,7 +302,7 @@ export async function getArtistSongs(
   ensureScript(source);
   const payload = await sourceCall<{ songs?: MusicInfo[]; picUrl?: string }>(
     "artistSongs",
-    { source, name, page, size },
+    { source, name, page, size: clampSearchPageSize(source, size) },
     (p) => p as { songs?: MusicInfo[]; picUrl?: string },
   );
   const songs = Array.isArray(payload.songs) ? payload.songs : [];

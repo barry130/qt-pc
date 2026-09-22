@@ -92,7 +92,7 @@
 ```text
 ┌────────────────────────────────────────────┐
 │              React 主窗口 UI                │
-│ 首页 / 搜索 / 歌单 / 榜单 / 新歌 / 歌手 / MV │
+│ 首页 / 搜索 / 歌单 / 榜单 / 新歌 / MV       │
 └──────────────────┬─────────────────────────┘
                    │ Tauri invoke / event
 ┌──────────────────▼─────────────────────────┐
@@ -198,7 +198,7 @@
 | 发现 | `playlistCategories`、`recommendations`、`latest`、`allLatest` |
 | 榜单 | `charts`、`allCharts`、`chartDetail` |
 | 搜索 | `search`、`allSearch`、`searchPlaylists`、`searchAlbums` |
-| 歌手 | `searchArtists`、`artistList`、`artistSongs` |
+| 歌手 | `searchArtists`、`artistSongs` |
 | 歌单 | `playlist` |
 | 热词 | `hotWords`、`allHotWords` |
 | MV | `videos`、`videoUrl` |
@@ -485,7 +485,7 @@ Windows 平台注意事项（原文未覆盖，均为实测坑点）：
 │               │                                      │
 │   侧边栏       │               内容区                 │
 │               │                                      │
-│  首页          │ 搜索 / 歌单 / 榜单 / 新歌 / 歌手 / MV │
+│  首页          │ 搜索 / 歌单 / 榜单 / 新歌 / MV      │
 │  全部音源      │
 │  网易云 / QQ   │
 │  酷我 / 酷狗   │
@@ -513,9 +513,8 @@ Windows 平台注意事项（原文未覆盖，均为实测坑点）：
 | `/playlist/:platform/:id` | 歌单详情 | **必须带 platform**，否则跨音源同 ID 会撞车（原文缺失） |
 | `/charts` | 排行榜列表 | 当前音源 / 聚合 |
 | `/chart/:platform/:id` | 榜单详情 | 榜单歌曲 |
-| `/artist/:platform/:id` | 歌手页 | 歌手歌曲分页 |
+| `/artist/:platform/:id` | 歌手页 | 歌手歌曲（进页一次拉完全部，不分页滚动） |
 | `/album/:platform/:id` | 专辑页 | 专辑曲目 |
-| `/artists` | 歌手列表 | 当前音源真实歌手列表（分页）+ 首字母索引（酷我服务端筛 / QQ 按已加载筛 / 网易云·酷狗置灰） |
 | `/library` | 本地音乐 | 本地歌曲列表 |
 | `/library/folders` | 文件夹视图 | 按目录查看 |
 | `/my/playlists` | 我的歌单 | 本地歌单管理（原「收藏」已并入本页） |
@@ -564,7 +563,6 @@ Windows 平台注意事项（原文未覆盖，均为实测坑点）：
 - 首页 / 每日推荐
 - 歌单广场
 - 排行榜
-- 歌手
 
 ### 我的
 
@@ -772,7 +770,6 @@ pub trait MusicProvider: Send + Sync {
 | `allSearch(keyword, page, size)` | 聚合调用四个 Provider | `search_all_music_sources` |
 | `searchPlaylists(...)` | `search_playlists` | `search_playlists` |
 | `searchArtists(...)` | `search_artists` | `search_artists` |
-| `artistList(initial, page, size, source)` | `artist_list` | `get_artist_list` |
 | `artistSongs(...)` | `artist_songs` | `get_artist_songs` |
 | `searchAlbums(...)` | `search_albums` | `search_albums` |
 | `videos(page, size, source)` | `videos` | `get_videos` |
@@ -2218,8 +2215,7 @@ Provider.lyric() （wyy 额外取 translation）
 | `search_music` | `sourceId, keyword, type, page, size` |
 | `search_all_music_sources` | `keyword, type, page, size` |
 | `search_playlists` / `search_artists` / `search_albums` | `sourceId, keyword, page, size` |
-| `get_artist_songs` | `sourceId, name, page, size` |
-| `get_artist_list` | `sourceId, initial, page, size`（`initial` 空串 = 热门；不支持字母查询的音源会忽略它） |
+| `get_artist_songs` | `sourceId, name, page, size`（每页上限见 `SEARCH_PAGE_MAX`：kw 100 / qq 50 / kg 30 / wyy 100） |
 | `get_videos` | `sourceId, page, size` |
 | `get_video_url` | `sourceId, videoId, quality` |
 | `get_lyric` / `get_lyric_translation` | `track` |

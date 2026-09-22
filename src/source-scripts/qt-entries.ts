@@ -29,7 +29,6 @@ import {
 import { setChainConfigCache } from "./chain-store";
 import type {
   ContractArtist,
-  ContractArtistPage,
   ContractChart,
   ContractPlaylist,
   ContractPlaylistCategory,
@@ -46,7 +45,6 @@ import {
   allHotWords,
   allLatestBatches,
   allSearchBatches,
-  artistList,
   artistSongs,
   search,
 } from "./actions/aggregate";
@@ -274,22 +272,8 @@ export function registerQtEntries(host: QtHost): void {
     },
 
     /**
-     * 歌手列表（热门 / 按首字母）。
-     * initial 为空串表示热门；不支持字母筛选的音源会忽略它并返回热门列表，
-     * 能力由返回里的 initialSupported 如实告知 UI（见 ContractArtistPage）。
+     * 歌手歌曲（第一页附头像 picUrl）
      */
-    async artistList(args: { source?: string; initial?: string; page?: number; size?: number }): Promise<string> {
-      const page: ContractArtistPage = await artistList(
-        req,
-        String(args.source) as Source,
-        String(args.initial == null ? "" : args.initial),
-        Number(args.page == null ? 1 : args.page),
-        Number(args.size == null ? 30 : args.size),
-      );
-      return JSON.stringify(page);
-    },
-
-    /** 歌手歌曲（第一页附头像 picUrl） */
     async artistSongs(args: { source?: string; name?: string; page?: number; size?: number }): Promise<string> {
       const result = await artistSongs(
         req,

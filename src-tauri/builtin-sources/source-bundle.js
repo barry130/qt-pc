@@ -1544,33 +1544,6 @@ const kg = {
     }
     return out;
   },
-  /**
-   * 歌手列表（热门）。酷狗 singer/list 只有语言/性别/排序维度，**没有字母筛选**，
-   * 所以 initial 被忽略、initialSupported 恒为 false（UI 侧字母栏置灰）。
-   * 头像是蓝本的 singerid 规律拼接，与歌手搜索共用 artistFromKG。
-   */
-  async artistList(request, _initial, page, size) {
-    const json = await kgRequestJson(
-      request,
-      "http://mobilecdn.kugou.com/api/v3/singer/list" + buildQuery({
-        showtype: "1",
-        musician: "0",
-        page: String(page),
-        pagesize: String(size),
-        type: "0",
-        area: "0",
-        sex: "0",
-        sort: "0"
-      })
-    );
-    const data = asObject(json["data"]);
-    const out = [];
-    for (const entry of asArray(data["info"])) {
-      out.push(artistFromKG(asObject(entry)));
-    }
-    const total = asNumber(data["total"]);
-    return { list: out, initialSupported: false, hasMore: page * size < total };
-  },
   /** 蓝本 searchAlbums kg 分支 :1712（search/album）+ albumFromKG :1325 */
   async albumSearch(request, keyword, page, size) {
     const json = await kgRequestJson(
@@ -12676,38 +12649,6 @@ const kw = {
     }
     return out;
   },
-  /**
-   * 歌手列表。酷我 `artist/artistInfo` 支持 prefix 按首字母筛选，是四个音源里
-   * **唯一**支持服务端字母索引的，initialSupported 为 true。
-   * prefix 取值（实测）：字母 → 该字母（`a` 456 人）；空串 → 热门（9204 人）；
-   * `~` → 非字母档（551 人，对应 UI 的「#」）；`#`/数字 → 0 条，故做了归一。
-   * 响应是 data.artistList + data.total（不是 list）。
-   */
-  async artistList(request, initial, page, size) {
-    const letter = initial.trim();
-    let prefix = "";
-    if (/^[A-Za-z]$/.test(letter)) prefix = letter.toLowerCase();
-    else if (letter === "#") prefix = "~";
-    const json = await kuwoRequest(
-      request,
-      "https://www.kuwo.cn/api/www/artist/artistInfo" + buildQuery({
-        category: "0",
-        prefix,
-        pn: String(page),
-        rn: String(size),
-        httpsStatus: "1",
-        reqId: Date.now().toString() + "ar"
-      }),
-      "GET"
-    );
-    const data = asObject(json["data"]);
-    const out = [];
-    for (const entry of asArray(data["artistList"])) {
-      out.push(artistFromKW(asObject(entry)));
-    }
-    const total = asNumber(data["total"]);
-    return { list: out, initialSupported: true, hasMore: page * size < total };
-  },
   /** 蓝本 searchAlbums kw 分支 :1688（searchAlbumBykeyWord，data.albumList，reqId 带 al 后缀）+ albumFromKW :1294 */
   async albumSearch(request, keyword, page, size) {
     const json = await kuwoRequest(
@@ -13214,47 +13155,6 @@ const qq = {
     }
     return artists;
   },
-  /**
-   * 歌手列表。QQ 的 v8.fcg 歌手列表**忽略字母参数**（实测 index=A 无效），
-   * 所以 initialSupported 为 false；但每条带 Findex（首字母），随条目返回给
-   * 客户端做分组。列表本身不给头像，按 mid 拼官方图片地址（实测 200）。
-   */
-  async artistList(request, _initial, page, size) {
-    const json = await requestJson(
-      request,
-      "https://c.y.qq.com/v8/fcg-bin/v8.fcg" + buildQuery({
-        channel: "singer",
-        page: "list",
-        key: "all_all_all",
-        pagesize: String(size),
-        pagenum: String(page),
-        hostUin: "0",
-        format: "json",
-        inCharset: "utf8",
-        outCharset: "utf-8",
-        notice: "0",
-        platform: "yqq",
-        needNewCode: "0"
-      }),
-      { headers: QQ_HEADERS }
-    );
-    const data = asObject(json["data"]);
-    const out = [];
-    for (const entry of asArray(data["list"])) {
-      const item = asObject(entry);
-      const mid = asString(item["Fsinger_mid"]);
-      out.push({
-        id: mid,
-        platform: "qq",
-        name: asString(item["Fsinger_name"]),
-        // 列表不给图：按 mid 拼官方歌手图（T001R300x300M000{mid}.jpg）
-        picUrl: mid.length > 0 ? "https://y.qq.com/music/photo_new/T001R300x300M000" + mid + ".jpg" : "",
-        initial: asString(item["Findex"]).toUpperCase()
-      });
-    }
-    const total = asNumber(data["total"]);
-    return { list: out, initialSupported: false, hasMore: page * size < total };
-  },
   /** 蓝本 searchAlbums qq 分支 :1671（client_search_cp t=8）+ albumFromQQ :1255 */
   async albumSearch(request, keyword, page, size) {
     const json = await requestJson(
@@ -13411,9 +13311,9 @@ function wyyBrParam(quality) {
 function songFromWyy(item) {
   const songData = asObject(item["song"]);
   const merged = Object.keys(songData).length > 0 ? songData : item;
-  const artistList2 = asArray(merged["artists"]);
+  const artistList = asArray(merged["artists"]);
   const arList = asArray(merged["ar"]);
-  const finalArtists = artistList2.length > 0 ? artistList2 : arList;
+  const finalArtists = artistList.length > 0 ? artistList : arList;
   const albumData = asObject(merged["album"]).id !== void 0 ? asObject(merged["album"]) : asObject(merged["al"]);
   const firstArtist = finalArtists.length > 0 ? asObject(finalArtists[0]) : {};
   const albumObj = Object.keys(albumData).length > 0 ? albumData : {};
@@ -13720,35 +13620,6 @@ const wyy = {
       });
     }
     return out;
-  },
-  /**
-   * 歌手列表（热门）。wyy 的 artist/list 只有 initial=0（热门）实测有数据，
-   * 字母档（1..27）在该接口上恒空，所以 initialSupported 为 false。
-   * 翻页靠响应里的 more 标志，比按条数猜准。
-   */
-  async artistList(request, _initial, page, size) {
-    const json = await requestJson(
-      request,
-      "https://music.163.com/api/artist/list" + buildQuery({
-        type: "1",
-        area: "-1",
-        initial: "0",
-        limit: String(size),
-        offset: String((page - 1) * size)
-      }),
-      { headers: WYY_HEADERS }
-    );
-    const out = [];
-    for (const entry of asArray(json["artists"])) {
-      const item = asObject(entry);
-      out.push({
-        id: asString(item["id"]),
-        platform: "wyy",
-        name: asString(item["name"]),
-        picUrl: asString(item["picUrl"])
-      });
-    }
-    return { list: out, initialSupported: false, hasMore: json["more"] === true };
   },
   /** 蓝本 searchAlbums wyy 分支 :1725（type=10）+ albumFromWyy :1240 */
   async albumSearch(request, keyword, page, size) {
@@ -14209,9 +14080,6 @@ async function artistSongs(request, source, name, page, size) {
   }
   return { picUrl, songs };
 }
-async function artistList(request, source, initial, page, size) {
-  return platformModule$1(source).artistList(request, initial, page, size);
-}
 async function allSearchBatches(request, keyword, page, size) {
   const batches = [];
   for (const s2 of ALL_SOURCES) {
@@ -14462,21 +14330,8 @@ function registerQtEntries(host2) {
       return JSON.stringify({ detail });
     },
     /**
-     * 歌手列表（热门 / 按首字母）。
-     * initial 为空串表示热门；不支持字母筛选的音源会忽略它并返回热门列表，
-     * 能力由返回里的 initialSupported 如实告知 UI（见 ContractArtistPage）。
+     * 歌手歌曲（第一页附头像 picUrl）
      */
-    async artistList(args) {
-      const page = await artistList(
-        req,
-        String(args.source),
-        String(args.initial == null ? "" : args.initial),
-        Number(args.page == null ? 1 : args.page),
-        Number(args.size == null ? 30 : args.size)
-      );
-      return JSON.stringify(page);
-    },
-    /** 歌手歌曲（第一页附头像 picUrl） */
     async artistSongs(args) {
       const result = await artistSongs(
         req,

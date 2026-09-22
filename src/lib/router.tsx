@@ -105,14 +105,6 @@ const albumRoute = createRoute({
   component: AlbumPage,
 });
 
-const artistsRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: "/artists",
-  // 一级页面由 AppShell 的 KeepAliveOutlet 常驻渲染（切 tab 不重载），
-  // 这里只保留路由用于匹配与导航，组件渲染 null。
-  component: () => null,
-});
-
 const libraryRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/library",
@@ -227,7 +219,6 @@ const routeTree = rootRoute.addChildren([
   chartDetailRoute,
   artistRoute,
   albumRoute,
-  artistsRoute,
   libraryRoute,
   libraryFoldersRoute,
   myPlaylistsRoute,

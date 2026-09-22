@@ -205,6 +205,27 @@
   }
 }
 
+/* 全量拉取进度带（歌手页「进页即全部」）：分母未知，只表达「还在加载」，不做假百分比 */
+@keyframes qm-progress {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(300%);
+  }
+}
+.qm-progress-bar {
+  animation: qm-progress 1.2s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .qm-progress-bar {
+    animation: none;
+    width: 100%;
+    transform: none;
+    opacity: 0.6;
+  }
+}
+
 /* 减弱动效 */
 .reduce-motion *,
 .reduce-motion *::before,
