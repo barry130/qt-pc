@@ -37,6 +37,9 @@ const ALLOWED_HOST_SUFFIXES: &[&str] = &[
     "kugou.com",
     "kgimg.com",
     "gdstudio.xyz",
+    // Astral 账号头像：后端 astral.canace.cn / 存储 storage.canace.icu
+    "canace.cn",
+    "canace.icu",
 ];
 
 /// 内存封面缓存：URL → bytes。M0 用简单 HashMap + 上限淘汰。
@@ -585,6 +588,14 @@ mod tests {
         assert!(host_allowed("https://imge.kugou.com/a.jpg"));
         assert!(!host_allowed("https://evil.example.com/a.jpg"));
         assert!(!host_allowed("file:///C:/Windows/system32"));
+    }
+
+    #[test]
+    fn host_whitelist_allows_astral_avatar_hosts() {
+        // 账号头像走 qtres 代取：后端 astral.canace.cn / 存储 storage.canace.icu，
+        // 不在白名单会被拦成破图（标题栏头像回退到 logo）。
+        assert!(host_allowed("http://astral.canace.cn/files/avatar/1.png"));
+        assert!(host_allowed("https://storage.canace.icu/p/xyz/avatar.png"));
     }
 
     #[test]

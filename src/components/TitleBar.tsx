@@ -5,7 +5,6 @@ import {
   Minus,
   Settings,
   Square,
-  UserRound,
   X,
 } from "lucide-react";
 import { Link, useRouter, useNavigate } from "@tanstack/react-router";
@@ -13,7 +12,8 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useTitleBarDrag } from "@/hooks/useFramelessWindow";
 import { MusicSourceSwitcher } from "@/components/music-source/MusicSourceSwitcher";
 import { MessagesPopover } from "@/components/mine/MessagesPopover";
-import { displayName, useAuthStore } from "@/stores/auth";
+import { avatarUrl, displayName, useAuthStore } from "@/stores/auth";
+import { qtresCoverUrl } from "@/lib/lrc";
 import { cn } from "@/lib/utils";
 
 /**
@@ -30,6 +30,9 @@ export function TitleBar(): React.JSX.Element {
   const router = useRouter();
   const session = useAuthStore((s) => s.session);
   const profile = useAuthStore((s) => s.profile);
+  // 头像地址：CSP 不放开外部域名，远程头像经 qtres 代理（Rust 代取）加载
+  const avatar = avatarUrl(profile);
+  const avatarSrc = avatar ? qtresCoverUrl(avatar) : null;
   const win = getCurrentWindow();
 
   useEffect(() => {
@@ -116,7 +119,13 @@ export function TitleBar(): React.JSX.Element {
           onDoubleClick={(e) => e.stopPropagation()}
           className="flex w-11 items-center justify-center text-foreground/80 transition-colors hover:bg-secondary hover:text-foreground"
         >
-          <UserRound className="h-4 w-4" />
+          {/* 真实头像优先，拿不到（未登录/无头像字段/代理转换失败）回退应用 logo */}
+          <img
+            src={avatarSrc ?? "/app-icon.svg"}
+            alt=""
+            className="h-5 w-5 rounded-full object-cover"
+            draggable={false}
+          />
         </Link>
         <WindowButton onClick={() => void win.minimize()} label="最小化">
           <Minus className="h-4 w-4" />

@@ -83,9 +83,9 @@ export function Sidebar(): React.JSX.Element {
         collapsed ? "w-[64px]" : "w-[208px]",
       )}
     >
-      {/* 不用 flex-1：否则这一区会被撑满，底部项被顶到窗口最下沿，
-          中间空一大块。内容超出时靠 flex 收缩 + overflow 滚动。 */}
-      <div className="flex min-h-0 flex-col overflow-y-auto px-2 py-3">
+      {/* flex-1：导航整体撑满侧边栏高度，折叠按钮跟在「我的」最后一项后面，
+          不再单独一节 + 横向隔离线。内容超出时靠 overflow 滚动。 */}
+      <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-2 py-3">
         <NavGroup title={`在线 · ${sourceName}`} collapsed={collapsed}>
           {ONLINE_ITEMS.map((item) => (
             <NavLink key={item.to} item={item} collapsed={collapsed} />
@@ -96,14 +96,11 @@ export function Sidebar(): React.JSX.Element {
             <NavLink key={item.to} item={item} collapsed={collapsed} />
           ))}
         </NavGroup>
-      </div>
-
-      <div className="shrink-0 border-t border-border px-2 py-2">
         <button
           type="button"
           onClick={() => setCollapsed((c) => !c)}
           aria-label={collapsed ? "展开侧边栏" : "折叠侧边栏"}
-          className="flex w-full items-center gap-3 rounded-md px-2 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+          className="mt-1 flex w-full items-center gap-3 rounded-md px-2 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
         >
           {collapsed ? (
             <ChevronsRight className="h-4 w-4 shrink-0" />

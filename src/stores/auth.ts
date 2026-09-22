@@ -46,6 +46,34 @@ export function displayName(
   return fallback;
 }
 
+/**
+ * 从 me 的响应里猜头像地址（后端字段名可能不同，逐个兜底；兼容 user 嵌套）。
+ * 只认 http(s) 远程地址 —— 相对路径/本地路径在 webview 里加载不出来，宁可不用。
+ * 拿不到返回空串，标题栏回退到应用 logo。
+ */
+export function avatarUrl(profile: Record<string, unknown> | null): string {
+  if (!profile) return "";
+  const user = profile.user as Record<string, unknown> | null | undefined;
+  for (const o of [profile, user]) {
+    if (!o) continue;
+    for (const key of [
+      "avatar",
+      "avatarUrl",
+      "avatar_url",
+      "headImg",
+      "headImage",
+      "faceUrl",
+      "picUrl",
+      "pic",
+      "face",
+    ]) {
+      const v = o[key];
+      if (typeof v === "string" && /^https?:\/\//.test(v.trim())) return v.trim();
+    }
+  }
+  return "";
+}
+
 /** 同步失败时把错误写到这里，便于从库中排查 */
 export const LIKE_LAST_ERROR_KEY = "like.lastError";
 

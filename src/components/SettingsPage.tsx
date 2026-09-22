@@ -1242,8 +1242,11 @@ function SettingsTabs(props: { active: string }): React.JSX.Element {
 export function SettingsPage(props: { section: string }): React.JSX.Element {
   const title = SECTION_TITLES[props.section] ?? "设置";
   return (
-    <PageContainer title={`设置 · ${title}`}>
-      <SettingsTabs active={props.section} />
+    // 分节标签固定在顶部（滚动区外），内容滚动时始终可见
+    <PageContainer
+      title={`设置 · ${title}`}
+      stickyHeader={<SettingsTabs active={props.section} />}
+    >
       {props.section === "appearance" ? (
         <AppearanceSection />
       ) : props.section === "desktop-lyric" ? (
