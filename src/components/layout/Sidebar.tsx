@@ -6,7 +6,6 @@ import {
   ChevronsRight,
   Clock,
   Download,
-  Heart,
   ListMusic,
   Mic2,
   Music,
@@ -39,7 +38,8 @@ const ONLINE_ITEMS: Item[] = [
 ];
 
 const MINE_ITEMS: Item[] = [
-  { label: "收藏", to: "/favorites", icon: Heart },
+  // 「我的歌单」与「收藏」已合成一页（/my/playlists），不再分两个入口
+  { label: "我的歌单", to: "/my/playlists", icon: ListMusic },
   { label: "本地音乐", to: "/library", icon: Music },
   { label: "下载管理", to: "/downloads", icon: Download },
   { label: "最近播放", to: "/history", icon: Clock },

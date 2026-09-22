@@ -53,12 +53,13 @@ describe("页面渲染冒烟", () => {
     expect(container.textContent).toContain("还没有扫描目录");
   });
 
-  it("我的收藏页：空态提示", async () => {
-    const { FavoritesPage } = await import("@/components/mine/FavoritesPage");
-    const container = await renderAfterEffects(<FavoritesPage />);
-    expect(container.textContent).toContain("我的收藏");
-    // 收藏页只列歌单了（歌单是唯一组织单位），歌曲不再单列
+  it("我的歌单页：空态提示（已与收藏合并为一页）", async () => {
+    const { MyPlaylistsPage } = await import("@/components/mine/MyPlaylistsPage");
+    const container = await renderAfterEffects(<MyPlaylistsPage />);
+    expect(container.textContent).toContain("我的歌单");
+    // 歌单是唯一组织单位：建单 / 导入 / 收藏都在这一页
     expect(container.textContent).toContain("还没有歌单");
+    expect(container.textContent).toContain("同步云端收藏");
   });
 
   it("最近播放页：空态提示", async () => {

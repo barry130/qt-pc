@@ -9,7 +9,7 @@ import { qtresCoverUrl } from "@/lib/lrc";
 import { ImportPlaylistDialog } from "./ImportPlaylistDialog";
 
 /**
- * 我的歌单（路由 /my/playlists，DESIGN §5.3）。
+ * 我的歌单（路由 /my/playlists，DESIGN §5.3）——「我的歌单」与「收藏」已合成一页。
  *
  * 歌单是唯一的组织单位，`platform` 区分两种来源：
  * - `"local"`：本地自建，曲目就是挂在它 pid 下的收藏（liked_songs.pid）
@@ -18,6 +18,8 @@ import { ImportPlaylistDialog } from "./ImportPlaylistDialog";
  * 两类的操作也不同：在线歌单不能重命名（名字归音源所有），
  * 「移除」的语义是**取消收藏**，不是删除；「我喜欢的歌曲」
  * 既不能改名也不能删 —— 散装收藏要靠它落脚。
+ *
+ * 建单 / 导入 / 重命名 / 同步云端收藏 都在这一页，不再拆成两个页面。
  */
 export function MyPlaylistsPage(): React.JSX.Element {
   const navigate = useNavigate();
@@ -26,19 +28,24 @@ export function MyPlaylistsPage(): React.JSX.Element {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState("");
   const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [importOpen, setImportOpen] = useState(false);
 
   const load = useCallback(async (): Promise<void> => {
     setLoading(true);
+    setError(null);
     try {
       // 打开时先把云端收藏拉回来（未登录 / 后端不可达由 pullLikes 内部吞掉），
-      // 别端的建单/删单/改名才能反映到这个列表 —— 对齐 FavoritesPage
+      // 别端的建单/删单/改名才能反映到这个列表
       await pullLikes().catch(() => {});
-      const l = await ipc
-        .listMyPlaylists()
-        .catch(() => [] as MyPlaylistSummary[]);
+      // 这里**不吞**错误：读不到歌单时要让用户看见原因，
+      // 否则一律显示空态，分不清是「真没有」还是「读失败」
+      const l = await ipc.listMyPlaylists();
       setList(Array.isArray(l) ? l : []);
+    } catch (err) {
+      setError(errMsg(err));
+      setList([]);
     } finally {
       setLoading(false);
     }
@@ -47,6 +54,20 @@ export function MyPlaylistsPage(): React.JSX.Element {
   useEffect(() => {
     void load();
   }, [load]);
+
+  /** 手动同步云端收藏。这里不吞错误，失败要让用户看得见 */
+  const syncNow = async (): Promise<void> => {
+    setSyncing(true);
+    setError(null);
+    try {
+      await pullLikes();
+      await load();
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setSyncing(false);
+    }
+  };
 
   const create = async (): Promise<void> => {
     const n = name.trim();
@@ -120,7 +141,20 @@ export function MyPlaylistsPage(): React.JSX.Element {
   return (
     <div className="flex h-full min-w-0 flex-col">
       <div className="border-b border-border px-4 py-3">
-        <h1 className="text-base font-medium">我的歌单</h1>
+        <div className="flex items-center justify-between">
+          <h1 className="text-base font-medium">我的歌单</h1>
+          <button
+            type="button"
+            onClick={() => void syncNow()}
+            disabled={syncing}
+            className="h-7 rounded-md border border-border px-3 text-xs transition-colors hover:bg-secondary disabled:opacity-50"
+          >
+            {syncing ? "同步中…" : "同步云端收藏"}
+          </button>
+        </div>
+        <p className="mt-1 text-xs text-muted-foreground">
+          共 {local.length} 个本地歌单 · {online.length} 个在线歌单
+        </p>
         <div className="mt-2 flex gap-2">
           <input
             value={name}
@@ -161,7 +195,8 @@ export function MyPlaylistsPage(): React.JSX.Element {
           </div>
         ) : !error && list.length === 0 ? (
           <div className="py-10 text-center text-sm text-muted-foreground">
-            还没有歌单。可以新建一个，或在歌单详情页收藏在线歌单
+            还没有歌单。可以新建一个，或点上方「导入」粘贴分享链接，
+            也可以在歌单详情页点「收藏」
           </div>
         ) : (
           <>
@@ -225,15 +260,17 @@ function Group(props: {
   removeLabel: string;
   /** 云端卡片歌单不可改名（名字归云端/音源所有） */
   hideRename?: boolean;
-}): React.JSX.Element | null {
-  if (props.items.length === 0) return null;
-
+}): React.JSX.Element {
   return (
     <div className="pb-2">
       <h2 className="px-4 pb-1 pt-3 text-xs text-muted-foreground">
         {props.title}
       </h2>
-      <ul>
+      {/* 空分组也保留标题与引导：另一组有内容时，这组空着要说得清为什么 */}
+      {props.items.length === 0 ? (
+        <p className="px-4 py-2 text-xs text-muted-foreground">{props.emptyHint}</p>
+      ) : (
+        <ul>
         {props.items.map((p) => {
           const cover =
             p.platform === ipc.LOCAL_PLATFORM ? "" : qtresCoverUrl(p.picUrl);
@@ -301,7 +338,8 @@ function Group(props: {
             </li>
           );
         })}
-      </ul>
+        </ul>
+      )}
     </div>
   );
 }
