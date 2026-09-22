@@ -12,7 +12,6 @@ import { PlaceholderPage } from "@/components/layout/PlaceholderPage";
 import { SettingsPage } from "@/components/SettingsPage";
 import { PlaylistDetailPage } from "@/components/discovery/PlaylistDetailPage";
 import { ChartDetailPage } from "@/components/discovery/ChartDetailPage";
-import { MvDetailPage } from "@/components/discovery/MvDetailPage";
 import { FeedbackPage } from "@/components/mine/FeedbackPage";
 import { MyPlaylistDetailPage } from "@/components/mine/MyPlaylistDetailPage";
 import { LoginPage } from "@/components/mine/LoginPage";
@@ -106,24 +105,12 @@ const albumRoute = createRoute({
   component: AlbumPage,
 });
 
-const mvRoute = createRoute({
+const artistsRoute = createRoute({
   getParentRoute: () => rootRoute,
-  path: "/mv",
+  path: "/artists",
   // 一级页面由 AppShell 的 KeepAliveOutlet 常驻渲染（切 tab 不重载），
   // 这里只保留路由用于匹配与导航，组件渲染 null。
   component: () => null,
-});
-
-const mvDetailRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: "/mv/$platform/$id",
-  component: () => {
-    const { platform, id } = useParams({ strict: false }) as {
-      platform: string;
-      id: string;
-    };
-    return <MvDetailPage platform={platform} id={id} />;
-  },
 });
 
 const libraryRoute = createRoute({
@@ -240,8 +227,7 @@ const routeTree = rootRoute.addChildren([
   chartDetailRoute,
   artistRoute,
   albumRoute,
-  mvRoute,
-  mvDetailRoute,
+  artistsRoute,
   libraryRoute,
   libraryFoldersRoute,
   myPlaylistsRoute,

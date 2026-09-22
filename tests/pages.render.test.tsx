@@ -73,6 +73,17 @@ describe("页面渲染冒烟", () => {
     expect(container.textContent).toContain("我的歌单");
   });
 
+  it("歌手页：无听歌记录时给引导，搜索框在位", async () => {
+    const { ArtistsPage } = await import("@/components/discovery/ArtistsPage");
+    const container = await renderAfterEffects(<ArtistsPage />);
+    expect(container.textContent).toContain("歌手");
+    expect(container.textContent).toContain("常听歌手");
+    expect(container.textContent).toContain("还没有听歌记录");
+    expect(
+      container.querySelector('input[aria-label="搜索歌手"]'),
+    ).toBeTruthy();
+  });
+
   it("最近播放页：空态提示", async () => {
     const { HistoryPage } = await import("@/components/mine/HistoryPage");
     const container = await renderAfterEffects(<HistoryPage />);
