@@ -67,7 +67,7 @@ export function TitleBar(): React.JSX.Element {
     >
       {/* 左：Logo + 应用名 */}
       <div className="flex h-full items-center gap-2 pl-3">
-        <img src="/app-icon.svg" alt="" className="h-5 w-5" draggable={false} />
+        <img src="/app-icon.png" alt="" className="h-5 w-5" draggable={false} />
         <span className="text-sm font-semibold">轻听</span>
       </div>
 
@@ -121,7 +121,7 @@ export function TitleBar(): React.JSX.Element {
         >
           {/* 真实头像优先，拿不到（未登录/无头像字段/代理转换失败）回退应用 logo */}
           <img
-            src={avatarSrc ?? "/app-icon.svg"}
+            src={avatarSrc ?? "/app-icon.png"}
             alt=""
             className="h-5 w-5 rounded-full object-cover"
             draggable={false}
