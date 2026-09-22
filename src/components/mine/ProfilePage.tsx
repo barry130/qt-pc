@@ -74,8 +74,9 @@ export function ProfilePage(): React.JSX.Element {
 
   const avatar = avatarUrl(profile);
   const avatarSrc = avatar ? qtresCoverUrl(avatar) : null;
-  const name = session ? displayName(profile, "已登录") : "未登录";
-  const account = session ? accountLine(profile) : "登录后可同步收藏、消息与反馈";
+  // 昵称优先、其次用户名；都不给就中性称呼（不出现「已登录」字样）
+  const name = session ? displayName(profile, "") || "轻听用户" : "未登录";
+  const account = session ? subLine(profile) : "登录后可同步收藏、消息与反馈";
 
   return (
     <div className="h-full min-w-0 overflow-y-auto">
@@ -112,24 +113,13 @@ export function ProfilePage(): React.JSX.Element {
                 }}
               >
                 <div className="flex h-16 w-16 items-center justify-center overflow-hidden rounded-full bg-card">
-                  {avatarSrc ? (
-                    <img
-                      src={avatarSrc}
-                      alt=""
-                      className="h-full w-full object-cover"
-                      draggable={false}
-                    />
-                  ) : (
-                    <span
-                      className="bg-clip-text text-2xl font-semibold text-transparent"
-                      style={{
-                        backgroundImage:
-                          "linear-gradient(135deg, var(--brand-from), var(--brand-to))",
-                      }}
-                    >
-                      {session ? name.slice(0, 1) : "游"}
-                    </span>
-                  )}
+                  {/* 真实头像优先，拿不到回退应用 logo（与标题栏口径一致） */}
+                  <img
+                    src={avatarSrc ?? "/app-icon.png"}
+                    alt=""
+                    className="h-full w-full object-cover"
+                    draggable={false}
+                  />
                 </div>
               </div>
 
@@ -230,9 +220,9 @@ function Stat(props: { label: string; value: number }): React.JSX.Element {
   );
 }
 
-/** 账号副标题：优先用户名 / 邮箱，拿不到就给一句说明 */
-function accountLine(profile: Record<string, unknown> | null): string {
-  const keys = ["username", "account", "email", "mobile", "phone"];
+/** 账号副标题：邮箱 / 手机，拿不到就给中性说明（不重复展示名，也不写「已登录」） */
+function subLine(profile: Record<string, unknown> | null): string {
+  const keys = ["email", "mobile", "phone"];
   const user = profile?.user as Record<string, unknown> | null | undefined;
   for (const source of [profile, user]) {
     if (!source) continue;
@@ -241,5 +231,5 @@ function accountLine(profile: Record<string, unknown> | null): string {
       if (typeof v === "string" && v.trim()) return v.trim();
     }
   }
-  return "轻听账号 · 已登录";
+  return "轻听账号";
 }

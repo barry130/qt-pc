@@ -33,15 +33,29 @@ export function isSessionValid(s: AuthSession | null): boolean {
   return !!s && s.expiresAt > Date.now() + 60_000;
 }
 
-/** 从 me 的响应里猜一个展示名（后端字段名可能不同，逐个兜底） */
+/**
+ * 从 me 的响应里猜一个展示名：**昵称优先，其次用户名**。
+ * 后端字段名不固定（QtUserInfoVo 是 Java 风格 nickName/userName），且名字可能挂在
+ * 嵌套的 `user` 对象上 —— 两种命名、两层结构都要兜底，否则有名字也会落到 fallback。
+ */
 export function displayName(
   profile: Record<string, unknown> | null,
   fallback: string,
 ): string {
   if (!profile) return fallback;
-  for (const key of ["nickname", "nickName", "username", "name", "account"]) {
-    const v = profile[key];
-    if (typeof v === "string" && v.trim()) return v;
+  const user = profile.user as Record<string, unknown> | null | undefined;
+  const groups = [
+    ["nickname", "nickName", "nick_name", "nick"],
+    ["username", "userName", "user_name", "account", "name"],
+  ];
+  for (const keys of groups) {
+    for (const source of [profile, user]) {
+      if (!source) continue;
+      for (const key of keys) {
+        const v = source[key];
+        if (typeof v === "string" && v.trim()) return v.trim();
+      }
+    }
   }
   return fallback;
 }
