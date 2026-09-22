@@ -104,18 +104,20 @@ export function TrackList(props: {
               activeRow ? "bg-secondary/60" : ""
             }`}
           >
-            {selection && localRow && (
-              <input
-                type="checkbox"
-                checked={selection.ids.has(t.id)}
-                aria-label={`选择 ${t.title}`}
-                onClick={(e) => e.stopPropagation()}
-                onChange={() => selection.onToggle(t.id)}
-                className="h-3.5 w-3.5 shrink-0 accent-primary"
-              />
-            )}
+            {/* 左侧固定槽位：批量选择时放复选框，否则放序号 / 播放态均衡条。
+                复选框放在槽位里（而不是另起一列），否则槽位空着还要多占一份
+                行间距，复选框到歌名会拉开近 50px。 */}
             <span className="flex h-5 w-6 shrink-0 items-center justify-center text-xs tabular-nums text-muted-foreground">
-              {showIndex ? (
+              {selection && localRow ? (
+                <input
+                  type="checkbox"
+                  checked={selection.ids.has(t.id)}
+                  aria-label={`选择 ${t.title}`}
+                  onClick={(e) => e.stopPropagation()}
+                  onChange={() => selection.onToggle(t.id)}
+                  className="h-3.5 w-3.5 accent-primary"
+                />
+              ) : showIndex ? (
                 i + 1
               ) : activeRow ? (
                 // 正在播放：三根跳动的均衡条（样式见 index.css .eq-bar）
