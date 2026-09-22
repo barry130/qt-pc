@@ -29,6 +29,7 @@ import {
 import { setChainConfigCache } from "./chain-store";
 import type {
   ContractArtist,
+  ContractArtistPage,
   ContractChart,
   ContractPlaylist,
   ContractPlaylistCategory,
@@ -45,6 +46,7 @@ import {
   allHotWords,
   allLatestBatches,
   allSearchBatches,
+  artistList,
   artistSongs,
   search,
 } from "./actions/aggregate";
@@ -172,7 +174,8 @@ export function registerQtEntries(host: QtHost): void {
       if (url.length === 0) {
         // 追踪随错误上抛：安卓端 console 不落盘（AAR 未 setConsole），引擎应答
         // 的 error 文本是唯一的诊断通道；PC 侧同样受益（一行看清每条线路死因）
-        const trace = consumeLastMissTrace();
+        // 用和取链一致的 cacheKey 取追踪，避免拿到别的并发请求残留的 trace
+        const trace = consumeLastMissTrace(source + ":" + song.id + ":" + quality);
         throw new Error(trace.length > 0 ? `未取到播放地址（${trace}）` : "未取到播放地址");
       }
       return JSON.stringify({ url, source, quality });
@@ -268,6 +271,22 @@ export function registerQtEntries(host: QtHost): void {
         String(args.id == null ? "" : args.id),
       );
       return JSON.stringify({ detail });
+    },
+
+    /**
+     * 歌手列表（热门 / 按首字母）。
+     * initial 为空串表示热门；不支持字母筛选的音源会忽略它并返回热门列表，
+     * 能力由返回里的 initialSupported 如实告知 UI（见 ContractArtistPage）。
+     */
+    async artistList(args: { source?: string; initial?: string; page?: number; size?: number }): Promise<string> {
+      const page: ContractArtistPage = await artistList(
+        req,
+        String(args.source) as Source,
+        String(args.initial == null ? "" : args.initial),
+        Number(args.page == null ? 1 : args.page),
+        Number(args.size == null ? 30 : args.size),
+      );
+      return JSON.stringify(page);
     },
 
     /** 歌手歌曲（第一页附头像 picUrl） */

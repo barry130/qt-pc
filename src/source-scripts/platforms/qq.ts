@@ -27,6 +27,7 @@
 import type {
   ContractAlbum,
   ContractArtist,
+  ContractArtistPage,
   ContractChart,
   ContractPlaylist,
   ContractPlaylistCategory,
@@ -571,6 +572,57 @@ export const qq = {
       });
     }
     return artists;
+  },
+
+  /**
+   * 歌手列表。QQ 的 v8.fcg 歌手列表**忽略字母参数**（实测 index=A 无效），
+   * 所以 initialSupported 为 false；但每条带 Findex（首字母），随条目返回给
+   * 客户端做分组。列表本身不给头像，按 mid 拼官方图片地址（实测 200）。
+   */
+  async artistList(
+    request: RequestBuiltin,
+    _initial: string,
+    page: number,
+    size: number,
+  ): Promise<ContractArtistPage> {
+    const json = await requestJson(
+      request,
+      "https://c.y.qq.com/v8/fcg-bin/v8.fcg" +
+        buildQuery({
+          channel: "singer",
+          page: "list",
+          key: "all_all_all",
+          pagesize: String(size),
+          pagenum: String(page),
+          hostUin: "0",
+          format: "json",
+          inCharset: "utf8",
+          outCharset: "utf-8",
+          notice: "0",
+          platform: "yqq",
+          needNewCode: "0",
+        }),
+      { headers: QQ_HEADERS },
+    );
+    const data = asObject(json["data"]);
+    const out: ContractArtist[] = [];
+    for (const entry of asArray(data["list"])) {
+      const item = asObject(entry);
+      const mid = asString(item["Fsinger_mid"]);
+      out.push({
+        id: mid,
+        platform: "qq",
+        name: asString(item["Fsinger_name"]),
+        // 列表不给图：按 mid 拼官方歌手图（T001R300x300M000{mid}.jpg）
+        picUrl:
+          mid.length > 0
+            ? "https://y.qq.com/music/photo_new/T001R300x300M000" + mid + ".jpg"
+            : "",
+        initial: asString(item["Findex"]).toUpperCase(),
+      });
+    }
+    const total = asNumber(data["total"]);
+    return { list: out, initialSupported: false, hasMore: page * size < total };
   },
 
   /** 蓝本 searchAlbums qq 分支 :1671（client_search_cp t=8）+ albumFromQQ :1255 */

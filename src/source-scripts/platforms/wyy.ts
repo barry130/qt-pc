@@ -22,6 +22,7 @@
 import type {
   ContractAlbum,
   ContractArtist,
+  ContractArtistPage,
   ContractChart,
   ContractPlaylist,
   ContractPlaylistCategory,
@@ -440,6 +441,42 @@ export const wyy = {
       });
     }
     return out;
+  },
+
+  /**
+   * 歌手列表（热门）。wyy 的 artist/list 只有 initial=0（热门）实测有数据，
+   * 字母档（1..27）在该接口上恒空，所以 initialSupported 为 false。
+   * 翻页靠响应里的 more 标志，比按条数猜准。
+   */
+  async artistList(
+    request: RequestBuiltin,
+    _initial: string,
+    page: number,
+    size: number,
+  ): Promise<ContractArtistPage> {
+    const json = await requestJson(
+      request,
+      "https://music.163.com/api/artist/list" +
+        buildQuery({
+          type: "1",
+          area: "-1",
+          initial: "0",
+          limit: String(size),
+          offset: String((page - 1) * size),
+        }),
+      { headers: WYY_HEADERS },
+    );
+    const out: ContractArtist[] = [];
+    for (const entry of asArray(json["artists"])) {
+      const item = asObject(entry);
+      out.push({
+        id: asString(item["id"]),
+        platform: "wyy",
+        name: asString(item["name"]),
+        picUrl: asString(item["picUrl"]),
+      });
+    }
+    return { list: out, initialSupported: false, hasMore: json["more"] === true };
   },
 
   /** 蓝本 searchAlbums wyy 分支 :1725（type=10）+ albumFromWyy :1240 */

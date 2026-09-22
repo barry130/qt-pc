@@ -1,6 +1,6 @@
 {
-  "chainRevision": 3,
-  "maxLinesPerQuality": 4,
+  "chainRevision": 7,
+  "maxLinesPerQuality": 3,
   "crossSources": {
     "wyy": [
       "kw"
@@ -18,8 +18,8 @@
     ]
   },
   "budget": {
-    "totalMs": 12000,
-    "lineMs": 6000
+    "totalMs": 5000,
+    "lineMs": 5000
   },
   "chains": {
     "wyy": [
@@ -45,6 +45,9 @@
           "128",
           "320",
           "flac"
+        ],
+        "platforms": [
+          1103
         ]
       },
       {
@@ -90,7 +93,7 @@
       },
       {
         "id": "qq-yuningxi-tang",
-        "name": "玉宁熙 tang.api",
+        "name": "玉宁熙 tang.api（主机不通，留作精确 mid 兜底）",
         "kind": "http",
         "qualities": [
           "128",
@@ -100,7 +103,7 @@
         "pre": [
           {
             "url": "https://www.97abc.com/count.php?id=lx-yuningxi",
-            "timeoutMs": 8000
+            "timeoutMs": 1500
           }
         ],
         "request": {
@@ -111,7 +114,8 @@
           "headers": {
             "Content-Type": "application/json",
             "Referer": "https://y.qq.com/"
-          }
+          },
+          "timeoutMs": 3000
         },
         "require": {
           "song_mid": "nonEmpty"
@@ -144,6 +148,9 @@
           "128",
           "320",
           "flac"
+        ],
+        "platforms": [
+          1103
         ]
       },
       {
@@ -155,6 +162,9 @@
           "128",
           "320",
           "flac"
+        ],
+        "platforms": [
+          1103
         ]
       },
       {
@@ -166,6 +176,9 @@
           "128",
           "320",
           "flac"
+        ],
+        "platforms": [
+          1103
         ]
       },
       {
@@ -177,15 +190,18 @@
           "128",
           "320",
           "flac"
+        ],
+        "platforms": [
+          1103
         ]
       }
     ],
     "kg": [
       {
-        "id": "kg-molan",
-        "name": "墨澜",
+        "id": "kg-stellarwave",
+        "name": "Stellarwave",
         "kind": "lx",
-        "scriptId": "molan",
+        "scriptId": "stellarwave",
         "qualities": [
           "128",
           "320",
@@ -201,17 +217,23 @@
           "128",
           "320",
           "flac"
+        ],
+        "platforms": [
+          1103
         ]
       },
       {
-        "id": "kg-stellarwave",
-        "name": "Stellarwave",
+        "id": "kg-molan",
+        "name": "墨澜",
         "kind": "lx",
-        "scriptId": "stellarwave",
+        "scriptId": "molan",
         "qualities": [
           "128",
           "320",
           "flac"
+        ],
+        "platforms": [
+          1103
         ]
       },
       {
@@ -221,6 +243,9 @@
         "scriptId": "yuningxi-pro",
         "qualities": [
           "flac"
+        ],
+        "platforms": [
+          1103
         ]
       },
       {
@@ -232,6 +257,9 @@
           "128",
           "320",
           "flac"
+        ],
+        "platforms": [
+          1103
         ]
       }
     ]

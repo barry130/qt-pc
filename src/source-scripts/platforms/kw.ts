@@ -30,6 +30,7 @@
 import type {
   ContractAlbum,
   ContractArtist,
+  ContractArtistPage,
   ContractChart,
   ContractPlaylist,
   ContractPlaylistCategory,
@@ -636,6 +637,45 @@ export const kw = {
       out.push(artistFromKW(asObject(entry)));
     }
     return out;
+  },
+
+  /**
+   * 歌手列表。酷我 `artist/artistInfo` 支持 prefix 按首字母筛选，是四个音源里
+   * **唯一**支持服务端字母索引的，initialSupported 为 true。
+   * prefix 取值（实测）：字母 → 该字母（`a` 456 人）；空串 → 热门（9204 人）；
+   * `~` → 非字母档（551 人，对应 UI 的「#」）；`#`/数字 → 0 条，故做了归一。
+   * 响应是 data.artistList + data.total（不是 list）。
+   */
+  async artistList(
+    request: RequestBuiltin,
+    initial: string,
+    page: number,
+    size: number,
+  ): Promise<ContractArtistPage> {
+    const letter = initial.trim();
+    let prefix = "";
+    if (/^[A-Za-z]$/.test(letter)) prefix = letter.toLowerCase();
+    else if (letter === "#") prefix = "~";
+    const json = await kuwoRequest(
+      request,
+      "https://www.kuwo.cn/api/www/artist/artistInfo" +
+        buildQuery({
+          category: "0",
+          prefix,
+          pn: String(page),
+          rn: String(size),
+          httpsStatus: "1",
+          reqId: Date.now().toString() + "ar",
+        }),
+      "GET",
+    );
+    const data = asObject(json["data"]);
+    const out: ContractArtist[] = [];
+    for (const entry of asArray(data["artistList"])) {
+      out.push(artistFromKW(asObject(entry)));
+    }
+    const total = asNumber(data["total"]);
+    return { list: out, initialSupported: true, hasMore: page * size < total };
   },
 
   /** 蓝本 searchAlbums kw 分支 :1688（searchAlbumBykeyWord，data.albumList，reqId 带 al 后缀）+ albumFromKW :1294 */

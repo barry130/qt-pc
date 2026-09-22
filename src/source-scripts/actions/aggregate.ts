@@ -12,6 +12,7 @@
  * （蓝本 Song 有），映射回 App Track 时由调用方按批标注，避免跨平台混批后丢失归属。
  */
 import type {
+  ContractArtistPage,
   ContractChart,
   MusicInfo,
   RequestBuiltin,
@@ -60,6 +61,22 @@ export async function artistSongs(
     }
   }
   return { picUrl, songs };
+}
+
+/**
+ * 歌手列表（热门 / 按首字母）。
+ *
+ * 各平台能力差异见 ContractArtistPage：不支持字母筛选的实现会忽略 initial，
+ * 因此这里不做能力判断，直接把 initialSupported 透传给 UI。
+ */
+export async function artistList(
+  request: RequestBuiltin,
+  source: Source,
+  initial: string,
+  page: number,
+  size: number,
+): Promise<ContractArtistPage> {
+  return platformModule(source).artistList(request, initial, page, size);
 }
 
 /** 蓝本 allSearch：四源顺序（单源失败跳过），按平台分批返回 */

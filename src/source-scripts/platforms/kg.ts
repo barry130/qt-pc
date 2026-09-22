@@ -36,6 +36,7 @@
 import type {
   ContractAlbum,
   ContractArtist,
+  ContractArtistPage,
   ContractChart,
   ContractPlaylist,
   ContractPlaylistCategory,
@@ -1057,6 +1058,40 @@ export const kg = {
       out.push(artistFromKG(asObject(entry)));
     }
     return out;
+  },
+
+  /**
+   * 歌手列表（热门）。酷狗 singer/list 只有语言/性别/排序维度，**没有字母筛选**，
+   * 所以 initial 被忽略、initialSupported 恒为 false（UI 侧字母栏置灰）。
+   * 头像是蓝本的 singerid 规律拼接，与歌手搜索共用 artistFromKG。
+   */
+  async artistList(
+    request: RequestBuiltin,
+    _initial: string,
+    page: number,
+    size: number,
+  ): Promise<ContractArtistPage> {
+    const json = await kgRequestJson(
+      request,
+      "http://mobilecdn.kugou.com/api/v3/singer/list" +
+        buildQuery({
+          showtype: "1",
+          musician: "0",
+          page: String(page),
+          pagesize: String(size),
+          type: "0",
+          area: "0",
+          sex: "0",
+          sort: "0",
+        }),
+    );
+    const data = asObject(json["data"]);
+    const out: ContractArtist[] = [];
+    for (const entry of asArray(data["info"])) {
+      out.push(artistFromKG(asObject(entry)));
+    }
+    const total = asNumber(data["total"]);
+    return { list: out, initialSupported: false, hasMore: page * size < total };
   },
 
   /** 蓝本 searchAlbums kg 分支 :1712（search/album）+ albumFromKG :1325 */

@@ -14,6 +14,12 @@
 export const CHAIN_BUDGET_MS = 12_000;
 export const CHAIN_LINE_MS = 6_000;
 
+/**
+ * 整链兜底比内层多让出的宽限（见 ChainBudget.runChain）。
+ * 只用于「让内层的失败与追踪先落定」，必须远小于引擎侧应答预算。
+ */
+export const CHAIN_GRACE_MS = 250;
+
 export class ChainBudget {
   private readonly deadline: number;
   private readonly lineMs: number;
@@ -41,20 +47,60 @@ export class ChainBudget {
    * 在分片时长内等待 work；超时或 work 抛错都返回 fallback。
    * 不取消底层请求（无 AbortSignal 通道），只是不再等它——换源语义里
    * 「超时」与「失败」等价，都是继续下一条线路。
+   *
+   * @param sliceOverrideMs 显式指定等待时长（缺省 = 单线路分片）。
    */
-  async run<T>(work: Promise<T>, fallback: T): Promise<T> {
-    const slice = this.sliceMs();
-    if (slice <= 0) return fallback;
+  async run<T>(work: Promise<T>, fallback: T, sliceOverrideMs?: number): Promise<T> {
+    return (await this.runTimed(work, fallback, sliceOverrideMs)).value;
+  }
+
+  /**
+   * 同 run，但额外告知「是不是等超时了」。
+   *
+   * 预检必须区分这两者：Range 预检超时只说明这一档预算不够，**不等于链接是死的**。
+   * 2026-09-21 实测：`206 + 2 字节`（按 verifyPlayable 口径属于通过）的合法直链，
+   * 因为预检慢过切片被判成「死链（Range 预检不过）」，好链接被丢掉。
+   */
+  async runTimed<T>(
+    work: Promise<T>,
+    fallback: T,
+    sliceOverrideMs?: number,
+  ): Promise<{ value: T; timedOut: boolean }> {
+    const slice = sliceOverrideMs !== undefined ? sliceOverrideMs : this.sliceMs();
+    if (slice <= 0) return { value: fallback, timedOut: true };
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
     try {
-      return await Promise.race([
+      const value = await Promise.race([
         work.catch(() => fallback),
         new Promise<T>((resolve) => {
-          timer = setTimeout(() => resolve(fallback), slice);
+          timer = setTimeout(() => {
+            timedOut = true;
+            resolve(fallback);
+          }, slice);
         }),
       ]);
+      return { value, timedOut };
     } finally {
       if (timer !== undefined) clearTimeout(timer);
     }
+  }
+
+  /**
+   * 整链兜底等待：按**剩余总预算**而不是单线路分片。
+   *
+   * layer.ts 的外层包装必须用它。用 run() 的后果（2026-09-21 实测，可复现）：
+   * 外层只等 lineMs，而 lineMs 总不大于 totalMs，于是外层永远在内层跑完之前截断——
+   *   · 内层的 totalMs 预算整段不可达（totalMs=12000/lineMs=6000 时，实测无论内层
+   *     需要多久，外层都在 6000ms 返回空串）；
+   *   · 外层截断时内层还没写回追踪，错误文本永远拿不到本次请求的 trace，
+   *     用户看到的逐线路追踪其实是别的请求残留的（见 play-url.ts 的 lastMissTrace）。
+   */
+  async runChain<T>(work: Promise<T>, fallback: T): Promise<T> {
+    // 比内层多让 CHAIN_GRACE_MS：外层与内层共用 totalMs，两个定时器同时到点，
+    // 而外层先注册先触发，会在内层写回追踪之前就返回空串（实测 100% 命中），
+    // 错误文本因此永远拿不到本次请求的 trace。多等一点点，让内层的失败先落定。
+    // 宽限很小，仍在引擎应答预算内（安卓侧取链预算 12s、App 侧 6s）。
+    return await this.run(work, fallback, this.remainingMs + CHAIN_GRACE_MS);
   }
 }

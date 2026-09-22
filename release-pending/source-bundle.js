@@ -85,6 +85,7 @@ function normalizeKgPic(url) {
 }
 const CHAIN_BUDGET_MS = 12e3;
 const CHAIN_LINE_MS = 6e3;
+const CHAIN_GRACE_MS = 250;
 class ChainBudget {
   constructor(totalMs = CHAIN_BUDGET_MS, lineMs = CHAIN_LINE_MS) {
     __publicField(this, "deadline");
@@ -107,21 +108,51 @@ class ChainBudget {
    * 在分片时长内等待 work；超时或 work 抛错都返回 fallback。
    * 不取消底层请求（无 AbortSignal 通道），只是不再等它——换源语义里
    * 「超时」与「失败」等价，都是继续下一条线路。
+   *
+   * @param sliceOverrideMs 显式指定等待时长（缺省 = 单线路分片）。
    */
-  async run(work, fallback) {
-    const slice = this.sliceMs();
-    if (slice <= 0) return fallback;
+  async run(work, fallback, sliceOverrideMs) {
+    return (await this.runTimed(work, fallback, sliceOverrideMs)).value;
+  }
+  /**
+   * 同 run，但额外告知「是不是等超时了」。
+   *
+   * 预检必须区分这两者：Range 预检超时只说明这一档预算不够，**不等于链接是死的**。
+   * 2026-09-21 实测：`206 + 2 字节`（按 verifyPlayable 口径属于通过）的合法直链，
+   * 因为预检慢过切片被判成「死链（Range 预检不过）」，好链接被丢掉。
+   */
+  async runTimed(work, fallback, sliceOverrideMs) {
+    const slice = sliceOverrideMs !== void 0 ? sliceOverrideMs : this.sliceMs();
+    if (slice <= 0) return { value: fallback, timedOut: true };
     let timer;
+    let timedOut = false;
     try {
-      return await Promise.race([
+      const value = await Promise.race([
         work.catch(() => fallback),
         new Promise((resolve) => {
-          timer = setTimeout(() => resolve(fallback), slice);
+          timer = setTimeout(() => {
+            timedOut = true;
+            resolve(fallback);
+          }, slice);
         })
       ]);
+      return { value, timedOut };
     } finally {
       if (timer !== void 0) clearTimeout(timer);
     }
+  }
+  /**
+   * 整链兜底等待：按**剩余总预算**而不是单线路分片。
+   *
+   * layer.ts 的外层包装必须用它。用 run() 的后果（2026-09-21 实测，可复现）：
+   * 外层只等 lineMs，而 lineMs 总不大于 totalMs，于是外层永远在内层跑完之前截断——
+   *   · 内层的 totalMs 预算整段不可达（totalMs=12000/lineMs=6000 时，实测无论内层
+   *     需要多久，外层都在 6000ms 返回空串）；
+   *   · 外层截断时内层还没写回追踪，错误文本永远拿不到本次请求的 trace，
+   *     用户看到的逐线路追踪其实是别的请求残留的（见 play-url.ts 的 lastMissTrace）。
+   */
+  async runChain(work, fallback) {
+    return await this.run(work, fallback, this.remainingMs + CHAIN_GRACE_MS);
   }
 }
 const PLATFORMS = { ANDROID: 1101, IOS: 1102, WINDOWS: 1103 };
@@ -1512,6 +1543,33 @@ const kg = {
       out.push(artistFromKG(asObject(entry)));
     }
     return out;
+  },
+  /**
+   * 歌手列表（热门）。酷狗 singer/list 只有语言/性别/排序维度，**没有字母筛选**，
+   * 所以 initial 被忽略、initialSupported 恒为 false（UI 侧字母栏置灰）。
+   * 头像是蓝本的 singerid 规律拼接，与歌手搜索共用 artistFromKG。
+   */
+  async artistList(request, _initial, page, size) {
+    const json = await kgRequestJson(
+      request,
+      "http://mobilecdn.kugou.com/api/v3/singer/list" + buildQuery({
+        showtype: "1",
+        musician: "0",
+        page: String(page),
+        pagesize: String(size),
+        type: "0",
+        area: "0",
+        sex: "0",
+        sort: "0"
+      })
+    );
+    const data = asObject(json["data"]);
+    const out = [];
+    for (const entry of asArray(data["info"])) {
+      out.push(artistFromKG(asObject(entry)));
+    }
+    const total = asNumber(data["total"]);
+    return { list: out, initialSupported: false, hasMore: page * size < total };
   },
   /** 蓝本 searchAlbums kg 分支 :1712（search/album）+ albumFromKG :1325 */
   async albumSearch(request, keyword, page, size) {
@@ -12618,6 +12676,38 @@ const kw = {
     }
     return out;
   },
+  /**
+   * 歌手列表。酷我 `artist/artistInfo` 支持 prefix 按首字母筛选，是四个音源里
+   * **唯一**支持服务端字母索引的，initialSupported 为 true。
+   * prefix 取值（实测）：字母 → 该字母（`a` 456 人）；空串 → 热门（9204 人）；
+   * `~` → 非字母档（551 人，对应 UI 的「#」）；`#`/数字 → 0 条，故做了归一。
+   * 响应是 data.artistList + data.total（不是 list）。
+   */
+  async artistList(request, initial, page, size) {
+    const letter = initial.trim();
+    let prefix = "";
+    if (/^[A-Za-z]$/.test(letter)) prefix = letter.toLowerCase();
+    else if (letter === "#") prefix = "~";
+    const json = await kuwoRequest(
+      request,
+      "https://www.kuwo.cn/api/www/artist/artistInfo" + buildQuery({
+        category: "0",
+        prefix,
+        pn: String(page),
+        rn: String(size),
+        httpsStatus: "1",
+        reqId: Date.now().toString() + "ar"
+      }),
+      "GET"
+    );
+    const data = asObject(json["data"]);
+    const out = [];
+    for (const entry of asArray(data["artistList"])) {
+      out.push(artistFromKW(asObject(entry)));
+    }
+    const total = asNumber(data["total"]);
+    return { list: out, initialSupported: true, hasMore: page * size < total };
+  },
   /** 蓝本 searchAlbums kw 分支 :1688（searchAlbumBykeyWord，data.albumList，reqId 带 al 后缀）+ albumFromKW :1294 */
   async albumSearch(request, keyword, page, size) {
     const json = await kuwoRequest(
@@ -13124,6 +13214,47 @@ const qq = {
     }
     return artists;
   },
+  /**
+   * 歌手列表。QQ 的 v8.fcg 歌手列表**忽略字母参数**（实测 index=A 无效），
+   * 所以 initialSupported 为 false；但每条带 Findex（首字母），随条目返回给
+   * 客户端做分组。列表本身不给头像，按 mid 拼官方图片地址（实测 200）。
+   */
+  async artistList(request, _initial, page, size) {
+    const json = await requestJson(
+      request,
+      "https://c.y.qq.com/v8/fcg-bin/v8.fcg" + buildQuery({
+        channel: "singer",
+        page: "list",
+        key: "all_all_all",
+        pagesize: String(size),
+        pagenum: String(page),
+        hostUin: "0",
+        format: "json",
+        inCharset: "utf8",
+        outCharset: "utf-8",
+        notice: "0",
+        platform: "yqq",
+        needNewCode: "0"
+      }),
+      { headers: QQ_HEADERS }
+    );
+    const data = asObject(json["data"]);
+    const out = [];
+    for (const entry of asArray(data["list"])) {
+      const item = asObject(entry);
+      const mid = asString(item["Fsinger_mid"]);
+      out.push({
+        id: mid,
+        platform: "qq",
+        name: asString(item["Fsinger_name"]),
+        // 列表不给图：按 mid 拼官方歌手图（T001R300x300M000{mid}.jpg）
+        picUrl: mid.length > 0 ? "https://y.qq.com/music/photo_new/T001R300x300M000" + mid + ".jpg" : "",
+        initial: asString(item["Findex"]).toUpperCase()
+      });
+    }
+    const total = asNumber(data["total"]);
+    return { list: out, initialSupported: false, hasMore: page * size < total };
+  },
   /** 蓝本 searchAlbums qq 分支 :1671（client_search_cp t=8）+ albumFromQQ :1255 */
   async albumSearch(request, keyword, page, size) {
     const json = await requestJson(
@@ -13280,9 +13411,9 @@ function wyyBrParam(quality) {
 function songFromWyy(item) {
   const songData = asObject(item["song"]);
   const merged = Object.keys(songData).length > 0 ? songData : item;
-  const artistList = asArray(merged["artists"]);
+  const artistList2 = asArray(merged["artists"]);
   const arList = asArray(merged["ar"]);
-  const finalArtists = artistList.length > 0 ? artistList : arList;
+  const finalArtists = artistList2.length > 0 ? artistList2 : arList;
   const albumData = asObject(merged["album"]).id !== void 0 ? asObject(merged["album"]) : asObject(merged["al"]);
   const firstArtist = finalArtists.length > 0 ? asObject(finalArtists[0]) : {};
   const albumObj = Object.keys(albumData).length > 0 ? albumData : {};
@@ -13590,6 +13721,35 @@ const wyy = {
     }
     return out;
   },
+  /**
+   * 歌手列表（热门）。wyy 的 artist/list 只有 initial=0（热门）实测有数据，
+   * 字母档（1..27）在该接口上恒空，所以 initialSupported 为 false。
+   * 翻页靠响应里的 more 标志，比按条数猜准。
+   */
+  async artistList(request, _initial, page, size) {
+    const json = await requestJson(
+      request,
+      "https://music.163.com/api/artist/list" + buildQuery({
+        type: "1",
+        area: "-1",
+        initial: "0",
+        limit: String(size),
+        offset: String((page - 1) * size)
+      }),
+      { headers: WYY_HEADERS }
+    );
+    const out = [];
+    for (const entry of asArray(json["artists"])) {
+      const item = asObject(entry);
+      out.push({
+        id: asString(item["id"]),
+        platform: "wyy",
+        name: asString(item["name"]),
+        picUrl: asString(item["picUrl"])
+      });
+    }
+    return { list: out, initialSupported: false, hasMore: json["more"] === true };
+  },
   /** 蓝本 searchAlbums wyy 分支 :1725（type=10）+ albumFromWyy :1240 */
   async albumSearch(request, keyword, page, size) {
     const json = await requestJson(
@@ -13777,6 +13937,7 @@ async function runHttpLine(line, request, song, quality) {
 }
 const PLAY_URL_TTL_MS = 10 * 60 * 1e3;
 const urlCache = new TtlCache(PLAY_URL_TTL_MS);
+const VERIFY_MS = 2500;
 const BUNDLE_IMPLS = {
   wyyMusicUrlCore: (request, song, quality) => wyy.musicUrlCore(request, song, quality),
   qqMusicUrlCore: (request, song, quality) => qq.musicUrlCore(request, song, quality),
@@ -13847,9 +14008,12 @@ async function resolvePlayUrl(request, source, song, quality, platform = LOCAL_P
   return resolvePlayUrlWithBudget(request, source, song, quality, budget, platform);
 }
 let lastMissTrace = "";
-function consumeLastMissTrace() {
+let lastMissKey = "";
+function consumeLastMissTrace(key) {
+  if (lastMissKey !== key) return "";
   const t2 = lastMissTrace;
   lastMissTrace = "";
+  lastMissKey = "";
   return t2;
 }
 function traceEntry(lineId, detail) {
@@ -13862,6 +14026,7 @@ async function resolvePlayUrlWithBudget(request, source, song, quality, budget, 
   const cached2 = urlCache.get(cacheKey);
   if (cached2.length > 0) return cached2;
   lastMissTrace = "";
+  lastMissKey = "";
   const runners = filterChainLines(config.chains[source] ?? [], platform).filter((line) => line.qualities.includes(quality)).slice(0, config.maxLinesPerQuality).map((line) => ({
     id: line.id,
     parallel: line.parallel === true,
@@ -13877,23 +14042,30 @@ async function resolvePlayUrlWithBudget(request, source, song, quality, budget, 
       );
     }
   }
-  for (const runner of runners) {
+  for (let i2 = 0; i2 < runners.length; i2++) {
+    const runner = runners[i2];
     if (budget.expired) {
       trace.push(traceEntry(runner.id, "预算耗尽未跑"));
       continue;
     }
+    const restCount = runners.length - 1 - i2;
+    const lineSlice = restCount > 0 ? Math.min(budget.sliceMs(), Math.floor(budget.remainingMs / 2)) : void 0;
     const raw = await budget.run(
       started.get(runner.executor) ?? runner.executor(request, song, quality).catch((e2) => `err:${msgOf(e2)}`),
-      ""
+      "",
+      lineSlice
     );
     let url = typeof raw === "string" ? raw : "";
     if (typeof raw === "string" && raw.length > 6 && raw.startsWith("err:")) {
       trace.push(traceEntry(runner.id, raw));
       continue;
     }
-    if (url.length > 0 && !await budget.run(verifyPlayable(request, url), false)) {
-      trace.push(traceEntry(runner.id, "死链（Range 预检不过）"));
-      url = "";
+    if (url.length > 0) {
+      const verified = await budget.runTimed(verifyPlayable(request, url), false, VERIFY_MS);
+      if (!verified.value) {
+        trace.push(traceEntry(runner.id, verified.timedOut ? "预检超时" : "死链（Range 预检不过）"));
+        url = "";
+      }
     }
     if (url.length > 0) {
       trace.push(traceEntry(runner.id, "ok"));
@@ -13913,6 +14085,7 @@ async function resolvePlayUrlWithBudget(request, source, song, quality, budget, 
     if (url.length > 0) return settle(cacheKey, url);
   }
   lastMissTrace = `${source}@${quality} ${trace.join("; ")}`;
+  lastMissKey = cacheKey;
   throw new Error("该歌曲暂时无法播放");
 }
 function msgOf(e2) {
@@ -14007,7 +14180,7 @@ function createSourceLayer(deps) {
       if (!handler) return "";
       const config = await getChainConfig();
       const budget = new ChainBudget(config.budget.totalMs, config.budget.lineMs);
-      return budget.run(
+      return budget.runChain(
         Promise.resolve(handler(deps.request, song, quality, deps.platform)),
         ""
       );
@@ -14035,6 +14208,9 @@ async function artistSongs(request, source, name, page, size) {
     }
   }
   return { picUrl, songs };
+}
+async function artistList(request, source, initial, page, size) {
+  return platformModule$1(source).artistList(request, initial, page, size);
 }
 async function allSearchBatches(request, keyword, page, size) {
   const batches = [];
@@ -14197,7 +14373,7 @@ function registerQtEntries(host2) {
       };
       const url = await layer.resolvePlayUrl(source, song, quality);
       if (url.length === 0) {
-        const trace = consumeLastMissTrace();
+        const trace = consumeLastMissTrace(source + ":" + song.id + ":" + quality);
         throw new Error(trace.length > 0 ? `未取到播放地址（${trace}）` : "未取到播放地址");
       }
       return JSON.stringify({ url, source, quality });
@@ -14284,6 +14460,21 @@ function registerQtEntries(host2) {
         String(args.id == null ? "" : args.id)
       );
       return JSON.stringify({ detail });
+    },
+    /**
+     * 歌手列表（热门 / 按首字母）。
+     * initial 为空串表示热门；不支持字母筛选的音源会忽略它并返回热门列表，
+     * 能力由返回里的 initialSupported 如实告知 UI（见 ContractArtistPage）。
+     */
+    async artistList(args) {
+      const page = await artistList(
+        req,
+        String(args.source),
+        String(args.initial == null ? "" : args.initial),
+        Number(args.page == null ? 1 : args.page),
+        Number(args.size == null ? 30 : args.size)
+      );
+      return JSON.stringify(page);
     },
     /** 歌手歌曲（第一页附头像 picUrl） */
     async artistSongs(args) {

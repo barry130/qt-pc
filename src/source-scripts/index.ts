@@ -243,6 +243,42 @@ export async function searchAlbums(
 }
 
 /**
+ * 歌手列表（热门 / 按首字母）。
+ *
+ * `initial` 传空串表示热门；不支持字母筛选的音源会忽略它并返回热门列表，
+ * 能力由返回里的 `initialSupported` 如实告知 —— UI 据此决定字母栏是否可点。
+ */
+export async function getArtistList(
+  source: SourceId,
+  initial: string,
+  page: number,
+  size: number,
+): Promise<{ list: Artist[]; initialSupported: boolean; hasMore: boolean }> {
+  ensureScript(source);
+  const payload = await sourceCall<{
+    list?: { id: string; name: string; picUrl: string; initial?: string }[];
+    initialSupported?: boolean;
+    hasMore?: boolean;
+  }>("artistList", { source, initial, page, size }, (p) => p as {
+    list?: { id: string; name: string; picUrl: string; initial?: string }[];
+    initialSupported?: boolean;
+    hasMore?: boolean;
+  });
+  const list = Array.isArray(payload.list) ? payload.list : [];
+  return {
+    list: list.map((item) => ({
+      id: item.id,
+      platform: source,
+      name: item.name,
+      picUrl: item.picUrl,
+      initial: typeof item.initial === "string" ? item.initial : undefined,
+    })),
+    initialSupported: payload.initialSupported === true,
+    hasMore: payload.hasMore === true,
+  };
+}
+
+/**
  * 专辑详情（蓝本 albumDetail :1758，四平台全量移植）：
  * 返回结构与歌单详情一致（Playlist + tracks），供 UI 以歌单详情形态打开专辑。
  */

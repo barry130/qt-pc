@@ -73,8 +73,11 @@ describe("source-update 判定（§2.3）", () => {
   });
 
   it("5b. 未安装任何包且远端 > 内置版 → 下载", () => {
-    // 字面量取「比当前内置版（2026092101）新一号」；内置版升级后这里要跟着挪
-    const d = decideUpdate(release({ sourceVersionCode: 2026092102 }), local({ installed: null }));
+    // 从常量推「比内置版新一号」，别再写死字面量：内置版号随 App 发版同步，写死必过期
+    const d = decideUpdate(
+      release({ sourceVersionCode: BUILTIN_SOURCE_VERSION.code + 1 }),
+      local({ installed: null }),
+    );
     expect(d.action).toBe("download");
   });
 
@@ -96,7 +99,7 @@ describe("source-update 判定（§2.3）", () => {
 
   it("5e. 未装远程包且远端 > 内置版 → 下载", () => {
     const d = decideUpdate(
-      release({ sourceVersionCode: 2026092102 }),
+      release({ sourceVersionCode: BUILTIN_SOURCE_VERSION.code + 1 }),
       local({ installed: null }),
     );
     expect(d.action).toBe("download");
@@ -105,7 +108,7 @@ describe("source-update 判定（§2.3）", () => {
   it("5f. 公开 manifest 的 published 为 null（管理端字段）→ 视为已发布", () => {
     const d = decideUpdate(
       release({
-        sourceVersionCode: 2026092102,
+        sourceVersionCode: BUILTIN_SOURCE_VERSION.code + 1,
         published: null as unknown as boolean,
       }),
       local({ installed: null }),

@@ -36,7 +36,12 @@ export function createSourceLayer(deps: SourceLayerDeps) {
       const budget = new ChainBudget(config.budget.totalMs, config.budget.lineMs);
       // deps.platform 透传给执行器：chain.json 的行级 platforms 过滤按本机平台生效
       // （安卓 1101 与 PC 1103 共用同一份 bundle，这一步是两端唯一的平台差异入口）
-      return budget.run(
+      //
+      // 必须用 runChain（等剩余**总**预算）而不是 run（等单线路分片）：run 的切片是
+      // min(lineMs, remaining)，而 lineMs 总不大于 totalMs，于是外层永远在内层跑完之前
+      // 截断——内层 totalMs 整段不可达，且外层截断时内层还没写回追踪，错误文本里的
+      // 逐线路 trace 会变成别的请求残留的。详见 budget.ts runChain 注释。
+      return budget.runChain(
         Promise.resolve(handler(deps.request, song, quality, deps.platform)),
         "",
       );

@@ -56,6 +56,7 @@ const cases = [
   ["searchAll", { keyword: "晴天", page: 1, size: 2 }, (r) => `batches=${r.batches.map((b) => b.source + ":" + b.list.length).join(",")}`],
   ["searchPlaylists", { source: "wyy", keyword: "周杰伦", page: 1, size: 3 }, (r) => `list=${r.list.length} first=${r.list[0]?.name}`],
   ["searchArtists", { source: "qq", keyword: "周杰伦", page: 1, size: 3 }, (r) => `list=${r.list.length} first=${r.list[0]?.name} pic=${(r.list[0]?.picUrl || "").slice(0, 30)}`],
+  ["artistList", { source: "kw", initial: "z", page: 1, size: 3 }, (r) => `list=${r.list.length} first=${r.list[0]?.name} 服务端字母=${r.initialSupported} hasMore=${r.hasMore}`],
   ["searchAlbums", { source: "kw", keyword: "周杰伦", page: 1, size: 3 }, (r) => `list=${r.list.length} first=${r.list[0]?.name}`],
   ["playlistCategories", { source: "wyy" }, (r) => `list=${r.list.length} first=${r.list[0]?.name}`],
   ["charts", { source: "wyy" }, (r) => `list=${r.list.length} first=${r.list[0]?.name}`],

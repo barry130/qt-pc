@@ -148,12 +148,17 @@ export interface Playlist {
   tracks?: Track[];
 }
 
-/** 歌手（搜索歌手结果） */
+/** 歌手（搜索歌手结果 / 歌手列表） */
 export interface Artist {
   id: string;
   platform: SourceId;
   name: string;
   picUrl: string;
+  /**
+   * 首字母（A-Z / #）。只有音源给了才有（qq 的 Findex）——
+   * 拿不到就别在客户端猜拼音，按「其他」归组即可。
+   */
+  initial?: string;
 }
 
 /** 专辑（搜索专辑结果） */

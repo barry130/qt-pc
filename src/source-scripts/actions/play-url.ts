@@ -34,6 +34,17 @@ import { getLxHost, lxPlayUrl } from "../schemes/lx-host/sources";
 const PLAY_URL_TTL_MS = 10 * 60 * 1000;
 const urlCache = new TtlCache(PLAY_URL_TTL_MS);
 
+/**
+ * Range 预检单独的时间片（不吃整条线路的分片）。
+ *
+ * 预检只是「这条直链还能不能取到音频字节」的校验，代价应当远小于取址本身；
+ * 按整条线路的分片计时会出现两个后果（2026-09-21 实测）：
+ *   · 一条线路 + 它的预检 = 2×lineMs，足够吃光 totalMs，后面线路全部「预算耗尽未跑」；
+ *   · 预检慢过切片时被判成「死链（Range 预检不过）」，把合法直链丢掉——
+ *     实测该直链随后返回 206 + 2 字节，按 verifyPlayable 口径本来是通过。
+ */
+const VERIFY_MS = 2500;
+
 /** 单条线路解析成的执行函数（未命中返回空串；失败抛错也按未命中处理） */
 type LineExecutor = (request: RequestBuiltin, song: MusicInfo, quality: Quality) => Promise<string>;
 
@@ -149,11 +160,20 @@ export async function resolvePlayUrl(
 
 /** 最近一次整链全灭的逐线路追踪（诊断用；安卓端会随「未取到播放地址」一并上抛） */
 let lastMissTrace = "";
+/**
+ * 上面这条追踪属于哪次请求（cacheKey = source:song.id:quality）。
+ *
+ * 没有归属标记时，并发/被外层提前截断的请求会把别的请求的死因报进本次错误文本——
+ * 2026-09-21 用户日志里三条不同歌曲的 trace 逐字相同，就是这么来的。
+ */
+let lastMissKey = "";
 
-/** 读走最近一次全灭追踪（读后即清，避免旧 trace 混进下一次失败） */
-export function consumeLastMissTrace(): string {
+/** 读走最近一次全灭追踪（读后即清，避免旧 trace 混进下一次失败）；归属不匹配返回空串 */
+export function consumeLastMissTrace(key: string): string {
+  if (lastMissKey !== key) return "";
   const t = lastMissTrace;
   lastMissTrace = "";
+  lastMissKey = "";
   return t;
 }
 
@@ -180,6 +200,7 @@ export async function resolvePlayUrlWithBudget(
   const cached = urlCache.get(cacheKey);
   if (cached.length > 0) return cached;
   lastMissTrace = "";
+  lastMissKey = "";
 
   // 档内线路：按音质过滤 → 行级 enabled/platforms 过滤 → 封顶 maxLinesPerQuality
   const runners = filterChainLines(config.chains[source] ?? [], platform)
@@ -203,25 +224,40 @@ export async function resolvePlayUrlWithBudget(
       );
     }
   }
-  for (const runner of runners) {
+  for (let i = 0; i < runners.length; i++) {
+    const runner = runners[i];
     if (budget.expired) {
       trace.push(traceEntry(runner.id, "预算耗尽未跑"));
       continue;
     }
+    // 还有几条线路排在后面：本线路最多只用剩余预算的一半，把另一半留给它们。
+    // 不分摊的后果（2026-09-21 实测）：第一条挂死线路（或它慢过切片的 Range 预检）
+    // 就能吃光 totalMs，后面每条线路都被记为「预算耗尽未跑」——用户看到的就是
+    // 「一次失败之后，后面所有线路都不跑了」。
+    const restCount = runners.length - 1 - i;
+    const lineSlice =
+      restCount > 0 ? Math.min(budget.sliceMs(), Math.floor(budget.remainingMs / 2)) : undefined;
     // 挂死的线路由分片上限切断，让后面的线路还有机会；整链总时长由预算兜底
     const raw = await budget.run(
       started.get(runner.executor) ?? runner.executor(request, song, quality).catch((e: unknown) => `err:${msgOf(e)}`),
       "",
+      lineSlice,
     );
     let url = typeof raw === "string" ? raw : "";
     if (typeof raw === "string" && raw.length > 6 && raw.startsWith("err:")) {
       trace.push(traceEntry(runner.id, raw));
       continue;
     }
-    // 每条线路的返回值都实测（见 verifyPlayable 注释）：死链按未命中继续换源
-    if (url.length > 0 && !(await budget.run(verifyPlayable(request, url), false))) {
-      trace.push(traceEntry(runner.id, "死链（Range 预检不过）"));
-      url = "";
+    // 每条线路的返回值都实测（见 verifyPlayable 注释）：死链按未命中继续换源。
+    // 预检单独给 VERIFY_MS，不吃整条线路的分片——它只是校验，不该和取址同价；
+    // 且必须区分「超时」与「死链」：超时只说明这档预算不够，记成死链会把好链接判死
+    // （2026-09-21 实测：206 + 2 字节的合法直链被记成「死链（Range 预检不过）」）。
+    if (url.length > 0) {
+      const verified = await budget.runTimed(verifyPlayable(request, url), false, VERIFY_MS);
+      if (!verified.value) {
+        trace.push(traceEntry(runner.id, verified.timedOut ? "预检超时" : "死链（Range 预检不过）"));
+        url = "";
+      }
     }
     if (url.length > 0) {
       trace.push(traceEntry(runner.id, "ok"));
@@ -242,6 +278,7 @@ export async function resolvePlayUrlWithBudget(
     if (url.length > 0) return settle(cacheKey, url);
   }
   lastMissTrace = `${source}@${quality} ${trace.join("; ")}`;
+  lastMissKey = cacheKey;
   throw new Error("该歌曲暂时无法播放");
 }
 
