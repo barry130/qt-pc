@@ -62,6 +62,17 @@ describe("页面渲染冒烟", () => {
     expect(container.textContent).toContain("同步云端收藏");
   });
 
+  it("个人中心页：未登录态渲染登录入口与本地统计", async () => {
+    const { ProfilePage } = await import("@/components/mine/ProfilePage");
+    const container = await renderAfterEffects(<ProfilePage />);
+    expect(container.textContent).toContain("未登录");
+    expect(container.textContent).toContain("登录 / 注册");
+    expect(container.textContent).toContain("常用");
+    // 统计格与常用入口是登录与否都在的
+    expect(container.textContent).toContain("本地歌曲");
+    expect(container.textContent).toContain("我的歌单");
+  });
+
   it("最近播放页：空态提示", async () => {
     const { HistoryPage } = await import("@/components/mine/HistoryPage");
     const container = await renderAfterEffects(<HistoryPage />);

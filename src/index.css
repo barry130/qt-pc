@@ -41,6 +41,10 @@
   --sidebar-ring: #4f46e5;
   --lyric-highlight: var(--primary);
   --lyric-inactive: oklch(0.55 0.02 265);
+  /* 品牌渐变（强调面：个人中心资料卡、头像描边等）。
+     第二色由 --primary 混出，跟着运行时皮肤走，组件里不硬编码 hex。 */
+  --brand-from: var(--primary);
+  --brand-to: color-mix(in oklab, var(--primary) 55%, #a855f7);
 }
 
 .dark {
@@ -74,6 +78,9 @@
   /* 歌词高亮用亮一档的 indigo-400，深底上才够跳 */
   --lyric-highlight: #818cf8;
   --lyric-inactive: #64748b;
+  /* 深色下第二色提亮一档，深底上渐变才看得见 */
+  --brand-from: var(--primary);
+  --brand-to: color-mix(in oklab, var(--primary) 50%, #c084fc);
 }
 
 @theme inline {
@@ -99,6 +106,8 @@
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
+  --color-brand-from: var(--brand-from);
+  --color-brand-to: var(--brand-to);
   --color-sidebar: var(--sidebar);
   --color-sidebar-foreground: var(--sidebar-foreground);
   --color-sidebar-primary: var(--sidebar-primary);
