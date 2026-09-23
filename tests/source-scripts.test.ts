@@ -413,8 +413,12 @@ describe("声明式 http 线路（chain.json kind:http）+ script qq 链", () =>
     // 2026-09-23 全量逐线路复测（platform 1101，独立单链 × 12 首 × 3 档）后摘除 3 条：
     //   kw-stellarwave 0/36、kg-lxv6 0/36（脚本初始化即失败）、kg-yuningxi-pro 1/12。
     // 均为「只摘该平台线路、脚本保留」（同一脚本在别的平台仍可用）。
+    // kw 顺序按复测「成功率 → 耗时」从优到劣（取链命中即返回，越靠前越省预算）：
+    // native-des 36/36=100%/128ms > yuningxi-pro 32/36=89%/137ms
+    //   > yuxi 89%/202ms > quandouyao 89%/715ms。
+    // 已上线的 2026092301 就是这个顺序，锁死避免下次构建被改回。
     expect(cfg.chains.kw!.map((line) => line.id)).toEqual([
-      "kw-yuningxi-pro", "kw-yuxi", "kw-quandouyao", "kw-native-des",
+      "kw-native-des", "kw-yuningxi-pro", "kw-yuxi", "kw-quandouyao",
     ]);
     expect(cfg.chains.kg!.map((line) => line.id)).toEqual([
       "kg-yuxi", "kg-stellarwave", "kg-molan",
