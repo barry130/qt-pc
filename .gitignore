@@ -22,12 +22,13 @@ src-tauri/gen/schemas/
 .npm-cache/
 .pnpm-store/
 .vite-cache/
-qtMusicqt-pc.npm-cache/
 # 只写了本机 cache/store 绝对路径
 .npmrc
 
-# 临时脚本与临时目录
+# 临时脚本与临时目录（.tmp 是会话级临时目录，注意 *.tmp 规则只按后缀匹配，
+# 这里显式列出目录名以免误提交）
 tmp/
+.tmp/
 
 # 编辑器 / 系统
 .vscode/
