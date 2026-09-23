@@ -1,0 +1,48 @@
+{
+  "$comment": [
+    "轻听 PC 版唯一的配置源。改配置只改这个文件，然后跑 `pnpm config:sync`",
+    "（或 `node scripts/sync-config.mjs`）把值写进各工具自己的配置文件；",
+    "禁止直接改派生文件（它们由 scripts/sync-config.mjs 生成，`pnpm config:check` 会校验）。",
+    "规则：只有「在多个文件里重复出现」的值才收进这里；某个工具独占的配置",
+    "（tsconfig 编译选项、vite 构建目标、Cargo 依赖与 profile、NSIS 模板等）留在原文件，",
+    "因为那些工具只能读自己的文件名与格式。字段含义见 docs/CONFIG.md。"
+  ],
+
+  "product": {
+    "name": "QuietMusic",
+    "displayName": "轻听",
+    "identifier": "com.qt.quietmusic"
+  },
+
+  "version": {
+    "name": "1.0.7",
+    "code": 107
+  },
+
+  "sourcePack": {
+    "code": 2026092301,
+    "name": "2026.09.23.1",
+    "hostApiVersion": 1
+  },
+
+  "backend": {
+    "dev": "http://localhost:27000/api/v1/",
+    "prod": "http://astral.canace.cn/api/v1/",
+    "active": "prod"
+  },
+
+  "platform": {
+    "android": 1101,
+    "ios": 1102,
+    "windows": 1103
+  },
+
+  "feedback": {
+    "platform": "windows"
+  },
+
+  "devServer": {
+    "port": 1420,
+    "hmrPort": 1421
+  }
+}

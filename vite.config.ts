@@ -2,6 +2,9 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import path from "node:path";
+// 端口单源于仓库根的 app.config.json（改端口只改那里；tauri.conf.json 的 devUrl 由
+// scripts/sync-config.mjs 同步，两边不会漂移）
+import appConfig from "./app.config.json";
 
 // @tauri-apps/cli 固定 host/port，dev server 不得使用 strictPort 之外的随机端口
 const host = process.env.TAURI_DEV_HOST;
@@ -17,14 +20,14 @@ export default defineConfig({
   cacheDir: ".vite-cache",
   clearScreen: false,
   server: {
-    port: 1420,
+    port: appConfig.devServer.port,
     strictPort: true,
     host: host || false,
     hmr: host
       ? {
           protocol: "ws",
           host,
-          port: 1421,
+          port: appConfig.devServer.hmrPort,
         }
       : undefined,
     watch: {

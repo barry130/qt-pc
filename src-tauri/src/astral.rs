@@ -187,18 +187,23 @@ fn parse_session(data: &Value) -> Result<AuthSession, String> {
     })
 }
 
+// ---- 后端地址与平台参数单源于仓库根的 app.config.json（scripts/sync-config.mjs
+// ---- 生成到 src/app_config.rs）。这里只做转发，对外名字不变，调用方无需改动。
+
 /// 生产后端（线上环境，qt-uniappx services/config.local.ts API_BASE_URL_PROD 同源）
-pub const PROD_BASE_URL: &str = "http://astral.canace.cn/api/v1/";
+pub const PROD_BASE_URL: &str = crate::app_config::PROD_BASE_URL;
 /// 本地开发后端（本机 astral 服务，qt-uniappx services/config.local.ts API_BASE_URL_DEV 同源）
-pub const DEV_BASE_URL: &str = "http://localhost:27000/api/v1/";
-/// 当前生效的后端地址：生产后端（音源包 P2 联调已完成；联调期间临时切 `DEV_BASE_URL`）。
-pub const DEFAULT_BASE_URL: &str = PROD_BASE_URL;
+pub const DEV_BASE_URL: &str = crate::app_config::DEV_BASE_URL;
+/// 当前生效的后端地址：由 app.config.json 的 `backend.active` 决定（当前 = 生产后端）。
+/// 要联调本地后端：把 active 改成 "dev" → `pnpm config:sync` → 重新编译。
+pub const DEFAULT_BASE_URL: &str = crate::app_config::DEFAULT_BASE_URL;
 
 /// 更新 / 消息 / 统计的平台固定参数（§15.2）
-pub const UPDATE_TYPE: &str = "1103";
+/// UPDATE_TYPE 取 app.config.json 的 platform.windows（1103 = Windows）
+pub const UPDATE_TYPE: &str = crate::app_config::UPDATE_TYPE;
 pub const MESSAGE_CHANNEL: &str = "pc";
 pub const STAT_UT: &str = "app-windows";
-pub const FEEDBACK_PLATFORM: &str = "windows";
+pub const FEEDBACK_PLATFORM: &str = crate::app_config::FEEDBACK_PLATFORM;
 
 /// 会话被服务端否认时统一的错误文案。
 /// HTTP 401 和业务码 401 都归一成这一条，调用方（如 `cmd_astral_me`）据此
@@ -875,16 +880,16 @@ fn feedback_headers() -> Vec<(&'static str, String)> {
     vec![("X-Platform", FEEDBACK_PLATFORM.to_string())]
 }
 
-/// versionName：Cargo 包版本（与 tauri.conf.json version 保持一致，单一真值 §15.7）
+/// versionName：Cargo 包版本（Cargo.toml 由 app.config.json 同步，单一真值 §15.7）
 pub fn version_name() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
-/// versionCode：发版时手动维护的整数（与移动端 manifest.json 的 versionCode 同一约定），
+/// versionCode：发版版本号（与移动端 manifest.json 的 versionCode 同一约定），
 /// 必须和后端 qt_app_update 表里对应版本的记录一致——更新检查就是拿它比大小。
-/// 1.0.0 → 100；1.0.1 → 101；1.0.2 → 102；1.0.3 → 103；1.0.4 → 104；1.0.5 → 105；
-/// 1.0.6 → 106；1.0.7 → 107；下次发版记得同步 +1。
-pub const VERSION_CODE: i64 = 107;
+/// 1.0.0 → 100 … 1.0.7 → 107。值来自 app.config.json 的 `version.code`，
+/// 由 scripts/sync-config.mjs 写进 app_config.rs：**改版本号只改 app.config.json**。
+pub const VERSION_CODE: i64 = crate::app_config::VERSION_CODE;
 
 pub fn version_code() -> i64 {
     VERSION_CODE
@@ -895,12 +900,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn version_code_is_the_manual_release_constant() {
-        // versionCode 不再从版本号推导（旧公式 1.0.0 会算出 10000），
-        // 而是与后端 qt_app_update 记录对齐的手动常量：1.0.0 → 100 … 1.0.7 → 107
-        assert_eq!(VERSION_CODE, 107);
+    fn version_code_is_sourced_from_app_config() {
+        // 版本号单源：app.config.json → app_config.rs（这里只验证转发没被改坏）。
+        // 「version.name ↔ version.code 自洽」「app_config.rs ↔ JSON 逐项一致」
+        // 「Cargo.toml 版本 ↔ JSON」由 app_config.rs 的单测守着（那里能直接读 JSON）。
+        assert_eq!(VERSION_CODE, crate::app_config::VERSION_CODE);
         assert_eq!(version_code(), VERSION_CODE);
-        assert_eq!(version_name(), env!("CARGO_PKG_VERSION"));
+        assert_eq!(version_name(), crate::app_config::VERSION_NAME);
     }
 
     #[test]

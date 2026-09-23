@@ -1,5 +1,6 @@
 //! 轻听 PC 版 Tauri 入口（lib 形式，便于集成测试）。
 
+pub mod app_config;
 pub mod app_paths;
 pub mod audio;
 pub mod astral;

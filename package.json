@@ -4,12 +4,14 @@
   "version": "1.0.7",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "tsc --noEmit && vite build",
+    "dev": "node scripts/sync-config.mjs && vite",
+    "build": "node scripts/sync-config.mjs && tsc --noEmit && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "node scripts/sync-config.mjs --check && vitest run",
+    "config:sync": "node scripts/sync-config.mjs",
+    "config:check": "node scripts/sync-config.mjs --check",
     "build:sources": "node scripts/build-sources.mjs",
     "sync:builtin": "node scripts/sync-builtin-sources.mjs"
   },
