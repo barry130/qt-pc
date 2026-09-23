@@ -5,8 +5,10 @@
  * 末级跨源）。这里只收脚本包每档 5 条上限放不下的剩余线路，同样按音质高→低
  * 排线，不做跨源（跨源由脚本包末级统一承担）：
  *
- * - kw：墨澜（聚合）→ 独家音源 v6（88.lxmusic.中国 中控）→ 洛雪 v2-fix
- *       （实测仅 320k 可用，线路慢，排最后）；
+ * - kw：墨澜（聚合）→ 洛雪 v2-fix（实测仅 320k 可用，线路慢，排最后）；
+ *       原中间一步「独家音源 v6（88.lxmusic.中国 中控）」已于 2026-09-23 摘除：
+ *       该脚本初始化即失败（lx 未注册 request handler，36 格全败），中控域名
+ *       88.lxmusic.xn--fiqs8s 实测 6s 超时，属脚本级失效、与平台无关；
  * - kg：酷狗官方接口（上游已失效，保留占位对齐蓝本，秒失败）；
  * - wyy / qq：无剩余线路（已全部并入脚本包），不声明 playUrl，
  *   换源顺序走到这里自动跳过。
@@ -15,7 +17,7 @@ import type { MusicInfo, Quality, RequestBuiltin, Source } from "../../contract"
 import { ChainBudget } from "../../budget";
 import { kg } from "../../platforms/kg";
 import { TtlCache } from "../../platforms/utils";
-import { lxPlayUrl, luoxueHost, lxv6Host, molanHost } from "../lx-host/sources";
+import { lxPlayUrl, luoxueHost, molanHost } from "../lx-host/sources";
 
 const PLAY_URL_TTL_MS = 10 * 60 * 1000;
 const urlCache = new TtlCache(PLAY_URL_TTL_MS);
@@ -33,11 +35,6 @@ export const PREMIUM_LINES: Partial<Record<Source, PremiumLine[]>> = {
       name: "墨澜",
       qualities: ["128", "320", "flac"],
       fetch: (request, song, quality) => lxPlayUrl(molanHost, request, "kw", song, quality),
-    },
-    {
-      name: "独家音源 v6",
-      qualities: ["128", "320", "flac"],
-      fetch: (request, song, quality) => lxPlayUrl(lxv6Host, request, "kw", song, quality),
     },
     {
       name: "洛雪 v2-fix",

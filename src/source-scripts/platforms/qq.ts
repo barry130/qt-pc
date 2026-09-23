@@ -43,6 +43,7 @@ import {
   asString,
   buildQuery,
   decodeBase64Utf8,
+  joinSingerNames,
   platformHeaders,
   requestJson,
 } from "./utils";
@@ -62,14 +63,12 @@ function playlistFromQQ(item: Record<string, unknown>): ContractPlaylist {
 
 /** 蓝本 songFromQQ :243（新歌接口：mid/name/album/singer/interval 字段） */
 function songFromQQ(item: Record<string, unknown>): MusicInfo {
-  const singers = asArray(item["singer"]);
-  const singerItem = singers.length > 0 ? asObject(singers[0]) : {};
   const album = asObject(item["album"]);
   const albumMid = album["mid"];
   return {
     id: asString(item["mid"]),
     name: asString(item["name"]),
-    singer: asString(singerItem["name"]),
+    singer: joinSingerNames(item["singer"]),
     album: asString(album["name"]),
     picUrl:
       albumMid != null
@@ -161,13 +160,11 @@ function songFromQQSearch(item: Record<string, unknown>): MusicInfo {
   const fallbackMid = asString(item["mid"]);
   const name1 = asString(item["songname"]);
   const name2 = asString(item["name"]);
-  const singers = asArray(item["singer"]);
-  const singerItem = singers.length > 0 ? asObject(singers[0]) : {};
   const albumMid = item["albummid"];
   return {
     id: idText.length > 0 ? idText : fallbackMid,
     name: name1.length > 0 ? name1 : name2,
-    singer: asString(singerItem["name"]),
+    singer: joinSingerNames(item["singer"]),
     album: asString(item["albumname"]),
     picUrl:
       albumMid != null
@@ -179,13 +176,11 @@ function songFromQQSearch(item: Record<string, unknown>): MusicInfo {
 
 /** 蓝本 songFromQQDetail :1958（歌单/榜单详情：songmid/songname/albumname/albummid/singer/interval） */
 function songFromQQDetail(item: Record<string, unknown>): MusicInfo {
-  const singers = asArray(item["singer"]);
-  const singerItem = singers.length > 0 ? asObject(singers[0]) : {};
   const albumMid = item["albummid"];
   return {
     id: asString(item["songmid"]),
     name: asString(item["songname"]),
-    singer: asString(singerItem["name"]),
+    singer: joinSingerNames(item["singer"]),
     album: asString(item["albumname"]),
     picUrl:
       albumMid != null
@@ -638,14 +633,12 @@ export const qq = {
     const out: ContractVideo[] = [];
     for (const entry of asArray(data["list"])) {
       const item = asObject(entry);
-      const singers = asArray(item["singers"]);
-      const first = singers.length > 0 ? asObject(singers[0]) : null;
       out.push({
         id: asString(item["vid"]),
         platform: "qq",
         name: asString(item["title"]),
         picUrl: asString(item["picurl"]),
-        singer: first != null ? asString(first["name"]) : "",
+        singer: joinSingerNames(item["singers"]),
       });
     }
     return out;

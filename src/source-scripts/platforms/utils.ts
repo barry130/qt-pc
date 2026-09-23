@@ -86,6 +86,25 @@ export function asNumber(value: unknown): number {
   return typeof value === "number" ? value : Number(value) || 0;
 }
 
+/**
+ * 多位歌手拼接：QQ / 网易云的歌手字段是 [{ name }] 数组，原实现只取第一位，
+ * 合唱曲目会漏歌手（「因为爱情」只显示陈奕迅、丢掉王菲）。这里按平台网页端的
+ * 「/」拼接全部歌手名；传入字符串时原样返回（酷我/酷狗接口本身已是拼好的串）。
+ */
+export function joinSingerNames(value: unknown): string {
+  if (typeof value === "string") return value.trim();
+  const names: string[] = [];
+  for (const entry of asArray(value)) {
+    const name =
+      entry !== null && typeof entry === "object"
+        ? asString(asObject(entry)["name"])
+        : asString(entry);
+    const trimmed = name.trim();
+    if (trimmed.length > 0 && !names.includes(trimmed)) names.push(trimmed);
+  }
+  return names.join("/");
+}
+
 /** 简单 TTL 缓存（蓝本 urlCache/lyricCache/coverCache 同职责；进程内） */
 export class TtlCache {
   private readonly inner = new Map<string, { value: string; at: number }>();

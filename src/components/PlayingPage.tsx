@@ -6,17 +6,20 @@ import { usePlayerStore } from "@/stores/player";
 import { useInterpolatedPosition } from "@/hooks/useInterpolatedPosition";
 import { getPlaybackLyric } from "@/lib/localOnline";
 import { findActiveIndex, mergeTranslation, parseLrc, qtresCoverUrl } from "@/lib/lrc";
+import { WindowControls } from "@/components/WindowControls";
 import { cn , errMsg } from "@/lib/utils";
 
 /**
  * 播放页（全屏歌词 + 旋转封面）：
- * - 左侧：黑胶唱片风格旋转封面
+ * - 左侧：黑胶唱片风格旋转封面（仅播放时旋转，暂停停在当前角度）
  * - 右侧：曲目信息 + 滚动歌词
  * - 左上角：收回按钮（返回上一页）
+ * - 右上角：最小化 / 最大化 / 退出（本页隐藏了 TitleBar，必须自带窗口控制）
  * - 歌词同步误差 ≤ 50ms（rAF 插值 + 高亮平滑）
  */
 export function PlayingPage(): React.JSX.Element {
   const track = usePlayerStore((s) => s.state?.track ?? null);
+  const playing = usePlayerStore((s) => s.state?.status === "playing");
   const position = useInterpolatedPosition();
   const navigate = useNavigate();
   const pathname = useLocation().pathname;
@@ -77,15 +80,23 @@ export function PlayingPage(): React.JSX.Element {
         <ChevronDown className="h-5 w-5" />
       </button>
 
+      {/* 窗口控制：AppShell 在播放页整页隐藏 TitleBar，没有这组按钮就没法最小化/关闭窗口 */}
+      <WindowControls
+        variant="floating"
+        closeLabel="退出"
+        className="absolute right-4 top-3 z-10"
+      />
+
       <div className="flex min-h-0 w-full flex-1">
         {/* 左侧：旋转封面 */}
         <div className="flex w-[38%] shrink-0 items-center justify-center">
-          <VinylCover track={track} />
+          <VinylCover track={track} playing={playing} />
         </div>
 
         {/* 右侧：曲目信息 + 歌词 */}
         <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-          <div className="px-8 pt-10 pb-4">
+          {/* pr-32：给右上角的窗口控制按钮让位，长标题不会钻到按钮底下 */}
+          <div className="pl-8 pr-32 pt-10 pb-4">
             <TrackInfo track={track} />
           </div>
           <div className="min-h-0 flex-1 overflow-hidden">
@@ -107,9 +118,9 @@ export function PlayingPage(): React.JSX.Element {
   );
 }
 
-/** 黑胶唱片风格旋转封面 */
-function VinylCover(props: { track: Track | null }): React.JSX.Element {
-  const { track } = props;
+/** 黑胶唱片风格旋转封面（仅播放时旋转） */
+function VinylCover(props: { track: Track | null; playing: boolean }): React.JSX.Element {
+  const { track, playing } = props;
   const coverUrl = track ? qtresCoverUrl(track.picUrl) : null;
 
   return (
@@ -123,10 +134,11 @@ function VinylCover(props: { track: Track | null }): React.JSX.Element {
             "color-mix(in srgb, var(--playing-cover-accent, var(--primary)) 38%, transparent)",
         }}
       />
-      {/* 唱片 */}
+      {/* 唱片：animation-play-state 控制转/停 —— 暂停时停在当前角度，
+          恢复播放从原角度继续，不会跳回 0 度 */}
       <div
-        className="relative h-[280px] w-[280px] rounded-full bg-neutral-900 shadow-2xl sm:h-[320px] sm:w-[320px]"
-        style={{ animation: "spin 20s linear infinite" }}
+        className="vinyl-spin relative h-[280px] w-[280px] rounded-full bg-neutral-900 shadow-2xl sm:h-[320px] sm:w-[320px]"
+        style={{ animationPlayState: playing ? "running" : "paused" }}
       >
         {/* 唱片纹理（同心圆） */}
         <div className="absolute inset-0 rounded-full border border-neutral-800" />

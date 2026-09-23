@@ -39,6 +39,9 @@
   --sidebar-accent-foreground: oklch(0.25 0.02 265);
   --sidebar-border: oklch(0.915 0.008 260);
   --sidebar-ring: #4f46e5;
+  /* 标题栏 / 侧边栏底色。默认等同 --sidebar（首帧回退）；
+     设了背景图时由 useAppearanceEffect 覆写成带 alpha 的版本，让壁纸透出。 */
+  --sidebar-surface: var(--sidebar);
   --lyric-highlight: var(--primary);
   --lyric-inactive: oklch(0.55 0.02 265);
 }
@@ -223,6 +226,28 @@
     width: 100%;
     transform: none;
     opacity: 0.6;
+  }
+}
+
+/* 播放页黑胶封面旋转。
+ * 用 animation-play-state 而不是增删 animation：暂停时停在当前角度，
+ * 恢复播放后从原角度继续，不会「啪」地跳回 0 度。
+ * 也刻意不复用 Tailwind 的 spin —— 那个关键帧只有用到 animate-spin 时才由
+ * Tailwind 输出，这里显式定义，避免依赖它的生成时机。 */
+@keyframes vinyl-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+.vinyl-spin {
+  animation: vinyl-spin 20s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .vinyl-spin {
+    animation: none;
   }
 }
 

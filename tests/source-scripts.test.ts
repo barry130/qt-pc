@@ -397,12 +397,12 @@ describe("声明式 http 线路（chain.json kind:http）+ script qq 链", () =>
     expect(typeof registry.getPlayUrlHandler(premium!, "kg")).toBe("function");
 
     // premium 剩余链组成（音质高→低，不跨源）
-    expect(PREMIUM_LINES.kw!.map((line) => line.name)).toEqual(["墨澜", "独家音源 v6", "洛雪 v2-fix"]);
+    expect(PREMIUM_LINES.kw!.map((line) => line.name)).toEqual(["墨澜", "洛雪 v2-fix"]);
     expect(PREMIUM_LINES.kg!.map((line) => line.name)).toEqual(["酷狗官方（上游失效占位）"]);
 
     // 默认 chain 组成（id 锁定；远端 chain.json 以此为锚点做差异）
     expect(cfg.maxLinesPerQuality).toBe(5);
-    expect(cfg.budget).toEqual({ totalMs: 12000, lineMs: 6000 });
+    expect(cfg.budget).toEqual({ totalMs: 5000, lineMs: 5000 });
     expect(cfg.crossSources).toEqual({
       wyy: ["kw"], kw: ["wyy"], qq: ["kw", "wyy"], kg: ["kw", "wyy"],
     });
@@ -410,15 +410,16 @@ describe("声明式 http 线路（chain.json kind:http）+ script qq 链", () =>
     expect(cfg.chains.qq!.map((line) => line.id)).toEqual([
       "qq-molan-tx", "qq-world260809", "qq-stellarwave-tx", "qq-yuningxi-tang",
     ]);
+    // 2026-09-23 全量逐线路复测（platform 1101，独立单链 × 12 首 × 3 档）后摘除 3 条：
+    //   kw-stellarwave 0/36、kg-lxv6 0/36（脚本初始化即失败）、kg-yuningxi-pro 1/12。
+    // 均为「只摘该平台线路、脚本保留」（同一脚本在别的平台仍可用）。
     expect(cfg.chains.kw!.map((line) => line.id)).toEqual([
-      "kw-yuningxi-pro", "kw-yuxi", "kw-stellarwave", "kw-quandouyao", "kw-native-des",
+      "kw-yuningxi-pro", "kw-yuxi", "kw-quandouyao", "kw-native-des",
     ]);
     expect(cfg.chains.kg!.map((line) => line.id)).toEqual([
-      "kg-yuxi", "kg-stellarwave", "kg-molan", "kg-lxv6", "kg-yuningxi-pro",
+      "kg-yuxi", "kg-stellarwave", "kg-molan",
     ]);
-    // kg 末位玉宁熙 Pro 只实测过 flac；QQ 链已移除 native-vkey（墨澜 tx 首位）
-    const kgLast = cfg.chains.kg![cfg.chains.kg!.length - 1]!;
-    expect(kgLast.qualities).toEqual(["flac"]);
+    // QQ 链仍是墨澜 tx 首位、玉宁熙 tang.api 末位兜底（实测 44%，但能出链，保留）
     const qqLast = cfg.chains.qq![cfg.chains.qq!.length - 1]!;
     expect(qqLast.id).toBe("qq-yuningxi-tang");
     // 每音质档参与换源的线路 ≤上限（全灭耗时上限）

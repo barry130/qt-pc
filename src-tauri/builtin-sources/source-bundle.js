@@ -58,6 +58,16 @@ function asString(value) {
 function asNumber(value) {
   return typeof value === "number" ? value : Number(value) || 0;
 }
+function joinSingerNames(value) {
+  if (typeof value === "string") return value.trim();
+  const names = [];
+  for (const entry of asArray(value)) {
+    const name = entry !== null && typeof entry === "object" ? asString(asObject(entry)["name"]) : asString(entry);
+    const trimmed = name.trim();
+    if (trimmed.length > 0 && !names.includes(trimmed)) names.push(trimmed);
+  }
+  return names.join("/");
+}
 class TtlCache {
   constructor(ttlMs) {
     __publicField(this, "inner", /* @__PURE__ */ new Map());
@@ -83,8 +93,8 @@ function normalizeKgPic(url) {
   out = out.split("http://").join("https://");
   return out;
 }
-const CHAIN_BUDGET_MS = 12e3;
-const CHAIN_LINE_MS = 6e3;
+const CHAIN_BUDGET_MS = 5e3;
+const CHAIN_LINE_MS = 5e3;
 const CHAIN_GRACE_MS = 250;
 class ChainBudget {
   constructor(totalMs = CHAIN_BUDGET_MS, lineMs = CHAIN_LINE_MS) {
@@ -351,7 +361,7 @@ function parseChainConfig(raw) {
 }
 function defaultChainConfig() {
   return {
-    chainRevision: 2,
+    chainRevision: 8,
     maxLinesPerQuality: DEFAULT_MAX_LINES_PER_QUALITY,
     crossSources: { wyy: ["kw"], kw: ["wyy"], qq: ["kw", "wyy"], kg: ["kw", "wyy"] },
     budget: { totalMs: DEFAULT_CHAIN_BUDGET.totalMs, lineMs: DEFAULT_CHAIN_BUDGET.lineMs },
@@ -412,6 +422,11 @@ function defaultChainConfig() {
         }
       ],
       kw: [
+        // 2026-09-23 全量逐线路复测（platform 1101，独立单链 × 12 首 × 3 档）后摘除：
+        //   kw-stellarwave 0/36，36 格全部「死链（Range 预检不过）」。
+        // 同一个 stellarwave 脚本在 qq 是 100%、kg 是 56%，只在 kw 档全废，
+        // 所以只摘这条线路、脚本保留（kg-stellarwave 仍在用）。复测原始数据见
+        // qt-pc/diag-live-rank-1101-kw-wyy.json。
         {
           id: "kw-yuningxi-pro",
           name: "玉宁熙 Pro",
@@ -424,13 +439,6 @@ function defaultChainConfig() {
           name: "屿溪 · 终章",
           kind: "lx",
           scriptId: "yuxi",
-          qualities: ["128", "320", "flac"]
-        },
-        {
-          id: "kw-stellarwave",
-          name: "Stellarwave",
-          kind: "lx",
-          scriptId: "stellarwave",
           qualities: ["128", "320", "flac"]
         },
         {
@@ -449,6 +457,13 @@ function defaultChainConfig() {
         }
       ],
       kg: [
+        // 2026-09-23 全量逐线路复测后摘除两条（原始数据见 qt-pc/diag-live-rank-1101.json）：
+        //   kg-lxv6         0/36  「lx 脚本「?」未注册 request handler」——脚本初始化即失败，
+        //                         36 格一个都没发出去（lxv6 的中控 88.lxmusic.xn--fiqs8s）。
+        //   kg-yuningxi-pro 1/12 = 8%  「酷狗所有接口未获取到有效播放链接」（flac 专用线）。
+        //                         同一个 yuningxi-pro 脚本在 kw 是 89%，故只摘 kg 这条。
+        // 另注：qq-yuningxi-tang 虽然只有 44%，但实测能出链（旧数据「主机不通」已过期），
+        // 保留作 qq 的最后一道兜底。
         {
           id: "kg-yuxi",
           name: "屿溪 · 终章",
@@ -469,20 +484,6 @@ function defaultChainConfig() {
           kind: "lx",
           scriptId: "molan",
           qualities: ["128", "320", "flac"]
-        },
-        {
-          id: "kg-lxv6",
-          name: "独家音源 v6",
-          kind: "lx",
-          scriptId: "lxv6",
-          qualities: ["128", "320", "flac"]
-        },
-        {
-          id: "kg-yuningxi-pro",
-          name: "玉宁熙 Pro",
-          kind: "lx",
-          scriptId: "yuningxi-pro",
-          qualities: ["flac"]
         }
       ]
     }
@@ -10855,11 +10856,6 @@ const PREMIUM_LINES = {
       fetch: (request, song, quality) => lxPlayUrl(molanHost, request, "kw", song, quality)
     },
     {
-      name: "独家音源 v6",
-      qualities: ["128", "320", "flac"],
-      fetch: (request, song, quality) => lxPlayUrl(lxv6Host, request, "kw", song, quality)
-    },
-    {
       name: "洛雪 v2-fix",
       qualities: ["320"],
       fetch: (request, song, quality) => lxPlayUrl(luoxueHost, request, "kw", song, quality)
@@ -12748,14 +12744,12 @@ function playlistFromQQ(item) {
   };
 }
 function songFromQQ(item) {
-  const singers = asArray(item["singer"]);
-  const singerItem = singers.length > 0 ? asObject(singers[0]) : {};
   const album = asObject(item["album"]);
   const albumMid = album["mid"];
   return {
     id: asString(item["mid"]),
     name: asString(item["name"]),
-    singer: asString(singerItem["name"]),
+    singer: joinSingerNames(item["singer"]),
     album: asString(album["name"]),
     picUrl: albumMid != null ? "https://y.qq.com/music/photo_new/T002R300x300M000" + asString(albumMid) + ".jpg" : "",
     interval: item["interval"] != null ? asNumber(item["interval"]) : 0
@@ -12817,26 +12811,22 @@ function songFromQQSearch(item) {
   const fallbackMid = asString(item["mid"]);
   const name1 = asString(item["songname"]);
   const name2 = asString(item["name"]);
-  const singers = asArray(item["singer"]);
-  const singerItem = singers.length > 0 ? asObject(singers[0]) : {};
   const albumMid = item["albummid"];
   return {
     id: idText.length > 0 ? idText : fallbackMid,
     name: name1.length > 0 ? name1 : name2,
-    singer: asString(singerItem["name"]),
+    singer: joinSingerNames(item["singer"]),
     album: asString(item["albumname"]),
     picUrl: albumMid != null ? "https://y.qq.com/music/photo_new/T002R300x300M000" + asString(albumMid) + ".jpg" : "",
     interval: item["interval"] != null ? asNumber(item["interval"]) : 0
   };
 }
 function songFromQQDetail(item) {
-  const singers = asArray(item["singer"]);
-  const singerItem = singers.length > 0 ? asObject(singers[0]) : {};
   const albumMid = item["albummid"];
   return {
     id: asString(item["songmid"]),
     name: asString(item["songname"]),
-    singer: asString(singerItem["name"]),
+    singer: joinSingerNames(item["singer"]),
     album: asString(item["albumname"]),
     picUrl: albumMid != null ? "https://y.qq.com/music/photo_new/T002R300x300M000" + asString(albumMid) + ".jpg" : "",
     interval: item["interval"] != null ? asNumber(item["interval"]) : 0
@@ -13209,14 +13199,12 @@ const qq = {
     const out = [];
     for (const entry of asArray(data["list"])) {
       const item = asObject(entry);
-      const singers = asArray(item["singers"]);
-      const first = singers.length > 0 ? asObject(singers[0]) : null;
       out.push({
         id: asString(item["vid"]),
         platform: "qq",
         name: asString(item["title"]),
         picUrl: asString(item["picurl"]),
-        singer: first != null ? asString(first["name"]) : ""
+        singer: joinSingerNames(item["singers"])
       });
     }
     return out;
@@ -13315,14 +13303,13 @@ function songFromWyy(item) {
   const arList = asArray(merged["ar"]);
   const finalArtists = artistList.length > 0 ? artistList : arList;
   const albumData = asObject(merged["album"]).id !== void 0 ? asObject(merged["album"]) : asObject(merged["al"]);
-  const firstArtist = finalArtists.length > 0 ? asObject(finalArtists[0]) : {};
   const albumObj = Object.keys(albumData).length > 0 ? albumData : {};
   const cover = asString(item["picUrl"]);
   const albumCover = asString(albumObj["picUrl"]);
   return {
     id: asString(item["id"]),
     name: asString(item["name"]),
-    singer: asString(firstArtist["name"]),
+    singer: joinSingerNames(finalArtists),
     album: asString(albumObj["name"]),
     picUrl: cover.length > 0 ? cover : albumCover,
     interval: merged["duration"] !== void 0 ? asNumber(merged["duration"]) / 1e3 : merged["dt"] !== void 0 ? asNumber(merged["dt"]) / 1e3 : 0
@@ -13331,11 +13318,10 @@ function songFromWyy(item) {
 function songFromWyyDetail(item) {
   const arList = asArray(item["ar"]);
   const al = asObject(item["al"]);
-  const firstArtist = arList.length > 0 ? asObject(arList[0]) : {};
   return {
     id: asString(item["id"]),
     name: asString(item["name"]),
-    singer: asString(firstArtist["name"]),
+    singer: joinSingerNames(arList),
     album: asString(al["name"]),
     picUrl: asString(al["picUrl"]),
     interval: item["dt"] !== void 0 ? asNumber(item["dt"]) / 1e3 : 0

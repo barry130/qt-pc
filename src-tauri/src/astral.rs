@@ -883,8 +883,8 @@ pub fn version_name() -> &'static str {
 /// versionCode：发版时手动维护的整数（与移动端 manifest.json 的 versionCode 同一约定），
 /// 必须和后端 qt_app_update 表里对应版本的记录一致——更新检查就是拿它比大小。
 /// 1.0.0 → 100；1.0.1 → 101；1.0.2 → 102；1.0.3 → 103；1.0.4 → 104；1.0.5 → 105；
-/// 1.0.6 → 106；下次发版记得同步 +1。
-pub const VERSION_CODE: i64 = 106;
+/// 1.0.6 → 106；1.0.7 → 107；下次发版记得同步 +1。
+pub const VERSION_CODE: i64 = 107;
 
 pub fn version_code() -> i64 {
     VERSION_CODE
@@ -897,8 +897,8 @@ mod tests {
     #[test]
     fn version_code_is_the_manual_release_constant() {
         // versionCode 不再从版本号推导（旧公式 1.0.0 会算出 10000），
-        // 而是与后端 qt_app_update 记录对齐的手动常量：1.0.0 → 100 … 1.0.6 → 106
-        assert_eq!(VERSION_CODE, 106);
+        // 而是与后端 qt_app_update 记录对齐的手动常量：1.0.0 → 100 … 1.0.7 → 107
+        assert_eq!(VERSION_CODE, 107);
         assert_eq!(version_code(), VERSION_CODE);
         assert_eq!(version_name(), env!("CARGO_PKG_VERSION"));
     }

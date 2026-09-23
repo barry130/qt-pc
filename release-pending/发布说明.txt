@@ -1,184 +1,162 @@
-音源包发布物（2026092202 · 2026-09-22：新增歌手列表入口 + 执行层四处修复）
-====================================================
-chain.json          5 251 B      chainRevision 7（一个字节都没动，哈希与上一版相同）
-source-bundle.js    1 778 893 B  重新构建：新增 artistList 入口（26 个入口）+ 四处执行层修复
-source-release.zip  609 632 B    两个文件的压缩包（已解包校验，与 dist-sources 逐字节一致）
+音源包 2026092301 · 2026.09.23.1
+全量逐线路复测后摘除 3 条死线路 + 预算收口 5000 + 多歌手拼接
+================================================================================
 
-文件哈希（SHA256）
-  chain.json         2A6AA5A1813F8E4A79325FC67635EC57706C0811584896308514852FB3952DC7
-  source-bundle.js   F10E0BFDEB61072311A6012239B23E3775B49920D891BB414211354EC8DE302C
-  source-release.zip C5380B09984243CCBAB0D78B5F3FC9D1AA647BB46E948609CB9FCB51AAFC0809
-  （上一版对照：bundle 7A7100786810F7F2…；内置旧版 072B2C7823131581…）
+【一】发布物（release-pending/，共 3 个文件，zip 内恰好 2 个条目）
 
-**版本号必须用 2026092202，不是 2026092201**：2026092201 已被线上占用（14:24 有客户端
-装过，bundle 是**不含 artistList** 的在飞版）。同号换内容会被盘上旧副本盖住（引擎按
-「谁新用谁」选包，但同号时盘上优先）——这就是内置包镜像「最新发布号」的规则要防的事。
+  chain.json          4,140 B   SHA256 C70790BE6112DC175C9C4818EC47BE3246F5C071DC3787997C54C1C9C8C6AC92
+  source-bundle.js 1,773,680 B  SHA256 E08388A9C1A30A7AD00D829D872EB67E66CB6BA034BE05B8A3A7C99AB01A78FA
+  source-release.zip 608,426 B  SHA256 1026E7015784B77F901692BE70ED391079F5CD6C6F94BC80161DEFA1426B85EF
 
-内置包（src-tauri/builtin-sources/）已跑 `npm run sync:builtin` 同步为 **2026092202**
-（version.json = 2026092202 / 2026.09.22.2），bundle 与 chain.json 与本目录逐字节相同。
-已装远程包 2026092201 < 内置 2026092202 → 引擎会优先用内置新包（含 artistList）；
-后端发布 2026092202 后客户端会自动下载。回滚语义不变。
+  chain.json 内容：chainRevision = 8，maxLinesPerQuality = 5，
+                   budget = { totalMs: 5000, lineMs: 5000 }，共 12 条线路
+                   （wyy 1 / qq 4 / kw 4 / kg 3），无任何 platforms 白名单字段。
+  source-bundle.js：25 个入口（bundleInfo / loadChain / getPlayUrl / verifyPlayable /
+                   search 系列 / playlist 系列 / charts 系列 / videos / lyric / cover 等）。
+  zip 已用 Expand-Archive 解包并与 release-pending 逐字节比对：一致。
 
-一、新增 artistList 入口（歌手列表 + 首字母索引）
-----------------------------------------------------
-歌手页原先只有「常听歌手 + 按名字搜索」——音源契约里根本没有歌手列表接口。
-本次给四个平台各加 `artistList(initial, page, size)`，返回
-`{ list: [{id, platform, name, picUrl, initial?}], initialSupported, hasMore }`。
-服务端字母筛选能力**实测**差异极大，所以契约用 initialSupported 如实上报：
+【二】内置包已同步（同号同物）
 
-  音源  歌手列表接口                                  按首字母筛选
-  kw    www.kuwo.cn/api/www/artist/artistInfo         ✅ 唯一支持：prefix=a…z（空=热门、~=非字母档）
-  qq    c.y.qq.com/v8/fcg-bin/v8.fcg channel=singer   ❌ 接口忽略字母参数；条目带 Findex，客户端可分组
-  wyy   music.163.com/api/artist/list                 ❌ 只有 initial=0（热门）有数据，字母档 1..27 恒空
-  kg    mobilecdn.kugou.com/api/v3/singer/list        ❌ 只有语言/性别维度，连首字母字段都没有
+  qt-pc/src-tauri/builtin-sources/{chain.json, source-bundle.js} 与 release-pending 逐字节一致，
+  version.json = { "code": 2026092301, "name": "2026.09.23.1" }。
+  source-update.ts 的 BUILTIN_SOURCE_VERSION 同为 2026092301。
 
-  实测样本：kw prefix=a → 456 人（首条阿杜）、prefix 空 → 9204 人、prefix=z 第 2 页正常；
-  qq total=552503、条目 Findex=X（薛之谦）；kg total≈265 万、分页正常；wyy 热门页 more 标志正常。
-  头像：kw 取 pic、qq 按 mid 拼 T001R300x300M000{mid}.jpg（列表不给图，实测 200）、
-  kg 用蓝本的 singerid 规律拼接、wyy 取 picUrl。
-  客户端按能力降级：kw 点字母重新查服务端；qq 用条目首字母筛**已加载**的；
-  网易云/酷狗字母档置灰并提示改用搜索——不做假装能筛的假索引。
-  契约 v1 不变（只是多一个入口），两端共用同一份源码。
+【三】⚠️ 同号提醒（发版前务必确认）
 
-bundle 同时含上一批「执行层四处修复」（上一版只改了源码、没进包，这次真的在包里，
-逐条见第五节）。chain.json 未动，所以客户端这次只需更新 bundle 这一个文件
-（上一版相反：只换了编排层，执行层的四处缺陷还在）。
+  2026092301 今天构建过两版，本版是第二版（rev 8 / 12 条线路 / 预算 5000）：
+    · 第一版：rev 2 / 15 条线路 / 预算 12000，已被本版取代，未发布则无需处理；
+    · 若你已把第一版上传到音源后端，**必须换号**（改为 2026092302），
+      否则同号不同物会让已更新的客户端拿到旧编排。
+      换号 = 改 source-update.ts 的 BUILTIN_SOURCE_VERSION + 重跑 build:sources + sync:builtin + 重打包。
 
-二、构建链路本身先修了两处（否则根本构建不出来）
-----------------------------------------------------
-· scripts/restore-lx-bodies.mjs —— 配对安全阀的判据错了。
-  它要求「包装段与 vendored 原文的 16-gram 覆盖率 ≥ 30%」，但**带自校验的混淆件正是
-  被 Rollup 重排版破坏得最彻底的那批**：kulou 5.5% / luoxue 6.8% / molan 6.4%，全都
-  低于门槛，而这三个恰好就是必须逐字节还原的三个。也就是说这个门槛等于让构建永远失败
-  （实测：`Error: 包装段#1 与 kulou 的相似度仅 5.5%，拒绝写入`）。
-  改为双判据：覆盖率 ≥30% **或** 长字符串字面量命中 ≥50%（实测 kulou 96.3%
-  (1910/1983)、luoxue 95.9%(518/540)、molan 98.5%(2296/2331)，而错误配对一律 <1%）。
-  字面量抗重排——混淆器保留了字符串数组本身，只有转义与数字进制被改写。
-  同时把还原时的分隔空白对齐 gen-lx-vendor.mjs 的形态，使三个脚本体与线上已验证的
-  bundle **逐字节相同**（这就是上面 diff 里看不到任何 LX 段改动的原因）。
-· scripts/check-lx-bodies.mjs —— 返回值契约与调用方不一致：build-sources.mjs 读
-  `guard.hung`，而它只返回 `{ok, results}`，构建在守卫之后崩在
-  `TypeError: Cannot read properties of undefined (reading 'length')`。补上 `hung`。
+【四】本次改了什么
 
-三、构建期验证（都是真跑出来的）
-----------------------------------------------------
-· 守卫：12 个 LX 脚本体在 worker 沙箱里逐个初始化 → **通过：无脚本体挂死**
-  （kulou 42ms / luoxue 2.9s / molan 156ms 注册 handler 成功，三个自校验件均已还原为原文）。
-· 与线上 bundle 的 diff：只有 budget.ts / layer.ts / play-url.ts / qt-entries.ts 四处。
-· 单测：`npx vitest run tests/source-scripts.test.ts tests/source-update.test.ts
-  tests/lx-host.test.ts` → **3 files / 80 tests 全绿**（含四平台真实网络取链）。
-· 源码语义单测 `diag-budget-unit.mjs` → 7 项断言全绿（runChain 859ms 严格晚于 run 606ms）。
-· 安卓视角整链回归（新 bundle + 本 chain.json，platform=1101）→ 见第六节。
+  1) 全量逐线路复测（本次唯一依据）
+     用 qt-pc/diag-live-rank.mjs 把**每条线路单独**放进只有它自己的链里跑
+     （platform 1101，12 首 Live × 3 档 = 36 格/线路），因此不受其它线路和跨源兜底影响。
+     15 条线路全测，原始数据落在：
+       qt-pc/diag-live-rank-1101.json          （qq 4 条 + kg 5 条 = 288 格）
+       qt-pc/diag-live-rank-1101-kw-wyy.json   （kw 4 条 + wyy 1 条 = 216 格）
+     汇总工具：qt-pc/diag-line-verdict.mjs（可一次合并多份结果）。
+     注：该诊断工具原先把源写死成 qq,kg，本次改成第 5 个参数可传源列表，
+         并给输出文件名加标签，避免不同批次互相覆盖（默认行为不变）。
 
-四、上一版要修的问题（你 20:16 的实机日志）
-----------------------------------------------------
-20:16:30.102 [QT Player] 取播放地址失败：qq:000cbbsH3KQZwA auto=true
-20:16:41.812 [SourceEngine] 引擎取链失败：Error: 未取到播放地址（qq@flac
-    qq-molan-tx=死链（Range 预检不过）; qq-world260809=预算耗尽未跑;
-    qq-stellarwave-tx=预算耗尽未跑; qq-yuningxi-tang=预算耗尽未跑;
-    cross:kw=预算耗尽未跑; cross:wyy=预算耗尽未跑）
+  2) 摘除 3 条死线路（只摘该平台线路，脚本保留）
+     · kg-lxv6          0/36 = 0%   「lx 脚本「?」未注册 request handler」×36
+                                   脚本初始化就失败，36 格一个请求都没发出去。
+     · kw-stellarwave   0/36 = 0%   36 格全部「死链（Range 预检不过）」。
+     · kg-yuningxi-pro  1/12 = 8%   「酷狗所有接口未获取到有效播放链接」×11（flac 专用线）。
+     为什么是「按线路删」而不是「按脚本删」——同一脚本在不同平台差异极大：
+       stellarwave     qq 100% / kg 56% / kw 0%
+       yuningxi-pro    kw 89% / kg 8%
+     所以只摘掉失效的那个平台入口，脚本与其在别处的线路照旧。
+     删除处已在 chain-config.ts 写下来源注释，避免以后被误加回来。
 
-三条线索指向同一个结论——**链首那条线路吃光了整链预算，后面的线路一条都没跑**：
-1. trace 的线路顺序 molan → world260809 → stellarwave-tx → yuningxi-tang 与**内置包
-   chainRevision 3** 逐字对应，即当时生效的是内置包（内置 2026092101 > 线上 2026092001）。
-2. `qq-molan-tx=死链（Range 预检不过）` 是**误判**：同一条歌的直链
-   `F000000cbbsH3KQZwA.flac` 在 20:16:41.943 返回了 206 + 2 字节，按 verifyPlayable
-   的口径本来就是通过的，它是「Range 预检等超时」被记成了「死链」。
-3. 除第一条外全部「预算耗尽未跑」：一条线路 + 它自己的 Range 预检各吃一个 lineMs 分片，
-   6000+6000 正好等于 totalMs 12000，后面的线路一条都轮不到。
+  3) 整链预算 12000/6000 → 5000/5000
+     chain.json 是四端共用的一份编排，预算必须满足两侧应答上限、取更紧的那个：
+       PC/Tauri：playurl_bridge.rs ASK_TIMEOUT = 15s（宽松）
+       App：     stores/player.ts URL_FETCH_BUDGET_MS = 6000ms（硬上限）
+     上一版写 12000 时，整链实测出现过单次取链 10,495ms——在 App 上会被直接掐断、
+     日志只剩超时且没有逐线路 trace。5000 + 整链宽限 250 = 5250 < 6000，保证在 App
+     放弃之前给出确定答复。V8 引擎下健康取链中位 228~737ms，5000 对成功率无影响。
 
-本地复现（`diag-budget.mjs`，真实 bundle + 可控假 request，每场景独立进程）：
-  ① 单线 + 预检挂死 → 6015ms 失败，错误文本没有 trace
-  ② 三线 + 预检挂死 → 6012ms 失败，3 条线路里只有第 1 条真的发了请求
-  ③ 两线请求都挂死 → 6009ms 失败（内层要 12s，不可达）
-  ④ 单线正常       → 96ms 成功
-另外发现错误文本里的 trace 永远不是本次请求的：外层先注册定时器先触发，读
-lastMissTrace 时内层还没写回（你日志里三条不同歌曲的 trace 逐字相同就是这个原因）。
+  4) premium「优选聚合」剩余链同步摘掉 lxv6
+     lxv6 是脚本级失效（在任何平台逻辑之前就失败），所以 premium 的 kw 链
+     「墨澜 → 独家音源 v6 → 洛雪 v2-fix」中的中间一步同样是死步，已摘除。
+     现为「墨澜 → 洛雪 v2-fix」。kg 那条「酷狗官方（上游失效占位）」是文档化的
+     故意占位（秒失败、对齐蓝本），未动。
 
-五、本次进包的四处源码修复（执行层）
-----------------------------------------------------
-  src/source-scripts/budget.ts
-    + runTimed()  区分「超时」与「失败」——预检超时不再被记成死链
-    + runChain()  外层按**总预算 + 250ms 宽限**等待（宽限只为了让内层先把 trace 写回）
-  src/source-scripts/layer.ts
-    外层改用 runChain()：修掉「内层 totalMs 整段不可达」——原来外层用 min(lineMs,remaining)
-    当切片，而 lineMs 总不大于 totalMs，于是外层**永远**在内层跑完之前截断
-  src/source-scripts/actions/play-url.ts
-    + VERIFY_MS = 2500：Range 预检单独计时，不再吃掉整条线路的分片
-    + 每条线路最多只用剩余预算的一半，把另一半留给后面的线路
-    + trace 归属标记（lastMissKey）：并发/被截断时不会把别的请求的死因报进本次错误
-  src/source-scripts/qt-entries.ts
-    按 cacheKey（source:id:quality）取 trace，配合上面的归属标记
+  5) 多歌手拼接 joinSingerNames（platforms/utils.ts + qq.ts / wyy.ts 调用点）
+     多歌手歌曲的歌手名按平台习惯拼接，替换原先的直接拼接。
 
-效果：一条挂死线路不再吃光预算，后面的线路真的会被尝试；错误文本里的逐线路 trace 可信。
+  结果：15 条 → 12 条线路，wyy 1 / qq 4 / kw 4 / kg 3。
 
-六、安卓视角整链验证（新 bundle + chainRevision 7，真实网络）
-----------------------------------------------------
-  定点样本（日志里的失败曲目 qq「雨终曲」id=001ES52Q3qN0u7）
-    128 ✅792ms  320 ✅598ms  flac ✅591ms   全部经 a.aa.cab → ws.stream.qqmusic.qq.com
-  全矩阵 4 平台 × 3 音质 × 2 样本 = **24/24 全部返回真实档位**：
-    qq  MP3 128k 3.9MB / MP3 320k 9.8MB / FLAC 24bit/48kHz 50.8MB
-    wyy MP3 128k 3.9MB / MP3 320k 9.8MB / FLAC 24bit 51.2MB
-    kw  MP3 128k 3.9MB / MP3 320k 9.8MB / FLAC 24bit 50.8MB
-    kg  MP3 128k 3.9MB / MP3 320k 9.8MB / FLAC 16bit 27.4MB
-  首页聚合：allHotWords 1224ms / allCharts 827ms / recommendations 194ms /
-    allLatest 599ms / searchAll 684ms
-  平台白名单：墨澜后端 106.55.0.102 请求数 = 0 ✅（安卓路径上已被过滤）
-  已知遗留（与本次改动无关）：wyy 搜索命中率（「晴天 周杰伦」会命中「晴天(深情版)/
-    Lucky小爱」）以及 wyy 320 档偶发只有 0.7MB。
+【五】全量复测数据（platform 1101，独立单链 × 12 首 × 3 档 = 36 格/线路）
 
-七、chain.json 保持 chainRevision 7 不变（回顾一下它的编排）
-----------------------------------------------------
-  · 安卓 qq 首条 = qq-world260809（当前可用、快、三档齐）→ qq-stellarwave-tx（320/flac）
-    → qq-yuningxi-tang（主机 tang.api.s01s.cn 不通，保留作精确 mid 兜底，
-      pre 打卡 8000→1500ms、主请求补 timeoutMs 3000）。PC 顺序仍是墨澜置首。
-    单线路体检（`diag-qq-lines.mjs`，每条线路独立导入 bundle 以避开 urlCache，样本「雨终曲」）：
-      qq-molan-tx [1103] 128 ✅633ms 320 ✅385ms flac ✅370ms
-      qq-yuningxi-tang   128 ❌10.7s 320 ❌10.7s flac ❌10.7s ← 主机不通
-      qq-world260809     128 ✅668ms 320 ✅705ms flac ✅741ms
-      qq-stellarwave-tx  128 —       320 ✅834ms flac ✅635ms
-  · 预算 5000/5000：App 侧 `URL_FETCH_BUDGET_MS = 6000`（stores/player.ts:29）是真正的
-    硬上限，5000 让取链在 App 超时**之前**给出确定答复。新语义下单条线路的分片本来就会
-    被「剩余预算的一半」压到 2500，所以 lineMs 写 5000 不会独占；runChain 的 250ms 宽限
-    使整链最坏 5250ms，仍在 6000 以内。（上一版提过的「放开到 8000/2500」现在没必要了。）
-  · 墨澜两条线路（qq/kg）保持 platforms:[1103]：它 init 在 QuickJS 上 6.3s，
-    安卓任何合理预算都装不下。
+  可播率  线路                 类型    可播/总  中位ms  主要失败原因
+  ---------------------------------------------------------------------------
+    0%   kg-lxv6              lx       0/36       —    未注册 request handler ×36   ← 已摘
+    0%   kw-stellarwave       lx       0/36       —    死链（Range 预检不过）×36     ← 已摘
+    8%   kg-yuningxi-pro      lx       1/12    3197    酷狗所有接口未获取到有效播放链接 ×11 ← 已摘
+   44%   qq-yuningxi-tang     http    16/36     884    返回空 ×14（保留：能出链，作 qq 末位兜底）
+   56%   kg-molan             lx      20/36     497    128/320 档死链 ×16（flac 全过）
+   56%   kg-stellarwave       lx      20/36    1554    128/320 档死链 ×16（flac 全过）
+   56%   kg-yuxi              lx      20/36     533    128/320 档死链 ×16（flac 全过）
+   89%   kw-quandouyao        lx      32/36     715    探测不过 HTTP 206 ×4
+   89%   kw-yuningxi-pro      lx      32/36     137    探测不过 HTTP 206 ×4
+   89%   kw-yuxi              lx      32/36     202    探测不过 HTTP 206 ×4
+  100%   kw-native-des        bundle  36/36     128    —
+  100%   wyy-core             bundle  36/36     679    —
+  100%   qq-molan-tx          lx      36/36     488    —
+  100%   qq-stellarwave-tx    lx      24/24     702    —
+  100%   qq-world260809       http    36/36     660    —
 
-八、版本号（已按 2026092202 收口）
-----------------------------------------------------
-· 本产物按 **2026092202** 发布：source-update.ts 的 BUILTIN_SOURCE_VERSION 已同步为
-  2026092202 / 2026.09.22.2，内置包也跑过 `npm run sync:builtin` → 发布同号即同号同物。
-· **为什么不是 2026092201**：2201 已被线上占用（14:24 有客户端装过，bundle 不含
-  artistList）。同号换内容时设备上已解包的旧副本会一直盖住新实现（engine 页按
-  「谁新用谁」选包，同号时盘上优先）——正是同号同物规则要防的事。
-· 已装远程包 2026092201 < 内置 2026092202 → 新基座直接走内置新包；后端发布 2202 后下载覆盖。
-· **遗留账（下次构建前必须处理）**：src/source-scripts/chain-config.ts 里的默认链仍是
-  chainRevision 2（maxLinesPerQuality 5 / totalMs 12000），比线上 chain.json 的 rev 7
-  （3 / 5000 + 线路重排 + 平台白名单）旧。本次按「chain.json 一字节不动」处理，
-  但源码与线上编排不一致这件事还挂着：谁下次跑 `npm run build:sources`，
-  chain.json 都会被打回 rev 2。要么把 rev 7 回灌进 chain-config.ts，
-  要么在构建脚本里显式保留线上 chain.json。
+  说明：kg 三条线在 128/320 档记「死链」而 flac 全过，是 Range 预检的口径问题
+  （同一条直链换个时刻探测就能过），不是线路整体失效，故保留；整链路径下 kg 的
+  128/320 由跨源兜底补齐，实测 18/18。
 
-九、管理端四步（astral-front → 仪表盘 → qt → 音源包）
-----------------------------------------------------
-① 新建 release（platforms 勾 1101+1103，channel stable，准入 appVersionCodes 留空，
-   notes 如「音源包 2026092202：新增歌手列表/首字母索引入口 + 执行层预算/预检/trace 四处修复」）
-   → 版本号填 **2026092202**（与内置包同号同物；2201 已被占用，不要复用。
-   若 2202 也被占用则顺延一位并同步改 source-update.ts 的 BUILTIN_SOURCE_VERSION
-   后重跑 sync:builtin + 重打基座）
-② 上传本目录的 chain.json / source-bundle.js（或直接传 source-release.zip），拿直链 URL
-③ 回填 artifacts（path=chain.json / source-bundle.js，version 留空）
-④ 点「发布」
+【六】顺带查清 / 被推翻的旧结论（旧数据已过期，勿再引用）
 
-详细流程见《音源包打包发布完整教程.md》§5 / §5.1。
+  对 8 个后端域名做了 DNS + HTTPS 实测（GET /，超时 6s）：
+    ✅ yy.zddyr.top        348ms  HTTP 200   —— 旧结论「已失效后端，吃满 8000ms」**已过期**
+    ✅ tang.api.s01s.cn    124ms  HTTP 200   —— 旧结论「主机不通」**已过期**
+    ✅ www.97abc.com        55ms  HTTP 200
+    ✅ a.aa.cab            101ms  HTTP 200
+    ✅ zrcdy.dpdns.org    2320ms  HTTP 200
+    ✅ oiapi.net           180ms  HTTP 200
+    ✅ api.xcvts.cn        171ms  HTTP 200
+    ❌ 88.lxmusic.xn--fiqs8s 6013ms 超时     —— lxv6 的中控，真死（故 lxv6 按死源处理）
 
-十、还没生效的（不在本产物范围内）
-----------------------------------------------------
-· 基座侧的引擎隔离自愈与 STALL_MS 调整（qt-uniappx/services/source-engine.uts、
-  uni_modules/qt-js-engine/utssdk/app-android/index.uts）已改好并通过回归测试
-  （tools/check-engine-revive.mjs，6 场景 / 17 断言），需**重打 APK** 生效。
-· App 侧 stores/player.ts 的 URL_FETCH_BUDGET_MS = 6000 覆盖了整个 musicApi.playUrl，
-  包含冷启动时 QuickJS 解析 1.77MB bundle 的数秒。冷启动立刻播放仍可能超时，
-  建议把这笔账从取链预算里拆出去（属基座改动）。
-· 长期方案：用上游 QuickJS 源码重编 .so 暴露 JS_SetInterruptHandler，才能从外部打断
-  真正失控的脚本；当前 AAR 固定 cn.net.zhijian.quickjs-0.2.2，64 位、minSdk 24。
+  据此**取消**了两个上一版发布说明里挂着待定的优化项：
+    · 不再往 DEAD_BACKEND_HOSTS 加 yy.zddyr.top —— 它现在 348ms 就应答，
+      而且没有任何线路再出现 ~8000ms 停顿（最长中位 3197ms）。
+    · 不收紧 qq-yuningxi-tang 的超时 —— 它实测能出链（44%），收紧反而会砍掉它。
+  另外，现有剪线表 bridge.ts:133 的三个域名现在全部 HTTP 200，其中：
+    · oiapi.net/api/QQ_Music → HTTP 403「该Api暂时无法访问，可能在维护中」→ 剪线**仍然合理**；
+    · api.xcvts.cn/api/music/migu → HTTP 200「请输入歌名」→ **接口是活的，属误杀**；
+      但它只走脚本内部的咪咕路径，而契约平台只有 wyy/qq/kw/kg、链里没有咪咕线路，
+      影响≈0，本次不动，仅记录备查。
+    · zrcdy.dpdns.org → 816ms 返回 HTML 首页，判不准，保留。
+
+【七】验证记录（全部在最终产物上跑）
+
+  · tsc --noEmit                    干净，无错误
+  · npm run build:sources           12 个 lx 体全部通过挂死守卫；无脚本体挂死
+  · 单测                            80 passed / 80（3 个文件）
+                                    注：改前是 79/80，失败的是 kg 聚合链取链用例
+                                    （吃满预算后「该歌曲暂时无法播放」）。摘掉两条
+                                    死 kg 线路 + 预算收口后，该用例转为通过。
+  · 端到端回归（V8 泵，platform 1101，四平台各 6 首 × 3 档）
+      probe __qtEnvProbe() = "2"  ✅
+      __qtEntries 入口数 = 25     ✅
+      坏包闸门 SyntaxError        ✅
+      loadChain 32ms → 12 条线路  ✅
+      可播 72 / 失败 0            ✅   qq 18/18(668ms) kg 18/18(658ms)
+                                        kw 18/18(228ms) wyy 18/18(737ms)
+      bundle ESM 装载 20ms；evaluate 2468；泵 1815；残留 waiters 0
+  · zip 解包逐字节比对            一致（恰好 2 个条目）
+  · 内置包与发布物逐字节比对      一致
+
+【八】发布动作（4 步）
+
+  1. 先确认【三】的同号问题（是否已发过第一版）。
+  2. 把 release-pending/source-release.zip 上传到音源后端。
+  3. 客户端准入 appVersionCodes 建议设为 106 及以上：本包不含 artistList 入口
+     （歌手列表页已于 c12c5c9 移除），旧版本客户端取不到该入口会报错。
+  4. 本次改的是**远端可更新**的编排与脚本包，PC/App 客户端无需重新发版即可生效
+     （前提是客户端已装 1.0.6 / versionCode 106 或更高）。
+
+【九】还没生效 / 后续可做
+
+  · lxv6 脚本仍留在包里但已无任何链引用（sources.ts 的 lxv6Host 定义与 LX_HOST_REGISTRY
+    注册还在，bundle 里仍含该 64KB 脚本）。彻底移除需要同时改 vendored 文件、
+    sources.ts 注册表和构建守卫的包装段清单，风险大于收益，留作后续清理。
+  · 剪线表 api.xcvts.cn 属误杀，见【六】；因无咪咕线路，影响≈0。
+  · qt-pc 侧新增的两个诊断工具（diag-live-rank.mjs 的源列表参数、diag-line-verdict.mjs）
+    仍是未跟踪文件，未提交。
+
+【十】版本谱系（换号时不要重复）
+
+  2026092202 / 2026.09.22.2   线上版，26 个入口，含 artistList
+  2026092203 / 2026.09.22.3   仅内置包，随 c12c5c9 + 1.0.6/106 发布，已移除 artistList
+  2026092301 / 2026.09.23.1   ← 本版（rev 8 / 12 条线路 / 预算 5000）

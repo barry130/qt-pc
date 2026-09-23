@@ -533,7 +533,7 @@ function AppearanceSection(): React.JSX.Element {
           <div>
             <h3 className="text-sm font-medium">背景图片</h3>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              自定义主区域背景图片（最大 5MB）
+              自定义窗口背景图片，覆盖内容区、侧边栏与标题栏（最大 5MB）
             </p>
           </div>
           {preference.bgImage && (

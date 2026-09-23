@@ -10,9 +10,18 @@
  * 第三方直出模板常见），以及跨源多首逐个试。所以整条链带一个总预算，
  * 单条线路再带一个分片上限：分片上限保证挂死的线路不独占预算（后面的
  * 线路还有机会），总预算保证一定按时应答。
+ *
+ * 为什么是 5000 而不是更大的值：chain.json 是**四端共用**的一份编排，
+ * 预算必须同时满足两侧的应答上限，取更紧的那个——
+ *   · PC/Tauri：playurl_bridge.rs 的 ASK_TIMEOUT = 15s（宽松）；
+ *   · App：stores/player.ts 的 URL_FETCH_BUDGET_MS = **6000ms**（硬上限）。
+ * 总预算 5000 + 整链宽限 250 = 5250 < 6000，保证取链在 App 放弃**之前**
+ * 给出确定答复并带上逐线路 trace；写 12000 时实测出现过单次取链 10495ms，
+ * 在 App 上会被直接掐断、日志只剩超时。V8 引擎下健康取链通常 1~3s，
+ * 5000 对成功率没有影响。
  */
-export const CHAIN_BUDGET_MS = 12_000;
-export const CHAIN_LINE_MS = 6_000;
+export const CHAIN_BUDGET_MS = 5_000;
+export const CHAIN_LINE_MS = 5_000;
 
 /**
  * 整链兜底比内层多让出的宽限（见 ChainBudget.runChain）。

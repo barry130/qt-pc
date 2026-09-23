@@ -37,6 +37,7 @@ import {
   asObject,
   asString,
   buildQuery,
+  joinSingerNames,
   platformHeaders,
   requestJson,
 } from "./utils";
@@ -68,14 +69,13 @@ function songFromWyy(item: Record<string, unknown>): MusicInfo {
   const arList = asArray(merged["ar"]);
   const finalArtists = artistList.length > 0 ? artistList : arList;
   const albumData = asObject(merged["album"]).id !== undefined ? asObject(merged["album"]) : asObject(merged["al"]);
-  const firstArtist = finalArtists.length > 0 ? asObject(finalArtists[0]) : {};
   const albumObj = Object.keys(albumData).length > 0 ? albumData : {};
   const cover = asString(item["picUrl"]);
   const albumCover = asString(albumObj["picUrl"]);
   return {
     id: asString(item["id"]),
     name: asString(item["name"]),
-    singer: asString(firstArtist["name"]),
+    singer: joinSingerNames(finalArtists),
     album: asString(albumObj["name"]),
     picUrl: cover.length > 0 ? cover : albumCover,
     interval:
@@ -91,11 +91,10 @@ function songFromWyy(item: Record<string, unknown>): MusicInfo {
 function songFromWyyDetail(item: Record<string, unknown>): MusicInfo {
   const arList = asArray(item["ar"]);
   const al = asObject(item["al"]);
-  const firstArtist = arList.length > 0 ? asObject(arList[0]) : {};
   return {
     id: asString(item["id"]),
     name: asString(item["name"]),
-    singer: asString(firstArtist["name"]),
+    singer: joinSingerNames(arList),
     album: asString(al["name"]),
     picUrl: asString(al["picUrl"]),
     interval: item["dt"] !== undefined ? asNumber(item["dt"]) / 1000 : 0,

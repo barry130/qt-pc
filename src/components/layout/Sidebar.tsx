@@ -11,6 +11,7 @@ import {
   Radio,
 } from "lucide-react";
 import { useMusicSourceStore } from "@/stores/musicSource";
+import { useAppearanceStore } from "@/stores/appearance";
 import { SOURCE_DISPLAY } from "@/types";
 import { cn } from "@/lib/utils";
 import { migrateLegacyStorageKey } from "@/lib/legacy-storage";
@@ -67,6 +68,9 @@ function writeCollapsed(collapsed: boolean): void {
 export function Sidebar(): React.JSX.Element {
   const [collapsed, setCollapsed] = useState(readCollapsed);
   const activeSourceId = useMusicSourceStore((s) => s.activeSourceId);
+  // 有背景图时侧栏底色半透明（见 --sidebar-surface），此时去掉 backdrop-blur-sm：
+  // 那层 8px 模糊会把侧栏里的壁纸糊掉，与内容区之间出现一条明显的模糊分界。
+  const hasBgImage = useAppearanceStore((s) => Boolean(s.preference.bgImage));
   const sourceName =
     activeSourceId === "local" ? "本地" : SOURCE_DISPLAY[activeSourceId];
 
@@ -77,7 +81,8 @@ export function Sidebar(): React.JSX.Element {
   return (
     <aside
       className={cn(
-        "flex h-full shrink-0 select-none flex-col border-r border-border bg-sidebar backdrop-blur-sm transition-[width]",
+        "flex h-full shrink-0 select-none flex-col border-r border-border bg-[color:var(--sidebar-surface)] transition-[width]",
+        !hasBgImage && "backdrop-blur-sm",
         collapsed ? "w-[64px]" : "w-[208px]",
       )}
     >

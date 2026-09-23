@@ -1,18 +1,12 @@
-import { useEffect, useState } from "react";
-import {
-  ArrowLeft,
-  Copy,
-  Minus,
-  Settings,
-  Square,
-  X,
-} from "lucide-react";
+import { useState } from "react";
+import { ArrowLeft, Settings } from "lucide-react";
 import { Link, useRouter, useNavigate } from "@tanstack/react-router";
-import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useTitleBarDrag } from "@/hooks/useFramelessWindow";
+import { WindowControls } from "@/components/WindowControls";
 import { MusicSourceSwitcher } from "@/components/music-source/MusicSourceSwitcher";
 import { MessagesPopover } from "@/components/mine/MessagesPopover";
 import { avatarUrl, displayName, useAuthStore } from "@/stores/auth";
+import { useAppearanceStore } from "@/stores/appearance";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { cn } from "@/lib/utils";
 
@@ -24,30 +18,17 @@ import { cn } from "@/lib/utils";
  */
 export function TitleBar(): React.JSX.Element {
   const { ref, onDoubleClick } = useTitleBarDrag();
-  const [maximized, setMaximized] = useState(false);
   const [keyword, setKeyword] = useState("");
   const navigate = useNavigate();
   const router = useRouter();
   const session = useAuthStore((s) => s.session);
   const profile = useAuthStore((s) => s.profile);
+  // 有背景图时标题栏底色半透明（见 --sidebar-surface），此时去掉 backdrop-blur-sm：
+  // 那层 8px 模糊会把标题栏里的壁纸糊掉，与内容区之间出现一条明显的模糊分界。
+  const hasBgImage = useAppearanceStore((s) => Boolean(s.preference.bgImage));
   // 头像地址：CSP 不放开外部域名，远程头像经 qtres 代理（Rust 代取）加载
   const avatar = avatarUrl(profile);
   const avatarSrc = avatar ? qtresCoverUrl(avatar) : null;
-  const win = getCurrentWindow();
-
-  useEffect(() => {
-    let un: (() => void) | undefined;
-    const run = (): void => {
-      void win.isMaximized().then(setMaximized);
-      void win.onResized(async () => {
-        setMaximized(await win.isMaximized());
-      }).then((u) => {
-        un = u;
-      });
-    };
-    run();
-    return () => un?.();
-  }, [win]);
 
   const goSearch = (): void => {
     const kw = keyword.trim();
@@ -63,7 +44,10 @@ export function TitleBar(): React.JSX.Element {
       // 而它本身是非定位元素 —— 后面内容区的 `relative z-10` 会盖在它上面，
       // 把音源切换的下拉（z-50 被关在这个层叠上下文内）整个遮住，
       // 表现就是「点了没反应」。给标题栏一个高于内容区的层级即可。
-      className="relative z-20 flex h-[40px] shrink-0 select-none items-center justify-between border-b border-border bg-sidebar pr-0 backdrop-blur-sm"
+      className={cn(
+        "relative z-20 flex h-[40px] shrink-0 select-none items-center justify-between border-b border-border bg-[color:var(--sidebar-surface)] pr-0",
+        !hasBgImage && "backdrop-blur-sm",
+      )}
     >
       {/* 左：Logo + 应用名 */}
       <div className="flex h-full items-center gap-2 pl-3">
@@ -127,47 +111,8 @@ export function TitleBar(): React.JSX.Element {
             draggable={false}
           />
         </Link>
-        <WindowButton onClick={() => void win.minimize()} label="最小化">
-          <Minus className="h-4 w-4" />
-        </WindowButton>
-        <WindowButton
-          onClick={() => void win.toggleMaximize()}
-          label={maximized ? "还原" : "最大化"}
-        >
-          {maximized ? (
-            <Copy className="h-3.5 w-3.5 -scale-x-100" />
-          ) : (
-            <Square className="h-3 w-3" />
-          )}
-        </WindowButton>
-        <WindowButton onClick={() => void win.close()} label="关闭" danger>
-          <X className="h-4 w-4" />
-        </WindowButton>
+        <WindowControls />
       </div>
     </div>
-  );
-}
-
-function WindowButton(props: {
-  onClick: () => void;
-  label: string;
-  danger?: boolean;
-  children: React.ReactNode;
-}): React.JSX.Element {
-  return (
-    <button
-      type="button"
-      aria-label={props.label}
-      title={props.label}
-      onMouseDown={(e) => e.stopPropagation()}
-      onDoubleClick={(e) => e.stopPropagation()}
-      onClick={props.onClick}
-      className={cn(
-        "flex w-11 items-center justify-center text-foreground/80 transition-colors hover:bg-secondary hover:text-foreground",
-        props.danger && "hover:bg-destructive hover:text-white",
-      )}
-    >
-      {props.children}
-    </button>
   );
 }

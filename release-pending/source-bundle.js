@@ -58,6 +58,16 @@ function asString(value) {
 function asNumber(value) {
   return typeof value === "number" ? value : Number(value) || 0;
 }
+function joinSingerNames(value) {
+  if (typeof value === "string") return value.trim();
+  const names = [];
+  for (const entry of asArray(value)) {
+    const name = entry !== null && typeof entry === "object" ? asString(asObject(entry)["name"]) : asString(entry);
+    const trimmed = name.trim();
+    if (trimmed.length > 0 && !names.includes(trimmed)) names.push(trimmed);
+  }
+  return names.join("/");
+}
 class TtlCache {
   constructor(ttlMs) {
     __publicField(this, "inner", /* @__PURE__ */ new Map());
@@ -83,8 +93,8 @@ function normalizeKgPic(url) {
   out = out.split("http://").join("https://");
   return out;
 }
-const CHAIN_BUDGET_MS = 12e3;
-const CHAIN_LINE_MS = 6e3;
+const CHAIN_BUDGET_MS = 5e3;
+const CHAIN_LINE_MS = 5e3;
 const CHAIN_GRACE_MS = 250;
 class ChainBudget {
   constructor(totalMs = CHAIN_BUDGET_MS, lineMs = CHAIN_LINE_MS) {
@@ -351,7 +361,7 @@ function parseChainConfig(raw) {
 }
 function defaultChainConfig() {
   return {
-    chainRevision: 2,
+    chainRevision: 8,
     maxLinesPerQuality: DEFAULT_MAX_LINES_PER_QUALITY,
     crossSources: { wyy: ["kw"], kw: ["wyy"], qq: ["kw", "wyy"], kg: ["kw", "wyy"] },
     budget: { totalMs: DEFAULT_CHAIN_BUDGET.totalMs, lineMs: DEFAULT_CHAIN_BUDGET.lineMs },
@@ -412,6 +422,11 @@ function defaultChainConfig() {
         }
       ],
       kw: [
+        // 2026-09-23 全量逐线路复测（platform 1101，独立单链 × 12 首 × 3 档）后摘除：
+        //   kw-stellarwave 0/36，36 格全部「死链（Range 预检不过）」。
+        // 同一个 stellarwave 脚本在 qq 是 100%、kg 是 56%，只在 kw 档全废，
+        // 所以只摘这条线路、脚本保留（kg-stellarwave 仍在用）。复测原始数据见
+        // qt-pc/diag-live-rank-1101-kw-wyy.json。
         {
           id: "kw-yuningxi-pro",
           name: "玉宁熙 Pro",
@@ -424,13 +439,6 @@ function defaultChainConfig() {
           name: "屿溪 · 终章",
           kind: "lx",
           scriptId: "yuxi",
-          qualities: ["128", "320", "flac"]
-        },
-        {
-          id: "kw-stellarwave",
-          name: "Stellarwave",
-          kind: "lx",
-          scriptId: "stellarwave",
           qualities: ["128", "320", "flac"]
         },
         {
@@ -449,6 +457,13 @@ function defaultChainConfig() {
         }
       ],
       kg: [
+        // 2026-09-23 全量逐线路复测后摘除两条（原始数据见 qt-pc/diag-live-rank-1101.json）：
+        //   kg-lxv6         0/36  「lx 脚本「?」未注册 request handler」——脚本初始化即失败，
+        //                         36 格一个都没发出去（lxv6 的中控 88.lxmusic.xn--fiqs8s）。
+        //   kg-yuningxi-pro 1/12 = 8%  「酷狗所有接口未获取到有效播放链接」（flac 专用线）。
+        //                         同一个 yuningxi-pro 脚本在 kw 是 89%，故只摘 kg 这条。
+        // 另注：qq-yuningxi-tang 虽然只有 44%，但实测能出链（旧数据「主机不通」已过期），
+        // 保留作 qq 的最后一道兜底。
         {
           id: "kg-yuxi",
           name: "屿溪 · 终章",
@@ -469,20 +484,6 @@ function defaultChainConfig() {
           kind: "lx",
           scriptId: "molan",
           qualities: ["128", "320", "flac"]
-        },
-        {
-          id: "kg-lxv6",
-          name: "独家音源 v6",
-          kind: "lx",
-          scriptId: "lxv6",
-          qualities: ["128", "320", "flac"]
-        },
-        {
-          id: "kg-yuningxi-pro",
-          name: "玉宁熙 Pro",
-          kind: "lx",
-          scriptId: "yuningxi-pro",
-          qualities: ["flac"]
         }
       ]
     }
@@ -1543,33 +1544,6 @@ const kg = {
       out.push(artistFromKG(asObject(entry)));
     }
     return out;
-  },
-  /**
-   * 歌手列表（热门）。酷狗 singer/list 只有语言/性别/排序维度，**没有字母筛选**，
-   * 所以 initial 被忽略、initialSupported 恒为 false（UI 侧字母栏置灰）。
-   * 头像是蓝本的 singerid 规律拼接，与歌手搜索共用 artistFromKG。
-   */
-  async artistList(request, _initial, page, size) {
-    const json = await kgRequestJson(
-      request,
-      "http://mobilecdn.kugou.com/api/v3/singer/list" + buildQuery({
-        showtype: "1",
-        musician: "0",
-        page: String(page),
-        pagesize: String(size),
-        type: "0",
-        area: "0",
-        sex: "0",
-        sort: "0"
-      })
-    );
-    const data = asObject(json["data"]);
-    const out = [];
-    for (const entry of asArray(data["info"])) {
-      out.push(artistFromKG(asObject(entry)));
-    }
-    const total = asNumber(data["total"]);
-    return { list: out, initialSupported: false, hasMore: page * size < total };
   },
   /** 蓝本 searchAlbums kg 分支 :1712（search/album）+ albumFromKG :1325 */
   async albumSearch(request, keyword, page, size) {
@@ -10882,11 +10856,6 @@ const PREMIUM_LINES = {
       fetch: (request, song, quality) => lxPlayUrl(molanHost, request, "kw", song, quality)
     },
     {
-      name: "独家音源 v6",
-      qualities: ["128", "320", "flac"],
-      fetch: (request, song, quality) => lxPlayUrl(lxv6Host, request, "kw", song, quality)
-    },
-    {
       name: "洛雪 v2-fix",
       qualities: ["320"],
       fetch: (request, song, quality) => lxPlayUrl(luoxueHost, request, "kw", song, quality)
@@ -12676,38 +12645,6 @@ const kw = {
     }
     return out;
   },
-  /**
-   * 歌手列表。酷我 `artist/artistInfo` 支持 prefix 按首字母筛选，是四个音源里
-   * **唯一**支持服务端字母索引的，initialSupported 为 true。
-   * prefix 取值（实测）：字母 → 该字母（`a` 456 人）；空串 → 热门（9204 人）；
-   * `~` → 非字母档（551 人，对应 UI 的「#」）；`#`/数字 → 0 条，故做了归一。
-   * 响应是 data.artistList + data.total（不是 list）。
-   */
-  async artistList(request, initial, page, size) {
-    const letter = initial.trim();
-    let prefix = "";
-    if (/^[A-Za-z]$/.test(letter)) prefix = letter.toLowerCase();
-    else if (letter === "#") prefix = "~";
-    const json = await kuwoRequest(
-      request,
-      "https://www.kuwo.cn/api/www/artist/artistInfo" + buildQuery({
-        category: "0",
-        prefix,
-        pn: String(page),
-        rn: String(size),
-        httpsStatus: "1",
-        reqId: Date.now().toString() + "ar"
-      }),
-      "GET"
-    );
-    const data = asObject(json["data"]);
-    const out = [];
-    for (const entry of asArray(data["artistList"])) {
-      out.push(artistFromKW(asObject(entry)));
-    }
-    const total = asNumber(data["total"]);
-    return { list: out, initialSupported: true, hasMore: page * size < total };
-  },
   /** 蓝本 searchAlbums kw 分支 :1688（searchAlbumBykeyWord，data.albumList，reqId 带 al 后缀）+ albumFromKW :1294 */
   async albumSearch(request, keyword, page, size) {
     const json = await kuwoRequest(
@@ -12807,14 +12744,12 @@ function playlistFromQQ(item) {
   };
 }
 function songFromQQ(item) {
-  const singers = asArray(item["singer"]);
-  const singerItem = singers.length > 0 ? asObject(singers[0]) : {};
   const album = asObject(item["album"]);
   const albumMid = album["mid"];
   return {
     id: asString(item["mid"]),
     name: asString(item["name"]),
-    singer: asString(singerItem["name"]),
+    singer: joinSingerNames(item["singer"]),
     album: asString(album["name"]),
     picUrl: albumMid != null ? "https://y.qq.com/music/photo_new/T002R300x300M000" + asString(albumMid) + ".jpg" : "",
     interval: item["interval"] != null ? asNumber(item["interval"]) : 0
@@ -12876,26 +12811,22 @@ function songFromQQSearch(item) {
   const fallbackMid = asString(item["mid"]);
   const name1 = asString(item["songname"]);
   const name2 = asString(item["name"]);
-  const singers = asArray(item["singer"]);
-  const singerItem = singers.length > 0 ? asObject(singers[0]) : {};
   const albumMid = item["albummid"];
   return {
     id: idText.length > 0 ? idText : fallbackMid,
     name: name1.length > 0 ? name1 : name2,
-    singer: asString(singerItem["name"]),
+    singer: joinSingerNames(item["singer"]),
     album: asString(item["albumname"]),
     picUrl: albumMid != null ? "https://y.qq.com/music/photo_new/T002R300x300M000" + asString(albumMid) + ".jpg" : "",
     interval: item["interval"] != null ? asNumber(item["interval"]) : 0
   };
 }
 function songFromQQDetail(item) {
-  const singers = asArray(item["singer"]);
-  const singerItem = singers.length > 0 ? asObject(singers[0]) : {};
   const albumMid = item["albummid"];
   return {
     id: asString(item["songmid"]),
     name: asString(item["songname"]),
-    singer: asString(singerItem["name"]),
+    singer: joinSingerNames(item["singer"]),
     album: asString(item["albumname"]),
     picUrl: albumMid != null ? "https://y.qq.com/music/photo_new/T002R300x300M000" + asString(albumMid) + ".jpg" : "",
     interval: item["interval"] != null ? asNumber(item["interval"]) : 0
@@ -13214,47 +13145,6 @@ const qq = {
     }
     return artists;
   },
-  /**
-   * 歌手列表。QQ 的 v8.fcg 歌手列表**忽略字母参数**（实测 index=A 无效），
-   * 所以 initialSupported 为 false；但每条带 Findex（首字母），随条目返回给
-   * 客户端做分组。列表本身不给头像，按 mid 拼官方图片地址（实测 200）。
-   */
-  async artistList(request, _initial, page, size) {
-    const json = await requestJson(
-      request,
-      "https://c.y.qq.com/v8/fcg-bin/v8.fcg" + buildQuery({
-        channel: "singer",
-        page: "list",
-        key: "all_all_all",
-        pagesize: String(size),
-        pagenum: String(page),
-        hostUin: "0",
-        format: "json",
-        inCharset: "utf8",
-        outCharset: "utf-8",
-        notice: "0",
-        platform: "yqq",
-        needNewCode: "0"
-      }),
-      { headers: QQ_HEADERS }
-    );
-    const data = asObject(json["data"]);
-    const out = [];
-    for (const entry of asArray(data["list"])) {
-      const item = asObject(entry);
-      const mid = asString(item["Fsinger_mid"]);
-      out.push({
-        id: mid,
-        platform: "qq",
-        name: asString(item["Fsinger_name"]),
-        // 列表不给图：按 mid 拼官方歌手图（T001R300x300M000{mid}.jpg）
-        picUrl: mid.length > 0 ? "https://y.qq.com/music/photo_new/T001R300x300M000" + mid + ".jpg" : "",
-        initial: asString(item["Findex"]).toUpperCase()
-      });
-    }
-    const total = asNumber(data["total"]);
-    return { list: out, initialSupported: false, hasMore: page * size < total };
-  },
   /** 蓝本 searchAlbums qq 分支 :1671（client_search_cp t=8）+ albumFromQQ :1255 */
   async albumSearch(request, keyword, page, size) {
     const json = await requestJson(
@@ -13309,14 +13199,12 @@ const qq = {
     const out = [];
     for (const entry of asArray(data["list"])) {
       const item = asObject(entry);
-      const singers = asArray(item["singers"]);
-      const first = singers.length > 0 ? asObject(singers[0]) : null;
       out.push({
         id: asString(item["vid"]),
         platform: "qq",
         name: asString(item["title"]),
         picUrl: asString(item["picurl"]),
-        singer: first != null ? asString(first["name"]) : ""
+        singer: joinSingerNames(item["singers"])
       });
     }
     return out;
@@ -13411,18 +13299,17 @@ function wyyBrParam(quality) {
 function songFromWyy(item) {
   const songData = asObject(item["song"]);
   const merged = Object.keys(songData).length > 0 ? songData : item;
-  const artistList2 = asArray(merged["artists"]);
+  const artistList = asArray(merged["artists"]);
   const arList = asArray(merged["ar"]);
-  const finalArtists = artistList2.length > 0 ? artistList2 : arList;
+  const finalArtists = artistList.length > 0 ? artistList : arList;
   const albumData = asObject(merged["album"]).id !== void 0 ? asObject(merged["album"]) : asObject(merged["al"]);
-  const firstArtist = finalArtists.length > 0 ? asObject(finalArtists[0]) : {};
   const albumObj = Object.keys(albumData).length > 0 ? albumData : {};
   const cover = asString(item["picUrl"]);
   const albumCover = asString(albumObj["picUrl"]);
   return {
     id: asString(item["id"]),
     name: asString(item["name"]),
-    singer: asString(firstArtist["name"]),
+    singer: joinSingerNames(finalArtists),
     album: asString(albumObj["name"]),
     picUrl: cover.length > 0 ? cover : albumCover,
     interval: merged["duration"] !== void 0 ? asNumber(merged["duration"]) / 1e3 : merged["dt"] !== void 0 ? asNumber(merged["dt"]) / 1e3 : 0
@@ -13431,11 +13318,10 @@ function songFromWyy(item) {
 function songFromWyyDetail(item) {
   const arList = asArray(item["ar"]);
   const al = asObject(item["al"]);
-  const firstArtist = arList.length > 0 ? asObject(arList[0]) : {};
   return {
     id: asString(item["id"]),
     name: asString(item["name"]),
-    singer: asString(firstArtist["name"]),
+    singer: joinSingerNames(arList),
     album: asString(al["name"]),
     picUrl: asString(al["picUrl"]),
     interval: item["dt"] !== void 0 ? asNumber(item["dt"]) / 1e3 : 0
@@ -13720,35 +13606,6 @@ const wyy = {
       });
     }
     return out;
-  },
-  /**
-   * 歌手列表（热门）。wyy 的 artist/list 只有 initial=0（热门）实测有数据，
-   * 字母档（1..27）在该接口上恒空，所以 initialSupported 为 false。
-   * 翻页靠响应里的 more 标志，比按条数猜准。
-   */
-  async artistList(request, _initial, page, size) {
-    const json = await requestJson(
-      request,
-      "https://music.163.com/api/artist/list" + buildQuery({
-        type: "1",
-        area: "-1",
-        initial: "0",
-        limit: String(size),
-        offset: String((page - 1) * size)
-      }),
-      { headers: WYY_HEADERS }
-    );
-    const out = [];
-    for (const entry of asArray(json["artists"])) {
-      const item = asObject(entry);
-      out.push({
-        id: asString(item["id"]),
-        platform: "wyy",
-        name: asString(item["name"]),
-        picUrl: asString(item["picUrl"])
-      });
-    }
-    return { list: out, initialSupported: false, hasMore: json["more"] === true };
   },
   /** 蓝本 searchAlbums wyy 分支 :1725（type=10）+ albumFromWyy :1240 */
   async albumSearch(request, keyword, page, size) {
@@ -14209,9 +14066,6 @@ async function artistSongs(request, source, name, page, size) {
   }
   return { picUrl, songs };
 }
-async function artistList(request, source, initial, page, size) {
-  return platformModule$1(source).artistList(request, initial, page, size);
-}
 async function allSearchBatches(request, keyword, page, size) {
   const batches = [];
   for (const s2 of ALL_SOURCES) {
@@ -14462,21 +14316,8 @@ function registerQtEntries(host2) {
       return JSON.stringify({ detail });
     },
     /**
-     * 歌手列表（热门 / 按首字母）。
-     * initial 为空串表示热门；不支持字母筛选的音源会忽略它并返回热门列表，
-     * 能力由返回里的 initialSupported 如实告知 UI（见 ContractArtistPage）。
+     * 歌手歌曲（第一页附头像 picUrl）
      */
-    async artistList(args) {
-      const page = await artistList(
-        req,
-        String(args.source),
-        String(args.initial == null ? "" : args.initial),
-        Number(args.page == null ? 1 : args.page),
-        Number(args.size == null ? 30 : args.size)
-      );
-      return JSON.stringify(page);
-    },
-    /** 歌手歌曲（第一页附头像 picUrl） */
     async artistSongs(args) {
       const result = await artistSongs(
         req,

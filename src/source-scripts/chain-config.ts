@@ -335,7 +335,7 @@ export function parseChainConfig(raw: unknown): ChainConfig {
 /** 内置默认 chain（line id 稳定，作为后续 chain.json 差异的锚点） */
 export function defaultChainConfig(): ChainConfig {
   return {
-    chainRevision: 2,
+    chainRevision: 8,
     maxLinesPerQuality: DEFAULT_MAX_LINES_PER_QUALITY,
     crossSources: { wyy: ["kw"], kw: ["wyy"], qq: ["kw", "wyy"], kg: ["kw", "wyy"] },
     budget: { totalMs: DEFAULT_CHAIN_BUDGET.totalMs, lineMs: DEFAULT_CHAIN_BUDGET.lineMs },
@@ -396,6 +396,11 @@ export function defaultChainConfig(): ChainConfig {
         },
       ],
       kw: [
+        // 2026-09-23 全量逐线路复测（platform 1101，独立单链 × 12 首 × 3 档）后摘除：
+        //   kw-stellarwave 0/36，36 格全部「死链（Range 预检不过）」。
+        // 同一个 stellarwave 脚本在 qq 是 100%、kg 是 56%，只在 kw 档全废，
+        // 所以只摘这条线路、脚本保留（kg-stellarwave 仍在用）。复测原始数据见
+        // qt-pc/diag-live-rank-1101-kw-wyy.json。
         {
           id: "kw-yuningxi-pro",
           name: "玉宁熙 Pro",
@@ -408,13 +413,6 @@ export function defaultChainConfig(): ChainConfig {
           name: "屿溪 · 终章",
           kind: "lx",
           scriptId: "yuxi",
-          qualities: ["128", "320", "flac"],
-        },
-        {
-          id: "kw-stellarwave",
-          name: "Stellarwave",
-          kind: "lx",
-          scriptId: "stellarwave",
           qualities: ["128", "320", "flac"],
         },
         {
@@ -433,6 +431,13 @@ export function defaultChainConfig(): ChainConfig {
         },
       ],
       kg: [
+        // 2026-09-23 全量逐线路复测后摘除两条（原始数据见 qt-pc/diag-live-rank-1101.json）：
+        //   kg-lxv6         0/36  「lx 脚本「?」未注册 request handler」——脚本初始化即失败，
+        //                         36 格一个都没发出去（lxv6 的中控 88.lxmusic.xn--fiqs8s）。
+        //   kg-yuningxi-pro 1/12 = 8%  「酷狗所有接口未获取到有效播放链接」（flac 专用线）。
+        //                         同一个 yuningxi-pro 脚本在 kw 是 89%，故只摘 kg 这条。
+        // 另注：qq-yuningxi-tang 虽然只有 44%，但实测能出链（旧数据「主机不通」已过期），
+        // 保留作 qq 的最后一道兜底。
         {
           id: "kg-yuxi",
           name: "屿溪 · 终章",
@@ -453,20 +458,6 @@ export function defaultChainConfig(): ChainConfig {
           kind: "lx",
           scriptId: "molan",
           qualities: ["128", "320", "flac"],
-        },
-        {
-          id: "kg-lxv6",
-          name: "独家音源 v6",
-          kind: "lx",
-          scriptId: "lxv6",
-          qualities: ["128", "320", "flac"],
-        },
-        {
-          id: "kg-yuningxi-pro",
-          name: "玉宁熙 Pro",
-          kind: "lx",
-          scriptId: "yuningxi-pro",
-          qualities: ["flac"],
         },
       ],
     },

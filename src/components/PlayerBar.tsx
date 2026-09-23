@@ -151,11 +151,11 @@ export function PlayerBar(): React.JSX.Element {
   return (
     <div
       className={cn(
-        // z-20 不能省：播放条有 backdrop-blur，会自成层叠上下文，而它本身 z 是 auto；
+        // z-20 不能省：播放条自成层叠上下文（z-20），而它本身 z 是 auto；
         // 内容区是 `relative z-10`，层数更高的内容区会盖在播放条（连同它的弹窗）上面，
         // 于是向上弹的收藏 / 音质菜单被页面内容整个遮住，表现是「点了没反应」。
         // 与 TitleBar 的 z-20 同理（见 TitleBar.tsx 同位置注释）。
-        "relative z-20 flex h-[80px] shrink-0 items-center gap-4 border-t backdrop-blur-xl px-4",
+        "relative z-20 flex h-[80px] shrink-0 items-center gap-4 border-t px-4",
         isPlayingPage ? "" : "border-border bg-card/70",
       )}
       style={
@@ -171,6 +171,14 @@ export function PlayerBar(): React.JSX.Element {
           : undefined
       }
     >
+      {/*
+        毛玻璃单独成层：backdrop-filter 每次重绘都要重新抓取并模糊身后内容，
+        而本组件内部的进度条每帧都在更新——毛玻璃和它同层时，等于每帧重做一次
+        全宽模糊（实测该层 paintCount 高达 527，而其它层都是 1）。
+        拆成独立层（负 z 序，位于底色之上、内容之下，观感不变）后，
+        进度条的更新不再触发背景重抓。
+      */}
+      <div aria-hidden className="pointer-events-none absolute inset-0 -z-10 backdrop-blur-xl" />
       {/* 播放失败提示（REQUIREMENTS §3.1：重取仍失败时提示不可播放） */}
       {state?.status === "error" && state.error && (
         <div className="pointer-events-none absolute bottom-full left-1/2 mb-1 max-w-[60%] -translate-x-1/2 truncate rounded-md bg-destructive/10 px-3 py-1 text-xs text-destructive shadow">
