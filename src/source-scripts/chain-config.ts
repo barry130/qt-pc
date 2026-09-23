@@ -401,6 +401,21 @@ export function defaultChainConfig(): ChainConfig {
         // 同一个 stellarwave 脚本在 qq 是 100%、kg 是 56%，只在 kw 档全废，
         // 所以只摘这条线路、脚本保留（kg-stellarwave 仍在用）。复测原始数据见
         // qt-pc/diag-live-rank-1101-kw-wyy.json。
+        //
+        // 顺序按复测「成功率 → 耗时」从优到劣排（取链命中即返回，越靠前越省预算）：
+        //   kw-native-des    36/36 = 100%  128ms   ← bundle 实现，kw 档唯一满勤
+        //   kw-yuningxi-pro  32/36 =  89%  137ms
+        //   kw-yuxi          32/36 =  89%  202ms
+        //   kw-quandouyao    32/36 =  89%  715ms
+        // 已发布并上线的 2026092301 就是这个顺序；源码此前把 native-des 放在末尾，
+        // 与线上产物「同号不同物」，故在源码侧对齐，避免下次 build:sources 把它改回去。
+        {
+          id: "kw-native-des",
+          name: "酷我官方 DES",
+          kind: "bundle",
+          impl: "kwMusicUrlCore",
+          qualities: ["128", "320", "flac"],
+        },
         {
           id: "kw-yuningxi-pro",
           name: "玉宁熙 Pro",
@@ -420,13 +435,6 @@ export function defaultChainConfig(): ChainConfig {
           name: "全豆要",
           kind: "lx",
           scriptId: "quandouyao",
-          qualities: ["128", "320", "flac"],
-        },
-        {
-          id: "kw-native-des",
-          name: "酷我官方 DES",
-          kind: "bundle",
-          impl: "kwMusicUrlCore",
           qualities: ["128", "320", "flac"],
         },
       ],
