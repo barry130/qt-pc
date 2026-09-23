@@ -46,9 +46,10 @@ pnpm install
 pnpm tauri dev
 ```
 
-Vite 开发服务器固定监听 `http://localhost:1420`（见 `tauri.conf.json` 的 `devUrl`）。
+Vite 开发服务器固定监听 `http://localhost:1420` —— 端口单源于 `app.config.json` 的
+`devServer.port`（`vite.config.ts` 直接读它，`tauri.conf.json` 的 `devUrl` 由同步器写入）。
 
-前端单独调试：`pnpm dev`。
+前端单独调试：`pnpm dev`（会先同步配置再起 vite）。
 
 ### 可选：账号与云同步后端
 
@@ -59,7 +60,24 @@ Vite 开发服务器固定监听 `http://localhost:1420`（见 `tauri.conf.json`
 - 开发：`http://localhost:27000/api/v1/`（当前默认值）
 - 生产：`http://astral.canace.cn/api/v1/`
 
-> 发布安装包前需把 `DEFAULT_BASE_URL` 切回 `PROD_BASE_URL`，详见 `docs/CONFIG.md`。
+> 切换环境只改 `app.config.json` 的 `backend.active`（`dev` / `prod`）再跑 `pnpm config:sync` 重新编译，
+> 不要手改 `astral.rs` 里的地址字面量。详见 [`docs/CONFIG.md`](docs/CONFIG.md)。
+
+## 配置
+
+**所有配置只在仓库根的 [`app.config.json`](app.config.json) 里改一处**，其余文件由
+[`scripts/sync-config.mjs`](scripts/sync-config.mjs) 自动写入 —— 版本号、产品名、应用 ID、
+后端地址、平台号、开发端口、音源包版本都在那里：
+
+```bash
+pnpm config:sync     # 同步到 package.json / tauri.conf.json / Cargo.toml / Cargo.lock /
+                     # src-tauri/src/app_config.rs / builtin-sources/version.json / source-update.ts
+pnpm config:check    # 只校验（已挂进 pnpm build / pnpm test：手改派生文件会直接失败）
+```
+
+- 发版只改 `version.name` 与 `version.code` 两行（如 `1.0.8` / `108`），二者自洽性由单测校验。
+- 工具独占的配置（tsconfig 选项、vite 构建目标、Cargo 依赖与 profile、NSIS 模板）留在各自文件，
+  不重复记录；完整字段表、护栏位置、音源包换号流程、安装包行为见 [`docs/CONFIG.md`](docs/CONFIG.md)。
 
 ## 测试
 
@@ -81,7 +99,7 @@ cd src-tauri && cargo test --test live_wyy -- --ignored --nocapture
 ## 构建与打包
 
 ```bash
-pnpm build          # 仅前端产物
+pnpm build          # 仅前端产物（会先跑 config:sync）
 pnpm tauri build    # 完整安装包（NSIS）
 ```
 
@@ -91,21 +109,26 @@ Windows 安装包的详细流程与注意事项见 [`docs/PACKAGING.md`](docs/PA
 
 ```
 qt-pc/
+├── app.config.json          # ★ 唯一配置源：版本号 / 产品名 / ID / 后端地址 / 端口 / 音源包版本
 ├── src/                     # 前端（React）
-│   ├── components/          # UI 组件：discovery / library / lyric / mine / player / update …
+│   ├── components/          # UI 组件：common / layout / discovery / library / lyric / mine / player / update …
 │   ├── hooks/               # 位置插值、播放事件订阅等
 │   ├── services/ipc.ts      # 所有 Tauri invoke 的唯一出口
+│   ├── source-scripts/      # 音源脚本引擎（打进音源包 bundle）
+│   ├── source-engine/       # 引擎页（跑音源包取链）
 │   ├── stores/              # Zustand：播放状态 / 队列 / 认证 / 外观
 │   └── types/               # 与 Rust serde 模型一一对应的 TS 类型
 ├── src-tauri/               # Rust 后端
 │   ├── src/audio/           # 音频引擎（专属线程 + 命令通道）、队列、HTTP Range 读取
-│   ├── src/provider/        # 四音源实现（qq / wyy / kw / kg）+ 注册表与取址缓存
+│   ├── src/provider/        # 音源类型 / 取址缓存（原生 Provider 已删除，取链走前端脚本线路）
 │   ├── src/db/              # SQLite 存储与迁移
+│   ├── src/app_config.rs    # 配置生成物（唯一读取入口，勿手改）
 │   ├── src/commands.rs      # Tauri 命令层
 │   └── tests/               # 集成测试（含真实链路测试与 FLAC 定位回归）
-├── tests/                   # 前端测试
-├── docs/                    # 配置 / 打包 / 重构方案
-├── tools/                   # 开发辅助脚本
+├── scripts/                 # 构建与配置脚本：sync-config / build-sources / sync-builtin-sources
+├── tests/                   # 前端测试（含 config.test.ts 配置护栏）
+├── docs/                    # CONFIG.md（配置）/ PACKAGING.md（打包）/ 重构方案
+├── tools/                   # 开发辅助脚本（registry-proxy.mjs）
 ├── DESIGN.md                # 设计文档
 └── REQUIREMENTS.md          # 需求文档
 ```
@@ -116,7 +139,7 @@ qt-pc/
 |---|---|
 | [`DESIGN.md`](DESIGN.md) | 架构设计、模块边界、接口契约 |
 | [`REQUIREMENTS.md`](REQUIREMENTS.md) | 功能需求与验收标准 |
-| [`docs/CONFIG.md`](docs/CONFIG.md) | 发布前必须检查/修改的配置项 |
+| [`docs/CONFIG.md`](docs/CONFIG.md) | **唯一配置源 `app.config.json`**：字段表、同步器用法、发布流程、安装包行为与护栏 |
 | [`docs/PACKAGING.md`](docs/PACKAGING.md) | Windows 安装包打包流程 |
 | [`docs/plan-playlist-merge.md`](docs/plan-playlist-merge.md) | 收藏 / 歌单模型重构方案 |
 

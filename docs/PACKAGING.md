@@ -18,7 +18,8 @@
    ```powershell
    Get-Process quietmusic -ErrorAction SilentlyContinue | Stop-Process -Force
    ```
-2. 版本号三处已同步（见《配置文档》§1）。
+2. **配置已同步**：`pnpm config:check`（版本号等只在仓库根 `app.config.json` 改一处，
+   见《配置文档》）。发版前确认 `version.name` 与 `version.code` 已一起改。
 3. 验证基线全绿（可选但建议）：
    ```powershell
    pnpm tsc --noEmit; pnpm vitest run
@@ -32,8 +33,9 @@
 
 ```powershell
 Set-Location F:\qtMusic\qt-pc
-pnpm exec tsc --noEmit          # 类型检查
-pnpm exec vite build            # 产出 dist/（不要用 pnpm build，它会带交互确认）
+node scripts/sync-config.mjs    # 配置同步（pnpm build 也会先跑；本机 pnpm 可能被拦，直接调 node）
+node node_modules/typescript/bin/tsc --noEmit          # 类型检查
+node node_modules/vite/bin/vite.js build               # 产出 dist/
 ```
 
 > 若 `pnpm build` 出现 `Terminate batch job (Y/N)?` 挂起，就是组合命令的
@@ -88,6 +90,7 @@ Start-Process "F:\qtMusic\qt-pc\src-tauri\target\release\quietmusic.exe"
 | `failed to remove file ... os error 5` | 应用还在运行，见前置检查 1 |
 | NSIS 下载 makensis 卡住 | Tauri CLI 首次会拉 NSIS 工具链，保持网络通畅或设 `TAURI_NSIS_PATH` 指向已有安装 |
 | 前端构建后窗口空白 | 确认走的是 `vite build` 且 `dist/` 已生成（生产模式吃 dist，不吃 1420 端口） |
-| 图标/中文乱码 | `tauri.conf.json` 保存编码必须 UTF-8 无 BOM |
+| 图标/中文乱码 | `tauri.conf.json` / `app.config.json` 保存编码必须 UTF-8 无 BOM |
+| 安装时弹「系统中已存在…是否卸载」 | 说明用的不是仓库里的自定义模板。确认 `tauri.conf.json` 的 `bundle.windows.nsis.template` 指向 `nsis/installer.nsi`；升级 Tauri CLI 后需重新提取官方模板并重打补丁（见《配置文档》§6） |
 | 启动后挂着一个终端/控制台窗口 | `main.rs` 顶部必须有 `#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]`（release 不分配控制台，dev 保留看日志）；已修，勿删 |
 | NSIS 下载失败（timeout / os error 10054） | Tauri 从 GitHub 拉 NSIS 工具链；网络不通时设代理环境变量再重试，例如 `$env:HTTPS_PROXY = "socks5://127.0.0.1:<socks端口>"`（本机实测 10808 端口可用，HTTP 代理端口不行） |

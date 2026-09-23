@@ -2931,32 +2931,40 @@ PC 端规则：
 
 | 项 | 规则 |
 |---|---|
-| `versionName` | 语义化版本 `major.minor.patch`，如 `1.0.0` |
-| `versionCode` | `major*10000 + minor*100 + patch`，如 `1.0.0` → `10000`、`1.2.3` → `10203` |
-| 起始值 | PC 首个版本 `1.0.0` / `10000`，与移动端 `3.0.0 / 300` 天然不冲突（同 `type` 内单调即可） |
-| 请求参数 | `GET /app/update?type=1103&version=10000&channel=stable`，注意 **`version` 传的是 versionCode 的字符串**，不是 `versionName` |
-| 官方校验 | `GET /app/version/check?type=1103&version=10000&versionName=1.0.0`，三者必须与后台记录完全一致 |
-| 单一真值 | `versionCode` / `versionName` 由 `tauri.conf.json` 的 `version` 派生，构建时注入到 Rust 常量与前端 `import.meta.env`，禁止三处手写 |
+| `versionName` | 语义化版本 `major.minor.patch`，如 `1.0.7` |
+| `versionCode` | `major*100 + minor*10 + patch`，如 `1.0.0` → `100`、`1.0.7` → `107`、`1.2.3` → `123` |
+| 起始值 | PC 首个版本 `1.0.0` / `100`，与移动端 `3.0.0 / 300` 天然不冲突（同 `type` 内单调即可） |
+| 请求参数 | `GET /app/update?type=1103&version=107&channel=stable`，注意 **`version` 传的是 versionCode 的字符串**，不是 `versionName` |
+| 官方校验 | `GET /app/version/check?type=1103&version=107&versionName=1.0.7`，三者必须与后台记录完全一致 |
+| 单一真值 | 二者只在仓库根的 `app.config.json`（`version.name` / `version.code`）写一次，由 `scripts/sync-config.mjs` 写进 `package.json`、`tauri.conf.json`、`Cargo.toml`、`Cargo.lock`、`src-tauri/src/app_config.rs`（§24.2）；**禁止手改派生文件** |
+
+> 历史注：本文档早期写的是 `major*10000 + minor*100 + patch`（`1.0.0` → `10000`），
+> 实现时改成了两位进制的 `major*100 + minor*10 + patch`：后端 `qt_app_update` 表由
+> PC 与移动端共用、按 `type` 区分，两位一档更贴近移动端 `3.0.0 / 300` 的量级，
+> 也便于人工核对。**以本表与 `app.config.json` 为准**（单测会校验 name ↔ code 自洽）。
 
 ### 发布流程
 
 ```text
-1. 更新 tauri.conf.json 的 version（如 1.0.1）
-2. CI：pnpm build → cargo tauri build（NSIS）
-3. CI：计算安装包 MD5 与字节大小
-4. 上传安装包（GitHub Release 或对象存储）
-5. 后台「版本更新」新增记录：type=1103、versionCode、versionName、
+1. 改 app.config.json 的 version.name 与 version.code（如 1.0.8 / 108，两个必须一起改）
+2. pnpm config:sync —— 写进 package.json / tauri.conf.json / Cargo.toml / Cargo.lock /
+   src-tauri/src/app_config.rs（pnpm build 会先自动同步）
+3. 全绿：pnpm config:check、pnpm test、cargo test --lib
+4. 打包（见 docs/PACKAGING.md）→ 计算安装包 MD5 与字节大小
+5. 上传安装包（GitHub Release 或对象存储）
+6. 后台「版本更新」新增记录：type=1103、versionCode、versionName、
    downloadUrl（GitHub 原始链接）、browserUrl、isGithub=1、md5、fileSize、
    channel、isForce、isPublished=0
-6. 用当前版本自测 /app/version/check 通过（未发布也能校验通过）
-7. 确认无误后将 isPublished 置 1，客户端开始收到更新
+7. 用当前版本自测 /app/version/check 通过（未发布也能校验通过）
+8. 确认无误后将 isPublished 置 1，客户端开始收到更新
 ```
 
 ### 安装与替换
 
 | 事项 | 做法 |
 |---|---|
-| 安装器 | NSIS，`installMode: perUser`（免管理员，避免 UAC 拦截自动更新） |
+| 安装器 | NSIS，`installMode: currentUser`（免管理员，避免 UAC 拦截自动更新） |
+| 升级体验 | 自定义模板 `src-tauri/nsis/installer.nsi`（Tauri 官方模板 + 18 行补丁）：**升级 / 同版本重装不再询问是否卸载**，直接原地覆盖安装，用户数据不动；仅「从 WiX/MSI 迁移」与「降级」仍提示。原理与 CLI 升级后的重新提取步骤见 `docs/CONFIG.md` §6 |
 | 静默参数 | 更新时以 `/S`（或 Tauri Updater 默认参数）启动新安装器，安装完成后重启应用 |
 | 退出时机 | 先落盘播放现场与数据库（`PRAGMA wal_checkpoint`），再启动安装器并退出，避免 SQLite 被强杀导致 `-wal` 残留 |
 | 校验 | 下载完成后先比对 `md5` 与 `fileSize`，任一不符即删除临时文件并报错，**不进入安装** |
@@ -3131,35 +3139,23 @@ Tauri 2 的权限是**按窗口授权**的，§17.2 提出了「最小授权」�
 
 ```text
 src/
- ├─ assets/
- ├─ components/
- ├─ features/
- │   ├─ home/
- │   ├─ library/
- │   ├─ search/
- │   ├─ playlist/
- │   ├─ charts/
- │   ├─ daily/
- │   ├─ artist/
- │   ├─ mv/
- │   ├─ player/
- │   ├─ lyric/
- │   ├─ downloads/
- │   ├─ stats/
- │   ├─ feedback/
- │   ├─ messages/
- │   ├─ profile/
- │   ├─ music-source/
- │   └─ settings/
- ├─ routes/
- ├─ stores/
- ├─ themes/
- ├─ lib/
- │   ├─ ipc.ts
- │   ├─ theme.ts
- │   ├─ format.ts
- │   ├─ query.ts
- │   └─ constants.ts
+ ├─ components/            # UI 组件，按页面域分子目录
+ │   ├─ common/            # 通用件（按钮、封面、虚拟列表…）
+ │   ├─ layout/            # 标题栏 / 侧边栏 / 主框架
+ │   ├─ discovery/         # 发现（推荐、排行榜、歌单广场）
+ │   ├─ library/           # 本地音乐库
+ │   ├─ lyric/             # 歌词
+ │   ├─ mine/              # 我的（收藏、歌单、下载、设置、账号）
+ │   ├─ music-source/      # 音源切换与管理
+ │   ├─ onboarding/        # 首次启动引导
+ │   ├─ player/            # 播放条 / 播放队列
+ │   └─ update/            # 更新弹窗与下载进度
+ ├─ hooks/                 # 位置插值、播放事件订阅等
+ ├─ lib/                   # 工具函数
+ ├─ services/ipc.ts        # 所有 Tauri invoke 的唯一出口
+ ├─ source-engine/         # 引擎页（跑音源包取链）
+ ├─ source-scripts/        # 音源脚本引擎（打进音源包 bundle）
+ ├─ stores/                # Zustand：播放 / 队列 / 认证 / 外观
  ├─ types/
  ├─ App.tsx
  └─ main.tsx
@@ -3334,36 +3330,57 @@ M0 通过后再按下表推进；M0 不通过就要在架构层面调整（例�
 
 ```text
 qt-pc/
+ ├─ app.config.json          # ★ 唯一配置源（§24.2）：版本号 / 产品名 / ID / 后端地址 / 端口 / 音源包版本
  ├─ REQUIREMENTS.md
  ├─ DESIGN.md
- ├─ package.json
- ├─ vite.config.ts
- ├─ components.json          # shadcn/ui 配置
+ ├─ README.md
+ ├─ package.json             # version 由 config:sync 写入
+ ├─ tsconfig.json
+ ├─ vite.config.ts           # 端口读 app.config.json
+ ├─ vitest.config.js
+ ├─ index.html
+ ├─ scripts/
+ │   ├─ sync-config.mjs      # ★ 配置同步器（config:sync / config:check）
+ │   ├─ build-sources.mjs    # 音源包 bundle 构建
+ │   └─ sync-builtin-sources.mjs  # 产物同步进 src-tauri/builtin-sources/
  ├─ src/                     # §19.1
+ ├─ tests/                   # 前端单测（含 config.test.ts 配置护栏）
+ ├─ docs/                    # CONFIG.md / PACKAGING.md
+ ├─ tools/                   # registry-proxy.mjs（本机 cargo 绕行）
  └─ src-tauri/               # §19.2
 ```
 
-### 24.2 环境与配置分离
+### 24.2 配置单一真值（`app.config.json`）
 
-对齐移动端 `services/config.ts` 的做法，避免生产地址进仓库：
+> 早期草案设想的 `config.dev.toml` / `config.local.toml` **没有落地**，按下面的方案实现。
+> 草案的问题：同一份信息（版本号）散落在 5 个文件里手改，发版时必然漏改一处。
 
-| 文件 | 是否提交 | 内容 |
+| 位置 | 提交 | 内容 |
 |---|---|---|
-| `src-tauri/config.dev.toml` | 提交 | 开发环境 Astral 基地址（局域网） |
-| `src-tauri/config.local.toml` | **不提交**（加 `.gitignore`） | 生产环境基地址 |
-| 运行时覆盖 | — | 设置页提供隐藏入口可临时改基地址，便于联调；改动只存本机 |
+| `app.config.json`（仓库根） | 提交 | **唯一配置源**：产品名 / 展示名 / ID、`version.{name,code}`、`sourcePack.{code,name,hostApiVersion}`、`backend.{dev,prod,active}`、`platform.*`、`feedback.platform`、`devServer.{port,hmrPort}` |
+| `scripts/sync-config.mjs` | 提交 | 同步器：把上面的值写进 7 个派生文件；`--check` 只校验不写盘 |
+| `src-tauri/src/app_config.rs` | 提交（**生成物**） | Rust 侧唯一读取入口（`astral.rs` 的对外常量转指到它，调用方不变）+ 一致性单测 |
+| `src-tauri/.cargo/config.toml` | **不提交** | 本机 cargo 走 127.0.0.1 镜像的绕行配置（已在 `.gitignore`） |
 
-基地址由 Rust 持有，前端不感知也不硬编码。
+规则：
+
+- 改配置**只改 `app.config.json`**，然后 `pnpm config:sync`；`pnpm build` / `pnpm dev` 会自动先同步，
+  `pnpm test` 会先校验（不一致直接失败）。
+- 后端地址由 Rust 持有（`app_config.rs` → `astral.rs`），前端不感知也不硬编码；
+  切换环境改 `backend.active`（`dev` / `prod`）后同步重编，不再手改 `DEFAULT_BASE_URL` 的字面量。
+- 只有「在多个文件里重复出现」的值才进配置源；工具独占的配置（tsconfig 选项、vite 构建目标、
+  Cargo 依赖与 profile、NSIS 模板…）留在原文件 —— 理由与完整字段表见 `docs/CONFIG.md`。
 
 ### 24.3 构建与 CI
 
 | 任务 | 命令 |
 |---|---|
-| 前端类型检查 | `pnpm tsc --noEmit` |
-| 前端单测 | `pnpm vitest run` |
+| 配置校验 | `pnpm config:check`（`pnpm build` / `pnpm test` 已内置） |
+| 前端类型检查 | `pnpm typecheck`（= `tsc --noEmit`） |
+| 前端单测 | `pnpm test`（= `config:check` + `vitest run`） |
 | Rust 检查 | `cargo clippy --all-targets -- -D warnings` |
-| Rust 单测 | `cargo test`（§20.1 的模块） |
-| 本地运行 | `pnpm tauri dev` |
+| Rust 单测 | `cargo test`（§20.1 的模块；含 `app_config` 的配置一致性单测） |
+| 本地运行 | `pnpm tauri dev`（本机 CLI 的 argv[0] 问题见 `docs/PACKAGING.md`） |
 | 出包 | `pnpm tauri build`（产物：`src-tauri/target/release/bundle/nsis/*.exe`） |
 
 CI（GitHub Actions，`windows-latest`）：`checkout → setup node/pnpm → setup rust(msvc) → 缓存 cargo/pnpm → 类型检查 + clippy + 测试 → tauri build → 计算 MD5/大小 → 上传 artifact`。Release 环节保持人工确认，避免自动发布未验证的包。
