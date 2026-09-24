@@ -14,20 +14,38 @@ import type { ChainConfig } from "./chain-config";
 import { defaultChainConfig, parseChainConfig } from "./chain-config";
 
 let cached: ChainConfig | null = null;
+/**
+ * 在途加载（单飞）。并发调用只读一次 overlay，且**迟到的结果不覆盖已生效的值**：
+ * 加载要 await invoke（跨进程），期间可能已经被 setChainConfigCache 注入（测试）
+ * 或被另一次加载填上；无条件写回会让并发取链读到两份不同链路
+ * （2026-09-24 实测：测试注入的链路被上一个用例的在途加载覆盖成默认链路）。
+ */
+let loading: Promise<ChainConfig> | null = null;
 
 /** 取生效的 chain 配置（overlay 加载失败回退内置默认；结果进程内缓存） */
 export async function getChainConfig(): Promise<ChainConfig> {
   if (cached !== null) return cached;
+  if (loading === null) {
+    loading = loadChainConfig().finally(() => {
+      loading = null;
+    });
+  }
+  return loading;
+}
+
+async function loadChainConfig(): Promise<ChainConfig> {
+  let loaded: ChainConfig | null = null;
   try {
     const raw = await invoke<string | null>("source_chain_overlay");
     if (raw !== null && raw.length > 0) {
-      cached = parseChainConfig(JSON.parse(raw));
-      return cached;
+      loaded = parseChainConfig(JSON.parse(raw));
     }
   } catch {
     // 文件不存在 / JSON 坏 / schema 坏：一律回退默认（坏 overlay 等同没有）
   }
-  cached = defaultChainConfig();
+  if (loaded === null) loaded = defaultChainConfig();
+  // 谁先写谁生效：加载期间已被填上就保留那个值（不覆盖更新的配置）
+  if (cached === null) cached = loaded;
   return cached;
 }
 

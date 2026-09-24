@@ -100,6 +100,13 @@ class ChainBudget {
   constructor(totalMs = CHAIN_BUDGET_MS, lineMs = CHAIN_LINE_MS) {
     __publicField(this, "deadline");
     __publicField(this, "lineMs");
+    /**
+     * 整链总预算（毫秒）。取链链用它按比例收缩「留给跨源兜底的预留」
+     * （play-url.ts 的 CROSS_RESERVE_MS）：总预算被 chain.json 调小时，
+     * 预留不能大到把档内线路全挤掉。
+     */
+    __publicField(this, "totalMs");
+    this.totalMs = totalMs;
     this.deadline = Date.now() + totalMs;
     this.lineMs = lineMs;
   }
@@ -361,7 +368,7 @@ function parseChainConfig(raw) {
 }
 function defaultChainConfig() {
   return {
-    chainRevision: 8,
+    chainRevision: 10,
     maxLinesPerQuality: DEFAULT_MAX_LINES_PER_QUALITY,
     crossSources: { wyy: ["kw"], kw: ["wyy"], qq: ["kw", "wyy"], kg: ["kw", "wyy"] },
     budget: { totalMs: DEFAULT_CHAIN_BUDGET.totalMs, lineMs: DEFAULT_CHAIN_BUDGET.lineMs },
@@ -376,13 +383,13 @@ function defaultChainConfig() {
         }
       ],
       qq: [
-        {
-          id: "qq-molan-tx",
-          name: "墨澜 tx（聚合内核）",
-          kind: "lx",
-          scriptId: "molan",
-          qualities: ["128", "320", "flac"]
-        },
+        // 2026-09-24 按《音源质量报告-20260924》双平台实测重排（每源 6 首 × 3 档 × 1103/1101）。
+        // 五条线在隔离实测里成功率相同（12/12），所以顺序只影响「耗时」，按 p50 从快到慢排：
+        //   qq-world260809   660 / 653ms   128/320/flac 全通
+        //   qq-stellarwave-tx 713 / 700ms  320/flac（parallel，与链首并发起跑）
+        //   qq-molan-tx      738 / 634ms   128/320/flac 全通
+        //   qq-haitang-core  844 / 849ms   128/320/flac 全通（p90 有 kuwo CDN 长尾）
+        //   qq-yuningxi-tang 1047 / 1071ms 仅 flac（见下）
         {
           id: "qq-world260809",
           name: "World 260809 a.aa.cab",
@@ -407,10 +414,32 @@ function defaultChainConfig() {
           parallel: true
         },
         {
+          id: "qq-molan-tx",
+          name: "墨澜 tx（聚合内核）",
+          kind: "lx",
+          scriptId: "molan",
+          qualities: ["128", "320", "flac"]
+        },
+        {
+          id: "qq-haitang-core",
+          name: "恒堂核心 API",
+          kind: "bundle",
+          impl: "qqHaitangCore",
+          qualities: ["128", "320", "flac"]
+        },
+        // 2026-09-24 收敛为仅 flac（用户要求）。原因见《音源质量报告-20260924》§4.2：
+        // 它有损档交付的是 AAC 而非 MP3，且规格低于标称 ——
+        //   请求 320 → AAC 192k（`audio/mp4`，isure6.stream.qqmusic.qq.com）
+        //   请求 128 → AAC 96k
+        // 192k AAC 听感约等于 256k MP3，明显低于 320k；用户会以为拿到了 320k。
+        // 它 flac 档是真无损（fLaC 魔数、压缩比落真无损区间），故只保留 flac 兜底；
+        // flac 档实测 10/12（`多远都要在一起` 两平台皆失败）。
+        // 注：pick 里 128/320 的取值路径一并删除 —— 该线路不再参与这两档换源。
+        {
           id: "qq-yuningxi-tang",
-          name: "玉宁熙 tang.api",
+          name: "玉宁熙 tang.api（仅无损）",
           kind: "http",
-          qualities: ["128", "320", "flac"],
+          qualities: ["flac"],
           pre: [{ url: "https://www.97abc.com/count.php?id=lx-yuningxi", timeoutMs: 8e3 }],
           request: {
             url: "https://tang.api.s01s.cn/music_open_api.php",
@@ -418,7 +447,7 @@ function defaultChainConfig() {
             headers: { "Content-Type": "application/json", Referer: "https://y.qq.com/" }
           },
           require: { song_mid: "nonEmpty" },
-          pick: { "128": "song_play_url_standard", "320": "song_play_url", flac: "song_play_url_sq" }
+          pick: { flac: "song_play_url_sq" }
         }
       ],
       kw: [
@@ -427,6 +456,21 @@ function defaultChainConfig() {
         // 同一个 stellarwave 脚本在 qq 是 100%、kg 是 56%，只在 kw 档全废，
         // 所以只摘这条线路、脚本保留（kg-stellarwave 仍在用）。复测原始数据见
         // qt-pc/diag-live-rank-1101-kw-wyy.json。
+        //
+        // 顺序按复测「成功率 → 耗时」从优到劣排（取链命中即返回，越靠前越省预算）：
+        //   kw-native-des    36/36 = 100%  128ms   ← bundle 实现，kw 档唯一满勤
+        //   kw-yuningxi-pro  32/36 =  89%  137ms
+        //   kw-yuxi          32/36 =  89%  202ms
+        //   kw-quandouyao    32/36 =  89%  715ms
+        // 已发布并上线的 2026092301 就是这个顺序；源码此前把 native-des 放在末尾，
+        // 与线上产物「同号不同物」，故在源码侧对齐，避免下次 build:sources 把它改回去。
+        {
+          id: "kw-native-des",
+          name: "酷我官方 DES",
+          kind: "bundle",
+          impl: "kwMusicUrlCore",
+          qualities: ["128", "320", "flac"]
+        },
         {
           id: "kw-yuningxi-pro",
           name: "玉宁熙 Pro",
@@ -447,13 +491,6 @@ function defaultChainConfig() {
           kind: "lx",
           scriptId: "quandouyao",
           qualities: ["128", "320", "flac"]
-        },
-        {
-          id: "kw-native-des",
-          name: "酷我官方 DES",
-          kind: "bundle",
-          impl: "kwMusicUrlCore",
-          qualities: ["128", "320", "flac"]
         }
       ],
       kg: [
@@ -462,8 +499,32 @@ function defaultChainConfig() {
         //                         36 格一个都没发出去（lxv6 的中控 88.lxmusic.xn--fiqs8s）。
         //   kg-yuningxi-pro 1/12 = 8%  「酷狗所有接口未获取到有效播放链接」（flac 专用线）。
         //                         同一个 yuningxi-pro 脚本在 kw 是 89%，故只摘 kg 这条。
-        // 另注：qq-yuningxi-tang 虽然只有 44%，但实测能出链（旧数据「主机不通」已过期），
-        // 保留作 qq 的最后一道兜底。
+        //
+        // 2026-09-24 按《音源质量报告-20260924》双平台实测重排，p50 从快到慢：
+        //   kg-molan         426 / 465ms   128档 6/12  320档 6/12  flac 12/12
+        //   kg-haitang-core  458 / 466ms   128档 6/12  320档 6/12  flac 12/12
+        //   kg-yuxi          506 / 519ms   128档 6/12  320档 6/12  flac 12/12
+        //   kg-stellarwave  1554 / 1488ms  128档 5/12  320档 6/12  flac 12/12
+        // 四条线成功率**完全相同**（有损档失败集中在同一批歌、全线一致 —— 上游把
+        // 有损直链解析到连不上的 v3-32-yp-qqmusic.a.bdycdn.cn，属上游缺陷，加线无收益），
+        // 所以顺序只影响耗时：把最慢的 stellarwave 从第 2 位挪到末位，避免拖慢失败路径。
+        {
+          id: "kg-molan",
+          name: "墨澜",
+          kind: "lx",
+          scriptId: "molan",
+          qualities: ["128", "320", "flac"]
+        },
+        // 2026-09-24 新增（用户指定接入 asice999/lxmusic-sources 的核心 API）。
+        // flac 是真无损（fLaC 魔数）、320 的 URL 路径带 _qu32 确认按档出；
+        // 出链 ~460ms，是 kg 里最快的两条之一。
+        {
+          id: "kg-haitang-core",
+          name: "恒堂核心 API",
+          kind: "bundle",
+          impl: "kgHaitangCore",
+          qualities: ["128", "320", "flac"]
+        },
         {
           id: "kg-yuxi",
           name: "屿溪 · 终章",
@@ -476,13 +537,6 @@ function defaultChainConfig() {
           name: "Stellarwave",
           kind: "lx",
           scriptId: "stellarwave",
-          qualities: ["128", "320", "flac"]
-        },
-        {
-          id: "kg-molan",
-          name: "墨澜",
-          kind: "lx",
-          scriptId: "molan",
           qualities: ["128", "320", "flac"]
         }
       ]
@@ -497,17 +551,27 @@ async function invoke(cmd, args = {}, options) {
   return window.__TAURI_INTERNALS__.invoke(cmd, args, options);
 }
 let cached = null;
+let loading = null;
 async function getChainConfig() {
   if (cached !== null) return cached;
+  if (loading === null) {
+    loading = loadChainConfig().finally(() => {
+      loading = null;
+    });
+  }
+  return loading;
+}
+async function loadChainConfig() {
+  let loaded = null;
   try {
     const raw = await invoke("source_chain_overlay");
     if (raw !== null && raw.length > 0) {
-      cached = parseChainConfig(JSON.parse(raw));
-      return cached;
+      loaded = parseChainConfig(JSON.parse(raw));
     }
   } catch {
   }
-  cached = defaultChainConfig();
+  if (loaded === null) loaded = defaultChainConfig();
+  if (cached === null) cached = loaded;
   return cached;
 }
 function setChainConfigCache(config) {
@@ -13702,6 +13766,36 @@ const wyy = {
     throw new Error("该 MV 可能为 VIP 内容，暂时无法播放");
   }
 };
+const CORE_URL = "https://musicserver.haitangw.cc/v1/music/resolve-url";
+const CORE_SOURCE = { qq: "tx", kg: "kg" };
+function levelOf(quality) {
+  return quality === "flac" ? "lossless" : "exhigh";
+}
+async function coreMusicUrl(request, source, song, quality) {
+  try {
+    if (song.id.length === 0) return "";
+    const json = await requestJson(request, CORE_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        source: CORE_SOURCE[source],
+        rid: song.id,
+        level: levelOf(quality)
+      })
+    });
+    if (json["code"] !== void 0 && Number(json["code"]) !== 0) return "";
+    const url = asString(asObject(json["data"])["url"]);
+    return url.replace(/\$/g, "=");
+  } catch {
+    return "";
+  }
+}
+function qqHaitangCore(request, song, quality) {
+  return coreMusicUrl(request, "qq", song, quality);
+}
+function kgHaitangCore(request, song, quality) {
+  return coreMusicUrl(request, "kg", song, quality);
+}
 const BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 function varValue(key, vars) {
   if (key === "name") return vars.song.name;
@@ -13795,11 +13889,32 @@ async function runHttpLine(line, request, song, quality) {
 const PLAY_URL_TTL_MS = 10 * 60 * 1e3;
 const urlCache = new TtlCache(PLAY_URL_TTL_MS);
 const VERIFY_MS = 2500;
+const CROSS_RESERVE_MS = 1500;
+const MIN_SLOT_MS = 600;
+const DEGRADE_MISSES = 3;
+const DEGRADE_TTL_MS = 6e4;
+const sourceHealth = /* @__PURE__ */ new Map();
+function isSourceDegraded(source) {
+  const health = sourceHealth.get(source);
+  return health !== void 0 && health.until > Date.now();
+}
+function noteSourceMiss(source) {
+  const health = sourceHealth.get(source) ?? { misses: 0, until: 0 };
+  health.misses += 1;
+  if (health.misses >= DEGRADE_MISSES) health.until = Date.now() + DEGRADE_TTL_MS;
+  sourceHealth.set(source, health);
+}
+function noteSourceHit(source) {
+  sourceHealth.delete(source);
+}
 const BUNDLE_IMPLS = {
   wyyMusicUrlCore: (request, song, quality) => wyy.musicUrlCore(request, song, quality),
   qqMusicUrlCore: (request, song, quality) => qq.musicUrlCore(request, song, quality),
   kwMusicUrlCore: (request, song, quality) => kw.musicUrlCore(request, song, quality),
-  kgMusicUrlCore: (request, song, quality) => kg.musicUrlCore(request, song, quality)
+  kgMusicUrlCore: (request, song, quality) => kg.musicUrlCore(request, song, quality),
+  // 恒堂核心 API（POST JSON 官源直链解析）—— 只有 qq/kg 两条链在用
+  qqHaitangCore,
+  kgHaitangCore
 };
 const warnedRefs = /* @__PURE__ */ new Set();
 function warnOnce(key, message) {
@@ -13845,20 +13960,6 @@ async function verifyPlayable(request, url) {
     return false;
   }
 }
-async function playFromSource(request, keyword, target, quality) {
-  try {
-    const results = await (target === "kw" ? kw : wyy).search(request, keyword, 1, 3);
-    for (const hit of results) {
-      try {
-        const url = await (target === "kw" ? kw : wyy).musicUrlCore(request, hit, quality);
-        if (url.length > 0) return url;
-      } catch {
-      }
-    }
-  } catch {
-  }
-  return "";
-}
 async function resolvePlayUrl(request, source, song, quality, platform = LOCAL_PLATFORM) {
   const config = await getChainConfig();
   const budget = new ChainBudget(config.budget.totalMs, config.budget.lineMs);
@@ -13873,6 +13974,20 @@ function consumeLastMissTrace(key) {
   lastMissKey = "";
   return t2;
 }
+let lastHitLine = null;
+let lastHitKey = "";
+function consumeLastHitLine(key) {
+  if (lastHitKey !== key) return null;
+  const t2 = lastHitLine;
+  lastHitLine = null;
+  lastHitKey = "";
+  return t2;
+}
+const CROSS_LINE_NAMES = { kw: "酷我（跨源兜底）", wyy: "网易云（跨源兜底）" };
+function markHitLine(cacheKey, id, name, kind) {
+  lastHitLine = { id, name, kind };
+  lastHitKey = cacheKey;
+}
 function traceEntry(lineId, detail) {
   const d = detail.length > 60 ? detail.slice(0, 60) + "…" : detail;
   return `${lineId}=${d}`;
@@ -13884,12 +13999,31 @@ async function resolvePlayUrlWithBudget(request, source, song, quality, budget, 
   if (cached2.length > 0) return cached2;
   lastMissTrace = "";
   lastMissKey = "";
+  lastHitLine = null;
+  lastHitKey = "";
   const runners = filterChainLines(config.chains[source] ?? [], platform).filter((line) => line.qualities.includes(quality)).slice(0, config.maxLinesPerQuality).map((line) => ({
     id: line.id,
+    name: line.name,
+    kind: line.kind,
     parallel: line.parallel === true,
     executor: lineExecutor(line, source)
-  })).filter((runner) => runner.executor !== null);
+  })).filter(
+    (runner) => runner.executor !== null
+  );
   const trace = [];
+  const crossTargets = (config.crossSources[source] ?? []).filter(
+    (target) => target === "kw" || target === "wyy"
+  );
+  const reserve = crossTargets.length > 0 ? Math.min(CROSS_RESERVE_MS, Math.floor(budget.totalMs / 3)) : 0;
+  const keyword = song.name + " " + song.singer;
+  if (reserve > 0 && isSourceDegraded(source)) {
+    trace.push("降级中");
+    const early = await runCrossSources(request, keyword, crossTargets, song, quality, budget, trace, reserve);
+    if (early.target !== null) {
+      markHitLine(cacheKey, "cross:" + early.target, CROSS_LINE_NAMES[early.target], "cross");
+      return settle(cacheKey, early.url);
+    }
+  }
   const started = /* @__PURE__ */ new Map();
   for (const runner of runners) {
     if (runner.parallel) {
@@ -13901,24 +14035,34 @@ async function resolvePlayUrlWithBudget(request, source, song, quality, budget, 
   }
   for (let i2 = 0; i2 < runners.length; i2++) {
     const runner = runners[i2];
-    if (budget.expired) {
+    const restCount = runners.length - 1 - i2;
+    const usable = Math.max(0, budget.remainingMs - reserve);
+    if (usable <= 0) {
       trace.push(traceEntry(runner.id, "预算耗尽未跑"));
       continue;
     }
-    const restCount = runners.length - 1 - i2;
-    const lineSlice = restCount > 0 ? Math.min(budget.sliceMs(), Math.floor(budget.remainingMs / 2)) : void 0;
-    const raw = await budget.run(
+    const keepForRest = Math.min(usable, MIN_SLOT_MS * restCount);
+    const lineSlice = Math.max(1, Math.min(budget.sliceMs(), usable - keepForRest));
+    const outcome = await budget.runTimed(
       started.get(runner.executor) ?? runner.executor(request, song, quality).catch((e2) => `err:${msgOf(e2)}`),
       "",
       lineSlice
     );
+    const raw = outcome.value;
     let url = typeof raw === "string" ? raw : "";
     if (typeof raw === "string" && raw.length > 6 && raw.startsWith("err:")) {
       trace.push(traceEntry(runner.id, raw));
       continue;
     }
+    if (url.length === 0 && outcome.timedOut) {
+      trace.push(traceEntry(runner.id, "超时未返回"));
+      continue;
+    }
     if (url.length > 0) {
-      const verified = await budget.runTimed(verifyPlayable(request, url), false, VERIFY_MS);
+      const usableNow = Math.max(0, budget.remainingMs - reserve);
+      const keepForRestNow = Math.min(usableNow, MIN_SLOT_MS * restCount);
+      const verifySlice = Math.min(VERIFY_MS, Math.max(0, usableNow - keepForRestNow));
+      const verified = await budget.runTimed(verifyPlayable(request, url), false, verifySlice);
       if (!verified.value) {
         trace.push(traceEntry(runner.id, verified.timedOut ? "预检超时" : "死链（Range 预检不过）"));
         url = "";
@@ -13926,24 +14070,57 @@ async function resolvePlayUrlWithBudget(request, source, song, quality, budget, 
     }
     if (url.length > 0) {
       trace.push(traceEntry(runner.id, "ok"));
+      markHitLine(cacheKey, runner.id, runner.name, runner.kind);
+      noteSourceHit(source);
       return settle(cacheKey, url);
     }
     if (!trace.some((t2) => t2.startsWith(runner.id + "="))) trace.push(traceEntry(runner.id, "空"));
   }
-  const keyword = song.name + " " + song.singer;
-  for (const target of config.crossSources[source] ?? []) {
-    if (target !== "kw" && target !== "wyy") continue;
-    if (budget.expired) {
+  const cross = await runCrossSources(request, keyword, crossTargets, song, quality, budget, trace);
+  if (cross.target !== null) {
+    markHitLine(cacheKey, "cross:" + cross.target, CROSS_LINE_NAMES[cross.target], "cross");
+    return settle(cacheKey, cross.url);
+  }
+  noteSourceMiss(source);
+  const degraded = isSourceDegraded(source) ? "[降级中]" : "";
+  lastMissTrace = `${source}@${quality}${degraded} ${trace.join("; ")}`;
+  lastMissKey = cacheKey;
+  throw new Error("该歌曲暂时无法播放");
+}
+async function crossFirstLineUrl(request, target, song, quality) {
+  const config = await getChainConfig();
+  const candidates = filterChainLines(config.chains[target] ?? [], LOCAL_PLATFORM).filter((line) => line.qualities.includes(quality)).slice(0, config.maxLinesPerQuality);
+  for (const line of candidates) {
+    const executor = lineExecutor(line, target);
+    if (executor === null) continue;
+    try {
+      const url = await executor(request, song, quality);
+      if (url.length > 0) return url;
+    } catch {
+    }
+    break;
+  }
+  return "";
+}
+async function runCrossSources(request, keyword, targets, song, quality, budget, trace, capMs) {
+  const startedAt = Date.now();
+  for (let i2 = 0; i2 < targets.length; i2++) {
+    const target = targets[i2];
+    const left = budget.remainingMs;
+    const capLeft = capMs === void 0 ? left : capMs - (Date.now() - startedAt);
+    const usable = Math.min(left, capLeft);
+    if (usable <= 0) {
       trace.push(traceEntry("cross:" + target, "预算耗尽未跑"));
       continue;
     }
-    const url = await budget.run(playFromSource(request, keyword, target, quality), "");
+    const restCount = targets.length - 1 - i2;
+    const keepForRest = Math.min(usable, MIN_SLOT_MS * restCount);
+    const slice = Math.max(1, usable - keepForRest);
+    const url = await budget.run(crossFirstLineUrl(request, target, song, quality), "", slice);
     trace.push(traceEntry("cross:" + target, url.length > 0 ? "ok" : "空"));
-    if (url.length > 0) return settle(cacheKey, url);
+    if (url.length > 0) return { url, target };
   }
-  lastMissTrace = `${source}@${quality} ${trace.join("; ")}`;
-  lastMissKey = cacheKey;
-  throw new Error("该歌曲暂时无法播放");
+  return { url: "", target: null };
 }
 function msgOf(e2) {
   return e2 instanceof Error ? e2.message : String(e2);
@@ -14230,7 +14407,8 @@ function registerQtEntries(host2) {
         const trace = consumeLastMissTrace(source + ":" + song.id + ":" + quality);
         throw new Error(trace.length > 0 ? `未取到播放地址（${trace}）` : "未取到播放地址");
       }
-      return JSON.stringify({ url, source, quality });
+      const line = consumeLastHitLine(source + ":" + song.id + ":" + quality);
+      return JSON.stringify({ url, source, quality, line });
     },
     /** 冒烟自检的 Range 预检：判定口径与 PC 的 verifyPlayable 一致 */
     async verifyPlayable(args) {

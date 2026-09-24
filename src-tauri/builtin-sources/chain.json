@@ -1,5 +1,5 @@
 {
-  "chainRevision": 8,
+  "chainRevision": 10,
   "maxLinesPerQuality": 5,
   "crossSources": {
     "wyy": [
@@ -36,17 +36,6 @@
       }
     ],
     "qq": [
-      {
-        "id": "qq-molan-tx",
-        "name": "墨澜 tx（聚合内核）",
-        "kind": "lx",
-        "scriptId": "molan",
-        "qualities": [
-          "128",
-          "320",
-          "flac"
-        ]
-      },
       {
         "id": "qq-world260809",
         "name": "World 260809 a.aa.cab",
@@ -90,12 +79,32 @@
         "parallel": true
       },
       {
-        "id": "qq-yuningxi-tang",
-        "name": "玉宁熙 tang.api",
-        "kind": "http",
+        "id": "qq-molan-tx",
+        "name": "墨澜 tx（聚合内核）",
+        "kind": "lx",
+        "scriptId": "molan",
         "qualities": [
           "128",
           "320",
+          "flac"
+        ]
+      },
+      {
+        "id": "qq-haitang-core",
+        "name": "恒堂核心 API",
+        "kind": "bundle",
+        "impl": "qqHaitangCore",
+        "qualities": [
+          "128",
+          "320",
+          "flac"
+        ]
+      },
+      {
+        "id": "qq-yuningxi-tang",
+        "name": "玉宁熙 tang.api（仅无损）",
+        "kind": "http",
+        "qualities": [
           "flac"
         ],
         "pre": [
@@ -118,8 +127,6 @@
           "song_mid": "nonEmpty"
         },
         "pick": {
-          "128": "song_play_url_standard",
-          "320": "song_play_url",
           "flac": "song_play_url_sq"
         }
       }
@@ -172,6 +179,28 @@
     ],
     "kg": [
       {
+        "id": "kg-molan",
+        "name": "墨澜",
+        "kind": "lx",
+        "scriptId": "molan",
+        "qualities": [
+          "128",
+          "320",
+          "flac"
+        ]
+      },
+      {
+        "id": "kg-haitang-core",
+        "name": "恒堂核心 API",
+        "kind": "bundle",
+        "impl": "kgHaitangCore",
+        "qualities": [
+          "128",
+          "320",
+          "flac"
+        ]
+      },
+      {
         "id": "kg-yuxi",
         "name": "屿溪 · 终章",
         "kind": "lx",
@@ -187,17 +216,6 @@
         "name": "Stellarwave",
         "kind": "lx",
         "scriptId": "stellarwave",
-        "qualities": [
-          "128",
-          "320",
-          "flac"
-        ]
-      },
-      {
-        "id": "kg-molan",
-        "name": "墨澜",
-        "kind": "lx",
-        "scriptId": "molan",
         "qualities": [
           "128",
           "320",

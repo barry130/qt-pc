@@ -8,7 +8,8 @@
  *   - kind "status"：查询引擎生命周期（booting/ready/error，builtin 仅为
  *     兼容保留）——引擎启动早于主窗口前端，boot 时推送的状态事件会错过，
  *     绑定后主动查询；
- *   - kind "resolve"：取链（url "" = 失败/无可用层）；
+ *   - kind "resolve"：取链（url "" = 失败/无可用层；line = 本次命中的音源线路，
+ *     null = 未知，见 PlayUrlLine）；
  *   - kind "invoke"：数据接口（搜索/歌单/专辑/歌手/榜单/歌词/封面/热词/MV），
  *     bundle 的 `__qtEntries` 入口名 + JSON 参数，result 为 JSON 文本。
  *
@@ -28,12 +29,38 @@ export type EnginePhase = "booting" | "builtin" | "ready" | "error";
 
 interface EngineReply {
   url?: string;
+  /** 本次取链命中的音源线路（bundle 的 getPlayUrl 应答里的 line） */
+  line?: unknown;
   phase?: EnginePhase;
   code?: number | null;
   detail?: string | null;
   /** kind=invoke 的返回值（bundle 入口的 JSON 文本） */
   result?: string | null;
   error?: string | null;
+}
+
+/**
+ * 取链命中的音源线路：音源包 chain.json 里那条真正给出地址的源。
+ * kind 取值 lx / http / bundle，另有 "cross" = 本档线路全灭、跨源兜底救回。
+ * （安卓端同名字段见 qt-uniappx/services/source-engine.uts 的 PlayUrlLine。）
+ */
+export interface PlayUrlLine {
+  id: string;
+  name: string;
+  kind: string;
+}
+
+/** 取链结果：地址 + 命中线路（line null = 未知，不是失败）+ 失败死因（trace） */
+export interface EngineResolved {
+  url: string;
+  line: PlayUrlLine | null;
+  /**
+   * 取链失败时 bundle 抛出的逐线路 trace（`kg@320 kg-yuxi=超时未返回; …;
+   * cross:kw=预算耗尽未跑`）；成功或引擎页较旧时为空串。
+   * 用途：管理端面板显示「上次取链死因」+ 控制台告警——以前这条文本被吞掉，
+   * 「酷狗失败却不换源」只能靠猜。
+   */
+  error: string;
 }
 
 /**
@@ -167,28 +194,54 @@ async function ensureBound(): Promise<void> {
 }
 
 /**
+ * 应答里的 line 只信形状正确的：{id: string, name?: string, kind?: string}。
+ * 引擎页可能比宿主旧（没有这个字段）、也可能是别的形状，一律按「未知」处理。
+ */
+function normalizeLine(raw: unknown): PlayUrlLine | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const obj = raw as Record<string, unknown>;
+  const id = typeof obj.id === "string" ? obj.id : "";
+  if (id.length === 0) return null;
+  return {
+    id,
+    name: typeof obj.name === "string" ? obj.name : "",
+    kind: typeof obj.kind === "string" ? obj.kind : "",
+  };
+}
+
+/**
  * 经引擎窗口解析播放地址。
- * 返回直链；"" = 引擎不可用/解析失败/超时（调用方应回退内置实现）。
+ * url "" = 引擎不可用/解析失败/超时（调用方按本次取链失败处理）；
+ * line = 本次命中的音源线路（管理端「当前播放地址」显示走的是哪条源），
+ * null = 未知（包内 10 分钟缓存命中，或引擎页比宿主旧没有这个字段）；
+ * error = 失败时的逐线路 trace（成功为空串）。
  */
 export async function engineResolve(
   source: Source,
   song: MusicInfo,
   quality: Quality,
-): Promise<string> {
+): Promise<EngineResolved> {
   await ensureBound();
-  if (phase !== "ready") return "";
+  if (phase !== "ready") return { url: "", line: null, error: "" };
   const requestId = ++seq;
   const reply = new Promise<EngineReply>((resolve) => pending.set(requestId, resolve));
   try {
     await emitRequest({ requestId, kind: "resolve", source, song, quality });
   } catch {
     pending.delete(requestId);
-    return "";
+    return { url: "", line: null, error: "" };
   }
   const answer = await withTimeout(reply, RESOLVE_TIMEOUT_MS)
     .finally(() => pending.delete(requestId))
     .catch(() => null);
-  return String(answer?.url ?? "");
+  if (!answer) return { url: "", line: null, error: "" };
+  const url = String(answer.url ?? "");
+  const error = typeof answer.error === "string" ? answer.error : "";
+  // 死因落控制台：面板只在 qt_admin 打开时才看得到，日志是排障的第一现场
+  if (url.length === 0 && error.length > 0) {
+    console.warn(`[playurl] 取链失败 ${source}:${song.id}@${quality} — ${error}`);
+  }
+  return { url, line: normalizeLine(answer.line), error };
 }
 
 /** 引擎当前状态快照（设置页展示用） */

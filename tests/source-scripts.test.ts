@@ -54,6 +54,10 @@ const engineMock = vi.hoisted(() => ({
   detail: null as string | null,
   invokeResult: null as Record<string, unknown> | null,
   resolveUrl: "",
+  /** 命中线路（bundle getPlayUrl 应答里的 line；null = 未知） */
+  resolveLine: null as { id: string; name: string; kind: string } | null,
+  /** 失败死因（bundle getPlayUrl 抛出的逐线路 trace） */
+  resolveError: "",
   resolveThrows: false,
   calls: [] as Array<{ entry: string; args: Record<string, unknown> }>,
 }));
@@ -64,7 +68,11 @@ vi.mock("@/source-engine/client", () => ({
   },
   engineResolve: async () => {
     if (engineMock.resolveThrows) throw new Error("引擎窗口不可用");
-    return engineMock.resolveUrl;
+    return {
+      url: engineMock.resolveUrl,
+      line: engineMock.resolveLine,
+      error: engineMock.resolveError,
+    };
   },
   engineSnapshot: () => ({
     phase: engineMock.phase,
@@ -316,7 +324,7 @@ describe("声明式 http 线路（chain.json kind:http）+ script qq 链", () =>
     expect(request).not.toHaveBeenCalled();
   });
 
-  it("tang.api 请求形态：pre 打卡 + mid={id} + song_mid 非空 + 按音质 pick", async () => {
+  it("tang.api 请求形态：pre 打卡 + mid={id} + song_mid 非空 + 仅 flac（有损档已收敛）", async () => {
     const line = await httpLineById("qq-yuningxi-tang");
     const { request, calls } = stubRequest([
       { match: "97abc.com", body: {} },
@@ -330,9 +338,10 @@ describe("声明式 http 线路（chain.json kind:http）+ script qq 链", () =>
         },
       },
     ]);
-    expect(await runHttpLine(line, request, song, "128")).toBe("http://t/128.mp3");
-    expect(await runHttpLine(line, request, song, "320")).toBe("http://t/320.mp3");
+    // 2026-09-24 收敛为仅 flac：pick 只保留 song_play_url_sq，128/320 不再取值
     expect(await runHttpLine(line, request, song, "flac")).toBe("http://t/flac.flac");
+    expect(await runHttpLine(line, request, song, "128")).toBe("");
+    expect(await runHttpLine(line, request, song, "320")).toBe("");
     expect(calls.some((c) => c.includes("97abc.com"))).toBe(true);
     expect(calls.some((c) => c.includes("mid=" + encodeURIComponent(song.id)))).toBe(true);
   });
@@ -343,7 +352,7 @@ describe("声明式 http 线路（chain.json kind:http）+ script qq 链", () =>
       { match: "97abc.com", body: {} },
       { match: "tang.api.s01s.cn", body: { song_mid: null, song_play_url: null } },
     ]);
-    expect(await runHttpLine(line, request, song, "320")).toBe("");
+    expect(await runHttpLine(line, request, song, "flac")).toBe("");
   });
 
   it("script qq：a.aa.cab 命中时直接用其地址，不再走玉宁熙", async () => {
@@ -357,18 +366,19 @@ describe("声明式 http 线路（chain.json kind:http）+ script qq 链", () =>
     expect(calls.some((item) => item.includes("tang.api.s01s.cn"))).toBe(false);
   });
 
-  it("script qq：a.aa.cab 失败时兜底到玉宁熙 tang.api", async () => {
+  it("script qq：a.aa.cab 失败时兜底到玉宁熙 tang.api（flac 档）", async () => {
     const { request } = stubRequest([
       { match: "a.aa.cab", body: { code: 1 } },
       { match: "97abc.com", body: {} },
       {
         match: "tang.api.s01s.cn",
-        body: { song_mid: "003UkWuI0E8U0l", song_play_url_standard: "http://t/tang.mp3" },
+        body: { song_mid: "003UkWuI0E8U0l", song_play_url_sq: "http://t/tang.mp3" },
       },
       // tang.api 命中后同样要过 Range 预检
       { match: "t/tang.mp3", body: "" },
     ]);
-    const url = await resolvePlayUrl(request, "qq", { ...song, id: "u-world-miss" }, "128");
+    // 用 flac 档：tang.api 已收敛为仅 flac（有损档交付 AAC，见质量报告 §4.2）
+    const url = await resolvePlayUrl(request, "qq", { ...song, id: "u-world-miss" }, "flac");
     expect(url).toBe("http://t/tang.mp3");
   });
 
@@ -407,8 +417,14 @@ describe("声明式 http 线路（chain.json kind:http）+ script qq 链", () =>
       wyy: ["kw"], kw: ["wyy"], qq: ["kw", "wyy"], kg: ["kw", "wyy"],
     });
     expect(cfg.chains.wyy!.map((line) => line.id)).toEqual(["wyy-core"]);
+    // 2026-09-24 按《音源质量报告-20260924》双平台实测（每源 6 首 × 3 档 × 1103/1101）重排。
+    // qq 五条线隔离成功率相同（12/12），顺序只影响耗时 → 按 p50 从快到慢：
+    //   world260809 660/653ms > stellarwave-tx 713/700ms（parallel）
+    //   > molan-tx 738/634ms > haitang-core 844/849ms > yuningxi-tang 1047/1071ms
+    // 注意 molan-tx 在生产里命中 15/18（1103）/18/18（1101），可靠性历史更好，
+    // 但本次按用户要求采用实测耗时序。
     expect(cfg.chains.qq!.map((line) => line.id)).toEqual([
-      "qq-molan-tx", "qq-world260809", "qq-stellarwave-tx", "qq-yuningxi-tang",
+      "qq-world260809", "qq-stellarwave-tx", "qq-molan-tx", "qq-haitang-core", "qq-yuningxi-tang",
     ]);
     // 2026-09-23 全量逐线路复测（platform 1101，独立单链 × 12 首 × 3 档）后摘除 3 条：
     //   kw-stellarwave 0/36、kg-lxv6 0/36（脚本初始化即失败）、kg-yuningxi-pro 1/12。
@@ -420,12 +436,18 @@ describe("声明式 http 线路（chain.json kind:http）+ script qq 链", () =>
     expect(cfg.chains.kw!.map((line) => line.id)).toEqual([
       "kw-native-des", "kw-yuningxi-pro", "kw-yuxi", "kw-quandouyao",
     ]);
+    // kg 四条线成功率完全相同（有损档失败集中同一批歌、全线一致 = 上游缺陷），
+    // 顺序只影响耗时 → 按 p50 从快到慢，把最慢的 stellarwave 挪到末位：
+    //   molan 426/465ms > haitang-core 458/466ms > yuxi 506/519ms > stellarwave 1554/1488ms
     expect(cfg.chains.kg!.map((line) => line.id)).toEqual([
-      "kg-yuxi", "kg-stellarwave", "kg-molan",
+      "kg-molan", "kg-haitang-core", "kg-yuxi", "kg-stellarwave",
     ]);
-    // QQ 链仍是墨澜 tx 首位、玉宁熙 tang.api 末位兜底（实测 44%，但能出链，保留）
+    // qq 链末位是玉宁熙 tang.api，且已收敛为「仅 flac」
     const qqLast = cfg.chains.qq![cfg.chains.qq!.length - 1]!;
     expect(qqLast.id).toBe("qq-yuningxi-tang");
+    // 玉宁熙 tang.api 的有损档交付 AAC（96k/192k）而非标称的 MP3 128k/320k，
+    // 2026-09-24 按用户要求收敛为仅 flac（避免用户在 320 档听到 192k AAC）
+    expect(qqLast.qualities).toEqual(["flac"]);
     // 每音质档参与换源的线路 ≤上限（全灭耗时上限）
     for (const lines of Object.values(cfg.chains)) {
       for (const quality of ["128", "320", "flac"] as const) {
@@ -882,6 +904,42 @@ describe("source-scripts dispatcher（纯音源包：app 只经引擎调用）",
     backfillSpy.mockRestore();
   });
 
+  it("resolvePlayUrl（预解析）：命中线路随地址一起记，管理端按曲目+音质读回", async () => {
+    const { playUrlLine, clearPlayUrlLines } = await import("@/source-scripts/playurl-line");
+    const ipc = await import("@/services/ipc");
+    const backfillSpy = vi.spyOn(ipc, "setResolvedPlayUrl").mockResolvedValue(undefined);
+    const mod = await import("@/source-scripts");
+    const track = {
+      id: "000iBXhy1RQDgL",
+      platform: "qq" as const,
+      title: "微光",
+      singer: "任歌飞",
+      album: "",
+      picUrl: "",
+      duration: 161,
+      musicId: null,
+    };
+    clearPlayUrlLines();
+    // 未取过链 = 未知
+    expect(playUrlLine(track, "320")).toBe("");
+    engineMock.phase = "ready";
+    engineMock.resolveUrl = "http://dl.music.example/weiguang.mp3";
+    engineMock.resolveLine = { id: "qq-molan-tx", name: "墨澜 tx（聚合内核）", kind: "lx" };
+    await mod.resolvePlayUrl(track, "320");
+    // 展示文本与安卓端同口径：名称 · 机制 · 线路 id
+    expect(playUrlLine(track, "320")).toBe("墨澜 tx（聚合内核） · lx · qq-molan-tx");
+    // 另一个音质没有记录（key 含音质）
+    expect(playUrlLine(track, "128")).toBe("");
+    // 包内缓存命中（line = null）不改写已有记录
+    engineMock.resolveLine = null;
+    await mod.resolvePlayUrl(track, "320");
+    expect(playUrlLine(track, "320")).toBe("墨澜 tx（聚合内核） · lx · qq-molan-tx");
+    engineMock.resolveLine = null;
+    engineMock.resolveUrl = "";
+    backfillSpy.mockRestore();
+    clearPlayUrlLines();
+  });
+
   it("resolvePlayUrl（预解析）：引擎为空/抛错返回空串且不回填（无内置兜底）", async () => {
     const ipc = await import("@/services/ipc");
     const backfillSpy = vi.spyOn(ipc, "setResolvedPlayUrl").mockResolvedValue(undefined);
@@ -902,6 +960,42 @@ describe("source-scripts dispatcher（纯音源包：app 只经引擎调用）",
     await expect(mod.resolvePlayUrl(track, "128")).resolves.toBe("");
     expect(backfillSpy).not.toHaveBeenCalled();
     backfillSpy.mockRestore();
+  });
+
+  it("resolvePlayUrl（预解析）：失败死因记进面板，之后成功即清除", async () => {
+    const { playUrlMiss, clearPlayUrlLines } = await import("@/source-scripts/playurl-line");
+    const ipc = await import("@/services/ipc");
+    const backfillSpy = vi.spyOn(ipc, "setResolvedPlayUrl").mockResolvedValue(undefined);
+    const mod = await import("@/source-scripts");
+    const track = {
+      id: "000iBXhy1RQDgL",
+      platform: "kg" as const,
+      title: "微光",
+      singer: "任歌飞",
+      album: "",
+      picUrl: "",
+      duration: 161,
+      musicId: null,
+    };
+    clearPlayUrlLines();
+    engineMock.phase = "ready";
+    // 失败：trace 落进「上次取链死因」（PC 上以前这条文本被引擎页吞掉）
+    engineMock.resolveUrl = "";
+    engineMock.resolveError = "kg@320 kg-yuxi=超时未返回; cross:kw=预算耗尽未跑";
+    await expect(mod.resolvePlayUrl(track, "320")).resolves.toBe("");
+    expect(playUrlMiss(track, "320")).toBe(
+      "kg@320 kg-yuxi=超时未返回; cross:kw=预算耗尽未跑",
+    );
+    // 之后成功：旧死因不该继续挂着
+    engineMock.resolveUrl = "http://t/ok.mp3";
+    engineMock.resolveError = "";
+    engineMock.resolveLine = { id: "kw-yuxi", name: "屿溪", kind: "lx" };
+    await expect(mod.resolvePlayUrl(track, "320")).resolves.toBe("http://t/ok.mp3");
+    expect(playUrlMiss(track, "320")).toBe("");
+    engineMock.resolveLine = null;
+    engineMock.resolveUrl = "";
+    backfillSpy.mockRestore();
+    clearPlayUrlLines();
   });
 
   it("resolvePlayUrl（预解析）：local 源直接报错不预取链", async () => {
@@ -1105,7 +1199,7 @@ describe("取链预算（挂死线路不拖垮整链）", () => {
     expect(budget.sliceMs()).toBeLessThanOrEqual(0);
   });
 
-  it("挂死的首条线路被分片切断，后续线路照常取到地址（qq 链 128 档）", async () => {
+  it("挂死的首条线路被分片切断，后续线路照常取到地址（qq 链 flac 档）", async () => {
     const { resolvePlayUrlWithBudget } = await import("@/source-scripts/actions/play-url");
     const { ChainBudget } = await import("@/source-scripts/budget");
     const request = budgetStub([
@@ -1113,7 +1207,7 @@ describe("取链预算（挂死线路不拖垮整链）", () => {
       { match: "97abc.com", body: {} },
       {
         match: "tang.api.s01s.cn",
-        body: { song_mid: "u-budget-hit", song_play_url_standard: "http://t/tang.mp3" },
+        body: { song_mid: "u-budget-hit", song_play_url_sq: "http://t/tang.mp3" },
       },
       { match: "t/tang.mp3", body: "" },
     ]);
@@ -1122,7 +1216,7 @@ describe("取链预算（挂死线路不拖垮整链）", () => {
       request,
       "qq",
       { ...song, id: "u-budget-hit" },
-      "128",
+      "flac",
       new ChainBudget(3000, 200),
     );
     expect(url).toBe("http://t/tang.mp3");

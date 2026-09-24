@@ -33,6 +33,7 @@ import type {
   Source,
 } from "./contract";
 import { engineInvoke, engineResolve, engineSnapshot } from "@/source-engine/client";
+import { rememberPlayUrlLine, rememberPlayUrlMiss } from "./playurl-line";
 
 // ---------- 引擎调用 ----------
 
@@ -327,13 +328,20 @@ export async function resolvePlayUrl(
   ensureScript(track.platform);
   const source = track.platform as Source;
   try {
-    const engineUrl = await engineResolve(source, fromAppTrack(track), quality);
-    if (engineUrl.length > 0) {
-      await ipc.setResolvedPlayUrl(track, quality, engineUrl);
-      return engineUrl;
+    const resolved = await engineResolve(source, fromAppTrack(track), quality);
+    if (resolved.url.length > 0) {
+      // 命中线路与地址一起记（管理端「当前播放地址」要显示走的是哪条源）：
+      // 地址被引擎缓存复用，线路必须跟着地址走，不能只看最后一次取链
+      rememberPlayUrlLine(track, quality, resolved.line);
+      await ipc.setResolvedPlayUrl(track, quality, resolved.url);
+      return resolved.url;
     }
-  } catch {
+    // 失败死因（逐线路 trace）也记下来：面板显示「上次取链死因」，
+    // 否则「取不到地址」在 PC 上完全不可诊断（2026-09-24 kg 不换源即此类）
+    rememberPlayUrlMiss(track, quality, resolved.error);
+  } catch (e) {
     // 引擎层已尽力（多线路换源 + 跨源兜底）：本次播放失败
+    rememberPlayUrlMiss(track, quality, e instanceof Error ? e.message : String(e));
   }
   return "";
 }

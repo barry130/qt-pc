@@ -253,7 +253,8 @@
 
       /** 主窗口 RPC：source-engine-request → source-engine-response。
        *  kind "status" = 查询当前生命周期（client 绑定晚于引擎启动也能对齐状态）；
-       *  kind "resolve" = 取链（url "" = 失败/无可用层）；
+       *  kind "resolve" = 取链（url "" = 失败/无可用层；line = 本次命中的线路，
+       *                    null = 未知，即包内缓存命中或旧包没有这个字段）；
        *  kind "invoke"  = 数据接口（搜索/歌单/歌词/榜单…走 bundle 入口，result 为 JSON 文本）。 */
       async function onRequest(event) {
         const payload = (event && event.payload) || {};
@@ -282,19 +283,37 @@
           await emitToMain("source-engine-response", { requestId, result, error });
           return;
         }
+        // 取链统一走 bundle 的 getPlayUrl 入口（与安卓端同一契约）：应答里除了
+        // url 还带 line = 本次命中的线路 {id,name,kind}（管理端展示「走的是音源包
+        // 里哪条源」）；失败时带 error = 逐线路 trace（哪条线死链/超时/预算耗尽未跑，
+        // 以及跨源兜底有没有跑）——这条文本以前被吞掉，用户只看到「取不到地址」，
+        // 排查只能靠猜（2026-09-24 kg 不换源就是这么发现的）。
         let url = "";
+        let line = null;
+        let error = null;
         try {
-          if (layer && typeof payload.source === "string") {
-            url = (await layer.resolvePlayUrl(
-              payload.source,
-              payload.song,
-              payload.quality,
-            )) || "";
+          if (entries && typeof payload.source === "string") {
+            const song = payload.song || {};
+            const parsed = JSON.parse(
+              await entries.getPlayUrl({
+                platform: payload.source,
+                id: song.id,
+                name: song.name,
+                singer: song.singer,
+                album: song.album,
+                quality: payload.quality,
+                duration: song.interval,
+              }),
+            );
+            url = parsed.url || "";
+            line = parsed.line || null;
           }
-        } catch {
+        } catch (err) {
           url = "";
+          line = null;
+          error = String((err && err.message) || err);
         }
-        await emitToMain("source-engine-response", { requestId, url });
+        await emitToMain("source-engine-response", { requestId, url, line, error });
       }
 
       await invoke("plugin:event|listen", {

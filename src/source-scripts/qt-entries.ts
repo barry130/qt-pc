@@ -39,7 +39,7 @@ import type {
   RequestBuiltin,
   Source,
 } from "./contract";
-import { consumeLastMissTrace } from "./actions/play-url";
+import { consumeLastHitLine, consumeLastMissTrace } from "./actions/play-url";
 import {
   allCharts,
   allHotWords,
@@ -176,7 +176,12 @@ export function registerQtEntries(host: QtHost): void {
         const trace = consumeLastMissTrace(source + ":" + song.id + ":" + quality);
         throw new Error(trace.length > 0 ? `未取到播放地址（${trace}）` : "未取到播放地址");
       }
-      return JSON.stringify({ url, source, quality });
+      // line = 本次命中的线路 {id, name, kind}（管理端「当前播放地址」显示「走的是
+      // 音源包里哪条源」），是**嵌套对象**，包内 10 分钟缓存命中时为 null，
+      // 前端按「未知」展示。同样按 cacheKey 归属读取，并发取链不会把别人的线路
+      // 报给本次。
+      const line = consumeLastHitLine(source + ":" + song.id + ":" + quality);
+      return JSON.stringify({ url, source, quality, line });
     },
 
     /** 冒烟自检的 Range 预检：判定口径与 PC 的 verifyPlayable 一致 */

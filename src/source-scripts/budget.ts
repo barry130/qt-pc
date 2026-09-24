@@ -32,8 +32,15 @@ export const CHAIN_GRACE_MS = 250;
 export class ChainBudget {
   private readonly deadline: number;
   private readonly lineMs: number;
+  /**
+   * 整链总预算（毫秒）。取链链用它按比例收缩「留给跨源兜底的预留」
+   * （play-url.ts 的 CROSS_RESERVE_MS）：总预算被 chain.json 调小时，
+   * 预留不能大到把档内线路全挤掉。
+   */
+  readonly totalMs: number;
 
   constructor(totalMs: number = CHAIN_BUDGET_MS, lineMs: number = CHAIN_LINE_MS) {
+    this.totalMs = totalMs;
     this.deadline = Date.now() + totalMs;
     this.lineMs = lineMs;
   }

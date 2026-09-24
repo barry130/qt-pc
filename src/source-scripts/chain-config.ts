@@ -24,7 +24,7 @@ export const LOCAL_PLATFORM: PlatformId = PLATFORMS.WINDOWS;
 
 export const QUALITY_VALUES: readonly Quality[] = ["128", "320", "flac"];
 
-/** 跨源兜底只支持 kw/wyy 互备（playFromSource 的实现面） */
+/** 跨源兜底只支持 kw/wyy 互备（crossFirstLineUrl 的实现面：各取该源第 1 条链线路） */
 export const CROSS_SOURCE_VALUES: readonly Source[] = ["kw", "wyy"];
 
 /** 默认预算：与 budget.ts 的常量同源（chain.json 可覆盖） */
@@ -335,7 +335,7 @@ export function parseChainConfig(raw: unknown): ChainConfig {
 /** 内置默认 chain（line id 稳定，作为后续 chain.json 差异的锚点） */
 export function defaultChainConfig(): ChainConfig {
   return {
-    chainRevision: 8,
+    chainRevision: 10,
     maxLinesPerQuality: DEFAULT_MAX_LINES_PER_QUALITY,
     crossSources: { wyy: ["kw"], kw: ["wyy"], qq: ["kw", "wyy"], kg: ["kw", "wyy"] },
     budget: { totalMs: DEFAULT_CHAIN_BUDGET.totalMs, lineMs: DEFAULT_CHAIN_BUDGET.lineMs },
@@ -350,13 +350,13 @@ export function defaultChainConfig(): ChainConfig {
         },
       ],
       qq: [
-        {
-          id: "qq-molan-tx",
-          name: "墨澜 tx（聚合内核）",
-          kind: "lx",
-          scriptId: "molan",
-          qualities: ["128", "320", "flac"],
-        },
+        // 2026-09-24 按《音源质量报告-20260924》双平台实测重排（每源 6 首 × 3 档 × 1103/1101）。
+        // 五条线在隔离实测里成功率相同（12/12），所以顺序只影响「耗时」，按 p50 从快到慢排：
+        //   qq-world260809   660 / 653ms   128/320/flac 全通
+        //   qq-stellarwave-tx 713 / 700ms  320/flac（parallel，与链首并发起跑）
+        //   qq-molan-tx      738 / 634ms   128/320/flac 全通
+        //   qq-haitang-core  844 / 849ms   128/320/flac 全通（p90 有 kuwo CDN 长尾）
+        //   qq-yuningxi-tang 1047 / 1071ms 仅 flac（见下）
         {
           id: "qq-world260809",
           name: "World 260809 a.aa.cab",
@@ -381,10 +381,32 @@ export function defaultChainConfig(): ChainConfig {
           parallel: true,
         },
         {
-          id: "qq-yuningxi-tang",
-          name: "玉宁熙 tang.api",
-          kind: "http",
+          id: "qq-molan-tx",
+          name: "墨澜 tx（聚合内核）",
+          kind: "lx",
+          scriptId: "molan",
           qualities: ["128", "320", "flac"],
+        },
+        {
+          id: "qq-haitang-core",
+          name: "恒堂核心 API",
+          kind: "bundle",
+          impl: "qqHaitangCore",
+          qualities: ["128", "320", "flac"],
+        },
+        // 2026-09-24 收敛为仅 flac（用户要求）。原因见《音源质量报告-20260924》§4.2：
+        // 它有损档交付的是 AAC 而非 MP3，且规格低于标称 ——
+        //   请求 320 → AAC 192k（`audio/mp4`，isure6.stream.qqmusic.qq.com）
+        //   请求 128 → AAC 96k
+        // 192k AAC 听感约等于 256k MP3，明显低于 320k；用户会以为拿到了 320k。
+        // 它 flac 档是真无损（fLaC 魔数、压缩比落真无损区间），故只保留 flac 兜底；
+        // flac 档实测 10/12（`多远都要在一起` 两平台皆失败）。
+        // 注：pick 里 128/320 的取值路径一并删除 —— 该线路不再参与这两档换源。
+        {
+          id: "qq-yuningxi-tang",
+          name: "玉宁熙 tang.api（仅无损）",
+          kind: "http",
+          qualities: ["flac"],
           pre: [{ url: "https://www.97abc.com/count.php?id=lx-yuningxi", timeoutMs: 8000 }],
           request: {
             url: "https://tang.api.s01s.cn/music_open_api.php",
@@ -392,7 +414,7 @@ export function defaultChainConfig(): ChainConfig {
             headers: { "Content-Type": "application/json", Referer: "https://y.qq.com/" },
           },
           require: { song_mid: "nonEmpty" },
-          pick: { "128": "song_play_url_standard", "320": "song_play_url", flac: "song_play_url_sq" },
+          pick: { flac: "song_play_url_sq" },
         },
       ],
       kw: [
@@ -444,8 +466,32 @@ export function defaultChainConfig(): ChainConfig {
         //                         36 格一个都没发出去（lxv6 的中控 88.lxmusic.xn--fiqs8s）。
         //   kg-yuningxi-pro 1/12 = 8%  「酷狗所有接口未获取到有效播放链接」（flac 专用线）。
         //                         同一个 yuningxi-pro 脚本在 kw 是 89%，故只摘 kg 这条。
-        // 另注：qq-yuningxi-tang 虽然只有 44%，但实测能出链（旧数据「主机不通」已过期），
-        // 保留作 qq 的最后一道兜底。
+        //
+        // 2026-09-24 按《音源质量报告-20260924》双平台实测重排，p50 从快到慢：
+        //   kg-molan         426 / 465ms   128档 6/12  320档 6/12  flac 12/12
+        //   kg-haitang-core  458 / 466ms   128档 6/12  320档 6/12  flac 12/12
+        //   kg-yuxi          506 / 519ms   128档 6/12  320档 6/12  flac 12/12
+        //   kg-stellarwave  1554 / 1488ms  128档 5/12  320档 6/12  flac 12/12
+        // 四条线成功率**完全相同**（有损档失败集中在同一批歌、全线一致 —— 上游把
+        // 有损直链解析到连不上的 v3-32-yp-qqmusic.a.bdycdn.cn，属上游缺陷，加线无收益），
+        // 所以顺序只影响耗时：把最慢的 stellarwave 从第 2 位挪到末位，避免拖慢失败路径。
+        {
+          id: "kg-molan",
+          name: "墨澜",
+          kind: "lx",
+          scriptId: "molan",
+          qualities: ["128", "320", "flac"],
+        },
+        // 2026-09-24 新增（用户指定接入 asice999/lxmusic-sources 的核心 API）。
+        // flac 是真无损（fLaC 魔数）、320 的 URL 路径带 _qu32 确认按档出；
+        // 出链 ~460ms，是 kg 里最快的两条之一。
+        {
+          id: "kg-haitang-core",
+          name: "恒堂核心 API",
+          kind: "bundle",
+          impl: "kgHaitangCore",
+          qualities: ["128", "320", "flac"],
+        },
         {
           id: "kg-yuxi",
           name: "屿溪 · 终章",
@@ -458,13 +504,6 @@ export function defaultChainConfig(): ChainConfig {
           name: "Stellarwave",
           kind: "lx",
           scriptId: "stellarwave",
-          qualities: ["128", "320", "flac"],
-        },
-        {
-          id: "kg-molan",
-          name: "墨澜",
-          kind: "lx",
-          scriptId: "molan",
           qualities: ["128", "320", "flac"],
         },
       ],

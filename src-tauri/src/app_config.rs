@@ -19,9 +19,9 @@ pub const VERSION_NAME: &str = "1.0.7";
 pub const VERSION_CODE: i64 = 107;
 
 /// 内嵌音源包版本号（镜像后端最新发布号；与 source-update.ts 同源）
-pub const SOURCE_PACK_CODE: i64 = 2026092301;
+pub const SOURCE_PACK_CODE: i64 = 2026092308;
 /// 内嵌音源包版本名
-pub const SOURCE_PACK_NAME: &str = "2026.09.23.1";
+pub const SOURCE_PACK_NAME: &str = "2026.09.23.8";
 /// 宿主契约版本（音源包与本机的接口版本，两端同步抬高）
 pub const HOST_API_VERSION: i64 = 1;
 

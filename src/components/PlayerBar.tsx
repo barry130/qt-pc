@@ -23,6 +23,7 @@ import { QUALITY_OPTIONS, qualityShort } from "@/lib/quality";
 import type { Quality } from "@/types";
 import { useInterpolatedPosition } from "@/hooks/useInterpolatedPosition";
 import { formatTime, qtresCoverUrl } from "@/lib/lrc";
+import { playUrlLine, playUrlMiss } from "@/source-scripts/playurl-line";
 import { cn } from "@/lib/utils";
 import {
   getDesktopLyricState,
@@ -218,7 +219,13 @@ export function PlayerBar(): React.JSX.Element {
       <div className="flex min-w-0 flex-1 flex-col items-center gap-1">
         <div className="flex items-center gap-3">
           {/* qt_admin 专属：播放地址入口（图标按钮，点击展开当前实际播放地址） */}
-          {showPlayUrl && <PlayUrlButton url={state?.playUrl ?? null} />}
+          {showPlayUrl && (
+            <PlayUrlButton
+              url={state?.playUrl ?? null}
+              line={playUrlLine(track, state?.quality ?? null)}
+              miss={playUrlMiss(track, state?.quality ?? null)}
+            />
+          )}
           {/* 收藏：点开是本地歌单清单，勾上/取消即收藏/取消收藏 */}
           <CollectButton track={track} />
           <PlayModeButton mode={state?.playMode ?? "listLoop"} onCycle={() => void cyclePlayMode()} />
@@ -437,10 +444,12 @@ function PlayModeButton(props: {
 
 /**
  * 播放地址入口（qt_admin 专属）：图标按钮，点开向上弹面板展示**当前实际在播**
- * 的地址（换源兜底后指向真正在播的源），点地址即复制。
+ * 的地址（换源兜底后指向真正在播的源）、这条地址是**音源包里哪条源**取到的
+ * （line，见 @/source-scripts/playurl-line），以及上次取链失败的死因（miss，
+ * 逐线路 trace：哪条线挂死/死链/预算耗尽未跑、跨源有没有跑），点地址即复制。
  * 与音质菜单同款：向上弹 + 点外面/Esc 收起。
  */
-function PlayUrlButton(props: { url: string | null }): React.JSX.Element {
+function PlayUrlButton(props: { url: string | null; line: string; miss: string }): React.JSX.Element {
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const boxRef = useRef<HTMLDivElement | null>(null);
@@ -492,6 +501,17 @@ function PlayUrlButton(props: { url: string | null }): React.JSX.Element {
           <div className="mb-1.5 text-[10px] text-muted-foreground">
             当前实际播放地址（换源后指向真正在播的源）
           </div>
+          {/* 音源线路：本次取链命中 chain.json 里的哪条源（安卓端同款文案）。
+              「未知」= 走的是音源包内 10 分钟缓存，或引擎页比宿主旧没有这个字段 */}
+          <div
+            className="mb-1.5 text-[11px] leading-relaxed"
+            title="未知 = 走的是音源包内缓存，或本次未重新取链"
+          >
+            <span className="text-muted-foreground">音源线路：</span>
+            <span className={props.line ? "break-all text-foreground/85" : "text-muted-foreground"}>
+              {props.line || "未知"}
+            </span>
+          </div>
           {props.url ? (
             <button
               type="button"
@@ -506,6 +526,14 @@ function PlayUrlButton(props: { url: string | null }): React.JSX.Element {
               本地曲目，或尚未取到播放地址
             </div>
           )}
+          {/* 上次取链死因：bundle 的逐线路 trace（哪条线挂死/死链/预算耗尽未跑、
+              跨源兜底有没有跑）。没有它，「取不到地址」在 PC 上只能靠猜 */}
+          {props.miss ? (
+            <div className="mt-1.5 text-[10px] leading-relaxed">
+              <span className="text-muted-foreground">上次取链死因：</span>
+              <span className="break-all font-mono text-amber-500/90">{props.miss}</span>
+            </div>
+          ) : null}
           <div className="mt-1.5 flex items-center gap-1 text-[10px] text-muted-foreground">
             {copied ? (
               <>

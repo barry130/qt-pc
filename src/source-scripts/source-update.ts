@@ -68,7 +68,7 @@ export const HOST_API_VERSION = 1;
  * 这里与安卓端 `qt-uniappx/services/source-bundle-fs.uts` 的 BUILTIN_VERSION_CODE
  * 同步更新（两端同号）。
  */
-export const BUILTIN_SOURCE_VERSION = { code: 2026092301, name: "2026.09.23.1" };
+export const BUILTIN_SOURCE_VERSION = { code: 2026092308, name: "2026.09.23.8" };
 
 /**
  * §2.3 判定 6 步（纯函数）：
