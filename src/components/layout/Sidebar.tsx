@@ -148,11 +148,17 @@ function NavLink(props: { item: Item; collapsed: boolean }): React.JSX.Element {
     <Link
       to={item.to}
       params={item.params}
-      activeProps={{ className: "bg-primary text-primary-foreground font-medium" }}
+      // 选中态用主色轻量 tint（浅底胶囊）而非实心主色：侧边栏是常驻区，
+      // 实心靛蓝视觉权重过大，会让主色稀释到每屏多处；
+      // hover 类挂在 inactiveProps 上，避免 hover 灰底盖过选中态的主色 tint
+      activeProps={{ className: "bg-primary/10 text-primary font-medium" }}
+      inactiveProps={{
+        className: "text-foreground/80 hover:bg-secondary/60 hover:text-foreground",
+      }}
       activeOptions={{ exact: item.to === "/" }}
       title={collapsed ? item.label : undefined}
       className={cn(
-        "flex items-center gap-3 rounded-lg px-2.5 py-2 text-sm text-foreground/80 transition-colors hover:bg-secondary/60 hover:text-foreground",
+        "flex items-center gap-3 rounded-lg px-2.5 py-2 text-sm transition-colors",
         collapsed && "justify-center px-0",
       )}
     >

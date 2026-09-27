@@ -44,6 +44,15 @@ export function rememberPlayUrlLine(
   misses.delete(key);
 }
 
+/** 原始线路记忆（含跨源命中的 targetSong）：「歌词跟随换源」要按精确歌曲取词 */
+const rawLines = new Map<string, PlayUrlLine>();
+
+/** 读最近一次命中线路的原始结构（含 targetSong；未知返回 null） */
+export function playUrlHitLine(track: Track | null, quality: Quality | null): PlayUrlLine | null {
+  if (track === null || quality === null) return null;
+  return rawLines.get(playUrlLineKey(track, quality)) ?? null;
+}
+
 /** 读某首歌某个音质最近一次命中的线路展示文本（未知返回空串） */
 export function playUrlLine(track: Track | null, quality: Quality | null): string {
   if (track === null || quality === null) return "";
@@ -71,5 +80,6 @@ export function playUrlMiss(track: Track | null, quality: Quality | null): strin
 /** 清空（测试用；生产靠 key 覆盖，规模是「播过的歌 × 音质」） */
 export function clearPlayUrlLines(): void {
   lines.clear();
+  rawLines.clear();
   misses.clear();
 }

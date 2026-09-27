@@ -3,6 +3,7 @@ import { errMsg } from "@/lib/utils";
 import type { HistoryItem } from "@/types";
 import * as ipc from "@/services/ipc";
 import { TrackList } from "../discovery/TrackList";
+import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 
 /**
  * 最近播放（路由 /history，DESIGN §5.3）。
@@ -25,9 +26,14 @@ export function HistoryPage(): React.JSX.Element {
     }
   }, []);
 
+  // 本页常驻缓存（挂载后不再卸载）：历史由播放自动写入，只在首次挂载拉一次的话
+// 刚听过的歌不会出现。改为每次切回本页时重拉。
+  const active = useKeepAliveActive();
+
   useEffect(() => {
+    if (!active) return;
     void load();
-  }, [load]);
+  }, [active, load]);
 
   const clear = async (): Promise<void> => {
     setError(null);

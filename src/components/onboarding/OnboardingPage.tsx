@@ -5,8 +5,11 @@ import type { SourceId } from "@/types";
 import * as ipc from "@/services/ipc";
 import { useMusicSourceStore } from "@/stores/musicSource";
 
-/** 引导完成标记（settings 表 key，DESIGN §12 首次启动引导） */
-export const ONBOARDING_KEY = "onboarded";
+/** 引导完成标记（settings 表 key，DESIGN §12 首次启动引导）。
+ *  真正的定义在 `@/lib/storageKeys`：AppShell 也要用它，而 AppShell 静态 import
+ *  本页面会让整页引导流程被绑进主 chunk、页面懒加载失效。这里保留转出以兼容旧引用。 */
+export { ONBOARDING_KEY } from "@/lib/storageKeys";
+import { ONBOARDING_KEY } from "@/lib/storageKeys";
 
 // 引导只让用户先挑一个「默认音源」，不暴露具体平台名（DESIGN §12）
 const SOURCES: { id: SourceId; name: string; desc: string }[] = [

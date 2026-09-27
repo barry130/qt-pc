@@ -8,6 +8,7 @@ import type {
 } from "@/types";
 import * as ipc from "@/services/ipc";
 import { usePlayerStore } from "@/stores/player";
+import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 
 /**
  * 听歌统计（路由 /stats，DESIGN §5.3）。
@@ -23,7 +24,12 @@ export function StatsPage(): React.JSX.Element {
   const [singers, setSingers] = useState<SingerStat[]>([]);
   const [loading, setLoading] = useState(true);
 
+  // 本页常驻缓存（KeepAliveOutlet），挂载后不会卸载：只在首次挂载拉数据的话，
+  // 听完歌再切回来看到的还是旧统计。改成「每次变为可见时重拉一次」。
+  const active = useKeepAliveActive();
+
   useEffect(() => {
+    if (!active) return;
     let cancelled = false;
     setLoading(true);
     void (async () => {
@@ -52,7 +58,7 @@ export function StatsPage(): React.JSX.Element {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [active]);
 
   const empty = !overview || overview.totalPlays === 0;
 

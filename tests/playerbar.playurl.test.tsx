@@ -84,6 +84,7 @@ describe("播放地址面板：音源线路", () => {
       id: "qq-molan-tx",
       name: "墨澜 tx（聚合内核）",
       kind: "lx",
+      targetSong: null,
     });
     const { container } = render(<PlayerBar />);
     openPanel(container);
@@ -104,6 +105,7 @@ describe("播放地址面板：音源线路", () => {
       id: "qq-molan-tx",
       name: "墨澜 tx（聚合内核）",
       kind: "lx",
+      targetSong: null,
     });
     const { container } = render(<PlayerBar />);
     openPanel(container);

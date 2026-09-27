@@ -21,7 +21,8 @@
 
     "baseUrl": ".",
     "paths": {
-      "@/*": ["src/*"]
+      "@/*": ["src/*"],
+      "@qt-sources/*": ["../qt-sources/src/*"]
     },
     "types": ["vite/client"]
   },

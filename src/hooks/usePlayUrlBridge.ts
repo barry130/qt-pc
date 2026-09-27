@@ -1,8 +1,9 @@
 import { useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { listen, emit, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { resolvePlayUrl } from "@/source-scripts";
+import { playUrlHitLine } from "@/source-scripts/playurl-line";
 import type { Quality, Track } from "@/types";
 
 /**
@@ -33,6 +34,13 @@ async function answer(req: PlayUrlRequest): Promise<void> {
   }
   // 迟到的应答（引擎已超时回落）在 Rust 侧按 requestId 找不到条目，静默忽略
   await invoke("resolve_play_url_reply", { requestId: req.requestId, url }).catch(() => {});
+  // 桌面歌词窗口读不到宿主侧的线路记忆（各窗口独立 JS 上下文），广播命中线路供它
+  // 判断「当前地址是否跨源兜底」并按目标源重取歌词；主窗口自己读 playurl-line 即可
+  void emit("play-url-line", {
+    platform: req.track.platform,
+    id: req.track.id,
+    line: playUrlHitLine(req.track, req.quality),
+  }).catch(() => {});
 }
 
 export function usePlayUrlBridge(): void {

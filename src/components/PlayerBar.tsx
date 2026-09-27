@@ -5,6 +5,7 @@ import {
   Check,
   Link2,
   ListMusic,
+  Music,
   Pause,
   Play,
   Repeat,
@@ -12,6 +13,9 @@ import {
   Shuffle,
   SkipBack,
   SkipForward,
+  Volume1,
+  Volume2,
+  VolumeX,
 } from "lucide-react";
 import { useNavigate, useRouter, useRouterState } from "@tanstack/react-router";
 import type { PointerEvent as ReactPointerEvent } from "react";
@@ -56,10 +60,14 @@ export function PlayerBar(): React.JSX.Element {
   // 队列面板是布局级组件（挂在 AppShell 主区右侧），开关状态放 store 里共享
   const queueOpen = usePlayerStore((s) => s.queueOpen);
   const toggleQueue = usePlayerStore((s) => s.toggleQueue);
+  // 拖动进度条期间拖块常显（hover 才浮现的互补态）
+  const isDraggingProgress = usePlayerStore((s) => s.isDraggingProgress);
 
   const track = state?.track ?? null;
   const isPlayingPage = pathname === "/playing";
-  const duration = state?.durationMs ?? 0;
+  // 时长是高频字段（tick 里每 250ms 带一次），单独订阅标量：
+  // 订整个 state 会让整棵播放条跟着 tick 重渲染（见 stores/player.ts 的说明）
+  const duration = usePlayerStore((s) => s.durationMs);
   const playing = state?.status === "playing";
   const loading = state?.status === "loading" || state?.status === "buffering";
   const cover = track ? qtresCoverUrl(track.picUrl) : null;
@@ -69,7 +77,9 @@ export function PlayerBar(): React.JSX.Element {
   const showPlayUrl = isAdmin(profile);
 
   // 自愈：状态不是"停止"却拿不到曲目（事件丢失/覆盖的兜底）——
-  // 主动拉一次实时快照，拿到曲目为止；正常时这个 effect 空转
+  // 主动拉一次实时快照，拿到曲目为止；正常时这个 effect 空转。
+  // 依赖里**不要**再放 positionMs：它每 250ms 变一次，会让这个 800ms 定时器
+  // 被反复重置、永远烧不到（以前 tick 重建 state 就是这个效果）。
   useEffect(() => {
     if (track || !state || state.status === "stopped") return;
     const timer = setTimeout(() => {
@@ -78,7 +88,7 @@ export function PlayerBar(): React.JSX.Element {
         .catch(() => {});
     }, 800);
     return () => clearTimeout(timer);
-  }, [track, state, state?.positionMs]);
+  }, [track, state]);
 
   /**
    * 封面/歌名点击 = 播放页开关：第一次进播放页（歌词页）
@@ -99,7 +109,7 @@ export function PlayerBar(): React.JSX.Element {
   const ratioFromEvent = (
     e: ReactPointerEvent<HTMLDivElement>,
   ): number | null => {
-    const durationMs = usePlayerStore.getState().state?.durationMs ?? 0;
+    const durationMs = usePlayerStore.getState().durationMs;
     if (durationMs <= 0) return null;
     const rect = e.currentTarget.getBoundingClientRect();
     const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
@@ -202,7 +212,10 @@ export function PlayerBar(): React.JSX.Element {
               draggable={false}
             />
           ) : (
-            <span className="text-xs text-muted-foreground">无封面</span>
+            // 空态与列表占位一致：图标而非文字，避免播放条上出现孤立小字
+            <span className="flex h-full w-full items-center justify-center text-muted-foreground/60">
+              <Music className="h-5 w-5" />
+            </span>
           )}
         </div>
         <div className="min-w-0">
@@ -266,7 +279,8 @@ export function PlayerBar(): React.JSX.Element {
           )}
         </div>
 
-        {/* 进度条 */}
+        {/* 进度条：外层 16px 高命中区，轨道 hover 从 6px 长到 8px 并浮现拖块；
+            拖动期间（isDraggingProgress）拖块常显。时间标签在容器高度内不跳动 */}
         <div className="flex w-full items-center gap-2 text-[11px] tabular-nums text-muted-foreground">
           <span className="w-10 text-right">{formatTime(shownPosition)}</span>
           <div
@@ -280,14 +294,32 @@ export function PlayerBar(): React.JSX.Element {
             onPointerUp={onBarUp}
             onPointerCancel={onBarCancel}
             style={{ touchAction: "none" }}
-            className="relative h-2 min-w-0 flex-1 cursor-pointer rounded-full bg-secondary/60"
+            className="group relative flex h-4 min-w-0 flex-1 cursor-pointer items-center"
           >
+            <div className="relative h-1.5 w-full rounded-full bg-secondary/60 transition-[height] duration-150 group-hover:h-2">
+              <div
+                className="absolute inset-y-0 left-0 rounded-full bg-primary"
+                style={{
+                  width:
+                    duration > 0
+                      ? `${Math.min(100, (shownPosition / duration) * 100)}%`
+                      : "0%",
+                }}
+              />
+            </div>
+            {/* 拖块：hover 浮现，拖动中常显；两端超出轨道属预期（标准滑块形态） */}
             <div
-              className="absolute inset-y-0 left-0 rounded-full bg-primary"
+              aria-hidden
+              className={cn(
+                "pointer-events-none absolute top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-primary shadow-[0_1px_4px_rgba(0,0,0,0.3)] transition-opacity duration-150",
+                isDraggingProgress
+                  ? "opacity-100"
+                  : "opacity-0 group-hover:opacity-100",
+              )}
               style={{
-                width:
+                left:
                   duration > 0
-                    ? `${Math.min(100, (shownPosition / duration) * 100)}%`
+                    ? `${Math.min(100, Math.max(0, (shownPosition / duration) * 100))}%`
                     : "0%",
               }}
             />
@@ -584,6 +616,48 @@ function VolumeControl(): React.JSX.Element {
   const toggleMute = usePlayerStore((s) => s.toggleMute);
   const volume = state?.volume ?? 0.8;
   const muted = state?.muted ?? false;
+  /** 展示值：静音时轨道归零，但拖动/键盘调整会先解除静音 */
+  const effective = muted ? 0 : volume;
+  /** 拖动标记：ref 记录，避免 move 事件高频触发重渲染 */
+  const draggingRef = useRef(false);
+
+  const ratioFromEvent = (e: ReactPointerEvent<HTMLDivElement>): number => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    return Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+  };
+
+  const onDown = (e: ReactPointerEvent<HTMLDivElement>): void => {
+    e.currentTarget.setPointerCapture(e.pointerId);
+    draggingRef.current = true;
+    // 静音中开始拖动：先解除静音，否则轨道纹丝不动像「冻结」
+    if (muted) void toggleMute();
+    void setVolume(ratioFromEvent(e));
+  };
+
+  const onMove = (e: ReactPointerEvent<HTMLDivElement>): void => {
+    if (!draggingRef.current) return;
+    void setVolume(ratioFromEvent(e));
+  };
+
+  const onUp = (e: ReactPointerEvent<HTMLDivElement>): void => {
+    if (!draggingRef.current) return;
+    draggingRef.current = false;
+    e.currentTarget.releasePointerCapture(e.pointerId);
+  };
+
+  // 键盘可达性：←/↓ 减、→/↑ 增（5% 步进），Home/End 跳到最小/最大
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>): void => {
+    const step = 0.05;
+    let next: number | null = null;
+    if (e.key === "ArrowRight" || e.key === "ArrowUp") next = effective + step;
+    else if (e.key === "ArrowLeft" || e.key === "ArrowDown") next = effective - step;
+    else if (e.key === "Home") next = 0;
+    else if (e.key === "End") next = 1;
+    if (next === null) return;
+    e.preventDefault();
+    if (muted) void toggleMute();
+    void setVolume(Math.min(1, Math.max(0, next)));
+  };
 
   return (
     <div className="flex w-32 items-center gap-2">
@@ -592,20 +666,44 @@ function VolumeControl(): React.JSX.Element {
         aria-label={muted ? "取消静音" : "静音"}
         title={muted ? "取消静音" : "静音"}
         onClick={() => void toggleMute()}
-        className="text-xs text-muted-foreground hover:text-foreground"
+        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
       >
-        {muted || volume === 0 ? "🔇" : volume < 0.5 ? "🔉" : "🔊"}
+        {muted || volume === 0 ? (
+          <VolumeX className="h-4 w-4" />
+        ) : volume < 0.5 ? (
+          <Volume1 className="h-4 w-4" />
+        ) : (
+          <Volume2 className="h-4 w-4" />
+        )}
       </button>
-      <input
-        type="range"
+      {/* 自绘轨道：与进度条同一套视觉语言（主题色填充、hover 增高、拖块浮现），
+          原生 range 的 OS 默认样式做不出这种一致性。
+          role=slider + 方向键兜底键盘操作，focus-visible 由全局 base 层接管 */}
+      <div
+        role="slider"
         aria-label="音量"
-        min={0}
-        max={1}
-        step={0.01}
-        value={muted ? 0 : volume}
-        onChange={(e) => void setVolume(parseFloat(e.target.value))}
-        className="h-1 w-full accent-[var(--primary)]"
-      />
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={Math.round(effective * 100)}
+        tabIndex={0}
+        onPointerDown={onDown}
+        onPointerMove={onMove}
+        onPointerUp={onUp}
+        onKeyDown={onKeyDown}
+        className="group relative flex h-4 min-w-0 flex-1 cursor-pointer items-center"
+      >
+        <div className="relative h-1.5 w-full rounded-full bg-secondary/60 transition-[height] duration-150 group-hover:h-2">
+          <div
+            className="absolute inset-y-0 left-0 rounded-full bg-primary"
+            style={{ width: `${effective * 100}%` }}
+          />
+        </div>
+        <div
+          aria-hidden
+          className="pointer-events-none absolute top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-primary opacity-0 shadow-[0_1px_4px_rgba(0,0,0,0.3)] transition-opacity duration-150 group-hover:opacity-100"
+          style={{ left: `${effective * 100}%` }}
+        />
+      </div>
     </div>
   );
 }

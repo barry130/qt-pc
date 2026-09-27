@@ -1,35 +1,37 @@
 import { useState } from "react";
-import { errMsg } from "@/lib/utils";
 import { useNavigate } from "@tanstack/react-router";
 import { useAuthStore } from "@/stores/auth";
+import {
+  AuthButton,
+  AuthInput,
+  AuthShell,
+  AuthTabs,
+  AuthTip,
+  EyeToggle,
+} from "@/components/mine/auth-ui";
+import {
+  PASSWORD_MAX,
+  PASSWORD_MIN,
+  USERNAME_MAX,
+  USERNAME_MIN,
+  authTip,
+  checkConfirm,
+  checkEmail,
+  checkLoginAccount,
+  checkPassword,
+  checkUsername,
+} from "@/lib/auth-tip";
 
 /**
- * 登录 / 注册（路由 /login，DESIGN §2.3.4）。
- * 接口契约与 qt-uniappx 一致：app/user/login 与 app/user/register，
- * 成功后后端直接返回 token（satoken），Rust 侧负责存会话并在启动时恢复。
+ * 登录 / 注册（路由 /login）。
+ *
+ * 契约对齐后端 astral-plugin（QtAppUserController + QtUserService）：
+ * - 登录 app/user/login：`username` 字段**同时接受用户名与邮箱**，成功直接回 token；
+ * - 注册 app/user/register：用户名 3-30、密码 6-18、两次一致、邮箱必填、昵称选填
+ *   （昵称留空时后端默认用用户名）；
+ * - 校验规则一律与后端 DTO 对齐（见 lib/auth-tip），本地不做比后端更严的拦截。
  */
-
-/**
- * 错误提示：不把服务端地址、内部实现细节抛到界面上。
- * Rust 侧错误串形如「Astral 业务错误(500): 用户名或密码错误」或
- * 「Astral 请求失败: error sending request for url (http://…)」——
- * 前者只保留业务文案，后者统一成网络提示（reqwest 的错误串里带 URL）。
- */
-function authTip(err: unknown): string {
-  const raw = errMsg(err);
-  const biz = /业务错误\(\d+\)[:：]\s*(.+)$/.exec(raw);
-  if (biz && biz[1].trim().length > 0) return biz[1].trim();
-  if (/https?:\/\//i.test(raw) || /请求失败|响应解析失败|error sending request/i.test(raw)) {
-    return "网络异常，请稍后重试";
-  }
-  return raw;
-}
-/** 注册校验规则：用户名 5-18 位英文/数字；密码 6-18 位（上限对齐后端 QtRegisterDto） */
-const USERNAME_RE = /^[A-Za-z0-9]{5,18}$/;
-const PASSWORD_MIN = 6;
-const PASSWORD_MAX = 18;
-/** 邮箱格式：够用即可，不做 RFC 级别的严格匹配 */
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+type Mode = "login" | "register";
 
 export function LoginPage(): React.JSX.Element {
   const navigate = useNavigate();
@@ -38,163 +40,162 @@ export function LoginPage(): React.JSX.Element {
   const login = useAuthStore((s) => s.login);
   const register = useAuthStore((s) => s.register);
 
-  const [mode, setMode] = useState<"login" | "register">("login");
+  const [mode, setMode] = useState<Mode>("login");
   const [username, setUsername] = useState("");
+  const [nickname, setNickname] = useState("");
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [email, setEmail] = useState("");
+  const [showPw, setShowPw] = useState(false);
   const [tip, setTip] = useState<string | null>(null);
+
+  const switchMode = (m: Mode): void => {
+    setMode(m);
+    setTip(null);
+  };
 
   const submit = async (): Promise<void> => {
     setTip(null);
     const name = username.trim();
-    if (!name || !password) {
-      setTip("请填写用户名和密码");
-      return;
-    }
-    if (mode === "register") {
-      // 注册规则本地先挡一遍，不用等后端往返
-      if (!USERNAME_RE.test(name)) {
-        setTip("用户名需为 5-18 位英文或数字");
+
+    if (mode === "login") {
+      // 登录侧只校验非空：后端 QtLoginDto 对密码没有长度限制，账号字段还接受邮箱
+      // （邮箱长度普遍超过 30），套注册那套规则会把能登的账号拦在本地。
+      const bad = checkLoginAccount(name) ?? (password ? null : "请填写密码");
+      if (bad) {
+        setTip(bad);
         return;
       }
-      if (password.length < PASSWORD_MIN || password.length > PASSWORD_MAX) {
-        setTip(`密码需为 ${PASSWORD_MIN}-${PASSWORD_MAX} 位`);
-        return;
-      }
-      if (password !== confirm) {
-        setTip("两次输入的密码不一致");
-        return;
-      }
-      const mail = email.trim();
-      if (!mail) {
-        setTip("请填写邮箱");
-        return;
-      }
-      if (!EMAIL_RE.test(mail)) {
-        setTip("邮箱格式不正确");
-        return;
-      }
-      try {
-        await register(name, password, confirm, mail);
-      } catch (err) {
-        setTip(authTip(err));
-        return;
-      }
-    } else {
       try {
         await login(name, password);
       } catch (err) {
         setTip(authTip(err));
         return;
       }
+      await navigate({ to: "/profile" });
+      return;
+    }
+
+    const bad =
+      checkUsername(name) ??
+      checkEmail(email) ??
+      checkPassword(password) ??
+      checkConfirm(password, confirm);
+    if (bad) {
+      setTip(bad);
+      return;
+    }
+    try {
+      await register(name, password, confirm, email.trim(), nickname.trim());
+    } catch (err) {
+      setTip(authTip(err));
+      return;
     }
     await navigate({ to: "/profile" });
   };
 
   if (session) {
     return (
-      <div className="flex h-full items-center justify-center p-6">
-        <div className="text-center">
-          <p className="text-sm">当前已登录</p>
-          <button
-            type="button"
-            onClick={() => void navigate({ to: "/profile" })}
-            className="mt-4 rounded-md bg-primary px-4 py-2 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90"
-          >
-            进入个人中心
-          </button>
-        </div>
-      </div>
+      <AuthShell title="轻听" subtitle="当前已登录">
+        <AuthButton label="进入个人中心" onClick={() => void navigate({ to: "/profile" })} />
+      </AuthShell>
     );
   }
 
+  const pwToggle = <EyeToggle shown={showPw} onToggle={() => setShowPw((v) => !v)} />;
+
   return (
-    <div className="flex h-full items-center justify-center overflow-y-auto p-6">
-      <div className="w-full max-w-sm">
-        <h1 className="text-center text-lg font-semibold">轻听</h1>
-        <p className="mt-1 text-center text-xs text-muted-foreground">
-          登录后可同步收藏、消息与反馈
-        </p>
+    <AuthShell title="轻听" subtitle="登录后可同步收藏、消息与反馈">
+      <AuthTabs
+        value={mode}
+        onChange={switchMode}
+        items={[
+          { value: "login", label: "登录" },
+          { value: "register", label: "注册" },
+        ]}
+      />
 
-        <div className="mt-5 flex rounded-md bg-secondary p-1">
-          {(["login", "register"] as const).map((m) => (
+      <div className="space-y-3">
+        <AuthInput
+          value={username}
+          onChange={setUsername}
+          placeholder={
+            mode === "login" ? "用户名或邮箱" : `用户名（${USERNAME_MIN}-${USERNAME_MAX} 个字符）`
+          }
+          autoComplete="username"
+          onEnter={() => void submit()}
+        />
+
+        {mode === "register" ? (
+          <>
+            <AuthInput
+              value={nickname}
+              onChange={setNickname}
+              placeholder="昵称（选填，默认同用户名）"
+              // 仅输入上限：后端对昵称没有长度校验，这里按用户名的量级挡一下超长粘贴
+              maxLength={USERNAME_MAX}
+              onEnter={() => void submit()}
+            />
+            <AuthInput
+              value={email}
+              onChange={setEmail}
+              placeholder="邮箱（用于找回密码）"
+              type="email"
+              autoComplete="email"
+              onEnter={() => void submit()}
+            />
+          </>
+        ) : null}
+
+        <AuthInput
+          value={password}
+          onChange={setPassword}
+          placeholder={mode === "login" ? "密码" : `密码（${PASSWORD_MIN}-${PASSWORD_MAX} 位）`}
+          type={showPw ? "text" : "password"}
+          autoComplete={mode === "login" ? "current-password" : "new-password"}
+          maxLength={PASSWORD_MAX}
+          onEnter={() => void submit()}
+          action={pwToggle}
+        />
+
+        {mode === "register" ? (
+          <AuthInput
+            value={confirm}
+            onChange={setConfirm}
+            placeholder="确认密码"
+            // 与上面共用一个显隐开关：一次点开两个都看得见，省得来回切
+            type={showPw ? "text" : "password"}
+            autoComplete="new-password"
+            maxLength={PASSWORD_MAX}
+            onEnter={() => void submit()}
+          />
+        ) : null}
+
+        <AuthButton
+          label={mode === "login" ? "登 录" : "注册并登录"}
+          busyLabel="处理中…"
+          busy={loading}
+          onClick={() => void submit()}
+        />
+
+        <AuthTip tip={tip} />
+
+        {mode === "login" ? (
+          <div className="text-center">
             <button
-              key={m}
               type="button"
-              onClick={() => {
-                setMode(m);
-                setTip(null);
-              }}
-              className={`flex-1 rounded px-3 py-1.5 text-xs transition-colors ${
-                mode === m
-                  ? "bg-background text-foreground shadow-sm"
-                  : "text-muted-foreground"
-              }`}
+              onClick={() => void navigate({ to: "/forgot-password" })}
+              className="cursor-pointer text-xs text-muted-foreground underline-offset-2 transition-colors hover:text-primary hover:underline"
             >
-              {m === "login" ? "登录" : "注册"}
+              忘记密码？
             </button>
-          ))}
-        </div>
-
-        <div className="mt-4 space-y-3">
-          <input
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-            placeholder={mode === "login" ? "用户名" : "用户名（5-18 位英文或数字）"}
-            autoComplete="username"
-            className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
-          />
-          <input
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            type="password"
-            placeholder={mode === "login" ? "密码" : "密码（至少 6 位）"}
-            autoComplete={mode === "login" ? "current-password" : "new-password"}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") void submit();
-            }}
-            className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
-          />
-
-          {mode === "register" && (
-            <>
-              <input
-                value={confirm}
-                onChange={(e) => setConfirm(e.target.value)}
-                type="password"
-                placeholder="确认密码"
-                autoComplete="new-password"
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") void submit();
-                }}
-                className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
-              />
-              <input
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                type="email"
-                placeholder="邮箱"
-                autoComplete="email"
-                className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
-              />
-            </>
-          )}
-
-          <button
-            type="button"
-            onClick={() => void submit()}
-            disabled={loading}
-            className="h-9 w-full rounded-md bg-primary text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
-          >
-            {loading ? "处理中…" : mode === "login" ? "登 录" : "注册并登录"}
-          </button>
-
-          {tip && (
-            <p className="text-center text-xs text-destructive">{tip}</p>
-          )}
-        </div>
+          </div>
+        ) : (
+          <p className="text-center text-[11px] leading-relaxed text-muted-foreground">
+            注册后可用该邮箱重置密码，请填真实邮箱
+          </p>
+        )}
       </div>
-    </div>
+    </AuthShell>
   );
 }

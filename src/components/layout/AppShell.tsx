@@ -1,7 +1,7 @@
-import { useEffect } from "react";
+import { Suspense, useEffect } from "react";
 import { Outlet, useLocation, useNavigate } from "@tanstack/react-router";
 import * as ipc from "@/services/ipc";
-import { ONBOARDING_KEY } from "@/components/onboarding/OnboardingPage";
+import { ONBOARDING_KEY } from "@/lib/storageKeys";
 import { useAuthStore } from "@/stores/auth";
 import { TitleBar } from "@/components/TitleBar";
 import { Sidebar } from "@/components/layout/Sidebar";
@@ -23,6 +23,9 @@ import { useDownloadsStore } from "@/stores/downloads";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { initStat, trackStatPage } from "@/lib/stat";
 import { UpdateDialog } from "@/components/update/UpdateDialog";
+import { QtNoticeDialog } from "@/components/notice/qt-NoticeDialog";
+import { ErrorBoundary } from "@/components/common/ErrorBoundary";
+import { PageFallback } from "@/lib/lazyPage";
 
 /**
  * 全局布局（DESIGN §5.1）：标题栏 + 侧边栏 + 内容区 + 播放条。
@@ -38,7 +41,7 @@ export function AppShell(): React.JSX.Element {
   usePlayingCoverBg();
   useLocalTrackOnlineMeta();
   useUpdateCheck();
-  // 音源包启动检查（静默，4h 节流；发现新包只落盘，设置页可立即应用）
+  // 音源包启动检查（静默，每次启动查一次；发现新包只落盘，设置页可立即应用）
   useSourceUpdateCheck();
 
   const bgImage = useAppearanceStore((s) => s.preference.bgImage);
@@ -177,18 +180,35 @@ export function AppShell(): React.JSX.Element {
         {!isPlayingPage && <Sidebar />}
         <main className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
           <div className="relative z-10 h-full">
-            {/* 一级页面常驻缓存（切 tab 不再整页重载）；其余路由仍走 Outlet */}
-            <KeepAliveOutlet pathname={pathname} />
-            {!isKeepAlivePath(pathname) && <Outlet />}
+            {/* 内容区独立边界：页面崩掉不连累侧边栏/播放条，切路由会自动重试一次 */}
+            <ErrorBoundary label="内容区" resetKey={pathname}>
+              {/* 页面路由是懒加载的（见 lib/lazyPage）：这里给 Outlet 兜一层，
+                  否则首次进入未下载完的路由会同步挂起报错。常驻页各自在
+                  KeepAliveOutlet 内部有自己的兜底。 */}
+              <Suspense fallback={<PageFallback />}>
+                {/* 一级页面常驻缓存（切 tab 不再整页重载）；其余路由仍走 Outlet */}
+                <KeepAliveOutlet pathname={pathname} />
+                {!isKeepAlivePath(pathname) && <Outlet />}
+              </Suspense>
+            </ErrorBoundary>
           </div>
         </main>
-        {!isPlayingPage && <QueuePanel />}
+        {!isPlayingPage && (
+          <ErrorBoundary label="播放队列">
+            <QueuePanel />
+          </ErrorBoundary>
+        )}
       </div>
 
-      <PlayerBar />
+      <ErrorBoundary label="播放条">
+        <PlayerBar />
+      </ErrorBoundary>
 
-      {/* 更新弹窗（启动自动检查发现新版本时弹出，§15.3） */}
-      <UpdateDialog />
+      <ErrorBoundary label="对话框">
+        {/* 更新弹窗（启动自动检查发现新版本时弹出，§15.3） */}
+        <UpdateDialog />
+        <QtNoticeDialog />
+      </ErrorBoundary>
 
       {/* 8 向 resize 命中区（fixed 覆盖层，最后挂载保证在最上） */}
       <div aria-hidden className="pointer-events-none">

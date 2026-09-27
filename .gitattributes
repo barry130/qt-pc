@@ -1,0 +1,22 @@
+# 编译期 include_bytes! 的音源包产物：必须逐字节保持，禁止任何行尾转换。
+#
+# 本机 core.autocrlf=true（Windows 默认）时 git 会把 LF 换成 CRLF。实测克隆一份
+# 本仓库，HEAD 版 source-bundle.js 就有 14,624 个 CRLF，而正确产物只有 7 个
+# （那 7 个是脚本体里本就存在的换行）。后果不是"格式难看"：
+# bundle 内嵌的混淆脚本体带源码自校验，内容一变校验即失效 → 字符串数组轮转永不
+# 收敛 → **同步忙循环挂死**（2026091905 事故：PC 全部接口超时、安卓 QuickJS
+# 线程卡死）。也就是说，任何人 clone 后编译出来的安装包都是坏的。
+src-tauri/builtin-sources/* -text
+
+# 二进制（git 的 text 探测对 PNG 不可靠，显式声明）
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.zip binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary

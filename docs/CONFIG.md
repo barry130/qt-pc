@@ -28,7 +28,7 @@ pnpm config:check    # 只校验，不一致退出码 1（已挂进 pnpm build /
 | `src-tauri/tauri.conf.json` | 窗口尺寸、CSP、capabilities、bundle 段；**只有 5 个值由同步器写入** |
 | `src-tauri/nsis/installer.nsi` | NSIS 模板（见 §6）；`nsis-hooks.nsh` 同 |
 | `pnpm-workspace.yaml` / `.npmrc` | 包管理器行为 |
-| `src/source-scripts/chain-config.ts` | **音源引擎包源码**（会打进 1.77 MB 的 bundle），平台枚举 `PLATFORMS` 与取链顺序都在里面，改动等于换包（见 §5） |
+| `../qt-sources/src/chain-config.ts` | **音源引擎包源码**（独立工程，会打进约 1.7 MB 的 bundle），平台枚举 `PLATFORMS` 与取链顺序都在里面，改动等于换包（见 §5） |
 
 ## 2. `app.config.json` 字段 → 落点 → 谁读
 
@@ -37,9 +37,9 @@ pnpm config:check    # 只校验，不一致退出码 1（已挂进 pnpm build /
 | `product.name` | `QuietMusic` | `tauri.conf.json` `productName` | 安装包名、进程名、开始菜单名 |
 | `product.displayName` | `轻听` | `tauri.conf.json` `app.windows[0].title` | 主窗口标题 |
 | `product.identifier` | `com.qt.quietmusic` | `tauri.conf.json` `identifier` | 注册表路径、数据目录派生（**发布后不可改**） |
-| `version.name` | `1.0.7` | `package.json` / `tauri.conf.json` / `Cargo.toml` / `Cargo.lock` / `app_config.rs` | 安装包版本、关于页、`/app/version/check` |
-| `version.code` | `107` | `app_config.rs`（`VERSION_CODE`） | `/app/update?version=`、后台 `qt_app_update` 记录 |
-| `sourcePack.code` / `.name` | `2026092301` / `2026.09.23.1` | `src/source-scripts/source-update.ts`、`src-tauri/builtin-sources/version.json`、`app_config.rs` | 内置音源包版本、更新判定基线 |
+| `version.name` | `1.0.8` | `package.json` / `tauri.conf.json` / `Cargo.toml` / `Cargo.lock` / `app_config.rs` | 安装包版本、关于页、`/app/version/check` |
+| `version.code` | `108` | `app_config.rs`（`VERSION_CODE`） | `/app/update?version=`、后台 `qt_app_update` 记录 |
+| `sourcePack.code` / `.name` | `2026092602` / `2026.09.26.2` | `src/source-scripts/source-update.ts`、`src-tauri/builtin-sources/version.json`、`app_config.rs` | 内置音源包版本、更新判定基线 |
 | `sourcePack.hostApiVersion` | `1` | `source-update.ts`、`app_config.rs` | 宿主契约版本（与 Rust `HOST_API_VERSION` 同源） |
 | `backend.dev` / `.prod` | 见文件 | `app_config.rs`（`DEV_BASE_URL` / `PROD_BASE_URL`） | Astral 后端地址 |
 | `backend.active` | `prod` | `app_config.rs`（`DEFAULT_BASE_URL`） | **当前生效**的后端；联调改 `dev` 后同步重编 |
@@ -72,7 +72,7 @@ src-tauri/src/app_config.rs                    Rust 侧常量 + 一致性单测�
 
 ```text
 1. 改 app.config.json 的 version.name 与 version.code
-   （1.0.7 → 1.0.8 对应 code 108；两个必须一起改，单测会校验自洽）
+   （如 1.0.8 → 1.0.9 对应 code 109；两个必须一起改，单测会校验自洽）
 2. pnpm config:sync              # 或直接 pnpm build，它会先同步
 3. pnpm config:check && pnpm test && (cd src-tauri && cargo test --lib)
 4. 打包（见 docs/PACKAGING.md），产物：
@@ -85,7 +85,7 @@ src-tauri/src/app_config.rs                    Rust 侧常量 + 一致性单测�
 9. 确认无误后 isPublished 置 1，客户端开始收到更新
 ```
 
-> **`version.code` 是发版版本号**（`major*100 + minor*10 + patch`：1.0.0 → 100、1.0.7 → 107），
+> **`version.code` 是发版版本号**（`major*100 + minor*10 + patch`：1.0.0 → 100、1.0.8 → 108），
 > 必须与后台 `qt_app_update` 记录一致 —— 更新检查就是拿它比大小。传错等于「永远没有更新」。
 
 ## 5. 音源包版本（`sourcePack`）
@@ -94,8 +94,13 @@ src-tauri/src/app_config.rs                    Rust 侧常量 + 一致性单测�
   内置包随后同步为同号同物。安卓端 `qt-uniappx/services/source-bundle-fs.uts` 的
   `BUILTIN_VERSION_CODE` 必须同号。
 - 换号流程：改 `app.config.json` 的 `sourcePack` → `pnpm config:sync`
-  → `pnpm build:sources`（产出 `dist-sources/`）→ `pnpm sync:builtin`
-  （同步进 `src-tauri/builtin-sources/`，`version.json` 由它生成）→ 重新编译。
+  （号会写进 7 个派生文件，含 `src/source-scripts/source-update.ts` 与
+  `src-tauri/builtin-sources/version.json` —— 后者**不需要**另外再写一遍）
+  → 到独立工程 `../qt-sources` 跑 `pnpm build`（一次构建同时交付 `qt-pc/src-tauri/builtin-sources/`
+  与 `qt-uniappx/static/source-bundle/`；在 qt-pc 里等价于 `pnpm sources:build`）
+  → 回 qt-pc 跑 `pnpm builtin:check` 体检（确认包齐备、与配置同号、打印产物指纹）→ 重新编译。
+  `pnpm sources:build` 对 qt-sources 的构建**全程托管**（含 `restore-lx-bodies` 逐字节还原与
+  `check-lx-bodies` 挂死守卫），产物与在 qt-sources 里直接构建逐字节一致。
 - **同号换内容**会让设备上已解包的旧副本一直盖住新实现，所以内置包内容一变就必须换号。
 - 同步器对 `source-update.ts` 是**写前比对**：值没变绝不碰文件 —— 该文件参与构建，
   无意义改动会污染产物哈希（发布说明里记了 bundle 的 SHA256）。
@@ -128,9 +133,10 @@ src-tauri/src/app_config.rs                    Rust 侧常量 + 一致性单测�
    `node node_modules/vite/bin/vite.js build`。脚本本身与 CI 不受影响。
 3. 打包前**必须关掉正在运行的 QuietMusic 进程**，否则链接 `quietmusic.exe` 报 `os error 5 拒绝访问`。
 4. cargo 命令统一加环境变量：
-   `$env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"; $env:CARGO_HOME = "F:\qtMusic\qt-pc\.cargo-home"`
-   —— 本机 HTTPS 拉取 crates.io 不可用，依赖走 `.cargo-home` 缓存 + `tools/registry-proxy.mjs`，
-   **不要删 `.cargo-home/`**。
+   `$env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"`
+   —— 本机 HTTPS 拉取 crates.io 不可用，依赖走 **默认 `CARGO_HOME`（`~/.cargo`）** 的缓存 +
+   `tools/registry-proxy.mjs`（`src-tauri/.cargo/config.toml` 把 crates.io 指向 `127.0.0.1:8650`）。
+   仓库根的 `.cargo-home/` **已废弃不用**（历史遗留约 1.3 GB，可删）。
 5. 所有带中文的配置文件（`tauri.conf.json`、`app.config.json`）必须 **UTF-8 无 BOM**，
    否则窗口标题/安装包名会乱码。改完用 `Get-Content -Encoding UTF8` 确认。
 6. PowerShell 5.1 读 UTF-8 文件会显示乱码（那是**显示**问题，不代表文件坏了）；
@@ -142,20 +148,27 @@ src-tauri/src/app_config.rs                    Rust 侧常量 + 一致性单测�
 
 `.gitignore` 覆盖：`node_modules/`、`dist/`、`dist-sources/`、`src-tauri/target/`、
 `.cargo-home/`、`.pnpm-store/`、`.npm-cache/`、`.vite-cache/`、`tmp/`、`.tmp/`、
-`src-tauri/gen/schemas/`、`src-tauri/.cargo/`、`*.log`、`nul` 等。
+`src-tauri/gen/schemas/`、`src-tauri/.cargo/`、`release-pending/`、`diag-*.mjs`、
+`diag-live-rank-*.json`、`*.log`、`nul` 等。
 
-**可以随时删（会自动重建）**：`dist/`、`dist-sources/`、`.vite-cache/`、`.npm-cache/`、
-`src-tauri/gen/schemas/`、`src-tauri/target/debug/`（debug 产物，删后 `tauri dev` 首次重编较慢）。
+**可以随时删（会自动重建）**：`dist/`、`.vite-cache/`、`.npm-cache/`、
+`src-tauri/gen/schemas/`、`src-tauri/target/debug/`（debug 产物，删后 `tauri dev` 首次重编较慢）、
+`.cargo-home/`（**已废弃**：当前依赖缓存在默认 `~/.cargo`，此目录是历史遗留约 1.3 GB）。
+
+> 注：`src-tauri/builtin-sources/` **不能删**——它是 `include_bytes!` 的编译输入，
+> 由 `../qt-sources` 的构建交付；删了要先去那边跑 `pnpm build`。
 
 **不要删**：
 
 | 目录 | 原因 |
 |---|---|
-| `.cargo-home/` | 本机唯一的 crates.io 缓存，删了在本机无法构建 |
 | `node_modules/`、`.pnpm-store/` | 本机 pnpm 安装不稳，删了可能装不回来 |
 | `src-tauri/target/release/` | 保留可让 release 重编只需几分钟；安装包产物也在这里 |
 
-根目录保留的 4 个诊断文件（**不是垃圾，勿删**，被源码注释与发布说明引用）：
-`diag-live-rank.mjs`、`diag-line-verdict.mjs`（线路排名复测工具）、
-`diag-live-rank-1101.json`、`diag-live-rank-1101-kw-wyy.json`（复测原始数据，
-见 `src/source-scripts/chain-config.ts` 里「摘除两条线路」的依据）。
+**本地保留、不入库**（已加进 `.gitignore`，`git rm --cached` 过；文件仍在本机）：
+
+| 项 | 说明 |
+|---|---|
+| `release-pending/` | 发布暂存：`source-bundle.js` / `source-release.zip` / `chain.json` / 发布说明。与 `src-tauri/builtin-sources/` 内容重复且会漂移，属生成物 |
+| `diag-live-rank.mjs`、`diag-line-verdict.mjs` | 线路排名复测工具 |
+| `diag-live-rank-1101.json`、`diag-live-rank-1101-kw-wyy.json` | 复测原始数据（约 471 KB）。`../qt-sources/src/chain-config.ts` 注释引用它们作为「摘除两条线路」的依据，**需要保留在本机**才能复查该结论 |

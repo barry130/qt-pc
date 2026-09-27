@@ -7,9 +7,11 @@ pub mod astral;
 pub mod commands;
 pub mod db;
 pub mod download;
+pub mod ipc_guard;
 pub mod local;
 pub mod lyric_window;
 pub mod media;
+pub mod net_guard;
 pub mod provider;
 pub mod playurl_bridge;
 pub mod qtres;
@@ -96,6 +98,8 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         // 本地音乐文件夹选择（/library/folders 用它的目录选择对话框）
         .plugin(tauri_plugin_dialog::init())
+        // 系统通知（音频引擎自动切歌熔断时后台告知，audio::engine::notify_failure）
+        .plugin(tauri_plugin_notification::init())
         .on_window_event(|window, event| {
             // §4 关闭行为：点关闭 = 最小化到托盘，退出走托盘菜单
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
@@ -213,6 +217,14 @@ pub fn run() {
                 }
             }
 
+            // 内置包接管（与安卓端 demoteStaleInstalled 同一套方案）：升级应用后
+            // 内置音源包可能比盘上残留的旧远程包新，先把旧包降级为回退目标，
+            // 设置页/更新检查才不会拿旧记录当「当前版本」
+            source_install::demote_stale_installed(
+                &source_bundle::bundle_dir(&handle),
+                crate::app_config::SOURCE_PACK_CODE,
+            );
+
             // 音源引擎窗口（音源包热更新 P1）：常驻隐藏 webview，加载远程
             // 音源包跑取链；创建失败不影响主流程（主窗口有内置实现兜底）
             if let Err(e) = source_window::create(&handle) {
@@ -225,7 +237,9 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![
+        // 所有应用命令都过一层来源授权：音源引擎窗口（会把第三方脚本 import
+        // 进自己 JS 环境）默认只能调用 ipc_guard 白名单里的命令（见 ipc_guard.rs）
+        .invoke_handler(ipc_guard::guarded(tauri::generate_handler![
             cmd_builtin_request,
             cmd_set_resolved_play_url,
             cmd_script_bridge_ready,
@@ -306,6 +320,10 @@ pub fn run() {
             cmd_astral_send_email_code,
             cmd_astral_change_password,
             cmd_astral_update_profile,
+            // 媒体直传（UPDATE_DESIGN.md §5.2/§5.3）
+            cmd_astral_upload_avatar,
+            cmd_astral_upload_playlist_cover,
+            cmd_astral_clear_playlist_cover,
             // 听歌统计（DESIGN §5.3）
             cmd_get_play_overview,
             cmd_get_top_tracks,
@@ -327,6 +345,7 @@ pub fn run() {
             cmd_scan_library,
             cmd_list_drives,
             cmd_get_local_tracks,
+            cmd_get_local_track_files,
             cmd_get_scan_dirs,
             cmd_add_scan_dir,
             cmd_remove_scan_dir,
@@ -352,6 +371,8 @@ pub fn run() {
             cmd_create_playlist,
             cmd_rename_playlist,
             cmd_delete_playlist,
+            cmd_set_playlist_cover,
+            cmd_get_playlist_cover,
             cmd_list_my_playlists,
             cmd_get_playlist_tracks,
             cmd_add_tracks_to_playlist,
@@ -370,7 +391,7 @@ pub fn run() {
             cmd_get_download_dir,
             cmd_choose_download_dir,
             cmd_reset_download_dir,
-        ])
+        ]))
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

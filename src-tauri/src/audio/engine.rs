@@ -208,6 +208,12 @@ struct EngineInner {
     /// 本轮队列里已经播放失败过的曲目（自动跳过用；换队列时清空）。
     /// 有它才能保证「队列全挂」时不会无限互相跳过。
     failed_tracks: HashSet<String>,
+    /// 自动下一首标识：播放失败且为 true 时自动跳下一首（skip_if_recoverable）。
+    /// 连续失败 FAIL_STREAK_LIMIT 首自动关闭（熔断，防止死歌队列无限空转）并通知；
+    /// 任一成功播放或用户手动发起播放（SetQueue/PlayAt/Play）时重新打开。
+    auto_next: bool,
+    /// 连续播放失败计数（成功挂载播放或手动播放时清零）
+    fail_streak: u32,
     /// 系统媒体控制（SMTC）句柄；None = 不可用（非 Windows / 初始化失败）
     smtc: Option<crate::smtc::SmtcHandle>,
     /// 加载代次：每次发起新的「取址+构建解码器」链就 +1。LoadReady /
@@ -451,6 +457,8 @@ fn run_engine(deps: EngineDeps) {
         volume_before_mute: 0.8,
         tick_anchor: None,
         failed_tracks: HashSet::new(),
+        auto_next: true,
+        fail_streak: 0,
         smtc: None,
         load_gen: 0,
         last_persist: None,
@@ -606,12 +614,33 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             }
         }
         AudioCmd::Play => {
-            inner.sink.play();
-            inner.mutate(|st| {
-                if st.status == PlaybackStatus::Paused {
-                    st.status = PlaybackStatus::Playing;
+            // Error 态下 sink 是空的，裸 sink.play() 是空操作 → 播放键失效。
+            // 改为重载当前队列曲目（autoplay=true）：成功即从原进度续播，再失败
+            // 走 LoadFailed 的自动跳过链。用户按播放 = 明确意图，重开自动切歌熔断。
+            let reload = inner
+                .state
+                .read()
+                .unwrap()
+                .status
+                == PlaybackStatus::Error;
+            if reload {
+                let track = inner.queue.lock().unwrap().current().cloned();
+                if let Some(track) = track {
+                    let pos = inner.state.read().unwrap().position_ms;
+                    inner.auto_next = true;
+                    inner.fail_streak = 0;
+                    load_queue_track(inner, track, true, pos);
+                } else {
+                    inner.mutate(|st| st.status = PlaybackStatus::Stopped);
                 }
-            });
+            } else {
+                inner.sink.play();
+                inner.mutate(|st| {
+                    if st.status == PlaybackStatus::Paused {
+                        st.status = PlaybackStatus::Playing;
+                    }
+                });
+            }
         }
         AudioCmd::Pause => {
             inner.sink.pause();
@@ -681,9 +710,12 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
         }
         AudioCmd::SetQueue { tracks, index } => {
             // 播放新列表 = 新一轮播放：上一首的临时音质作废，回到默认音质；
-            // 失败跳过记录也清空，新的队列重新给每首歌机会
+            // 失败跳过记录也清空，新的队列重新给每首歌机会；
+            // 用户主动发起播放，同时重开自动切歌熔断
             inner.track_quality = None;
             inner.failed_tracks.clear();
+            inner.auto_next = true;
+            inner.fail_streak = 0;
             let mut q = inner.queue.lock().unwrap();
             q.set(tracks, index);
             let current = q.current().cloned();
@@ -708,6 +740,11 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             inner.sync_queue_to_snapshot();
             inner.queue_emit();
             if let Some(track) = track {
+                // 用户手动点播 = 明确意图：重开熔断，并给失败过的歌第二次机会
+                // （覆盖「线路恢复后老歌被永久跳过」）
+                inner.auto_next = true;
+                inner.fail_streak = 0;
+                inner.failed_tracks.remove(&track.id);
                 play_queue_track(inner, track);
             }
             inner.persist_queue();
@@ -862,7 +899,22 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                     st.error = Some(message);
                 });
                 // 事件已由取址方（含原消息）发出，这里只负责状态与跳过决策
-                skip_if_recoverable(inner, &track_id, autoplay);
+                // 自动下一首标识关闭（熔断已触发）就不跳，保持错误态等用户处理；
+                // autoplay=false 的加载（启动恢复/暂停态重载）本来就不在自动链上
+                if autoplay && inner.auto_next {
+                    inner.fail_streak += 1;
+                    if inner.fail_streak >= FAIL_STREAK_LIMIT {
+                        inner.auto_next = false;
+                        inner.fail_streak = 0;
+                        let notice = format!("连续{FAIL_STREAK_LIMIT}首播放失败，已停止自动切歌");
+                        log::warn!("[queue] {notice}");
+                        inner.mutate(|st| st.error = Some(notice.clone()));
+                        // 自动切歌多发生在后台，应用内错误条看不到，走系统通知告知
+                        notify_failure(&inner.app, &notice);
+                    } else {
+                        skip_if_recoverable(inner, &track_id, autoplay);
+                    }
+                }
             }
         }
         AudioCmd::SetSmtc(handle) => {
@@ -952,6 +1004,22 @@ fn advance(inner: &mut EngineInner, auto: bool) {
     }
 }
 
+/// 自动切歌熔断阈值：连续失败这么多首（每首失败计一次，成功挂载播放清零）
+/// 就关闭 auto_next 并发系统通知，防止死歌队列一首接一首白等取链无限空转。
+const FAIL_STREAK_LIMIT: u32 = 5;
+
+/// 发系统通知（Windows toast 等）。自动切歌熔断发生在后台，应用内错误条看不到。
+/// 未安装/未初始化通知插件时 show() 返回 Err，静默忽略即可。
+fn notify_failure(app: &tauri::AppHandle, body: &str) {
+    use tauri_plugin_notification::NotificationExt;
+    let _ = app
+        .notification()
+        .builder()
+        .title("轻听")
+        .body(body)
+        .show();
+}
+
 /// 播放失败后的恢复策略：仍处于「应当继续播放」的语义（自动切歌 / 在播时换曲）
 /// 且队列里还有没失败过的曲目，就跳过当前这首继续播；全部失败则停下 ——
 /// 否则整个队列都播不出来时会无限互相跳过。
@@ -992,6 +1060,11 @@ fn skip_if_recoverable(inner: &mut EngineInner, track_id: &str, autoplay: bool) 
 
     let Some(i) = target else {
         log::warn!("[queue] 队列内 {len} 首均播放失败，停止自动跳过");
+        // 播放条只显示最后一首的单曲错误，用户不知道全队都挂了；这里覆盖成
+        // 聚合文案（PlayerBar 的 error 展示位直接显示）
+        inner.mutate(|st| {
+            st.error = Some(format!("队列内 {len} 首均无法播放，请检查音源或稍后重试"))
+        });
         return;
     };
     log::info!("[queue] 曲目 {track_id} 失败，跳过到队列第 {} 首", i + 1);
@@ -1271,6 +1344,9 @@ fn mount_decoder(
     play_url: Option<String>,
 ) {
     inner.failed_tracks.remove(&track.id);
+    // 成功挂载 = 这首能播：重开自动切歌熔断（连续失败计数一并清零）
+    inner.auto_next = true;
+    inner.fail_streak = 0;
     inner.sink.clear();
     inner.sink.append(decoder);
     inner.sink.set_volume(inner.effective_volume());

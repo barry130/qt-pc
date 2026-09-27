@@ -64,11 +64,24 @@ fn host_allowed(url: &str) -> bool {
         Some((_, r)) => r,
         None => return false,
     };
-    let host = rest.split('/').next().unwrap_or("");
-    let host = host.split(':').next().unwrap_or("");
-    ALLOWED_HOST_SUFFIXES
-        .iter()
-        .any(|sfx| host == *sfx || host.ends_with(sfx))
+    // host 大小写不敏感（HOST 头本来就允许大写，别让大写 host 无辜被拒）
+    let host = rest.split('/').next().unwrap_or("").to_ascii_lowercase();
+    // 去掉端口（含 IPv6 字面量的 [::1]:80 形式：白名单里没有 IP，遇 [ 一律不放行）
+    let host = if host.starts_with('[') {
+        return false;
+    } else {
+        host.split(':').next().unwrap_or("")
+    };
+    // 后缀必须落在**点边界**上：原来 `host.ends_with("qq.com")` 会把
+    // `evilqq.com` / `notqq.com` 判为放行，等于把白名单架空（任何人注册一个
+    // 以 qq.com 结尾的域名就能借 qtres 代取任意内容）。这里要求 host 恰好等于
+    // 后缀，或以 `.后缀` 结尾（不分配字符串，逐字节比边界）。
+    ALLOWED_HOST_SUFFIXES.iter().any(|sfx| {
+        host == *sfx
+            || (host.len() > sfx.len()
+                && host.ends_with(sfx)
+                && host.as_bytes()[host.len() - sfx.len() - 1] == b'.')
+    })
 }
 
 /// 解码 `cover/` 或 `mv/` 路径（base64url，可无填充）→ 原始 URL
@@ -112,8 +125,9 @@ const ENGINE_INDEX_HTML: &str = include_str!("source_engine_page.html");
 
 /// 内置音源包（音源包热更新 P2 补充）：随应用编译进二进制的 bundle，
 /// 引擎页在未安装远程包 / 远程包加载失败时加载，保证开箱可用。
-/// 产物由 `npm run sync:builtin` 从 dist-sources 同步（勿手改）；
-/// version.json 的 code/name 单源于前端 BUILTIN_SOURCE_VERSION。
+/// 产物由独立工程 ../qt-sources 的 `pnpm build` 直接交付到本目录（勿手改）；
+/// version.json 的 code/name 由 `npm run builtin:version` 从
+/// src/source-scripts/source-update.ts 的 BUILTIN_SOURCE_VERSION 读出。
 const BUILTIN_BUNDLE_JS: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/builtin-sources/source-bundle.js"
@@ -254,6 +268,19 @@ static COVER_CACHE: Mutex<Option<lru_simple::Lru<String, Vec<u8>>>> = Mutex::new
 mod lru_simple {
     use std::collections::HashMap;
 
+    /// 一次淘汰多少条：容量的 1/8（至少 1 条）。
+    ///
+    /// 为什么批量：找"最旧"必须扫全表（O(n)），旧实现每来一张封面就扫一次，
+    /// 满容量后每次插入都是 O(n)（一屏几十张图 = 连续几十次全表扫描）。
+    /// 一次淘汰 cap/8 条后，平均每 cap/8 次插入才扫一次表，
+    /// 单次插入的淘汰成本摊还成 O(1)（cap=64 时约 8 次插入扫一次，摊到每次
+    /// 插入上是 8 次比较）。批量取 1/8 而不是更大：多淘汰的条目会让缓存命中率
+    /// 下降（未命中 = 多打一次图床请求），1/8 是在"摊还成本可忽略"和
+    /// "别把命中率打下来"之间的折中（旧行为是每次只淘汰 1 条 = 严格 LRU）。
+    fn evict_batch(cap: usize) -> usize {
+        std::cmp::max(1, cap / 8)
+    }
+
     pub struct Lru<K, V> {
         map: HashMap<K, (V, u64)>,
         tick: u64,
@@ -278,16 +305,30 @@ mod lru_simple {
         pub fn insert(&mut self, k: K, v: V) {
             self.tick += 1;
             if self.map.len() >= self.cap && !self.map.contains_key(&k) {
-                if let Some(oldest) = self
-                    .map
-                    .iter()
-                    .min_by_key(|(_, (_, t))| *t)
-                    .map(|(k, _)| k.clone())
-                {
-                    self.map.remove(&oldest);
-                }
+                self.evict_oldest(evict_batch(self.cap));
             }
             self.map.insert(k, (v, self.tick));
+        }
+
+        /// 淘汰最旧的 n 条（按最近一次访问的 tick；tick 单调自增所以不会打平）。
+        /// select_nth 是 O(n)，不必全排序。
+        fn evict_oldest(&mut self, n: usize) {
+            let n = n.min(self.map.len());
+            if n == 0 {
+                return;
+            }
+            let mut entries: Vec<(u64, K)> =
+                self.map.iter().map(|(k, (_, t))| (*t, k.clone())).collect();
+            entries.select_nth_unstable_by_key(n - 1, |e| e.0);
+            for (_, k) in entries.drain(..n) {
+                self.map.remove(&k);
+            }
+        }
+
+        /// 测试用的条目数（正常构建里不需要）
+        #[cfg(test)]
+        pub fn len(&self) -> usize {
+            self.map.len()
         }
     }
 }
@@ -298,9 +339,17 @@ pub fn handle_qtres<R: tauri::Runtime>(
     request: Request<Vec<u8>>,
     responder: tauri::UriSchemeResponder,
 ) {
-    // 阻塞部分放独立线程，避免卡 WebView 主线程
+    // 阻塞部分放线程池，避免卡 WebView 主线程。
+    //
+    // P2-4：这里从 `std::thread::spawn` 换成 tokio 阻塞池（Tauri 的
+    // `spawn_blocking`）。原因：一屏封面就是几十个并发请求，裸线程没有任何上限，
+    // 每个线程还要吃默认 1MB 栈；阻塞池有上限（默认 512）并在满载时排队，
+    // 超出的请求只是晚一点执行，不会把线程/内存铺满，而且线程是复用的。
+    // 逻辑本身一行没动：仍然是"在别的线程上跑同步代取（reqwest blocking，
+    // 收完整个 body 再回），完成后 respond"，不做异步流式改造，
+    // 也就不可能改变 cover/mv 的响应语义。
     let app = ctx.app_handle().clone();
-    std::thread::spawn(move || {
+    tauri::async_runtime::spawn_blocking(move || {
         let response = handle_qtres_sync(&app, request);
         responder.respond(response);
     });
@@ -627,5 +676,38 @@ mod tests {
         assert!(host_allowed(
             "http://qpic.y.qq.com/music_cover/8eiaDBJ/300?n=1"
         ));
+    }
+
+    /// 封面缓存淘汰：超容量时按"最旧"**批量**淘汰，容量上限绝不被突破，
+    /// 且刚访问过的条目不会被误杀（LRU 语义不变，只是淘汰改成一批一批做）
+    #[test]
+    fn cover_cache_evicts_oldest_in_batch() {
+        // cap 取 16 → 一次淘汰 2 条，能真正覆盖"批量淘汰"分支
+        let cap = 16usize;
+        let mut lru = lru_simple::Lru::new(cap);
+        for i in 0..cap {
+            lru.insert(i, i);
+        }
+        assert_eq!(lru.len(), cap);
+        // 读一次 0 号，把它顶成"最新访问"
+        assert_eq!(lru.get(&0), Some(&0));
+        // 满容量后再插一条：直接淘汰最旧的一批
+        lru.insert(cap, cap);
+        assert!(lru.len() <= cap, "容量上限不得突破: {}", lru.len());
+        assert!(
+            lru.get(&0).is_some(),
+            "刚被访问过的条目不在最旧的一批里，应当存活"
+        );
+        assert!(lru.get(&1).is_none(), "最旧的条目应被淘汰");
+        assert!(
+            lru.get(&2).is_none(),
+            "同批的第二旧也应一起淘汰（批量淘汰，不是每次只掉一条）"
+        );
+        // 继续插到下一批，最新写入的条目必须都在，容量始终守得住
+        for i in cap + 1..cap + 4 {
+            lru.insert(i, i);
+        }
+        assert!(lru.len() <= cap);
+        assert!(lru.get(&(cap + 3)).is_some(), "最新插入的条目必须在");
     }
 }

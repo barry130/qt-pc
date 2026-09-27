@@ -7,6 +7,7 @@ import {
   LogOut,
   MessageSquareText,
   Music,
+  UserRound,
 } from "lucide-react";
 import { avatarUrl, displayName, useAuthStore } from "@/stores/auth";
 import { qtresCoverUrl } from "@/lib/lrc";
@@ -81,10 +82,10 @@ export function ProfilePage(): React.JSX.Element {
   return (
     <div className="h-full min-w-0 overflow-y-auto">
       <div className="px-5 pb-2 pt-6">
-        {/* 正文内容卡：实底 + 极淡品牌色渐变（同首页 hero 卡）。
-            玻璃态在本站是「浮在内容之上的层」的专属语言（标题栏/播放条/弹层），
-            正文卡片不用，避免和其余页面不一致。 */}
-        <section className="relative overflow-hidden rounded-2xl border border-border bg-card p-5">
+        {/* 正文内容卡：与首页 hero 卡同一配方——不做实底（壁纸下会变成整块白板），
+            用极淡品牌色渐变直接铺在壁纸上；卡内次级面用 bg-card/xx 半透明砖，
+            与发现页胶囊（bg-card/60）同一表面语言。 */}
+        <section className="relative overflow-hidden rounded-2xl border border-border bg-gradient-to-br from-primary/10 via-primary/5 to-transparent p-5">
           <div
             aria-hidden
             className="pointer-events-none absolute inset-0 bg-gradient-to-br from-primary/10 via-transparent to-transparent"
@@ -95,7 +96,7 @@ export function ProfilePage(): React.JSX.Element {
             <div className="shrink-0 rounded-full ring-1 ring-border">
               <div className="flex h-16 w-16 items-center justify-center overflow-hidden rounded-full bg-secondary">
                 <img
-                  src={avatarSrc ?? "/app-icon.png"}
+                  src={avatarSrc ?? "/static/icon/xxxhdpi.png"}
                   alt=""
                   className="h-full w-full object-cover"
                   draggable={false}
@@ -142,6 +143,24 @@ export function ProfilePage(): React.JSX.Element {
             <Stat label="本地歌曲" value={stats.tracks} />
             <Stat label="已下载" value={stats.downloads} />
           </div>
+
+          {/* 编辑资料入口：只在登录后出现（未登录时没有可改的资料） */}
+          {session ? (
+            <button
+              type="button"
+              onClick={() => void navigate({ to: "/profile/edit" })}
+              className="group relative mt-3 flex w-full cursor-pointer items-center gap-2.5 rounded-xl border border-border bg-card/50 px-3 py-2.5 text-left transition-colors hover:border-primary/40 hover:bg-card/70"
+            >
+              <UserRound className="h-4 w-4 shrink-0 text-primary" />
+              <span className="min-w-0 flex-1">
+                <span className="block truncate text-sm font-medium">编辑资料</span>
+                <span className="block truncate text-[11px] text-muted-foreground">
+                  昵称、邮箱与密码
+                </span>
+              </span>
+              <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground transition-colors group-hover:text-primary" />
+            </button>
+          ) : null}
         </section>
       </div>
 
@@ -157,7 +176,7 @@ export function ProfilePage(): React.JSX.Element {
                 key={item.to}
                 type="button"
                 onClick={() => void navigate({ to: item.to })}
-                className="group flex cursor-pointer items-center gap-3 rounded-xl border border-border bg-card p-3 text-left transition-colors hover:border-primary/40 hover:bg-secondary/60"
+                className="group flex cursor-pointer items-center gap-3 rounded-xl border border-border bg-card/60 p-3 text-left transition-colors hover:border-primary/40 hover:bg-card/80"
               >
                 <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/10 text-primary">
                   <Icon className="h-4 w-4" />
@@ -180,10 +199,10 @@ export function ProfilePage(): React.JSX.Element {
   );
 }
 
-/** 统计格：实底次级面，跟全站卡片同一套表面语言 */
+/** 统计格：bg-card 半透明砖，壁纸/深浅模式下都和卡内其他次级面同语言 */
 function Stat(props: { label: string; value: number }): React.JSX.Element {
   return (
-    <div className="rounded-xl bg-secondary px-3 py-2.5">
+    <div className="rounded-xl bg-card/50 px-3 py-2.5">
       <div className="text-lg font-semibold tabular-nums leading-tight">
         {props.value}
       </div>

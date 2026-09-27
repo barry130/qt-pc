@@ -133,6 +133,8 @@
   body {
     background-color: var(--background);
     color: var(--foreground);
+    /* 浅色模式下细字重更清晰锐利（Windows ClearType 偏灰时改善明显） */
+    -webkit-font-smoothing: antialiased;
     font-family:
       "Segoe UI Variable Display",
       "Segoe UI",
@@ -161,17 +163,18 @@
 .resize-hit-se { bottom: 0; right: 0; width: 10px; height: 10px; cursor: se-resize; }
 .resize-hit-sw { bottom: 0; left: 0; width: 10px; height: 10px; cursor: sw-resize; }
 
-/* 滚动条（跟随主题） */
+/* 滚动条（跟随主题）：6px 收窄 + 低存在感默认态，
+   悬停滚动条本体才加深，列表页观感更干净 */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 6px;
+  height: 6px;
 }
 ::-webkit-scrollbar-thumb {
-  background: color-mix(in oklab, var(--muted-foreground) 30%, transparent);
-  border-radius: 4px;
+  background: color-mix(in oklab, var(--muted-foreground) 18%, transparent);
+  border-radius: 3px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: color-mix(in oklab, var(--muted-foreground) 50%, transparent);
+  background: color-mix(in oklab, var(--muted-foreground) 45%, transparent);
 }
 ::-webkit-scrollbar-track {
   background: transparent;
@@ -249,6 +252,36 @@
   .vinyl-spin {
     animation: none;
   }
+}
+
+/* 桌面歌词溢出（见 MarqueeLine.tsx）：先稍作停顿，再单程滚动到最右端（-overflow）并停住，
+ * 不再往返（网易云式）。动画时长 = overflow/60px·s⁻¹；animation-fill-mode: forwards 保持末端位移。 */
+@keyframes qt-marquee {
+  0% {
+    transform: translateX(0);
+  }
+  12% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(calc(var(--mq-d) * -1));
+  }
+}
+
+/* 长列表行级跳绘（曲目列表等）。
+ *
+ * content-visibility: auto 让**视口外**的行跳过布局与绘制（浏览器保留其占位），
+ * 滚动到附近才真正渲染。本地曲库几千首时，这是「首屏 DOM 数量与滚动帧率」
+ * 最省事的一档改善：DOM 结构不变、交互语义不变，因此不需要引入虚拟滚动
+ * （虚拟化要接管滚动容器，会牵动吸顶头、滚动定位、批量选择等既有行为）。
+ *
+ * contain-intrinsic-size 给的是「还没渲染过时按多高占位」的估值：行高固定
+ * （py-2 + 36px 封面 ≈ 52px），先按 52px 占位避免滚动条长度跳动；`auto` 关键字
+ * 让浏览器记住每行**实际**渲染过的高度，之后用真实值，估值只影响首次。
+ * 若将来行模板变化（改成两行文本等），这个估值要跟着调。 */
+.cv-row {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 52px;
 }
 
 /* 减弱动效 */

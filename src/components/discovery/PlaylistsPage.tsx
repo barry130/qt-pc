@@ -219,7 +219,9 @@ function CategoryFilter(props: {
     return () => document.removeEventListener("mousedown", onDown);
   }, [open]);
 
-  // 只有一行时没有必要给「更多」
+  // 只有一行时没有必要给「更多」。
+  // 行内**始终**裁到一行（展开面板时也不例外）：面板里已经是完整列表，
+  // 行内若跟着展开就会上下重复两份分类。
   const collapsible = rowHeight > 0 && fullHeight > rowHeight + 1;
 
   const chips = (closeOnPick: boolean): React.JSX.Element => (
@@ -248,11 +250,15 @@ function CategoryFilter(props: {
 
   return (
     <div ref={rootRef} className="relative mt-2">
-      {/* 一行分类 + 最右「更多」：超出一行的部分被裁掉，点更多在下方面板看全部 */}
-      <div className="flex items-center gap-2">
+      {/* 分类行占满整宽，「更多」浮在行尾：把「更多」挪出 flex 布局，
+          否则它先占位会把分类行挤窄，窄窗口下只能露出一两个分类。
+          overflow-hidden + maxHeight 让行内恒定只露一行。 */}
+      <div className="relative">
         <div
           ref={listRef}
-          className="flex min-w-0 flex-1 flex-wrap gap-1.5 overflow-hidden"
+          className={`flex flex-wrap gap-1.5 overflow-hidden ${
+            collapsible ? "pr-16" : ""
+          }`}
           style={collapsible ? { maxHeight: rowHeight } : undefined}
         >
           {chips(false)}
@@ -263,7 +269,7 @@ function CategoryFilter(props: {
             onClick={() => setOpen((v) => !v)}
             aria-expanded={open}
             aria-label={open ? "收起全部分类" : "展开全部分类"}
-            className="flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+            className="absolute right-0 top-0 flex items-center gap-1 rounded-md bg-card px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
           >
             更多
             <ChevronDown

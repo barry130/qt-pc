@@ -60,24 +60,40 @@ export function usePagedList<T>(options: {
 
   // fetchPage / keyOf 多为内联箭头（每次渲染都是新函数），用 ref 读，
   // 否则 effect 依赖它们会无限重跑。
+  //
+  // ref 的同步放在 **effect** 里、且声明在取数 effect 之前：渲染期写 ref 在并发
+  // 渲染下会写坏——一次被丢弃的渲染照样会执行函数体，把 ref 指向"不存在的那次
+  // 渲染"的闭包。effect 按声明顺序执行，所以取数 effect 读到的总是最新值。
   const fetchRef = useRef(options.fetchPage);
-  fetchRef.current = options.fetchPage;
   const keyRef = useRef(options.keyOf);
-  keyRef.current = options.keyOf;
   const sizeRef = useRef(pageSize);
-  sizeRef.current = pageSize;
   const concurrency = options.concurrency ?? 6;
   const maxPages = options.maxPages ?? 120;
+  useEffect(() => {
+    fetchRef.current = options.fetchPage;
+    keyRef.current = options.keyOf;
+    sizeRef.current = pageSize;
+  });
 
   const [cursor, setCursor] = useState({ key: resetKey, page: 1, nonce: 0 });
   const [view, setView] = useState<View<T>>(EMPTY_VIEW);
 
+  // 已合并列表 + 已见 key 的镜像：appendUnique 复用同一个 Set，
+  // 避免"每追加一页就 new Set(prev.map(keyOf)) 全量重建"（O(n²)）。
+  const itemsRef = useRef<T[]>([]);
+  const seenRef = useRef<Set<string>>(new Set());
+
   // resetKey 变化 → 在同一帧里把「键 + 页码 + 视图」一起归位。
   // 放进 effect 会先用旧页码拉一页（还会把第 3 页追加到已清空的列表上）。
-  // 这是 React 官方的「渲染期派生 state」写法，会立刻重渲染而不提交中间态。
+  // 这是 React 官方文档里的「渲染期派生 state」写法（adjusting state when props
+  // change）：同一个组件内渲染期 setState 不会提交中间态，React 会立刻用新 state
+  // 重渲染。这里同步写两个 ref 也是安全的——它们只描述"归位"这一确定结果，
+  // 不依赖本次渲染的数据；就算这次渲染被丢弃，下次渲染还会再判一次同样的条件。
   if (cursor.key !== resetKey) {
     setCursor({ key: resetKey, page: 1, nonce: cursor.nonce + 1 });
     setView(EMPTY_VIEW);
+    itemsRef.current = [];
+    seenRef.current = new Set();
   }
 
   useEffect(() => {
@@ -97,23 +113,39 @@ export function usePagedList<T>(options: {
         const result = await fetchRef.current(cursor.page);
         if (cancelled) return;
         const { list, hasMore } = splitPage(result, sizeRef.current);
-        setView((v) => ({
-          items: first ? list : appendUnique(v.items, list, keyRef.current),
+        const keyOf = keyRef.current;
+        if (first) {
+          itemsRef.current = list;
+          seenRef.current = new Set(list.map(keyOf));
+        } else {
+          itemsRef.current = appendUnique(
+            itemsRef.current,
+            list,
+            keyOf,
+            seenRef.current,
+          );
+        }
+        setView({
+          items: itemsRef.current,
           loading: false,
           error: null,
           hasMore,
           progress: null,
-        }));
+        });
       } catch (err) {
         if (cancelled) return;
-        setView((v) => ({
-          items: first ? [] : v.items,
+        if (first) {
+          itemsRef.current = [];
+          seenRef.current = new Set();
+        }
+        setView({
+          items: itemsRef.current,
           loading: false,
           error: errMsg(err),
           // 出错后不再自动翻页，避免反复失败刷请求；重试走 reload
           hasMore: false,
           progress: null,
-        }));
+        });
       }
     })();
 
@@ -130,8 +162,12 @@ export function usePagedList<T>(options: {
       let total: number | null = null;
       let acc: T[] = [];
       let failed: string | null = null;
+      // 与 acc 同步维护的 key 集合（见 appendUnique 的说明）
+      let seen = new Set<string>();
 
       const publish = (): void => {
+        itemsRef.current = acc;
+        seenRef.current = seen;
         setView({
           items: acc,
           loading: done === 0,
@@ -146,6 +182,7 @@ export function usePagedList<T>(options: {
         if (cancelled) return;
         const firstPage = splitPage(firstResult, sizeRef.current);
         acc = firstPage.list;
+        seen = new Set(acc.map(keyRef.current));
         done = 1;
         total = firstPage.hasMore ? null : 1;
         publish();
@@ -155,7 +192,7 @@ export function usePagedList<T>(options: {
           const second = await fetchRef.current(2);
           if (cancelled) return;
           const secondPage = splitPage(second, sizeRef.current);
-          acc = appendUnique(acc, secondPage.list, keyRef.current);
+          acc = appendUnique(acc, secondPage.list, keyRef.current, seen);
           done = 2;
           publish();
 
@@ -185,7 +222,7 @@ export function usePagedList<T>(options: {
                   continue;
                 }
                 const page = splitPage(entry.result, sizeRef.current);
-                acc = appendUnique(acc, page.list, keyRef.current);
+                acc = appendUnique(acc, page.list, keyRef.current, seen);
                 done++;
                 if (!page.hasMore || page.list.length === 0) exhausted = true;
               }
@@ -211,6 +248,8 @@ export function usePagedList<T>(options: {
 
   const reload = useCallback(() => {
     setView(EMPTY_VIEW);
+    itemsRef.current = [];
+    seenRef.current = new Set();
     // nonce 自增 → effect 必跑（即使 page 已经是 1 也能重拉）
     setCursor((c) => ({ ...c, page: 1, nonce: c.nonce + 1 }));
   }, []);
@@ -257,21 +296,38 @@ interface View<T> {
   progress: { done: number; total: number | null } | null;
 }
 
-/** 空视图：items 用 never[]，对任意 View<T> 都可赋值 */
+/**
+ * 空视图：items 用 never[]，对任意 View<T> 都可赋值。
+ *
+ * `hasMore: false`（原本是 true）：重置后的首帧不该声称"还有下一页"——
+ * 那会让哨兵 observer 在数据还没到时先挂上，且底部提示会闪一下"还有更多"。
+ */
 const EMPTY_VIEW: View<never> = {
   items: [],
   loading: true,
   error: null,
-  hasMore: true,
+  hasMore: false,
   progress: null,
 };
 
+/**
+ * 追加去重。`seen` 由调用方传入并**就地更新**（其中包含 `prev` 的全部 key）：
+ * 以前每追加一页都 `new Set(prev.map(keyOf))` 全量重建，60 页 × 50 条的规模下
+ * 是纯粹的 O(n²) 重复扫描。
+ *
+ * 万一 `seen` 与 `prev` 对不上（理论不该发生：列表只经这里合并），按 prev 重建一次，
+ * 保证结果永远正确——宁可多扫一次，也不能漏去重或放进重复项。
+ */
 function appendUnique<T>(
   prev: T[],
   next: T[],
   keyOf: (item: T) => string,
+  seen: Set<string>,
 ): T[] {
-  const seen = new Set(prev.map(keyOf));
+  if (seen.size !== prev.length) {
+    seen.clear();
+    for (const item of prev) seen.add(keyOf(item));
+  }
   const out = [...prev];
   for (const item of next) {
     const key = keyOf(item);

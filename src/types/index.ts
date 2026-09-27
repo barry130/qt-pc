@@ -23,6 +23,10 @@ export interface Track {
   /** 秒（移动端同口径） */
   duration: number;
   musicId?: string | null;
+  /** 本地曲目：文件大小（字节）；在线曲目无。供本地库按大小排序 */
+  fileSize?: number | null;
+  /** 本地曲目：文件修改时间（秒）；在线曲目无。供本地库按修改时间排序 */
+  mtime?: number | null;
 }
 
 /** 播放历史条目，对齐 Rust `HistoryItem`（serde rename_all = "camelCase"，DESIGN §5.3） */

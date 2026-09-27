@@ -2,25 +2,19 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import {
-  AlignCenter,
-  AlignLeft,
-  AlignRight,
-  LocateFixed,
   Lock,
   LockOpen,
   Minus,
   Pause,
-  Pin,
-  PinOff,
   Play,
   Plus,
-  Rows3,
   Settings,
   SkipBack,
   SkipForward,
   X,
 } from "lucide-react";
 import type { DesktopLyricState, Track } from "@/types";
+import { MarqueeLine } from "./MarqueeLine";
 import {
   getDesktopLyricState,
   getPlaybackState,
@@ -30,7 +24,6 @@ import {
   openLyricSettings,
   pause,
   previous,
-  resetDesktopLyric,
   resume,
   onLyricWindowChanged,
   onPlaybackStateChanged,
@@ -40,8 +33,10 @@ import {
   setDesktopLyricLocked,
   setDesktopLyricStyle,
 } from "@/services/ipc";
+import { listen } from "@tauri-apps/api/event";
 import { findActiveIndex, mergeTranslation, parseLrc, type LyricLine } from "@/lib/lrc";
-import { getPlaybackLyric } from "@/lib/localOnline";
+import { crossSourceHitFromLine, getPlaybackLyric } from "@/lib/localOnline";
+import type { PlayUrlLine } from "@/source-engine/client";
 
 /**
  * 桌面歌词窗口视图（DESIGN §10.2 R4）：
@@ -49,8 +44,9 @@ import { getPlaybackLyric } from "@/lib/localOnline";
  *   以本地单调时钟为基准自行插值，不依赖主窗口转发；
  * - 整篇歌词在曲目变化时一次性拉取，逐帧只做二分查找当前行；
  * - 鼠标悬停（或右键固定）时在歌词正上方展示一行图标工具条
- *   （播放控制 / 字号 / 行数 / 配色 / 对齐 / 锁定 / 置顶 / 复位 / 设置 / 关闭），
- *   平时不显示任何按钮，样式与网易云音乐桌面歌词一致；
+ *   （播放控制 / 字号 / 锁定 / 设置 / 关闭），平时不显示任何按钮，
+ *   样式与网易云音乐桌面歌词一致；行数 / 配色 / 对齐 / 宽度 / 置顶 / 复位
+ *   等低频设置收进「歌词设置」，工具条保持精简；
  * - 拖动 / 滚轮字号 / 双击换行数，落盘由 Rust 命令完成。
  */
 
@@ -65,7 +61,7 @@ const DEFAULT_STATE: DesktopLyricState = {
   locked: false,
   x: 120,
   y: 940,
-  width: 900,
+  width: 520,
   height: 180,
   alwaysOnTop: true,
   fontFamily: "",
@@ -93,24 +89,6 @@ const LINE_MODES: DesktopLyricState["lineMode"][] = [
   "three-lines",
 ];
 
-const LINE_MODE_LABEL: Record<DesktopLyricState["lineMode"], string> = {
-  single: "单行",
-  "two-lines": "双行",
-  "three-lines": "三行",
-};
-
-const ALIGN_ORDER: DesktopLyricState["align"][] = ["left", "center", "right"];
-
-/** 工具条配色弹层里的预设渐变（当前行高亮色） */
-const GRADIENT_PRESETS: Array<{ name: string; colors: [string, string] }> = [
-  { name: "星云", colors: ["#5b8cff", "#b18cff"] },
-  { name: "晴空", colors: ["#4facfe", "#00f2fe"] },
-  { name: "薄荷", colors: ["#43e97b", "#38f9d7"] },
-  { name: "蜜桃", colors: ["#ff9a9e", "#fecfef"] },
-  { name: "暖阳", colors: ["#f6d365", "#fda085"] },
-  { name: "樱桃", colors: ["#ff5f6d", "#ffc371"] },
-];
-
 const FONT_STACK = '"Microsoft YaHei", "PingFang SC", "Noto Sans SC", sans-serif';
 
 export function LyricWindow(): React.JSX.Element {
@@ -122,7 +100,6 @@ export function LyricWindow(): React.JSX.Element {
   // 工具条：悬停即现；右键可固定（再次右键收起）
   const [hovered, setHovered] = useState(false);
   const [pinned, setPinned] = useState(false);
-  const [paletteOpen, setPaletteOpen] = useState(false);
 
   const baseRef = useRef<InterpBase>({ positionMs: 0, receivedAt: 0 });
   const playingRef = useRef(false);
@@ -150,29 +127,40 @@ export function LyricWindow(): React.JSX.Element {
     };
   }, []);
 
-  // 曲目变化 → 一次性拉整篇歌词
+  const trackKey = (t: Track | null | undefined): string =>
+    t ? `${t.platform}:${t.id}` : "";
+  const loadedTrackKey = useRef("");
+  /** 各曲目最近一次取链的命中线路（取链桥广播原始 line 对象；本窗口没有宿主侧线路记忆） */
+  const crossLineByTrack = useRef(new Map<string, PlayUrlLine | null>());
+  const currentTrackRef = useRef<Track | null>(null);
+  const lyricSeq = useRef(0);
+
+  // 曲目变化 → 一次性拉整篇歌词（含换源兜底：按目标源取词）
   const loadLyricFor = useCallback(async (track: Track | null): Promise<void> => {
-    if (!track) {
+    currentTrackRef.current = track;
+    const key = trackKey(track);
+    if (!track || key.length === 0) {
       setHasTrack(false);
       linesRef.current = [];
       setLines([]);
       return;
     }
     setHasTrack(true);
+    const seq = ++lyricSeq.current;
+    const cross = crossSourceHitFromLine(crossLineByTrack.current.get(key) ?? null, track.platform);
     try {
-      const lyric = await getPlaybackLyric(track);
+      const lyric = await getPlaybackLyric(track, cross);
+      // 过期取词不应用（换源后旧源的慢响应不得回填，最后应用的必须是对应源的）
+      if (seq !== lyricSeq.current) return;
       const merged = mergeTranslation(parseLrc(lyric.lrc), lyric.translation);
       linesRef.current = merged;
       setLines(merged);
     } catch {
+      if (seq !== lyricSeq.current) return;
       linesRef.current = [];
       setLines([]);
     }
   }, []);
-
-  const trackKey = (t: Track | null | undefined): string =>
-    t ? `${t.platform}:${t.id}` : "";
-  const loadedTrackKey = useRef("");
 
   // —— 订阅与初始化（一次） ——
   useEffect(() => {
@@ -245,6 +233,17 @@ export function LyricWindow(): React.JSX.Element {
           setUi(payload);
         }),
       );
+      // 取链桥广播的命中线路：当前曲目被跨源兜底接走时按目标源重取歌词
+      //（曲目 id/platform 不变，queue/state 事件不会触发重取，必须自己听）
+      unlisten.push(
+        await listen<{ platform: string; id: string; line: PlayUrlLine | null }>("play-url-line", (e) => {
+          const key = `${e.payload.platform}:${e.payload.id}`;
+          crossLineByTrack.current.set(key, e.payload.line);
+          if (key === loadedTrackKey.current) {
+            void loadLyricFor(currentTrackRef.current);
+          }
+        }),
+      );
     })();
 
     return () => {
@@ -273,15 +272,18 @@ export function LyricWindow(): React.JSX.Element {
   }, []);
 
   // —— 内容自适应：窗口高度跟随歌词实际内容（大字号 / 三行时自动加高，
-  // 内容变少时自动缩回），下限 180（工具条占位 + 两三行歌词的舒适高度），
+  // 内容变少时自动缩回），蒙版模式下收紧上下留白；工具条仍保留独立占位，
   // 上限跟随 Rust 侧 set_bounds 的 600 夹紧。变化超过阈值才动手，避免抖动。
   useEffect(() => {
     const el = lyricAreaRef.current;
     const inner = el?.firstElementChild as HTMLElement | null;
     if (!el || !inner) return;
     const fit = (): void => {
-      // 44 = 顶部工具条占位条，+12 = 底部 padding 与余量
-      const needed = Math.max(180, Math.ceil(44 + inner.offsetHeight + 12));
+      // 工具条始终位于蒙版之外，保留独立的 44px 透明区域。
+      // 歌词区域高度直接跟随实际排版高度，因此字号、行间距、行数变化后都会自动伸缩。
+      const toolbarSpace = 44;
+      const lyricVerticalPadding = ui.backgroundMode === "mask" ? 8 : 16;
+      const needed = Math.ceil(toolbarSpace + inner.offsetHeight + lyricVerticalPadding);
       void (async () => {
         try {
           const win = getCurrentWindow();
@@ -304,24 +306,32 @@ export function LyricWindow(): React.JSX.Element {
   }, [ui, activeIdx, lines, hasTrack, paused, toolbarVisible]);
 
   // —— 拖动结束 / 移动后写回位置（防抖） ——
+  // Windows 在程序性 resize 时也可能发出 moved。等待窗口稳定后再读取最终 bounds，
+  // 并串行写回，避免多个异步 moved 回调乱序把瞬时坐标覆盖成持久状态。
   useEffect(() => {
     const win = getCurrentWindow();
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let generation = 0;
+    let writeQueue = Promise.resolve();
     const promise = win.onMoved(() => {
+      const currentGeneration = ++generation;
       if (timer) clearTimeout(timer);
       timer = setTimeout(() => {
-        void (async () => {
+        writeQueue = writeQueue.then(async () => {
+          if (currentGeneration !== generation) return;
           try {
             const pos = await win.outerPosition();
             const size = await win.outerSize();
+            if (currentGeneration !== generation) return;
             await setDesktopLyricBounds(pos.x, pos.y, size.width, size.height);
           } catch {
             /* 越界等失败忽略，Rust 侧已有日志 */
           }
-        })();
+        });
       }, 400);
     });
     return () => {
+      generation += 1;
       if (timer) clearTimeout(timer);
       void promise.then((off) => off());
     };
@@ -372,16 +382,6 @@ export function LyricWindow(): React.JSX.Element {
     void (paused ? resume() : pause()).catch(() => {});
   }, [paused]);
 
-  const cycleAlign = useCallback((): void => {
-    const i = ALIGN_ORDER.indexOf(ui.align);
-    void patchStyle({ align: ALIGN_ORDER[(i + 1) % ALIGN_ORDER.length] });
-  }, [patchStyle, ui.align]);
-
-  const cycleLineMode = useCallback((): void => {
-    const i = LINE_MODES.indexOf(ui.lineMode);
-    void patchStyle({ lineMode: LINE_MODES[(i + 1) % LINE_MODES.length] });
-  }, [patchStyle, ui.lineMode]);
-
   const bumpFont = useCallback(
     (delta: number): void => {
       void patchStyle({ fontSize: Math.max(12, Math.min(96, ui.fontSize + delta)) });
@@ -430,20 +430,26 @@ export function LyricWindow(): React.JSX.Element {
     color: ui.inactiveColor,
   };
 
-  const background =
+  // 背景只绘制在歌词内容区域，不覆盖工具条预留的透明区域。
+  const lyricBackground: React.CSSProperties =
     ui.backgroundMode === "mask"
-      ? `rgba(0, 0, 0, ${ui.backgroundOpacity})`
+      ? {
+          backgroundColor: `color-mix(in srgb, ${ui.backgroundColor} ${Math.round(ui.backgroundOpacity * 100)}%, transparent)`,
+          borderRadius: `${ui.borderRadius}px`,
+        }
       : ui.backgroundMode === "solid"
-        ? ui.backgroundColor
-        : "transparent";
+        ? {
+            backgroundColor: ui.backgroundColor,
+            borderRadius: `${ui.borderRadius}px`,
+          }
+        : {};
 
   return (
     <div
-      className="relative flex h-screen w-screen select-none flex-col overflow-hidden rounded-lg"
+      className="relative flex h-screen w-screen select-none flex-col overflow-hidden"
       style={{
-        background,
+        background: "transparent",
         opacity: ui.opacity,
-        borderRadius: ui.borderRadius,
         cursor: toolbarVisible || ui.locked ? "default" : "move",
       }}
       onPointerDown={onPointerDown}
@@ -455,63 +461,16 @@ export function LyricWindow(): React.JSX.Element {
     >
       {/* 工具条独立区域（容器之外的一部分）：始终占位一条，悬停 / 右键固定时
           在这里展示，歌词永远在下方剩余空间内居中，绝不与文字重叠；
-          区域跟随左 / 中 / 右对齐 */}
+          工具条固定水平居中，不随歌词对齐变位（对齐只作用于下方歌词行） */}
       <div
         className="z-20 flex h-11 w-full shrink-0 items-start px-2 pt-1"
-        style={{ justifyContent: alignItems }}
+        style={{ justifyContent: "center" }}
         onPointerDown={(e) => e.stopPropagation()}
         onContextMenu={(e) => e.stopPropagation()}
         onWheel={(e) => e.stopPropagation()}
       >
         {toolbarVisible && (
           <div className="relative">
-          {paletteOpen && (
-            <div className="absolute left-1/2 top-full mt-2 flex -translate-x-1/2 items-center gap-2 whitespace-nowrap rounded-lg bg-black/80 px-3 py-2 shadow-lg">
-              {GRADIENT_PRESETS.map((p) => (
-                <button
-                  key={p.name}
-                  type="button"
-                  title={p.name}
-                  aria-label={`配色：${p.name}`}
-                  onClick={() => {
-                    setPaletteOpen(false);
-                    void patchStyle({ gradient: p.colors });
-                  }}
-                  className="h-5 w-5 rounded-full border border-white/30"
-                  style={{
-                    backgroundImage: `linear-gradient(90deg, ${p.colors[0]}, ${p.colors[1]})`,
-                  }}
-                />
-              ))}
-              <span className="mx-1 h-4 w-px bg-white/20" />
-              <label className="flex items-center gap-1 text-[10px] text-white/70">
-                起
-                <input
-                  type="color"
-                  value={ui.gradient[0]}
-                  className="h-5 w-6 cursor-pointer border-0 bg-transparent p-0"
-                  onChange={(e) =>
-                    void patchStyle({
-                      gradient: [e.target.value, ui.gradient[1]],
-                    })
-                  }
-                />
-              </label>
-              <label className="flex items-center gap-1 text-[10px] text-white/70">
-                止
-                <input
-                  type="color"
-                  value={ui.gradient[1]}
-                  className="h-5 w-6 cursor-pointer border-0 bg-transparent p-0"
-                  onChange={(e) =>
-                    void patchStyle({
-                      gradient: [ui.gradient[0], e.target.value],
-                    })
-                  }
-                />
-              </label>
-            </div>
-          )}
           <div className="flex items-center gap-0.5 rounded-full bg-black/75 px-2 py-1 shadow-lg">
             <ToolButton
               title={paused ? "播放" : "暂停"}
@@ -537,45 +496,7 @@ export function LyricWindow(): React.JSX.Element {
                 A<Plus size={10} />
               </span>
             </ToolButton>
-            <ToolButton
-              title={`行数：${LINE_MODE_LABEL[ui.lineMode]}（点击切换）`}
-              onClick={cycleLineMode}
-            >
-              <Rows3 size={15} />
-            </ToolButton>
-            <ToolButton
-              title={`对齐：${
-                ui.align === "left" ? "左" : ui.align === "center" ? "中" : "右"
-              }（点击切换）`}
-              onClick={cycleAlign}
-            >
-              {ui.align === "left" ? (
-                <AlignLeft size={15} />
-              ) : ui.align === "right" ? (
-                <AlignRight size={15} />
-              ) : (
-                <AlignCenter size={15} />
-              )}
-            </ToolButton>
-            <ToolButton
-              title="更换配色"
-              onClick={() => setPaletteOpen((o) => !o)}
-              active={paletteOpen}
-            >
-              <span
-                className="block h-3.5 w-3.5 rounded-full border border-white/40"
-                style={{
-                  backgroundImage: `linear-gradient(90deg, ${ui.gradient[0]}, ${ui.gradient[1]})`,
-                }}
-              />
-            </ToolButton>
             <span className="mx-0.5 h-4 w-px bg-white/20" />
-            <ToolButton
-              title={ui.alwaysOnTop ? "取消置顶" : "总在最前"}
-              onClick={() => void patchStyle({ alwaysOnTop: !ui.alwaysOnTop })}
-            >
-              {ui.alwaysOnTop ? <Pin size={15} /> : <PinOff size={15} />}
-            </ToolButton>
             <ToolButton
               title={ui.locked ? "解锁歌词" : "锁定歌词（防误拖）"}
               onClick={() =>
@@ -584,9 +505,6 @@ export function LyricWindow(): React.JSX.Element {
               testid="lyric-toolbar-lock"
             >
               {ui.locked ? <Lock size={15} /> : <LockOpen size={15} />}
-            </ToolButton>
-            <ToolButton title="复位歌词位置" onClick={() => void resetDesktopLyric().then(setUi).catch(() => {})}>
-              <LocateFixed size={15} />
             </ToolButton>
             <ToolButton title="歌词设置" onClick={() => void openLyricSettings().catch(() => {})}>
               <Settings size={15} />
@@ -603,7 +521,11 @@ export function LyricWindow(): React.JSX.Element {
           scrollHeight 才能量准），跟随左 / 中 / 右对齐 */}
       <div
         ref={lyricAreaRef}
-        className="flex min-h-0 w-full flex-1 flex-col overflow-hidden pb-1"
+        className="flex min-h-0 w-full flex-1 flex-col overflow-hidden"
+        style={{
+          ...lyricBackground,
+          padding: ui.backgroundMode === "mask" ? 0 : 4,
+        }}
       >
         <div
           className="my-auto flex w-full flex-col gap-1"
@@ -611,54 +533,43 @@ export function LyricWindow(): React.JSX.Element {
         >
         {/* 三行模式：上一句 */}
         {showThird && prevText && (
-          <div
-            className="max-w-full truncate px-4"
-            style={{
-              ...inactiveStyle,
-              fontSize: ui.fontSize * 0.6,
-              textAlign,
-            }}
-            data-testid="lyric-prev-line"
-          >
-            {prevText}
-          </div>
+          <MarqueeLine
+            text={prevText}
+            textStyle={{ ...inactiveStyle, fontSize: ui.fontSize * 0.6, textAlign }}
+            className="px-4"
+            testid="lyric-prev-line"
+            marquee={false}
+          />
         )}
 
-        <div
-          className="max-w-full truncate px-4"
-          style={{ ...currentStyle, fontSize: ui.fontSize, textAlign }}
-          data-testid="lyric-main-line"
-        >
-          {mainText}
-        </div>
+        <MarqueeLine
+          text={mainText}
+          textStyle={{ ...currentStyle, fontSize: ui.fontSize, textAlign }}
+          className="px-4"
+          testid="lyric-main-line"
+          marquee
+          playing={!paused}
+        />
 
         {showSecond && secondText && (
-          <div
-            className="max-w-full truncate px-4"
-            style={{
-              ...inactiveStyle,
-              fontSize: ui.fontSize * 0.6,
-              textAlign,
-            }}
-            data-testid="lyric-second-line"
-          >
-            {secondText}
-          </div>
+          <MarqueeLine
+            text={secondText}
+            textStyle={{ ...inactiveStyle, fontSize: ui.fontSize * 0.6, textAlign }}
+            className="px-4"
+            testid="lyric-second-line"
+            marquee={false}
+          />
         )}
 
         {/* 三行模式：下一句 */}
         {showThird && thirdText && (
-          <div
-            className="max-w-full truncate px-4"
-            style={{
-              ...inactiveStyle,
-              fontSize: ui.fontSize * 0.6,
-              textAlign,
-            }}
-            data-testid="lyric-next-line"
-          >
-            {thirdText}
-          </div>
+          <MarqueeLine
+            text={thirdText}
+            textStyle={{ ...inactiveStyle, fontSize: ui.fontSize * 0.6, textAlign }}
+            className="px-4"
+            testid="lyric-next-line"
+            marquee={false}
+          />
         )}
 
         {paused && hasTrack && (

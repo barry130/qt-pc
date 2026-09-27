@@ -39,12 +39,29 @@ impl Database {
         Ok(Self { conn: Mutex::new(conn) })
     }
 
+    /// 取连接锁，**容忍互斥锁毒化**。
+    ///
+    /// 为什么不能用 `lock().unwrap()`：`Cargo.toml` 已恢复默认的 panic=unwind
+    /// （见其注释），于是任何一次在持锁期间 panic 都会把 `Mutex` 标记为中毒，
+    /// 之后**所有**取锁点都会 `unwrap()` 失败 —— 一次偶发 panic 会让整个数据层
+    /// 在本次运行里永久不可用（设置存不下、歌单读不出、播放现场丢），
+    /// 而这正是 "一个线程的 panic 不该升级成整个库的死亡" 的典型场景。
+    ///
+    /// 为什么 `into_inner()` 是安全的：毒化只表示"上次持锁者 panic 了"，
+    /// 不表示 `Connection` 本身损坏。SQLite 连接在事务未提交时会自动回滚
+    /// （rusqlite 的 `Transaction` 在 Drop 时回滚），拿回连接继续用不会读到
+    /// 半提交状态；最坏情况是那一笔写没落库，而这是 panic 本身已造成的结果，
+    /// 与"连库都打不开"相比是明显更好的降级。
+    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// 串行执行一段只读/写操作；错误统一转 String（写库失败不应打断播放链路）。
     pub fn with<T>(
         &self,
         f: impl FnOnce(&Connection) -> Result<T, rusqlite::Error>,
     ) -> Result<T, String> {
-        let conn = self.conn.lock().unwrap();
+        let conn = self.conn();
         f(&conn).map_err(|e| e.to_string())
     }
 }
@@ -159,5 +176,46 @@ mod tests {
         assert_eq!(saved.state.position_ms, 42_000);
         assert_eq!(saved.state.play_mode, "oneLoop");
         assert!(saved.state.muted);
+    }
+
+    #[test]
+    fn wal_is_actually_enabled() {
+        // P2-7 第 3 项：`pragma_update(.., "journal_mode", "WAL")` 走的是
+        // execute_batch（忽略语句返回值），所以"设了但没生效"在代码上是看不出来的，
+        // 这里实测一次 journal_mode 的返回值。
+        let db = test_db();
+        let mode: String = db
+            .with(|c| c.query_row("PRAGMA journal_mode", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal", "WAL 必须真的生效（§8.3）");
+    }
+
+    #[test]
+    fn lock_survives_a_panicking_holder() {
+        // P1-1：持锁线程 panic 会把 Mutex 标记为中毒，旧代码的 `lock().unwrap()`
+        // 之后每次取锁都失败 —— 一次偶发 panic 就让整个数据层在本次运行里永久不可用。
+        // 这里实测"毒化之后仍能取锁、仍能读写"。
+        let db = std::sync::Arc::new(test_db());
+        let holder = db.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = holder.conn(); // 持有锁不放，然后 panic（_guard 在栈展开时释放）
+            panic!("模拟持锁线程 panic，用于制造 Mutex 毒化");
+        })
+        .join();
+
+        // 已经中毒，但取锁不应失败
+        let one: i64 = db
+            .with(|c| c.query_row("SELECT 1", [], |r| r.get(0)))
+            .expect("毒化后仍应能取锁并查询");
+        assert_eq!(one, 1);
+
+        // 写路径也要能用：说明连接本身没被 panic 弄坏
+        let t = track("1", "毒化后仍可写");
+        db.with(|c| store::upsert_tracks(c, &[&t]))
+            .expect("毒化后仍应能写库");
+        let n: i64 = db
+            .with(|c| c.query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0)))
+            .unwrap();
+        assert_eq!(n, 1);
     }
 }

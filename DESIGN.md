@@ -3,9 +3,9 @@
 - 项目名称：轻听 PC 版
 - 目标平台：Windows 10 / Windows 11
 - 技术栈：Tauri 2 + React 19 + TypeScript + Tailwind CSS v4 + shadcn/ui + Rust
-- 文档版本：v1.3
-- 更新日期：2026-09-05
-- 关联文档：`qt-pc/REQUIREMENTS.md`、`UPDATE_DESIGN.md`、`LIKE_SYNC_DESIGN.md`、`STATS_DESIGN.md`、`FEEDBACK_DESIGN.md`
+- 文档版本：v1.4
+- 更新日期：2026-09-27
+- 关联文档：`qt-pc/REQUIREMENTS.md`、`../UPDATE_DESIGN.md`、`docs/CONFIG.md`、`docs/PACKAGING.md`
 
 ---
 
@@ -56,6 +56,42 @@
 | R14 | 补 PC `versionCode` 规则与发布流程 | §15.7 |
 | R15 | 路由表、事件表、状态结构补全至与 §19 目录结构一致 | §5.2、§11.8、§12.1 |
 
+### 0.3 实现现状修订（v1.4 · 2026-09-27）
+
+本节记录 v1.3 之后代码实际发生的架构变化，供阅读下文时对照。**与下文冲突处，以本节为准。**
+
+**A. 音源架构：原生 Provider 已删除，改为前端音源脚本引擎**
+
+- `MusicProvider` trait / `ProviderRegistry` / `async_trait` **在代码中已完全不存在** —— 上文
+  §6.4 与 §0.2 的 **R8 已作废**（该 trait 从未落地为最终形态）。
+- 现状：应用**不内置**第三方音源实现。wyy / qq / kw / kg 的接口与取链全部由「音源包」
+  （`source-bundle.js`）在隐藏的**引擎窗口**里执行，前端经 `src/source-engine/client.ts` 与之通信；
+  Rust 侧只保留 `src-tauri/src/provider/` 下的类型（`types.rs`）与进程内取址缓存（`url_cache.rs`）。
+- 取链回填：前端预解析地址后经 `set_resolved_play_url` 回填 Rust 引擎缓存，引擎播放时命中缓存直接使用
+  （对应 R1「播放地址不落库」）。
+
+**B. 安全加固（详见 [`docs/代码审查与优化报告-20260927.md`](docs/代码审查与优化报告-20260927.md)）**
+
+- `src-tauri/src/ipc_guard.rs`：危险命令校验**调用窗口**（更新安装器、删除本地文件/下载等只允许主窗口调用），
+  引擎窗口无法越权；
+- `src-tauri/src/net_guard.rs`：出网请求校验 scheme / 私网与回环地址 / host 白名单；
+- 生产后端地址由明文 HTTP 改为 **HTTPS**（更新链路依赖它做完整性校验）。
+
+**C. 数据层**
+
+- `src-tauri/src/db/store.rs`（单文件 2615 行）**按域拆分为 `db/store/`**：
+  `tracks` / `local` / `likes` / `playlists` / `history` / `stats` / `downloads` / `session` / `settings`（+ `tests`）。
+  拆分是机械搬运，对外调用路径 `crate::db::store::xxx` 保持不变。
+- `Database::conn()` 改为**容忍 Mutex 毒化**（`unwrap_or_else(|e| e.into_inner())`），
+  配合 `panic` 恢复为默认 `unwind`：一次偶发 panic 不再让整个数据层在本次运行里永久不可用。
+
+**D. 前端**
+
+- 路由改为 **`React.lazy` 代码分割**（`src/lib/lazyPage.tsx`），首屏不再解析全部路由组件；
+- 新增 `ErrorBoundary`（根级 + 常驻页级）；
+- `src/main.tsx` 的全局错误兜底改为**叠加可关闭浮层**，不再清空 `#root`；
+- KeepAlive 常驻页引入 `active` 标记（`components/layout/keepAliveActive.ts`），激活时才重新校验数据。
+
 ---
 
 ## 1. 设计目标
@@ -68,7 +104,7 @@
 4. 通过 SQLite 管理歌单、收藏、历史、扫描结果和设置。
 5. 支持完整皮肤自定义体系。
 6. 支持独立桌面歌词窗口。
-7. 通过 Provider 架构支持音源切换与后续扩展。
+7. 通过音源脚本引擎（音源包）支持多音源聚合与后续扩展。
 8. 保持 Windows 10/11 下的高性能和稳定性。
 
 ### 1.2 架构原则
@@ -78,7 +114,7 @@
 | 前端轻 | React 只负责界面和交互 |
 | Rust 重 | 音频、文件、系统集成、数据层由 Rust 处理 |
 | 单向数据流 | Rust 推送状态，前端订阅渲染 |
-| 音源抽象 | 所有音乐来源统一 Provider 接口 |
+| 音源抽象 | 所有音乐来源统一走音源脚本引擎的契约接口（`../qt-sources/src/contract.ts`），第三方实现以音源包形式热更新 |
 | 主题 token 化 | 所有视觉参数通过 CSS Variables 控制 |
 | 数据分层 | 永久数据、缓存数据、内存数据明确分离 |
 | 可降级 | 高级视觉效果可关闭，核心播放优先保障 |
@@ -691,6 +727,9 @@ export interface ProviderCapabilities {
 ```
 
 ## 6.4 Rust Provider Trait
+
+> ⚠️ **本节已作废（2026-09-27）**：`MusicProvider` trait / `ProviderRegistry` 在代码中已完全不存在，
+> 音源访问改由前端音源脚本引擎（音源包）承担。见 §0.3-A。下文保留仅为记录当时的取舍过程。
 
 **原文问题**：`trait` 里直接写 `async fn` 在 Rust 中不是对象安全的，无法 `Box<dyn MusicProvider>` 或放进 `HashMap<SourceId, Arc<dyn MusicProvider>>` 做运行时分发；同时所有方法返回裸 `Vec<T>` / `Option<T>`，会把 §6.10 要求的错误分类（网络失败 / 超时 / 格式异常 / 无结果）全部压成空值，前端无法区分「没搜到」和「音源挂了」。
 
@@ -3153,8 +3192,8 @@ src/
  ├─ hooks/                 # 位置插值、播放事件订阅等
  ├─ lib/                   # 工具函数
  ├─ services/ipc.ts        # 所有 Tauri invoke 的唯一出口
- ├─ source-engine/         # 引擎页（跑音源包取链）
- ├─ source-scripts/        # 音源脚本引擎（打进音源包 bundle）
+ ├─ source-engine/         # 引擎页客户端（跑音源包取链）
+ ├─ source-scripts/        # 音源包宿主 facade（3 个文件；实现在 ../qt-sources）
  ├─ stores/                # Zustand：播放 / 队列 / 认证 / 外观
  ├─ types/
  ├─ App.tsx
@@ -3341,8 +3380,7 @@ qt-pc/
  ├─ index.html
  ├─ scripts/
  │   ├─ sync-config.mjs      # ★ 配置同步器（config:sync / config:check）
- │   ├─ build-sources.mjs    # 音源包 bundle 构建
- │   └─ sync-builtin-sources.mjs  # 产物同步进 src-tauri/builtin-sources/
+ │   └─ check-builtin-sources.mjs # 内置包体检（只读：齐备 / 同号 / 指纹）
  ├─ src/                     # §19.1
  ├─ tests/                   # 前端单测（含 config.test.ts 配置护栏）
  ├─ docs/                    # CONFIG.md / PACKAGING.md

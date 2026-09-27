@@ -7,6 +7,7 @@ import * as ipc from "@/services/ipc";
 import { pullLikes } from "@/stores/auth";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { ImportPlaylistDialog } from "./ImportPlaylistDialog";
+import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 
 /**
  * 我的歌单（路由 /my/playlists，DESIGN §5.3）——「我的歌单」与「收藏」已合成一页。
@@ -19,7 +20,8 @@ import { ImportPlaylistDialog } from "./ImportPlaylistDialog";
  * 「移除」的语义是**取消收藏**，不是删除；「我喜欢的歌曲」
  * 既不能改名也不能删 —— 散装收藏要靠它落脚。
  *
- * 建单 / 导入 / 重命名 / 同步云端收藏 都在这一页，不再拆成两个页面。
+ * 建单 / 导入 / 重命名 / 本地歌单换封面都在这一页，不再拆成两个页面。
+ * 云端收藏在打开本页时自动拉取（pullLikes），不提供手动同步入口。
  */
 export function MyPlaylistsPage(): React.JSX.Element {
   const navigate = useNavigate();
@@ -28,7 +30,6 @@ export function MyPlaylistsPage(): React.JSX.Element {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState("");
   const [loading, setLoading] = useState(true);
-  const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [importOpen, setImportOpen] = useState(false);
 
@@ -51,23 +52,14 @@ export function MyPlaylistsPage(): React.JSX.Element {
     }
   }, []);
 
-  useEffect(() => {
-    void load();
-  }, [load]);
+  // 本页常驻缓存（挂载后不再卸载）：只在首次挂载拉数据的话，别端的建单/删单/改名
+  // 永远反映不过来，与上面「打开本页时自动拉取」的说明也不一致。改为每次切回来重拉。
+  const active = useKeepAliveActive();
 
-  /** 手动同步云端收藏。这里不吞错误，失败要让用户看得见 */
-  const syncNow = async (): Promise<void> => {
-    setSyncing(true);
-    setError(null);
-    try {
-      await pullLikes();
-      await load();
-    } catch (err) {
-      setError(errMsg(err));
-    } finally {
-      setSyncing(false);
-    }
-  };
+  useEffect(() => {
+    if (!active) return;
+    void load();
+  }, [active, load]);
 
   const create = async (): Promise<void> => {
     const n = name.trim();
@@ -135,23 +127,36 @@ export function MyPlaylistsPage(): React.JSX.Element {
     });
   };
 
+  /**
+   * 换本地歌单封面：选图 → Rust 复制进应用数据目录 → 登记 cover_path。
+   * 成功后本页乐观替换 picUrl（即新封面路径），下次读列表以本地库为准。
+   * 仅本地自建歌单可换；在线歌单封面归音源/云端所有，不提供入口。
+   */
+  const changeCover = async (p: MyPlaylistSummary): Promise<void> => {
+    const path = await ipc.pickImage("选择歌单封面");
+    if (!path) return;
+    setError(null);
+    try {
+      const coverPath = await ipc.setPlaylistCover(p.pid, path);
+      setList((prev) =>
+        prev.map((it) =>
+          it.platform === ipc.LOCAL_PLATFORM && it.pid === p.pid
+            ? { ...it, picUrl: coverPath }
+            : it,
+        ),
+      );
+    } catch (err) {
+      setError(errMsg(err));
+    }
+  };
+
   const local = list.filter((p) => p.platform === ipc.LOCAL_PLATFORM);
   const online = list.filter((p) => p.platform !== ipc.LOCAL_PLATFORM);
 
   return (
     <div className="flex h-full min-w-0 flex-col">
       <div className="border-b border-border px-4 py-3">
-        <div className="flex items-center justify-between">
-          <h1 className="text-base font-medium">我的歌单</h1>
-          <button
-            type="button"
-            onClick={() => void syncNow()}
-            disabled={syncing}
-            className="h-7 rounded-md border border-border px-3 text-xs transition-colors hover:bg-secondary disabled:opacity-50"
-          >
-            {syncing ? "同步中…" : "同步云端收藏"}
-          </button>
-        </div>
+        <h1 className="text-base font-medium">我的歌单</h1>
         <p className="mt-1 text-xs text-muted-foreground">
           共 {local.length} 个本地歌单 · {online.length} 个在线歌单
         </p>
@@ -216,6 +221,7 @@ export function MyPlaylistsPage(): React.JSX.Element {
               onCancelRename={() => setEditingId(null)}
               onRemove={(p) => void remove(p)}
               removeLabel="删除"
+              onChangeCover={(p) => void changeCover(p)}
             />
             <Group
               title="收藏的在线歌单"
@@ -260,6 +266,8 @@ function Group(props: {
   removeLabel: string;
   /** 云端卡片歌单不可改名（名字归云端/音源所有） */
   hideRename?: boolean;
+  /** 本地自建歌单换封面；不传则不显示入口（在线歌单封面归音源/云端所有） */
+  onChangeCover?: (p: MyPlaylistSummary) => void;
 }): React.JSX.Element {
   return (
     <div className="pb-2">
@@ -272,22 +280,12 @@ function Group(props: {
       ) : (
         <ul>
         {props.items.map((p) => {
-          const cover =
-            p.platform === ipc.LOCAL_PLATFORM ? "" : qtresCoverUrl(p.picUrl);
           return (
             <li
               key={`${p.platform}:${p.pid}`}
               className="flex items-center gap-3 border-b border-border/50 px-4 py-2"
             >
-              {cover ? (
-                <img
-                  src={cover}
-                  alt=""
-                  className="h-10 w-10 shrink-0 rounded object-cover"
-                />
-              ) : (
-                <div className="h-10 w-10 shrink-0 rounded bg-secondary" />
-              )}
+              <PlaylistCoverImage p={p} />
 
               {props.editingId === p.pid ? (
                 <input
@@ -328,6 +326,16 @@ function Group(props: {
                   重命名
                 </button>
               )}
+              {/* 换封面只给本地自建歌单（云端卡片「我喜欢的歌曲」与在线歌单都不给） */}
+              {props.onChangeCover && p.isLocal && (
+                <button
+                  type="button"
+                  onClick={() => props.onChangeCover?.(p)}
+                  className="shrink-0 rounded px-2 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+                >
+                  换封面
+                </button>
+              )}
               <button
                 type="button"
                 onClick={() => props.onRemove(p)}
@@ -342,4 +350,50 @@ function Group(props: {
       )}
     </div>
   );
+}
+
+/**
+ * 歌单封面图：在线歌单走 qtres 代取；本地歌单按 pid 异步读封面文件
+ * （Rust 转成 data URL，模块级按 pid 缓存），没有自设封面回退默认图。
+ */
+const localCoverCache = new Map<string, string | null>();
+
+function PlaylistCoverImage({ p }: { p: MyPlaylistSummary }): React.JSX.Element {
+  const isLocal = p.platform === ipc.LOCAL_PLATFORM;
+  const onlineUrl = isLocal ? null : qtresCoverUrl(p.picUrl);
+  const [localSrc, setLocalSrc] = useState<string | null>(
+    isLocal ? (localCoverCache.get(p.pid) ?? null) : null,
+  );
+
+  useEffect(() => {
+    if (!isLocal || !p.picUrl) return;
+    if (localCoverCache.has(p.pid)) {
+      setLocalSrc(localCoverCache.get(p.pid) ?? null);
+      return;
+    }
+    let alive = true;
+    void ipc
+      .getPlaylistCover(p.pid)
+      .then((v) => {
+        localCoverCache.set(p.pid, v);
+        if (alive) setLocalSrc(v);
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [isLocal, p.pid, p.picUrl]);
+
+  const src = isLocal ? localSrc : onlineUrl;
+  if (!src) {
+    return (
+      <img
+        src="/static/icon/xxxhdpi.png"
+        alt=""
+        className="h-10 w-10 shrink-0 rounded object-cover"
+        draggable={false}
+      />
+    );
+  }
+  return <img src={src} alt="" className="h-10 w-10 shrink-0 rounded object-cover" />;
 }

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
-import { Disc3, FileMusic, Flame, Sparkles } from "lucide-react";
+import { BarChart3, ChevronRight, Disc3, FileMusic, Flame, Sparkles } from "lucide-react";
 import type { Chart, Playlist, Track } from "@/types";
 import { SOURCE_DISPLAY } from "@/types";
 import * as sourceApi from "@/source-scripts";
@@ -123,16 +123,15 @@ export function DiscoverPage(): React.JSX.Element {
             <button
               type="button"
               onClick={() => void navigate({ to: "/charts" })}
-              className="text-xs text-muted-foreground transition-colors hover:text-foreground"
+              className="flex items-center gap-0.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
             >
-              全部榜单 →
+              全部榜单
+              <ChevronRight className="h-3 w-3" />
             </button>
           }
         />
         {charts.length === 0 ? (
-          <p className="py-6 text-center text-sm text-muted-foreground">
-            暂无榜单
-          </p>
+          <EmptyBlock icon={BarChart3} text="暂无榜单" />
         ) : (
           <HorizontalScroller>
             {charts.map((c) => (
@@ -165,16 +164,15 @@ export function DiscoverPage(): React.JSX.Element {
             <button
               type="button"
               onClick={() => void navigate({ to: "/daily" })}
-              className="text-xs text-muted-foreground transition-colors hover:text-foreground"
+              className="flex items-center gap-0.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
             >
-              更多新歌 →
+              更多新歌
+              <ChevronRight className="h-3 w-3" />
             </button>
           }
         />
         {songs.length === 0 ? (
-          <p className="py-6 text-center text-sm text-muted-foreground">
-            暂无新歌
-          </p>
+          <EmptyBlock icon={Sparkles} text="暂无新歌" />
         ) : (
           <HorizontalScroller>
             {songs.map((t, i) => (
@@ -196,16 +194,15 @@ export function DiscoverPage(): React.JSX.Element {
             <button
               type="button"
               onClick={() => void navigate({ to: "/playlists" })}
-              className="text-xs text-muted-foreground transition-colors hover:text-foreground"
+              className="flex items-center gap-0.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
             >
-              歌单广场 →
+              歌单广场
+              <ChevronRight className="h-3 w-3" />
             </button>
           }
         />
         {playlists.length === 0 ? (
-          <p className="py-6 text-center text-sm text-muted-foreground">
-            暂无推荐歌单
-          </p>
+          <EmptyBlock icon={Disc3} text="暂无推荐歌单" />
         ) : (
           <CoverGrid fillRows>
             {playlists.map((p) => (
@@ -225,6 +222,24 @@ export function DiscoverPage(): React.JSX.Element {
           </CoverGrid>
         )}
       </section>
+    </div>
+  );
+}
+
+/**
+ * 区块空态：图标 + 一句话说明，虚线框轻量占位。
+ * 替换此前的裸文本 <p>——空态与正常内容共用同一版式骨架（圆角容器），
+ * 数据到达后切换不会产生明显的排版跳变。
+ */
+function EmptyBlock(props: {
+  icon: React.ComponentType<{ className?: string }>;
+  text: string;
+}): React.JSX.Element {
+  const Icon = props.icon;
+  return (
+    <div className="flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border/80 py-8 text-muted-foreground">
+      <Icon className="h-6 w-6 opacity-50" />
+      <span className="text-xs">{props.text}</span>
     </div>
   );
 }

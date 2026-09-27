@@ -6,25 +6,53 @@ import {
   useParams,
 } from "@tanstack/react-router";
 import { AppShell } from "@/components/layout/AppShell";
-import { SearchPage } from "@/components/SearchPage";
-import { PlayingPage } from "@/components/PlayingPage";
 import { PlaceholderPage } from "@/components/layout/PlaceholderPage";
-import { SettingsPage } from "@/components/SettingsPage";
-import { PlaylistDetailPage } from "@/components/discovery/PlaylistDetailPage";
-import { ChartDetailPage } from "@/components/discovery/ChartDetailPage";
-import { FeedbackPage } from "@/components/mine/FeedbackPage";
-import { MyPlaylistDetailPage } from "@/components/mine/MyPlaylistDetailPage";
-import { LoginPage } from "@/components/mine/LoginPage";
-import { ProfilePage } from "@/components/mine/ProfilePage";
-import { OnboardingPage } from "@/components/onboarding/OnboardingPage";
-import { ArtistPage } from "@/components/discovery/ArtistPage";
-import { AlbumPage } from "@/components/discovery/AlbumPage";
+import { lazyPage } from "@/lib/lazyPage";
 
 /**
- * 路由表（DESIGN §5.2）。M1 阶段除搜索 / 播放页外均为占位页，
- * 各 feature 在后续里程碑逐个落地为真实实现。
- * 壳内使用 memory history：Tauri 无地址栏，前进 / 后退语义保留即可。
+ * 路由表（DESIGN §5.2）。壳内使用 memory history：Tauri 无地址栏，
+ * 前进 / 后退语义保留即可。
+ *
+ * 所有页面组件都是**懒加载**（`lazyPage`）：进应用只加载壳 + 首屏那一页，
+ * 其余页面在首次导航到时才拉自己的 chunk。壳内的 `Suspense`（AppShell）
+ * 与常驻页各自的 `Suspense`（KeepAliveOutlet）负责兜底。
  */
+
+const SearchPage = lazyPage(() => import("@/components/SearchPage"), "SearchPage");
+const PlayingPage = lazyPage(() => import("@/components/PlayingPage"), "PlayingPage");
+const SettingsPage = lazyPage<{ section: string }>(
+  () => import("@/components/SettingsPage"),
+  "SettingsPage",
+);
+const PlaylistDetailPage = lazyPage<{ platform: string; id: string }>(
+  () => import("@/components/discovery/PlaylistDetailPage"),
+  "PlaylistDetailPage",
+);
+const ChartDetailPage = lazyPage<{ platform: string; id: string }>(
+  () => import("@/components/discovery/ChartDetailPage"),
+  "ChartDetailPage",
+);
+const FeedbackPage = lazyPage(() => import("@/components/mine/FeedbackPage"), "FeedbackPage");
+const MyPlaylistDetailPage = lazyPage(
+  () => import("@/components/mine/MyPlaylistDetailPage"),
+  "MyPlaylistDetailPage",
+);
+const LoginPage = lazyPage(() => import("@/components/mine/LoginPage"), "LoginPage");
+const ForgotPasswordPage = lazyPage(
+  () => import("@/components/mine/ForgotPasswordPage"),
+  "ForgotPasswordPage",
+);
+const ProfileEditPage = lazyPage(
+  () => import("@/components/mine/ProfileEditPage"),
+  "ProfileEditPage",
+);
+const ProfilePage = lazyPage(() => import("@/components/mine/ProfilePage"), "ProfilePage");
+const OnboardingPage = lazyPage(
+  () => import("@/components/onboarding/OnboardingPage"),
+  "OnboardingPage",
+);
+const ArtistPage = lazyPage(() => import("@/components/discovery/ArtistPage"), "ArtistPage");
+const AlbumPage = lazyPage(() => import("@/components/discovery/AlbumPage"), "AlbumPage");
 
 const rootRoute = createRootRoute({ component: AppShell });
 
@@ -183,6 +211,20 @@ const loginRoute = createRoute({
   component: LoginPage,
 });
 
+/** 找回密码：邮箱验证码重置（后端 app/user/email + app/user/changePass） */
+const forgotPasswordRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/forgot-password",
+  component: ForgotPasswordPage,
+});
+
+/** 修改个人信息（后端 app/user/update，全量替换 + 改完踢下线） */
+const profileEditRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/profile/edit",
+  component: ProfileEditPage,
+});
+
 const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings/$section",
@@ -229,7 +271,9 @@ const routeTree = rootRoute.addChildren([
   statsRoute,
   feedbackRoute,
   profileRoute,
+  profileEditRoute,
   loginRoute,
+  forgotPasswordRoute,
   settingsRoute,
   onboardingRoute,
   lyricsRoute,

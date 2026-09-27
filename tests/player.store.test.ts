@@ -53,6 +53,10 @@ function tick(positionMs: number): PositionChanged {
 beforeEach(() => {
   usePlayerStore.setState({
     state: null,
+    // 高频进度标量（P1-10 拆出来的一层）也要归零，否则用例之间会互相污染
+    positionMs: 0,
+    durationMs: 0,
+    bufferedMs: 0,
     queue: [],
     queueIndex: null,
     positionAnchorMs: 0,

@@ -19,8 +19,8 @@ fn live_update_check_version_and_messages() {
         let client = AstralClient::new(DEFAULT_BASE_URL);
         println!("[live] versionName={} versionCode={}", version_name(), version_code());
 
-        // /app/update?type=1103&version=<versionCode>&channel=stable
-        let update = client.app_update(version_code(), "stable").await;
+        // /app/update?type=1103&version=<versionCode>（无 channel 入参）
+        let update = client.app_update(version_code()).await;
         match update {
             Ok(data) => println!("[live] app/update = {data}"),
             Err(e) => println!("[live] app/update 失败（后端未发布 PC 记录时返回 null 属正常）: {e}"),

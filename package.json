@@ -1,7 +1,7 @@
 {
   "name": "quietmusic",
   "private": true,
-  "version": "1.0.7",
+  "version": "1.0.9",
   "type": "module",
   "scripts": {
     "dev": "node scripts/sync-config.mjs && vite",
@@ -12,8 +12,8 @@
     "test": "node scripts/sync-config.mjs --check && vitest run",
     "config:sync": "node scripts/sync-config.mjs",
     "config:check": "node scripts/sync-config.mjs --check",
-    "build:sources": "node scripts/build-sources.mjs",
-    "sync:builtin": "node scripts/sync-builtin-sources.mjs"
+    "sources:build": "pnpm -C ../qt-sources build",
+    "builtin:version": "node scripts/sync-builtin-sources.mjs"
   },
   "dependencies": {
     "@tanstack/react-router": "1.170.32",

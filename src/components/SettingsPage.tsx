@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { errMsg, stripErrorUrls } from "@/lib/utils";
 import { useNavigate } from "@tanstack/react-router";
+import { getAllWindows } from "@tauri-apps/api/window";
 import { PageContainer } from "@/components/layout/PageContainer";
 import * as ipc from "@/services/ipc";
 import {
@@ -200,6 +201,36 @@ function DesktopLyricSection(): React.JSX.Element {
         />
       </SettingRow>
 
+      <SettingRow
+        title={`歌词窗口宽度（${state.width}px）`}
+        description="调窄后长行歌词会自动横向滚动（歌词滚动）；在歌词上悬停工具条里也有 窄/宽 按钮，拖动窗口边缘同样可调"
+      >
+        <input
+          type="range"
+          min={480}
+          max={1280}
+          step={20}
+          value={state.width}
+          onChange={(e) => {
+            const w = Number(e.target.value);
+            void (async () => {
+              try {
+                const windows = await getAllWindows();
+                const win = windows.find((candidate) => candidate.label === "lyrics");
+                if (!win) return;
+                const pos = await win.outerPosition();
+                const size = await win.outerSize();
+                const next = await ipc.setDesktopLyricBounds(pos.x, pos.y, w, size.height);
+                setState(next);
+              } catch {
+                /* 窗口暂不可用时忽略，下一次交互会重试 */
+              }
+            })();
+          }}
+          className="w-40 accent-[var(--primary)]"
+        />
+      </SettingRow>
+
       <SettingRow title="当前行配色" description="当前歌词行的渐变高亮色（两端）">
         <div className="flex items-center gap-2">
           <input
@@ -383,6 +414,8 @@ function Segmented<T extends string>(props: {
 function AppearanceSection(): React.JSX.Element {
   const preference = useAppearanceStore((s) => s.preference);
   const update = useAppearanceStore((s) => s.update);
+  const saveError = useAppearanceStore((s) => s.saveError);
+  const retrySave = useAppearanceStore((s) => s.retrySave);
   const followCover = preference.followCoverColor;
   const activeSkin = getSkin(preference.skinId, preference.customColor);
   const [bgError, setBgError] = useState<string | null>(null);
@@ -404,6 +437,23 @@ function AppearanceSection(): React.JSX.Element {
 
   return (
     <div className="max-w-[576px]">
+      {/* 写库失败必须看得见：以前是「界面已生效、重启却回滚」而用户无从察觉（P2-8）。
+          role="alert" 让读屏器也念出来（P2-10）。 */}
+      {saveError !== null && (
+        <div
+          role="alert"
+          className="mb-4 flex items-start justify-between gap-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+        >
+          <span>{saveError}</span>
+          <button
+            type="button"
+            onClick={() => void retrySave()}
+            className="shrink-0 rounded border border-destructive/40 px-2 py-0.5 transition-colors hover:bg-destructive/10"
+          >
+            重试
+          </button>
+        </div>
+      )}
       <SettingRow title="亮暗模式" description="深色 / 浅色，或跟随 Windows 系统设置">
         <div className="flex overflow-hidden rounded-md border border-border">
           {MODE_OPTIONS.map((opt) => (
@@ -775,7 +825,7 @@ function SourcePackageSection(): React.JSX.Element {
           {remote ? `${remote.sourceVersionName} (code ${remote.sourceVersionCode})` : "未检查"}
         </span>
       </SettingRow>
-      <SettingRow title="更新检查" description="启动时也会静默检查（4 小时节流），只下载不自动生效">
+      <SettingRow title="更新检查" description="启动时也会静默检查，只下载不自动生效">
         <button
           type="button"
           onClick={() => void run(check)}
@@ -832,22 +882,18 @@ function AboutSection(): React.JSX.Element {
   const [version, setVersion] = useState<AppVersion | null>(null);
   const [checking, setChecking] = useState(false);
   const [result, setResult] = useState<string>("");
-  const [channel, setChannel] = useState("stable");
   const setUpdate = useUpdateStore((s) => s.setUpdate);
 
   useEffect(() => {
     void getAppVersion().then(setVersion).catch(() => {});
-    void ipc.getSetting("update_channel").then((c) => {
-      if (c === "beta" || c === "stable") setChannel(c);
-    });
   }, []);
 
   const checkUpdate = async (): Promise<void> => {
     setChecking(true);
     setResult("");
     try {
-      // 手动检查：不受启动自动检查的 4 小时节流限制，无条件查一次。
-      // 复用 runCheck：把结果写入全局 update store → UpdateDialog 会弹出。
+      // 手动检查：无条件查一次。复用 runCheck：把结果写入全局 update store
+      // → UpdateDialog 会弹出。
       const update = await runCheck(setUpdate);
       if (update && update.versionName) {
         const sizeStr =
@@ -868,11 +914,6 @@ function AboutSection(): React.JSX.Element {
     }
   };
 
-  const switchChannel = async (c: string): Promise<void> => {
-    setChannel(c);
-    await ipc.setSetting("update_channel", c);
-  };
-
   return (
     <div className="max-w-xl divide-y divide-border">
       <SettingRow title="当前版本" description="轻听 PC 版">
@@ -880,28 +921,7 @@ function AboutSection(): React.JSX.Element {
           {version ? `${version.versionName} (versionCode ${version.versionCode})` : "…"}
         </span>
       </SettingRow>
-      <SettingRow
-        title="更新渠道"
-        description="正式版只收稳定推送；测试版额外收 beta，正式版更高时也能收到"
-      >
-        <div className="flex gap-1">
-          {(["stable", "beta"] as const).map((c) => (
-            <button
-              key={c}
-              type="button"
-              onClick={() => void switchChannel(c)}
-              className={`rounded px-3 py-1.5 text-xs transition-colors ${
-                channel === c
-                  ? "bg-primary text-primary-foreground"
-                  : "hover:bg-accent"
-              }`}
-            >
-              {c === "stable" ? "正式版" : "测试版"}
-            </button>
-          ))}
-        </div>
-      </SettingRow>
-      <SettingRow title="检查更新" description="手动检查不受 4 小时节流限制">
+      <SettingRow title="检查更新" description="启动时自动检查一次，也可手动立即检查">
         <button
           type="button"
           onClick={() => void checkUpdate()}
@@ -917,6 +937,18 @@ function AboutSection(): React.JSX.Element {
     </div>
   );
 }
+
+/** 快捷键动作 id → 中文名（模块级常量：原先定义在组件体内，每次渲染都重建一遍） */
+const LABELS: Record<string, string> = {
+  play_pause: "播放 / 暂停",
+  previous: "上一首",
+  next: "下一首",
+  volume_up: "音量加",
+  volume_down: "音量减",
+  mute: "静音",
+  desktop_lyric: "桌面歌词开关",
+  lock_lyric: "锁定 / 解锁桌面歌词",
+};
 
 /** 播放设置：全局快捷键（可改键 / 可禁用，保存即热重载） */
 function ShortcutSection(): React.JSX.Element {
@@ -948,6 +980,16 @@ function ShortcutSection(): React.JSX.Element {
   useEffect(() => {
     if (!listening) return;
     const onKey = (e: KeyboardEvent): void => {
+      // Esc = 取消录制。必须放在 preventDefault 之前单独处理：
+      // 这个监听挂在 capture 阶段并且会 stopPropagation，输入框自身的
+      // onKeyDown 永远收不到事件；何况下面"排除修饰键"的列表里没有 Escape，
+      // 漏掉这一行就会把 Esc 本身存成该动作的快捷键。
+      if (e.key === "Escape") {
+        e.preventDefault();
+        e.stopPropagation();
+        setListening(null);
+        return;
+      }
       e.preventDefault();
       e.stopPropagation();
       // 单独的修饰键不构成快捷键
@@ -971,6 +1013,11 @@ function ShortcutSection(): React.JSX.Element {
     try {
       const list = await ipc.saveShortcuts(draft);
       setEntries(list);
+      // draft 必须跟着后端返回值重建（与 reset() 一致）：若返回列表里出现了
+      // draft 中不存在的 id，下面开关的 setter 就会读到 undefined 而抛错。
+      const next: Record<string, { key: string; enabled: boolean }> = {};
+      for (const e of list) next[e.id] = { key: e.accelerator, enabled: e.enabled };
+      setDraft(next);
     } catch (err) {
       setError(errMsg(err));
     } finally {
@@ -995,17 +1042,6 @@ function ShortcutSection(): React.JSX.Element {
     } finally {
       setSaving(false);
     }
-  };
-
-  const LABELS: Record<string, string> = {
-    play_pause: "播放 / 暂停",
-    previous: "上一首",
-    next: "下一首",
-    volume_up: "音量加",
-    volume_down: "音量减",
-    mute: "静音",
-    desktop_lyric: "桌面歌词开关",
-    lock_lyric: "锁定 / 解锁桌面歌词",
   };
 
   return (
@@ -1045,10 +1081,12 @@ function ShortcutSection(): React.JSX.Element {
               <Switch
                 checked={d.enabled}
                 onToggle={() =>
-                  setDraft((prev) => ({
-                    ...prev,
-                    [e.id]: { ...prev[e.id], enabled: !prev[e.id].enabled },
-                  }))
+                  setDraft((prev) => {
+                    // 与渲染处 `draft[e.id] ?? {…}` 同样的兜底：缺项时用 entries 的值，
+                    // 否则展开 undefined 会抛 TypeError（再撞上未处理拒绝就整窗报错）
+                    const cur = prev[e.id] ?? { key: e.accelerator, enabled: e.enabled };
+                    return { ...prev, [e.id]: { ...cur, enabled: !cur.enabled } };
+                  })
                 }
               />
               {changed && (
@@ -1101,17 +1139,20 @@ function ShortcutSection(): React.JSX.Element {
 function DownloadSection(): React.JSX.Element {
   const [dir, setDir] = useState("");
   const [quality, setQuality] = useState<Quality>("320");
+  const [nameFormat, setNameFormat] = useState<"artist" | "song">("artist");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async (): Promise<void> => {
     try {
-      const [d, q] = await Promise.all([
+      const [d, q, f] = await Promise.all([
         ipc.getDownloadDir(),
         ipc.getDownloadQuality(),
+        ipc.getDownloadNameFormat(),
       ]);
       setDir(d);
       setQuality(q);
+      setNameFormat(f);
     } catch (err) {
       setError(errMsg(err));
     }
@@ -1159,6 +1200,19 @@ function DownloadSection(): React.JSX.Element {
     }
   };
 
+  const chooseNameFormat = async (f: "artist" | "song"): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    try {
+      await ipc.setDownloadNameFormat(f);
+      setNameFormat(f);
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="max-w-xl divide-y divide-border">
       <SettingRow
@@ -1199,6 +1253,21 @@ function DownloadSection(): React.JSX.Element {
           disabled={busy}
           onChange={(q) => void chooseQuality(q)}
         />
+      </SettingRow>
+      <SettingRow
+        title="下载文件名格式"
+        description="下载歌曲的存盘文件名顺序：歌手-歌名 或 歌名-歌手。仅影响设置变更后新开始的下载。"
+      >
+        <select
+          value={nameFormat}
+          disabled={busy}
+          aria-label="下载文件名格式"
+          onChange={(e) => void chooseNameFormat(e.target.value as "artist" | "song")}
+          className="rounded-md border border-input bg-background px-2 py-1.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+        >
+          <option value="artist">歌手 - 歌名</option>
+          <option value="song">歌名 - 歌手</option>
+        </select>
       </SettingRow>
       {error && <p className="py-2 text-xs text-destructive">{error}</p>}
     </div>

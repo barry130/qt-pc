@@ -4,7 +4,7 @@ import { ChevronDown } from "lucide-react";
 import type { Track } from "@/types";
 import { usePlayerStore } from "@/stores/player";
 import { useInterpolatedPosition } from "@/hooks/useInterpolatedPosition";
-import { getPlaybackLyric } from "@/lib/localOnline";
+import { crossSourceForPlayback, getPlaybackLyric } from "@/lib/localOnline";
 import { findActiveIndex, mergeTranslation, parseLrc, qtresCoverUrl } from "@/lib/lrc";
 import { WindowControls } from "@/components/WindowControls";
 import { cn , errMsg } from "@/lib/utils";
@@ -19,6 +19,8 @@ import { cn , errMsg } from "@/lib/utils";
  */
 export function PlayingPage(): React.JSX.Element {
   const track = usePlayerStore((s) => s.state?.track ?? null);
+  const playUrl = usePlayerStore((s) => s.state?.playUrl ?? null);
+  const quality = usePlayerStore((s) => s.state?.quality ?? null);
   const playing = usePlayerStore((s) => s.state?.status === "playing");
   const position = useInterpolatedPosition();
   const navigate = useNavigate();
@@ -30,7 +32,17 @@ export function PlayingPage(): React.JSX.Element {
   const [loading, setLoading] = useState(false);
   const loadedFor = useRef<string | null>(null);
 
-  const key = track ? `${track.platform}:${track.id}` : null;
+  // 换源兜底会把实际播放地址切到别的平台（playUrl 变化时命中线路记忆刚更新）：
+  // 歌词必须跟着换到对应源重取，避免「放的是 kw 的音、显示的是 wyy 的词」
+  const cross = useMemo(
+    () => crossSourceForPlayback(track, quality),
+    // 线路记忆不是响应式数据，靠 playUrl 变化触发重估（跨源兜底必然改地址）
+    [track, quality, playUrl],
+  );
+
+  const key = track
+    ? `${track.platform}:${track.id}:${cross?.target ?? ""}:${cross?.song?.id ?? ""}`
+    : null;
 
   useEffect(() => {
     if (!track || !key || loadedFor.current === key) return;
@@ -39,18 +51,21 @@ export function PlayingPage(): React.JSX.Element {
     setTranslation("");
     setError(null);
     setLoading(true);
-    getPlaybackLyric(track)
+    getPlaybackLyric(track, cross)
       .then((lyr) => {
+        // 已有更新的取词（如随后又换源）：过期结果不应用，最后应用的必须是对应源的
+        if (loadedFor.current !== key) return;
         setLrc(lyr.lrc);
         setTranslation(lyr.translation);
       })
       .catch((err) => {
+        if (loadedFor.current !== key) return;
         setError(errMsg(err));
       })
       .finally(() => {
-        setLoading(false);
+        if (loadedFor.current === key) setLoading(false);
       });
-  }, [track, key]);
+  }, [track, key, cross]);
 
   const lines = useMemo(() => {
     const parsed = parseLrc(lrc);
@@ -135,20 +150,25 @@ function VinylCover(props: { track: Track | null; playing: boolean }): React.JSX
         }}
       />
       {/* 唱片：animation-play-state 控制转/停 —— 暂停时停在当前角度，
-          恢复播放从原角度继续，不会跳回 0 度 */}
+          恢复播放从原角度继续，不会跳回 0 度。
+          尺寸随视口呼吸：窄窗不低于 240px，宽窗封顶 420px（固定 280/320 在大屏全屏下偏小） */}
       <div
-        className="vinyl-spin relative h-[280px] w-[280px] rounded-full bg-neutral-900 shadow-2xl sm:h-[320px] sm:w-[320px]"
-        style={{ animationPlayState: playing ? "running" : "paused" }}
+        className="vinyl-spin relative rounded-full bg-neutral-900 shadow-2xl"
+        style={{
+          width: "clamp(240px, 30vw, 420px)",
+          height: "clamp(240px, 30vw, 420px)",
+          animationPlayState: playing ? "running" : "paused",
+        }}
       >
-        {/* 唱片纹理（同心圆） */}
+        {/* 唱片纹理（同心圆）：百分比 inset，随唱片尺寸等比缩放 */}
         <div className="absolute inset-0 rounded-full border border-neutral-800" />
-        <div className="absolute inset-4 rounded-full border border-neutral-800" />
-        <div className="absolute inset-8 rounded-full border border-neutral-800" />
-        <div className="absolute inset-12 rounded-full border border-neutral-800" />
+        <div className="absolute inset-[5%] rounded-full border border-neutral-800" />
+        <div className="absolute inset-[10%] rounded-full border border-neutral-800" />
+        <div className="absolute inset-[15%] rounded-full border border-neutral-800" />
 
         {/* 专辑封面 */}
         <div className="absolute inset-0 flex items-center justify-center">
-          <div className="relative h-28 w-28 overflow-hidden rounded-full shadow-lg sm:h-32 sm:w-32">
+          <div className="relative h-[38%] w-[38%] overflow-hidden rounded-full shadow-lg">
             {coverUrl ? (
               <img
                 src={coverUrl}
@@ -180,11 +200,23 @@ function TrackInfo(props: { track: Track | null }): React.JSX.Element {
       <div className="truncate text-2xl font-bold tracking-tight">
         {track ? track.title : "未在播放"}
       </div>
-      <div className="mt-1 truncate text-sm text-muted-foreground">
-        {track
-          ? `专辑：${track.album}    歌手：${track.singer}`
-          : "去搜索页找一首歌开始播放"}
-      </div>
+      {track ? (
+        // 歌手在前（音乐 App 惯例），专辑可选展示，用「·」分隔替代全角空格；
+        // 两段都可收缩截断，长专辑名不再把歌手名挤出视野
+        <div className="mt-2 flex min-w-0 items-center gap-x-2 text-sm text-muted-foreground">
+          <span className="min-w-0 truncate">{track.singer}</span>
+          {track.album && (
+            <>
+              <span className="shrink-0 text-muted-foreground/50">·</span>
+              <span className="min-w-0 truncate">{track.album}</span>
+            </>
+          )}
+        </div>
+      ) : (
+        <div className="mt-1 text-sm text-muted-foreground">
+          去搜索页找一首歌开始播放
+        </div>
+      )}
     </div>
   );
 }

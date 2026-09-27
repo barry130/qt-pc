@@ -34,6 +34,19 @@ async function preResolvePlayUrl(
 
 interface PlayerStore {
   state: PlaybackState | null;
+  /**
+   * 高频播放进度（250ms tick 写入）。
+   *
+   * 为什么与 `state` 分开：`state` 是"语义快照"，只在切歌 / 播放状态 / 音量等
+   * 真变化时才该换新对象；而这三个字段每秒变 4 次。以前 tick 会
+   * `set({ state: { ...st, positionMs } })` 造一个新快照对象，于是每个
+   * `s => s.state` 的订阅者（播放条 705 行整棵子树、音量控件）每秒被重渲染 4 次。
+   * 拆成标量后 `s => s.durationMs` 这类订阅按数值比较，只有真变了才重渲染；
+   * 进度条/歌词的平滑推进本来就走 rAF 插值（`interpolatedPositionMs`）。
+   */
+  positionMs: number;
+  durationMs: number;
+  bufferedMs: number;
   queue: Track[];
   queueIndex: number | null;
   /** 最近一次 Rust tick 的时间戳（performance.now 基准） */
@@ -104,6 +117,9 @@ const initialSnapshot: PlaybackState = {
 
 export const usePlayerStore = create<PlayerStore>((set, get) => ({
   state: initialSnapshot,
+  positionMs: 0,
+  durationMs: 0,
+  bufferedMs: 0,
   queue: [],
   queueIndex: null,
   positionAnchorMs: 0,
@@ -163,6 +179,10 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
       state: { ...incoming, positionMs: anchorMs },
       positionAnchorValue: anchorMs,
       positionAnchorMs: performance.now(),
+      // 进度标量跟随快照：暂停/停止之后不再有 tick，进度条得靠它显示
+      positionMs: anchorMs,
+      durationMs: incoming.durationMs,
+      bufferedMs: incoming.bufferedMs,
     });
   },
 
@@ -177,18 +197,15 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
       if (!confirmed && !expired) return;
       set({ pendingSeekMs: null });
     }
-    const st = get().state;
+    // 只更新高频进度标量与锚点，**不重建 state**（见 positionMs 字段的注释）。
+    // 注意 `state.positionMs` 此后表示"最近一次快照/seek 的位置"，
+    // 实时位置一律读 positionMs / interpolatedPositionMs()。
     set({
       positionAnchorValue: t.positionMs,
       positionAnchorMs: performance.now(),
-      state: st
-        ? {
-            ...st,
-            positionMs: t.positionMs,
-            durationMs: t.durationMs,
-            bufferedMs: t.bufferedMs,
-          }
-        : st,
+      positionMs: t.positionMs,
+      durationMs: t.durationMs,
+      bufferedMs: t.bufferedMs,
     });
   },
 
@@ -206,15 +223,20 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
   setQueueOpen: (open) => set({ queueOpen: open }),
 
   interpolatedPositionMs: () => {
-    const { positionAnchorMs, positionAnchorValue, state, isDraggingProgress } =
-      get();
+    const {
+      positionAnchorMs,
+      positionAnchorValue,
+      state,
+      isDraggingProgress,
+      durationMs,
+    } = get();
     if (!state || state.status !== "playing" || isDraggingProgress) {
       return positionAnchorValue;
     }
     const elapsed = performance.now() - positionAnchorMs;
     return Math.min(
       positionAnchorValue + elapsed,
-      state.durationMs > 0 ? state.durationMs : Number.MAX_SAFE_INTEGER,
+      durationMs > 0 ? durationMs : Number.MAX_SAFE_INTEGER,
     );
   },
 
@@ -267,7 +289,9 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
     const st = get().state;
     if (!st) return;
     if (st.status === "playing") await ipc.pause();
-    else if (st.status === "paused") await ipc.resume();
+    // paused 之外的 error 也按恢复处理：引擎侧 Play 会兜底重载当前曲
+    // （Error 态 sink 是空的，裸 resume 原本是空操作，播放键像坏了）
+    else await ipc.resume();
   },
 
   seekTo: async (ms) => {
@@ -280,6 +304,8 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
       pendingSeekAt: performance.now(),
       positionAnchorValue: target,
       positionAnchorMs: performance.now(),
+      // 高频标量也要同步落点，否则暂停态（没有 tick 驱动）会显示旧位置
+      positionMs: target,
       state: st ? { ...st, positionMs: target } : st,
     });
     try {

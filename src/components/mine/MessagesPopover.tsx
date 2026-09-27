@@ -39,11 +39,13 @@ export function MessagesPopover(): React.JSX.Element {
         // 标题栏是拖动区，按钮按下要拦住，防止误触发拖动
         onMouseDown={(e) => e.stopPropagation()}
         onDoubleClick={(e) => e.stopPropagation()}
-        className="flex h-full w-11 items-center justify-center text-foreground/80 transition-colors hover:bg-secondary hover:text-foreground"
+        // 圆角小块 hover，与标题栏右侧其它入口同形状（窗口控制仍为贴边全高矩形）
+        className="mx-1 flex h-8 w-9 items-center justify-center rounded-md text-foreground/80 transition-colors hover:bg-secondary hover:text-foreground"
       >
         <MessageSquare className="h-4 w-4" />
         {unread > 0 && (
-          <span className="absolute right-1 top-1 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-destructive px-0.5 text-[9px] font-medium leading-none text-white">
+          // 角标定位在按钮右上角（外层包裹器 = 按钮 + 左右 4px 边距）
+          <span className="absolute right-0 top-1 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-destructive px-0.5 text-[9px] font-medium leading-none text-white">
             {unread > 99 ? "99+" : unread}
           </span>
         )}

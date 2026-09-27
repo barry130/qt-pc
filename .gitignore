@@ -3,6 +3,8 @@ node_modules/
 
 # 前端构建产物（由 beforeBuildCommand 生成）
 dist/
+# dist-sources/ 已废弃：音源包构建产物改由 ../qt-sources 直接交付到
+# src-tauri/builtin-sources/，本目录只作历史遗留的忽略项保留
 dist-sources/
 
 # Rust / Tauri 构建产物
@@ -41,6 +43,17 @@ Thumbs.db
 *.log
 *.tmp
 nul
+
+# 发布暂存（source-bundle.js / source-release.zip / 发布说明 等生成物，
+# 与 src-tauri/builtin-sources/ 内容重复且会漂移；本地保留、不入库）
+release-pending/
+
+# 线路复测诊断产物（本地参考数据：chain-config.ts 注释引用了它们作为
+# 「摘除两条线路」的依据；体积约 471 KB，不入库，需要时从本地读取）
+diag-live-rank.mjs
+diag-line-verdict.mjs
+diag-live-rank-1101.json
+diag-live-rank-1101-kw-wyy.json
 
 # tauri icon 生成的移动端图标（本项目为桌面 NSIS 打包，用不到）
 src-tauri/icons/android/

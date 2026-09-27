@@ -1,5 +1,5 @@
 {
-  "chainRevision": 10,
+  "chainRevision": 11,
   "maxLinesPerQuality": 5,
   "crossSources": {
     "wyy": [
@@ -36,6 +36,28 @@
       }
     ],
     "qq": [
+      {
+        "id": "qq-molan-tx",
+        "name": "墨澜 tx（聚合内核）",
+        "kind": "lx",
+        "scriptId": "molan",
+        "qualities": [
+          "128",
+          "320",
+          "flac"
+        ]
+      },
+      {
+        "id": "qq-haitang-core",
+        "name": "恒堂核心 API",
+        "kind": "bundle",
+        "impl": "qqHaitangCore",
+        "qualities": [
+          "128",
+          "320",
+          "flac"
+        ]
+      },
       {
         "id": "qq-world260809",
         "name": "World 260809 a.aa.cab",
@@ -77,58 +99,6 @@
           "flac"
         ],
         "parallel": true
-      },
-      {
-        "id": "qq-molan-tx",
-        "name": "墨澜 tx（聚合内核）",
-        "kind": "lx",
-        "scriptId": "molan",
-        "qualities": [
-          "128",
-          "320",
-          "flac"
-        ]
-      },
-      {
-        "id": "qq-haitang-core",
-        "name": "恒堂核心 API",
-        "kind": "bundle",
-        "impl": "qqHaitangCore",
-        "qualities": [
-          "128",
-          "320",
-          "flac"
-        ]
-      },
-      {
-        "id": "qq-yuningxi-tang",
-        "name": "玉宁熙 tang.api（仅无损）",
-        "kind": "http",
-        "qualities": [
-          "flac"
-        ],
-        "pre": [
-          {
-            "url": "https://www.97abc.com/count.php?id=lx-yuningxi",
-            "timeoutMs": 8000
-          }
-        ],
-        "request": {
-          "url": "https://tang.api.s01s.cn/music_open_api.php",
-          "query": {
-            "mid": "{id}"
-          },
-          "headers": {
-            "Content-Type": "application/json",
-            "Referer": "https://y.qq.com/"
-          }
-        },
-        "require": {
-          "song_mid": "nonEmpty"
-        },
-        "pick": {
-          "flac": "song_play_url_sq"
-        }
       }
     ],
     "kw": [
@@ -190,10 +160,10 @@
         ]
       },
       {
-        "id": "kg-haitang-core",
-        "name": "恒堂核心 API",
-        "kind": "bundle",
-        "impl": "kgHaitangCore",
+        "id": "kg-yuxi",
+        "name": "屿溪 · 终章",
+        "kind": "lx",
+        "scriptId": "yuxi",
         "qualities": [
           "128",
           "320",
@@ -201,10 +171,10 @@
         ]
       },
       {
-        "id": "kg-yuxi",
-        "name": "屿溪 · 终章",
-        "kind": "lx",
-        "scriptId": "yuxi",
+        "id": "kg-haitang-core",
+        "name": "恒堂核心 API",
+        "kind": "bundle",
+        "impl": "kgHaitangCore",
         "qualities": [
           "128",
           "320",

@@ -22,7 +22,7 @@
 import { emitTo, listen } from "@tauri-apps/api/event";
 import { stripErrorUrls } from "@/lib/utils";
 import type { Quality } from "@/types";
-import type { MusicInfo, Source } from "@/source-scripts/contract";
+import type { MusicInfo, Source } from "@qt-sources/contract";
 
 /** 引擎页生命周期：booting=启动中 ready=可用 error=失败；builtin=兼容保留值 */
 export type EnginePhase = "booting" | "builtin" | "ready" | "error";
@@ -48,6 +48,8 @@ export interface PlayUrlLine {
   id: string;
   name: string;
   kind: string;
+  /** 仅跨源兜底命中时有值：目标平台上实际命中的那首歌（旧引擎页/缓存命中为 null） */
+  targetSong: MusicInfo | null;
 }
 
 /** 取链结果：地址 + 命中线路（line null = 未知，不是失败）+ 失败死因（trace） */
@@ -76,6 +78,58 @@ const INVOKE_TIMEOUT_MS = 20_000;
 /** 状态查询单次超时 / 重试上限（引擎启动毫秒级，上限只为防呆） */
 const STATUS_QUERY_TIMEOUT_MS = 2_500;
 const STATUS_QUERY_MAX_FAILURES = 2;
+
+/**
+ * 引擎置 error 后的后台重探间隔（指数退避，封顶 ERROR_REPROBE_MAX_MS）。
+ *
+ * 为什么需要它：`phase` 一旦变成 "error" 就是**终态** —— `ensureBound()` 只在
+ * `phase === null` 时才重新查询，于是 `engineResolve` / `engineInvoke` 会一直
+ * 短路返回空值，第三方源在本次会话里永久失效（唯一的复位是安装/回滚音源包触发的
+ * source-applied 事件）。
+ *
+ * 而引擎页是会被**临时冻住**的：音源脚本 init 走同步执行且没有超时
+ * （bridge.ts 的 spec.run），脚本里一个同步忙循环就能让引擎页几十秒不响应；
+ * 两次 status 查询超时（2×2.5s）之后 phase 就锁死在 error —— 脚本恢复正常了，
+ * 音源也回不来了。2026091905 事故正是这个形状（脚本自校验退化成同步忙循环）。
+ *
+ * 所以置 error 时挂一个后台重探：**不占用户关键路径**（resolve/invoke 不会因此
+ * 变慢，仍然走既有短路逻辑立刻回退），探到 ready 就自动恢复。退避是为了引擎
+ * 确实不存在时（未装音源包 / 窗口未创建）不做无意义的高频查询。
+ */
+const ERROR_REPROBE_BASE_MS = 15_000;
+const ERROR_REPROBE_MAX_MS = 120_000;
+let reprobeTimer: number | null = null;
+let reprobeDelay = ERROR_REPROBE_BASE_MS;
+
+/** 停掉后台重探并复位退避（引擎已恢复，或即将由 source-applied 重新查询） */
+function cancelReprobe(): void {
+  if (reprobeTimer !== null) {
+    window.clearTimeout(reprobeTimer);
+    reprobeTimer = null;
+  }
+  reprobeDelay = ERROR_REPROBE_BASE_MS;
+}
+
+/** 置 error 后安排一次后台重探；重复调用是安全的（已有计时器就直接返回） */
+function scheduleReprobe(): void {
+  if (reprobeTimer !== null) return;
+  reprobeTimer = window.setTimeout(() => {
+    reprobeTimer = null;
+    // 期间可能已被 source-applied 复位成 null 或查询成 ready，那就不必再探
+    if (phase !== "error") {
+      reprobeDelay = ERROR_REPROBE_BASE_MS;
+      return;
+    }
+    void refreshPhase().then(() => {
+      if (phase === "error") {
+        reprobeDelay = Math.min(reprobeDelay * 2, ERROR_REPROBE_MAX_MS);
+        scheduleReprobe();
+      } else {
+        reprobeDelay = ERROR_REPROBE_BASE_MS;
+      }
+    });
+  }, reprobeDelay);
+}
 
 let bound = false;
 let binding: Promise<void> | null = null;
@@ -157,6 +211,8 @@ async function refreshPhase(): Promise<void> {
     failures += 1;
     if (failures >= STATUS_QUERY_MAX_FAILURES) {
       phase = "error";
+      // 终态会一直短路所有调用 → 挂后台重探，等引擎页解冻/就绪后自动恢复
+      scheduleReprobe();
       return;
     }
     await new Promise((r) => window.setTimeout(r, 300));
@@ -179,6 +235,8 @@ async function ensureBound(): Promise<void> {
         phase = null;
         remoteCode = null;
         engineDetail = null;
+        // 窗口重建了，之前挂的重探作废（下次 ensureBound 会立即重新查询）
+        cancelReprobe();
         for (const [, resolve] of pending) resolve({});
         pending.clear();
       });
@@ -187,6 +245,7 @@ async function ensureBound(): Promise<void> {
       binding = null;
       phase = "error";
       engineDetail = "event listen failed";
+      scheduleReprobe();
     });
   }
   await binding;
@@ -206,6 +265,24 @@ function normalizeLine(raw: unknown): PlayUrlLine | null {
     id,
     name: typeof obj.name === "string" ? obj.name : "",
     kind: typeof obj.kind === "string" ? obj.kind : "",
+    targetSong: normalizeTargetSong(obj.targetSong),
+  };
+}
+
+/** targetSong 只信形状正确的：跨源兜底在目标平台命中的那首歌（字段缺失按空串兜底） */
+function normalizeTargetSong(raw: unknown): MusicInfo | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const obj = raw as Record<string, unknown>;
+  const id = typeof obj.id === "string" ? obj.id : "";
+  if (id.length === 0) return null;
+  return {
+    id,
+    name: typeof obj.name === "string" ? obj.name : "",
+    singer: typeof obj.singer === "string" ? obj.singer : "",
+    album: typeof obj.album === "string" ? obj.album : "",
+    picUrl: typeof obj.picUrl === "string" ? obj.picUrl : "",
+    interval: typeof obj.interval === "number" ? obj.interval : 0,
+    musicId: typeof obj.musicId === "string" ? obj.musicId : null,
   };
 }
 

@@ -41,6 +41,37 @@ interface MusicSourceStore {
 const STORAGE_KEY = "quietmusic.music-source";
 migrateLegacyStorageKey(STORAGE_KEY);
 
+/**
+ * 持久化结构版本。**改动已持久化字段的形状时必须 +1 并补 migrate 分支**：
+ * 桌面端用户不会清 localStorage，旧结构会被直接 hydrate 进新代码，
+ * 这种问题一旦发出去会长期潜伏（P2-8）。
+ */
+const PERSIST_VERSION = 1;
+
+/** 真正落盘的字段（只存状态，不存 setter；也不存将来可能加的派生/大字段） */
+type PersistedMusicSource = Pick<MusicSourceStore, "activeSourceId" | "aggregateMode">;
+
+/** 运行时可接受的音源 id（SourceId 是类型，运行时要自己列一份用来校验存档） */
+const VALID_SOURCE_IDS: readonly SourceId[] = ["wyy", "qq", "kw", "kg", "local"];
+
+/**
+ * 把任意版本 / 被手改过的存档收敛成合法结构。
+ * 为什么必须做：存档是用户可编辑的（devtools / 旧版本写入），
+ * 一个非法 activeSourceId 会让所有页面按未知音源请求而**没有报错**，
+ * 排查成本极高；这里退回默认值，行为可预期。
+ */
+function sanitizePersisted(raw: unknown): PersistedMusicSource {
+  const src = (raw ?? {}) as Partial<Record<keyof PersistedMusicSource, unknown>>;
+  const id = src.activeSourceId;
+  return {
+    activeSourceId:
+      typeof id === "string" && (VALID_SOURCE_IDS as readonly string[]).includes(id)
+        ? (id as SourceId)
+        : "wyy",
+    aggregateMode: typeof src.aggregateMode === "boolean" ? src.aggregateMode : false,
+  };
+}
+
 export const useMusicSourceStore = create<MusicSourceStore>()(
   persist(
     (set) => ({
@@ -49,6 +80,19 @@ export const useMusicSourceStore = create<MusicSourceStore>()(
       setActiveSource: (id) => set({ activeSourceId: id }),
       setAggregateMode: (on) => set({ aggregateMode: on }),
     }),
-    { name: STORAGE_KEY, storage: createJSONStorage(safeStorage) },
+    {
+      name: STORAGE_KEY,
+      storage: createJSONStorage(safeStorage),
+      version: PERSIST_VERSION,
+      // 任何旧版本（含未带 version 的 v0 存档）都过一遍 sanitize
+      migrate: (persisted) => sanitizePersisted(persisted),
+      // migrate 只在**版本不同**时才会被调用，所以「当前版本但内容非法」
+      // （手改过、写入被截断）还得靠 merge 兜一道 —— 这才是常态入口。
+      merge: (persisted, current) => ({ ...current, ...sanitizePersisted(persisted) }),
+      partialize: (s): PersistedMusicSource => ({
+        activeSourceId: s.activeSourceId,
+        aggregateMode: s.aggregateMode,
+      }),
+    },
   ),
 );

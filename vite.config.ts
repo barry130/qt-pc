@@ -14,6 +14,11 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
+      // 音源包源码（独立工程 qt-sources，与 qt-pc 同级）。
+      // 主窗口 facade 只借用两个平台无关模块：contract（类型契约）与 timeout（超时工具）。
+      // 第三方音源的**实现**不进主窗口 bundle——一切数据接口与取链都经引擎窗口
+      // 加载 source-bundle.js 承担（见 src/source-scripts/index.ts 文件头）。
+      "@qt-sources": path.resolve(__dirname, "../qt-sources/src"),
     },
   },
   // vite dev 依赖预构建缓存放在工作区内，避免沙箱外写入
@@ -42,6 +47,11 @@ export default defineConfig({
     minify: !process.env.TAURI_ENV_DEBUG ? "esbuild" : false,
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
     outDir: "dist",
-    chunkSizeWarningLimit: 1024,
+    // 刻意不设 chunkSizeWarningLimit：默认 500 kB 的警告是**有用的信号**。
+    // 之前把它抬到 1024 只是把「单个 577 kB 大 chunk」的警告藏起来；现在路由已按页
+    // 懒加载（src/lib/router.tsx + KeepAliveOutlet），主包回到 500 kB 以下，
+    // 保留默认值可以继续盯着它——哪天又超了，说明有人把大模块重新塞进了首屏路径。
+    // 若将来确实出现合理的超大 chunk（例如必须整体加载的音源包），再针对它设
+    // manualChunks 或单独提升阈值，而不是全局放宽。
   },
 });

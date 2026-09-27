@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Trash2, ChevronDown } from "lucide-react";
+import { Trash2, ChevronDown, ArrowUp, ArrowDown, Play } from "lucide-react";
 import { errMsg } from "@/lib/utils";
 import type { Track } from "@/types";
 import * as ipc from "@/services/ipc";
+import { usePlayerStore } from "@/stores/player";
 import { TrackList } from "../discovery/TrackList";
 import { AddDirButtons } from "./AddDirButtons";
 import { BatchDeleteButton } from "../common/RowActions";
+import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 
 /**
  * 本地音乐（路由 /library，DESIGN §5.2 / §13）。
@@ -13,12 +15,13 @@ import { BatchDeleteButton } from "../common/RowActions";
  * 扫描目录持久化在 Rust 侧（scan_dirs 表），扫描结果入库（tracks 表，platform=local）。
  * 本地曲目的 Track.id 即文件绝对路径，播放由 Rust 引擎特判本地源解码。
  *
- * 本地曲库 2.0：搜索、排序、按歌曲 / 歌手 / 专辑 / 文件夹分组浏览、
- * 多选批量删除、缺失文件体检与清理。
+ * 本地曲库 2.0：搜索、排序（标题/歌手/专辑/时长/大小/修改时间 + 正/倒序）、
+ * 按歌曲 / 歌手 / 专辑 / 文件夹分组浏览、全部播放、多选批量删除、
+ * 缺失文件体检与清理。
  */
 
 type ViewMode = "songs" | "artists" | "albums" | "folders";
-type SortKey = "title" | "singer" | "album" | "duration";
+type SortKey = "title" | "singer" | "album" | "duration" | "size" | "mtime";
 
 const VIEW_OPTIONS: { value: ViewMode; label: string }[] = [
   { value: "songs", label: "歌曲" },
@@ -32,6 +35,8 @@ const SORT_OPTIONS: { value: SortKey; label: string }[] = [
   { value: "singer", label: "按歌手" },
   { value: "album", label: "按专辑" },
   { value: "duration", label: "按时长" },
+  { value: "size", label: "按大小" },
+  { value: "mtime", label: "按修改时间" },
 ];
 
 /** 无损扩展名（按文件后缀判断，本地 Track 没有 format 字段） */
@@ -64,6 +69,8 @@ export function LibraryPage(): React.JSX.Element {
   const [query, setQuery] = useState("");
   const [view, setView] = useState<ViewMode>("songs");
   const [sortKey, setSortKey] = useState<SortKey>("title");
+  /** 正序（默认） / 倒序 */
+  const [sortDesc, setSortDesc] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const allRef = useRef<HTMLInputElement | null>(null);
   const [missing, setMissing] = useState<Track[]>([]);
@@ -74,12 +81,24 @@ export function LibraryPage(): React.JSX.Element {
   const load = useCallback(async (): Promise<void> => {
     setLoading(true);
     try {
-      const [t, d, m] = await Promise.all([
+      const [t, d, m, metas] = await Promise.all([
         ipc.getLocalTracks().catch(() => [] as Track[]),
         ipc.getScanDirs().catch(() => [] as string[]),
         ipc.getMissingLocalTracks().catch(() => [] as Track[]),
+        ipc.getLocalTrackFiles().catch(() => [] as ipc.LocalTrackFileMeta[]),
       ]);
-      setTracks(Array.isArray(t) ? t : []);
+      // 合并本地曲目的文件大小 / 修改时间，供「按大小 / 修改时间」排序
+      const metaMap = new Map<string, { fileSize: number; mtime: number }>();
+      const metaArr = Array.isArray(metas) ? metas : [];
+      for (const meta of metaArr) {
+        metaMap.set(meta.id, { fileSize: meta.fileSize, mtime: meta.mtime });
+      }
+      const trackArr = Array.isArray(t) ? t : [];
+      const withMeta: Track[] = trackArr.map((tr) => {
+        const fm = metaMap.get(tr.id);
+        return fm ? { ...tr, fileSize: fm.fileSize, mtime: fm.mtime } : tr;
+      });
+      setTracks(withMeta);
       setDirs(Array.isArray(d) ? d : []);
       setMissing(Array.isArray(m) ? m : []);
       // 列表换了，旧的勾选不再有意义（被删掉的曲目尤其要清掉）
@@ -89,9 +108,14 @@ export function LibraryPage(): React.JSX.Element {
     }
   }, []);
 
+  // 本页常驻缓存（挂载后不再卸载）：文件/曲目可能在别处被增删（扫描、下载落盘、
+// 曲目页删除），只在首次挂载拉一次会一直显示旧库。改为每次切回来重拉。
+  const active = useKeepAliveActive();
+
   useEffect(() => {
+    if (!active) return;
     void load();
-  }, [load]);
+  }, [active, load]);
 
   // 扫描进度订阅：整盘扫描可能上万文件，给用户实时反馈
   useEffect(() => {
@@ -245,22 +269,36 @@ export function LibraryPage(): React.JSX.Element {
       );
     }
     const sorted = [...list];
+    const dir = sortDesc ? -1 : 1;
     sorted.sort((a, b) => {
+      let c = 0;
       switch (sortKey) {
         case "singer":
-          return a.singer.localeCompare(b.singer, "zh-Hans-CN") ||
+          c =
+            a.singer.localeCompare(b.singer, "zh-Hans-CN") ||
             a.title.localeCompare(b.title, "zh-Hans-CN");
+          break;
         case "album":
-          return a.album.localeCompare(b.album, "zh-Hans-CN") ||
+          c =
+            a.album.localeCompare(b.album, "zh-Hans-CN") ||
             a.title.localeCompare(b.title, "zh-Hans-CN");
+          break;
         case "duration":
-          return b.duration - a.duration;
+          c = a.duration - b.duration;
+          break;
+        case "size":
+          c = (a.fileSize ?? 0) - (b.fileSize ?? 0);
+          break;
+        case "mtime":
+          c = (a.mtime ?? 0) - (b.mtime ?? 0);
+          break;
         default:
-          return a.title.localeCompare(b.title, "zh-Hans-CN");
+          c = a.title.localeCompare(b.title, "zh-Hans-CN");
       }
+      return dir * c;
     });
     return sorted;
-  }, [tracks, query, sortKey]);
+  }, [tracks, query, sortKey, sortDesc]);
 
   // 批量选择：以「当前可见列表」为范围，全选 / 取消全选都只影响可见项
   const allSelected = visible.length > 0 && visible.every((t) => selected.has(t.id));
@@ -464,6 +502,16 @@ export function LibraryPage(): React.JSX.Element {
               aria-label="搜索本地歌曲"
               className="h-7 w-48 rounded-md border border-input bg-background px-2 text-xs outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
             />
+            <button
+              type="button"
+              disabled={visible.length === 0}
+              onClick={() => void usePlayerStore.getState().playQueue(visible, 0)}
+              title="播放当前列表全部歌曲"
+              className="flex h-7 items-center gap-1 rounded-md bg-primary px-2.5 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
+            >
+              <Play className="h-3.5 w-3.5" />
+              全部播放
+            </button>
             <div className="flex overflow-hidden rounded-md border border-border">
               {VIEW_OPTIONS.map((o) => (
                 <button
@@ -492,6 +540,20 @@ export function LibraryPage(): React.JSX.Element {
                 </option>
               ))}
             </select>
+            <button
+              type="button"
+              onClick={() => setSortDesc((v) => !v)}
+              title={sortDesc ? "当前为倒序，点击切换正序" : "当前为正序，点击切换倒序"}
+              aria-label="切换排序方向"
+              className="flex h-7 items-center gap-0.5 rounded-md border border-border px-2 text-xs text-muted-foreground transition-colors hover:bg-secondary"
+            >
+              {sortDesc ? (
+                <ArrowDown className="h-3.5 w-3.5" />
+              ) : (
+                <ArrowUp className="h-3.5 w-3.5" />
+              )}
+              {sortDesc ? "倒序" : "正序"}
+            </button>
 
             {/* 批量选择：勾选行首复选框后「批量删除」 */}
             <label className="flex items-center gap-1.5 text-xs text-muted-foreground">

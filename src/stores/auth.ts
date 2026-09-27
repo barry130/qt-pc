@@ -24,9 +24,39 @@ interface AuthStore {
     password: string,
     passwordConfirm: string,
     email?: string,
+    nickname?: string,
   ) => Promise<void>;
   logout: () => Promise<void>;
+  /** 改资料：后端是全量替换（nickname/email/avatar 必填，password 选填） */
+  updateProfile: (patch: ProfilePatch) => Promise<void>;
+  /**
+   * 头像上传成功后只改本地展示态（UPDATE_DESIGN.md §5.2）：
+   * 后端头像走独立接口（avatar/complete 直接写 sys_user.avatar），不走 update 全量替换，
+   * 也就不会触发踢下线 —— 千万别用 updateProfile 改头像。
+   */
+  setLocalAvatar: (url: string) => void;
+  /** 发邮箱验证码（找回密码用；邮件模板 scene 由 Rust 侧持有） */
+  sendEmailCode: (email: string) => Promise<void>;
+  /** 用邮箱验证码重置密码（后端会踢掉该用户全部会话） */
+  changePassword: (email: string, password: string, code: string) => Promise<void>;
 }
+
+/**
+ * 改资料的请求体。
+ *
+ * 后端 QtUpdateUserDto 是**全量替换**：nickname / email / avatar 都带 @NotBlank，
+ * 只想改昵称也必须把当前邮箱与头像原样回传，否则后端校验直接 400。
+ * password 选填（不传 = 不改密码）。
+ *
+ * 用 type 而不是 interface：interface 没有隐式索引签名，无法赋给
+ * `Record<string, unknown>`（ipc.astralUpdateProfile 的形参类型）。
+ */
+export type ProfilePatch = {
+  nickname: string;
+  email: string;
+  avatar: string;
+  password?: string;
+};
 
 /** 会话是否有效（留 60s 余量，和 Rust 侧 AuthSession::is_valid 同口径） */
 export function isSessionValid(s: AuthSession | null): boolean {
@@ -318,7 +348,7 @@ async function confirmSession(
   }
 }
 
-export const useAuthStore = create<AuthStore>((set) => ({
+export const useAuthStore = create<AuthStore>((set, get) => ({
   session: null,
   profile: null,
   loading: false,
@@ -381,7 +411,7 @@ export const useAuthStore = create<AuthStore>((set) => ({
     }
   },
 
-  register: async (username, password, passwordConfirm, email) => {
+  register: async (username, password, passwordConfirm, email, nickname) => {
     set({ loading: true, error: null });
     try {
       const session = await ipc.astralRegister(
@@ -389,6 +419,7 @@ export const useAuthStore = create<AuthStore>((set) => ({
         password,
         passwordConfirm,
         email,
+        nickname,
       );
       const profile = await ipc.astralMe().catch(() => null);
       set({ session, profile, loading: false });
@@ -416,5 +447,36 @@ export const useAuthStore = create<AuthStore>((set) => ({
       await ipc.likeResetSync().catch(() => {});
       set({ session: null, profile: null, loading: false });
     }
+  },
+
+  updateProfile: async (patch) => {
+    set({ loading: true, error: null });
+    try {
+      await ipc.astralUpdateProfile(patch);
+    } catch (err) {
+      // 失败时后端还没走到 kickout（校验不过就返回了），本地登录态保持不动
+      set({ loading: false, error: errMsg(err) });
+      throw err;
+    }
+    // 成功：后端 updateUser 结尾会 StpUtil.kickout(userId)，token 当场作废。
+    // 本地必须跟着清，否则界面会停在「显示已登录、接口全 401」。
+    // 收藏数据与归属标记按 logout 的口径保留（同账号重登无缝恢复）。
+    await ipc.astralLogout().catch(() => {});
+    await ipc.likeResetSync().catch(() => {});
+    set({ session: null, profile: null, loading: false });
+  },
+
+  setLocalAvatar: (url) => {
+    const p = get().profile;
+    if (p) set({ profile: { ...p, avatar: url } });
+  },
+
+  // 下面两个不碰 store 的 loading/error：调用方（找回密码页）自己管按钮倒计时与报错
+  sendEmailCode: async (email) => {
+    await ipc.astralSendEmailCode(email);
+  },
+
+  changePassword: async (email, password, code) => {
+    await ipc.astralChangePassword(email, password, code);
   },
 }));

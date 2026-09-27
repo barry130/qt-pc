@@ -7,6 +7,9 @@ export default defineConfig({
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
+      // 与 vite.config.ts 保持一致：音源包源码在独立工程 qt-sources（同级目录），
+      // 主窗口只借用 contract（类型）与 timeout（工具）两个平台无关模块。
+      "@qt-sources": path.resolve(__dirname, "../qt-sources/src"),
     },
   },
   test: {

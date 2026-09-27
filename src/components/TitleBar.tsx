@@ -91,7 +91,9 @@ export function TitleBar(): React.JSX.Element {
           aria-label="设置"
           onMouseDown={(e) => e.stopPropagation()}
           onDoubleClick={(e) => e.stopPropagation()}
-          className="flex w-11 items-center justify-center text-foreground/80 transition-colors hover:bg-secondary hover:text-foreground"
+          // 圆角小块 hover，与中间返回键的圆形 hover 同一形状语言；
+          // 窗口控制仍是贴边全高矩形（Windows 惯例，命中区到窗沿）
+          className="mx-1 flex h-8 w-9 items-center justify-center self-center rounded-md text-foreground/80 transition-colors hover:bg-secondary hover:text-foreground"
         >
           <Settings className="h-4 w-4" />
         </Link>
@@ -101,11 +103,11 @@ export function TitleBar(): React.JSX.Element {
           aria-label={session ? "个人中心" : "登录"}
           onMouseDown={(e) => e.stopPropagation()}
           onDoubleClick={(e) => e.stopPropagation()}
-          className="flex w-11 items-center justify-center text-foreground/80 transition-colors hover:bg-secondary hover:text-foreground"
+          className="mx-1 flex h-8 w-9 items-center justify-center self-center rounded-md transition-colors hover:bg-secondary"
         >
           {/* 真实头像优先，拿不到（未登录/无头像字段/代理转换失败）回退应用 logo */}
           <img
-            src={avatarSrc ?? "/app-icon.png"}
+            src={avatarSrc ?? "/static/icon/xxxhdpi.png"}
             alt=""
             className="h-5 w-5 rounded-full object-cover"
             draggable={false}

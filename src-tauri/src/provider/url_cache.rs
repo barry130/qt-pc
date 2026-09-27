@@ -3,26 +3,64 @@
 //!
 //! 前端脚本包解析出的地址经 `set_resolved_play_url` 写入本缓存，
 //! 引擎播放/预取命中缓存直接使用。
+//!
+//! P2-5：旧实现只有"get 命中时惰性过期"，没有容量上限、也没有全量清扫 ——
+//! 长时间挂机 + 频繁换歌（每首歌都会按 音质 档缓存一条，跨源重取还会覆盖）
+//! 时表只涨不落。这里补上容量上限 + 按批清扫，超容量按"最旧"淘汰。
 
 use std::collections::HashMap;
 
+/// 单条缓存条目上限。
+///
+/// 为什么是 512：一条 = key（约 40 字节）+ URL（约 200 字节）+ 结构体本身，
+/// 512 条合计也在百 KB 量级；而 10 分钟 TTL 下正常听歌的取链量最多个位数到
+/// 几十条（按音质分档也就 ×3），512 已经比正常水位高一到两个数量级，
+/// 只用来挡住"长时间挂机 + 疯狂换歌 + 反复跨源重取"这种病态场景。
+const PLAY_URL_MAX_ENTRIES: usize = 512;
+
+/// 每多少次 `set` 顺带做一次全量清扫。
+///
+/// 为什么是 64：全量清扫是 O(n)（n ≤ 512），逐次清扫会把 `set` 从 O(1) 变成
+/// O(n)；每 64 次插入清一次，清扫成本摊到 64 次插入上（摊还 O(n/64) ≈ O(1)），
+/// 代价是过期项最多多占 64 次插入的时间 —— 相对 10 分钟 TTL 完全可以忽略。
+const SWEEP_EVERY_INSERTS: u32 = 64;
+
+const PLAY_URL_TTL_MS: u64 = 10 * 60 * 1000;
+
 pub struct PlayUrlCache {
-    inner: std::sync::Mutex<HashMap<String, CachedUrl>>,
+    inner: std::sync::Mutex<CacheInner>,
     ttl_ms: u64,
+    max_entries: usize,
+}
+
+struct CacheInner {
+    map: HashMap<String, CachedUrl>,
+    /// 自上次全量清扫以来的插入次数（摊还清扫的计数器）
+    inserts_since_sweep: u32,
+    /// 单调自增的插入序号。
+    /// 为什么要它：同一毫秒内批量写入时 `fetched_at` 会打平，"淘汰最旧"
+    /// 就失去了确定次序（也会被系统时间回拨影响）；插入序号是唯一的，
+    /// 同刻按它兜底，淘汰结果稳定可测。
+    next_seq: u64,
 }
 
 struct CachedUrl {
     url: String,
     fetched_at: u64,
+    /// 插入序号（越小越旧，仅用于同刻打平时的稳定排序）
+    seq: u64,
 }
-
-const PLAY_URL_TTL_MS: u64 = 10 * 60 * 1000;
 
 impl PlayUrlCache {
     pub fn new() -> Self {
         Self {
-            inner: std::sync::Mutex::new(HashMap::new()),
+            inner: std::sync::Mutex::new(CacheInner {
+                map: HashMap::new(),
+                inserts_since_sweep: 0,
+                next_seq: 0,
+            }),
             ttl_ms: PLAY_URL_TTL_MS,
+            max_entries: PLAY_URL_MAX_ENTRIES,
         }
     }
 
@@ -38,14 +76,20 @@ impl PlayUrlCache {
     }
 
     /// 命中返回 `(url, fetched_at)`；缓存条目自身的时间戳原样返回，不得刷新为当前时间。
+    ///
+    /// 用 `saturating_sub` 而不是裸减法：`now_ms` 来自 `SystemTime`（不是单调钟），
+    /// 系统时间被 NTP 或用户往回调时 `now < fetched_at`，裸减法在 debug 构建里
+    /// 会 panic（panic 会毒化 Mutex，之后整个缓存静默失效）、release 构建里会回绕成
+    /// 巨大值把条目误判过期。饱和后语义是"未来的时间戳 = 新鲜"，与 sweep 里的
+    /// 过期判定（`now.saturating_sub(..) <= ttl`）完全一致，正常时间走向下逐字不变。
     pub fn get(&self, key: &str) -> Option<(String, u64)> {
-        let mut map = self.inner.lock().ok()?;
-        match map.get(key) {
-            Some(c) if Self::now_ms() - c.fetched_at <= self.ttl_ms => {
+        let mut inner = self.inner.lock().ok()?;
+        match inner.map.get(key) {
+            Some(c) if Self::now_ms().saturating_sub(c.fetched_at) <= self.ttl_ms => {
                 Some((c.url.clone(), c.fetched_at))
             }
             Some(_) => {
-                map.remove(key); // 过期即清除
+                inner.map.remove(key); // 过期即清除
                 None
             }
             None => None,
@@ -53,21 +97,55 @@ impl PlayUrlCache {
     }
 
     pub fn set(&self, key: String, url: String) {
-        if let Ok(mut map) = self.inner.lock() {
-            map.insert(
-                key,
-                CachedUrl {
-                    url,
-                    fetched_at: Self::now_ms(),
-                },
-            );
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let now = Self::now_ms();
+        inner.next_seq = inner.next_seq.wrapping_add(1);
+        let seq = inner.next_seq;
+        inner.map.insert(
+            key,
+            CachedUrl {
+                url,
+                fetched_at: now,
+                seq,
+            },
+        );
+        inner.inserts_since_sweep = inner.inserts_since_sweep.saturating_add(1);
+        // 触发条件：攒够一批（摊还清扫）或已经超容量（必须立刻压回去）
+        if inner.inserts_since_sweep >= SWEEP_EVERY_INSERTS || inner.map.len() > self.max_entries {
+            inner.inserts_since_sweep = 0;
+            self.sweep(&mut inner, now);
+        }
+    }
+
+    /// 全量清扫：先删过期项；仍超容量再按"最旧"（fetched_at，同刻用 seq 兜底）
+    /// 淘汰到上限。只在 `set` 的批量触发点调用，理由见 `SWEEP_EVERY_INSERTS`。
+    fn sweep(&self, inner: &mut CacheInner, now: u64) {
+        let ttl = self.ttl_ms;
+        inner
+            .map
+            .retain(|_, c| now.saturating_sub(c.fetched_at) <= ttl);
+        if inner.map.len() <= self.max_entries {
+            return;
+        }
+        let mut entries: Vec<(u64, u64, String)> = inner
+            .map
+            .iter()
+            .map(|(k, c)| (c.fetched_at, c.seq, k.clone()))
+            .collect();
+        let drop_count = entries.len() - self.max_entries;
+        // select_nth 是 O(n)：不必给全表排序，只要把最旧的 drop_count 条挪到前面
+        entries.select_nth_unstable_by_key(drop_count - 1, |e| (e.0, e.1));
+        for (_, _, key) in entries.drain(..drop_count) {
+            inner.map.remove(&key);
         }
     }
 
     /// 播放失败时作废缓存
     pub fn invalidate(&self, key: &str) {
-        if let Ok(mut map) = self.inner.lock() {
-            map.remove(key);
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.map.remove(key);
         }
     }
 }
@@ -92,5 +170,65 @@ mod tests {
         assert_eq!(url, "https://example.com/a.mp3");
         cache.invalidate(&key);
         assert!(cache.get(&key).is_none());
+    }
+
+    /// 过期项要真的从表里被清掉（不只是 get 时惰性删），否则挂机久了表只涨不落
+    #[test]
+    fn expired_entries_are_swept_in_batch() {
+        let cache = PlayUrlCache::new();
+        cache.set("stale".into(), "https://example.com/old.mp3".into());
+        // 直接把这条的时间戳改成 1970（同模块可访问私有字段），避免 sleep 拖慢测试
+        {
+            let mut inner = cache.inner.lock().unwrap();
+            inner.map.get_mut("stale").unwrap().fetched_at = 0;
+        }
+        // 攒满一批插入 → 触发全量清扫
+        for i in 0..SWEEP_EVERY_INSERTS {
+            cache.set(format!("fresh-{i}"), "https://example.com/new.mp3".into());
+        }
+        let inner = cache.inner.lock().unwrap();
+        assert!(
+            !inner.map.contains_key("stale"),
+            "过期项应被批量清扫掉（物理删除）"
+        );
+        assert_eq!(
+            inner.map.len(),
+            SWEEP_EVERY_INSERTS as usize,
+            "未过期的条目一条都不能少"
+        );
+        drop(inner);
+        assert!(cache.get("stale").is_none());
+    }
+
+    /// 超容量按"最旧"淘汰，且表永远不会涨过上限
+    #[test]
+    fn over_capacity_evicts_oldest() {
+        let cache = PlayUrlCache::new();
+        let total = PLAY_URL_MAX_ENTRIES + 8;
+        for i in 0..total {
+            cache.set(format!("k{i:04}"), format!("https://example.com/{i}.mp3"));
+        }
+        let inner = cache.inner.lock().unwrap();
+        assert!(
+            inner.map.len() <= PLAY_URL_MAX_ENTRIES,
+            "条目数 {} 超过上限 {PLAY_URL_MAX_ENTRIES}",
+            inner.map.len()
+        );
+        assert!(!inner.map.contains_key("k0000"), "最旧的一条应被淘汰");
+        assert!(
+            inner.map.contains_key(&format!("k{:04}", total - 1)),
+            "最新写入的一条必须保留"
+        );
+    }
+
+    /// 命中过的条目不改写时间戳语义：get 返回的是写入时刻，不是当前时刻
+    #[test]
+    fn get_returns_original_fetched_at() {
+        let cache = PlayUrlCache::new();
+        cache.set("k".into(), "https://example.com/a.mp3".into());
+        let (_, at) = cache.get("k").expect("should hit");
+        assert!(at > 0 && at <= PlayUrlCache::now_ms());
+        let (_, again) = cache.get("k").expect("should hit");
+        assert_eq!(at, again, "读到的时间戳必须原样返回，不得刷新");
     }
 }

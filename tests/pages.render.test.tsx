@@ -57,9 +57,10 @@ describe("页面渲染冒烟", () => {
     const { MyPlaylistsPage } = await import("@/components/mine/MyPlaylistsPage");
     const container = await renderAfterEffects(<MyPlaylistsPage />);
     expect(container.textContent).toContain("我的歌单");
-    // 歌单是唯一组织单位：建单 / 导入 / 收藏都在这一页
+    // 歌单是唯一组织单位：建单 / 导入 / 收藏都在这一页；
+    // 云端收藏改为进页自动拉取，没有手动同步按钮（MyPlaylistsPage 头注）
     expect(container.textContent).toContain("还没有歌单");
-    expect(container.textContent).toContain("同步云端收藏");
+    expect(container.textContent).toContain("导入");
   });
 
   it("个人中心页：未登录态渲染登录入口与本地统计", async () => {

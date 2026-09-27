@@ -205,6 +205,31 @@ pub const MESSAGE_CHANNEL: &str = "pc";
 pub const STAT_UT: &str = "app-windows";
 pub const FEEDBACK_PLATFORM: &str = crate::app_config::FEEDBACK_PLATFORM;
 
+/// 更新安装包的临时目录名（`%TEMP%/quietmusic-update`）与固定落盘名。
+///
+/// 落盘名**不能**从下载 URL 推导：URL 由服务端下发，形如
+/// `https://host/x/..\..\Windows\System32\bad.exe` 的路径落在 `Path::join` 上
+/// 会被当成多级路径（Windows 下 `\` 同样是分隔符），写到临时目录之外。
+/// 固定文件名之后，"这个路径能不能执行"就有了唯一确定的答案
+/// （见 `commands::cmd_run_update_installer` 的校验）。
+pub const UPDATE_DIR_NAME: &str = "quietmusic-update";
+pub const UPDATE_INSTALLER_FILE_NAME: &str = "quietmusic-setup.exe";
+
+/// 更新安装包的固定路径（下载写入与执行校验共用同一口径，避免两处各写一份）
+pub fn update_installer_path() -> std::path::PathBuf {
+    std::env::temp_dir()
+        .join(UPDATE_DIR_NAME)
+        .join(UPDATE_INSTALLER_FILE_NAME)
+}
+
+/// 邮件模板业务标识（后端 QtSendEmailDto.body / sys_mail_template.scene）。
+///
+/// **不是邮件正文**：后端拿它去 sys_mail_template 找模板并渲染正文，同时用
+/// `qt:email:code:{email}:{scene}` 存验证码；改密码时 `changePwByEmail` 校验的
+/// 是同一个 scene（QtUserService.EMAIL_BODY_CHANGE_PW）。传错就是两头都错——
+/// 模板查不到（MAIL002）导致发信失败，就算发出去了验证码也永远校验不过。
+pub const MAIL_SCENE_CHANGE_PW: &str = "changePasswordByEmail";
+
 /// 会话被服务端否认时统一的错误文案。
 /// HTTP 401 和业务码 401 都归一成这一条，调用方（如 `cmd_astral_me`）据此
 /// 判断"确实失效"从而清掉本地会话——网络不可达是另一类错误，不能混用，
@@ -268,6 +293,17 @@ pub struct AstralClient {
     satoken: RwLock<Option<String>>,
 }
 
+/// 直传凭证（后端 QtUploadTicketVo 的 Rust 镜像）
+#[derive(Debug, Clone)]
+pub struct UploadTicket {
+    pub upload_url: String,
+    pub method: String,
+    pub form_field: Option<String>,
+    pub upload_id: String,
+    pub form_policy: Option<String>,
+    pub form_authorization: Option<String>,
+}
+
 impl AstralClient {
     pub fn new(base_url: &str) -> Self {
         Self {
@@ -303,7 +339,9 @@ impl AstralClient {
         &self.base_url
     }
 
-    fn token(&self) -> Option<String> {
+    /// 当前登录态下的 satoken（未登录 / 已登出为 None）。音源包 manifest 等
+    /// 走 builtin_client 的自拼请求也需要随登录态附带 satoken。
+    pub fn token(&self) -> Option<String> {
         self.satoken.read().expect("satoken lock").clone()
     }
 
@@ -399,6 +437,7 @@ impl AstralClient {
         password: &str,
         password_confirm: &str,
         email: Option<&str>,
+        nickname: Option<&str>,
     ) -> Result<AuthSession, String> {
         let mut body = json!({
             "username": username,
@@ -407,6 +446,11 @@ impl AstralClient {
         });
         if let Some(e) = email.filter(|s| !s.is_empty()) {
             body["email"] = json!(e);
+        }
+        // 昵称可选：留空时后端把昵称默认成用户名（QtUserService.register），
+        // 空串不上送，免得把「用户没填」和「用户想叫空名字」混成一件事。
+        if let Some(n) = nickname.filter(|s| !s.is_empty()) {
+            body["nickname"] = json!(n);
         }
         let data = self
             .post_json("app/user/register", body, &[], false)
@@ -441,9 +485,10 @@ impl AstralClient {
         Ok(session)
     }
 
-    /// 发送邮箱验证码（注册 / 找回密码共用）。body 是邮件正文，由调用方决定文案。
-    pub async fn send_email_code(&self, email: &str, body: &str) -> Result<Value, String> {
-        self.post_json("app/user/email", json!({ "email": email, "body": body }), &[], false)
+    /// 发送邮箱验证码。`scene` 是邮件模板业务标识（见 [`MAIL_SCENE_CHANGE_PW`]），
+    /// 不是邮件正文：它同时决定模板渲染和验证码的存取 key。
+    pub async fn send_email_code(&self, email: &str, scene: &str) -> Result<Value, String> {
+        self.post_json("app/user/email", json!({ "email": email, "body": scene }), &[], false)
             .await
     }
 
@@ -526,6 +571,252 @@ impl AstralClient {
         self.post_json("app/user/update", patch, &[], true).await
     }
 
+    // ---------- 媒体直传（UPDATE_DESIGN.md §5.2/§5.3） ----------
+    //
+    // 文件正文不经过 Astral 服务器：客户端先取签发凭证（ticket），
+    // 凭证里带存储端的直传地址与表单字段，传完再拿 uploadId 回执登记。
+    // 直传必须走 Rust：CSP 不放开外部域名，WebView 发不了这个请求。
+
+    fn parse_upload_ticket(data: &Value) -> Result<UploadTicket, String> {
+        let get_str = |k: &str| {
+            data.get(k)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        Ok(UploadTicket {
+            upload_url: get_str("uploadUrl").ok_or("凭证缺少 uploadUrl")?,
+            method: get_str("method").unwrap_or_else(|| "PUT".into()),
+            form_field: get_str("formField"),
+            upload_id: get_str("uploadId").ok_or("凭证缺少 uploadId")?,
+            form_policy: get_str("formPolicy"),
+            form_authorization: get_str("formAuthorization"),
+        })
+    }
+
+    fn url_of(data: &Value) -> Result<String, String> {
+        Ok(data
+            .get("url")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or("回执缺少 url")?
+            .to_string())
+    }
+
+    /// 头像直传凭证（app/user/avatar/ticket）
+    pub async fn avatar_ticket(
+        &self,
+        file_name: &str,
+        content_type: &str,
+        size_bytes: i64,
+    ) -> Result<UploadTicket, String> {
+        let data = self
+            .post_json(
+                "app/user/avatar/ticket",
+                json!({ "fileName": file_name, "contentType": content_type, "sizeBytes": size_bytes }),
+                &[],
+                true,
+            )
+            .await?;
+        Self::parse_upload_ticket(&data)
+    }
+
+    /// 头像回执登记（app/user/avatar/complete），返回头像 URL（即版本）。
+    pub async fn avatar_complete(&self, upload_id: &str) -> Result<String, String> {
+        let data = self
+            .post_json("app/user/avatar/complete", json!({ "uploadId": upload_id }), &[], true)
+            .await?;
+        Self::url_of(&data)
+    }
+
+    /// 歌单封面直传凭证（app/user/like/playlist/{pid}/cover/ticket）
+    pub async fn cover_ticket(
+        &self,
+        pid: &str,
+        platform: &str,
+        file_name: &str,
+        content_type: &str,
+        size_bytes: i64,
+    ) -> Result<UploadTicket, String> {
+        let data = self
+            .post_json(
+                &format!("app/user/like/playlist/{}/cover/ticket", pid),
+                json!({
+                    "platform": platform,
+                    "fileName": file_name,
+                    "contentType": content_type,
+                    "sizeBytes": size_bytes,
+                }),
+                &[],
+                true,
+            )
+            .await?;
+        Self::parse_upload_ticket(&data)
+    }
+
+    /// 歌单封面回执登记，返回封面 URL。
+    pub async fn cover_complete(&self, pid: &str, platform: &str, upload_id: &str) -> Result<String, String> {
+        let data = self
+            .request(
+                reqwest::Method::POST,
+                &format!("app/user/like/playlist/{}/cover/complete", pid),
+                &[("platform", platform)],
+                Some(json!({ "uploadId": upload_id })),
+                &[],
+                true,
+            )
+            .await?;
+        Self::url_of(&data)
+    }
+
+    /// 清除歌单封面（app/user/like/playlist/{pid}/cover DELETE），回到默认资源。
+    pub async fn cover_clear(&self, pid: &str, platform: &str) -> Result<(), String> {
+        self.request(
+            reqwest::Method::DELETE,
+            &format!("app/user/like/playlist/{}/cover", pid),
+            &[("platform", platform)],
+            None,
+            &[],
+            true,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// 把文件正文按凭证描述的形态直传存储端。
+    /// PUT = 预签名地址（S3 系/COS/OSS，body 即文件字节）；
+    /// POST multipart = Worker 直传（TELEGRAM）或又拍云表单（额外带 policy/authorization 字段）。
+    /// 用独立长超时客户端：目标在公网对象存储，和 Astral 接口的 15s 不共用。
+    pub async fn direct_upload(
+        &self,
+        t: &UploadTicket,
+        file_name: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), String> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .pool_max_idle_per_host(0)
+            .build()
+            .map_err(|e| format!("上传客户端构建失败: {e}"))?;
+        let resp = if t.method.eq_ignore_ascii_case("PUT") {
+            client
+                .put(&t.upload_url)
+                .body(bytes)
+                .send()
+                .await
+                .map_err(|e| format!("直传失败: {}", sanitize_err(e)))?
+        } else {
+            let field = t.form_field.clone().unwrap_or_else(|| "file".into());
+            let mut form = reqwest::multipart::Form::new();
+            if let Some(p) = &t.form_policy {
+                form = form.text("policy", p.clone());
+            }
+            if let Some(a) = &t.form_authorization {
+                form = form.text("authorization", a.clone());
+            }
+            let part = reqwest::multipart::Part::bytes(bytes)
+                .file_name(file_name.to_string())
+                .mime_str(content_type)
+                .map_err(|e| format!("MIME 非法: {e}"))?;
+            form = form.part(field, part);
+            client
+                .post(&t.upload_url)
+                .multipart(form)
+                .send()
+                .await
+                .map_err(|e| format!("直传失败: {}", sanitize_err(e)))?
+        };
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            let brief: String = body.chars().take(200).collect();
+            return Err(format!("直传被存储端拒绝({status}): {brief}"));
+        }
+        Ok(())
+    }
+
+    /// 头像 / 封面上传的图片大小上限（8 MiB）。
+    ///
+    /// 为什么要有上限：两条上传路径都是"整个文件读进内存 → 作为 PUT / multipart
+    /// body 一次性上传"（预检只认 png / jpg / webp）。真实头像/封面都在 1-2 MiB
+    /// 以内（手机直出也就 3-5 MiB），8 MiB 留了充足余量；再大的一律明确拒绝，
+    /// 免得误选一个几百 MB 的文件就把整块内存吃掉（旧实现没有上限，`std::fs::read`
+    /// 有多少读多少）。
+    const IMAGE_UPLOAD_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+    /// 图片超限的统一文案（预检失败与实读失败共用，保证两条路径提示一致）
+    fn image_too_large_err(size: u64, path: &str) -> String {
+        format!(
+            "图片过大：{size} 字节，上限 {} MiB（{path}）",
+            Self::IMAGE_UPLOAD_MAX_BYTES / 1024 / 1024
+        )
+    }
+
+    /// 图片文件预检（扩展名 → MIME；只认 png/jpg/webp，与后端文件夹策略一致）
+    fn image_meta(path: &str, base: &str) -> Result<(String, &'static str, i64), String> {
+        let ext = std::path::Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let mime = match ext.as_str() {
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "webp" => "image/webp",
+            other => return Err(format!("暂不支持的图片格式 .{other}，仅支持 png / jpg / webp")),
+        };
+        let meta = std::fs::metadata(path).map_err(|_| format!("读不到文件：{path}"))?;
+        // 大小上限放在预检里：不合格的图片不必白跑一趟取凭证的网络请求
+        if meta.len() > Self::IMAGE_UPLOAD_MAX_BYTES {
+            return Err(Self::image_too_large_err(meta.len(), path));
+        }
+        Ok((format!("{base}.{ext}"), mime, meta.len() as i64))
+    }
+
+    /// 读图片正文（上传 body 需要一次性字节）。
+    ///
+    /// P2-4：两条上传路径原先都在 `async fn` 里直接 `std::fs::read`，
+    /// 大文件读盘会把 tokio worker 占住 —— 这里放到阻塞池线程上读。
+    /// 另外最多只读「上限 + 1」字节（`Read::take`）：预检的 `metadata` 与这里的
+    /// `open` 之间有 TOCTOU 窗口（文件可能被换掉/正在增长），以实际读到的长度
+    /// 为准兜底，任何情况下都不会把超大文件整块读进内存。
+    async fn read_image_bytes(path: &str) -> Result<Vec<u8>, String> {
+        let path = path.to_string();
+        tauri::async_runtime::spawn_blocking(move || {
+            use std::io::Read;
+            let file = std::fs::File::open(&path).map_err(|e| format!("读取文件失败: {e}"))?;
+            let mut bytes = Vec::new();
+            file.take(Self::IMAGE_UPLOAD_MAX_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|e| format!("读取文件失败: {e}"))?;
+            if bytes.len() as u64 > Self::IMAGE_UPLOAD_MAX_BYTES {
+                return Err(Self::image_too_large_err(bytes.len() as u64, &path));
+            }
+            Ok(bytes)
+        })
+        .await
+        .map_err(|e| format!("读取文件失败: {e}"))?
+    }
+
+    /// 头像上传一条龙：预检 → 取凭证 → 直传 → 回执登记，返回头像 URL。
+    pub async fn upload_avatar_file(&self, path: &str) -> Result<String, String> {
+        let (name, mime, size) = Self::image_meta(path, "avatar")?;
+        let t = self.avatar_ticket(&name, &mime, size).await?;
+        let bytes = Self::read_image_bytes(path).await?;
+        self.direct_upload(&t, &name, &mime, bytes).await?;
+        self.avatar_complete(&t.upload_id).await
+    }
+
+    /// 歌单封面上传一条龙，返回封面 URL。
+    pub async fn upload_cover_file(&self, pid: &str, platform: &str, path: &str) -> Result<String, String> {
+        let (name, mime, size) = Self::image_meta(path, "cover")?;
+        let t = self.cover_ticket(pid, platform, &name, &mime, size).await?;
+        let bytes = Self::read_image_bytes(path).await?;
+        self.direct_upload(&t, &name, &mime, bytes).await?;
+        self.cover_complete(pid, platform, &t.upload_id).await
+    }
+
     // ---------- 收藏同步（接口契约同 qt-uniappx services/like.ts） ----------
 
     /// 单曲收藏/取消（app/user/like/song）。返回服务端 seq，用作同步游标。
@@ -539,10 +830,14 @@ impl AstralClient {
 
     // ---------- 更新（§15.3 / §15.7）：version 传 versionCode 数字字符串 ----------
 
-    pub async fn app_update(&self, version_code: i64, channel: &str) -> Result<Value, String> {
+    pub async fn app_update(&self, version_code: i64) -> Result<Value, String> {
         let code_str = version_code.to_string();
-        self.get("app/update", &[("type", UPDATE_TYPE), ("version", &code_str), ("channel", channel)], false)
-            .await
+        self.get(
+            "app/update",
+            &[("type", UPDATE_TYPE), ("version", &code_str)],
+            true,
+        )
+        .await
     }
 
     pub async fn check_official_version(
@@ -671,8 +966,37 @@ impl AstralClient {
     /// 几 MB 的安装包在慢网络下必然超 15s，超时会中断流式读取并报成
     /// 「下载中断: error decoding response body」——下载要的是「连得上」
     /// 而不是「限时完成」，这里只留 10s 连接超时，不限总时长。
+    ///
+    /// P2-4：整个「请求 + 流式落盘」过程搬到 tokio 阻塞池线程上跑
+    /// （见 `download_update_file_inner`）。命令本身是 `async` 的，若直接在
+    /// tokio worker 上做 `create_dir_all` / `File::create` / `write_all` / `flush`，
+    /// 一个几十 MB 的安装包会把 worker 占住到下载结束（worker 数 = CPU 核数，
+    /// 几个并发命令就能让所有异步任务排队）。下载逻辑一行没动，只换了执行线程。
+    /// `_http` 参数保持原签名不变（实现里始终自建下载专用 client）。
     pub async fn download_update_file(
         _http: &reqwest::Client,
+        url: &str,
+        app: &tauri::AppHandle,
+    ) -> Result<std::path::PathBuf, String> {
+        let url = url.to_string();
+        let app = app.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            // 阻塞池线程不在任何 runtime 上下文里（它不是 tokio worker），
+            // 所以这里可以用运行时句柄 `block_on` 驱动原来的异步下载实现：
+            // reqwest 的连接池/超时照常由同一个运行时驱动，不会踩
+            // "Cannot start a runtime from within a runtime"（那个 panic 只在
+            // 已经处于 runtime 上下文的线程上触发）。
+            let rt = tauri::async_runtime::handle();
+            rt.block_on(Self::download_update_file_inner(&url, &app))
+        })
+        .await
+        .map_err(|e| format!("下载任务异常: {e}"))?
+    }
+
+    /// `download_update_file` 的实现本体（P2-4 拆分：整体在阻塞池线程上执行）。
+    /// 内容与拆分前的 `download_update_file` 逐字一致（URL、校验、落盘文件名、
+    /// 返回值、错误文案都没动），只是不再直接跑在 async worker 上。
+    async fn download_update_file_inner(
         url: &str,
         app: &tauri::AppHandle,
     ) -> Result<std::path::PathBuf, String> {
@@ -686,14 +1010,14 @@ impl AstralClient {
             .build()
             .map_err(|e| format!("下载客户端初始化失败: {e}"))?;
 
-        let dir = std::env::temp_dir().join("quietmusic-update");
+        // 临时目录 + 固定文件名（保持与改动前逐字一致；路径口径与
+        // `update_installer_path()` 完全相同，命令侧执行校验用同一个常量）
+        let dir = std::env::temp_dir().join(UPDATE_DIR_NAME);
         std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败: {e}"))?;
-        let file_name = url
-            .split('/')
-            .next_back()
-            .filter(|s| !s.is_empty() && !s.contains('?'))
-            .unwrap_or("quietmusic-setup.exe");
-        let path = dir.join(file_name);
+        // 固定文件名（理由见 UPDATE_INSTALLER_FILE_NAME 的注释）：
+        // 以前是 `url.split('/').next_back()`，反斜杠不会被 '/' 切开，
+        // 于是服务端下发的 `..\..\x.exe` 能写穿临时目录。
+        let path = dir.join(UPDATE_INSTALLER_FILE_NAME);
 
         let resp = http
             .get(url)
@@ -1134,5 +1458,100 @@ mod tests {
         // 无 URL 原样通过；中文/尾部 URL 也能处理
         assert_eq!(sanitize_err("manifest 解析失败: invalid type"), "manifest 解析失败: invalid type");
         assert_eq!(sanitize_err("拉取 https://x.cn/a 失败"), "拉取 … 失败");
+    }
+
+    /// P2-4 的关键运行时假设（下载实现就靠它）：阻塞池线程上可以用运行时句柄
+    /// `block_on` 驱动异步 reqwest，且事件驱动照常工作。
+    /// 这里起一个本地 TCP 服务器真发一次异步 HTTP 请求，验证：
+    /// - `block_on` 在阻塞池线程上不 panic（"Cannot start a runtime from within a
+    ///   runtime" 只在已处于 runtime 上下文的线程上触发，阻塞池线程不是）；
+    /// - 响应能在被 park 住的线程上被唤醒并读到完整 body（否则这条会挂住/超时）。
+    #[test]
+    fn blocking_pool_thread_can_drive_async_request() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf);
+                let body = b"hello-update";
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes());
+                let _ = sock.write_all(body);
+                let _ = sock.flush();
+            }
+        });
+        let got = tauri::async_runtime::block_on(async move {
+            tauri::async_runtime::spawn_blocking(move || {
+                // 与 download_update_file 完全同款：阻塞池线程 + 运行时句柄 block_on
+                let rt = tauri::async_runtime::handle();
+                rt.block_on(async move {
+                    let client = reqwest::Client::builder()
+                        .timeout(std::time::Duration::from_secs(10))
+                        .build()
+                        .expect("client");
+                    let resp = client
+                        .get(format!("http://{addr}/a.bin"))
+                        .send()
+                        .await
+                        .expect("send");
+                    resp.bytes().await.expect("body").to_vec()
+                })
+            })
+            .await
+            .expect("join")
+        });
+        assert_eq!(got, b"hello-update");
+        let _ = server.join();
+    }
+
+    /// P2-4：图片读盘有 8 MiB 上限，且读盘本身在阻塞池线程上完成
+    #[test]
+    fn image_bytes_are_capped_and_read_off_async_thread() {
+        let dir = std::env::temp_dir().join(format!("ll-astral-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        let small = dir.join("small.png");
+        std::fs::write(&small, b"png-bytes").expect("write small");
+
+        // 预检：扩展名 → MIME、大小如实上报
+        let (name, mime, size) =
+            AstralClient::image_meta(small.to_str().unwrap(), "avatar").expect("meta");
+        assert_eq!(name, "avatar.png");
+        assert_eq!(mime, "image/png");
+        assert_eq!(size, 9);
+
+        // 实读：正常文件原样读回（走 spawn_blocking，不占 async 线程）
+        let bytes = tauri::async_runtime::block_on(AstralClient::read_image_bytes(
+            small.to_str().unwrap(),
+        ))
+        .expect("read");
+        assert_eq!(bytes, b"png-bytes");
+
+        // 超限文件：稀疏文件（set_len 不真占磁盘）也会在读之前/读之中被挡住
+        let big = dir.join("big.jpg");
+        std::fs::File::create(&big)
+            .expect("create big")
+            .set_len(AstralClient::IMAGE_UPLOAD_MAX_BYTES + 1)
+            .expect("set_len");
+        let err = AstralClient::image_meta(big.to_str().unwrap(), "avatar").unwrap_err();
+        assert!(err.contains("图片过大"), "预检文案: {err}");
+        let err = tauri::async_runtime::block_on(AstralClient::read_image_bytes(
+            big.to_str().unwrap(),
+        ))
+        .unwrap_err();
+        assert!(err.contains("图片过大"), "实读文案: {err}");
+        assert!(err.contains("8 MiB"), "上限要写清楚: {err}");
+
+        // 不在白名单里的扩展名照旧被拒（原有行为不变）
+        let bad = dir.join("x.bmp");
+        std::fs::write(&bad, b"bmp").expect("write bad");
+        let err = AstralClient::image_meta(bad.to_str().unwrap(), "avatar").unwrap_err();
+        assert!(err.contains("暂不支持的图片格式"), "格式文案: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

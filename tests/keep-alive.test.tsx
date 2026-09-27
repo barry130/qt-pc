@@ -5,7 +5,7 @@
  * （如歌单广场的分类筛选）都保留，切回来不重新拉接口。
  */
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render } from "@testing-library/react";
+import { fireEvent, render, waitFor } from "@testing-library/react";
 
 const api = vi.hoisted(() => ({
   categories: 0,
@@ -67,9 +67,11 @@ describe("一级页面 keep-alive", () => {
   it("切 tab 保留数据与分类：回到歌单广场仍是原分类，且不重新拉接口", async () => {
     const { KeepAliveOutlet } = await import("@/components/layout/KeepAliveOutlet");
     const { container, rerender } = render(<KeepAliveOutlet pathname="/playlists" />);
+    // 一级页面本身是懒加载的（lib/lazyPage）：首帧先是 Suspense 占位，
+    // 对应 chunk 到位后才是真实页面。这里必须等它出现，不能只等固定时长。
+    await waitFor(() => expect(container.textContent).toContain("歌单广场"));
     await flush();
 
-    expect(container.textContent).toContain("歌单广场");
     expect(api.categories).toBe(1);
 
     // 切到「摇滚」
@@ -83,6 +85,9 @@ describe("一级页面 keep-alive", () => {
 
     // 切到首页：歌单广场仍在 DOM 里（只是隐藏），组件实例没被销毁
     rerender(<KeepAliveOutlet pathname="/" />);
+    // 首页同样懒加载：先等它真的渲染出来，再取推荐次数基线，
+    // 否则它的加载会在下面的断言之间完成、把计数改掉
+    await waitFor(() => expect(container.textContent).toContain("发现音乐"));
     await flush();
     expect(container.textContent).toContain("歌单广场");
     expect(headingBefore?.isConnected).toBe(true);

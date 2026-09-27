@@ -7,40 +7,33 @@
     "（tsconfig 编译选项、vite 构建目标、Cargo 依赖与 profile、NSIS 模板等）留在原文件，",
     "因为那些工具只能读自己的文件名与格式。字段含义见 docs/CONFIG.md。"
   ],
-
   "product": {
     "name": "QuietMusic",
     "displayName": "轻听",
     "identifier": "com.qt.quietmusic"
   },
-
   "version": {
-    "name": "1.0.7",
-    "code": 107
+    "name": "1.0.9",
+    "code": 109
   },
-
   "sourcePack": {
-    "code": 2026092308,
-    "name": "2026.09.23.8",
+    "code": 2026092701,
+    "name": "2026.09.27.1",
     "hostApiVersion": 1
   },
-
   "backend": {
     "dev": "http://localhost:27000/api/v1/",
-    "prod": "http://astral.canace.cn/api/v1/",
+    "prod": "https://astral.canace.cn/api/v1/",
     "active": "prod"
   },
-
   "platform": {
     "android": 1101,
     "ios": 1102,
     "windows": 1103
   },
-
   "feedback": {
     "platform": "windows"
   },
-
   "devServer": {
     "port": 1420,
     "hmrPort": 1421

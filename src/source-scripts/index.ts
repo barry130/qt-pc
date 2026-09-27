@@ -31,9 +31,10 @@ import type {
   ContractPlaylistCategory,
   MusicInfo,
   Source,
-} from "./contract";
+} from "@qt-sources/contract";
 import { engineInvoke, engineResolve, engineSnapshot } from "@/source-engine/client";
 import { rememberPlayUrlLine, rememberPlayUrlMiss } from "./playurl-line";
+import { PER_SOURCE_TIMEOUT_MS, withTimeoutMs } from "@qt-sources/timeout";
 
 // ---------- 引擎调用 ----------
 
@@ -95,7 +96,7 @@ function ensureScript(source: SourceId): void {
 
 // ---------- 契约 ↔ App 模型映射 ----------
 
-function toAppTrack(item: MusicInfo, platform: SourceId): Track {
+export function toAppTrack(item: MusicInfo, platform: SourceId): Track {
   return {
     id: item.id,
     platform,
@@ -474,7 +475,16 @@ export async function getAllLatestSongs(
     sources.map(async (source) => {
       const pageOffset = source === "wyy" || source === "kg" ? offset : 0;
       try {
-        return { source, list: await getLatestSongs(source, perSource, pageOffset) };
+        return {
+          source,
+          // 单项超时：一个平台挂死不该让"最新音乐"整块等到客户端 20s 上限。
+          // 超时按"该源本次失败"处理（空列表），其余三源的结果照常交错展示。
+          list: await withTimeoutMs(
+            getLatestSongs(source, perSource, pageOffset),
+            PER_SOURCE_TIMEOUT_MS,
+            `${source} 最新`,
+          ),
+        };
       } catch {
         return { source, list: [] as Track[] };
       }

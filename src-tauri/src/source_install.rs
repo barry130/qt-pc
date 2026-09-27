@@ -9,6 +9,8 @@
 //!   让新包在主窗口侧也彻底生效（坏包冒烟失败则不重启，走回退）；
 //! - `source_rollback_builtin`：删除 installed 记录（目录保留作证据），
 //!   引擎页读不到 installed 即回退主窗口内置层；
+//! - `demote_stale_installed`：内置包比已装远程包新时把旧包降级为 previous，
+//!   内置版直接生效（与安卓端 demoteStaleInstalled 同一套方案）；
 //! - `source_mark_bad` / `source_report`：冒烟失败登记 + 装载结果上报后端。
 //!
 //! 网络下载走 `cmd_builtin_request` 同款 source_builtin_request（统一 UA /
@@ -22,7 +24,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::astral;
 use crate::commands::{source_builtin_request, SourceRequestOptions};
-use crate::{source_bundle, source_window};
+use crate::{source_bundle, source_window, AppState};
 
 /// 音源包宿主契约版本（§2.2 hostApiVersion：1 = {request, chain kind:
 /// lx/http/bundle, verifyPlayable}）。bundle 要求更高时拒绝加载。
@@ -73,6 +75,40 @@ pub(crate) fn save_state(dir: &Path, state: &SourceBundleState) -> Result<(), St
 /// install/<code>/ 目录（code 转十进制串；白名单字符，杜绝路径注入）
 fn install_dir(dir: &Path, code: i64) -> PathBuf {
     dir.join("install").join(code.to_string())
+}
+
+/// 内置包比已装远程包还新时（升级应用后常见），把旧远程包降级为回退目标
+/// （installed → previous 平移，文件不动），让内置版直接生效。
+///
+/// 与安卓端 `qt-uniappx/services/source-bundle-fs.uts` 的 demoteStaleInstalled
+/// 同一套方案。不降级的话旧包会以 installed 身份继续出现在设置页（显示成
+/// 「当前音源包」）、被更新检查当基线（对着已过时的版本反复提更新）；引擎页
+/// 虽有「谁新用谁」兜底，但状态层面应保持一致。幂等：重复调用无副作用。
+///
+/// 返回 true 表示发生了降级。
+pub(crate) fn demote_stale_installed(dir: &Path, builtin_code: i64) -> bool {
+    let mut state = load_state(dir);
+    let Some(installed) = state.installed.clone() else {
+        return false;
+    };
+    if installed.source_version_code >= builtin_code {
+        return false;
+    }
+    state.previous = Some(installed);
+    state.installed = None;
+    match save_state(dir, &state) {
+        Ok(()) => {
+            log::info!(
+                "[source-bundle] 内置包（code {builtin_code}）新于已装远程包（code {}），已切回内置版生效",
+                state.previous.as_ref().map(|p| p.source_version_code).unwrap_or_default()
+            );
+            true
+        }
+        Err(e) => {
+            log::warn!("[source-bundle] 降级旧远程包写状态失败: {e}");
+            false
+        }
+    }
 }
 
 // ---------- manifest 解析（QtRestResp 包装响应，data 字段与 QtSourceManifestVo 对齐） ----------
@@ -168,6 +204,9 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for QtRestRespEnvelope<T> {
 #[tauri::command(rename = "source_state")]
 pub async fn cmd_source_state(app: AppHandle) -> Result<Value, String> {
     let dir = source_bundle::bundle_dir(&app);
+    // 读取前先对齐「内置版新于已装包」的降级（幂等）：设置页、引擎页、前端
+    // 更新检查都从这里拿事实，旧包不该再以 installed 身份出现
+    demote_stale_installed(&dir, crate::app_config::SOURCE_PACK_CODE);
     let state = load_state(&dir);
     serde_json::to_value(&state).map_err(|e| e.to_string())
 }
@@ -178,15 +217,23 @@ fn app_version_code() -> i64 {
 }
 
 /// 拉取 manifest（免认证；响应为 QtRestResp 包装：{code, data: SourceManifest}；由 cmd_source_manifest 调用）
-async fn fetch_manifest() -> Result<Option<SourceRelease>, String> {
-    let client = astral::AstralClient::new(astral::DEFAULT_BASE_URL);
+/// 登录态下附带 satoken（最近登录用户用于识别测试人群，与 app/update 一致）。
+async fn fetch_manifest(astral: &astral::AstralClient) -> Result<Option<SourceRelease>, String> {
     let url = format!(
-        "{}/app/source/manifest?platform=1103&appVersionCode={}&hostApiVersion={}&channel=stable",
-        client.base_url().trim_end_matches('/'),
+        "{}/app/source/manifest?platform=1103&appVersionCode={}&hostApiVersion={}",
+        astral.base_url().trim_end_matches('/'),
         app_version_code(),
         HOST_API_VERSION,
     );
-    let res = source_builtin_request(&url, None).await?;
+    let options = SourceRequestOptions {
+        method: None,
+        headers: astral
+            .token()
+            .map(|t| std::collections::HashMap::from([("satoken".to_string(), t)])),
+        body: None,
+        timeout_ms: None,
+    };
+    let res = source_builtin_request(&url, Some(&options)).await?;
     if res.status_code == 304 {
         return Ok(None);
     }
@@ -212,14 +259,19 @@ async fn fetch_manifest() -> Result<Option<SourceRelease>, String> {
 
 /// 手动/自动检查共用：拉 manifest 并返回远端 release（无发布 = null）
 #[tauri::command(rename = "source_manifest")]
-pub async fn cmd_source_manifest() -> Result<Option<SourceRelease>, String> {
-    fetch_manifest().await
+pub async fn cmd_source_manifest(
+    state: tauri::State<'_, AppState>,
+) -> Result<Option<SourceRelease>, String> {
+    fetch_manifest(&state.astral).await
 }
 
 /// 单文件下载（bytes）；失败返回 Err
 async fn download_file(url: &str, timeout_ms: u64) -> Result<Vec<u8>, String> {
+    // 音源包下载下来会被引擎 load 成脚本执行，所以只接受"https 或自有 CDN"。
+    //（source_builtin_request 内部还会再挡一次内网/非 http 协议。）
+    let checked = crate::net_guard::ensure_trusted_download_url(url)?;
     let res = source_builtin_request(
-        url,
+        checked.as_str(),
         Some(&SourceRequestOptions {
             method: Some("GET".to_string()),
             headers: None,
@@ -235,6 +287,36 @@ async fn download_file(url: &str, timeout_ms: u64) -> Result<Vec<u8>, String> {
         Value::String(s) => Ok(s.into_bytes()),
         other => serde_json::to_vec(&other).map_err(|e| e.to_string()),
     }
+}
+
+/// 把 manifest 给的相对路径安全地拼到安装目录下。
+///
+/// `artifact.path` 与 `artifact.url` 同出一份**远端** manifest，而原实现直接
+/// `target.join(&artifact.path)`：绝对路径、盘符、`..`、以及 Windows 下同样是
+/// 分隔符的反斜杠都没有防护，一个 `..\..\..\Windows\System32\x.dll` 就能写到
+/// 安装目录之外（同仓 `qtres.rs` 的 `/script` 分发早就有段名白名单，这里没有）。
+/// 现在只放行"若干个普通路径段"。
+fn safe_artifact_path(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    if rel.is_empty() {
+        return Err("artifact.path 为空".to_string());
+    }
+    if rel.contains('\\') {
+        return Err(format!("artifact.path 不允许包含反斜杠：{rel}"));
+    }
+    if rel.contains(':') {
+        return Err(format!("artifact.path 不允许包含盘符：{rel}"));
+    }
+    if rel.starts_with('/') {
+        return Err(format!("artifact.path 不允许是绝对路径：{rel}"));
+    }
+    let mut out = root.to_path_buf();
+    for seg in rel.split('/') {
+        if seg.is_empty() || seg == "." || seg == ".." {
+            return Err(format!("artifact.path 含非法路径段：{rel}"));
+        }
+        out.push(seg);
+    }
+    Ok(out)
 }
 
 /// 下载并安装音源包（§2.3 判定第 6 步的执行端）：
@@ -274,7 +356,7 @@ pub async fn cmd_source_install(app: AppHandle, release: SourceRelease) -> Resul
     for artifact in &release.artifacts {
         files.insert(artifact.path.clone(), artifact.version);
         // 已有同名同版本文件（上一次装到一半 / 同 code 重装）跳过
-        let local = target.join(&artifact.path);
+        let local = safe_artifact_path(&target, &artifact.path)?;
         let same_version = state
             .installed
             .as_ref()
@@ -480,6 +562,44 @@ mod tests {
     }
 
     #[test]
+    fn demote_stale_installed_shifts_to_previous() {
+        let tmp = std::env::temp_dir().join(format!("ll-src3-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let rel = |code: i64| InstalledRelease {
+            source_version_code: code,
+            dir: code.to_string(),
+            files: std::collections::BTreeMap::new(),
+            source_version_name: code.to_string(),
+        };
+        let builtin = 2026092602i64;
+        // 装了旧于内置版的包：降级为 previous，installed 清空（与安卓 demoteStaleInstalled 一致）
+        let mut st = SourceBundleState::default();
+        st.installed = Some(rel(2026092301));
+        st.bad = vec![2026091701];
+        save_state(&tmp, &st).unwrap();
+        assert!(demote_stale_installed(&tmp, builtin));
+        let back = load_state(&tmp);
+        assert!(back.installed.is_none());
+        assert_eq!(back.previous.as_ref().unwrap().source_version_code, 2026092301);
+        assert_eq!(back.bad, vec![2026091701], "黑名单不受降级影响");
+        // 幂等：installed 已空，再跑不变
+        assert!(!demote_stale_installed(&tmp, builtin));
+        let back = load_state(&tmp);
+        assert!(back.installed.is_none());
+        assert_eq!(back.previous.as_ref().unwrap().source_version_code, 2026092301);
+        // 已装包不旧于内置版（同号/更新）：不降级，previous 也不动
+        let mut st = SourceBundleState::default();
+        st.installed = Some(rel(2026092603));
+        st.previous = Some(rel(2026092602));
+        save_state(&tmp, &st).unwrap();
+        assert!(!demote_stale_installed(&tmp, builtin));
+        let back = load_state(&tmp);
+        assert_eq!(back.installed.as_ref().unwrap().source_version_code, 2026092603);
+        assert_eq!(back.previous.as_ref().unwrap().source_version_code, 2026092602);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn manifest_parses_backend_shape() {
         // 响应外层是 QtRestResp 包装；data 才与 astral QtSourceManifestVo/QtSourceReleaseVo 对齐（camelCase）
         let raw = r#"{
@@ -578,5 +698,38 @@ mod tests {
         );
         // 负数/0 也只是普通十进制串，不产生 ".." 等危险段
         assert_eq!(install_dir(base, -1), PathBuf::from("/tmp/x/install/-1"));
+    }
+
+    #[test]
+    fn artifact_path_cannot_escape_install_dir() {
+        let root = Path::new("/tmp/x/install/2026091801");
+        // 正常形态（manifest 里实际就是这两个）照旧可用
+        assert_eq!(
+            safe_artifact_path(root, "chain.json").unwrap(),
+            root.join("chain.json")
+        );
+        assert_eq!(
+            safe_artifact_path(root, "dist/source-bundle.js").unwrap(),
+            root.join("dist").join("source-bundle.js")
+        );
+        for bad in [
+            "../evil.dll",
+            "..\\..\\evil.dll",
+            "a/../../evil.dll",
+            "a/..",
+            "/abs/evil.dll",
+            "C:/Windows/evil.dll",
+            "C:\\Windows\\evil.dll",
+            "\\\\server\\share\\evil.dll",
+            "",
+            "a//b",
+            "./a",
+            "a/./b",
+        ] {
+            assert!(
+                safe_artifact_path(root, bad).is_err(),
+                "{bad:?} 属于危险路径，应被拒绝"
+            );
+        }
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "quietmusic"
-version = "1.0.7"
+version = "1.0.9"
 description = "轻听 PC 版 - 轻量级桌面聚合音乐播放器"
 authors = ["QuietMusic"]
 edition = "2021"
@@ -16,12 +16,14 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
+# 系统通知（Windows toast 等）：自动切歌熔断发生在后台，应用内错误条看不到
+tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "blocking"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "blocking", "multipart"] }
 # 0.22 起 Decoder::builder().with_byte_len() 会把总字节数透传给 symphonia 的
 # MediaSource，FLAC 的二分定位不再因 byte_len 缺失而报 Unseekable（进度条拖拽修复）
 rodio = { version = "0.22.2", features = ["symphonia-all"] }
@@ -51,6 +53,7 @@ windows = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_System_Com",
     "Win32_System_Registry",
+    "Win32_UI_Accessibility",
     "Win32_UI_HiDpi",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
@@ -63,5 +66,9 @@ incremental = true
 codegen-units = 1
 lto = true
 opt-level = "s"
-panic = "abort"
+# 这里原本是 panic = "abort"。本项目有 400+ 处 unwrap/expect，"abort" 会把
+# 「某条命令拿到意外数据」直接变成**无提示的进程闪退**（日志都来不及刷），
+# 前端只能看到应用凭空消失。改回默认 unwind 后：命令级 panic 由 Tauri 兜成
+# 一次 invoke 失败（前端能弹出错误），音频线程另有 catch_unwind 兜底。
+# 代价是二进制略大（unwind 表），相对"闪退变报错"完全可以接受。
 strip = true

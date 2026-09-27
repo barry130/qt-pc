@@ -5,6 +5,7 @@ import type { DownloadTask } from "@/types";
 import * as ipc from "@/services/ipc";
 import { useDownloadsStore } from "@/stores/downloads";
 import { BatchDeleteButton, RowActions } from "@/components/common/RowActions";
+import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 
 const STATUS_LABEL: Record<DownloadTask["status"], string> = {
   pending: "等待中",
@@ -64,11 +65,18 @@ export function DownloadsPage(): React.JSX.Element {
   const hasActive = tasks.some(
     (t) => t.status === "downloading" || t.status === "pending",
   );
+  // 本页常驻缓存（挂载后不再卸载）：轮询必须跟「可见性」绑定，否则用户切到
+  // 别的页面后它照样每秒打一次 IPC；同时切回来要立刻刷新一次状态。
+  const active = useKeepAliveActive();
   useEffect(() => {
-    if (!hasActive) return;
+    if (!active) return;
+    void refresh();
+  }, [active, refresh]);
+  useEffect(() => {
+    if (!active || !hasActive) return;
     const timer = window.setInterval(() => void refresh(), 1000);
     return () => window.clearInterval(timer);
-  }, [hasActive, refresh]);
+  }, [active, hasActive, refresh]);
 
   // 任务被删除 / 清空后，选择集里不能留下已不存在的 id（否则批量删除计数对不上）
   useEffect(() => {

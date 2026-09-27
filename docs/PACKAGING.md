@@ -20,12 +20,20 @@
    ```
 2. **配置已同步**：`pnpm config:check`（版本号等只在仓库根 `app.config.json` 改一处，
    见《配置文档》）。发版前确认 `version.name` 与 `version.code` 已一起改。
-3. 验证基线全绿（可选但建议）：
+3. **启动 crates 镜像代理**（仅当 cargo 需要联网拉索引/tarball 时必需）：
    ```powershell
-   pnpm tsc --noEmit; pnpm vitest run
+   node tools/registry-proxy.mjs   # 保持运行；构建完成可停
+   ```
+   `src-tauri/.cargo/config.toml` 把 crates.io 替换为 `127.0.0.1:8650` 的本地 HTTP
+   镜像（本机 schannel TLS 损坏，cargo 的 HTTPS 下载栈不可用）。代理没起时
+   构建报 `local-mirror … 连接失败 (os error 10061)`。依赖已全部缓存时
+   `cargo check` 可离线通过，但 release 构建通常触发索引更新，务必先起代理。
+4. 验证基线全绿（可选但建议；本机 `pnpm <script>` 可能被 pnpm 拦，直接调 node 入口，见《配置文档》§7.2）：
+   ```powershell
+   node node_modules/typescript/bin/tsc --noEmit
+   node node_modules/vitest/vitest.mjs run
    # cargo 侧：
    $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
-   $env:CARGO_HOME = "F:\qtMusic\qt-pc\.cargo-home"
    cargo clippy --all-targets -- -D warnings; cargo test
    ```
 
@@ -47,21 +55,27 @@ node node_modules/vite/bin/vite.js build               # 产出 dist/
 
 ```powershell
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
-$env:CARGO_HOME = "F:\qtMusic\qt-pc\.cargo-home"
 Set-Location F:\qtMusic\qt-pc
 pnpm exec tauri build --runner cargo
 ```
+
+> 镜像配置在 `src-tauri/.cargo/config.toml`，`CARGO_HOME` 用默认 `~/.cargo` 即可
+> （仓库根的 `.cargo-home` 已废弃不用）。
 
 **方式 B**：完全手动（等价于 tauri build 的核心动作）：
 
 ```powershell
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
-$env:CARGO_HOME = "F:\qtMusic\qt-pc\.cargo-home"
 Set-Location F:\qtMusic\qt-pc\src-tauri
-cargo build --release --features custom-protocol
+cargo build --release --features tauri/custom-protocol
 ```
 
 > `custom-protocol` 特性是 Tauri 生产模式的关键（内嵌 dist 资源）。
+> **注意必须写成 `tauri/custom-protocol`**：Tauri 2 里该特性挂在 `tauri` crate 上
+> （`tauri = { features = ["custom-protocol"] }` → `tauri-macros/custom-protocol`），
+> 本项目 `Cargo.toml` 并没有自己声明 `custom-protocol` 特性，
+> 所以写裸名 `--features custom-protocol` 会直接报
+> `the package 'quietmusic' does not contain this feature: custom-protocol`。
 > 方式 B 只出主程序，不出 NSIS 安装包；需要安装包时用方式 A
 > （NSIS 由 tauri-build 驱动 makensis 完成）。
 

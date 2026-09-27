@@ -4,7 +4,7 @@ import { useUpdateStore } from "@/stores/update";
 
 /**
  * 启动自动检查更新（§15.3）：
- * - 节流：settings `update.lastCheckAt`，4 小时一次（手动检查不受限）；
+ * - 每次启动都检查一次（无节流；手动检查同样无条件查一次）；
  * - 结果进全局 store：弹窗组件据此渲染（updateType=1 或 isForce 弹窗、2 红点）；
  * - 失败静默（后端没起 / 未登录都不打扰用户）。
  */
@@ -15,15 +15,7 @@ export function useUpdateCheck(): void {
   useEffect(() => {
     void (async () => {
       try {
-        const last = await ipc.getSetting("update.lastCheckAt").catch(() => null);
-        const lastMs = Number(last ?? 0);
-        if (Number.isFinite(lastMs) && Date.now() - lastMs < 4 * 3600 * 1000) {
-          return;
-        }
         await runCheck(setUpdate, setOfficialValid);
-        await ipc
-          .setSetting("update.lastCheckAt", String(Date.now()))
-          .catch(() => {});
       } catch {
         // 检查失败不打扰
       }

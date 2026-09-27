@@ -94,6 +94,16 @@ export async function getLocalTracks(): Promise<Track[]> {
   return invoke("get_local_tracks");
 }
 
+/** 本地曲目的文件大小 / 修改时间（供按大小、修改时间排序） */
+export interface LocalTrackFileMeta {
+  id: string;
+  fileSize: number;
+  mtime: number;
+}
+export async function getLocalTrackFiles(): Promise<LocalTrackFileMeta[]> {
+  return invoke("get_local_track_files");
+}
+
 /** 缺失的本地曲目（扫描后文件已不在），供本地曲库体检用 */
 export async function getMissingLocalTracks(): Promise<Track[]> {
   return invoke("get_missing_local_tracks");
@@ -301,6 +311,11 @@ export async function removeTrackFromPlaylist(
 
 /** 「默认下载音质」在 settings 表里的键 */
 const DOWNLOAD_QUALITY_KEY = "downloadQuality";
+/** 「下载文件名格式」在 settings 表里的键（artist=歌手-歌名，song=歌名-歌手） */
+const DOWNLOAD_NAME_FORMAT_KEY = "downloadNameFormat";
+
+/** 下载文件名格式：artist = 歌手-歌名（默认），song = 歌名-歌手 */
+export type DownloadNameFormat = "artist" | "song";
 
 export async function startDownload(
   track: Track,
@@ -392,6 +407,17 @@ export async function setDownloadQuality(quality: Quality): Promise<void> {
   await setSetting(DOWNLOAD_QUALITY_KEY, quality);
 }
 
+/** 默认下载文件名格式（settings 表 downloadNameFormat，缺省 artist=歌手-歌名） */
+export async function getDownloadNameFormat(): Promise<DownloadNameFormat> {
+  const v = await getSetting(DOWNLOAD_NAME_FORMAT_KEY);
+  return v === "song" ? "song" : "artist";
+}
+
+/** 设置里的默认下载文件名格式：新开始的下载按此命名 */
+export async function setDownloadNameFormat(format: DownloadNameFormat): Promise<void> {
+  await setSetting(DOWNLOAD_NAME_FORMAT_KEY, format);
+}
+
 /** 默认播放音质（设置页）：写 settings，重启后保持，并对当前曲目立即生效 */
 export async function setDefaultQuality(quality: Quality): Promise<void> {
   return invoke("set_default_quality", { quality });
@@ -416,8 +442,15 @@ export async function astralRegister(
   password: string,
   passwordConfirm: string,
   email?: string,
+  nickname?: string,
 ): Promise<AuthSession> {
-  return invoke("astral_register", { username, password, passwordConfirm, email });
+  return invoke("astral_register", {
+    username,
+    password,
+    passwordConfirm,
+    email,
+    nickname,
+  });
 }
 
 export async function astralLogout(): Promise<void> {
@@ -461,7 +494,13 @@ export async function sourceRollbackBuiltin(): Promise<void> {
   return invoke("source_rollback_builtin");
 }
 
-/** 发邮箱验证码（注册 / 找回密码共用） */
+/**
+ * 发邮箱验证码。
+ *
+ * 邮件模板业务标识（scene）由 Rust 侧持有，前端不传：后端把它**同时**当模板编码
+ * （sys_mail_template.template_code）和验证码的存取 key（`qt:email:code:{email}:{scene}`），
+ * 传错会既发不出信、又让 changePass 永远校验不过。
+ */
 export async function astralSendEmailCode(email: string): Promise<unknown> {
   return invoke("astral_send_email_code", { email });
 }
@@ -478,6 +517,61 @@ export async function astralUpdateProfile(
   patch: Record<string, unknown>,
 ): Promise<unknown> {
   return invoke("astral_update_profile", { patch });
+}
+
+// ---------- 媒体直传（UPDATE_DESIGN.md §5.2/§5.3） ----------
+//
+// 文件正文不经过 Astral 服务器：Rust 侧取凭证后直传存储端再回执登记。
+// CSP 不放开外部域名，直传必须落在 Rust（见 src-tauri/src/astral.rs）。
+
+/** 打开系统「选择图片」对话框（png/jpg/webp）；用户取消返回 null */
+export async function pickImage(title = "选择图片"): Promise<string | null> {
+  const result = await invoke<string | string[] | null>("plugin:dialog|open", {
+    options: {
+      directory: false,
+      multiple: false,
+      title,
+      filters: [{ name: "图片", extensions: ["png", "jpg", "jpeg", "webp"] }],
+    },
+  });
+  return Array.isArray(result) ? (result[0] ?? null) : result;
+}
+
+/** 头像上传一条龙，返回新头像 URL（URL 即版本，天然破缓存） */
+export async function astralUploadAvatar(
+  filePath: string,
+): Promise<{ url: string }> {
+  return invoke("astral_upload_avatar", { filePath });
+}
+
+/** 在线歌单封面上传，返回新封面 URL */
+export async function astralUploadPlaylistCover(
+  pid: string,
+  platform: string,
+  filePath: string,
+): Promise<{ url: string }> {
+  return invoke("astral_upload_playlist_cover", { pid, platform, filePath });
+}
+
+/** 清除在线歌单封面（回到默认本地资源） */
+export async function astralClearPlaylistCover(
+  pid: string,
+  platform: string,
+): Promise<void> {
+  return invoke("astral_clear_playlist_cover", { pid, platform });
+}
+
+/** 设置本地自建歌单封面：选中的图片复制进应用数据目录并登记，返回封面文件路径 */
+export async function setPlaylistCover(
+  pid: string,
+  filePath: string,
+): Promise<string> {
+  return invoke("set_playlist_cover", { pid, filePath });
+}
+
+/** 读本地歌单封面文件，转 data URL；未设置或读不到返回 null */
+export async function getPlaylistCover(pid: string): Promise<string | null> {
+  return invoke("get_playlist_cover", { pid });
 }
 
 // ---------- 听歌统计（DESIGN §5.3） ----------

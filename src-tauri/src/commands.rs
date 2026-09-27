@@ -19,12 +19,12 @@ use crate::db::store::{DownloadTask, HistoryItem, PlaylistSummary};
 
 // ---------- 音源脚本内置方法（插件化方案 v3 · 试点） ----------
 //
-// 音源脚本包（src/source-scripts/）不含 HTTP 实现，由本命令作为唯一内置
+// 音源脚本包（独立工程 ../qt-sources）不含 HTTP 实现，由本命令作为唯一内置
 // request 执行：URL/请求头/请求体全由脚本拼装（对齐蓝本 http.ts 的
 // makeHeaders/directRequest 职责划分），本命令只负责发出请求并回传
 // 状态码/响应头/已解析的 body。前端不直接发外部网络（CSP 不变）。
 
-/// 音源脚本的请求选项（前端 host-request.ts 以 camelCase 传入）
+/// 音源脚本的请求选项（前端以 camelCase 传入；引擎页注入 bundle 的 request）
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceRequestOptions {
@@ -34,7 +34,7 @@ pub struct SourceRequestOptions {
     pub timeout_ms: Option<u64>,
 }
 
-/// 音源脚本的响应（契约见 src/source-scripts/contract.ts）
+/// 音源脚本的响应（契约见 ../qt-sources/src/contract.ts）
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SourceResponse {
@@ -43,6 +43,13 @@ pub struct SourceResponse {
     /// JSON 响应为已解析值；非 JSON 为字符串
     pub body: serde_json::Value,
 }
+
+/// builtin_request 允许的请求方法（脚本只会用到这些；CONNECT/TRACE 之类没有正当用途）
+const ALLOWED_REQUEST_METHODS: [&str; 7] =
+    ["GET", "POST", "PUT", "DELETE", "HEAD", "OPTIONS", "PATCH"];
+
+/// 单次响应正文的上限：脚本可能被诱导去拉一个巨大文件，而正文是一次性读进内存的
+const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// 内置 HTTP 客户端：桌面浏览器 UA 兜底（各平台特殊头由脚本按需覆盖）
 fn source_builtin_client() -> &'static reqwest::Client {
@@ -60,17 +67,24 @@ pub(crate) async fn source_builtin_request(
     url: &str,
     options: Option<&SourceRequestOptions>,
 ) -> Result<SourceResponse, String> {
+    // 音源脚本可能来自第三方音源包，URL 由脚本自己拼装：先把"本机能被指使去访问什么"
+    // 收敛到公网 http(s)。原实现原样发出去，脚本可以让本机去打 127.0.0.1 的端口
+    // （拿本机服务当跳板）、云元数据地址 169.254.169.254，或直接用 file: 读本地文件。
+    let target = crate::net_guard::ensure_public_http_url(url)?;
     let method = options
         .and_then(|o| o.method.as_deref())
         .unwrap_or("GET")
         .to_uppercase();
+    if !ALLOWED_REQUEST_METHODS.contains(&method.as_str()) {
+        return Err(format!("不支持的请求方法 {method}"));
+    }
     let timeout = std::time::Duration::from_millis(
         options.and_then(|o| o.timeout_ms).unwrap_or(15_000),
     );
     let mut req = source_builtin_client()
         .request(
             reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?,
-            url,
+            target.as_str(),
         )
         .timeout(timeout);
     if let Some(headers) = options.and_then(|o| o.headers.as_ref()) {
@@ -85,6 +99,12 @@ pub(crate) async fn source_builtin_request(
         .send()
         .await
         .map_err(crate::astral::sanitize_err)?;
+    // 正文是一次性读进内存的：先按 content-length 拦一次超大响应
+    if let Some(len) = res.content_length() {
+        if len > MAX_RESPONSE_BYTES {
+            return Err(format!("响应过大（{len} 字节），已拒绝"));
+        }
+    }
     let status = res.status().as_u16();
     let mut headers = std::collections::HashMap::new();
     for (name, value) in res.headers() {
@@ -559,22 +579,9 @@ fn default_appearance() -> serde_json::Value {
 // ---------- Astral：更新 / 消息 / 统计 / 反馈（DESIGN §15） ----------
 // 平台参数固定：type=1103、channel=pc、ut=app-windows、X-Platform: windows（§15.2）
 
-/// 从 settings 表读更新通道（§15.5 默认 stable）
-fn update_channel(db: &Option<std::sync::Arc<crate::db::Database>>) -> String {
-    db.as_ref()
-        .and_then(|db| db.with(|c| crate::db::store::get_setting(c, "update_channel")).ok())
-        .flatten()
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "stable".to_string())
-}
-
 #[tauri::command(rename = "astral_app_update")]
 pub async fn cmd_astral_app_update(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let channel = update_channel(&state.db);
-    state
-        .astral
-        .app_update(crate::astral::version_code(), &channel)
-        .await
+    state.astral.app_update(crate::astral::version_code()).await
 }
 
 #[tauri::command(rename = "astral_check_official_version")]
@@ -615,19 +622,33 @@ pub async fn cmd_download_update_file(
     file_size: Option<i64>,
 ) -> Result<String, String> {
     let http_client = state.astral.http();
-    let result =
-        crate::astral::AstralClient::download_update_file(&http_client, &url, &app).await;
+    // 安装包会被本机执行，所以先审"从哪下"：协议、是否公网、明文链路是否可以接受
+    //（后端给了 MD5 或目标是自有 CDN 才允许明文 —— 见 net_guard 的规则说明）
+    let has_hash = md5.as_deref().is_some_and(|s| !s.trim().is_empty());
+    let checked = crate::net_guard::ensure_installer_url(&url, has_hash)?;
+    let result = crate::astral::AstralClient::download_update_file(
+        &http_client,
+        checked.as_str(),
+        &app,
+    )
+    .await;
     let path = match result {
         Ok(p) => p,
         Err(first_err) => {
             // 加速链接失败且原始 GitHub 链接和它不同 → 降级直链重试
             //（拼前缀的链接失败几乎都是加速节点劣化；直链本身失败时重试同样没坏处）
-            let original = crate::astral::AstralClient::strip_accel_prefix(&url);
-            if original != url {
+            let original_raw = crate::astral::AstralClient::strip_accel_prefix(&url);
+            if original_raw != url {
+                let original =
+                    crate::net_guard::ensure_installer_url(&original_raw, has_hash)?;
                 log::warn!("[update] 加速下载失败（{first_err}），降级原始直链重试");
-                crate::astral::AstralClient::download_update_file(&http_client, &original, &app)
-                    .await
-                    .map_err(|e| format!("加速链接与原始直链均失败：{e} / {first_err}"))?
+                crate::astral::AstralClient::download_update_file(
+                    &http_client,
+                    original.as_str(),
+                    &app,
+                )
+                .await
+                .map_err(|e| format!("加速链接与原始直链均失败：{e} / {first_err}"))?
             } else {
                 return Err(first_err);
             }
@@ -651,10 +672,22 @@ pub async fn cmd_run_update_installer(app: tauri::AppHandle, path: String) -> Re
     use std::os::windows::process::CommandExt;
     // CREATE_NO_WINDOW：不闪控制台
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    // 只允许执行"我们自己刚下载到固定路径"的那个安装包。
+    // path 虽然来自前端的 download_update_file 返回值，但命令入口不能假设调用方诚实：
+    // 命令一旦能执行任意路径 + 传参，就等于把"启动本机任意程序"开放出去
+    //（这也是 ipc_guard 里必须把本命令挡在音源引擎窗口之外的原因）。
+    let expected = crate::astral::update_installer_path();
+    let got = std::fs::canonicalize(&path)
+        .map_err(|e| format!("安装包路径无效（{path}）：{e}"))?;
+    let want = std::fs::canonicalize(&expected)
+        .map_err(|e| format!("更新临时目录里没有安装包（{}）：{e}", expected.display()))?;
+    if got != want {
+        return Err(format!("拒绝执行非更新安装包：{}", got.display()));
+    }
     // 直接 spawn 安装器。不能走 `cmd /C start`：实测 start 会把 `/UPDATE`
     // 当成自己的路径参数吞掉（转成 `E:/Git/UPDATE`），安装器收不到就
     // 走全新安装流程（「先卸载再安装」维护页）。
-    std::process::Command::new(&path)
+    std::process::Command::new(&got)
         .arg("/UPDATE")
         .creation_flags(CREATE_NO_WINDOW)
         .spawn()
@@ -668,16 +701,44 @@ pub async fn cmd_run_update_installer(app: tauri::AppHandle, path: String) -> Re
 }
 
 /// 用系统默认浏览器打开链接（更新页 browserUrl 兜底）。
+///
+/// 原来走 `cmd /C start "" <url>`：URL 是被**拼进命令行**的，`&`、`^`、引号都能
+/// 变成第二条命令（命令注入）。改用 `ShellExecuteW` 直接调 ShellExecute，
+/// 不经过任何 shell；同时把协议收敛到 http/https（挡掉 `file:` / 自定义协议）。
 #[tauri::command(rename = "run_update_browser")]
 pub async fn cmd_run_update_browser(url: String) -> Result<(), String> {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    std::process::Command::new("cmd")
-        .args(["/C", "start", "", &url])
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map_err(|e| format!("打开浏览器失败: {e}"))?;
-    Ok(())
+    let target = crate::net_guard::ensure_http_url(&url)?;
+    #[cfg(target_os = "windows")]
+    {
+        use windows::core::{HSTRING, PCWSTR};
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let op = HSTRING::from("open");
+        let file = HSTRING::from(target.as_str());
+        // SAFETY: 两个 PCWSTR 都在本调用期间有效（HSTRING 是自有缓冲），
+        // ShellExecuteW 只在调用内读取它们，不保留引用。
+        let ret = unsafe {
+            ShellExecuteW(
+                None,
+                &op,
+                &file,
+                PCWSTR::null(),
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        // 该 API 的约定：返回值 <= 32 表示失败（32 以后的整数才是成功句柄）
+        if ret.0 as isize <= 32 {
+            return Err(format!("打开浏览器失败（ShellExecuteW 返回 {}）", ret.0 as isize));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = target;
+        Err("当前平台未实现「用默认浏览器打开链接」".to_string())
+    }
 }
 
 #[tauri::command(rename = "astral_active_messages")]
@@ -933,6 +994,21 @@ pub async fn cmd_get_local_tracks(state: State<'_, AppState>) -> Result<Vec<Trac
     })
     .await
     .map_err(|e| format!("读取本地曲目失败: {e}"))?
+}
+
+/// 读本地曲目的文件大小 / 修改时间（供按大小、修改时间排序）。
+#[tauri::command(rename = "get_local_track_files")]
+pub async fn cmd_get_local_track_files(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::db::store::LocalTrackFileMeta>, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(Vec::new());
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(crate::db::store::query_local_track_files)
+    })
+    .await
+    .map_err(|e| format!("读取本地曲目文件属性失败: {e}"))?
 }
 
 /// 读缺失的本地曲目（扫描后文件已不在的记录），供本地曲库「体检」用。
@@ -1490,6 +1566,117 @@ pub async fn cmd_rename_playlist(
     Ok(())
 }
 
+/// 设置本地自建歌单封面：把选中的图片复制进应用数据目录
+/// （playlist-covers/{pid}.{ext}，覆盖式；扩展名变化时清掉旧文件避免残留），
+/// 再登记 playlists.cover_path，返回封面文件新路径。
+/// 只对本地自建歌单生效；云端卡片 / 在线歌单没有本地封面字段，会拒绝。
+#[tauri::command(rename = "set_playlist_cover")]
+pub async fn cmd_set_playlist_cover(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    pid: String,
+    file_path: String,
+) -> Result<String, String> {
+    // pid 直接拼文件名，先收紧字符集防路径穿越（本地 pid 本就是 [A-Za-z0-9_-]）
+    if pid.is_empty()
+        || pid.len() > 128
+        || !pid
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err("歌单标识非法".to_string());
+    }
+    // 只认 png/jpg/webp（与选择对话框的过滤一致）
+    let ext = std::path::Path::new(&file_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    let mime_ext = match ext.as_str() {
+        "png" => "png",
+        "jpg" | "jpeg" => "jpg",
+        "webp" => "webp",
+        other => return Err(format!("暂不支持的图片格式 .{other}，仅支持 png / jpg / webp")),
+    };
+    let covers_dir = crate::app_paths::data_root(&app).join("playlist-covers");
+    let dest = covers_dir.join(format!("{pid}.{mime_ext}"));
+
+    let (pid_copy, file_path_copy, dest_copy) = (pid.clone(), file_path.clone(), dest.clone());
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::create_dir_all(&covers_dir).map_err(|e| format!("创建封面目录失败: {e}"))?;
+        // 新封面扩展名可能与旧的不同：同 pid 其他扩展名的旧文件一并清掉
+        for old_ext in ["png", "jpg", "webp"] {
+            let old = covers_dir.join(format!("{pid_copy}.{old_ext}"));
+            if old != dest_copy {
+                let _ = std::fs::remove_file(&old);
+            }
+        }
+        std::fs::copy(&file_path_copy, &dest_copy).map_err(|e| format!("复制封面文件失败: {e}"))?;
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| format!("复制封面失败: {e}"))??;
+
+    let Some(db) = state.db.clone() else {
+        return Err("数据库不可用".to_string());
+    };
+    let dest_str = dest.to_string_lossy().to_string();
+    let updated = tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| crate::db::store::set_playlist_cover_path(conn, &pid, &dest_str))
+    })
+    .await
+    .map_err(|e| format!("登记封面失败: {e}"))?
+    .map_err(|e| format!("登记封面失败: {e}"))?;
+    if updated == 0 {
+        // 不是本地自建歌单：清掉刚复制的文件，别留孤儿
+        let _ = std::fs::remove_file(&dest);
+        return Err("只有本地自建歌单可以更换封面".to_string());
+    }
+    Ok(dest.to_string_lossy().to_string())
+}
+
+/// 读本地歌单封面（playlists.cover_path 指向的图片），转 data URL 返回。
+/// 未设置 / 不是本地自建歌单 / 文件已不在，都返回 null（前端回退默认图）。
+#[tauri::command(rename = "get_playlist_cover")]
+pub async fn cmd_get_playlist_cover(
+    state: State<'_, AppState>,
+    pid: String,
+) -> Result<Option<String>, String> {
+    use base64::Engine as _;
+    let Some(db) = state.db.clone() else {
+        return Ok(None);
+    };
+    let path = tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| crate::db::store::playlist_cover_path(conn, &pid))
+    })
+    .await
+    .map_err(|e| format!("读取封面失败: {e}"))?
+    .map_err(|e| format!("读取封面失败: {e}"))?
+    .filter(|p| !p.is_empty());
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = std::fs::read(&path).ok()?;
+        let ext = std::path::Path::new(&path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let mime = match ext.as_str() {
+            "png" => "image/png",
+            "webp" => "image/webp",
+            _ => "image/jpeg",
+        };
+        Some(format!(
+            "data:{mime};base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        ))
+    })
+    .await
+    .map_err(|e| format!("读取封面失败: {e}"))
+}
+
 /// 删除本地歌单（id 参数传歌单 pid）。已登录时上送云端 remove（失败静默）。
 #[tauri::command(rename = "delete_playlist")]
 pub async fn cmd_delete_playlist(state: State<'_, AppState>, id: String) -> Result<(), String> {
@@ -1678,21 +1865,49 @@ fn audio_ext_from_url(url: &str, quality: &str) -> String {
     }
 }
 
-/// 生成不与现有文件冲突的下载路径：`歌手 - 歌名.<ext>`，重名加 (2) (3)…
+/// 读取「下载文件名格式」设置：artist=歌手-歌名（默认），song=歌名-歌手。
+/// 仅影响设置变更后新开始的下载；已存在的任务沿用原保存路径。
+fn download_name_format(state: &AppState) -> String {
+    let v = state
+        .db
+        .clone()
+        .and_then(|db| {
+            db.with(|c| crate::db::store::get_setting(c, "downloadNameFormat"))
+                .ok()
+                .flatten()
+        });
+    match v.as_deref() {
+        Some("song") => "song".to_string(),
+        _ => "artist".to_string(),
+    }
+}
+
+/// 生成不与现有文件冲突的下载路径：`歌手 - 歌名.<ext>`（或按 name_format 反转），重名加 (2) (3)…
 /// 扩展名由取址 URL 决定，避免无损内容被写成 `.mp3`。
+///
+/// `name_format == "song"` 时用 `歌名 - 歌手`，其余（默认 "artist"）用 `歌手 - 歌名`。
 fn unique_download_path(
     dir: &std::path::Path,
     track: &Track,
     quality: &str,
     url: &str,
+    name_format: &str,
 ) -> std::path::PathBuf {
     let ext = audio_ext_from_url(url, quality);
     let base = {
-        let named = format!(
-            "{} - {}",
-            sanitize_file_name(&track.singer),
-            sanitize_file_name(&track.title)
-        );
+        let named = if name_format == "song" {
+            format!(
+                "{} - {}",
+                sanitize_file_name(&track.title),
+                sanitize_file_name(&track.singer)
+            )
+        } else {
+            format!(
+                "{} - {}",
+                sanitize_file_name(&track.singer),
+                sanitize_file_name(&track.title)
+            )
+        };
         let name = if named.trim_matches([' ', '-']).is_empty() {
             // 歌名/歌手全被过滤掉时退回老格式（platform_id_quality）
             format!(
@@ -1925,7 +2140,8 @@ pub async fn cmd_start_download(
             .map_err(|e| format!("取播放地址失败: {e}"))?;
 
     let dir = download_dir(&state)?;
-    let final_path = unique_download_path(&dir, &track, &q_str, &url);
+    let name_fmt = download_name_format(&state);
+    let final_path = unique_download_path(&dir, &track, &q_str, &url, &name_fmt);
     let part_path = download::part_path_for(&final_path);
     let part_str = part_path.to_string_lossy().to_string();
 
@@ -2182,7 +2398,12 @@ async fn launch_download(
             (final_path, PathBuf::from(&p))
         }
         None => {
-            let final_path = unique_download_path(&dir, &track, quality_str(quality), &url);
+            let name_fmt = db
+                .with(|c| crate::db::store::get_setting(c, "downloadNameFormat"))
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| "artist".to_string());
+            let final_path = unique_download_path(&dir, &track, quality_str(quality), &url, &name_fmt);
             let part = download::part_path_for(&final_path);
             (final_path, part)
         }
@@ -2275,10 +2496,17 @@ pub async fn cmd_astral_register(
     password: String,
     password_confirm: String,
     email: Option<String>,
+    nickname: Option<String>,
 ) -> Result<AuthSession, String> {
     let session = state
         .astral
-        .register(&username, &password, &password_confirm, email.as_deref())
+        .register(
+            &username,
+            &password,
+            &password_confirm,
+            email.as_deref(),
+            nickname.as_deref(),
+        )
         .await?;
     persist_session(&state.db, &session).await;
     Ok(session)
@@ -2350,7 +2578,13 @@ pub async fn cmd_astral_session(
     .map(|v| v.and_then(|s| serde_json::from_str::<AuthSession>(&s).ok()))
 }
 
-/// 发邮箱验证码（注册 / 找回密码共用）
+/// 发邮箱验证码（当前唯一场景：邮箱改密码）。
+///
+/// 第二个参数是**邮件模板业务标识**，不是邮件正文。以前这里传的是一句中文文案，
+/// 后端拿它当 template_code 去 sys_mail_template 查模板，必然 MAIL002 发不出信；
+/// 而且验证码按 `qt:email:code:{email}:{scene}` 存，与 changePass 校验用的 scene
+/// 不一致，就算发出去了也校验不过——整条找回密码链路是断的。
+/// scene 由 Rust 侧持有：前端不该知道后端的模板编码。
 #[tauri::command(rename = "astral_send_email_code")]
 pub async fn cmd_astral_send_email_code(
     state: State<'_, AppState>,
@@ -2358,7 +2592,7 @@ pub async fn cmd_astral_send_email_code(
 ) -> Result<serde_json::Value, String> {
     state
         .astral
-        .send_email_code(&email, "【轻听】您正在进行账号操作，请使用邮件中的验证码。")
+        .send_email_code(&email, crate::astral::MAIL_SCENE_CHANGE_PW)
         .await
 }
 
@@ -2381,6 +2615,42 @@ pub async fn cmd_astral_update_profile(
     patch: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
     state.astral.update_profile(patch).await
+}
+
+/// 头像上传（UPDATE_DESIGN.md §5.2）：预检→凭证→直传→登记一条龙，返回头像 URL。
+/// 文件正文不经过 Astral 服务器，这里在 Rust 侧直传存储端（CSP 不放开外部域名）。
+#[tauri::command(rename = "astral_upload_avatar")]
+pub async fn cmd_astral_upload_avatar(
+    state: State<'_, AppState>,
+    file_path: String,
+) -> Result<serde_json::Value, String> {
+    let url = state.astral.upload_avatar_file(&file_path).await?;
+    Ok(serde_json::json!({ "url": url }))
+}
+
+/// 歌单封面上传（UPDATE_DESIGN.md §5.3），返回封面 URL。
+#[tauri::command(rename = "astral_upload_playlist_cover")]
+pub async fn cmd_astral_upload_playlist_cover(
+    state: State<'_, AppState>,
+    pid: String,
+    platform: String,
+    file_path: String,
+) -> Result<serde_json::Value, String> {
+    let url = state
+        .astral
+        .upload_cover_file(&pid, &platform, &file_path)
+        .await?;
+    Ok(serde_json::json!({ "url": url }))
+}
+
+/// 清除歌单封面（回到默认本地资源）。
+#[tauri::command(rename = "astral_clear_playlist_cover")]
+pub async fn cmd_astral_clear_playlist_cover(
+    state: State<'_, AppState>,
+    pid: String,
+    platform: String,
+) -> Result<(), String> {
+    state.astral.cover_clear(&pid, &platform).await
 }
 
 // ---------- 收藏同步（DESIGN §5.3；契约同 qt-uniappx services/like.ts） ----------
@@ -3119,14 +3389,14 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("建临时目录");
 
         let url = "http://kw-er.kuwo.cn/abc/resource/1/trackmedia/F000.flac";
-        let first = unique_download_path(&dir, &sample_track(), "flac", url);
+        let first = unique_download_path(&dir, &sample_track(), "flac", url, "artist");
         assert_eq!(
             first.file_name().and_then(|s| s.to_str()),
             Some("周杰伦 - 晴天.flac")
         );
 
         std::fs::write(&first, b"x").expect("占位");
-        let second = unique_download_path(&dir, &sample_track(), "flac", url);
+        let second = unique_download_path(&dir, &sample_track(), "flac", url, "artist");
         assert_eq!(
             second.file_name().and_then(|s| s.to_str()),
             Some("周杰伦 - 晴天 (2).flac")
@@ -3137,7 +3407,7 @@ mod tests {
 
     /// 音源脚本内置 request 通路验证（真实网络，对齐脚本 wyy 分支的接口）：
     /// 走 builtin_request 发网易歌单列表请求，断言 200 + JSON body 有 playlists。
-    /// 与前端 source-scripts/actions/recommendations.ts 的 wyy 分支共用同一上游。
+    /// 与前端 ../qt-sources/src/actions/recommendations.ts 的 wyy 分支共用同一上游。
     #[tokio::test]
     async fn builtin_request_fetches_wyy_playlist_list() {
         let url = "https://music.163.com/api/playlist/list?cat=%E5%85%A8%E9%83%A8&limit=5&offset=0&total=true";

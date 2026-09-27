@@ -79,6 +79,12 @@
         if (!cfg || typeof cfg.chainRevision !== "number") {
           throw new Error("bundle 链配置解析失败");
         }
+        // chain.json 本地覆盖层：bundle 平台无关（不 import @tauri-apps/api），
+        // 读盘方式由这里注入。必须在取链之前注入，否则首个请求会走内置默认链。
+        if (typeof mod.setChainOverlayReader !== "function") {
+          throw new Error("bundle 缺少 setChainOverlayReader 导出");
+        }
+        mod.setChainOverlayReader(() => invoke("source_chain_overlay"));
         // 数据接口入口（搜索/歌单/歌词/榜单…）注册：主窗口经 kind=invoke 调用，
         // 与安卓端 __qtEntries 同一契约，HTTP 能力同样由 builtin_request 提供
         if (typeof mod.registerQtEntries !== "function") {
