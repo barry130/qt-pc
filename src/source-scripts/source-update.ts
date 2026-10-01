@@ -1,174 +1,170 @@
 /**
- * 播放音源包管理（双音源包架构）。
+ * 统一音源包管理（v3，与 qt-uniappx services/source-update.uts 同口径）。
  *
- * 数据音源包（meta-bundle.js）内嵌随应用发版，不经本模块；本模块只管
- * **播放音源包**（play-bundle.js，高风险、不内置）：
+ * 每个包 = 单文件 js，首行 `__QT_PACK__` 包头自描述身份；数据包（meta）与
+ * 播放包（play）共用同一条安装/更新/启停/卸载管线，只有槽位不同：
  *
- * - `decideUpdate`：纯函数判定（可单测）：远端 release 与本地状态 →
- *   动作（none / need_app_update / download）+ 说明。官方包缺席 → 引导安装
- *   （bootstrap）；已装官方包 → 只做更新；自定义包永远不自动更新；
- * - `checkSourceUpdate`：拉 manifest（Rust source_manifest）+ 判定；
- * - `installSourceRelease`：安装/更新官方播放包（Rust source_install）；
- * - `installSourceFromUrl`：用户粘贴直链安装自定义播放包（custom，不自动更新）；
- * - `activateSourcePack` / `uninstallSourcePack`：多包共存下切换/删除。
+ * - 数据槽 activeMetaId：内置基线永远兜底（null = 基线），数据包可运行时装；
+ * - 播放槽 activeId：播放包不随应用分发，用户安装，多包共存其一生效；
+ * - 更新发现（discoverSourceUpdates）三通道合一（每包 updateUrl 自探测 /
+ *   基线 meta 的 updateUrl / astral manifest），**只提示不自动装**；
+ * - 应用更新（applySourceUpdate）：下载 → 包头与 offer 完全一致 → 安装；
+ *   失败自动回滚并拉黑该版本（Rust source_install.rs 完成）。
  *
- * 安装/切换后 Rust 广播 `source-pack-changed`，引擎页热切换（不重启应用、
- * 不重建引擎窗口），因此没有 apply/rollback 动作；官方包装载失败的自动回退
- * 在 Rust 侧完成（source_pack_load_failed）。
- * manifest 与安装都在 Rust（source_install.rs），这里只做决策与编排，
- * 设置页与启动检查（useSourceUpdateCheck.ts）都走本模块。
+ * 启动检查（useSourceUpdateCheck.ts）与设置页（SettingsPage.tsx）都走本模块；
+ * 逐条确认的启动提示见 components/SourceUpdatePrompt.tsx。
  */
 import * as ipc from "@/services/ipc";
 
-/** 与 Rust SourceRelease serde 对齐（camelCase） */
-export interface SourceArtifactVo {
-  path: string;
-  version: number;
-  url: string;
-}
+/**
+ * 宿主契约版本（与 Rust source_pack_header::HOST_API_VERSION、引擎包
+ * bundleInfo.hostApiVersion 对齐；scripts/sync-config.mjs 从配置同步此值，
+ * 改配置不改这里）。
+ */
+export const HOST_API_VERSION = 1;
 
-export interface SourceReleaseVo {
-  sourceVersionCode: number;
-  sourceVersionName: string;
-  platforms: number[];
-  hostApiVersion: number;
-  channel: string;
-  notes: string;
-  artifacts: SourceArtifactVo[];
-  published: boolean;
-  bad: boolean;
-}
+/** 包类型：meta = 数据包（低风险，内置基线兜底）；play = 播放包（高风险，不内置） */
+export type SourcePackKind = "meta" | "play";
 
-/** 已安装的播放包（与 Rust PlayPackMeta serde 对齐） */
-export interface PlayPackVo {
-  /** official 或 custom-<时间戳> */
+/** 已安装的音源包（与 Rust SourcePackMeta serde 对齐，v3） */
+export interface SourcePackVo {
+  /** 包 id（来自包头 `^[a-z0-9-]{2,32}$`；同时是 install/ 下的目录名） */
   id: string;
-  /** 引擎装配成功后回填的包自述名（自定义包装配前为占位名） */
+  kind: SourcePackKind;
+  /** 展示名（包头自带） */
   name: string;
-  /** 引擎回填的包自述版本（如 chain.11） */
-  version: string;
-  /** official = manifest sourceVersionCode；custom = 0 */
+  /** 版本号（更新判定唯一依据） */
   versionCode: number;
   /** 版本展示名 */
   versionName: string;
-  /** official（自动更新）/ custom（直链安装，不自动更新） */
-  source: "official" | "custom" | string;
-  /** install/ 下的目录名 */
+  /** 自更新探测直链（空 = 不参与自探测通道） */
+  updateUrl: string;
+  /** install/ 下的目录名（= id） */
   dir: string;
   /** 安装时间（unix 秒） */
   installedAt: number;
+  /** 最后变更时间（unix 秒） */
+  updatedAt: number;
+  /** 拉黑过的 versionCode（装载/冒烟失败过，不再自动更新到该版本） */
+  skipCodes: number[];
+  /** 上次 updateUrl 探测时间（4h 节流） */
+  lastProbeAt: number;
 }
 
-/** 与 Rust SourceBundleState serde 对齐（v2） */
+/** 与 Rust SourceBundleState serde 对齐（v3 统一包模型） */
 export interface SourceStateVo {
   schema: number;
-  packs: PlayPackVo[];
-  /** 生效包 id（null = 未选任何包） */
+  packs: SourcePackVo[];
+  /** 播放槽：生效播放包 id（null = 未装） */
   activeId: string | null;
-  /** 冒烟失败的官方 versionCode 黑名单 */
-  bad: number[];
+  /** 数据槽：生效数据包 id（null = 内置基线） */
+  activeMetaId: string | null;
   lastCheckAt: number;
-  /** 官方包装载失败的自动回退快照 */
-  previousOfficial: PlayPackVo | null;
 }
 
-/** 判定结论：不更新 / 需要升级应用 / 可下载（含首装 bootstrap） */
-export type UpdateDecision =
-  | { action: "none"; reason: string }
-  | { action: "need_app_update"; reason: string }
-  | { action: "download"; release: SourceReleaseVo; reason: string };
+/** 更新 offer（发现三通道归一后的统一形状） */
+export interface PackUpdateOfferVo {
+  kind: SourcePackKind;
+  /** 目标包 id */
+  targetId: string;
+  currentCode: number;
+  newCode: number;
+  newName: string;
+  notes: string;
+  /** self（包自身 updateUrl / 基线）/ manifest（astral 官方通道） */
+  channel: "self" | "manifest" | string;
+  url: string;
+  /** true = 从内置基线升到第一个数据包 */
+  fromBaseline: boolean;
+}
 
-/** 宿主契约版本（与 Rust source_install::HOST_API_VERSION 同步维护） */
-export const HOST_API_VERSION = 1;
+/** 内置数据包基线的身份（qtres 内嵌 meta-bundle.js 的包头） */
+export interface BaselineMetaVo {
+  id: string;
+  code: number;
+  name: string;
+  versionName: string;
+}
 
-/** 本地状态里的官方包（可能没装） */
-function officialPack(local: SourceStateVo): PlayPackVo | null {
-  return local.packs.find((p) => p.source === "official") ?? null;
+/** source_discover_updates 的返回 */
+export interface DiscoverResultVo {
+  offers: PackUpdateOfferVo[];
+  baselineMeta: BaselineMetaVo | null;
+}
+
+/** 安装结果（Rust InstallOutcome） */
+export interface InstallOutcomeVo {
+  kind: SourcePackKind;
+  /** 本次是否已上位到对应槽位（引擎热装载/重装 meta 槽） */
+  activated: boolean;
+  /** 同 id 原位更新 */
+  replaced: boolean;
+  pack: SourcePackVo;
+}
+
+export function kindLabel(kind: SourcePackKind | string): string {
+  return kind === "meta" ? "数据包" : "播放包";
+}
+
+export function packDisplayName(pack: SourcePackVo): string {
+  return pack.name?.trim() || kindLabel(pack.kind);
+}
+
+export function packVersionLabel(pack: SourcePackVo): string {
+  return pack.versionName?.trim() || `v${pack.versionCode}`;
 }
 
 /**
- * 更新判定（纯函数）：
- * 1. 无 release → 不更新；
- * 2. 撤回（bad=true 或未发布）→ 忽略（服务端预筛后通常不出现）；
- * 3. hostApiVersion 超本机 → 跳过并提示升级应用；
- * 4. 本地 bad[] 含该 code → 跳过（装载失败过，黑名单在 Rust 生效）；
- * 5. 官方包未装 → bootstrap 安装（用户同意后）；
- * 6. 已装官方包：远端 code > 本地 → 更新；== → 最新；< → 拒绝降级。
- *    自定义包永远不参与官方通道（要升级就重新粘贴链接）。
+ * 提示文案：`数据包有新版本：v内置基线 → v2（官方数据包）`。
+ * 与 uniappx offerLabel 同口径。
  */
-export function decideUpdate(
-  remote: SourceReleaseVo | null,
-  local: SourceStateVo,
-): UpdateDecision {
-  if (!remote) {
-    return { action: "none", reason: "远端没有可用播放包" };
-  }
-  // 公开 manifest 不暴露 published（管理端字段，恒为 null）；只有显式 false 才算未发布
-  if (remote.bad === true || remote.published === false) {
-    return { action: "none", reason: "该版本已撤回或未发布" };
-  }
-  if (remote.hostApiVersion > HOST_API_VERSION) {
-    return {
-      action: "need_app_update",
-      reason: `播放包需要宿主契约 v${remote.hostApiVersion}，当前应用支持 v${HOST_API_VERSION}，请先升级应用`,
-    };
-  }
-  if (local.bad.includes(remote.sourceVersionCode)) {
-    return { action: "none", reason: "该版本此前装载失败，已跳过" };
-  }
-  const installed = officialPack(local);
-  if (!installed) {
-    return { action: "download", release: remote, reason: "官方播放包未安装，可安装" };
-  }
-  if (remote.sourceVersionCode < installed.versionCode) {
-    return { action: "none", reason: "远端版本不高于本地官方包，拒绝降级" };
-  }
-  if (remote.sourceVersionCode === installed.versionCode) {
-    return { action: "none", reason: "官方播放包已是最新版本" };
-  }
-  return { action: "download", release: remote, reason: "官方播放包有新版本" };
+export function offerLabel(offer: PackUpdateOfferVo): string {
+  const from = offer.fromBaseline ? "内置基线" : `v${offer.currentCode}`;
+  return `${kindLabel(offer.kind)}有新版本：${from} → v${offer.newCode}（${offer.newName}）`;
 }
 
-/** 读本地播放包状态（Rust source_state，v2） */
+/** 读本地音源包状态（Rust source_state，v3） */
 export async function getSourceState(): Promise<SourceStateVo> {
   return (await ipc.sourceState()) as SourceStateVo;
 }
 
-/** 拉 manifest 并判定（检查动作不落盘，lastCheckAt 由调用方维护） */
-export async function checkSourceUpdate(): Promise<{
-  decision: UpdateDecision;
-  remote: SourceReleaseVo | null;
-  local: SourceStateVo;
-}> {
-  const [remote, local] = await Promise.all([ipc.sourceManifest(), getSourceState()]);
-  return {
-    decision: decideUpdate(remote as SourceReleaseVo | null, local),
-    remote: remote as SourceReleaseVo | null,
-    local,
-  };
+/**
+ * 更新发现（force=true 越过 4h/包 节流；启动静默检查用 false）。
+ * 只发现不安装：offers 交给 UI 逐条确认。
+ */
+export async function discoverSourceUpdates(force = false): Promise<DiscoverResultVo> {
+  return (await ipc.sourceDiscoverUpdates(force)) as DiscoverResultVo;
 }
 
-/** 本地是否已装官方播放包（启动静默检查的准入门槛：没装就不打扰用户） */
-export function hasOfficialPack(local: SourceStateVo): boolean {
-  return officialPack(local) !== null;
+/** 应用一个更新 offer（下载 + 包头一致性校验 + 安装；失败 Rust 自动回滚拉黑） */
+export async function applySourceUpdate(offer: PackUpdateOfferVo): Promise<InstallOutcomeVo> {
+  return (await ipc.sourceApplyUpdate(offer)) as InstallOutcomeVo;
 }
 
-/** 下载安装/更新官方播放包（Rust 落盘 install/<code>/ 并广播换包） */
-export async function installSourceRelease(release: SourceReleaseVo): Promise<void> {
-  await ipc.sourceInstall(release);
+/** 从 https 直链安装（meta/play 同一条管线；首装或并存安装） */
+export async function installSourceFromUrl(url: string): Promise<InstallOutcomeVo> {
+  return (await ipc.sourceInstallFromUrl(url)) as InstallOutcomeVo;
 }
 
-/** 从直链安装自定义播放包（Rust 下载校验落盘，source=custom，不自动更新） */
-export async function installSourceFromUrl(url: string): Promise<void> {
-  await ipc.sourceInstallFromUrl(url);
+/**
+ * 从本地文件安装（系统文件选择框选 .js；用户取消返回 null）。
+ * 对话框在 Rust 侧（无前端 dialog 插件依赖）。
+ */
+export async function installSourceFromLocalFile(): Promise<InstallOutcomeVo | null> {
+  const outcome = await ipc.sourceInstallLocalFile();
+  return (outcome ?? null) as InstallOutcomeVo | null;
 }
 
-/** 切换生效播放包（设置页单选；Rust 广播后引擎热切换） */
-export async function activateSourcePack(packId: string): Promise<void> {
-  await ipc.sourceActivatePack(packId);
+/** 切换生效包（kind 决定槽位：play → 热切换+冒烟；meta → 重装 meta 槽）；
+ *  packId 空串 + kind = 切回空位（meta=内置基线 / play=未装） */
+export async function activateSourcePack(
+  packId: string,
+  kind?: SourcePackKind,
+): Promise<void> {
+  await ipc.sourceActivatePack(packId, kind);
 }
 
-/** 卸载播放包（删目录 + 出列表，生效位顺延） */
+/** 卸载包（数据包卸载后数据槽回内置基线；卸载生效中的播放包后在线播放不可用） */
 export async function uninstallSourcePack(packId: string): Promise<void> {
   await ipc.sourceUninstallPack(packId);
 }

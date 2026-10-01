@@ -18,6 +18,7 @@ import { useLocalTrackOnlineMeta } from "@/hooks/useLocalTrackOnlineMeta";
 import { useUpdateCheck } from "@/hooks/useUpdateCheck";
 import { useSourceUpdateCheck } from "@/hooks/useSourceUpdateCheck";
 import { PlayPackPrompt } from "@/components/PlayPackPrompt";
+import { SourceUpdatePrompt } from "@/components/SourceUpdatePrompt";
 import { useAppearanceStore } from "@/stores/appearance";
 import { usePlayerStore } from "@/stores/player";
 import { useDownloadsStore } from "@/stores/downloads";
@@ -211,6 +212,8 @@ export function AppShell(): React.JSX.Element {
         <QtNoticeDialog />
         {/* 在线取链缺播放包时的可操作提示（跳设置页安装） */}
         <PlayPackPrompt />
+        {/* 音源包更新提示（发现可用更新时逐条确认，数据包优先） */}
+        <SourceUpdatePrompt />
       </ErrorBoundary>
 
       {/* 8 向 resize 命中区（fixed 覆盖层，最后挂载保证在最上） */}

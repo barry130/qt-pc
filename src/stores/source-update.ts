@@ -1,29 +1,45 @@
 /**
- * 播放音源包状态全局 store（设置页「音源包」区消费；useSourceUpdateCheck 写入）。
- * 不做持久化：packs/activeId 事实来源是 Rust state.json，启动时重新拉取。
+ * 统一音源包状态全局 store（v3；设置页「音源包」区 + 启动更新提示 + 侧栏
+ * 红点消费；useSourceUpdateCheck / SourceUpdatePrompt 写入）。
+ * 不做持久化：packs/activeId/activeMetaId 事实来源是 Rust state.json，
+ * 每次进设置页/包变化事件时重新拉取。
  */
 import { create } from "zustand";
-import type { SourceReleaseVo, SourceStateVo } from "@/source-scripts/source-update";
+import type {
+  BaselineMetaVo,
+  PackUpdateOfferVo,
+  SourceStateVo,
+} from "@/source-scripts/source-update";
 
 interface SourceUpdateStore {
   local: SourceStateVo | null;
-  /** 最近一次检查拿到的远端 release（null = 没有/未检查） */
-  remote: SourceReleaseVo | null;
+  /** 待用户确认的更新 offer（非空 = 设置页入口亮红点） */
+  offers: PackUpdateOfferVo[];
+  /** 内置数据包基线身份（无包头的老资产为 null） */
+  baselineMeta: BaselineMetaVo | null;
   message: string;
   busy: boolean;
   setLocal: (v: SourceStateVo | null) => void;
-  setRemote: (v: SourceReleaseVo | null) => void;
+  setOffers: (v: PackUpdateOfferVo[]) => void;
+  dropOffer: (targetId: string, kind: string) => void;
+  setBaselineMeta: (v: BaselineMetaVo | null) => void;
   setMessage: (v: string) => void;
   setBusy: (v: boolean) => void;
 }
 
 export const useSourceUpdateStore = create<SourceUpdateStore>((set) => ({
   local: null,
-  remote: null,
+  offers: [],
+  baselineMeta: null,
   message: "",
   busy: false,
   setLocal: (v) => set({ local: v }),
-  setRemote: (v) => set({ remote: v }),
+  setOffers: (v) => set({ offers: v }),
+  dropOffer: (targetId, kind) =>
+    set((s) => ({
+      offers: s.offers.filter((o) => !(o.targetId === targetId && o.kind === kind)),
+    })),
+  setBaselineMeta: (v) => set({ baselineMeta: v }),
   setMessage: (v) => set({ message: v }),
   setBusy: (v) => set({ busy: v }),
 }));

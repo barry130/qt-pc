@@ -19,17 +19,20 @@ import { useAppearanceStore } from "@/stores/appearance";
 import { useUpdateStore } from "@/stores/update";
 import { useSourceUpdateStore } from "@/stores/source-update";
 import { runCheck } from "@/hooks/useUpdateCheck";
-import { checkAndDownload } from "@/hooks/useSourceUpdateCheck";
 import {
   activateSourcePack,
-  checkSourceUpdate,
+  applySourceUpdate,
+  discoverSourceUpdates,
   getSourceState,
+  installSourceFromLocalFile,
   installSourceFromUrl,
-  installSourceRelease,
+  kindLabel,
+  offerLabel,
+  packDisplayName,
+  packVersionLabel,
   uninstallSourcePack,
-  type PlayPackVo,
+  type SourcePackVo,
 } from "@/source-scripts/source-update";
-import { engineInvoke } from "@/source-engine/client";
 import { SKINS, getSkin } from "@/lib/skins";
 import { QUALITY_OPTIONS } from "@/lib/quality";
 import {
@@ -1187,30 +1190,39 @@ function formatBytes(bytes: number): string {
   );
 }
 
-/** 播放包列表单行文案：包名 · 版本 · 来源 */
-function packLabel(p: PlayPackVo): string {
-  const tag = p.source === "official" ? "官方" : "自定义";
-  const ver = p.version || p.versionName || `code ${p.versionCode}`;
-  return `${p.name || `${tag}播放包`} · ${ver} · ${tag}`;
+/** 包列表单行文案：包名 · 版本 · code */
+function packLabel(p: SourcePackVo): string {
+  return `${packDisplayName(p)} · ${packVersionLabel(p)} (code ${p.versionCode})`;
 }
 
-/** 音源包设置（双音源包架构）：
- *  - 内置数据包（低风险，随应用发版）只展示自述信息；
- *  - 播放包（高风险，不内置）：官方包检查/安装/更新 + 多包列表（单选生效/
- *    卸载）+ 从直链安装自定义包。
- *  状态事实来源是 Rust state.json（v2 多包）；安装/切换/卸载后 Rust 广播
- *  source-pack-changed，引擎页热切换生效——不重启应用、不打断播放。 */
+/** 卸载按钮的「两击确认」状态：null = 未武装；否则记录包 id 与计时器 */
+type ArmedUninstall = { packId: string; timer: number };
+
+/** 音源包设置（v3 统一包模型，与 uniappx 设置面板同口径）：
+ *  - 数据包/播放包同构：单文件 js、首行 __QT_PACK__ 包头自描述身份；
+ *  - 数据槽 = 内置基线 + 可选安装的数据包覆盖（单选，随时切回基线）；
+ *  - 播放槽 = 用户安装的播放包（不随应用分发，多包共存其一生效）；
+ *  - 更新发现三通道合一（每包 updateUrl / 基线 / 官方 manifest），
+ *    只提示不自动装，这里可以逐条应用；
+ *  - 安装入口：https 直链 / 本地文件（系统选择框）；卸载两击确认。
+ *  状态事实来源是 Rust state.json（v3）；安装/切换/卸载后 Rust 广播
+ *  source-pack-changed / source-meta-changed，引擎页热切换生效——
+ *  不重启应用、不打断播放。 */
 function SourcePackageSection(): React.JSX.Element {
   const local = useSourceUpdateStore((s) => s.local);
-  const remote = useSourceUpdateStore((s) => s.remote);
+  const offers = useSourceUpdateStore((s) => s.offers);
+  const baselineMeta = useSourceUpdateStore((s) => s.baselineMeta);
   const message = useSourceUpdateStore((s) => s.message);
   const busy = useSourceUpdateStore((s) => s.busy);
   const setBusy = useSourceUpdateStore((s) => s.setBusy);
   const setMessage = useSourceUpdateStore((s) => s.setMessage);
   const setLocal = useSourceUpdateStore((s) => s.setLocal);
+  const setOffers = useSourceUpdateStore((s) => s.setOffers);
+  const setBaselineMeta = useSourceUpdateStore((s) => s.setBaselineMeta);
+  const dropOffer = useSourceUpdateStore((s) => s.dropOffer);
   const [url, setUrl] = useState("");
   const [installing, setInstalling] = useState(false);
-  const [metaInfo, setMetaInfo] = useState<{ name: string; version: string } | null>(null);
+  const [armed, setArmed] = useState<ArmedUninstall | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -1222,24 +1234,24 @@ function SourcePackageSection(): React.JSX.Element {
 
   useEffect(() => {
     void refresh();
-    // Rust 侧包变化（安装/切换/卸载，含引擎 describe 回填）时同步列表
-    let unlisten: (() => void) | null = null;
-    void listen("source-pack-changed", () => void refresh()).then((u) => {
-      unlisten = u;
-    });
-    return () => unlisten?.();
+    // Rust 侧包变化（安装/切换/卸载/回滚，含引擎 describe 回填）时同步列表
+    const unlisteners: (() => void)[] = [];
+    void listen("source-pack-changed", () => void refresh()).then((u) =>
+      unlisteners.push(u),
+    );
+    void listen("source-meta-changed", () => void refresh()).then((u) =>
+      unlisteners.push(u),
+    );
+    return () => unlisteners.forEach((u) => u());
   }, [refresh]);
 
-  // 内置数据包自述（引擎就绪后可查；未就绪就保持占位）
-  useEffect(() => {
-    void engineInvoke("bundleInfo", {})
-      .then((r) => {
-        const name = typeof r?.name === "string" ? r.name : "";
-        const version = typeof r?.version === "string" ? r.version : "";
-        if (name || version) setMetaInfo({ name, version });
-      })
-      .catch(() => {});
-  }, []);
+  // 武装态在组件卸载时清理计时器（3 秒自动解除在事件回调里做）
+  useEffect(
+    () => () => {
+      if (armed?.timer) window.clearTimeout(armed.timer);
+    },
+    [armed],
+  );
 
   const run = async (action: () => Promise<string>): Promise<void> => {
     setBusy(true);
@@ -1252,43 +1264,73 @@ function SourcePackageSection(): React.JSX.Element {
     }
   };
 
-  const check = (): Promise<string> => checkAndDownload();
-
-  /** 首装/手动更新官方包（用户在设置页主动点击；启动静默检查只做已装更新） */
-  const installOfficial = async (): Promise<string> => {
-    const { decision } = await checkSourceUpdate();
-    if (decision.action !== "download") {
-      return decision.reason;
-    }
-    await installSourceRelease(decision.release);
+  /** 手动检查（force=true 越过 4h/包 探测节流；发现不自动安装） */
+  const check = async (): Promise<string> => {
+    const result = await discoverSourceUpdates(true);
+    setOffers(result.offers);
+    setBaselineMeta(result.baselineMeta);
     await refresh();
-    return `官方播放包 ${decision.release.sourceVersionName} 已安装并生效`;
+    if (!result.offers.length) return "已是最新（没有可用更新）";
+    return `发现 ${result.offers.length} 个可用更新，逐条确认后应用`;
   };
 
-  const activate = async (packId: string): Promise<string> => {
-    await activateSourcePack(packId);
+  /** 应用单条更新 offer（失败 Rust 自动回滚并拉黑该版本，这里只需提示） */
+  const apply = async (index: number): Promise<string> => {
+    const offer = offers[index];
+    if (!offer) return "没有可用更新";
+    const outcome = await applySourceUpdate(offer);
+    dropOffer(offer.targetId, offer.kind);
     await refresh();
+    return `${kindLabel(outcome.kind)}已更新到 v${outcome.pack.versionCode}（${outcome.pack.name}）`;
+  };
+
+  /** 启用包 / 切回内置基线（packId 空串 + kind=meta） */
+  const activate = async (
+    packId: string,
+    kind: "meta" | "play",
+  ): Promise<string> => {
+    await activateSourcePack(packId, kind);
+    await refresh();
+    if (kind === "meta") {
+      return packId ? "已切换生效数据包" : "已切回内置基线数据包";
+    }
     return "已切换生效播放包";
   };
 
-  const uninstall = async (packId: string): Promise<string> => {
-    await uninstallSourcePack(packId);
+  /** 两击确认的卸载：第一击武装（3 秒内再点确认），第二击执行 */
+  const uninstall = async (pack: SourcePackVo): Promise<string> => {
+    if (armed?.packId !== pack.id) {
+      if (armed?.timer) window.clearTimeout(armed.timer);
+      setArmed({
+        packId: pack.id,
+        timer: window.setTimeout(() => setArmed(null), 3000),
+      });
+      return "再点一次确认卸载";
+    }
+    if (armed.timer) window.clearTimeout(armed.timer);
+    setArmed(null);
+    const wasActivePlay = pack.kind === "play" && local?.activeId === pack.id;
+    await uninstallSourcePack(pack.id);
     await refresh();
-    return "已卸载播放包";
+    return wasActivePlay
+      ? "已卸载播放包（在线播放将不可用，可重新安装）"
+      : `已卸载${kindLabel(pack.kind)}`;
   };
 
   const installUrl = async (): Promise<void> => {
     const trimmed = url.trim();
     if (!trimmed) {
-      setMessage("请先粘贴 play-bundle.js 直链");
+      setMessage("请先粘贴音源包 .js 直链");
       return;
     }
     setInstalling(true);
     try {
-      await installSourceFromUrl(trimmed);
+      const outcome = await installSourceFromUrl(trimmed);
       setUrl("");
       await refresh();
-      setMessage("自定义播放包已安装；列表中可切换生效");
+      setMessage(
+        `${kindLabel(outcome.kind)}已安装${outcome.activated ? "并生效" : "，列表中可启用"}`,
+      );
     } catch (e) {
       setMessage(`安装失败：${stripErrorUrls(String(e))}`);
     } finally {
@@ -1296,86 +1338,154 @@ function SourcePackageSection(): React.JSX.Element {
     }
   };
 
+  const installLocal = (): void => {
+    if (busy || installing) return;
+    setInstalling(true);
+    void (async () => {
+      try {
+        const outcome = await installSourceFromLocalFile();
+        if (!outcome) {
+          setMessage(""); // 用户取消选择，不打扰
+          return;
+        }
+        await refresh();
+        setMessage(
+          `${kindLabel(outcome.kind)}已安装${outcome.activated ? "并生效" : "，列表中可启用"}`,
+        );
+      } catch (e) {
+        setMessage(`安装失败：${stripErrorUrls(String(e))}`);
+      } finally {
+        setInstalling(false);
+      }
+    })();
+  };
+
   const packs = local?.packs ?? [];
-  const official = packs.find((p) => p.source === "official") ?? null;
-  const officialCurrent = official
-    ? `${official.versionName || official.version || "官方播放包"} (code ${official.versionCode})`
-    : "未安装";
-  // 官方包未装且远端有可用版本时才出现首装按钮（安装必须是用户主动行为）
-  const canInstallOfficial = !official && remote !== null;
-  const notes = remote?.notes;
+  const metaPacks = packs.filter((p) => p.kind === "meta");
+  const playPacks = packs.filter((p) => p.kind === "play");
+  const activeMeta = metaPacks.find((p) => p.id === local?.activeMetaId) ?? null;
+  const activePlay = playPacks.find((p) => p.id === local?.activeId) ?? null;
+  const metaStatus = activeMeta
+    ? packLabel(activeMeta)
+    : `内置基线${baselineMeta ? ` · ${baselineMeta.name} ${baselineMeta.versionName} (code ${baselineMeta.code})` : ""}`;
+  const playStatus = activePlay
+    ? packLabel(activePlay)
+    : "未安装（在线播放不可用）";
 
   return (
     <div className="max-w-xl divide-y divide-border">
       <SettingRow
-        title="内置数据包"
-        description="搜索/歌单/歌词/封面等低风险数据源，随应用内置更新，无需安装"
+        title="数据包"
+        description="搜索/歌单/歌词/封面等数据源。内置基线随应用发版，可另装数据包覆盖。"
       >
-        <span className="font-mono text-xs text-muted-foreground">
-          {metaInfo ? `${metaInfo.name} ${metaInfo.version}` : "…"}
-        </span>
+        <span className="font-mono text-xs text-muted-foreground">{metaStatus}</span>
       </SettingRow>
       <SettingRow
-        title="官方播放包"
-        description="在线播放（取链）必需；高风险源不随应用分发，由用户自行安装"
+        title="播放包"
+        description="在线播放（取链）必需；高风险源不随应用分发，由用户自行安装。"
       >
-        <div className="flex w-full flex-col items-end gap-2">
-          <span className="font-mono text-xs text-muted-foreground">{officialCurrent}</span>
-          {remote && (
-            <span className="font-mono text-xs text-muted-foreground">
-              远端最新 {remote.sourceVersionName} (code {remote.sourceVersionCode})
+        <span className="font-mono text-xs text-muted-foreground">{playStatus}</span>
+      </SettingRow>
+      <SettingRow
+        title="已安装的音源包"
+        description={`共 ${packs.length} 个（数据 ${metaPacks.length} / 播放 ${playPacks.length}）。启用即热切换；卸载两击确认。`}
+      >
+        <div className="flex w-full flex-col gap-2">
+          {packs.length === 0 && (
+            <span className="text-xs text-muted-foreground">
+              还没有安装任何音源包（数据接口使用内置基线，正常可用）
             </span>
           )}
-          <div className="flex gap-2">
-            {canInstallOfficial && (
-              <button
-                type="button"
-                onClick={() => void run(installOfficial)}
+          {metaPacks.length > 0 && (
+            <span className="text-[11px] font-medium text-muted-foreground">数据包</span>
+          )}
+          {metaPacks.map((p) => (
+            <PackRow
+              key={p.id}
+              pack={p}
+              radioName="active-meta-pack"
+              checked={local?.activeMetaId === p.id}
+              busy={busy}
+              armed={armed?.packId === p.id}
+              onActivate={() => void run(() => activate(p.id, "meta"))}
+              onUninstall={() => void run(() => uninstall(p))}
+            />
+          ))}
+          {metaPacks.length > 0 && (
+            <div className="flex items-center gap-2 text-xs">
+              <input
+                type="radio"
+                name="active-meta-pack"
+                aria-label="启用内置基线数据包"
+                checked={!local?.activeMetaId}
+                onChange={() => void run(() => activate("", "meta"))}
                 disabled={busy}
-                className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
-              >
-                安装官方播放包
-              </button>
-            )}
-            <button
-              type="button"
-              onClick={() => void run(check)}
-              disabled={busy}
-              className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
-            >
-              {busy ? "处理中…" : "立即检查"}
-            </button>
-          </div>
+              />
+              <span className="flex-1 font-mono text-muted-foreground">
+                内置基线（随应用分发）
+              </span>
+            </div>
+          )}
+          {playPacks.length > 0 && (
+            <span className="mt-1 text-[11px] font-medium text-muted-foreground">
+              播放包
+            </span>
+          )}
+          {playPacks.map((p) => (
+            <PackRow
+              key={p.id}
+              pack={p}
+              radioName="active-play-pack"
+              checked={local?.activeId === p.id}
+              busy={busy}
+              armed={armed?.packId === p.id}
+              onActivate={() => void run(() => activate(p.id, "play"))}
+              onUninstall={() => void run(() => uninstall(p))}
+            />
+          ))}
         </div>
       </SettingRow>
-      {packs.length > 0 && (
-        <SettingRow title="播放包列表" description="多包共存，选择其一生效；卸载即删除本地文件">
-          <div className="flex w-full flex-col gap-2">
-            {packs.map((p) => (
-              <div key={p.id} className="flex items-center gap-2 text-xs">
-                <input
-                  type="radio"
-                  name="active-pack"
-                  aria-label={`启用 ${packLabel(p)}`}
-                  checked={local?.activeId === p.id}
-                  onChange={() => void run(() => activate(p.id))}
-                  disabled={busy}
-                />
-                <span className="flex-1 font-mono text-muted-foreground">{packLabel(p)}</span>
+      <SettingRow
+        title="可用更新"
+        description="更新只提示不自动安装；应用失败会自动回滚到原版本并跳过该版本。"
+      >
+        <div className="flex w-full flex-col items-end gap-2">
+          {offers.length === 0 ? (
+            <span className="text-xs text-muted-foreground">暂无可用更新</span>
+          ) : (
+            offers.map((o, i) => (
+              <div
+                key={`${o.kind}:${o.targetId}`}
+                className="flex w-full items-center gap-2"
+              >
+                <span className="flex-1 text-xs text-muted-foreground">
+                  {offerLabel(o)}
+                </span>
                 <button
                   type="button"
-                  onClick={() => void run(() => uninstall(p.id))}
+                  onClick={() => void run(() => apply(i))}
                   disabled={busy}
                   className="rounded-md border border-border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
                 >
-                  卸载
+                  更新
                 </button>
               </div>
-            ))}
-          </div>
-        </SettingRow>
-      )}
-      <SettingRow title="从链接安装" description="粘贴 play-bundle.js 直链安装自定义播放包（不自动更新）">
+            ))
+          )}
+          <button
+            type="button"
+            onClick={() => void run(check)}
+            disabled={busy}
+            className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+          >
+            {busy ? "处理中…" : "检查更新"}
+          </button>
+        </div>
+      </SettingRow>
+      <SettingRow
+        title="从链接安装"
+        description="粘贴音源包 .js 直链（https）安装；数据包/播放包自动识别。"
+      >
         <div className="flex w-full flex-col gap-2">
           <input
             value={url}
@@ -1393,13 +1503,68 @@ function SourcePackageSection(): React.JSX.Element {
           </button>
         </div>
       </SettingRow>
+      <SettingRow
+        title="从本地文件安装"
+        description="选择本地 .js 音源包文件安装（适合手动下载/离线分发）。"
+      >
+        <button
+          type="button"
+          onClick={installLocal}
+          disabled={busy || installing}
+          className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+        >
+          {installing ? "安装中…" : "选择文件…"}
+        </button>
+      </SettingRow>
       {message && <div className="py-3 text-xs text-muted-foreground">{message}</div>}
-      {notes && (
-        <div className="py-3 text-xs text-muted-foreground">
-          <p className="mb-1 font-medium text-foreground">更新说明</p>
-          <p className="whitespace-pre-wrap">{notes}</p>
-        </div>
-      )}
+    </div>
+  );
+}
+
+/** 包列表单行：单选启用 + 卸载（两击确认，武装态变红） */
+function PackRow(props: {
+  pack: SourcePackVo;
+  radioName: string;
+  checked: boolean;
+  busy: boolean;
+  armed: boolean;
+  onActivate: () => void;
+  onUninstall: () => void;
+}): React.JSX.Element {
+  const activePlayWarn =
+    props.pack.kind === "play" && props.checked && props.armed
+      ? "卸载后在线播放将不可用"
+      : "";
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-2 text-xs">
+        <input
+          type="radio"
+          name={props.radioName}
+          aria-label={`启用 ${packLabel(props.pack)}`}
+          checked={props.checked}
+          onChange={props.onActivate}
+          disabled={props.busy}
+        />
+        <span className="flex-1 font-mono text-muted-foreground">
+          {packLabel(props.pack)}
+        </span>
+        <button
+          type="button"
+          onClick={props.onUninstall}
+          disabled={props.busy}
+          className={`rounded-md border px-2 py-1 text-xs transition-colors disabled:opacity-50 ${
+            props.armed
+              ? "border-destructive/60 bg-destructive/10 text-destructive hover:bg-destructive/20"
+              : "border-border text-destructive/80 hover:bg-accent"
+          }`}
+        >
+          {props.armed ? "确认卸载" : "卸载"}
+        </button>
+      </div>
+      {activePlayWarn ? (
+        <span className="pl-5 text-[11px] text-destructive">{activePlayWarn}</span>
+      ) : null}
     </div>
   );
 }
@@ -1814,6 +1979,9 @@ const SECTION_TITLES: Record<string, string> = {
 
 function SettingsTabs(props: { active: string }): React.JSX.Element {
   const navigate = useNavigate();
+  // 音源包有可用更新时标签亮红点（发现只提示，进设置页逐条应用）
+  const offers = useSourceUpdateStore((s) => s.offers);
+  const sourceDot = offers.length > 0;
   return (
     <div className="mb-4 flex gap-1 border-b border-border">
       {Object.entries(SECTION_TITLES).map(([key, label]) => (
@@ -1823,13 +1991,19 @@ function SettingsTabs(props: { active: string }): React.JSX.Element {
           onClick={() =>
             void navigate({ to: "/settings/$section", params: { section: key } })
           }
-          className={`px-3 py-2 text-xs transition-colors ${
+          className={`relative px-3 py-2 text-xs transition-colors ${
             props.active === key
               ? "border-b-2 border-[var(--primary)] font-medium text-[var(--primary)]"
               : "text-muted-foreground hover:text-foreground"
           }`}
         >
           {label}
+          {key === "source-package" && sourceDot && (
+            <span
+              aria-label="有可用更新"
+              className="absolute right-0.5 top-1.5 inline-block h-1.5 w-1.5 rounded-full bg-destructive"
+            />
+          )}
         </button>
       ))}
     </div>

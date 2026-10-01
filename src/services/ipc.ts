@@ -555,26 +555,37 @@ export async function astralSession(): Promise<AuthSession | null> {
   return invoke("astral_session");
 }
 
-// ---------- 播放音源包管理（双音源包架构；类型与流程见 source-scripts/source-update.ts） ----------
+// ---------- 统一音源包管理（v3；类型与流程见 source-scripts/source-update.ts） ----------
 
 export async function sourceState(): Promise<unknown> {
   return invoke("source_state");
 }
 
-export async function sourceManifest(): Promise<unknown> {
-  return invoke("source_manifest");
+/** 更新发现（force=true 越过节流；返回 offers + baselineMeta） */
+export async function sourceDiscoverUpdates(force: boolean): Promise<unknown> {
+  return invoke("source_discover_updates", { force });
 }
 
-export async function sourceInstall(release: unknown): Promise<unknown> {
-  return invoke("source_install", { release });
+/** 应用一个更新 offer（下载+校验+安装；失败 Rust 自动回滚拉黑） */
+export async function sourceApplyUpdate(offer: unknown): Promise<unknown> {
+  return invoke("source_apply_update", { offer });
 }
 
 export async function sourceInstallFromUrl(url: string): Promise<unknown> {
   return invoke("source_install_from_url", { url });
 }
 
-export async function sourceActivatePack(packId: string): Promise<unknown> {
-  return invoke("source_activate_pack", { packId });
+/** 从本地文件安装（Rust 侧弹文件选择框；用户取消返回 null） */
+export async function sourceInstallLocalFile(): Promise<unknown> {
+  return invoke("source_install_local_file");
+}
+
+/** 启用包（packId 空串 = 切回空位：meta=内置基线 / play=未装，须传 kind） */
+export async function sourceActivatePack(
+  packId: string,
+  kind?: "meta" | "play",
+): Promise<unknown> {
+  return invoke("source_activate_pack", { packId, kind });
 }
 
 export async function sourceUninstallPack(packId: string): Promise<unknown> {

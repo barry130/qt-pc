@@ -6,16 +6,20 @@
   </head>
   <body>
     <!--
-      音源引擎页（双音源包架构）：
+      音源引擎页（v3 统一包模型，与 qt-uniappx services/source-engine.uts 同口径）：
       - 由 qtres:// 协议内嵌提供（无 CSP 注入 → 可自由动态 import）；
       - __TAURI_INTERNALS__ 由 Tauri 注入（withGlobalTauri 仍为 false，不用全局 API）；
-      - 数据音源包（meta-bundle.js）：qtres 内嵌随应用分发，提供搜索/歌单/榜单/
-      歌词/封面等全部低风险接口 —— 永远可用，与是否安装播放包无关；
-      - 播放音源包（play-bundle.js）：用户在「设置 → 音源包管理」从链接安装，
-      可多包共存、其一生效；本页用 installPlayPack 在同一 JS 上下文里求值装配，
-      换包 = Rust 广播 source-pack-changed → 本页热切换，不需要重启应用；
+      - 数据槽（meta）：内置基线 meta-bundle.js 永远兜底；用户安装的数据包
+        （install/<id>/meta-bundle.js，首行 __QT_PACK__ 包头）可覆盖基线——
+        activeMetaId 指向它时本页动态 import（?v=versionCode 破缓存）、复验
+        bundleInfo 契约；装载失败 → source_meta_load_failed（Rust 回滚/回退）
+        + 本页立刻回退基线，数据接口永不下线；
+      - 播放槽（play）：用户安装的播放包（install/<id>/play-bundle.js）多包
+        共存、其一生效；本页用 installPlayPack 在 meta 上下文里求值装配，
+        换包 = Rust 广播 source-pack-changed → 本页热切换，不需要重启应用；
+        生效时跑真实取链冒烟（搜索“晴天”前 5 首任一取链 + Range 预检通过）；
       - 未安装播放包 ≠ 引擎失败：数据接口照常工作，仅取链入口按统一口径报错
-      （主窗口据此引导去设置页安装，见 client.ts / PLAY_PACK_MISSING_MESSAGE）；
+        （主窗口据此引导去设置页安装，见 client.ts / PLAY_PACK_MISSING_MESSAGE）；
       - 主窗口侧封装见 src/source-engine/client.ts。
     -->
     <script type="module">
@@ -28,23 +32,25 @@
       /** 主窗口事件目标（emit_to 用 AnyLabel；对齐 @tauri-apps/api emitTo） */
       const MAIN_TARGET = { kind: "AnyLabel", label: "main" };
 
-      /** 冒烟探针（已知免费歌）——与 scripts/smoke-bundle.mjs 同一首 */
-      const SMOKE_SONG = {
-        id: "1901371647",
-        name: "孤勇者",
-        singer: "陈奕迅",
-        album: "",
-        picUrl: "",
-        interval: 0,
-      };
+      /** 包头注释前缀（与 Rust source_pack_header.rs / qt-sources 同步维护） */
+      const PACK_HEADER_PREFIX = "/*__QT_PACK__";
+      /** 冒烟口径：搜索“晴天”取前 5 首做候选，任一取链 + Range 预检通过即通过 */
+      const SMOKE_SOURCE = "kw";
+      const SMOKE_KEYWORD = "晴天";
+      const SMOKE_SIZE = 5;
+      const SMOKE_ATTEMPTS = 2;
 
       /** meta 注册出的数据入口（搜索/歌单/…/installPlayPack/getPlayUrl） */
       let entries = null;
+      /** meta 槽已装载快照：{id: ""(基线)|包id, code, revision} */
+      let metaLoaded = { id: "", code: 0, revision: "" };
+      /** 数据包装载失败原因（已回退基线时记录，装配成功后清空） */
+      let metaError = null;
       /** 当前已装配的播放包（null = 未装配） */
       let activePack = null;
-      /** 装配失败原因（装配成功后清空；不阻断数据接口） */
+      /** 播放包装配失败原因（装配成功后清空；不阻断数据接口） */
       let packError = null;
-      /** 页面生命周期：booting → ready | error（仅 meta 自身加载失败才 error） */
+      /** 页面生命周期：booting → ready | error（仅基线 meta 自身失败才 error） */
       let phase = "booting";
       let phaseDetail = null;
 
@@ -69,21 +75,54 @@
         }
       }
 
+      /** 解析包首行 __QT_PACK__ 包头注释（与宿主同口径；不合法返回 null） */
+      function parsePackHeader(text) {
+        const firstLine = String(text).split("\n")[0] || "";
+        if (!firstLine.startsWith(PACK_HEADER_PREFIX) || !firstLine.endsWith("*/")) {
+          return null;
+        }
+        let header = null;
+        try {
+          header = JSON.parse(firstLine.slice(PACK_HEADER_PREFIX.length, -2));
+        } catch {
+          return null;
+        }
+        if (!header || typeof header !== "object") return null;
+        const kind = String(header.kind || "");
+        const id = String(header.id || "");
+        const code = Number(header.versionCode) || 0;
+        if (kind !== "meta" && kind !== "play") return null;
+        if (!/^[a-z0-9-]{2,32}$/.test(id)) return null;
+        if (code < 1) return null;
+        return {
+          kind,
+          id,
+          name: String(header.name || ""),
+          versionCode: code,
+          versionName: String(header.versionName || ""),
+        };
+      }
+
       function packSnapshot() {
         return activePack
           ? { id: activePack.id, name: activePack.name, version: activePack.version, code: activePack.code }
           : null;
       }
 
+      function metaSnapshot() {
+        return { id: metaLoaded.id, code: metaLoaded.code, revision: metaLoaded.revision || "" };
+      }
+
       function report(phase, extra) {
         return emitToMain("source-engine-status", {
           phase,
           pack: packSnapshot(),
+          meta: metaSnapshot(),
           ...(extra || {}),
         });
       }
 
-      /** 读 v2 安装状态（source_install.rs）：{packs:[…], activeId, …} */
+      /** 读 v3 安装状态（source_install.rs）：{packs:[…], activeId, activeMetaId, …} */
       async function readState() {
         try {
           const state = await invoke("source_state");
@@ -94,8 +133,92 @@
         }
       }
 
-      /** 本地 chain.json 覆盖层（开发/调链用；无则用播放包内置默认链） */
-      async function chainOverlay() {
+      /** 计算 meta 槽目标：activeMetaId 指向的数据包，否则内置基线。
+       *  包版 URL 带 ?v=versionCode 破 import 缓存（同 id 原位更新后必须重新求值）。 */
+      function metaTarget(state) {
+        const active = state && typeof state.activeMetaId === "string" ? state.activeMetaId : "";
+        if (active) {
+          const packs = (state && state.packs) || [];
+          const pack = packs.find((p) => p && p.id === active && p.kind === "meta");
+          if (pack) {
+            const code = Number(pack.versionCode) || 0;
+            return {
+              id: active,
+              code,
+              url:
+                "/script/" +
+                encodeURIComponent(String(pack.dir || pack.id)) +
+                "/meta-bundle.js?v=" + code,
+            };
+          }
+        }
+        return { id: "", code: 0, url: "/meta-bundle.js" };
+      }
+
+      /**
+       * 装载 meta 槽（boot 与每次 source-meta-changed 共用）：
+       * 取目标文本（no-store）→ 包版校验包头身份 → 动态 import → bundleInfo
+       * 契约自检（name=meta-bundle 且 hostApiVersion=1）。任何失败抛错由
+       * 调用方决定回退/上报；基线 URL 的模块图固定，import 天然幂等。
+       */
+      async function loadMeta(state) {
+        const target = metaTarget(state);
+        const res = await fetch(target.url, { cache: "no-store" });
+        if (!res.ok) throw new Error("数据包文件读取失败: HTTP " + res.status);
+        const text = await res.text();
+        if (target.id) {
+          const header = parsePackHeader(text);
+          if (!header || header.kind !== "meta") {
+            throw new Error("数据包包头非法（首行缺少 __QT_PACK__ meta 包头）");
+          }
+          if (header.id !== target.id) {
+            throw new Error("数据包 id 不符: " + header.id);
+          }
+          target.code = header.versionCode;
+        }
+        const mod = await import(target.url);
+        const e = (mod && mod.__qtEntries) || globalThis.__qtEntries || null;
+        if (!e || typeof e.bundleInfo !== "function") {
+          throw new Error("meta-bundle 数据入口注册失败");
+        }
+        const info = JSON.parse(await e.bundleInfo({}));
+        if (
+          !info ||
+          info.name !== "meta-bundle" ||
+          Number(info.hostApiVersion) !== 1
+        ) {
+          throw new Error(
+            "数据包契约不符: name=" +
+              (info && info.name) +
+              " hostApiVersion=" +
+              (info && info.hostApiVersion),
+          );
+        }
+        entries = e;
+        metaLoaded = {
+          id: target.id,
+          code: target.code || 0,
+          revision: String((info && (info.metaRevision || info.version)) || ""),
+        };
+        metaError = null;
+        await invoke("source_meta_loaded", {
+          packId: target.id,
+          code: metaLoaded.code,
+        }).catch(() => {});
+      }
+
+      /** 数据包装载失败 → 上报 + 立刻回退内置基线（数据接口永不下线） */
+      async function fallbackBaseline(state, detail) {
+        metaError = detail;
+        await invoke("source_meta_load_failed", {
+          packId: metaTarget(state).id,
+          error: detail,
+        }).catch(() => {});
+        await loadMeta({ ...(state || {}), activeMetaId: null });
+      }
+
+      /** 根目录 chain.json 覆盖层（开发/调链用；无则用播放包内置默认链） */
+      async function rootChainOverlay() {
         try {
           const overlay = await invoke("source_chain_overlay");
           return typeof overlay === "string" && overlay.trim() ? overlay : null;
@@ -104,17 +227,32 @@
         }
       }
 
+      /** 播放包自带 chain.json（manifest 分发场景；包内覆盖层优先于根覆盖层） */
+      async function packChainOverlay(dir) {
+        try {
+          const res = await fetch(
+            "/script/" + encodeURIComponent(String(dir)) + "/chain.json",
+            { cache: "no-store" },
+          );
+          if (!res.ok) return null;
+          const text = await res.text();
+          return text.trim() ? text : null;
+        } catch {
+          return null;
+        }
+      }
+
       /**
-       * 装配当前生效的播放包（boot 与每次 source-pack-changed 共用）。
+       * 装配当前生效的播放包（boot / source-pack-changed / meta 重载后共用）。
        *
        * - 未选生效包 → 卸载引擎内残留并回到「数据可用 / 取链未装」态；
-       * - 装配失败 → 上报 source_pack_load_failed（官方包由 Rust 自动回退并
-       *   再次广播换包；自定义包保留在列表里等用户处理），数据接口不受影响；
-       * - smoke=true 时追加真实取链冒烟（Range 预检走 meta 的 verifyPlayable）。
+       * - 装配失败 → 上报 source_pack_load_failed（更新现场由 Rust 自动回滚
+       *   .prev 并广播换包；手动装的包保留在列表里等用户处理）；
+       * - smoke=true 时追加真实取链冒烟；通过后 source_pack_verified 收摊更新现场。
        */
       async function applyActivePack(state, smoke) {
         const packs = (state && state.packs) || [];
-        const pack = packs.find((p) => p && p.id === state.activeId) || null;
+        const pack = packs.find((p) => p && p.id === state.activeId && p.kind === "play") || null;
         if (!pack) {
           if (entries && typeof entries.uninstallPlayPack === "function") {
             try {
@@ -135,7 +273,8 @@
           if (!res.ok) throw new Error("播放包文件读取失败: HTTP " + res.status);
           const code = await res.text();
           const installed = JSON.parse(entries.installPlayPack({ code }));
-          const overlay = await chainOverlay();
+          const overlay =
+            (await packChainOverlay(pack.dir)) || (await rootChainOverlay());
           if (overlay) entries.loadChain(overlay);
           activePack = {
             id: String(pack.id),
@@ -151,6 +290,9 @@
             version: activePack.version,
           }).catch(() => {});
           if (smoke) await networkSmoke();
+          if (smoke) {
+            await invoke("source_pack_verified", { packId: pack.id }).catch(() => {});
+          }
         } catch (err) {
           const detail = String((err && err.message) || err);
           activePack = null;
@@ -162,29 +304,63 @@
         }
       }
 
-      /** 真实网络冒烟：取链 + Range 预检（口径与 verifyPlayable 一致） */
+      /**
+       * 真实取链冒烟（v3 口径）：搜索“晴天”取前 5 首做候选，任一首
+       * getPlayUrl + Range 预检通过 = 通过（每首最多 2 次）；候选为空 =
+       * 跳过（不下结论）。全部失败抛错 → 上层按更新失败回滚。
+       */
       async function networkSmoke() {
-        const resolved = JSON.parse(
-          await entries.getPlayUrl({
-            platform: "wyy",
-            id: SMOKE_SONG.id,
-            name: SMOKE_SONG.name,
-            singer: SMOKE_SONG.singer,
-            album: SMOKE_SONG.album,
-            quality: "128",
-            duration: SMOKE_SONG.interval,
-          }),
-        );
-        if (!resolved || !resolved.url) throw new Error("冒烟取链返回空");
-        const checked = JSON.parse(await entries.verifyPlayable({ url: resolved.url }));
-        if (!checked || checked.ok !== true) {
-          throw new Error("冒烟 Range 预检失败: HTTP " + (checked && checked.status));
+        let candidates = [];
+        try {
+          const searched = JSON.parse(
+            await entries.search({
+              source: SMOKE_SOURCE,
+              keyword: SMOKE_KEYWORD,
+              page: 1,
+              size: SMOKE_SIZE,
+            }),
+          );
+          const list = searched && Array.isArray(searched.list) ? searched.list : [];
+          candidates = list.slice(0, SMOKE_SIZE);
+        } catch {
+          candidates = [];
         }
-        await invoke("source_report", {
-          sourceVersionCode: activePack ? activePack.code : 0,
-          result: "ok",
-          detail: "",
-        }).catch(() => {});
+        if (!candidates.length) return; // 候选为空：视为通过（不下结论）
+        let lastError = "冒烟取链全部失败";
+        for (const song of candidates) {
+          for (let attempt = 0; attempt < SMOKE_ATTEMPTS; attempt++) {
+            try {
+              const resolved = JSON.parse(
+                await entries.getPlayUrl({
+                  platform: String(song.platform || SMOKE_SOURCE),
+                  id: song.id,
+                  name: song.name,
+                  singer: song.singer || "",
+                  album: song.album || "",
+                  quality: "128",
+                  duration: Number(song.interval) || 0,
+                }),
+              );
+              if (!resolved || !resolved.url) throw new Error("取链返回空");
+              const checked = JSON.parse(await entries.verifyPlayable({ url: resolved.url }));
+              if (!checked || checked.ok !== true) {
+                throw new Error("Range 预检失败: HTTP " + (checked && checked.status));
+              }
+              // 官方播放包上报冒烟结果（manifest 通道的服务端观测）
+              if (activePack && activePack.id === "play-official") {
+                await invoke("source_report", {
+                  sourceVersionCode: activePack.code,
+                  result: "ok",
+                  detail: "",
+                }).catch(() => {});
+              }
+              return;
+            } catch (err) {
+              lastError = String((err && err.message) || err);
+            }
+          }
+        }
+        throw new Error("冒烟失败（“" + SMOKE_KEYWORD + "”前 " + candidates.length + " 首全部取链失败）：" + lastError);
       }
 
       async function boot() {
@@ -195,20 +371,22 @@
             invoke("builtin_request", { url, options: options || null }),
           platform: 1103,
         };
-        // 2) 内置数据音源包（qtres 内嵌，随应用发版）
-        const mod = await import("/meta-bundle.js");
-        entries = (mod && mod.__qtEntries) || globalThis.__qtEntries || null;
-        if (!entries || typeof entries.bundleInfo !== "function") {
-          throw new Error("meta-bundle 数据入口注册失败");
-        }
-        // 3) 生效播放包（未装 = 数据接口照常，取链按「未安装」口径报错）
+        // 2) meta 槽：生效数据包 → 失败立刻回退内置基线（数据接口永不下线）
         const state = await readState();
+        try {
+          await loadMeta(state);
+        } catch (err) {
+          const detail = String((err && err.message) || err);
+          await fallbackBaseline(state, detail);
+          phaseDetail = "数据包装载失败已回退内置基线: " + detail;
+        }
+        // 3) 播放槽（未装 = 数据接口照常，取链按「未安装」口径报错）
         await applyActivePack(
           state,
           new URLSearchParams(location.search).get("smoke") === "1",
         );
         phase = "ready";
-        await report("ready", { detail: packError || phaseDetail || null });
+        await report("ready", { detail: packError || metaError || phaseDetail || null });
       }
 
       /** 主窗口 RPC：source-engine-request → source-engine-response。
@@ -225,8 +403,9 @@
             requestId,
             phase,
             code: activePack ? activePack.code : null,
-            detail: packError || phaseDetail,
+            detail: packError || metaError || phaseDetail,
             pack: packSnapshot(),
+            meta: metaSnapshot(),
           });
           return;
         }
@@ -276,12 +455,33 @@
         await emitToMain("source-engine-response", { requestId, url, line, error });
       }
 
-      /** Rust 在包列表/生效包变化后广播：热切换播放包，无需重启应用 */
+      /** Rust 在包列表/播放槽变化后广播：热切换播放包，无需重启应用 */
       async function onPackChanged() {
         if (!entries || phase !== "ready") return;
         const state = await readState();
         await applyActivePack(state, true);
-        await report("ready", { detail: packError || phaseDetail || null });
+        await report("ready", { detail: packError || metaError || phaseDetail || null });
+      }
+
+      /** Rust 在数据槽变化后广播（安装/启用/卸载/回滚数据包）：
+       *  幂等：目标没变（同 id 同 code）直接跳过；变了则重装 meta 槽 +
+       *  在全新 meta 上下文里重装播放包（不再冒烟——播放包此前已验证）。 */
+      async function onMetaChanged() {
+        if (phase !== "ready") return;
+        const state = await readState();
+        const target = metaTarget(state);
+        if (metaLoaded.id === target.id && metaLoaded.code === target.code && entries) {
+          return;
+        }
+        try {
+          await loadMeta(state);
+        } catch (err) {
+          const detail = String((err && err.message) || err);
+          await fallbackBaseline(state, detail);
+          phaseDetail = "数据包装载失败已回退内置基线: " + detail;
+        }
+        await applyActivePack(state, false);
+        await report("ready", { detail: packError || metaError || phaseDetail || null });
       }
 
       await invoke("plugin:event|listen", {
@@ -293,6 +493,11 @@
         event: "source-pack-changed",
         target: { kind: "Any" },
         handler: transformCallback(onPackChanged),
+      }).catch(() => {});
+      await invoke("plugin:event|listen", {
+        event: "source-meta-changed",
+        target: { kind: "Any" },
+        handler: transformCallback(onMetaChanged),
       }).catch(() => {});
 
       try {

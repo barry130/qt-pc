@@ -40,15 +40,21 @@ pub(crate) const RESTRICTED_WINDOW: &str = SOURCE_ENGINE_LABEL;
 pub(crate) const ENGINE_ALLOWED_COMMANDS: &[&str] = &[
     // 音源脚本唯一的网络出口（内部已做协议/内网校验）
     "builtin_request",
-    // 读当前播放包状态（packs/activeId；装配哪个包由它决定）
+    // 读当前包状态（packs/activeId/activeMetaId；装配哪个包由它决定）
     "source_state",
     // 读本地 chain.json 覆盖层（调链用；无覆盖层时播放包用内置默认链）
     "source_chain_overlay",
     // 装配成功后回填真实包名/版本（设置页展示）
     "source_pack_describe",
-    // 装配/冒烟失败上报（官方包自动回退，自定义包保留）
+    // 装配+冒烟全链路通过（更新现场收摊，见 source_install.rs）
+    "source_pack_verified",
+    // 装配/冒烟失败上报（更新现场自动回滚 .prev，手动装的包保留）
     "source_pack_load_failed",
-    // 上报取链结果（健康度统计）
+    // meta 槽装载成功上报（数据包更新现场收摊）
+    "source_meta_loaded",
+    // meta 槽装载失败上报（回滚/回退内置基线）
+    "source_meta_load_failed",
+    // 上报取链结果（官方播放包健康度统计）
     "source_report",
 ];
 
@@ -106,6 +112,10 @@ mod tests {
             "save_shortcuts",
             "source_install",
             "source_install_from_url",
+            "source_install_from_text",
+            "source_install_local_file",
+            "source_discover_updates",
+            "source_apply_update",
             "source_activate_pack",
             "source_uninstall_pack",
         ] {

@@ -1,133 +1,133 @@
 /**
- * 播放音源包更新判定单测（双音源包架构：官方包 bootstrap/更新，自定义包不参与）。
+ * 统一音源包（v3）前端展示与包装层单测：
+ * 纯文案 helper 直测；走 IPC 的包装函数用 vi.mock 桩掉 @/services/ipc。
  */
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import {
-  decideUpdate,
-  type PlayPackVo,
-  type SourceReleaseVo,
-  type SourceStateVo,
+  HOST_API_VERSION,
+  activateSourcePack,
+  installSourceFromLocalFile,
+  kindLabel,
+  offerLabel,
+  packDisplayName,
+  packVersionLabel,
+  type PackUpdateOfferVo,
+  type SourcePackVo,
 } from "@/source-scripts/source-update";
+import * as ipc from "@/services/ipc";
 
-function release(overrides: Partial<SourceReleaseVo> = {}): SourceReleaseVo {
-  return {
-    sourceVersionCode: 2026091801,
-    sourceVersionName: "2026.09.18.1",
-    platforms: [1101, 1103],
-    hostApiVersion: 1,
-    channel: "stable",
-    notes: "测试版本",
-    artifacts: [
-      { path: "play-bundle.js", version: 3, url: "https://cdn.example/play-bundle.js" },
-    ],
-    published: true,
-    bad: false,
-    ...overrides,
-  };
-}
+vi.mock("@/services/ipc", () => ({
+  sourceState: vi.fn(),
+  sourceDiscoverUpdates: vi.fn(),
+  sourceApplyUpdate: vi.fn(),
+  sourceInstallFromUrl: vi.fn(),
+  sourceInstallLocalFile: vi.fn(),
+  sourceActivatePack: vi.fn(),
+  sourceUninstallPack: vi.fn(),
+}));
 
-function pack(overrides: Partial<PlayPackVo> = {}): PlayPackVo {
+function pack(overrides: Partial<SourcePackVo> = {}): SourcePackVo {
   return {
-    id: "official",
-    name: "play-bundle",
-    version: "chain.10",
-    versionCode: 2026091701,
-    versionName: "2026.09.17.1",
-    source: "official",
-    dir: "2026091701",
+    id: "play-official",
+    kind: "play",
+    name: "官方播放包",
+    versionCode: 3,
+    versionName: "2026.09.18.1",
+    updateUrl: "https://cdn.example/play-bundle.js",
+    dir: "play-official",
     installedAt: 1_800_000_000,
+    updatedAt: 1_800_000_000,
+    skipCodes: [],
+    lastProbeAt: 0,
     ...overrides,
   };
 }
 
-function local(overrides: Partial<SourceStateVo> = {}): SourceStateVo {
+function offer(overrides: Partial<PackUpdateOfferVo> = {}): PackUpdateOfferVo {
   return {
-    schema: 2,
-    packs: [pack()],
-    activeId: "official",
-    bad: [],
-    lastCheckAt: 0,
-    previousOfficial: null,
+    kind: "play",
+    targetId: "play-official",
+    currentCode: 3,
+    newCode: 4,
+    newName: "官方播放包",
+    notes: "",
+    channel: "self",
+    url: "https://cdn.example/play-bundle.js",
+    fromBaseline: false,
     ...overrides,
   };
 }
 
-describe("source-update 判定（双音源包）", () => {
-  it("1. 无 release → 不更新", () => {
-    const d = decideUpdate(null, local());
-    expect(d.action).toBe("none");
+describe("source-update 文案 helper（v3）", () => {
+  it("0. 宿主契约版本与配置一致（sync-config 从 config 同步此值）", () => {
+    expect(HOST_API_VERSION).toBe(1);
   });
 
-  it("2. 撤回（bad=true / 未发布）→ 忽略", () => {
-    expect(decideUpdate(release({ bad: true }), local()).action).toBe("none");
-    expect(decideUpdate(release({ published: false }), local()).action).toBe("none");
+  it("1. kindLabel 数据/播放", () => {
+    expect(kindLabel("meta")).toBe("数据包");
+    expect(kindLabel("play")).toBe("播放包");
   });
 
-  it("3. hostApiVersion 超本机契约 → 提示升级应用", () => {
-    const d = decideUpdate(release({ hostApiVersion: 2 }), local());
-    expect(d.action).toBe("need_app_update");
-    expect(d.reason).toContain("v2");
+  it("2. packDisplayName 缺名兜底到类型名", () => {
+    expect(packDisplayName(pack())).toBe("官方播放包");
+    expect(packDisplayName(pack({ name: "" }))).toBe("播放包");
   });
 
-  it("4. 本地 bad[] 含该 code → 跳过", () => {
-    const d = decideUpdate(release(), local({ bad: [2026091801] }));
-    expect(d.action).toBe("none");
-    expect(d.reason).toContain("装载失败");
+  it("3. packVersionLabel versionName 缺省时落到 v{code}", () => {
+    expect(packVersionLabel(pack())).toBe("2026.09.18.1");
+    expect(packVersionLabel(pack({ versionName: "" }))).toBe("v3");
   });
 
-  it("5a. 官方包未装 → bootstrap 安装", () => {
-    const d = decideUpdate(release(), local({ packs: [], activeId: null }));
-    expect(d.action).toBe("download");
-    if (d.action === "download") {
-      expect(d.release.sourceVersionCode).toBe(2026091801);
-    }
+  it("4a. offerLabel 播放包：current → new（含新名）", () => {
+    expect(offerLabel(offer())).toBe(
+      "播放包有新版本：v3 → v4（官方播放包）",
+    );
   });
 
-  it("5b. 已装自定义包但无官方包 → 仍引导安装官方包（两者共存）", () => {
-    const d = decideUpdate(
-      release(),
-      local({
-        packs: [pack({ id: "custom-20261001-120000", source: "custom", versionCode: 0 })],
-        activeId: "custom-20261001-120000",
+  it("4b. offerLabel 数据包基线通道：内置基线 → new", () => {
+    const text = offerLabel(
+      offer({
+        kind: "meta",
+        targetId: "meta-official",
+        currentCode: 0,
+        newCode: 2,
+        newName: "官方数据包",
+        channel: "manifest",
+        fromBaseline: true,
       }),
     );
-    expect(d.action).toBe("download");
+    expect(text).toBe("数据包有新版本：内置基线 → v2（官方数据包）");
+  });
+});
+
+describe("source-update IPC 包装（v3）", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
   });
 
-  it("5c. 远端 > 本地官方包 → 更新", () => {
-    const d = decideUpdate(release(), local());
-    expect(d.action).toBe("download");
-    expect(d.reason).toContain("新版本");
+  it("5. activateSourcePack 透传 packId + kind（空串 = 切回内置基线）", async () => {
+    const spy = vi.spyOn(ipc, "sourceActivatePack").mockResolvedValue(undefined);
+    await activateSourcePack("", "meta");
+    await activateSourcePack("play-official", "play");
+    await activateSourcePack("play-official");
+    expect(spy).toHaveBeenNthCalledWith(1, "", "meta");
+    expect(spy).toHaveBeenNthCalledWith(2, "play-official", "play");
+    expect(spy).toHaveBeenNthCalledWith(3, "play-official", undefined);
   });
 
-  it("5d. 远端 < 本地官方包 → 拒绝降级", () => {
-    const d = decideUpdate(release({ sourceVersionCode: 2026091601 }), local());
-    expect(d.action).toBe("none");
-    expect(d.reason).toContain("拒绝降级");
+  it("6. installSourceFromLocalFile 取消（Rust 返回 null）原样返回 null", async () => {
+    vi.spyOn(ipc, "sourceInstallLocalFile").mockResolvedValue(null);
+    expect(await installSourceFromLocalFile()).toBeNull();
   });
 
-  it("5e. 远端 == 本地官方包 → 已是最新（同一 code 目录重装由 Rust 幂等处理）", () => {
-    const d = decideUpdate(release({ sourceVersionCode: 2026091701 }), local());
-    expect(d.action).toBe("none");
-    expect(d.reason).toContain("最新");
-  });
-
-  it("5f. 公开 manifest 的 published 为 null（管理端字段）→ 视为已发布", () => {
-    const d = decideUpdate(
-      release({ sourceVersionCode: 2026091801, published: null as unknown as boolean }),
-      local({ packs: [], activeId: null }),
-    );
-    expect(d.action).toBe("download");
-  });
-
-  it("5g. 本地只有自定义包不影响官方包更新通道（官方包在列表时按官方包比较）", () => {
-    const custom = pack({
-      id: "custom-20261001-120000",
-      source: "custom",
-      versionCode: 0,
-      dir: "custom-20261001-120000",
-    });
-    const d = decideUpdate(release(), local({ packs: [pack(), custom] }));
-    expect(d.action).toBe("download");
+  it("7. installSourceFromLocalFile 成功返回安装结果对象", async () => {
+    const outcome = {
+      kind: "meta",
+      activated: false,
+      replaced: false,
+      pack: pack({ kind: "meta", id: "meta-official", name: "官方数据包" }),
+    };
+    vi.spyOn(ipc, "sourceInstallLocalFile").mockResolvedValue(outcome);
+    expect(await installSourceFromLocalFile()).toEqual(outcome);
   });
 });

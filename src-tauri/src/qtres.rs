@@ -5,10 +5,11 @@
 //! - `cover/`：封面代取 + 内存去重缓存（不落盘缩略图，后续迭代补 @2x 与磁盘缓存）
 //! - `/engine/index.html`：音源引擎页（source_window.rs 的隐藏窗口加载，
 //!   内嵌 HTML，无 CSP 注入 → 可自由动态 import 音源包脚本）
-//! - `/meta-bundle.js`：内置元数据音源包（qt-sources 构建产物 meta-bundle.js，
-//!   编译期内嵌；搜索/歌单/榜单/歌词等低风险接口都来自它）
-//! - `/script/<code>/<file>`：只读分发已安装的**播放音源包**文件
-//!   （source-bundle/install/ 目录；code/file 严格校验防路径穿越）
+//! - `/meta-bundle.js`：内置数据音源包基线（qt-sources 构建产物 meta-bundle.js，
+//!   编译期内嵌，首行 __QT_PACK__ 包头；搜索/歌单/榜单/歌词等低风险接口都来自它）
+//! - `/script/<id>/<file>`：只读分发已安装的音源包文件（v3 统一包模型：
+//!   数据包/播放包同构，目录名 = 包 id；file 严格校验防路径穿越，查询串
+//!   仅用于模块缓存破坏 ?v=）
 //!
 //! MV/视频代理（`mv/` Range 透传）已随 MV 功能一并删除。
 //!
@@ -120,10 +121,15 @@ fn placeholder() -> Response<Vec<u8>> {
 /// 引擎页 HTML（内嵌编译；改页面要重编 Rust）
 const ENGINE_INDEX_HTML: &str = include_str!("source_engine_page.html");
 
-/// 内置元数据音源包（qt-sources `dist/meta-bundle.js`，发布时同步拷贝到本目录；
-/// 搜索/歌单/榜单/歌词/封面等低风险接口全部来自它，播放取链来自用户另行
-/// 安装的播放音源包，见 source_engine_page.html）
+/// 内置数据音源包基线（qt-sources `dist/meta-bundle.js`，发布时同步拷贝到本目录；
+/// 首行 __QT_PACK__ 包头自描述身份，宿主据此读版本号/更新直链；搜索/歌单/
+/// 榜单/歌词/封面等低风险接口全部来自它，播放取链来自用户另行安装的播放音源包）
 const META_BUNDLE_JS: &str = include_str!("assets/meta-bundle.js");
+
+/// 内置数据包基线文本（source_install.rs 解析包头用：基线版本号 + updateUrl 探测）
+pub(crate) fn meta_bundle_js() -> &'static str {
+    META_BUNDLE_JS
+}
 
 fn engine_page_response() -> Response<Vec<u8>> {
     Response::builder()
@@ -512,6 +518,11 @@ mod tests {
         // 元数据包是自注册形态：拿到 __qtHost 才注册 __qtEntries
         assert!(js.contains("__qtHost"), "meta-bundle 含宿主注册逻辑");
         assert!(js.contains("meta-bundle"), "bundleInfo 名称正确");
+        // v3：首行必须带 __QT_PACK__ 自描述包头（宿主不执行就读出身份）
+        assert!(
+            js.starts_with("/*__QT_PACK__"),
+            "meta-bundle 首行缺少 __QT_PACK__ 包头"
+        );
         // 与旧版全量包的区别：不再内置 createSourceLayer/链路实现
         assert!(!js.contains("createSourceLayer"));
     }

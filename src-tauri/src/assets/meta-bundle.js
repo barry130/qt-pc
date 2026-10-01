@@ -1,3 +1,4 @@
+/*__QT_PACK__{"kind":"meta","id":"meta-official","name":"官方数据包","versionCode":1,"versionName":"meta.1"}*/
 var __defProp = Object.defineProperty;
 var __defNormalProp = (obj, key, value) => key in obj ? __defProp(obj, key, { enumerable: true, configurable: true, writable: true, value }) : obj[key] = value;
 var __publicField = (obj, key, value) => __defNormalProp(obj, typeof key !== "symbol" ? key + "" : key, value);

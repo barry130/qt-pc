@@ -21,6 +21,7 @@ pub mod shortcuts;
 pub mod smtc;
 pub mod source_bundle;
 pub mod source_install;
+pub mod source_pack_header;
 pub mod source_window;
 pub mod taskbar;
 pub mod tray;
@@ -260,13 +261,18 @@ pub fn run() {
             cmd_invalidate_play_url,
             source_bundle::cmd_source_chain_overlay,
             source_install::cmd_source_state,
-            source_install::cmd_source_manifest,
-            source_install::cmd_source_install,
+            source_install::cmd_source_discover_updates,
+            source_install::cmd_source_apply_update,
             source_install::cmd_source_install_from_url,
+            source_install::cmd_source_install_from_text,
+            source_install::cmd_source_install_local_file,
             source_install::cmd_source_activate_pack,
             source_install::cmd_source_uninstall_pack,
             source_install::cmd_source_pack_describe,
+            source_install::cmd_source_pack_verified,
             source_install::cmd_source_pack_load_failed,
+            source_install::cmd_source_meta_loaded,
+            source_install::cmd_source_meta_load_failed,
             source_install::cmd_source_report,
             cmd_play_track,
             cmd_play_queue,
