@@ -1,0 +1,12 @@
+# 二进制（git 的 text 探测对 PNG 不可靠，显式声明）
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.zip binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.otf binary

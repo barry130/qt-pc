@@ -1,0 +1,97 @@
+name: Release
+
+# 打 tag（v*）才发版：构建 NSIS 安装包 → ed25519 签名 → 创建 GitHub Release。
+# 普通 push 只跑 ci.yml 的测试门，不出包。
+# 前置一次性配置（见 docs/PACKAGING.md「自动发版」）：
+#   仓库 secret QT_UPDATE_SIGNING_KEY = .signing/ed25519.key 的 base64
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: 构建 + 签名 + 发布
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 校验 tag 与 app.config.json 的版本一致
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $tag = $env:TAG.TrimStart('v')
+          $cfg = Get-Content app.config.json -Raw | ConvertFrom-Json
+          if ($tag -ne $cfg.version.name) {
+            Write-Error "tag($env:TAG) 与 app.config.json version.name($($cfg.version.name)) 不一致，先改版本号再打 tag"
+            exit 1
+          }
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      # 测试不过不发版
+      - run: pnpm test
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # 本机 pnpm tauri build 有 argv0 解析 bug；`pnpm exec + --runner cargo`
+      # 是 docs/PACKAGING.md 步骤 2 验证过的路径（CI 上同样成立）
+      - name: 构建 NSIS 安装包
+        run: pnpm exec tauri build --runner cargo
+
+      - name: 恢复签名私钥
+        shell: pwsh
+        env:
+          QT_UPDATE_SIGNING_KEY: ${{ secrets.QT_UPDATE_SIGNING_KEY }}
+        run: |
+          if ([string]::IsNullOrEmpty($env:QT_UPDATE_SIGNING_KEY)) {
+            Write-Error "缺少 secret QT_UPDATE_SIGNING_KEY（.signing/ed25519.key 的 base64），配置方法见 docs/PACKAGING.md「自动发版」"
+            exit 1
+          }
+          New-Item -ItemType Directory -Force -Path .signing | Out-Null
+          [IO.File]::WriteAllBytes("$PWD/.signing/ed25519.key", [Convert]::FromBase64String($env:QT_UPDATE_SIGNING_KEY))
+
+      - name: ed25519 签名并自验
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem "src-tauri/target/release/bundle/nsis/*-setup.exe" | Select-Object -First 1).FullName
+          if (-not $exe) { Write-Error "没找到 NSIS 安装包产物"; exit 1 }
+          node scripts/update-sign.mjs sign $exe
+          node scripts/update-sign.mjs verify $exe
+          "INSTALLER=$exe" >> $env:GITHUB_ENV
+
+      - name: 发布 GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          $hash = (Get-FileHash $env:INSTALLER -Algorithm MD5).Hash.ToLower()
+          $size = (Get-Item $env:INSTALLER).Length
+          $file = Split-Path $env:INSTALLER -Leaf
+          $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:TAG/$file"
+          # 注意：here-string 结束符 "@ 必须顶格（YAML 剥离缩进后正好处在行首），
+          # 且不能写成 `"@ | Set-Content ... -Value`——悬空的 -Value 会因缺参数直接绑定失败。
+          $notes = @"
+          ## 安装包信息（建后端更新记录用）
+
+          - 下载地址：$url
+          - MD5：$hash
+          - fileSize：$size
+          "@
+          Set-Content -Path release-notes.md -Value $notes
+          gh release create $env:TAG "$env:INSTALLER" "$env:INSTALLER.sig" --notes-file release-notes.md --generate-notes --title "轻听 $($env:TAG.TrimStart('v'))"

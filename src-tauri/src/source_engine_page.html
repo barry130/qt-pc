@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>轻听音源引擎</title>
+  </head>
+  <body>
+    <!--
+      音源引擎页（音源包热更新方案 P1）：
+      - 由 qtres:// 协议内嵌提供（无 CSP 注入 → 可自由动态 import 音源包脚本）；
+      - __TAURI_INTERNALS__ 由 Tauri 注入（withGlobalTauri 仍为 false，不用全局 API）；
+      - 职责：读安装状态 → import bundle → createSourceLayer(注入 builtin_request)
+        → 冒烟（编译级必做；?smoke=1 时追加真实取链）→ 监听主窗口取链 RPC；
+      - 未安装音源包 = 无可用层（error 终态带可操作提示，由主窗口引导去
+        「设置 → 音源包」安装）——应用不再内置任何音源实现。
+      - 主窗口侧封装见 src/source-engine/client.ts。
+    -->
+    <script type="module">
+      "use strict";
+
+      const internals = await waitInternals();
+      const invoke = internals.invoke.bind(internals);
+      const transformCallback = internals.transformCallback.bind(internals);
+
+      /** 主窗口事件目标（emit_to 用 AnyLabel；对齐 @tauri-apps/api emitTo） */
+      const MAIN_TARGET = { kind: "AnyLabel", label: "main" };
+
+      /** 冒烟探针（§2.4：已知免费歌）——与 scripts/smoke-bundle.mjs 同一首 */
+      const SMOKE_SONG = {
+        id: "1901371647",
+        name: "孤勇者",
+        singer: "陈奕迅",
+        album: "",
+        picUrl: "",
+        interval: 0,
+      };
+
+      let layer = null;
+      let entries = null;
+      let loadedCode = 0;
+      /** 页面生命周期：booting → ready | error（状态查询 RPC 回这个） */
+      let phase = "booting";
+      let phaseDetail = null;
+
+      async function waitInternals() {
+        for (let i = 0; i < 100; i++) {
+          const api = window.__TAURI_INTERNALS__;
+          if (api && typeof api.invoke === "function") return api;
+          await new Promise((r) => setTimeout(r, 50));
+        }
+        throw new Error("__TAURI_INTERNALS__ 注入失败");
+      }
+
+      async function emitToMain(event, payload) {
+        try {
+          await invoke("plugin:event|emit_to", {
+            target: MAIN_TARGET,
+            event,
+            payload,
+          });
+        } catch {
+          // 主窗口不在：无对策，引擎继续自持
+        }
+      }
+
+      function report(phase, extra) {
+        return emitToMain("source-engine-status", { phase, ...(extra || {}) });
+      }
+
+      /** 校验 bundle 并注册数据入口（远程包与内置包共用同一套契约） */
+      function prepareBundle(mod) {
+        if (!mod || typeof mod.createSourceLayer !== "function") {
+          throw new Error("bundle 缺少 createSourceLayer 导出");
+        }
+        // 编译级冒烟（§2.4 第 2 层）：链配置可完整解析
+        const cfg = mod.parseChainConfig(mod.defaultChainConfig());
+        if (!cfg || typeof cfg.chainRevision !== "number") {
+          throw new Error("bundle 链配置解析失败");
+        }
+        // chain.json 本地覆盖层：bundle 平台无关（不 import @tauri-apps/api），
+        // 读盘方式由这里注入。必须在取链之前注入，否则首个请求会走内置默认链。
+        if (typeof mod.setChainOverlayReader !== "function") {
+          throw new Error("bundle 缺少 setChainOverlayReader 导出");
+        }
+        mod.setChainOverlayReader(() => invoke("source_chain_overlay"));
+        // 数据接口入口（搜索/歌单/歌词/榜单…）注册：主窗口经 kind=invoke 调用，
+        // 与安卓端 __qtEntries 同一契约，HTTP 能力同样由 builtin_request 提供
+        if (typeof mod.registerQtEntries !== "function") {
+          throw new Error("bundle 缺少 registerQtEntries 导出");
+        }
+        mod.registerQtEntries({
+          request: (url, options) =>
+            invoke("builtin_request", { url, options: options || null }),
+          platform: (mod.PLATFORMS && mod.PLATFORMS.WINDOWS) || 1103,
+        });
+        const registered = globalThis.__qtEntries || null;
+        if (!registered) throw new Error("bundle 数据接口注册失败");
+        return registered;
+      }
+
+      /** 读安装状态：返回 {code, dir} 或 null（无包 / 宿主太老 / 状态读取失败） */
+      async function readInstalled() {
+        try {
+          const state = await invoke("source_state");
+          const installed = state && state.installed;
+          if (!installed || !installed.dir) return null;
+          return {
+            code: Number(installed.sourceVersionCode) || 0,
+            dir: String(installed.dir),
+          };
+        } catch {
+          return null;
+        }
+      }
+
+      /** 加载已安装远程包（dir/code 由调用方给出） */
+      async function loadInstalled(dir, code) {
+        const mod = await import(
+          "/script/" + encodeURIComponent(dir) + "/source-bundle.js"
+        );
+        entries = prepareBundle(mod);
+        return { code, mod };
+      }
+
+      /** 真实网络冒烟（§2.4 第 3 层，仅 ?smoke=1）：取链 + Range 预检 */
+      async function networkSmoke() {
+        const url = await layer.resolvePlayUrl("wyy", SMOKE_SONG, "128");
+        if (!url) throw new Error("冒烟取链返回空");
+        const res = await invoke("builtin_request", {
+          url,
+          options: {
+            method: "GET",
+            headers: { Range: "bytes=0-1" },
+            timeoutMs: 8000,
+          },
+        });
+        const status = Number(res.statusCode);
+        // 与 bundle 内 verifyPlayable 同口径：4xx 只放行 403/416
+        const statusOk = status < 400 || status === 403 || status === 416;
+        if (!statusOk) throw new Error("冒烟 Range 预检失败: HTTP " + status);
+        const contentType = String(
+          (res.headers && (res.headers["content-type"] || res.headers["Content-Type"])) || "",
+        ).toLowerCase();
+        if (/json|html|text\/plain/.test(contentType)) {
+          throw new Error("冒烟取到错误页: " + contentType);
+        }
+      }
+
+      async function boot() {
+        await report("booting");
+        // 应用不再内置音源包：只加载已安装的远程包（official 或 custom）
+        const installed = await readInstalled();
+        let loaded = null;
+        let firstErr = null;
+        if (installed) {
+          try {
+            loaded = await loadInstalled(installed.dir, installed.code);
+          } catch (err) {
+            firstErr = String((err && err.message) || err);
+          }
+        }
+        if (!loaded) {
+          // 未安装 / 加载失败：error 终态，由主窗口引导去「设置 → 音源包」安装
+          layer = null;
+          entries = null;
+          phase = "error";
+          phaseDetail = firstErr || "未安装音源包";
+          await report("error", { code: null, detail: phaseDetail });
+          return;
+        }
+        layer = loaded.mod.createSourceLayer({
+          request: (url, options) =>
+            invoke("builtin_request", { url, options: options || null }),
+          platform: (loaded.mod.PLATFORMS && loaded.mod.PLATFORMS.WINDOWS) || 1103,
+        });
+        loadedCode = loaded.code;
+        if (new URLSearchParams(location.search).get("smoke") === "1") {
+          try {
+            await networkSmoke();
+            await invoke("source_report", {
+              sourceVersionCode: loadedCode,
+              result: "ok",
+              detail: "",
+            }).catch(() => {});
+            // 冒烟通过 = 新包可用：重启应用，让新包在主窗口侧也彻底生效
+            // （取链缓存 / 播放会话都还挂在旧包上）。
+            // 冒烟失败走下面的 mark_bad 回退，那种情况不重启。
+            await invoke("app_restart").catch(() => {});
+          } catch (err) {
+            layer = null;
+            entries = null;
+            const detail = String((err && err.message) || err);
+            phase = "error";
+            phaseDetail = detail;
+            await report("error", { code: loadedCode || null, detail });
+            await invoke("source_mark_bad", {
+              code: loadedCode,
+              detail,
+              result: "smoke_failed",
+            }).catch(() => {});
+            return;
+          }
+        }
+        phase = "ready";
+        await report("ready", { code: loadedCode || null, detail: firstErr || null });
+      }
+
+      /** 主窗口 RPC：source-engine-request → source-engine-response。
+       *  kind "status" = 查询当前生命周期（client 绑定晚于引擎启动也能对齐状态）；
+       *  kind "resolve" = 取链（url "" = 失败/无可用层；line = 本次命中的线路，
+       *                    null = 未知，即包内缓存命中或旧包没有这个字段）；
+       *  kind "invoke"  = 数据接口（搜索/歌单/歌词/榜单…走 bundle 入口，result 为 JSON 文本）。 */
+      async function onRequest(event) {
+        const payload = (event && event.payload) || {};
+        const requestId = payload.requestId;
+        if (typeof requestId !== "number") return;
+        if (payload.kind === "status") {
+          await emitToMain("source-engine-response", {
+            requestId,
+            phase,
+            code: loadedCode || null,
+            detail: phaseDetail,
+          });
+          return;
+        }
+        if (payload.kind === "invoke") {
+          let result = null;
+          let error = null;
+          try {
+            const name = payload.entry == null ? "" : String(payload.entry);
+            const fn = entries ? entries[name] : null;
+            if (typeof fn !== "function") throw new Error("入口不存在: " + name);
+            result = await fn(payload.args || {});
+          } catch (err) {
+            error = String((err && err.message) || err);
+          }
+          await emitToMain("source-engine-response", { requestId, result, error });
+          return;
+        }
+        // 取链统一走 bundle 的 getPlayUrl 入口（与安卓端同一契约）：应答里除了
+        // url 还带 line = 本次命中的线路 {id,name,kind}（管理端展示「走的是音源包
+        // 里哪条源」）；失败时带 error = 逐线路 trace（哪条线死链/超时/预算耗尽未跑，
+        // 以及跨源兜底有没有跑）——这条文本以前被吞掉，用户只看到「取不到地址」，
+        // 排查只能靠猜（2026-09-24 kg 不换源就是这么发现的）。
+        let url = "";
+        let line = null;
+        let error = null;
+        try {
+          if (entries && typeof payload.source === "string") {
+            const song = payload.song || {};
+            const parsed = JSON.parse(
+              await entries.getPlayUrl({
+                platform: payload.source,
+                id: song.id,
+                name: song.name,
+                singer: song.singer,
+                album: song.album,
+                quality: payload.quality,
+                duration: song.interval,
+              }),
+            );
+            url = parsed.url || "";
+            line = parsed.line || null;
+          }
+        } catch (err) {
+          url = "";
+          line = null;
+          error = String((err && err.message) || err);
+        }
+        await emitToMain("source-engine-response", { requestId, url, line, error });
+      }
+
+      await invoke("plugin:event|listen", {
+        event: "source-engine-request",
+        target: { kind: "Any" },
+        handler: transformCallback(onRequest),
+      }).catch(() => {});
+
+      try {
+        await boot();
+      } catch (err) {
+        await report("error", { detail: String((err && err.message) || err) }).catch(() => {});
+      }
+    </script>
+  </body>
+</html>

@@ -1,0 +1,85 @@
+[package]
+name = "quietmusic"
+version = "1.1.0"
+description = "轻听 PC 版 - 轻量级桌面聚合音乐播放器"
+authors = ["QuietMusic"]
+edition = "2021"
+# rodio 0.22.2 的 MSRV 为 1.87；MSRV 感知解析器会据此挑选依赖版本，必须同步抬高
+rust-version = "1.87"
+
+[lib]
+name = "quietmusic_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# 钉 2.12.0：tao 0.37 / windows 0.62 链条。taskbar.rs / lyric_window.rs 的
+# Win32 调用已按 windows 0.62 适配；再升 tauri 时同样要连带评估 windows 依赖。
+tauri = { version = "=2.12.0", features = ["tray-icon"] }
+# 系统通知（Windows toast 等）：自动切歌熔断发生在后台，应用内错误条看不到
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "blocking", "multipart"] }
+# 0.22 起 Decoder::builder().with_byte_len() 会把总字节数透传给 symphonia 的
+# MediaSource，FLAC 的二分定位不再因 byte_len 缺失而报 Unseekable（进度条拖拽修复）
+rodio = { version = "0.22.2", features = ["symphonia-all"] }
+# 音频输出设备枚举 / 默认设备变化检测（与 rodio 0.22.2 内置的 cpal 0.17 对齐，不引入新副本）
+cpal = "0.17"
+# 本地音乐库元数据读取（DESIGN §13）：与 rodio 0.22.2 内置的 symphonia 0.5.5 同版本，不引入新副本
+symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "wav", "ogg", "aac", "isomp4", "vorbis"] }
+sha1 = "0.10"
+md-5 = "0.10"
+# 更新包 ed25519 签名校验（file_logger/更新链路）：ring 已由 rustls 带入依赖树，
+# 复用同一份源码不引入新副本
+ring = "0.17"
+base64 = "0.23"
+fastrand = "2"
+# std/alloc：set_boxed_logger（file_logger 自定义 Logger 用）默认特性集下被裁掉
+log = { version = "0.4", features = ["std", "alloc"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+tauri-plugin-global-shortcut = "2.3.2"
+tauri-plugin-dialog = "2.7"
+# 单实例：第二个实例拉起时把已有主窗口带到前台（必须最先注册，见 lib.rs）
+tauri-plugin-single-instance = "2"
+# 开机自启（Windows 注册表 Run 键）
+tauri-plugin-autostart = "2"
+# Windows 系统媒体控制（SMTC）：系统媒体面板 + 硬件媒体键 / 蓝牙耳机按键。
+# 只有 Windows 会编译到 windows crate；Linux 的 dbus 后端用不到，关掉默认特性。
+souvlaki = { version = "0.8.3", default-features = false }
+
+# Windows 任务栏缩略图工具栏（taskbar.rs）：ITaskbarList3::ThumbBarAddButtons +
+# GDI 现场生成图标 + 窗口过程替换接收按钮点击。
+# 版本与 tauri 2.12 链条锁定的 windows 0.62 对齐，避免引入第二份副本。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    "Win32_System_Registry",
+    # GetLocalTime（file_logger 的时间戳）
+    "Win32_System_SystemInformation",
+    "Win32_UI_Accessibility",
+    "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.dev]
+incremental = true
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+# 这里原本是 panic = "abort"。本项目有 400+ 处 unwrap/expect，"abort" 会把
+# 「某条命令拿到意外数据」直接变成**无提示的进程闪退**（日志都来不及刷），
+# 前端只能看到应用凭空消失。改回默认 unwind 后：命令级 panic 由 Tauri 兜成
+# 一次 invoke 失败（前端能弹出错误），音频线程另有 catch_unwind 兜底。
+# 代价是二进制略大（unwind 表），相对"闪退变报错"完全可以接受。
+strip = true

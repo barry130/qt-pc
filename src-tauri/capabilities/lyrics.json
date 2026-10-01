@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "lyrics-capability",
+  "description": "桌面歌词窗口能力：只允许订阅歌词与播放位置事件 + 上报自身状态（§17.4）",
+  "windows": [
+    "lyrics"
+  ],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-ignore-cursor-events",
+    "core:window:allow-set-size"
+  ]
+}

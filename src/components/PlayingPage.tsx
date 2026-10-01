@@ -1,0 +1,312 @@
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useLocation, useNavigate } from "@tanstack/react-router";
+import { ChevronDown } from "lucide-react";
+import type { Track } from "@/types";
+import { usePlayerStore } from "@/stores/player";
+import { useInterpolatedPosition } from "@/hooks/useInterpolatedPosition";
+import { crossSourceForPlayback, getPlaybackLyric } from "@/lib/localOnline";
+import { findActiveIndex, mergeTranslation, parseLrc, qtresCoverUrl } from "@/lib/lrc";
+import { WindowControls } from "@/components/WindowControls";
+import { cn , errMsg } from "@/lib/utils";
+
+/**
+ * 播放页（全屏歌词 + 旋转封面）：
+ * - 左侧：黑胶唱片风格旋转封面（仅播放时旋转，暂停停在当前角度）
+ * - 右侧：曲目信息 + 滚动歌词
+ * - 左上角：收回按钮（返回上一页）
+ * - 右上角：最小化 / 最大化 / 退出（本页隐藏了 TitleBar，必须自带窗口控制）
+ * - 歌词同步误差 ≤ 50ms（rAF 插值 + 高亮平滑）
+ */
+export function PlayingPage(): React.JSX.Element {
+  const track = usePlayerStore((s) => s.state?.track ?? null);
+  const playUrl = usePlayerStore((s) => s.state?.playUrl ?? null);
+  const quality = usePlayerStore((s) => s.state?.quality ?? null);
+  const playing = usePlayerStore((s) => s.state?.status === "playing");
+  const seekTo = usePlayerStore((s) => s.seekTo);
+  const position = useInterpolatedPosition();
+  const navigate = useNavigate();
+  const pathname = useLocation().pathname;
+
+  const [lrc, setLrc] = useState("");
+  const [translation, setTranslation] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const loadedFor = useRef<string | null>(null);
+
+  // 换源兜底会把实际播放地址切到别的平台（playUrl 变化时命中线路记忆刚更新）：
+  // 歌词必须跟着换到对应源重取，避免「放的是 kw 的音、显示的是 wyy 的词」
+  const cross = useMemo(
+    () => crossSourceForPlayback(track, quality),
+    // 线路记忆不是响应式数据，靠 playUrl 变化触发重估（跨源兜底必然改地址）
+    [track, quality, playUrl],
+  );
+
+  const key = track
+    ? `${track.platform}:${track.id}:${cross?.target ?? ""}:${cross?.song?.id ?? ""}`
+    : null;
+
+  useEffect(() => {
+    if (!track || !key || loadedFor.current === key) return;
+    loadedFor.current = key;
+    setLrc("");
+    setTranslation("");
+    setError(null);
+    setLoading(true);
+    getPlaybackLyric(track, cross)
+      .then((lyr) => {
+        // 已有更新的取词（如随后又换源）：过期结果不应用，最后应用的必须是对应源的
+        if (loadedFor.current !== key) return;
+        setLrc(lyr.lrc);
+        setTranslation(lyr.translation);
+      })
+      .catch((err) => {
+        if (loadedFor.current !== key) return;
+        setError(errMsg(err));
+      })
+      .finally(() => {
+        if (loadedFor.current === key) setLoading(false);
+      });
+  }, [track, key, cross]);
+
+  const lines = useMemo(() => {
+    const parsed = parseLrc(lrc);
+    return mergeTranslation(parsed, translation);
+  }, [lrc, translation]);
+
+  const activeIndex = findActiveIndex(lines, position);
+
+  const handleBack = (): void => {
+    if (pathname !== "/playing") return;
+    if (window.history.length > 1) {
+      window.history.back();
+    } else {
+      void navigate({ to: "/" });
+    }
+  };
+
+  return (
+    <div className="flex h-full w-full">
+      {/* 收回按钮 */}
+      <button
+        type="button"
+        onClick={handleBack}
+        className="absolute left-4 top-3 z-10 flex h-8 w-8 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+        aria-label="返回"
+      >
+        <ChevronDown className="h-5 w-5" />
+      </button>
+
+      {/* 窗口控制：AppShell 在播放页整页隐藏 TitleBar，没有这组按钮就没法最小化/关闭窗口 */}
+      <WindowControls
+        variant="floating"
+        closeLabel="退出"
+        className="absolute right-4 top-3 z-10"
+      />
+
+      <div className="flex min-h-0 w-full flex-1">
+        {/* 左侧：旋转封面 */}
+        <div className="flex w-[38%] shrink-0 items-center justify-center">
+          <VinylCover track={track} playing={playing} />
+        </div>
+
+        {/* 右侧：曲目信息 + 歌词 */}
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+          {/* pr-32：给右上角的窗口控制按钮让位，长标题不会钻到按钮底下 */}
+          <div className="pl-8 pr-32 pt-10 pb-4">
+            <TrackInfo track={track} />
+          </div>
+          <div className="min-h-0 flex-1 overflow-hidden">
+            {error ? (
+              <CenterText text={`歌词加载失败：${error}`} />
+            ) : loading ? (
+              <CenterText text="歌词加载中…" />
+            ) : lines.length === 0 ? (
+              <CenterText
+                text={track?.platform === "local" ? "没有歌词" : "暂无歌词"}
+              />
+            ) : (
+              <LyricScroller
+                lines={lines}
+                activeIndex={activeIndex}
+                onSeekMs={(ms) => void seekTo(ms)}
+              />
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** 黑胶唱片风格旋转封面（仅播放时旋转） */
+function VinylCover(props: { track: Track | null; playing: boolean }): React.JSX.Element {
+  const { track, playing } = props;
+  const coverUrl = track ? qtresCoverUrl(track.picUrl) : null;
+
+  return (
+    <div className="relative">
+      {/* 封面色光晕：唱片不再浮在纯色上，与整窗背景同一色源 */}
+      <div
+        aria-hidden
+        className="absolute -inset-10 rounded-full opacity-60 blur-3xl"
+        style={{
+          background:
+            "color-mix(in srgb, var(--playing-cover-accent, var(--primary)) 38%, transparent)",
+        }}
+      />
+      {/* 唱片：animation-play-state 控制转/停 —— 暂停时停在当前角度，
+          恢复播放从原角度继续，不会跳回 0 度。
+          尺寸随视口呼吸：窄窗不低于 240px，宽窗封顶 420px（固定 280/320 在大屏全屏下偏小） */}
+      <div
+        className="vinyl-spin relative rounded-full bg-neutral-900 shadow-2xl"
+        style={{
+          width: "clamp(240px, 30vw, 420px)",
+          height: "clamp(240px, 30vw, 420px)",
+          animationPlayState: playing ? "running" : "paused",
+        }}
+      >
+        {/* 唱片纹理（同心圆）：百分比 inset，随唱片尺寸等比缩放 */}
+        <div className="absolute inset-0 rounded-full border border-neutral-800" />
+        <div className="absolute inset-[5%] rounded-full border border-neutral-800" />
+        <div className="absolute inset-[10%] rounded-full border border-neutral-800" />
+        <div className="absolute inset-[15%] rounded-full border border-neutral-800" />
+
+        {/* 专辑封面 */}
+        <div className="absolute inset-0 flex items-center justify-center">
+          <div className="relative h-[38%] w-[38%] overflow-hidden rounded-full shadow-lg">
+            {coverUrl ? (
+              <img
+                src={coverUrl}
+                alt={track?.title ?? ""}
+                className="h-full w-full object-cover"
+              />
+            ) : (
+              <div className="flex h-full w-full items-center justify-center bg-neutral-800 text-neutral-500">
+                <svg className="h-8 w-8" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                  <circle cx="12" cy="12" r="10" />
+                  <path d="M12 6v6l4 2" />
+                </svg>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* 中心轴孔 */}
+        <div className="absolute left-1/2 top-1/2 h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-neutral-700 ring-1 ring-neutral-600" />
+      </div>
+    </div>
+  );
+}
+
+function TrackInfo(props: { track: Track | null }): React.JSX.Element {
+  const { track } = props;
+  return (
+    <div className="min-w-0">
+      <div className="truncate text-2xl font-bold tracking-tight">
+        {track ? track.title : "未在播放"}
+      </div>
+      {track ? (
+        // 歌手在前（音乐 App 惯例），专辑可选展示，用「·」分隔替代全角空格；
+        // 两段都可收缩截断，长专辑名不再把歌手名挤出视野
+        <div className="mt-2 flex min-w-0 items-center gap-x-2 text-sm text-muted-foreground">
+          <span className="min-w-0 truncate">{track.singer}</span>
+          {track.album && (
+            <>
+              <span className="shrink-0 text-muted-foreground/50">·</span>
+              <span className="min-w-0 truncate">{track.album}</span>
+            </>
+          )}
+        </div>
+      ) : (
+        <div className="mt-1 text-sm text-muted-foreground">
+          去搜索页找一首歌开始播放
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CenterText(props: { text: string }): React.JSX.Element {
+  return (
+    <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
+      {props.text}
+    </div>
+  );
+}
+
+/**
+ * 歌词滚动区：当前行高亮居中。整行可点击 —— 点击任意歌词行跳转到该行
+ * 对应的进度（主流播放器标配；无时间戳的行不响应）。
+ */
+function LyricScroller(props: {
+  lines: { timeMs: number; text: string; translation?: string }[];
+  activeIndex: number;
+  onSeekMs: (ms: number) => void;
+}): React.JSX.Element {
+  const { lines, activeIndex, onSeekMs } = props;
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const itemRefs = useRef<Array<HTMLDivElement | null>>([]);
+
+  useEffect(() => {
+    const el = itemRefs.current[activeIndex];
+    const container = containerRef.current;
+    if (!el || !container) return;
+    const target =
+      el.offsetTop - container.clientHeight / 2 + el.clientHeight / 2;
+    container.scrollTo({ top: target, behavior: "smooth" });
+  }, [activeIndex]);
+
+  return (
+    <div
+      ref={containerRef}
+      className="h-full overflow-y-auto scroll-smooth px-8 [mask-image:linear-gradient(to_bottom,transparent,black_15%,black_85%,transparent)]"
+    >
+      <div className="mx-auto flex max-w-xl flex-col gap-5 py-[40%]">
+        {lines.map((line, i) => (
+          <div
+            key={i}
+            ref={(el) => {
+              itemRefs.current[i] = el;
+            }}
+            role={line.timeMs >= 0 ? "button" : undefined}
+            tabIndex={line.timeMs >= 0 ? 0 : undefined}
+            onClick={line.timeMs >= 0 ? () => onSeekMs(line.timeMs) : undefined}
+            onKeyDown={
+              line.timeMs >= 0
+                ? (e) => {
+                    if (e.key === "Enter" || e.key === " ") {
+                      e.preventDefault();
+                      onSeekMs(line.timeMs);
+                    }
+                  }
+                : undefined
+            }
+            className={cn(
+              "text-center transition-all duration-300",
+              line.timeMs >= 0
+                ? "cursor-pointer hover:text-lyric-highlight/70 focus-visible:outline-none"
+                : "",
+              i === activeIndex
+                ? "scale-105 text-xl font-semibold text-lyric-highlight"
+                : "text-base text-lyric-inactive",
+            )}
+          >
+            <div>{line.text || "…"}</div>
+            {line.translation && (
+              <div
+                className={cn(
+                  "mt-1 text-sm",
+                  i === activeIndex
+                    ? "text-lyric-highlight/80"
+                    : "text-lyric-inactive/70",
+                )}
+              >
+                {line.translation}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}

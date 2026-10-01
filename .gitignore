@@ -1,0 +1,65 @@
+# 依赖
+node_modules/
+
+# 前端构建产物（由 beforeBuildCommand 生成）
+dist/
+# 音源包构建产物目录（历史遗留忽略项；仓库不含音源包，音源包在运行时安装）
+dist-sources/
+
+# Rust / Tauri 构建产物
+src-tauri/target/
+
+# 项目内 Cargo home（含 registry 源码缓存，体积大且每次 build 都会变动）
+.cargo-home/
+
+# 本机构建绕行配置：把 crates-io 指向 127.0.0.1 的本地 HTTP 镜像，
+# 只在开发这台机器上成立，提交会让别人的 cargo 构建直接失败
+src-tauri/.cargo/
+
+# Tauri CLI 生成，构建时自动重建
+src-tauri/gen/schemas/
+
+# 包管理器 / 构建缓存（含本机绝对路径与数十 MB 缓存，不入库）
+.npm-cache/
+.pnpm-store/
+.vite-cache/
+# 只写了本机 cache/store 绝对路径
+.npmrc
+
+# 临时脚本与临时目录（.tmp 是会话级临时目录，注意 *.tmp 规则只按后缀匹配，
+# 这里显式列出目录名以免误提交）
+tmp/
+.tmp/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# 日志与临时文件
+*.log
+*.tmp
+nul
+
+# 发布暂存（source-bundle.js / source-release.zip / 发布说明 等生成物，
+# 属线上交付物，本地保留、不入库）
+release-pending/
+
+# 线路复测诊断产物（本地参考数据，体积约 471 KB，不入库，需要时从本地读取）
+diag-live-rank.mjs
+diag-line-verdict.mjs
+diag-live-rank-1101.json
+diag-live-rank-1101-kw-wyy.json
+
+# tauri icon 生成的移动端图标（本项目为桌面 NSIS 打包，用不到）
+src-tauri/icons/android/
+src-tauri/icons/ios/
+
+# 更新包签名私钥（scripts/update-sign.mjs 用；泄露 = 更新链路沦陷）
+.signing/
+
+# 损坏修复残留与一次性诊断产物，不进仓库
+*.corrupt
+gitee_search.json

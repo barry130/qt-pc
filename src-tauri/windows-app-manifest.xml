@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <!-- Common Controls v6：rfd / muda / tauri-runtime-wry 引用的 TaskDialogIndirect
+       只存在于 comctl32 v6，v5（system32 里那份）没有这个导出。
+       本文件经 .cargo/config.toml 的 /MANIFESTINPUT 嵌入**所有**链接产物
+       （bin / cargo test 的测试 exe），与 tauri-build 默认 manifest 内容一致；
+       tauri-build 侧已用 new_without_app_manifest 关掉，避免 bin 里重复嵌入。 -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+</assembly>
