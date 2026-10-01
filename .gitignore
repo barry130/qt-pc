@@ -63,3 +63,5 @@ src-tauri/icons/ios/
 # 损坏修复残留与一次性诊断产物，不进仓库
 *.corrupt
 gitee_search.json
+
+tsconfig.tsbuildinfo
