@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { errMsg, stripErrorUrls } from "@/lib/utils";
 import { useNavigate } from "@tanstack/react-router";
 import { getAllWindows } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
 import { PageContainer } from "@/components/layout/PageContainer";
 import * as ipc from "@/services/ipc";
 import {
@@ -20,11 +21,15 @@ import { useSourceUpdateStore } from "@/stores/source-update";
 import { runCheck } from "@/hooks/useUpdateCheck";
 import { checkAndDownload } from "@/hooks/useSourceUpdateCheck";
 import {
-  applySourceRelease,
+  activateSourcePack,
+  checkSourceUpdate,
   getSourceState,
   installSourceFromUrl,
-  rollbackSource,
+  installSourceRelease,
+  uninstallSourcePack,
+  type PlayPackVo,
 } from "@/source-scripts/source-update";
+import { engineInvoke } from "@/source-engine/client";
 import { SKINS, getSkin } from "@/lib/skins";
 import { QUALITY_OPTIONS } from "@/lib/quality";
 import {
@@ -1182,23 +1187,59 @@ function formatBytes(bytes: number): string {
   );
 }
 
-/** 应用成功提示：冒烟通过后引擎页会请求重启，所以提示里带上重启口径 */
-const APPLY_OK_MESSAGE = "应用成功，正在重启应用…";
+/** 播放包列表单行文案：包名 · 版本 · 来源 */
+function packLabel(p: PlayPackVo): string {
+  const tag = p.source === "official" ? "官方" : "自定义";
+  const ver = p.version || p.versionName || `code ${p.versionCode}`;
+  return `${p.name || `${tag}播放包`} · ${ver} · ${tag}`;
+}
 
-/** 音源包设置：当前/远端版本 + 从链接安装 + 立即检查/应用/回退。
- *  状态事实来源是 Rust state.json；「已就绪」= 下载完成待应用。 */
+/** 音源包设置（双音源包架构）：
+ *  - 内置数据包（低风险，随应用发版）只展示自述信息；
+ *  - 播放包（高风险，不内置）：官方包检查/安装/更新 + 多包列表（单选生效/
+ *    卸载）+ 从直链安装自定义包。
+ *  状态事实来源是 Rust state.json（v2 多包）；安装/切换/卸载后 Rust 广播
+ *  source-pack-changed，引擎页热切换生效——不重启应用、不打断播放。 */
 function SourcePackageSection(): React.JSX.Element {
   const local = useSourceUpdateStore((s) => s.local);
   const remote = useSourceUpdateStore((s) => s.remote);
-  const ready = useSourceUpdateStore((s) => s.ready);
   const message = useSourceUpdateStore((s) => s.message);
   const busy = useSourceUpdateStore((s) => s.busy);
   const setBusy = useSourceUpdateStore((s) => s.setBusy);
   const setMessage = useSourceUpdateStore((s) => s.setMessage);
-  const setReady = useSourceUpdateStore((s) => s.setReady);
   const setLocal = useSourceUpdateStore((s) => s.setLocal);
   const [url, setUrl] = useState("");
   const [installing, setInstalling] = useState(false);
+  const [metaInfo, setMetaInfo] = useState<{ name: string; version: string } | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setLocal(await getSourceState());
+    } catch {
+      // 状态读取失败保持旧值（设置页其余操作仍可用）
+    }
+  }, [setLocal]);
+
+  useEffect(() => {
+    void refresh();
+    // Rust 侧包变化（安装/切换/卸载，含引擎 describe 回填）时同步列表
+    let unlisten: (() => void) | null = null;
+    void listen("source-pack-changed", () => void refresh()).then((u) => {
+      unlisten = u;
+    });
+    return () => unlisten?.();
+  }, [refresh]);
+
+  // 内置数据包自述（引擎就绪后可查；未就绪就保持占位）
+  useEffect(() => {
+    void engineInvoke("bundleInfo", {})
+      .then((r) => {
+        const name = typeof r?.name === "string" ? r.name : "";
+        const version = typeof r?.version === "string" ? r.version : "";
+        if (name || version) setMetaInfo({ name, version });
+      })
+      .catch(() => {});
+  }, []);
 
   const run = async (action: () => Promise<string>): Promise<void> => {
     setBusy(true);
@@ -1213,46 +1254,41 @@ function SourcePackageSection(): React.JSX.Element {
 
   const check = (): Promise<string> => checkAndDownload();
 
-  // 应用成功后提示「应用成功」，随即收起应用按钮与更新说明（已装上就不占版面）。
-  // 真实冒烟由引擎页执行，通过后引擎页会请求重启应用，所以这里的提示带上重启口径。
-  const apply = async (): Promise<void> => {
-    setBusy(true);
-    try {
-      await applySourceRelease(true);
-      setReady(null);
-      setMessage(APPLY_OK_MESSAGE);
-      window.setTimeout(() => {
-        if (useSourceUpdateStore.getState().message === APPLY_OK_MESSAGE) {
-          setMessage("");
-        }
-      }, 15000);
-    } catch (e) {
-      setMessage(`操作失败：${stripErrorUrls(String(e))}`);
-    } finally {
-      setBusy(false);
+  /** 首装/手动更新官方包（用户在设置页主动点击；启动静默检查只做已装更新） */
+  const installOfficial = async (): Promise<string> => {
+    const { decision } = await checkSourceUpdate();
+    if (decision.action !== "download") {
+      return decision.reason;
     }
+    await installSourceRelease(decision.release);
+    await refresh();
+    return `官方播放包 ${decision.release.sourceVersionName} 已安装并生效`;
   };
 
-  const rollback = async (): Promise<string> => {
-    await rollbackSource();
-    return "已回退引擎重启后生效";
+  const activate = async (packId: string): Promise<string> => {
+    await activateSourcePack(packId);
+    await refresh();
+    return "已切换生效播放包";
+  };
+
+  const uninstall = async (packId: string): Promise<string> => {
+    await uninstallSourcePack(packId);
+    await refresh();
+    return "已卸载播放包";
   };
 
   const installUrl = async (): Promise<void> => {
     const trimmed = url.trim();
     if (!trimmed) {
-      setMessage("请先粘贴 source-bundle.js 直链");
+      setMessage("请先粘贴 play-bundle.js 直链");
       return;
     }
     setInstalling(true);
     try {
       await installSourceFromUrl(trimmed);
       setUrl("");
-      // 重拉本地状态，展示新装的 custom 包
-      const st = await getSourceState();
-      setLocal(st);
-      setReady(null);
-      setMessage("自定义音源包已安装，点击「立即应用」后重启生效");
+      await refresh();
+      setMessage("自定义播放包已安装；列表中可切换生效");
     } catch (e) {
       setMessage(`安装失败：${stripErrorUrls(String(e))}`);
     } finally {
@@ -1260,27 +1296,91 @@ function SourcePackageSection(): React.JSX.Element {
     }
   };
 
-  const installed = local?.installed ?? null;
-  const isCustom = installed?.source === "custom";
-  const installedText = installed
-    ? `${installed.sourceVersionName} (code ${installed.sourceVersionCode})${isCustom ? " · 自定义" : " · 官方"}`
+  const packs = local?.packs ?? [];
+  const official = packs.find((p) => p.source === "official") ?? null;
+  const officialCurrent = official
+    ? `${official.versionName || official.version || "官方播放包"} (code ${official.versionCode})`
     : "未安装";
-  const pendingNotes =
-    remote?.notes && (ready !== null || (remote.sourceVersionCode > (installed?.sourceVersionCode ?? 0)));
+  // 官方包未装且远端有可用版本时才出现首装按钮（安装必须是用户主动行为）
+  const canInstallOfficial = !official && remote !== null;
+  const notes = remote?.notes;
+
   return (
     <div className="max-w-xl divide-y divide-border">
       <SettingRow
-        title="当前音源包"
-        description="应用不再内置音源：未安装时在线功能不可用，请安装官方包或从链接安装自定义包"
+        title="内置数据包"
+        description="搜索/歌单/歌词/封面等低风险数据源，随应用内置更新，无需安装"
       >
-        <span className="font-mono text-xs text-muted-foreground">{installedText}</span>
+        <span className="font-mono text-xs text-muted-foreground">
+          {metaInfo ? `${metaInfo.name} ${metaInfo.version}` : "…"}
+        </span>
       </SettingRow>
-      <SettingRow title="从链接安装" description="粘贴 source-bundle.js 直链（自定义包不自动更新）">
+      <SettingRow
+        title="官方播放包"
+        description="在线播放（取链）必需；高风险源不随应用分发，由用户自行安装"
+      >
+        <div className="flex w-full flex-col items-end gap-2">
+          <span className="font-mono text-xs text-muted-foreground">{officialCurrent}</span>
+          {remote && (
+            <span className="font-mono text-xs text-muted-foreground">
+              远端最新 {remote.sourceVersionName} (code {remote.sourceVersionCode})
+            </span>
+          )}
+          <div className="flex gap-2">
+            {canInstallOfficial && (
+              <button
+                type="button"
+                onClick={() => void run(installOfficial)}
+                disabled={busy}
+                className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+              >
+                安装官方播放包
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => void run(check)}
+              disabled={busy}
+              className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+            >
+              {busy ? "处理中…" : "立即检查"}
+            </button>
+          </div>
+        </div>
+      </SettingRow>
+      {packs.length > 0 && (
+        <SettingRow title="播放包列表" description="多包共存，选择其一生效；卸载即删除本地文件">
+          <div className="flex w-full flex-col gap-2">
+            {packs.map((p) => (
+              <div key={p.id} className="flex items-center gap-2 text-xs">
+                <input
+                  type="radio"
+                  name="active-pack"
+                  aria-label={`启用 ${packLabel(p)}`}
+                  checked={local?.activeId === p.id}
+                  onChange={() => void run(() => activate(p.id))}
+                  disabled={busy}
+                />
+                <span className="flex-1 font-mono text-muted-foreground">{packLabel(p)}</span>
+                <button
+                  type="button"
+                  onClick={() => void run(() => uninstall(p.id))}
+                  disabled={busy}
+                  className="rounded-md border border-border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
+                >
+                  卸载
+                </button>
+              </div>
+            ))}
+          </div>
+        </SettingRow>
+      )}
+      <SettingRow title="从链接安装" description="粘贴 play-bundle.js 直链安装自定义播放包（不自动更新）">
         <div className="flex w-full flex-col gap-2">
           <input
             value={url}
             onChange={(e) => setUrl(e.target.value)}
-            placeholder="https://…/source-bundle.js"
+            placeholder="https://…/play-bundle.js"
             className="w-full rounded-md border border-border px-3 py-1.5 text-xs"
           />
           <button
@@ -1293,60 +1393,11 @@ function SourcePackageSection(): React.JSX.Element {
           </button>
         </div>
       </SettingRow>
-      <SettingRow title="远端最新" description="检查后显示远端发布的官方音源包版本">
-        <span className="font-mono text-xs text-muted-foreground">
-          {remote ? `${remote.sourceVersionName} (code ${remote.sourceVersionCode})` : "未检查"}
-        </span>
-      </SettingRow>
-      {!isCustom && (
-        <SettingRow title="更新检查" description="启动时也会静默检查，只下载不自动生效">
-          <button
-            type="button"
-            onClick={() => void run(check)}
-            disabled={busy}
-            className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
-          >
-            {busy ? "处理中…" : "立即检查"}
-          </button>
-        </SettingRow>
-      )}
-      {installed && (
-        <SettingRow
-          title="回退上一版"
-          description="当前版本出问题时回退到上一版远程包；无上一版则卸载（在线功能需重新安装）"
-        >
-          <button
-            type="button"
-            onClick={() => void run(rollback)}
-            disabled={busy}
-            className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
-          >
-            回退
-          </button>
-        </SettingRow>
-      )}
-      {(ready !== null || message) && (
-        <div className="py-3 text-xs text-muted-foreground">
-          {ready !== null && (
-            <div className="mb-1">
-              <button
-                type="button"
-                onClick={() => void apply()}
-                disabled={busy}
-                className="rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground disabled:opacity-50"
-              >
-                立即应用
-              </button>
-              <span className="ml-2">音源包已就绪，应用后自动重启应用生效</span>
-            </div>
-          )}
-          {message && <div>{message}</div>}
-        </div>
-      )}
-      {pendingNotes && (
+      {message && <div className="py-3 text-xs text-muted-foreground">{message}</div>}
+      {notes && (
         <div className="py-3 text-xs text-muted-foreground">
           <p className="mb-1 font-medium text-foreground">更新说明</p>
-          <p className="whitespace-pre-wrap">{remote?.notes}</p>
+          <p className="whitespace-pre-wrap">{notes}</p>
         </div>
       )}
     </div>

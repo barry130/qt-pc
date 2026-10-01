@@ -1,17 +1,21 @@
 /**
- * 音源访问层统一入口（纯音源包版）。
+ * 音源访问层统一入口（双音源包架构）。
  *
- * 页面一律从这里调"第三方源"动作，不直接 import ipc 里的对应命令。
- * 应用**不再内置**第三方音源实现：wyy/qq/kw/kg 的一切数据接口与取链都由
- * 引擎窗口加载的音源包（source-bundle.js，含全部第三方线路地址）承担，
- * 应用侧只保留 astral 后端与音源包两条网络通道——平台官方接口、聚合线路
- * 等 URL 只允许出现在音源包构建产物里（scripts/build-sources.mjs）。
+ * 页面一律从这里调"在线源"动作，不直接 import ipc 里的对应命令。
+ * 在线能力拆成两个包，都由引擎窗口装载：
+ * - **数据包**（meta-bundle.js，低风险）：搜索/歌单/榜单/歌词/封面，随应用
+ *   内置，无需安装；
+ * - **播放包**（play-bundle.js，高风险）：取链线路，不内置，用户在
+ *   「设置 → 音源包」自行安装（官方 manifest 或直链），可多包共存。
+ * 应用侧只保留 astral 后端与引擎两条网络通道——平台官方接口、聚合线路等
+ * URL 只允许出现在音源包构建产物里（qt-sources，scripts/build-sources.mjs）。
  *
- * - local 源 → 本地扫描单元，第三方动作不适用（ensureScript 直接报错）；
- * - 音源包未安装/未就绪/调用失败 → 抛出带原因的统一错误（engineError）；
+ * - local 源 → 本地扫描单元，在线动作不适用（ensureScript 直接报错）；
+ * - 引擎未就绪/调用失败 → 抛出带原因的统一错误（engineError）；
  * - 取链（playUrl）特殊：播放由 Rust 引擎主导，脚本路径通过
  *   resolvePlayUrl() 预解析 + set_resolved_play_url 回填引擎缓存接入；
- *   引擎未命中缓存时经 playurl_bridge 再问一次前端。失败返回空串。
+ *   引擎未命中缓存时经 playurl_bridge 再问一次前端。失败返回空串；
+ *   缺播放包时派发 qt-play-pack-missing 事件（PlayPackPrompt 弹安装引导）。
  */
 import * as ipc from "@/services/ipc";
 import type {
@@ -24,7 +28,6 @@ import type {
   Quality,
   SourceId,
   Track,
-  Video,
 } from "@/types";
 import type {
   ContractChart,
@@ -38,19 +41,19 @@ import { PER_SOURCE_TIMEOUT_MS, withTimeoutMs } from "@/source-scripts/qt-contra
 
 // ---------- 引擎调用 ----------
 
-/** 音源包不可用时抛的错：按引擎生命周期给出可操作的原因 */
+/** 引擎（内置数据包）不可用时抛的错：按引擎生命周期给出可操作的原因 */
 function engineError(entry: string): Error {
   const snap = engineSnapshot();
   switch (snap.phase) {
     case null:
     case "booting":
-      return new Error(`音源包正在启动，请稍后再试（${entry}）`);
+      return new Error(`音源引擎正在启动，请稍后再试（${entry}）`);
     case "error":
       return new Error(
-        `音源包加载失败${snap.detail ? "：" + snap.detail : ""}，请到「设置 → 音源包」重新安装`,
+        `音源引擎加载失败${snap.detail ? "：" + snap.detail : ""}，请重启应用或升级到最新版本`,
       );
     default:
-      return new Error(`音源包接口调用失败或超时（${entry}）`);
+      return new Error(`音源接口调用失败或超时（${entry}）`);
   }
 }
 
@@ -335,10 +338,25 @@ export async function getArtistSongs(
 // ---------- 取链（脚本预解析 + 回填引擎缓存） ----------
 
 /**
+ * 内置数据包取链入口的「未装播放包」错误标记。
+ * 与 qt-sources meta-entries.ts 的 PLAY_PACK_MISSING_MESSAGE 前缀保持一致：
+ * 引擎页 resolve 失败时把错误文本带回来，这里据此弹安装引导。
+ */
+export const PLAY_PACK_MISSING_MARKER = "未安装播放音源包";
+
+/** 取链失败原因若为缺播放包 → 派发全局事件（PlayPackPrompt 弹安装引导） */
+function maybeEmitPlayPackMissing(errText: string): void {
+  if (errText.includes(PLAY_PACK_MISSING_MARKER)) {
+    window.dispatchEvent(new CustomEvent("qt-play-pack-missing"));
+  }
+}
+
+/**
  * 预解析播放地址（播放动作发起前调用）：
- * 只走音源引擎窗口（远程音源包）——就绪才参与，超时/失败静默。
- * 解析结果回填 Rust 引擎的 PlayUrl 缓存，引擎播放时命中缓存直接使用。
- * 包内自带多线路换源与跨源兜底；返回空串 = 本次取链失败（由引擎兜底/报错）。
+ * 只走音源引擎窗口——数据包内置，播放包按本地状态装配，就绪才参与，
+ * 超时/失败静默。解析结果回填 Rust 引擎的 PlayUrl 缓存，引擎播放时命中
+ * 缓存直接使用。包内自带多线路换源与跨源兜底；返回空串 = 本次取链失败
+ * （由引擎兜底/报错）。
  */
 export async function resolvePlayUrl(
   track: Track,
@@ -358,9 +376,12 @@ export async function resolvePlayUrl(
     // 失败死因（逐线路 trace）也记下来：面板显示「上次取链死因」，
     // 否则「取不到地址」在 PC 上完全不可诊断（2026-09-24 kg 不换源即此类）
     rememberPlayUrlMiss(track, quality, resolved.error);
+    maybeEmitPlayPackMissing(resolved.error);
   } catch (e) {
     // 引擎层已尽力（多线路换源 + 跨源兜底）：本次播放失败
-    rememberPlayUrlMiss(track, quality, e instanceof Error ? e.message : String(e));
+    const msg = e instanceof Error ? e.message : String(e);
+    rememberPlayUrlMiss(track, quality, msg);
+    maybeEmitPlayPackMissing(msg);
   }
   return "";
 }
@@ -536,36 +557,5 @@ export async function getAllHotWords(): Promise<string[]> {
 }
 
 // ---------- MV ----------
+// MV/视频接口已随双音源包架构移除（播放包不再产出 videoUrl，客户端全链路删除）。
 
-export async function getVideos(
-  source: SourceId,
-  page: number,
-  size: number,
-): Promise<Video[]> {
-  ensureScript(source);
-  const list = await sourceCall<{ id: string; name: string; picUrl: string; singer: string }[]>(
-    "videos",
-    { source, page, size },
-    (p) => p.list as { id: string; name: string; picUrl: string; singer: string }[] | undefined,
-  );
-  return list.map((item) => ({
-    id: item.id,
-    platform: source,
-    name: item.name,
-    picUrl: item.picUrl,
-    singer: item.singer,
-  }));
-}
-
-export async function getVideoUrl(
-  source: SourceId,
-  videoId: string,
-  quality: string,
-): Promise<string> {
-  ensureScript(source);
-  return sourceCall<string>(
-    "videoUrl",
-    { source, videoId, quality },
-    (p) => (typeof p.url === "string" ? p.url : undefined),
-  );
-}

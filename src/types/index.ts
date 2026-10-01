@@ -178,15 +178,6 @@ export interface Chart {
   description: string | null;
 }
 
-/** MV / 视频 */
-export interface Video {
-  id: string;
-  platform: SourceId;
-  name: string;
-  picUrl: string;
-  singer: string;
-}
-
 /** 对齐 Rust `PlaybackState`（DESIGN §7.2 全量快照） */
 export interface PlaybackState {
   trackId: string | null;

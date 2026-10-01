@@ -17,6 +17,7 @@ import { usePlayingCoverBg } from "@/hooks/usePlayingCoverBg";
 import { useLocalTrackOnlineMeta } from "@/hooks/useLocalTrackOnlineMeta";
 import { useUpdateCheck } from "@/hooks/useUpdateCheck";
 import { useSourceUpdateCheck } from "@/hooks/useSourceUpdateCheck";
+import { PlayPackPrompt } from "@/components/PlayPackPrompt";
 import { useAppearanceStore } from "@/stores/appearance";
 import { usePlayerStore } from "@/stores/player";
 import { useDownloadsStore } from "@/stores/downloads";
@@ -41,7 +42,7 @@ export function AppShell(): React.JSX.Element {
   usePlayingCoverBg();
   useLocalTrackOnlineMeta();
   useUpdateCheck();
-  // 音源包启动检查（静默，每次启动查一次；发现新包只落盘，设置页可立即应用）
+  // 播放音源包启动静默检查（只更新已装的官方包；未安装时不打扰）
   useSourceUpdateCheck();
 
   const bgImage = useAppearanceStore((s) => s.preference.bgImage);
@@ -208,6 +209,8 @@ export function AppShell(): React.JSX.Element {
         {/* 更新弹窗（启动自动检查发现新版本时弹出，§15.3） */}
         <UpdateDialog />
         <QtNoticeDialog />
+        {/* 在线取链缺播放包时的可操作提示（跳设置页安装） */}
+        <PlayPackPrompt />
       </ErrorBoundary>
 
       {/* 8 向 resize 命中区（fixed 覆盖层，最后挂载保证在最上） */}

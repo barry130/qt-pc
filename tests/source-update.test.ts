@@ -1,9 +1,10 @@
 /**
- * 音源包更新判定单测（§2.3 客户端判定 6 步，纯函数）。
+ * 播放音源包更新判定单测（双音源包架构：官方包 bootstrap/更新，自定义包不参与）。
  */
 import { describe, expect, it } from "vitest";
 import {
   decideUpdate,
+  type PlayPackVo,
   type SourceReleaseVo,
   type SourceStateVo,
 } from "@/source-scripts/source-update";
@@ -17,8 +18,7 @@ function release(overrides: Partial<SourceReleaseVo> = {}): SourceReleaseVo {
     channel: "stable",
     notes: "测试版本",
     artifacts: [
-      { path: "chain.json", version: 8, url: "https://cdn.example/chain.json" },
-      { path: "source-bundle.js", version: 3, url: "https://cdn.example/bundle.js" },
+      { path: "play-bundle.js", version: 3, url: "https://cdn.example/play-bundle.js" },
     ],
     published: true,
     bad: false,
@@ -26,21 +26,33 @@ function release(overrides: Partial<SourceReleaseVo> = {}): SourceReleaseVo {
   };
 }
 
-function local(overrides: Partial<SourceStateVo> = {}): Pick<SourceStateVo, "installed" | "bad"> {
+function pack(overrides: Partial<PlayPackVo> = {}): PlayPackVo {
   return {
-    installed: {
-      sourceVersionCode: 2026091701,
-      dir: "2026091701",
-      files: { "chain.json": 7, "source-bundle.js": 3 },
-      sourceVersionName: "2026.09.17.1",
-      source: "official",
-    },
-    bad: [],
+    id: "official",
+    name: "play-bundle",
+    version: "chain.10",
+    versionCode: 2026091701,
+    versionName: "2026.09.17.1",
+    source: "official",
+    dir: "2026091701",
+    installedAt: 1_800_000_000,
     ...overrides,
   };
 }
 
-describe("source-update 判定（§2.3）", () => {
+function local(overrides: Partial<SourceStateVo> = {}): SourceStateVo {
+  return {
+    schema: 2,
+    packs: [pack()],
+    activeId: "official",
+    bad: [],
+    lastCheckAt: 0,
+    previousOfficial: null,
+    ...overrides,
+  };
+}
+
+describe("source-update 判定（双音源包）", () => {
   it("1. 无 release → 不更新", () => {
     const d = decideUpdate(null, local());
     expect(d.action).toBe("none");
@@ -60,109 +72,62 @@ describe("source-update 判定（§2.3）", () => {
   it("4. 本地 bad[] 含该 code → 跳过", () => {
     const d = decideUpdate(release(), local({ bad: [2026091801] }));
     expect(d.action).toBe("none");
-    expect(d.reason).toContain("冒烟失败");
+    expect(d.reason).toContain("装载失败");
   });
 
-  it("5a. 远端 > 本地 → 下载全部 artifacts", () => {
-    const d = decideUpdate(release(), local());
+  it("5a. 官方包未装 → bootstrap 安装", () => {
+    const d = decideUpdate(release(), local({ packs: [], activeId: null }));
     expect(d.action).toBe("download");
     if (d.action === "download") {
       expect(d.release.sourceVersionCode).toBe(2026091801);
-      expect(d.release.artifacts).toHaveLength(2);
     }
   });
 
-  it("5b. 未安装任何包 → 任意有效 release 都下载（无内置包基线）", () => {
-    // 无内置包：installed=null 时基线按 0 计，任何正版本号都视为更新
+  it("5b. 已装自定义包但无官方包 → 仍引导安装官方包（两者共存）", () => {
     const d = decideUpdate(
-      release({ sourceVersionCode: 2026090101 }),
-      local({ installed: null }),
+      release(),
+      local({
+        packs: [pack({ id: "custom-20261001-120000", source: "custom", versionCode: 0 })],
+        activeId: "custom-20261001-120000",
+      }),
     );
     expect(d.action).toBe("download");
   });
 
-  it("5c. 远端 < 本地 → 拒绝降级", () => {
+  it("5c. 远端 > 本地官方包 → 更新", () => {
+    const d = decideUpdate(release(), local());
+    expect(d.action).toBe("download");
+    expect(d.reason).toContain("新版本");
+  });
+
+  it("5d. 远端 < 本地官方包 → 拒绝降级", () => {
     const d = decideUpdate(release({ sourceVersionCode: 2026091601 }), local());
     expect(d.action).toBe("none");
     expect(d.reason).toContain("拒绝降级");
   });
 
-  it("5d-新. 未装远程包且远端 == 本地基线（0 不可能出现，防御）→ 不下载", () => {
-    // 防御分支：后端不会发 code 0 的 release
-    const d = decideUpdate(
-      release({ sourceVersionCode: 0 }),
-      local({ installed: null }),
-    );
+  it("5e. 远端 == 本地官方包 → 已是最新（同一 code 目录重装由 Rust 幂等处理）", () => {
+    const d = decideUpdate(release({ sourceVersionCode: 2026091701 }), local());
     expect(d.action).toBe("none");
-  });
-
-  it("5e. 未装远程包且远端为正版本 → 下载", () => {
-    const d = decideUpdate(
-      release({ sourceVersionCode: 2026091801 }),
-      local({ installed: null }),
-    );
-    expect(d.action).toBe("download");
+    expect(d.reason).toContain("最新");
   });
 
   it("5f. 公开 manifest 的 published 为 null（管理端字段）→ 视为已发布", () => {
     const d = decideUpdate(
       release({ sourceVersionCode: 2026091801, published: null as unknown as boolean }),
-      local({ installed: null }),
+      local({ packs: [], activeId: null }),
     );
     expect(d.action).toBe("download");
   });
 
-  it("5g. 当前为自定义直链包（source=custom）→ 不自动更新", () => {
-    const d = decideUpdate(
-      release({ sourceVersionCode: 2026091901 }),
-      local({
-        installed: {
-          sourceVersionCode: -1,
-          dir: "-1",
-          files: {},
-          sourceVersionName: "custom:-1",
-          source: "custom",
-        },
-      }),
-    );
-    expect(d.action).toBe("none");
-    expect(d.reason).toContain("自定义");
-  });
-
-  it("6a. 同版本但文件版本不同 → 只补差异（仍按全集下载，Rust 端跳过同版本文件）", () => {
-    const d = decideUpdate(
-      release({ sourceVersionCode: 2026091701, artifacts: [release().artifacts[0]] }),
-      local(),
-    );
-    expect(d.action).toBe("download");
-  });
-
-  it("6b. 同版本且文件全一致 → 已是最新", () => {
-    const d = decideUpdate(
-      release({
-        sourceVersionCode: 2026091701,
-        artifacts: [
-          { path: "chain.json", version: 7, url: "https://cdn.example/chain.json" },
-          { path: "source-bundle.js", version: 3, url: "https://cdn.example/bundle.js" },
-        ],
-      }),
-      local(),
-    );
-    expect(d.action).toBe("none");
-    expect(d.reason).toContain("最新");
-  });
-
-  it("6c. 同版本但本地缺文件（装到一半）→ 补下", () => {
-    const d = decideUpdate(release({ sourceVersionCode: 2026091701 }), {
-      installed: {
-        sourceVersionCode: 2026091701,
-        dir: "2026091701",
-        files: {},
-        sourceVersionName: "x",
-        source: "official",
-      },
-      bad: [],
+  it("5g. 本地只有自定义包不影响官方包更新通道（官方包在列表时按官方包比较）", () => {
+    const custom = pack({
+      id: "custom-20261001-120000",
+      source: "custom",
+      versionCode: 0,
+      dir: "custom-20261001-120000",
     });
+    const d = decideUpdate(release(), local({ packs: [pack(), custom] }));
     expect(d.action).toBe("download");
   });
 });

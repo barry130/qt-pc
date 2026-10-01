@@ -6,13 +6,16 @@
   </head>
   <body>
     <!--
-      音源引擎页（音源包热更新方案 P1）：
-      - 由 qtres:// 协议内嵌提供（无 CSP 注入 → 可自由动态 import 音源包脚本）；
+      音源引擎页（双音源包架构）：
+      - 由 qtres:// 协议内嵌提供（无 CSP 注入 → 可自由动态 import）；
       - __TAURI_INTERNALS__ 由 Tauri 注入（withGlobalTauri 仍为 false，不用全局 API）；
-      - 职责：读安装状态 → import bundle → createSourceLayer(注入 builtin_request)
-        → 冒烟（编译级必做；?smoke=1 时追加真实取链）→ 监听主窗口取链 RPC；
-      - 未安装音源包 = 无可用层（error 终态带可操作提示，由主窗口引导去
-        「设置 → 音源包」安装）——应用不再内置任何音源实现。
+      - 数据音源包（meta-bundle.js）：qtres 内嵌随应用分发，提供搜索/歌单/榜单/
+      歌词/封面等全部低风险接口 —— 永远可用，与是否安装播放包无关；
+      - 播放音源包（play-bundle.js）：用户在「设置 → 音源包管理」从链接安装，
+      可多包共存、其一生效；本页用 installPlayPack 在同一 JS 上下文里求值装配，
+      换包 = Rust 广播 source-pack-changed → 本页热切换，不需要重启应用；
+      - 未安装播放包 ≠ 引擎失败：数据接口照常工作，仅取链入口按统一口径报错
+      （主窗口据此引导去设置页安装，见 client.ts / PLAY_PACK_MISSING_MESSAGE）；
       - 主窗口侧封装见 src/source-engine/client.ts。
     -->
     <script type="module">
@@ -25,7 +28,7 @@
       /** 主窗口事件目标（emit_to 用 AnyLabel；对齐 @tauri-apps/api emitTo） */
       const MAIN_TARGET = { kind: "AnyLabel", label: "main" };
 
-      /** 冒烟探针（§2.4：已知免费歌）——与 scripts/smoke-bundle.mjs 同一首 */
+      /** 冒烟探针（已知免费歌）——与 scripts/smoke-bundle.mjs 同一首 */
       const SMOKE_SONG = {
         id: "1901371647",
         name: "孤勇者",
@@ -35,10 +38,13 @@
         interval: 0,
       };
 
-      let layer = null;
+      /** meta 注册出的数据入口（搜索/歌单/…/installPlayPack/getPlayUrl） */
       let entries = null;
-      let loadedCode = 0;
-      /** 页面生命周期：booting → ready | error（状态查询 RPC 回这个） */
+      /** 当前已装配的播放包（null = 未装配） */
+      let activePack = null;
+      /** 装配失败原因（装配成功后清空；不阻断数据接口） */
+      let packError = null;
+      /** 页面生命周期：booting → ready | error（仅 meta 自身加载失败才 error） */
       let phase = "booting";
       let phaseDetail = null;
 
@@ -63,153 +69,153 @@
         }
       }
 
+      function packSnapshot() {
+        return activePack
+          ? { id: activePack.id, name: activePack.name, version: activePack.version, code: activePack.code }
+          : null;
+      }
+
       function report(phase, extra) {
-        return emitToMain("source-engine-status", { phase, ...(extra || {}) });
-      }
-
-      /** 校验 bundle 并注册数据入口（远程包与内置包共用同一套契约） */
-      function prepareBundle(mod) {
-        if (!mod || typeof mod.createSourceLayer !== "function") {
-          throw new Error("bundle 缺少 createSourceLayer 导出");
-        }
-        // 编译级冒烟（§2.4 第 2 层）：链配置可完整解析
-        const cfg = mod.parseChainConfig(mod.defaultChainConfig());
-        if (!cfg || typeof cfg.chainRevision !== "number") {
-          throw new Error("bundle 链配置解析失败");
-        }
-        // chain.json 本地覆盖层：bundle 平台无关（不 import @tauri-apps/api），
-        // 读盘方式由这里注入。必须在取链之前注入，否则首个请求会走内置默认链。
-        if (typeof mod.setChainOverlayReader !== "function") {
-          throw new Error("bundle 缺少 setChainOverlayReader 导出");
-        }
-        mod.setChainOverlayReader(() => invoke("source_chain_overlay"));
-        // 数据接口入口（搜索/歌单/歌词/榜单…）注册：主窗口经 kind=invoke 调用，
-        // 与安卓端 __qtEntries 同一契约，HTTP 能力同样由 builtin_request 提供
-        if (typeof mod.registerQtEntries !== "function") {
-          throw new Error("bundle 缺少 registerQtEntries 导出");
-        }
-        mod.registerQtEntries({
-          request: (url, options) =>
-            invoke("builtin_request", { url, options: options || null }),
-          platform: (mod.PLATFORMS && mod.PLATFORMS.WINDOWS) || 1103,
+        return emitToMain("source-engine-status", {
+          phase,
+          pack: packSnapshot(),
+          ...(extra || {}),
         });
-        const registered = globalThis.__qtEntries || null;
-        if (!registered) throw new Error("bundle 数据接口注册失败");
-        return registered;
       }
 
-      /** 读安装状态：返回 {code, dir} 或 null（无包 / 宿主太老 / 状态读取失败） */
-      async function readInstalled() {
+      /** 读 v2 安装状态（source_install.rs）：{packs:[…], activeId, …} */
+      async function readState() {
         try {
           const state = await invoke("source_state");
-          const installed = state && state.installed;
-          if (!installed || !installed.dir) return null;
-          return {
-            code: Number(installed.sourceVersionCode) || 0,
-            dir: String(installed.dir),
-          };
+          if (!state || !Array.isArray(state.packs)) return null;
+          return state;
         } catch {
           return null;
         }
       }
 
-      /** 加载已安装远程包（dir/code 由调用方给出） */
-      async function loadInstalled(dir, code) {
-        const mod = await import(
-          "/script/" + encodeURIComponent(dir) + "/source-bundle.js"
-        );
-        entries = prepareBundle(mod);
-        return { code, mod };
+      /** 本地 chain.json 覆盖层（开发/调链用；无则用播放包内置默认链） */
+      async function chainOverlay() {
+        try {
+          const overlay = await invoke("source_chain_overlay");
+          return typeof overlay === "string" && overlay.trim() ? overlay : null;
+        } catch {
+          return null;
+        }
       }
 
-      /** 真实网络冒烟（§2.4 第 3 层，仅 ?smoke=1）：取链 + Range 预检 */
-      async function networkSmoke() {
-        const url = await layer.resolvePlayUrl("wyy", SMOKE_SONG, "128");
-        if (!url) throw new Error("冒烟取链返回空");
-        const res = await invoke("builtin_request", {
-          url,
-          options: {
-            method: "GET",
-            headers: { Range: "bytes=0-1" },
-            timeoutMs: 8000,
-          },
-        });
-        const status = Number(res.statusCode);
-        // 与 bundle 内 verifyPlayable 同口径：4xx 只放行 403/416
-        const statusOk = status < 400 || status === 403 || status === 416;
-        if (!statusOk) throw new Error("冒烟 Range 预检失败: HTTP " + status);
-        const contentType = String(
-          (res.headers && (res.headers["content-type"] || res.headers["Content-Type"])) || "",
-        ).toLowerCase();
-        if (/json|html|text\/plain/.test(contentType)) {
-          throw new Error("冒烟取到错误页: " + contentType);
+      /**
+       * 装配当前生效的播放包（boot 与每次 source-pack-changed 共用）。
+       *
+       * - 未选生效包 → 卸载引擎内残留并回到「数据可用 / 取链未装」态；
+       * - 装配失败 → 上报 source_pack_load_failed（官方包由 Rust 自动回退并
+       *   再次广播换包；自定义包保留在列表里等用户处理），数据接口不受影响；
+       * - smoke=true 时追加真实取链冒烟（Range 预检走 meta 的 verifyPlayable）。
+       */
+      async function applyActivePack(state, smoke) {
+        const packs = (state && state.packs) || [];
+        const pack = packs.find((p) => p && p.id === state.activeId) || null;
+        if (!pack) {
+          if (entries && typeof entries.uninstallPlayPack === "function") {
+            try {
+              await entries.uninstallPlayPack({});
+            } catch {
+              /* 引擎内本就没有包，忽略 */
+            }
+          }
+          activePack = null;
+          packError = null;
+          return;
         }
+        try {
+          const res = await fetch(
+            "/script/" + encodeURIComponent(String(pack.dir)) + "/play-bundle.js",
+            { cache: "no-store" },
+          );
+          if (!res.ok) throw new Error("播放包文件读取失败: HTTP " + res.status);
+          const code = await res.text();
+          const installed = JSON.parse(entries.installPlayPack({ code }));
+          const overlay = await chainOverlay();
+          if (overlay) entries.loadChain(overlay);
+          activePack = {
+            id: String(pack.id),
+            code: Number(pack.versionCode) || 0,
+            name: (installed.playPack && installed.playPack.name) || "",
+            version: (installed.playPack && installed.playPack.version) || "",
+          };
+          packError = null;
+          // 把装配出的真实名/版本回填给设置页展示（如 chain.11）
+          await invoke("source_pack_describe", {
+            packId: pack.id,
+            name: activePack.name,
+            version: activePack.version,
+          }).catch(() => {});
+          if (smoke) await networkSmoke();
+        } catch (err) {
+          const detail = String((err && err.message) || err);
+          activePack = null;
+          packError = detail;
+          await invoke("source_pack_load_failed", {
+            packId: pack.id,
+            error: detail,
+          }).catch(() => {});
+        }
+      }
+
+      /** 真实网络冒烟：取链 + Range 预检（口径与 verifyPlayable 一致） */
+      async function networkSmoke() {
+        const resolved = JSON.parse(
+          await entries.getPlayUrl({
+            platform: "wyy",
+            id: SMOKE_SONG.id,
+            name: SMOKE_SONG.name,
+            singer: SMOKE_SONG.singer,
+            album: SMOKE_SONG.album,
+            quality: "128",
+            duration: SMOKE_SONG.interval,
+          }),
+        );
+        if (!resolved || !resolved.url) throw new Error("冒烟取链返回空");
+        const checked = JSON.parse(await entries.verifyPlayable({ url: resolved.url }));
+        if (!checked || checked.ok !== true) {
+          throw new Error("冒烟 Range 预检失败: HTTP " + (checked && checked.status));
+        }
+        await invoke("source_report", {
+          sourceVersionCode: activePack ? activePack.code : 0,
+          result: "ok",
+          detail: "",
+        }).catch(() => {});
       }
 
       async function boot() {
         await report("booting");
-        // 应用不再内置音源包：只加载已安装的远程包（official 或 custom）
-        const installed = await readInstalled();
-        let loaded = null;
-        let firstErr = null;
-        if (installed) {
-          try {
-            loaded = await loadInstalled(installed.dir, installed.code);
-          } catch (err) {
-            firstErr = String((err && err.message) || err);
-          }
-        }
-        if (!loaded) {
-          // 未安装 / 加载失败：error 终态，由主窗口引导去「设置 → 音源包」安装
-          layer = null;
-          entries = null;
-          phase = "error";
-          phaseDetail = firstErr || "未安装音源包";
-          await report("error", { code: null, detail: phaseDetail });
-          return;
-        }
-        layer = loaded.mod.createSourceLayer({
+        // 1) 宿主钩子必须先于 meta-bundle 注入（meta 顶层见到 __qtHost 才自注册）
+        globalThis.__qtHost = {
           request: (url, options) =>
             invoke("builtin_request", { url, options: options || null }),
-          platform: (loaded.mod.PLATFORMS && loaded.mod.PLATFORMS.WINDOWS) || 1103,
-        });
-        loadedCode = loaded.code;
-        if (new URLSearchParams(location.search).get("smoke") === "1") {
-          try {
-            await networkSmoke();
-            await invoke("source_report", {
-              sourceVersionCode: loadedCode,
-              result: "ok",
-              detail: "",
-            }).catch(() => {});
-            // 冒烟通过 = 新包可用：重启应用，让新包在主窗口侧也彻底生效
-            // （取链缓存 / 播放会话都还挂在旧包上）。
-            // 冒烟失败走下面的 mark_bad 回退，那种情况不重启。
-            await invoke("app_restart").catch(() => {});
-          } catch (err) {
-            layer = null;
-            entries = null;
-            const detail = String((err && err.message) || err);
-            phase = "error";
-            phaseDetail = detail;
-            await report("error", { code: loadedCode || null, detail });
-            await invoke("source_mark_bad", {
-              code: loadedCode,
-              detail,
-              result: "smoke_failed",
-            }).catch(() => {});
-            return;
-          }
+          platform: 1103,
+        };
+        // 2) 内置数据音源包（qtres 内嵌，随应用发版）
+        const mod = await import("/meta-bundle.js");
+        entries = (mod && mod.__qtEntries) || globalThis.__qtEntries || null;
+        if (!entries || typeof entries.bundleInfo !== "function") {
+          throw new Error("meta-bundle 数据入口注册失败");
         }
+        // 3) 生效播放包（未装 = 数据接口照常，取链按「未安装」口径报错）
+        const state = await readState();
+        await applyActivePack(
+          state,
+          new URLSearchParams(location.search).get("smoke") === "1",
+        );
         phase = "ready";
-        await report("ready", { code: loadedCode || null, detail: firstErr || null });
+        await report("ready", { detail: packError || phaseDetail || null });
       }
 
       /** 主窗口 RPC：source-engine-request → source-engine-response。
        *  kind "status" = 查询当前生命周期（client 绑定晚于引擎启动也能对齐状态）；
-       *  kind "resolve" = 取链（url "" = 失败/无可用层；line = 本次命中的线路，
-       *                    null = 未知，即包内缓存命中或旧包没有这个字段）；
-       *  kind "invoke"  = 数据接口（搜索/歌单/歌词/榜单…走 bundle 入口，result 为 JSON 文本）。 */
+       *  kind "resolve" = 取链（url "" = 失败/未装播放包；line = 本次命中的线路，
+       *                    null = 未知；error = 逐线路 trace 或「未安装」口径）；
+       *  kind "invoke"  = 数据接口（meta 入口名 + JSON 参数，result 为 JSON 文本）。 */
       async function onRequest(event) {
         const payload = (event && event.payload) || {};
         const requestId = payload.requestId;
@@ -218,8 +224,9 @@
           await emitToMain("source-engine-response", {
             requestId,
             phase,
-            code: loadedCode || null,
-            detail: phaseDetail,
+            code: activePack ? activePack.code : null,
+            detail: packError || phaseDetail,
+            pack: packSnapshot(),
           });
           return;
         }
@@ -237,11 +244,10 @@
           await emitToMain("source-engine-response", { requestId, result, error });
           return;
         }
-        // 取链统一走 bundle 的 getPlayUrl 入口（与安卓端同一契约）：应答里除了
-        // url 还带 line = 本次命中的线路 {id,name,kind}（管理端展示「走的是音源包
-        // 里哪条源」）；失败时带 error = 逐线路 trace（哪条线死链/超时/预算耗尽未跑，
-        // 以及跨源兜底有没有跑）——这条文本以前被吞掉，用户只看到「取不到地址」，
-        // 排查只能靠猜（2026-09-24 kg 不换源就是这么发现的）。
+        // 取链统一走 meta 的 getPlayUrl（未装播放包时它按统一口径抛错）：
+        // 应答里 url + line（本次命中的线路 {id,name,kind}）；失败带 error =
+        // 逐线路 trace（哪条线死链/超时/预算耗尽未跑、跨源兜底有没有跑）或
+        // 「未安装播放音源包：…」的安装引导。
         let url = "";
         let line = null;
         let error = null;
@@ -270,16 +276,31 @@
         await emitToMain("source-engine-response", { requestId, url, line, error });
       }
 
+      /** Rust 在包列表/生效包变化后广播：热切换播放包，无需重启应用 */
+      async function onPackChanged() {
+        if (!entries || phase !== "ready") return;
+        const state = await readState();
+        await applyActivePack(state, true);
+        await report("ready", { detail: packError || phaseDetail || null });
+      }
+
       await invoke("plugin:event|listen", {
         event: "source-engine-request",
         target: { kind: "Any" },
         handler: transformCallback(onRequest),
       }).catch(() => {});
+      await invoke("plugin:event|listen", {
+        event: "source-pack-changed",
+        target: { kind: "Any" },
+        handler: transformCallback(onPackChanged),
+      }).catch(() => {});
 
       try {
         await boot();
       } catch (err) {
-        await report("error", { detail: String((err && err.message) || err) }).catch(() => {});
+        phase = "error";
+        phaseDetail = String((err && err.message) || err);
+        await report("error", { detail: phaseDetail }).catch(() => {});
       }
     </script>
   </body>

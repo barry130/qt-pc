@@ -78,15 +78,6 @@ export interface ContractChart {
   description: string | null;
 }
 
-/** MV / 视频 */
-export interface ContractVideo {
-  id: string;
-  platform: Source;
-  name: string;
-  picUrl: string;
-  singer: string;
-}
-
 /** 歌词（原文 + 翻译；qt-pc Lyric 同构） */
 export interface ContractLyric {
   lyric: string;

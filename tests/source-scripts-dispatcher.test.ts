@@ -81,13 +81,13 @@ describe("source-scripts dispatcher（纯音源包：app 只经引擎调用）",
     });
   });
 
-  it("引擎报 error 相位（如未安装音源包）：数据接口抛可操作错误", async () => {
+  it("引擎报 error 相位（数据包内置，error 只可能是引擎自身异常）：数据接口抛可操作错误", async () => {
     engineMock.phase = "error";
-    engineMock.detail = "未安装音源包";
+    engineMock.detail = "meta-bundle.js 导入失败";
     engineMock.invokeResult = null;
     const mod = await import("@/source-scripts");
     await expect(mod.getRecommendations("wyy", null, 1)).rejects.toThrow(
-      "音源包加载失败",
+      "音源引擎加载失败",
     );
   });
 

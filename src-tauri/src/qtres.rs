@@ -3,13 +3,14 @@
 //! `http://qtres.localhost/cover/...`），Rust 按音源补 Referer / UA 代取。
 //!
 //! - `cover/`：封面代取 + 内存去重缓存（不落盘缩略图，后续迭代补 @2x 与磁盘缓存）
-//! - `mv/`：MV/视频 Range 透传——把 `<video>` 的 Range 头原样转发给上游，
-//!   回传上游状态（200/206）与 Content-Range / Content-Length / Accept-Ranges，
-//!   否则 video 无法拖动进度。视频不缓存。
 //! - `/engine/index.html`：音源引擎页（source_window.rs 的隐藏窗口加载，
 //!   内嵌 HTML，无 CSP 注入 → 可自由动态 import 音源包脚本）
-//! - `/script/<code>/<file>`：只读分发已安装音源包文件（source-bundle/install/
-//!   目录；code/file 严格校验防路径穿越）
+//! - `/meta-bundle.js`：内置元数据音源包（qt-sources 构建产物 meta-bundle.js，
+//!   编译期内嵌；搜索/歌单/榜单/歌词等低风险接口都来自它）
+//! - `/script/<code>/<file>`：只读分发已安装的**播放音源包**文件
+//!   （source-bundle/install/ 目录；code/file 严格校验防路径穿越）
+//!
+//! MV/视频代理（`mv/` Range 透传）已随 MV 功能一并删除。
 //!
 //! 白名单：只允许已知音源 CDN 域名，防止歌词/皮肤数据把它当任意代理。
 
@@ -81,12 +82,11 @@ fn host_allowed(url: &str) -> bool {
     })
 }
 
-/// 解码 `cover/` 或 `mv/` 路径（base64url，可无填充）→ 原始 URL
+/// 解码 `cover/` 路径（base64url，可无填充）→ 原始 URL
 fn decode_res_path(path: &str) -> Option<(&'static str, String)> {
     let rest = path.trim_start_matches('/');
     let (kind, b64) = match rest.split_once('/') {
         Some(("cover", b)) => ("cover", b),
-        Some(("mv", b)) => ("mv", b),
         _ => return None,
     };
     // URL path 中 base64url 无填充；补齐
@@ -120,6 +120,11 @@ fn placeholder() -> Response<Vec<u8>> {
 /// 引擎页 HTML（内嵌编译；改页面要重编 Rust）
 const ENGINE_INDEX_HTML: &str = include_str!("source_engine_page.html");
 
+/// 内置元数据音源包（qt-sources `dist/meta-bundle.js`，发布时同步拷贝到本目录；
+/// 搜索/歌单/榜单/歌词/封面等低风险接口全部来自它，播放取链来自用户另行
+/// 安装的播放音源包，见 source_engine_page.html）
+const META_BUNDLE_JS: &str = include_str!("assets/meta-bundle.js");
+
 fn engine_page_response() -> Response<Vec<u8>> {
     Response::builder()
         .status(StatusCode::OK)
@@ -127,6 +132,16 @@ fn engine_page_response() -> Response<Vec<u8>> {
         // 引擎页必须即时生效（音源包应用 = 重建窗口重新拉取）
         .header(header::CACHE_CONTROL, "no-store")
         .body(ENGINE_INDEX_HTML.as_bytes().to_vec())
+        .unwrap()
+}
+
+fn meta_bundle_response() -> Response<Vec<u8>> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/javascript; charset=utf-8")
+        // 100KB 量级的本地内嵌资源，no-store 代价可忽略；保证发版后即时生效
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(META_BUNDLE_JS.as_bytes().to_vec())
         .unwrap()
 }
 
@@ -305,7 +320,7 @@ pub fn handle_qtres<R: tauri::Runtime>(
     // 超出的请求只是晚一点执行，不会把线程/内存铺满，而且线程是复用的。
     // 逻辑本身一行没动：仍然是"在别的线程上跑同步代取（reqwest blocking，
     // 收完整个 body 再回），完成后 respond"，不做异步流式改造，
-    // 也就不可能改变 cover/mv 的响应语义。
+    // 也就不可能改变 cover 的响应语义。
     let app = ctx.app_handle().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let response = handle_qtres_sync(&app, request);
@@ -318,12 +333,15 @@ fn handle_qtres_sync<R: tauri::Runtime>(
     request: Request<Vec<u8>>,
 ) -> Response<Vec<u8>> {
     // Windows/WebView2 下 URI 被规范化为 http://qtres.localhost/...，
-    // 其余平台为 qtres://...；两者用 uri().path() 都得到 /cover|mv/<b64>
+    // 其余平台为 qtres://...；两者用 uri().path() 都得到 /cover/<b64>
     let path = request.uri().path().to_string();
     // 音源引擎路由（P1）：引擎页内嵌提供 + 安装目录脚本只读分发。
-    // 这些路径固定存在，放在 cover/mv 解码之前短路。
+    // 这些路径固定存在，放在 cover 解码之前短路。
     if path == "/engine/index.html" {
         return engine_page_response();
+    }
+    if path == "/meta-bundle.js" {
+        return meta_bundle_response();
     }
     if let Some(rest) = path.strip_prefix("/script/") {
         return handle_script_file(app, rest);
@@ -336,70 +354,11 @@ fn handle_qtres_sync<R: tauri::Runtime>(
         log::warn!("[qtres] 封面域名不在白名单，拒绝代取: {original_url}");
         return placeholder();
     }
-    if kind == "mv" {
-        return handle_mv(request, &original_url);
-    }
     let logged = original_url.clone();
     let resp = handle_cover(original_url);
     log::info!("[qtres] cover kind={kind} status={} url={logged}",
         resp.status().as_u16());
     resp
-}
-
-/// MV / 视频 Range 透传（§6.13）：转发 Range 头，回传上游 200/206 与相应头。
-fn handle_mv(request: Request<Vec<u8>>, url: &str) -> Response<Vec<u8>> {
-    let range = request
-        .headers()
-        .get(header::RANGE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-
-    let client = match reqwest::blocking::Client::builder()
-        .user_agent("Mozilla/5.0")
-        // 视频分块较大；连接/响应 20s 足够，避免假死占线程
-        .timeout(std::time::Duration::from_secs(60))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .pool_max_idle_per_host(0)
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return placeholder(),
-    };
-    let mut req = client.get(url).header("Referer", referer_for(url));
-    if let Some(r) = &range {
-        req = req.header(header::RANGE, r);
-    }
-    let resp = match req.send() {
-        Ok(r) => r,
-        Err(_) => return placeholder(),
-    };
-    let status = match StatusCode::from_u16(resp.status().as_u16()) {
-        Ok(s) => s,
-        Err(_) => return placeholder(),
-    };
-    if !status.is_success() {
-        return placeholder();
-    }
-    let mut builder = Response::builder()
-        .status(status)
-        .header("Access-Control-Allow-Origin", "*")
-        .header(header::ACCEPT_RANGES, "bytes");
-    let content_type = resp
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("video/mp4")
-        .to_string();
-    builder = builder.header(header::CONTENT_TYPE, content_type);
-    for key in [header::CONTENT_RANGE, header::CONTENT_LENGTH] {
-        if let Some(v) = resp.headers().get(&key).and_then(|v| v.to_str().ok()) {
-            builder = builder.header(key.clone(), v);
-        }
-    }
-    match resp.bytes() {
-        Ok(body) => builder.body(body.to_vec()).unwrap_or_else(|_| placeholder()),
-        Err(_) => placeholder(),
-    }
 }
 
 /// 图床基本都支持 https，而明文 http 在本机（系统代理 / 防火墙）常常取不到，
@@ -540,21 +499,31 @@ mod tests {
         let body = resp.into_body();
         let html = String::from_utf8(body).unwrap();
         assert!(html.contains("source-engine-request"), "含取链 RPC 监听");
-        assert!(html.contains("createSourceLayer"), "调用 bundle 入口");
+        assert!(html.contains("/meta-bundle.js"), "加载内置元数据包");
+        assert!(html.contains("installPlayPack"), "装配播放音源包");
     }
 
     #[test]
-    fn decode_cover_and_mv_paths() {
+    fn meta_bundle_embedded() {
+        let resp = meta_bundle_response();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body();
+        let js = String::from_utf8(body).unwrap();
+        // 元数据包是自注册形态：拿到 __qtHost 才注册 __qtEntries
+        assert!(js.contains("__qtHost"), "meta-bundle 含宿主注册逻辑");
+        assert!(js.contains("meta-bundle"), "bundleInfo 名称正确");
+        // 与旧版全量包的区别：不再内置 createSourceLayer/链路实现
+        assert!(!js.contains("createSourceLayer"));
+    }
+
+    #[test]
+    fn decode_cover_paths() {
         let cover = b64url("https://p1.music.126.net/abc.jpg");
         let (kind, url) = decode_res_path(&format!("/cover/{cover}")).unwrap();
         assert_eq!(kind, "cover");
         assert_eq!(url, "https://p1.music.126.net/abc.jpg");
 
-        let mv = b64url("http://media.kuwo.cn/a.mp4");
-        let (kind, url) = decode_res_path(&format!("/mv/{mv}")).unwrap();
-        assert_eq!(kind, "mv");
-        assert_eq!(url, "http://media.kuwo.cn/a.mp4");
-
+        // MV 路径已随 MV 功能删除，不再是合法 kind
         assert!(decode_res_path("/unknown/xxx").is_none());
     }
 

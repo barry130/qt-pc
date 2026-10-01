@@ -124,26 +124,3 @@ export function qtresCoverUrl(picUrl: string): string | null {
   }
 }
 
-/**
- * MV/视频播放地址 → qtres 代理 URL（§6.13 Range 透传：<video> 的 Range 头由
- * Rust 原样转发上游，206 + Content-Range 回传，进度可拖动）。编码规则与封面一致。
- */
-export function qtresMvUrl(videoUrl: string): string | null {
-  if (!videoUrl || !/^https?:\/\//i.test(videoUrl)) return null;
-  try {
-    const bytes = new TextEncoder().encode(videoUrl);
-    let binary = "";
-    for (const b of bytes) binary += String.fromCharCode(b);
-    const b64 = btoa(binary)
-      .replace(/\+/g, "-")
-      .replace(/\//g, "_")
-      .replace(/=+$/, "");
-    const path = `mv/${b64}`;
-    if (typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent)) {
-      return `http://qtres.localhost/${path}`;
-    }
-    return `qtres://localhost/${path}`;
-  } catch {
-    return null;
-  }
-}

@@ -12,13 +12,14 @@ export { ONBOARDING_KEY } from "@/lib/storageKeys";
 import { ONBOARDING_KEY } from "@/lib/storageKeys";
 
 // 引导让用户挑「默认音乐来源」：本地音乐是推荐默认（应用定位本地播放器），
-// 在线音源仅作可选项（需在「设置 → 音源包」安装音源包后才可用）
+// 在线音源仅作可选项（搜索/歌单等数据功能开箱即用；在线试听需在
+// 「设置 → 音源包」安装播放音源包后才可用）
 const SOURCES: { id: SourceId; name: string; desc: string }[] = [
   { id: "local", name: "本地音乐", desc: "播放自己电脑里的音乐（推荐）" },
   { id: "wyy", name: "音源一", desc: "曲库全、歌单丰富" },
   { id: "kw", name: "音源二", desc: "搜索稳定、新歌快" },
   { id: "qq", name: "音源三", desc: "版权多、榜单全" },
-  { id: "kg", name: "音源四", desc: "曲库广、MV 多" },
+  { id: "kg", name: "音源四", desc: "曲库广、翻唱多" },
 ];
 
 /**

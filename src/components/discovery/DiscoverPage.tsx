@@ -52,12 +52,18 @@ export function DiscoverPage(): React.JSX.Element {
   const [songs, setSongs] = useState<Track[]>([]);
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
   const [charts, setCharts] = useState<Chart[]>([]);
-  // 引擎相位（error = 未装/加载失败，此时给「去安装音源包」引导卡，而不是静默空区块）
+  // 引擎相位 + 播放包装配状态：数据包内置恒可用；error（引擎异常）或
+  // ready 但未装配播放包时，在线试听不可用 → 给「去安装播放包」引导卡
   const [enginePhase, setEnginePhase] = useState<string | null>("booting");
+  const [playPackMissing, setPlayPackMissing] = useState(false);
 
-  // 引擎启动与包安装都是异步的，快照轮询最简单；只影响一张卡的显隐
+  // 引擎启动与播放包安装都是异步的，快照轮询最简单；只影响一张卡的显隐
   useEffect(() => {
-    const tick = (): void => setEnginePhase(engineSnapshot().phase);
+    const tick = (): void => {
+      const snap = engineSnapshot();
+      setEnginePhase(snap.phase);
+      setPlayPackMissing(snap.phase === "ready" && snap.pack === null);
+    };
     tick();
     const timer = window.setInterval(tick, 3000);
     return () => window.clearInterval(timer);
@@ -126,14 +132,15 @@ export function DiscoverPage(): React.JSX.Element {
         </div>
       </section>
 
-      {/* 未安装音源包引导：在线区块会全部为空，这里给一条可操作的出口 */}
-      {enginePhase === "error" && (
+      {/* 未装播放包引导：搜索/歌单等数据功能正常（数据包内置），
+          只是在线试听需要播放音源包（应用不内置，需自行安装） */}
+      {(enginePhase === "error" || playPackMissing) && (
         <section className="mt-4 px-5">
           <div className="flex flex-wrap items-center gap-3 rounded-xl border border-border bg-card/70 px-4 py-3">
             <PackageOpen className="h-4 w-4 shrink-0 text-primary" />
             <div className="min-w-0 flex-1 text-xs leading-relaxed text-muted-foreground">
-              在线功能暂不可用：还没有安装音源包（或加载失败）。本地音乐不受影响；
-              想启用在线试听，可到「设置 → 音源包」从链接安装。
+              在线试听需要播放音源包（应用未内置）。搜索、歌单、榜单、歌词不受影响；
+              想在线播放，可到「设置 → 音源包」安装。
             </div>
             <button
               type="button"

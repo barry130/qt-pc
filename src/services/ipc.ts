@@ -555,7 +555,7 @@ export async function astralSession(): Promise<AuthSession | null> {
   return invoke("astral_session");
 }
 
-// ---------- 音源包热更新（P1/P2；类型与流程见 source-scripts/source-update.ts） ----------
+// ---------- 播放音源包管理（双音源包架构；类型与流程见 source-scripts/source-update.ts） ----------
 
 export async function sourceState(): Promise<unknown> {
   return invoke("source_state");
@@ -573,12 +573,12 @@ export async function sourceInstallFromUrl(url: string): Promise<unknown> {
   return invoke("source_install_from_url", { url });
 }
 
-export async function sourceApply(smoke = true): Promise<void> {
-  return invoke("source_apply", { smoke });
+export async function sourceActivatePack(packId: string): Promise<unknown> {
+  return invoke("source_activate_pack", { packId });
 }
 
-export async function sourceRollback(): Promise<void> {
-  return invoke("source_rollback");
+export async function sourceUninstallPack(packId: string): Promise<unknown> {
+  return invoke("source_uninstall_pack", { packId });
 }
 
 /**
