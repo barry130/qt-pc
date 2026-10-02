@@ -71,7 +71,20 @@ static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 /// 2026-09-17 架构收敛后前端是「音质档内 ≤5 条线路 + 跨源」的聚合链，
 /// VIP 歌要走完多级线路 + 跨源搜索，5s 预算不够（实测在 5s 整点成批失败），
 /// 放宽到 15s；成功的前端预解析仍会先回填缓存，常态命中不受影响。
-const ASK_TIMEOUT: Duration = Duration::from_secs(15);
+///
+/// 2026-10-02 修复（取链"无可用播放地址"风暴的真凶）：15s 与前端自己的
+/// 引擎等待上限**相等**，等于零余量。前端应答要走的完整路径是
+///   引擎 → play_url_request → 前端 resolvePlayUrl → engineResolve
+///   （等引擎窗口，上限 RESOLVE_TIMEOUT_MS = 15s，见 qt-pc/src/source-engine/client.ts）
+///   → set_resolved_play_url → resolve_play_url_reply
+/// 即"前端等引擎" + 两次 IPC 往返。只要引擎侧链预算被跑满（12s 链预算 +
+/// 慢尾 ≈15s，死线越多越贴近上限），应答必然晚于本超时到达，被当成
+/// "前端没答"丢弃（日志里超时 WARN 紧跟着「丢弃过期的失败回执」就是它），
+/// 于是慢但能成功的取链一律变成"该歌曲暂时无法播放"，连挂 5 首还会停掉
+/// 自动切歌。故本值必须**严格大于** RESOLVE_TIMEOUT_MS 加往返余量：
+/// 20s = 15s + 5s（两次 IPC + 引擎页调度抖动）。
+/// 改 client.ts 的 RESOLVE_TIMEOUT_MS 时必须同步复核这里。
+const ASK_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// 引擎发给前端脚本包的取链请求（track/quality 原样透传，
 /// 前端用它调 `resolvePlayUrl` 后按 requestId 应答）。
