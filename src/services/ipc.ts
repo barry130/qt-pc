@@ -561,7 +561,7 @@ export async function sourceState(): Promise<unknown> {
   return invoke("source_state");
 }
 
-/** 更新发现（force=true 越过节流；返回 offers，未装官方包含首装 offer） */
+/** 更新发现（force=true 越过节流；返回 offers，仅已装包的更新，无首装） */
 export async function sourceDiscoverUpdates(force: boolean): Promise<unknown> {
   return invoke("source_discover_updates", { force });
 }

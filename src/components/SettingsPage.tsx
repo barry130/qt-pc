@@ -1209,9 +1209,9 @@ const PROMPTED_CLIPBOARD_LINKS = new Set<string>();
 
 /** 音源包设置（v3 统一包模型，与 uniappx 设置面板同口径）：
  *  - 数据包/播放包同构：单文件 js、首行 __QT_PACK__ 包头自描述身份；
- *  - 数据槽 = 在线安装的数据包（不内置；未装 = 数据面下线，首页全屏引导）；
+ *  - 数据槽 = 用户安装的数据包（不内置；未装 = 数据面下线，首页引导指路）；
  *  - 播放槽 = 用户安装的播放包（不随应用分发，多包共存其一生效）；
- *  - 更新发现双通道合一（每包 updateUrl / 官方 manifest），
+ *  - 更新发现双通道合一（每包 updateUrl / 官方 manifest），仅对已装包，
  *    只提示不自动装，这里可以逐条应用；
  *  - 安装入口：https 直链 / 本地文件（系统选择框），先预览确认再落盘
  *    （包头 id 自称官方包时显著警示），剪贴板有包链接时主动询问；
@@ -1453,7 +1453,7 @@ function SourcePackageSection(): React.JSX.Element {
     <div className="max-w-xl divide-y divide-border">
       <SettingRow
         title="数据包"
-        description="搜索/歌单/歌词/封面等数据源。不随应用分发，在线安装（首页引导或下方入口）。"
+        description="搜索/歌单/歌词/封面等数据源。不随应用分发，可从链接或本地文件安装。"
       >
         <span className="font-mono text-xs text-muted-foreground">{metaStatus}</span>
       </SettingRow>

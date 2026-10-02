@@ -4,12 +4,12 @@
  * 每个包 = 单文件 js，首行 `__QT_PACK__` 包头自描述身份；数据包（meta）与
  * 播放包（play）共用同一条安装/更新/启停/卸载管线，只有槽位不同：
  *
- * - 数据槽 activeMetaId：数据包不再内置，在线安装（null = 未装，数据面下线，
- *   首页全屏引导安装）；
+ * - 数据槽 activeMetaId：数据包不再内置，用户自行安装（null = 未装，数据面
+ *   下线，首页全屏引导指路设置页）；
  * - 播放槽 activeId：播放包不随应用分发，用户安装，多包共存其一生效；
  * - 更新发现（discoverSourceUpdates）双通道合一（每包 updateUrl 自探测 /
- *   astral manifest），**只提示不自动装**；未装官方包时 manifest 也下发
- *   首装 offer（currentCode=0，由首页引导消费）；
+ *   astral manifest），**只提示不自动装**，且仅对已装包发更新 offer——
+ *   未装不主动宣传官方渠道，安装动作完全由用户发起；
  * - 应用更新（applySourceUpdate）：下载 → 包头与 offer 完全一致 → 安装；
  *   失败自动回滚并拉黑该版本（Rust source_install.rs 完成）。
  *
@@ -25,7 +25,7 @@ import * as ipc from "@/services/ipc";
  */
 export const HOST_API_VERSION = 1;
 
-/** 包类型：meta = 数据包（低风险）；play = 播放包（高风险）。均不内置，在线安装 */
+/** 包类型：meta = 数据包（低风险）；play = 播放包（高风险）。均不内置，用户自行安装 */
 export type SourcePackKind = "meta" | "play";
 
 /** 已安装的音源包（与 Rust SourcePackMeta serde 对齐，v3） */
@@ -77,7 +77,7 @@ export interface PackUpdateOfferVo {
   kind: SourcePackKind;
   /** 目标包 id */
   targetId: string;
-  /** 本地当前版本（0 = 未安装，首装引导） */
+  /** 本地当前版本（0 = 未安装；发现通道仅对已装包发 offer，正常不会出现） */
   currentCode: number;
   newCode: number;
   newName: string;

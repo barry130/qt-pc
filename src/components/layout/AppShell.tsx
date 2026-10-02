@@ -215,7 +215,7 @@ export function AppShell(): React.JSX.Element {
         <PlayPackPrompt />
         {/* 音源包更新提示（发现可用更新时逐条确认，数据包优先） */}
         <SourceUpdatePrompt />
-        {/* 未装数据包时的首页全屏引导（在线安装官方数据包） */}
+        {/* 未装数据包时的首页全屏引导（只指路设置页，不带下载动作） */}
         <MetaPackGuide />
       </ErrorBoundary>
 

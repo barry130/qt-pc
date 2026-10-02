@@ -12,9 +12,9 @@
 //! - 生效门：只有「槽位空着或本来就生效的是它」才自动上位，不抢用户选择；
 //! - 更新发现（`source_discover_updates`）双通道合一：① 每个包自身
 //!   updateUrl 的 Range 探测（4h 节流）② astral manifest（发布/平台/宿主
-//!   契约门槛；未装官方包 current=0 也下发首装引导）。同 id 多通道取最高
-//!   versionCode。**发现只提示不自动装**（前端逐条确认；首装数据包由
-//!   首页引导消费同一批 offer）；
+//!   契约门槛）。两种包均**仅对已装包提示更新**——未装不主动下发首装
+//!   offer（客户端口径：音源包自行安装，不宣传官方渠道）。同 id 多通道
+//!   取最高 versionCode。**发现只提示不自动装**（前端逐条确认）；
 //! - `source_apply_update`：下载 → 包头必须与 offer 的 id/kind/versionCode
 //!   完全一致 → 按更新安装（isUpdate）。更新失败（引擎装载/冒烟炸了）由
 //!   `source_pack_load_failed` / `source_meta_load_failed` 自动回滚 `.prev`
@@ -592,7 +592,7 @@ fn validate_pack_text(dir: &Path, text: &str) -> Result<PackHeader, String> {
 /// - 首装 / 手动重装：按实际渠道写（url+URL / file+文件名 / ""=来源不明）；
 /// - 更新 + 官方 manifest 通道：改写为 manifest + 空 ref；
 /// - 更新 + 自管通道（包自身 updateUrl）：保留原安装来源；
-///   无旧记录（首装 offer 走 apply）视为官方数据包本体 → manifest。
+///   无旧记录（首装 offer 走 apply，如 play 未装首装）→ manifest。
 ///
 /// 步骤：解析包头 → 播放包标记校验 → id 冲突校验 → 旧产物备份 `.prev` →
 /// 落盘 → putPack → 播放包清残留 chain.json → prune → 生效门 → 落盘状态。
@@ -632,7 +632,7 @@ fn install_pack_at(
         } else if is_update {
             match old_pack.as_ref() {
                 Some(old) => (old.install_source.clone(), old.install_ref.clone()),
-                // 自管更新但无旧记录（首装 offer 走 apply）= 官方数据包本体
+                // 自管更新但无旧记录（首装 offer 走 apply）= 官方渠道本体
                 None => (INSTALL_SOURCE_MANIFEST.to_string(), String::new()),
             }
         } else {
@@ -1110,8 +1110,9 @@ fn release_available(release: &SourceRelease) -> bool {
 
 /// 更新发现（双通道归一，**只提示不安装**）：
 /// ① 每个已装包自身 updateUrl 的 Range 包头探测（4h/包 节流，force 可越过）；
-/// ② astral manifest（play 产物版本 = release 版本；meta 产物需包头探测；
-///    未装官方包 current=0 也下发首装 offer——数据包首装由首页全屏引导消费）。
+/// ② astral manifest（play 产物版本 = release 版本；meta 产物需包头探测）。
+/// 两种包均仅对已装包提示更新——未装不下发首装 offer（安装动作完全由
+/// 用户在设置页发起，客户端不宣传官方渠道）。
 /// 同 targetId 多通道取 newCode 最高；meta 通道排在前面（先更数据包）。
 async fn discover_updates(
     app: &AppHandle,
@@ -1169,22 +1170,24 @@ async fn discover_updates(
     // ② astral manifest（官方包通道：play-official / meta-official）
     match fetch_manifest(astral).await {
         Ok(Some(release)) if release_available(&release) => {
-            // 播放包产物：release 版本即包版本（未装 current=0 也下发首装引导）
-            if let Some(art) = release.artifacts.iter().find(|a| a.path == ARTIFACT_PLAY) {
-                let installed = state.pack(OFFICIAL_PLAY_ID);
-                let current = installed.map(|p| p.version_code).unwrap_or(0);
-                let skip = installed
-                    .map(|p| p.skip_codes.contains(&release.source_version_code))
-                    .unwrap_or(false);
+            // 播放包产物：release 版本即包版本。仅对已装的 play-official
+            // 提示更新（未装不下发首装 offer——安装动作完全由用户发起）
+            if let (Some(art), Some(installed)) = (
+                release.artifacts.iter().find(|a| a.path == ARTIFACT_PLAY),
+                state.pack(OFFICIAL_PLAY_ID),
+            ) {
+                let skip = installed.skip_codes.contains(&release.source_version_code);
                 // 版本压制例外：本地官方包从未通过签名校验（签名落地前的历史
                 // 冒充包）——manifest 真官方更新不按 versionCode 压制，总能提示
                 // 出来覆盖掉它。
-                let unverified_official = installed.map(|p| !p.sign_verified).unwrap_or(false);
-                if (release.source_version_code > current || unverified_official) && !skip {
+                let unverified_official = !installed.sign_verified;
+                if (release.source_version_code > installed.version_code || unverified_official)
+                    && !skip
+                {
                     offers.push(PackUpdateOffer {
                         kind: PACK_KIND_PLAY.to_string(),
                         target_id: OFFICIAL_PLAY_ID.to_string(),
-                        current_code: current,
+                        current_code: installed.version_code,
                         new_code: release.source_version_code,
                         new_name: release.source_version_name.clone(),
                         notes: release.notes.clone(),
@@ -1193,40 +1196,35 @@ async fn discover_updates(
                     });
                 }
             }
-            // 数据包产物：manifest 只有产物清单，版本要探测包头才知道；
-            // 未装 current=0 也下发（首页全屏引导消费的就是这条首装 offer）
-            if let Some(art) = release.artifacts.iter().find(|a| a.path == ARTIFACT_META) {
+            // 数据包产物：manifest 只有产物清单，版本要探测包头才知道。
+            // 仅对已装的 meta-official 提示更新——未装不下发首装 offer
+            // （首页引导只指路设置页，安装动作完全由用户发起）
+            if let (Some(art), Some(installed)) = (
+                release.artifacts.iter().find(|a| a.path == ARTIFACT_META),
+                state.pack(OFFICIAL_META_ID),
+            ) {
                 if let Ok(Some(header)) = probe_pack_header(&art.url).await {
-                    if header.kind == PACK_KIND_META && header.id == OFFICIAL_META_ID {
-                        let current = state
-                            .pack(OFFICIAL_META_ID)
-                            .map(|p| p.version_code)
-                            .unwrap_or(0);
-                        let skip = state
-                            .pack(OFFICIAL_META_ID)
-                            .map(|p| p.skip_codes.contains(&header.version_code))
-                            .unwrap_or(false);
-                        // 版本压制例外：同 play 通道（历史未验签官方包不压制）
-                        let unverified_official = state
-                            .pack(OFFICIAL_META_ID)
-                            .map(|p| !p.sign_verified)
-                            .unwrap_or(false);
-                        if (header.version_code > current || unverified_official) && !skip {
-                            offers.push(PackUpdateOffer {
-                                kind: PACK_KIND_META.to_string(),
-                                target_id: OFFICIAL_META_ID.to_string(),
-                                current_code: current,
-                                new_code: header.version_code,
-                                new_name: if header.version_name.is_empty() {
-                                    format!("code {}", header.version_code)
-                                } else {
-                                    header.version_name
-                                },
-                                notes: release.notes.clone(),
-                                channel: "manifest".to_string(),
-                                url: art.url.clone(),
-                            });
-                        }
+                    // 版本压制例外：同 play 通道（历史未验签官方包不压制）
+                    let unverified_official = !installed.sign_verified;
+                    if header.kind == PACK_KIND_META
+                        && header.id == OFFICIAL_META_ID
+                        && (header.version_code > installed.version_code || unverified_official)
+                        && !installed.skip_codes.contains(&header.version_code)
+                    {
+                        offers.push(PackUpdateOffer {
+                            kind: PACK_KIND_META.to_string(),
+                            target_id: OFFICIAL_META_ID.to_string(),
+                            current_code: installed.version_code,
+                            new_code: header.version_code,
+                            new_name: if header.version_name.is_empty() {
+                                format!("code {}", header.version_code)
+                            } else {
+                                header.version_name
+                            },
+                            notes: release.notes.clone(),
+                            channel: "manifest".to_string(),
+                            url: art.url.clone(),
+                        });
                     }
                 }
             }
