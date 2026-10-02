@@ -1642,7 +1642,8 @@ function SourcePackageSection(): React.JSX.Element {
 
 /**
  * 安装预览确认弹窗（URL/本地文件安装的必经一步；manifest 通道的更新确认
- * 已含版本信息，不走这里）。id 自称官方包时给显著警示、确认键改「仍要安装」。
+ * 已含版本信息，不走这里）。官方 id 包在预览前已通过 ed25519 签名硬校验
+ * （假包到不了这里），弹窗里直接展示「官方 · 已验签」。
  */
 function InstallPreviewDialog(props: {
   preview: PackPreviewVo;
@@ -1683,9 +1684,9 @@ function InstallPreviewDialog(props: {
             将替换已安装的 v{p.installedCode}（同 id 原位更新）
           </p>
         ) : null}
-        {p.spoofOfficial ? (
-          <div className="mt-2 rounded-lg bg-destructive/10 px-3 py-2 text-[11px] leading-relaxed text-destructive">
-            该文件自称官方包。官方包只应来自应用内官方渠道更新；如非你主动从官方获取，请取消
+        {p.signatureVerified ? (
+          <div className="mt-2 rounded-lg bg-primary/10 px-3 py-2 text-[11px] leading-relaxed text-primary">
+            ✓ 官方签名校验通过（ed25519，与官方发布密钥匹配）
           </div>
         ) : null}
         <div className="mt-3 flex items-center justify-end gap-2">
@@ -1701,11 +1702,9 @@ function InstallPreviewDialog(props: {
             type="button"
             onClick={props.onConfirm}
             disabled={props.busy}
-            className={`rounded-md px-3 py-1.5 text-xs font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50 ${
-              p.spoofOfficial ? "bg-destructive" : "bg-primary"
-            }`}
+            className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
           >
-            {props.busy ? "安装中…" : p.spoofOfficial ? "仍要安装" : "安装"}
+            {props.busy ? "安装中…" : "安装"}
           </button>
         </div>
       </div>

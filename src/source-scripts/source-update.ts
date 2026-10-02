@@ -112,8 +112,9 @@ export interface InstallOutcomeVo {
 
 /**
  * 安装预览信息（Rust PackPreview；URL/本地文件安装先预览确认再落盘）。
- * spoofOfficial = 包头 id 自称 play-official/meta-official 而来源又不是
- * 官方渠道 → UI 要给冒充警示、确认键改「仍要安装」。
+ * signatureVerified = 官方 id（play-official/meta-official）ed25519 签名校验
+ * 通过（预览能到的官方包必为 true，假包在预览前就被硬拒）→ UI 显示
+ * 「官方 · 已验签」徽标。第三方包恒 false（不受影响）。
  */
 export interface PackPreviewVo {
   /** 暂存 token（一次性；确认安装时传回 sourceInstallStaged） */
@@ -127,7 +128,8 @@ export interface PackPreviewVo {
   channel: string;
   /** 来源展示（完整 URL 或文件名） */
   reference: string;
-  spoofOfficial: boolean;
+  /** 官方包签名校验通过（见上） */
+  signatureVerified: boolean;
   /** 已安装同 id 包的版本（0 = 未装过） */
   installedCode: number;
 }

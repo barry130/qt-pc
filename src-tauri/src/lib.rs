@@ -14,6 +14,7 @@ pub mod local;
 pub mod lyric_window;
 pub mod media;
 pub mod net_guard;
+pub mod pack_signature;
 pub mod provider;
 pub mod playurl_bridge;
 pub mod qtres;

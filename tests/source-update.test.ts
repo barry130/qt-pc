@@ -186,7 +186,7 @@ describe("source-update IPC 包装（v3）", () => {
       versionName: "",
       channel: "url",
       reference: "https://cdn.example/x.js",
-      spoofOfficial: false,
+      signatureVerified: false,
       installedCode: 0,
     };
     const spy = vi.spyOn(ipc, "sourceStageFromUrl").mockResolvedValue(preview);
@@ -206,7 +206,7 @@ describe("source-update IPC 包装（v3）", () => {
       versionName: "m.1",
       channel: "file",
       reference: "meta-bundle.js",
-      spoofOfficial: true,
+      signatureVerified: true,
       installedCode: 0,
     };
     vi.spyOn(ipc, "sourceStageFromFile").mockResolvedValue(preview);

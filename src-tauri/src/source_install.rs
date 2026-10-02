@@ -110,6 +110,11 @@ pub struct SourcePackMeta {
     pub last_error: String,
     /// 最近一次失败时间（unix 毫秒，与 uniappx Date.now() 同口径；0 = 无）
     pub last_error_at: i64,
+    /// 官方 id 包安装时 ed25519 签名校验通过。签名落地前安装的历史官方包
+    /// 为 false——manifest 通道对这类包不按 versionCode 压制（见
+    /// check_source_updates），让真官方更新总能提示出来，覆盖掉历史冒充包。
+    /// 第三方包恒 false（不参与判定）。
+    pub sign_verified: bool,
 }
 
 impl SourcePackMeta {
@@ -278,6 +283,9 @@ fn migrate_v2(dir: &Path, raw: Value) -> SourceBundleState {
             install_ref: String::new(),
             last_error: String::new(),
             last_error_at: 0,
+            // v2 时代的官方包没有签名（签名 2026-10 才落地）——按未验签迁移，
+            // manifest 通道对它不按 versionCode 压制，新版真官方包会覆盖上来
+            sign_verified: false,
         });
     }
     state.active_id = v2
@@ -505,7 +513,8 @@ pub struct InstallOutcome {
     pub pack: SourcePackMeta,
 }
 
-/// 包文本静态校验（包头 / 体积下限 / 播放包装配入口 / 跨 kind id 冲突）。
+/// 包文本静态校验（包头 / 体积下限 / 播放包装配入口 / 跨 kind id 冲突 /
+/// 官方 id 签名硬校验）。
 /// 安装管线与安装预览（staged）共用：预览能过的包，安装阶段基本不会再
 /// 栽在这些静态门槛上。
 fn validate_pack_text(dir: &Path, text: &str) -> Result<PackHeader, String> {
@@ -516,6 +525,21 @@ fn validate_pack_text(dir: &Path, text: &str) -> Result<PackHeader, String> {
     }
     if header.kind == PACK_KIND_PLAY && !text.contains(PLAY_PACK_FACTORY_MARKER) {
         return Err("不是可安装的播放音源包（缺少 __qtPlayPackFactory 装配入口）".to_string());
+    }
+    // 官方 id 签名硬校验：官方包同样走直链/本地分发，身份靠签名而非渠道——
+    // 验不过（含无签名块）一律拒绝，冒充/篡改的包进不了官方槽；第三方 id 不受影响。
+    // 对所有渠道生效（直链/本地/manifest/自管更新），是安装管线的最终闸门。
+    if header.id == OFFICIAL_META_ID || header.id == OFFICIAL_PLAY_ID {
+        #[cfg(test)]
+        if tests::BYPASS_SIGNATURE_GATE.load(std::sync::atomic::Ordering::SeqCst) {
+            // 测试旁路：模拟签名落地前的历史安装路径（仅测试二进制存在，见 tests 模块）
+        } else {
+            crate::pack_signature::verify_official_signature(text)
+                .map_err(|e| format!("官方包签名校验失败：{e}"))?;
+        }
+        #[cfg(not(test))]
+        crate::pack_signature::verify_official_signature(text)
+            .map_err(|e| format!("官方包签名校验失败：{e}"))?;
     }
     if let Some(old) = load_state(dir).pack(&header.id) {
         if old.kind != header.kind {
@@ -605,6 +629,8 @@ fn install_pack_at(
             install_ref,
             last_error: String::new(),
             last_error_at: 0,
+            // 走到这里 = validate_pack_text 已过（官方 id 必已验签）
+            sign_verified: header.id == OFFICIAL_META_ID || header.id == OFFICIAL_PLAY_ID,
         };
         state.pack_mut_or_push(pack.clone());
         // 生效门：槽位空着或本来就生效的是它 → 自动上位；否则不打扰用户选择
@@ -753,7 +779,7 @@ fn take_staged(token: &str) -> Option<StagedInstall> {
 }
 
 /// 安装预览信息（source_stage_from_url / source_stage_from_file 返回，
-/// 前端据此渲染确认弹窗：类型/名称/版本/id/来源 + 官方 id 冒充警示）
+/// 前端据此渲染确认弹窗：类型/名称/版本/id/来源 + 官方签名校验结果）
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackPreview {
@@ -767,14 +793,16 @@ pub struct PackPreview {
     pub channel: String,
     /// 来源展示（完整 URL 或文件名）
     pub reference: String,
-    /// 包头 id 冒充官方包（play-official / meta-official）：URL/本地文件
-    /// 通道不是官方渠道，前端要给显著警示并把确认键改成「仍要安装」
-    spoof_official: bool,
+    /// 官方包（play-official / meta-official）ed25519 签名校验通过。
+    /// 走到预览的官方包必为 true（validate_pack_text 已挡掉未验签的冒充包，
+    /// 预览报错不进弹窗）；前端显示「官方 · 已验签」徽标。第三方包恒 false。
+    signature_verified: bool,
     /// 已安装同 id 包的版本（0 = 未装过；>0 前端提示将原位替换）
     installed_code: i64,
 }
 
-/// 预览暂存 + 组装预览信息（静态校验放前面：预览能过的包基本能装上）
+/// 预览暂存 + 组装预览信息（静态校验放前面：预览能过的包基本能装上；
+/// 官方 id 的签名硬校验也在 validate_pack_text 里，冒充包在这一步就报错）
 fn stage_pack_text(
     app: &AppHandle,
     text: &str,
@@ -783,7 +811,7 @@ fn stage_pack_text(
 ) -> Result<PackPreview, String> {
     let dir = source_bundle::bundle_dir(app);
     let header = validate_pack_text(&dir, text)?;
-    let spoof_official = header.id == OFFICIAL_META_ID || header.id == OFFICIAL_PLAY_ID;
+    let signature_verified = header.id == OFFICIAL_META_ID || header.id == OFFICIAL_PLAY_ID;
     let installed_code = load_state(&dir).pack(&header.id).map(|p| p.version_code).unwrap_or(0);
     let token = put_staged(StagedInstall {
         channel: channel.to_string(),
@@ -799,7 +827,7 @@ fn stage_pack_text(
         version_name: header.version_name.trim().to_string(),
         channel: channel.to_string(),
         reference: reference.to_string(),
-        spoof_official,
+        signature_verified,
         installed_code,
     })
 }
@@ -1150,7 +1178,11 @@ async fn discover_updates(
                 let skip = installed
                     .map(|p| p.skip_codes.contains(&release.source_version_code))
                     .unwrap_or(false);
-                if release.source_version_code > current && !skip {
+                // 版本压制例外：本地官方包从未通过签名校验（签名落地前的历史
+                // 冒充包）——manifest 真官方更新不按 versionCode 压制，总能提示
+                // 出来覆盖掉它。
+                let unverified_official = installed.map(|p| !p.sign_verified).unwrap_or(false);
+                if (release.source_version_code > current || unverified_official) && !skip {
                     offers.push(PackUpdateOffer {
                         kind: PACK_KIND_PLAY.to_string(),
                         target_id: OFFICIAL_PLAY_ID.to_string(),
@@ -1178,7 +1210,12 @@ async fn discover_updates(
                             .pack(OFFICIAL_META_ID)
                             .map(|p| p.skip_codes.contains(&header.version_code))
                             .unwrap_or(false);
-                        if header.version_code > current && !skip {
+                        // 版本压制例外：同 play 通道（历史未验签官方包不压制）
+                        let unverified_official = state
+                            .pack(OFFICIAL_META_ID)
+                            .map(|p| !p.sign_verified)
+                            .unwrap_or(false);
+                        if (header.version_code > current || unverified_official) && !skip {
                             offers.push(PackUpdateOffer {
                                 kind: PACK_KIND_META.to_string(),
                                 target_id: OFFICIAL_META_ID.to_string(),
@@ -1426,10 +1463,8 @@ pub async fn cmd_source_install_local_file(app: AppHandle) -> Result<Option<Valu
     ))
 }
 
-/// 安装预览 ①（直链）：下载全文 → 静态校验 → 暂存，返回预览信息。
-/// 不落盘；用户在弹窗确认后调 source_install_staged 才真正安装。
-/// URL/本地文件不是官方渠道，包 id 自称 play-official/meta-official 时
-/// preview.spoofOfficial = true（前端给冒充警示）。
+/// 安装预览 ①（直链）：下载全文 → 静态校验（官方 id 含 ed25519 签名硬校验，
+/// 假包在这一步报错，到不了预览）→ 暂存，返回预览信息（signatureVerified）。
 #[tauri::command(rename = "source_stage_from_url")]
 pub async fn cmd_source_stage_from_url(app: AppHandle, url: String) -> Result<Value, String> {
     let url = url.trim().to_string();
@@ -1796,6 +1831,122 @@ mod tests {
         dir
     }
 
+    /// 官方 id 签名闸门旁路（仅测试二进制存在，生产编译无此符号）：
+    /// 需要安装「无签名官方 id 包」的旧测试用它模拟签名落地前（2026-10 之前）
+    /// 的历史安装路径；闸门本身的验证见 official_pack_gate_* 测试。
+    pub(super) static BYPASS_SIGNATURE_GATE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// RAII 旁路：作用域内放行无签名官方包，离开作用域自动恢复硬校验
+    struct SignatureGateBypass;
+
+    impl SignatureGateBypass {
+        fn new() -> Self {
+            BYPASS_SIGNATURE_GATE.store(true, std::sync::atomic::Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for SignatureGateBypass {
+        fn drop(&mut self) {
+            BYPASS_SIGNATURE_GATE.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// 发布私钥预签名的官方向量（qt-sources scripts/sign-pack.mjs 同约定，
+    /// node:crypto ed25519 生成；私钥不进仓库，向量只用于验证端到端验签路径：
+    /// 生产公钥 → split_sign_block → ring verify 全链路）。
+    /// 末尾的签名块在测试里拼上（SIGNED_OFFICIAL_SIG_B64 对本文本全文有效）。
+    const SIGNED_OFFICIAL_TEXT: &str = r#"/*__QT_PACK__{"kind":"play","id":"play-official","name":"官方播放包·测试向量","versionCode":2026100201,"versionName":"2026.10.02.1","updateUrl":"https://example.com/play-bundle.js","notes":""}*/
+/*__QT_PACK__*/ 后续行是注释占位……
+// pad line
+// xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+// xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+// xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+// xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+// xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+// xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+// xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+// xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+// xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+// xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+// xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+// xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+// xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+// xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+// xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+// __qtPlayPackFactory stub for gate test
+"#;    const SIGNED_OFFICIAL_SIG_B64: &str =
+        "lPtmJNM2R349y+OMrTbjg0AQq9vNCM01ow8ec/Ud9Xf4rsVQcAa6xirEG4r6VSSpSo4MKHdbeIPnccLJJNbZBA==";
+
+    fn signed_official_pack() -> String {
+        format!(
+            "{SIGNED_OFFICIAL_TEXT}/*__QT_SIGN__{{\"alg\":\"ed25519\",\"sig\":\"{SIGNED_OFFICIAL_SIG_B64}\"}}*/\n"
+        )
+    }
+
+    #[test]
+    fn official_pack_gate_rejects_unsigned() {
+        let dir = tmp_dir("gate-uns");
+        // 无签名块的官方 id 包：直链/本地渠道最常见的冒充形态
+        let err = install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_PLAY, OFFICIAL_PLAY_ID, 1, true),
+            false,
+            "",
+            "",
+        )
+        .unwrap_err();
+        assert!(err.contains("官方包签名校验失败"), "{err}");
+        assert!(err.contains("缺少官方签名"), "{err}");
+        // 也没有落盘
+        assert!(!install_dir(&dir, OFFICIAL_PLAY_ID).join(ARTIFACT_PLAY).is_file());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn official_pack_gate_rejects_forged_signature() {
+        let dir = tmp_dir("gate-fge");
+        // 有签名块但对不上内容（把别处签的名搬过来/改过正文）
+        let mut text = pack_text(PACK_KIND_PLAY, OFFICIAL_PLAY_ID, 1, true);
+        text.push_str(&format!(
+            "/*__QT_SIGN__{{\"alg\":\"ed25519\",\"sig\":\"{SIGNED_OFFICIAL_SIG_B64}\"}}*/\n"
+        ));
+        let err = install_pack_at(&dir, &text, false, "", "").unwrap_err();
+        assert!(err.contains("签名不匹配"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn official_pack_gate_accepts_release_signed_vector() {
+        let dir = tmp_dir("gate-ok");
+        install_pack_at(&dir, &signed_official_pack(), false, INSTALL_SOURCE_URL, "https://example.com/play-bundle.js")
+            .expect("发布签名的官方向量必须能装");
+        take_pending(OFFICIAL_PLAY_ID);
+        let st = load_state(&dir);
+        let p = st.pack(OFFICIAL_PLAY_ID).unwrap();
+        assert!(p.sign_verified, "验签通过的官方包记录 sign_verified");
+        assert_eq!(p.version_code, 2026100201);
+        assert_eq!(p.install_source, "url");
+        // 落盘文本与源一致（含尾部签块，装载引擎按注释忽略）
+        let on_disk =
+            std::fs::read_to_string(dir.join("install").join(OFFICIAL_PLAY_ID).join(ARTIFACT_PLAY)).unwrap();
+        assert!(on_disk.ends_with("*/\n"), "落盘保留尾部签名块");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn third_party_pack_needs_no_signature() {
+        let dir = tmp_dir("gate-3rd");
+        // 第三方包不签名照常安装（闸门只管官方保留 id）
+        install_pack_at(&dir, &pack_text(PACK_KIND_PLAY, "play-custom", 1, true), false, INSTALL_SOURCE_URL, "https://e/x.js")
+            .expect("第三方无签名包必须能装");
+        take_pending("play-custom");
+        let st = load_state(&dir);
+        assert!(!st.pack("play-custom").unwrap().sign_verified);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn state_roundtrip_v3() {
         let dir = tmp_dir("round");
@@ -1816,6 +1967,7 @@ mod tests {
             install_ref: "https://example.com/play.js".into(),
             last_error: "装载失败：SyntaxError".into(),
             last_error_at: 1_758_000_000_012,
+            sign_verified: true,
         });
         st.active_id = Some("play-official".into());
         st.active_meta_id = None;
@@ -1918,6 +2070,8 @@ mod tests {
     #[test]
     fn install_play_pack_activates_when_slot_empty() {
         let dir = tmp_dir("install1");
+        // 旁路签名闸门：本测试关注空槽上位语义（闸门验证见 official_pack_gate_*）
+        let _gate = SignatureGateBypass::new();
         let outcome = install_pack_at(&dir, &pack_text(PACK_KIND_PLAY, "play-official", 1, true), false, "", "").unwrap();
         assert!(outcome.activated, "空槽自动上位");
         assert!(!outcome.replaced);
@@ -1972,6 +2126,8 @@ mod tests {
     #[test]
     fn play_install_clears_leftover_chain_json() {
         let dir = tmp_dir("install4");
+        // 旁路签名闸门：本测试关注 chain.json 残留清理语义
+        let _gate = SignatureGateBypass::new();
         let target = install_dir(&dir, "play-official");
         std::fs::create_dir_all(&target).unwrap();
         std::fs::write(target.join("chain.json"), b"{}").unwrap();
@@ -2046,6 +2202,7 @@ mod tests {
             install_ref: String::new(),
             last_error: String::new(),
             last_error_at: 0,
+            sign_verified: false,
         });
         st.active_id = Some("ghost".into());
         save_state(&dir, &st).unwrap();
@@ -2091,7 +2248,10 @@ mod tests {
     #[test]
     fn fresh_install_without_old_record_self_channel_is_manifest() {
         let dir = tmp_dir("src-bl");
-        // 基线升格：自管更新但无旧记录 → 视作官方数据包本体
+        // 基线升格：自管更新但无旧记录 → 视作官方数据包本体。
+        // 旁路签名闸门：这里测的是来源归属语义，且模拟的是签名落地前的
+        // 历史安装路径（闸门本身的验证见 official_pack_gate_* 测试）
+        let _gate = SignatureGateBypass::new();
         install_pack_at(&dir, &pack_text(PACK_KIND_META, OFFICIAL_META_ID, 5, false), true, "", "").unwrap();
         take_pending(OFFICIAL_META_ID);
         let st = load_state(&dir);
