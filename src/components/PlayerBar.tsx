@@ -82,15 +82,27 @@ export function PlayerBar(): React.JSX.Element {
   const profile = useAuthStore((s) => s.profile);
   const showPlayUrl = isAdmin(profile);
 
-  // 自愈：状态不是"停止"却拿不到曲目（事件丢失/覆盖的兜底）——
-  // 主动拉一次实时快照，拿到曲目为止；正常时这个 effect 空转。
+  // 自愈：拿不到曲目时（事件丢失/快照被覆盖的兜底）主动拉一次实时快照，
+  // 拿到曲目为止；正常时这个 effect 空转。注意**不能**豁免 stopped——
+  // 事件通道挂掉时 store 恰恰冻结在初始的 stopped+无曲目上，豁免它等于
+  // 关掉最需要自愈的场景。连续 3 次拉取都无改善就停手，避免空转轮询。
   // 依赖里**不要**再放 positionMs：它每 250ms 变一次，会让这个 800ms 定时器
   // 被反复重置、永远烧不到（以前 tick 重建 state 就是这个效果）。
+  const healAttemptsRef = useRef(0);
   useEffect(() => {
-    if (track || !state || state.status === "stopped") return;
+    if (track || !state || healAttemptsRef.current >= 3) return;
     const timer = setTimeout(() => {
       void getPlaybackState()
-        .then((s) => usePlayerStore.getState().applySnapshot(s))
+        .then((s) => {
+          const before = usePlayerStore.getState().state;
+          usePlayerStore.getState().applySnapshot(s);
+          const after = usePlayerStore.getState().state;
+          if (after?.track || before?.status !== after?.status) {
+            healAttemptsRef.current = 0;
+          } else {
+            healAttemptsRef.current += 1;
+          }
+        })
         .catch(() => {});
     }, 800);
     return () => clearTimeout(timer);
