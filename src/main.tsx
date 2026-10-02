@@ -1,5 +1,6 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import App from "./App";
 import "./index.css";
 import * as ipc from "./services/ipc";
@@ -101,11 +102,54 @@ function showFatalError(message: string): void {
   }
 }
 
+/**
+ * 拒绝原因的人话描述。
+ *
+ * 2026-10-02 排查记录：日志里出现过 5 条 `未处理的 Promise 拒绝：[object Object]`
+ * 与 `false`。原来的 `String(e.reason)` 把它们压成一行没有信息量的文本，而拒绝值
+ * 本身不带 stack，事后完全无法定位（本次排查正是卡在这里）。这里带上类型/构造器名
+ * 与 JSON：对象给 `ProviderError {"kind":"noPlayableUrl"}`，布尔给 `boolean false`，
+ * 字符串给 `string: false` —— 后两者原本在日志里长得一模一样。
+ */
+function describeReason(reason: unknown): string {
+  if (reason instanceof Error) {
+    return reason.stack ?? `${reason.name}: ${reason.message}`;
+  }
+  if (typeof reason === "object" && reason !== null) {
+    let json: string;
+    try {
+      json = JSON.stringify(reason) ?? String(reason);
+    } catch {
+      json = "<无法序列化>";
+    }
+    const name =
+      (reason as { constructor?: { name?: string } }).constructor?.name ?? "Object";
+    return `${name} ${json}`;
+  }
+  return `${typeof reason}: ${String(reason)}`;
+}
+
+/**
+ * 当前窗口 label：主窗口与桌面歌词窗口复用同一 bundle、也共用下面这套全局
+ * 兜底，日志里必须能分辨是哪一侧报的（两边都写同一条 `[frontend]` 日志）。
+ */
+function currentLabel(): string {
+  try {
+    return getCurrentWindow().label;
+  } catch {
+    return "?";
+  }
+}
+
 window.addEventListener("error", (e) => {
-  showFatalError(`${e.message}\n${e.filename}:${e.lineno}:${e.colno}`);
+  showFatalError(
+    `未捕获异常（${currentLabel()}）：${e.message}\n${e.filename}:${e.lineno}:${e.colno}`,
+  );
 });
 window.addEventListener("unhandledrejection", (e) => {
-  showFatalError(`未处理的 Promise 拒绝：\n${String(e.reason)}`);
+  showFatalError(
+    `未处理的 Promise 拒绝（${currentLabel()}）：\n${describeReason(e.reason)}`,
+  );
 });
 
 try {

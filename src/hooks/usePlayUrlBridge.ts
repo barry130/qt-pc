@@ -49,15 +49,22 @@ export function usePlayUrlBridge(): void {
     let disposed = false;
     let unlisten: UnlistenFn | null = null;
     void (async () => {
-      const u = await listen<PlayUrlRequest>("play_url_request", (event) => {
-        void answer(event.payload);
-      });
-      if (disposed) {
-        u();
-        return;
+      try {
+        const u = await listen<PlayUrlRequest>("play_url_request", (event) => {
+          void answer(event.payload);
+        });
+        if (disposed) {
+          u();
+          return;
+        }
+        unlisten = u;
+        await invoke("script_bridge_ready").catch(() => {});
+      } catch (e) {
+        // 架桥失败 = 引擎主导的每一次换歌（自动切歌/随机下一首/失败重取）都取不到
+        // 地址，且本次会话内不会自愈，用户必须看得见。补上上下文再抛给全局兜底
+        // （main.tsx 的 unhandledrejection）：只留一个裸的 listen 失败无从定位。
+        throw new Error(`取链桥事件监听注册失败：${String(e)}`);
       }
-      unlisten = u;
-      await invoke("script_bridge_ready").catch(() => {});
     })();
     return () => {
       disposed = true;

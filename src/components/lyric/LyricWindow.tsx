@@ -190,60 +190,68 @@ export function LyricWindow(): React.JSX.Element {
         /* 主窗口尚未就绪时事件订阅会兜底 */
       }
 
-      unlisten.push(
-        await onQueueChanged((payload) => {
-          const track =
-            payload.index !== null ? (payload.tracks[payload.index] ?? null) : null;
-          const key = trackKey(track);
-          if (key === loadedTrackKey.current) return;
-          loadedTrackKey.current = key;
-          void loadLyricFor(track);
-        }),
-      );
-      unlisten.push(
-        await onPositionChanged((payload) => {
-          baseRef.current = {
-            positionMs: payload.positionMs,
-            receivedAt: performance.now(),
-          };
-        }),
-      );
-      unlisten.push(
-        await onPlaybackStateChanged((payload) => {
-          playingRef.current = payload.status === "playing";
-          setPaused(payload.status !== "playing");
-          baseRef.current = {
-            positionMs: payload.positionMs,
-            receivedAt: performance.now(),
-          };
-          // 曲目以快照为准（与播放页同源）。queue-changed 在个别切歌路径下可能
-          // 滞后或缺失，只认它会让桌面歌词慢一拍 —— 表现是显示上一首的词。
-          const snapTrack = payload.track ?? null;
-          if (snapTrack) {
-            const key = trackKey(snapTrack);
-            if (key !== loadedTrackKey.current) {
-              loadedTrackKey.current = key;
-              void loadLyricFor(snapTrack);
+      // 五路订阅：任一注册失败都不能让这个初始化 IIFE 以"未处理拒绝"收场 ——
+      // 那会弹一个说不清来源的致命浮层，而且后面的订阅静默缺失，
+      // 桌面歌词从此不跟随播放（2026-10-02 收口：全局兜底只印 String(reason)，
+      // 事后无从定位，所以这里补上上下文再交给全局兜底）。
+      try {
+        unlisten.push(
+          await onQueueChanged((payload) => {
+            const track =
+              payload.index !== null ? (payload.tracks[payload.index] ?? null) : null;
+            const key = trackKey(track);
+            if (key === loadedTrackKey.current) return;
+            loadedTrackKey.current = key;
+            void loadLyricFor(track);
+          }),
+        );
+        unlisten.push(
+          await onPositionChanged((payload) => {
+            baseRef.current = {
+              positionMs: payload.positionMs,
+              receivedAt: performance.now(),
+            };
+          }),
+        );
+        unlisten.push(
+          await onPlaybackStateChanged((payload) => {
+            playingRef.current = payload.status === "playing";
+            setPaused(payload.status !== "playing");
+            baseRef.current = {
+              positionMs: payload.positionMs,
+              receivedAt: performance.now(),
+            };
+            // 曲目以快照为准（与播放页同源）。queue-changed 在个别切歌路径下可能
+            // 滞后或缺失，只认它会让桌面歌词慢一拍 —— 表现是显示上一首的词。
+            const snapTrack = payload.track ?? null;
+            if (snapTrack) {
+              const key = trackKey(snapTrack);
+              if (key !== loadedTrackKey.current) {
+                loadedTrackKey.current = key;
+                void loadLyricFor(snapTrack);
+              }
             }
-          }
-        }),
-      );
-      unlisten.push(
-        await onLyricWindowChanged((payload) => {
-          setUi(payload);
-        }),
-      );
-      // 取链桥广播的命中线路：当前曲目被跨源兜底接走时按目标源重取歌词
-      //（曲目 id/platform 不变，queue/state 事件不会触发重取，必须自己听）
-      unlisten.push(
-        await listen<{ platform: string; id: string; line: PlayUrlLine | null }>("play-url-line", (e) => {
-          const key = `${e.payload.platform}:${e.payload.id}`;
-          crossLineByTrack.current.set(key, e.payload.line);
-          if (key === loadedTrackKey.current) {
-            void loadLyricFor(currentTrackRef.current);
-          }
-        }),
-      );
+          }),
+        );
+        unlisten.push(
+          await onLyricWindowChanged((payload) => {
+            setUi(payload);
+          }),
+        );
+        // 取链桥广播的命中线路：当前曲目被跨源兜底接走时按目标源重取歌词
+        //（曲目 id/platform 不变，queue/state 事件不会触发重取，必须自己听）
+        unlisten.push(
+          await listen<{ platform: string; id: string; line: PlayUrlLine | null }>("play-url-line", (e) => {
+            const key = `${e.payload.platform}:${e.payload.id}`;
+            crossLineByTrack.current.set(key, e.payload.line);
+            if (key === loadedTrackKey.current) {
+              void loadLyricFor(currentTrackRef.current);
+            }
+          }),
+        );
+      } catch (e) {
+        throw new Error(`桌面歌词事件订阅注册失败：${String(e)}`);
+      }
     })();
 
     return () => {
@@ -333,7 +341,8 @@ export function LyricWindow(): React.JSX.Element {
     return () => {
       generation += 1;
       if (timer) clearTimeout(timer);
-      void promise.then((off) => off());
+      // onMoved 注册失败（窗口正在销毁等）不该变成未处理拒绝：位置回写是尽力而为
+      void promise.then((off) => off()).catch(() => {});
     };
   }, []);
 
@@ -366,7 +375,10 @@ export function LyricWindow(): React.JSX.Element {
         const i = LINE_MODES.indexOf(ui.lineMode);
         void patchStyle({ lineMode: LINE_MODES[(i + 1) % LINE_MODES.length] });
       } else if (!ui.locked) {
-        void getCurrentWindow().startDragging();
+        // 拖动失败（少数平台/时机）只影响本次拖动，别弹全局浮层
+        void getCurrentWindow()
+          .startDragging()
+          .catch(() => {});
       }
     },
     [patchStyle, ui.lineMode, ui.locked],
@@ -509,7 +521,7 @@ export function LyricWindow(): React.JSX.Element {
             <ToolButton title="歌词设置" onClick={() => void openLyricSettings().catch(() => {})}>
               <Settings size={15} />
             </ToolButton>
-            <ToolButton title="关闭桌面歌词" onClick={() => void hideDesktopLyric()}>
+            <ToolButton title="关闭桌面歌词" onClick={() => void hideDesktopLyric().catch(() => {})}>
               <X size={15} />
             </ToolButton>
           </div>
