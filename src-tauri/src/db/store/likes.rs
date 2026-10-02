@@ -8,7 +8,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::provider::types::{Track};
+use crate::provider::types::Track;
 
 // 跨域共享的小工具（`db_track_id` / `now_ms` / `track_from_row` / `LOCAL_PLATFORM` …）
 // 由 store/mod.rs 统一再导出，这里一次性引入，省得每个域各写一长串 use。
@@ -166,11 +166,7 @@ pub(crate) fn list_track_playlists(
           WHERE sid = ?2 AND platform = ?3 AND deleted_at IS NULL",
     )?;
     let rows = stmt.query_map(
-        params![
-            db_track_id(track),
-            track.id,
-            track.platform.to_string(),
-        ],
+        params![db_track_id(track), track.id, track.platform.to_string(),],
         |r| r.get::<_, String>(0),
     )?;
     rows.collect()
@@ -222,8 +218,19 @@ pub(crate) fn list_liked_songs(
 /// (sid, platform, name, singer, album, hash, pic_url, 主归属 pid)。
 pub(crate) fn list_liked_songs_raw(
     conn: &Connection,
-) -> Result<Vec<(String, String, String, String, String, String, String, String)>, rusqlite::Error>
-{
+) -> Result<
+    Vec<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    )>,
+    rusqlite::Error,
+> {
     let mut stmt = conn.prepare(
         "SELECT l.sid, l.platform, l.name, l.singer, l.album,
                 COALESCE(t.pic_url, ''), l.hash, COALESCE(l.pid, '')

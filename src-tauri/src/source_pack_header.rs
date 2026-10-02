@@ -130,19 +130,17 @@ mod tests {
         // 没有包头（v2 老包）
         assert!(parse_pack_header("var x = 1;\n").is_none());
         // 包头不在首行
-        assert!(
-            parse_pack_header(&format!("console.log(1);\n{META_LINE}\n")).is_none()
-        );
+        assert!(parse_pack_header(&format!("console.log(1);\n{META_LINE}\n")).is_none());
         // kind 非法
-        assert!(
-            parse_pack_header(r#"/*__QT_PACK__{"kind":"widget","id":"a-b","versionCode":1}*/"#)
-                .is_none()
-        );
+        assert!(parse_pack_header(
+            r#"/*__QT_PACK__{"kind":"widget","id":"a-b","versionCode":1}*/"#
+        )
+        .is_none());
         // id 非法（大写 / 太短 / 非法字符）
-        assert!(
-            parse_pack_header(r#"/*__QT_PACK__{"kind":"meta","id":"Meta-1","versionCode":1}*/"#)
-                .is_none()
-        );
+        assert!(parse_pack_header(
+            r#"/*__QT_PACK__{"kind":"meta","id":"Meta-1","versionCode":1}*/"#
+        )
+        .is_none());
         assert!(
             parse_pack_header(r#"/*__QT_PACK__{"kind":"meta","id":"m","versionCode":1}*/"#)
                 .is_none()
@@ -152,9 +150,7 @@ mod tests {
                 .is_none()
         );
         // 缺 versionCode / versionCode < 1
-        assert!(
-            parse_pack_header(r#"/*__QT_PACK__{"kind":"meta","id":"a-b"}*/"#).is_none()
-        );
+        assert!(parse_pack_header(r#"/*__QT_PACK__{"kind":"meta","id":"a-b"}*/"#).is_none());
         assert!(
             parse_pack_header(r#"/*__QT_PACK__{"kind":"meta","id":"a-b","versionCode":0}*/"#)
                 .is_none()

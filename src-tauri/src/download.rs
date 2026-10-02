@@ -107,7 +107,12 @@ pub fn part_path_for(final_path: &Path) -> PathBuf {
 /// 明确是网页 / JSON 的则拒绝 —— 这类响应体写进 `.mp3` 只会得到坏文件。
 pub fn content_type_acceptable(ct: Option<&str>) -> bool {
     let Some(ct) = ct else { return true };
-    let ct = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let ct = ct
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     ct.is_empty()
         || ct.starts_with("audio/")
         || ct.starts_with("video/")
@@ -168,10 +173,8 @@ pub async fn run_job(
                         "[download] {} 第 {attempt} 次失败，退避重试：{last_err}",
                         job.task_id
                     );
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        400 * attempt as u64,
-                    ))
-                    .await;
+                    tokio::time::sleep(std::time::Duration::from_millis(400 * attempt as u64))
+                        .await;
                 }
             }
         }
@@ -234,10 +237,9 @@ async fn attempt_once(
     if offset > 0 {
         req = req.header("Range", format!("bytes={offset}-"));
     }
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| AttemptError::Retryable(format!("请求失败: {}", crate::astral::sanitize_err(e))))?;
+    let resp = req.send().await.map_err(|e| {
+        AttemptError::Retryable(format!("请求失败: {}", crate::astral::sanitize_err(e)))
+    })?;
 
     let code = resp.status().as_u16();
     if offset > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
@@ -358,9 +360,8 @@ async fn attempt_once(
     if let Some(parent) = job.final_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    std::fs::rename(&job.part_path, &job.final_path).map_err(|e| {
-        AttemptError::Fatal(format!("保存文件失败: {e}"))
-    })?;
+    std::fs::rename(&job.part_path, &job.final_path)
+        .map_err(|e| AttemptError::Fatal(format!("保存文件失败: {e}")))?;
     Ok(written as i64)
 }
 
@@ -382,7 +383,10 @@ mod tests {
     #[test]
     fn part_path_is_suffixed_next_to_target() {
         let p = part_path_for(Path::new("D:\\Music\\周杰伦 - 晴天.flac"));
-        assert_eq!(p.file_name().unwrap().to_str().unwrap(), "周杰伦 - 晴天.flac.part");
+        assert_eq!(
+            p.file_name().unwrap().to_str().unwrap(),
+            "周杰伦 - 晴天.flac.part"
+        );
     }
 
     #[test]

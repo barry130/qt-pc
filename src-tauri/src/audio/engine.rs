@@ -20,18 +20,18 @@ use std::time::Duration;
 use rodio::{Decoder, Player, Source};
 
 // 设备枚举 / 名称查询都挂在 trait 上，必须显式引入
+use crate::db::store::{self, PlayState};
+use crate::db::Database;
+use crate::provider::types::{self, Track};
+use crate::provider::url_cache::PlayUrlCache;
 use cpal::traits::{DeviceTrait, HostTrait};
 use serde::{Deserialize, Serialize};
 use tauri::Emitter;
-use crate::db::store::{self, PlayState};
-use crate::db::Database;
-use crate::provider::url_cache::PlayUrlCache;
-use crate::provider::types::{self, Track};
 
 use super::fx::{AudioFx, DspSource, EqParams, FadeParams, FxState};
 use super::queue::Queue;
 use super::range_reader::{self, RangeShared};
-use super::state::{PlaybackStateSnapshot, PlaybackStatus, PlayMode, Quality};
+use super::state::{PlayMode, PlaybackStateSnapshot, PlaybackStatus, Quality};
 
 /// 播放来源：在线 URL（走 HttpRangeReader）或本地文件。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,7 +68,10 @@ pub enum AudioCmd {
     SetVolume(f32),
     SetMuted(bool),
     /// 整表替换队列并从 index 开始播放
-    SetQueue { tracks: Vec<Track>, index: usize },
+    SetQueue {
+        tracks: Vec<Track>,
+        index: usize,
+    },
     /// 下一首播放：插到当前曲目之后（不打断当前播放）
     AddNext(Box<Track>),
     /// 加入队尾（不打断当前播放）
@@ -78,7 +81,10 @@ pub enum AudioCmd {
     /// 批量移除（批量管理）：一次移除多个下标，只发一次队列事件
     RemoveIndices(Vec<usize>),
     /// 拖动排序：把 from 位置的曲目移到 to
-    MoveItem { from: usize, to: usize },
+    MoveItem {
+        from: usize,
+        to: usize,
+    },
     /// 清空当前曲目之后的所有曲目
     ClearAfter,
     PlayAt(usize),
@@ -99,18 +105,27 @@ pub enum AudioCmd {
     },
     /// 切换音频输出设备。`None` = 跟随系统默认（设备插拔自动切换）；
     /// `Some(设备名)` = 固定到该设备。切换时当前曲目从原进度无缝续播。
-    SetOutputDevice { name: Option<String> },
+    SetOutputDevice {
+        name: Option<String>,
+    },
     /// 改「默认播放音质」（设置页入口）：写进 settings，重启后保持；
     /// 当前曲目没被单独指定音质时，立即按新音质重新取址续播。
-    SetDefaultQuality { quality: Quality },
+    SetDefaultQuality {
+        quality: Quality,
+    },
     /// 只改当前这首的音质（播放条入口）：不写 settings，切到别的歌自动回到默认。
-    SetTrackQuality { quality: Quality },
+    SetTrackQuality {
+        quality: Quality,
+    },
     /// 改播放倍速（0.5 ~ 2.0）。rodio Player 的速度控制链全权处理，
     /// 进度 / seek 的内容时间域由引擎在读写两侧换算（见 content_pos_ms / sink_seek_content）。
     SetSpeed(f32),
     /// 睡眠定时：`Some(ms)` = 定时武装（到点暂停并清空）；None = 取消。
     /// `after_track` = 播完当前曲目后停止（无倒计时）。
-    SetSleepTimer { remaining_ms: Option<u64>, after_track: bool },
+    SetSleepTimer {
+        remaining_ms: Option<u64>,
+        after_track: bool,
+    },
     /// 整体替换均衡器参数（设置页「音效」）。
     SetEq(EqParams),
     /// 响度归一化开关（设置页「音效」）。
@@ -176,20 +191,18 @@ impl AudioEngine {
                 // panic 细节由 panic 钩子落日志（file_logger），线程退出但进程
                 // 还活着，send() 侧能感知并报错，前端不至于无提示闪退。
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-                    run_engine(
-                        EngineDeps {
-                            app,
-                            rx,
-                            state: state_clone,
-                            cache_dir,
-                            url_cache,
-                            tx: tx_thread,
-                            queue: queue_thread,
-                            fx: fx_thread,
-                            cache_file: cache_file_thread,
-                            db,
-                        },
-                    );
+                    run_engine(EngineDeps {
+                        app,
+                        rx,
+                        state: state_clone,
+                        cache_dir,
+                        url_cache,
+                        tx: tx_thread,
+                        queue: queue_thread,
+                        fx: fx_thread,
+                        cache_file: cache_file_thread,
+                        db,
+                    });
                 }));
                 if let Err(payload) = result {
                     let msg = payload
@@ -201,7 +214,13 @@ impl AudioEngine {
                 }
             });
 
-        Self { tx, state, queue, fx, cache_file }
+        Self {
+            tx,
+            state,
+            queue,
+            fx,
+            cache_file,
+        }
     }
 
     pub fn send(&self, cmd: AudioCmd) {
@@ -352,7 +371,11 @@ impl EngineInner {
                 let device = cpal::default_host()
                     .output_devices()
                     .map_err(|e| e.to_string())?
-                    .find(|d| d.description().map(|desc| desc.name() == name).unwrap_or(false))
+                    .find(|d| {
+                        d.description()
+                            .map(|desc| desc.name() == name)
+                            .unwrap_or(false)
+                    })
                     .ok_or_else(|| format!("找不到输出设备：{name}"))?;
                 rodio::DeviceSinkBuilder::from_device(device)
                     .map_err(|e| e.to_string())?
@@ -367,11 +390,7 @@ impl EngineInner {
         let (track, pos_ms, was_playing) = {
             let st = self.state.read().unwrap();
             let pos = self.sink.get_pos().as_millis() as u64;
-            (
-                st.track.clone(),
-                pos,
-                st.status == PlaybackStatus::Playing,
-            )
+            (st.track.clone(), pos, st.status == PlaybackStatus::Playing)
         };
 
         new_sink.pause();
@@ -405,7 +424,10 @@ impl EngineInner {
                 self.current_device
             );
         } else {
-            log::info!("[device] 输出设备切换到「{}」（无播放中的曲目）", self.current_device);
+            log::info!(
+                "[device] 输出设备切换到「{}」（无播放中的曲目）",
+                self.current_device
+            );
         }
         Ok(())
     }
@@ -479,11 +501,7 @@ fn epoch_ms(inner: &EngineInner) -> u64 {
 /// （TrackPosition 包在 Speed 外层，除以 rate×factor）：倍速 f 下
 /// 内容位置 = get_pos × f。f=1 时恒等，存量语义不变。
 fn content_pos_ms(inner: &EngineInner) -> u64 {
-    inner
-        .sink
-        .get_pos()
-        .mul_f32(inner.speed)
-        .as_millis() as u64
+    inner.sink.get_pos().mul_f32(inner.speed).as_millis() as u64
 }
 
 /// 按内容时间域 seek：rodio 的 try_seek 会被外层 Speed 再乘一次倍速，
@@ -650,9 +668,7 @@ fn run_engine(deps: EngineDeps) {
     // 恢复倍速与音效设置（settings：playback.speed / fx.eq / fx.loudnorm / fx.fade）
     if let Some(db) = &inner.db {
         let load = |key: &str| -> Option<String> {
-            db.with(|c| store::get_setting(c, key))
-                .ok()
-                .flatten()
+            db.with(|c| store::get_setting(c, key)).ok().flatten()
         };
         if let Some(raw) = load(SETTING_SPEED) {
             if let Ok(v) = raw.parse::<f32>() {
@@ -679,7 +695,9 @@ fn run_engine(deps: EngineDeps) {
                 Err(e) => log::warn!("[fx] 淡入淡出设置解析失败，用默认值: {e}"),
             }
         }
-        if let Ok(saved) = db.with(|c| store::get_setting(c, crate::cache::SETTING_AUDIO_CACHE_LIMIT_MB)) {
+        if let Ok(saved) =
+            db.with(|c| store::get_setting(c, crate::cache::SETTING_AUDIO_CACHE_LIMIT_MB))
+        {
             inner.cache_limit_mb = crate::cache::parse_cache_limit_mb(saved.as_deref());
         }
     }
@@ -821,12 +839,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             // Error 态下 sink 是空的，裸 sink.play() 是空操作 → 播放键失效。
             // 改为重载当前队列曲目（autoplay=true）：成功即从原进度续播，再失败
             // 走 LoadFailed 的自动跳过链。用户按播放 = 明确意图，重开自动切歌熔断。
-            let reload = inner
-                .state
-                .read()
-                .unwrap()
-                .status
-                == PlaybackStatus::Error;
+            let reload = inner.state.read().unwrap().status == PlaybackStatus::Error;
             if reload {
                 let track = inner.queue.lock().unwrap().current().cloned();
                 if let Some(track) = track {
@@ -863,8 +876,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             if fading {
                 let dur = inner.fx.fade_duration_ms();
                 inner.fx.begin_fade_out(epoch_ms(inner));
-                inner.pause_deadline =
-                    Some(std::time::Instant::now() + Duration::from_millis(dur));
+                inner.pause_deadline = Some(std::time::Instant::now() + Duration::from_millis(dur));
             } else {
                 inner.pause_deadline = None;
                 finish_pause(inner);
@@ -972,7 +984,8 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             }
             inner.persist_queue();
         }
-        AudioCmd::Next => advance(inner, false),        AudioCmd::Previous => go_previous(inner),
+        AudioCmd::Next => advance(inner, false),
+        AudioCmd::Previous => go_previous(inner),
         AudioCmd::SetPlayMode(mode) => {
             inner.mutate(|st| st.play_mode = mode);
             inner.persist_state();
@@ -1079,8 +1092,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             // 选择存进 settings，重启后保持；切设备时重建输出流并续播当前曲
             if let Some(db) = &inner.db {
                 let key_val = name.clone().unwrap_or_default();
-                if let Err(e) = db.with(|c| store::set_setting(c, "audio.outputDevice", &key_val))
-                {
+                if let Err(e) = db.with(|c| store::set_setting(c, "audio.outputDevice", &key_val)) {
                     log::warn!("[db] 输出设备选择入库失败: {e}");
                 }
             }
@@ -1143,9 +1155,12 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             }
             inner.mutate(|st| st.speed = v);
         }
-        AudioCmd::SetSleepTimer { remaining_ms, after_track } => {
-            inner.sleep_deadline = remaining_ms
-                .map(|ms| std::time::Instant::now() + Duration::from_millis(ms.max(1)));
+        AudioCmd::SetSleepTimer {
+            remaining_ms,
+            after_track,
+        } => {
+            inner.sleep_deadline =
+                remaining_ms.map(|ms| std::time::Instant::now() + Duration::from_millis(ms.max(1)));
             inner.sleep_after_track = after_track;
             inner.mutate(|st| {
                 st.sleep_timer_ms = remaining_ms;
@@ -1199,7 +1214,11 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             inner.cache_limit_mb = mb;
             if let Some(db) = &inner.db {
                 if let Err(e) = db.with(|c| {
-                    store::set_setting(c, crate::cache::SETTING_AUDIO_CACHE_LIMIT_MB, &mb.to_string())
+                    store::set_setting(
+                        c,
+                        crate::cache::SETTING_AUDIO_CACHE_LIMIT_MB,
+                        &mb.to_string(),
+                    )
                 }) {
                     log::warn!("[db] 播放缓存上限入库失败: {e}");
                 }
@@ -1354,12 +1373,7 @@ const FAIL_STREAK_LIMIT: u32 = 5;
 /// 未安装/未初始化通知插件时 show() 返回 Err，静默忽略即可。
 fn notify_failure(app: &tauri::AppHandle, body: &str) {
     use tauri_plugin_notification::NotificationExt;
-    let _ = app
-        .notification()
-        .builder()
-        .title("轻听")
-        .body(body)
-        .show();
+    let _ = app.notification().builder().title("轻听").body(body).show();
 }
 
 /// 播放失败后的恢复策略：仍处于「应当继续播放」的语义（自动切歌 / 在播时换曲）
@@ -1424,7 +1438,8 @@ fn skip_if_recoverable(inner: &mut EngineInner, track_id: &str, autoplay: bool) 
     inner.persist_queue();
 }
 
-fn go_previous(inner: &mut EngineInner) {    let mode = inner.state.read().unwrap().play_mode;
+fn go_previous(inner: &mut EngineInner) {
+    let mode = inner.state.read().unwrap().play_mode;
     let prev = {
         let mut q = inner.queue.lock().unwrap();
         q.previous_index(mode).map(|i| {
@@ -1517,7 +1532,8 @@ impl LoadJob {
         if self.track.platform == types::SourceId::Local {
             log::info!("[queue] local track path={}", self.track.id);
             let path = self.track.id.clone();
-            self.build_and_dispatch(PlaySource::Local { path }, true, None).await;
+            self.build_and_dispatch(PlaySource::Local { path }, true, None)
+                .await;
             return;
         }
 
@@ -1532,7 +1548,8 @@ impl LoadJob {
             if let Ok(Ok(Some(path))) = found {
                 if std::path::Path::new(&path).exists() {
                     log::info!("[queue] 命中已下载文件，离线播放: {path}");
-                    self.build_and_dispatch(PlaySource::Local { path }, true, None).await;
+                    self.build_and_dispatch(PlaySource::Local { path }, true, None)
+                        .await;
                     return;
                 }
                 log::warn!("[queue] 已下载文件已不存在，回落在线取址: {path}");
@@ -1543,19 +1560,28 @@ impl LoadJob {
         // playurl_bridge 问前端脚本包，前端按「换源顺序」跨源解析后回填缓存。
         // 原生 Rust Provider 已删除，前端脚本线路是唯一的第三方取链路径。
         let resolved =
-            crate::resolve_play_url_script(&self.app, &self.cache, &self.track, self.quality)
-                .await;
+            crate::resolve_play_url_script(&self.app, &self.cache, &self.track, self.quality).await;
         match resolved {
             Ok((url, fetched_at)) => {
                 log::info!(
                     "[queue] resolve ok track={} url_host={}",
                     self.track.id,
-                    url.split("//").nth(1).unwrap_or("").split('/').next().unwrap_or("")
+                    url.split("//")
+                        .nth(1)
+                        .unwrap_or("")
+                        .split('/')
+                        .next()
+                        .unwrap_or("")
                 );
                 let play_url = url.clone();
-                let source = PlaySource::Online { url, fetchedAt: fetched_at };
+                let source = PlaySource::Online {
+                    url,
+                    fetchedAt: fetched_at,
+                };
                 match self.try_build(&source).await {
-                    Ok(built) => self.dispatch_ready(built, false, Some(fetched_at), Some(play_url)),
+                    Ok(built) => {
+                        self.dispatch_ready(built, false, Some(fetched_at), Some(play_url))
+                    }
                     Err(first_err) => {
                         // 打开流失败最常见两种：休眠唤醒后的半死连接、缓存的
                         // 签名 URL 已过期 —— 作废缓存重取一次再打开，仍失败才算真失败
@@ -1575,9 +1601,17 @@ impl LoadJob {
                         .await
                         {
                             Ok((url2, fetched_at2)) => {
-                                let source2 = PlaySource::Online { url: url2.clone(), fetchedAt: fetched_at2 };
+                                let source2 = PlaySource::Online {
+                                    url: url2.clone(),
+                                    fetchedAt: fetched_at2,
+                                };
                                 match self.try_build(&source2).await {
-                                    Ok(built2) => self.dispatch_ready(built2, false, Some(fetched_at2), Some(url2)),
+                                    Ok(built2) => self.dispatch_ready(
+                                        built2,
+                                        false,
+                                        Some(fetched_at2),
+                                        Some(url2),
+                                    ),
                                     Err(e2) => self.dispatch_load_failed(
                                         "load",
                                         &format!("打开音频流失败: {first_err}；重取后仍失败: {e2}"),
@@ -1613,12 +1647,7 @@ impl LoadJob {
     }
 
     /// 构建并回发（本地/离线文件路径，不重试）。
-    async fn build_and_dispatch(
-        self,
-        source: PlaySource,
-        is_local: bool,
-        fetched_at: Option<u64>,
-    ) {
+    async fn build_and_dispatch(self, source: PlaySource, is_local: bool, fetched_at: Option<u64>) {
         match self.try_build(&source).await {
             Ok(built) => self.dispatch_ready(built, is_local, fetched_at, None),
             Err(e) => self.dispatch_load_failed("load", &e),
@@ -1639,7 +1668,11 @@ impl LoadJob {
             decoder,
             shared,
             duration_ms,
-            start_at: if self.start_ms > 0 { Some(self.start_ms) } else { None },
+            start_at: if self.start_ms > 0 {
+                Some(self.start_ms)
+            } else {
+                None
+            },
             autoplay: self.autoplay,
             is_local,
             url_fetched_at: fetched_at,
@@ -1688,7 +1721,9 @@ fn spawn_cache_prune(inner: &EngineInner) {
         .spawn(move || {
             let (freed, removed) = crate::cache::prune_audio_cache(&dir, limit, keep.as_deref());
             if removed > 0 {
-                log::info!("[cache] 超出上限，清理最旧的流缓存：释放 {freed} 字节 / {removed} 个文件");
+                log::info!(
+                    "[cache] 超出上限，清理最旧的流缓存：释放 {freed} 字节 / {removed} 个文件"
+                );
             }
         });
 }
@@ -1810,8 +1845,7 @@ fn build_decoder(
 ) -> Result<BuiltDecoder, String> {
     match source {
         PlaySource::Local { path } => {
-            let file =
-                std::fs::File::open(path).map_err(|e| format!("打开本地文件失败: {e}"))?;
+            let file = std::fs::File::open(path).map_err(|e| format!("打开本地文件失败: {e}"))?;
             // TryFrom<File> 会用文件长度自动填 byte_len，FLAC 的二分定位才可用
             let decoder = Decoder::try_from(file).map_err(|e| format!("解码失败: {e}"))?;
             let duration = resolve_duration_ms(&decoder, track);

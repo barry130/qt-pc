@@ -17,13 +17,19 @@ fn live_update_check_version_and_messages() {
     let rt = runtime();
     rt.block_on(async {
         let client = AstralClient::new(DEFAULT_BASE_URL);
-        println!("[live] versionName={} versionCode={}", version_name(), version_code());
+        println!(
+            "[live] versionName={} versionCode={}",
+            version_name(),
+            version_code()
+        );
 
         // /app/update?type=1103&version=<versionCode>（无 channel 入参）
         let update = client.app_update(version_code()).await;
         match update {
             Ok(data) => println!("[live] app/update = {data}"),
-            Err(e) => println!("[live] app/update 失败（后端未发布 PC 记录时返回 null 属正常）: {e}"),
+            Err(e) => {
+                println!("[live] app/update 失败（后端未发布 PC 记录时返回 null 属正常）: {e}")
+            }
         }
 
         // /app/version/check?type=1103&version=&versionName=：三者与后台一致才通过
@@ -32,7 +38,9 @@ fn live_update_check_version_and_messages() {
             .await;
         match check {
             Ok(data) => println!("[live] version/check = {data}"),
-            Err(e) => println!("[live] version/check 未通过（本地 dev 版本号后台未登记属正常）: {e}"),
+            Err(e) => {
+                println!("[live] version/check 未通过（本地 dev 版本号后台未登记属正常）: {e}")
+            }
         }
 
         // /app/github/accels
@@ -42,7 +50,10 @@ fn live_update_check_version_and_messages() {
         }
 
         // /app/message/active?versionCode=&channel=pc（公开接口）
-        let msgs = client.active_messages(version_code()).await.expect("active messages 失败");
+        let msgs = client
+            .active_messages(version_code())
+            .await
+            .expect("active messages 失败");
         println!("[live] active messages = {msgs}");
 
         // 匿名统计上报（单条 launcher 探活；后端只落库不校验 ut 枚举）

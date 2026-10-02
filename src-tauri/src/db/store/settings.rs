@@ -21,10 +21,7 @@ pub(crate) fn set_setting(
     Ok(())
 }
 
-pub(crate) fn get_setting(
-    conn: &Connection,
-    key: &str,
-) -> Result<Option<String>, rusqlite::Error> {
+pub(crate) fn get_setting(conn: &Connection, key: &str) -> Result<Option<String>, rusqlite::Error> {
     conn.query_row(
         "SELECT value FROM settings WHERE key = ?1",
         params![key],

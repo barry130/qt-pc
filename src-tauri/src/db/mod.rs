@@ -35,8 +35,14 @@ impl Database {
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(|e| format!("开启 foreign_keys 失败: {e}"))?;
         migrations::run(&conn).map_err(|e| format!("数据库迁移失败: {e}"))?;
-        log::info!("[db] 已打开 {}（schema v{}）", path.display(), migrations::CURRENT_VERSION);
-        Ok(Self { conn: Mutex::new(conn) })
+        log::info!(
+            "[db] 已打开 {}（schema v{}）",
+            path.display(),
+            migrations::CURRENT_VERSION
+        );
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// 取连接锁，**容忍互斥锁毒化**。
@@ -112,8 +118,7 @@ mod tests {
         })
         .unwrap();
         // 删除曲目 → play_history 级联删除
-        db.with(|c| c.execute("DELETE FROM tracks", []))
-            .unwrap();
+        db.with(|c| c.execute("DELETE FROM tracks", [])).unwrap();
         let n: i64 = db
             .with(|c| c.query_row("SELECT COUNT(*) FROM play_history", [], |r| r.get(0)))
             .unwrap();

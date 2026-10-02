@@ -227,7 +227,9 @@ mod tests {
         )
         .is_ok());
         // https 一律放行（加速节点都是 https）
-        assert!(ensure_installer_url("https://ghproxy.cn/https://github.com/a/b.exe", false).is_ok());
+        assert!(
+            ensure_installer_url("https://ghproxy.cn/https://github.com/a/b.exe", false).is_ok()
+        );
         // 明文 + 非自有域名 + 无哈希 → 拒绝
         assert!(ensure_installer_url("http://evil.com/setup.exe", false).is_err());
         // 明文 + 非自有域名，但后端给了哈希 → 放行（下载后会校验）

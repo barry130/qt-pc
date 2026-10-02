@@ -36,10 +36,22 @@ fn pending_like_ops_queue_roundtrip() {
     enqueue_pending_like_op(&conn, "song", "add", "song:wyy:1001", r#"{"sid":"1001"}"#)
         .expect("enqueue add");
     // 同键第二条（remove）覆盖第一条：重放后只有 remove 生效
-    enqueue_pending_like_op(&conn, "song", "remove", "song:wyy:1001", r#"{"sid":"1001","action":"remove"}"#)
-        .expect("enqueue remove");
-    enqueue_pending_like_op(&conn, "playlist", "add", "playlist:local:p1", r#"{"pid":"p1"}"#)
-        .expect("enqueue playlist");
+    enqueue_pending_like_op(
+        &conn,
+        "song",
+        "remove",
+        "song:wyy:1001",
+        r#"{"sid":"1001","action":"remove"}"#,
+    )
+    .expect("enqueue remove");
+    enqueue_pending_like_op(
+        &conn,
+        "playlist",
+        "add",
+        "playlist:local:p1",
+        r#"{"pid":"p1"}"#,
+    )
+    .expect("enqueue playlist");
 
     let ops = list_pending_like_ops(&conn).expect("list");
     assert_eq!(ops.len(), 2, "同键去重后应只剩 2 条");
@@ -49,13 +61,22 @@ fn pending_like_ops_queue_roundtrip() {
     assert_eq!(song_op.action, "remove");
 
     // ack 歌单条目：队列和去重键一起清掉
-    let pl_op = ops.iter().find(|o| o.kind == "playlist").expect("playlist op");
+    let pl_op = ops
+        .iter()
+        .find(|o| o.kind == "playlist")
+        .expect("playlist op");
     ack_pending_like_op(&conn, &pl_op.id).expect("ack");
     assert_eq!(count_pending_like_ops(&conn).expect("count"), 1);
 
     // 再入同键操作不会复活已 ack 的条目，而是新起一条
-    enqueue_pending_like_op(&conn, "playlist", "add", "playlist:local:p1", r#"{"pid":"p1"}"#)
-        .expect("re-enqueue");
+    enqueue_pending_like_op(
+        &conn,
+        "playlist",
+        "add",
+        "playlist:local:p1",
+        r#"{"pid":"p1"}"#,
+    )
+    .expect("re-enqueue");
     assert_eq!(count_pending_like_ops(&conn).expect("count"), 2);
     // 歌单键现在只有新条目，旧的不会出现两条
     let pl_ops: Vec<_> = list_pending_like_ops(&conn)
@@ -68,7 +89,10 @@ fn pending_like_ops_queue_roundtrip() {
     // 退避：retry_count 递增，next_retry_at 写入下次时间
     defer_pending_like_op(&conn, &pl_ops[0].id, pl_ops[0].retry_count).expect("defer");
     let deferred = list_pending_like_ops(&conn).expect("list");
-    let d = deferred.iter().find(|o| o.id == pl_ops[0].id).expect("deferred");
+    let d = deferred
+        .iter()
+        .find(|o| o.id == pl_ops[0].id)
+        .expect("deferred");
     assert_eq!(d.retry_count, pl_ops[0].retry_count + 1);
     assert!(d.next_retry_at.is_some());
 }
@@ -91,7 +115,10 @@ fn like_clear_local_vs_reset_sync() {
     assert!(is_liked_song(&conn, &t).expect("song kept"));
     assert_eq!(list_liked_playlists(&conn).expect("pl kept").len(), 1);
     assert_eq!(count_pending_like_ops(&conn).expect("count"), 0);
-    assert_eq!(get_setting(&conn, "like.sync.seq").expect("seq").unwrap(), "");
+    assert_eq!(
+        get_setting(&conn, "like.sync.seq").expect("seq").unwrap(),
+        ""
+    );
 
     // 换号：全清
     let n = clear_like_local(&conn).expect("clear");
@@ -100,7 +127,12 @@ fn like_clear_local_vs_reset_sync() {
     assert!(list_liked_playlists(&conn).expect("pl gone").is_empty());
     let pls = list_my_playlists(&conn).expect("my pls");
     assert!(pls.is_empty(), "自建歌单也应清掉");
-    assert_eq!(get_setting(&conn, "like.imported").expect("imported").unwrap(), "");
+    assert_eq!(
+        get_setting(&conn, "like.imported")
+            .expect("imported")
+            .unwrap(),
+        ""
+    );
     assert_eq!(count_pending_like_ops(&conn).expect("count"), 0);
 }
 
@@ -138,8 +170,7 @@ fn delete_playlist_removes_ghost_cloud_card() {
     let conn = test_conn();
     let pid = create_playlist(&conn, "被删的歌单").expect("create");
     // 模拟服务器回声：同步回来一张同 pid 的 local 卡片
-    add_liked_playlist(&conn, "local", &pid, "被删的歌单", "", "")
-        .expect("echo card");
+    add_liked_playlist(&conn, "local", &pid, "被删的歌单", "", "").expect("echo card");
 
     delete_playlist(&conn, &pid).expect("delete");
 
@@ -165,7 +196,9 @@ fn delete_playlist_rebinds_main_pid_of_survivors() {
 
     assert!(is_liked_song(&conn, &t).expect("歌必须活着"));
     assert_eq!(
-        list_liked_songs(&conn, Some(&alive)).expect("幸存歌单").len(),
+        list_liked_songs(&conn, Some(&alive))
+            .expect("幸存歌单")
+            .len(),
         1
     );
     // 主归属重绑到幸存歌单
@@ -199,8 +232,7 @@ fn follow_cloud_delete_cleans_everything() {
     let t = track("3201", "随歌单走的歌");
     let pid = create_playlist(&conn, "他端删的").expect("create");
     add_liked_song(&conn, &t, &pid).expect("add");
-    add_liked_playlist(&conn, "local", &pid, "他端删的", "", "")
-        .expect("echo card");
+    add_liked_playlist(&conn, "local", &pid, "他端删的", "", "").expect("echo card");
 
     delete_playlist_follow_cloud(&conn, &pid).expect("follow delete");
 
@@ -221,15 +253,26 @@ fn favorite_binds_to_playlist_by_pid() {
     // 同一首歌收藏进两个歌单（多归属）
     add_liked_song(&conn, &a, &pid).expect("add to pid");
     add_liked_song(&conn, &a, &other).expect("add to other");
-    assert_eq!(list_liked_songs(&conn, Some(&pid)).expect("开车听").len(), 1);
-    assert_eq!(list_liked_songs(&conn, Some(&other)).expect("另一个").len(), 1);
+    assert_eq!(
+        list_liked_songs(&conn, Some(&pid)).expect("开车听").len(),
+        1
+    );
+    assert_eq!(
+        list_liked_songs(&conn, Some(&other)).expect("另一个").len(),
+        1
+    );
     // 归属清单两边都有
     assert_eq!(list_track_playlists(&conn, &a).expect("归属").len(), 2);
 
     // 从「开车听」摘掉后，「另一个」里的还在
     remove_liked_song(&conn, &a, Some(&pid)).expect("detach");
-    assert!(list_liked_songs(&conn, Some(&pid)).expect("开车听").is_empty());
-    assert_eq!(list_liked_songs(&conn, Some(&other)).expect("另一个").len(), 1);
+    assert!(list_liked_songs(&conn, Some(&pid))
+        .expect("开车听")
+        .is_empty());
+    assert_eq!(
+        list_liked_songs(&conn, Some(&other)).expect("另一个").len(),
+        1
+    );
 
     // 最后一个归属也摘掉 → 整首下线
     remove_liked_song(&conn, &a, Some(&other)).expect("detach last");
@@ -241,7 +284,9 @@ fn favorite_binds_to_playlist_by_pid() {
     assert_eq!(get_playlist_tracks(&conn, &other).expect("tracks").len(), 1);
     // 删歌单：b 因失去全部归属而下线
     delete_playlist(&conn, &other).expect("delete");
-    assert!(get_playlist_tracks(&conn, &other).expect("tracks").is_empty());
+    assert!(get_playlist_tracks(&conn, &other)
+        .expect("tracks")
+        .is_empty());
     assert!(!is_liked_song(&conn, &b).expect("b 整首下线"));
 }
 
@@ -252,10 +297,8 @@ fn playlist_list_merges_local_and_cloud_cards() {
     // 本地自建一张
     let pid = create_playlist(&conn, "测试歌单").expect("create");
     // 云端同步回两张卡片（含一张 local「我喜欢的歌曲」）
-    add_liked_playlist(&conn, "local", "local", "我喜欢的歌曲", "", "")
-        .expect("cloud card 1");
-    add_liked_playlist(&conn, "qq", "5033052", "拯救歌荒", "", "")
-        .expect("cloud card 2");
+    add_liked_playlist(&conn, "local", "local", "我喜欢的歌曲", "", "").expect("cloud card 1");
+    add_liked_playlist(&conn, "qq", "5033052", "拯救歌荒", "", "").expect("cloud card 2");
 
     let all = list_my_playlists(&conn).expect("list");
     // 本地 1 张 + 云端 2 张，pid 各不相同
@@ -263,7 +306,10 @@ fn playlist_list_merges_local_and_cloud_cards() {
     let mine = all.iter().find(|p| p.pid == pid).expect("自建歌单");
     assert!(mine.is_local);
     assert_eq!(mine.name, "测试歌单");
-    let liked = all.iter().find(|p| p.pid == "local").expect("云端local卡片");
+    let liked = all
+        .iter()
+        .find(|p| p.pid == "local")
+        .expect("云端local卡片");
     assert!(!liked.is_local);
     assert_eq!(liked.name, "我喜欢的歌曲");
     assert_eq!(liked.track_count, 0);
@@ -271,7 +317,10 @@ fn playlist_list_merges_local_and_cloud_cards() {
     // 收藏进云端 local 卡片后，其曲目数实时更新
     add_liked_song(&conn, &track("7001", "晴天"), "local").expect("add to local");
     let all = list_my_playlists(&conn).expect("list");
-    let liked = all.iter().find(|p| p.pid == "local").expect("云端local卡片");
+    let liked = all
+        .iter()
+        .find(|p| p.pid == "local")
+        .expect("云端local卡片");
     assert_eq!(liked.track_count, 1);
 }
 
@@ -304,14 +353,10 @@ fn history_dedups_by_track_and_orders_desc() {
 fn history_limit_and_untracked_local_track() {
     let conn = test_conn();
     for i in 0..5 {
-        record_play_history(&conn, &track(&format!("300{i}"), &format!("T{i}")))
-            .expect("record");
+        record_play_history(&conn, &track(&format!("300{i}"), &format!("T{i}"))).expect("record");
     }
     assert_eq!(list_play_history(&conn, 2).expect("limit 2").len(), 2);
-    assert_eq!(
-        list_play_history(&conn, 0).expect("default limit").len(),
-        5
-    );
+    assert_eq!(list_play_history(&conn, 0).expect("default limit").len(), 5);
 
     // 本地曲目若未被扫描入库（tracks 无行、外键指向不存在），记历史应静默跳过
     let local = Track {
@@ -342,13 +387,14 @@ fn my_playlist_crud_and_ordering() {
     let tracks = get_playlist_tracks(&conn, &id).expect("tracks");
     assert_eq!(tracks.len(), 2);
     let names: Vec<String> = tracks.iter().map(|t| t.title.clone()).collect();
-    assert_eq!(names, vec!["A".to_string(), "B".to_string()], "应保持加入顺序");
+    assert_eq!(
+        names,
+        vec!["A".to_string(), "B".to_string()],
+        "应保持加入顺序"
+    );
 
     let lists = list_playlists(&conn).expect("list");
-    let mine = lists
-        .iter()
-        .find(|p| p.pid == id)
-        .expect("找到刚建的歌单");
+    let mine = lists.iter().find(|p| p.pid == id).expect("找到刚建的歌单");
     assert_eq!(mine.name, "开车听");
     assert_eq!(mine.platform, LOCAL_PLATFORM);
     assert_eq!(mine.track_count, 2);
@@ -400,8 +446,8 @@ fn download_task_lifecycle() {
     assert!(tasks[0].part_path.is_none());
 
     // 失败态单独一条
-    let id2 = create_download_task(&conn, &track("5002", "另一首"), "128", "p2.part")
-        .expect("create 2");
+    let id2 =
+        create_download_task(&conn, &track("5002", "另一首"), "128", "p2.part").expect("create 2");
     fail_download_task(&conn, &id2, "网络错误").expect("fail");
     let tasks = list_download_tasks(&conn).expect("list");
     let failed = tasks.iter().find(|x| x.id == id2).expect("找到失败任务");
@@ -444,7 +490,9 @@ fn delete_download_tasks_batch_returns_paths_of_selected_only() {
     assert_eq!(left[0].id, c);
 
     // 再删一次：已删的 id 不再返回，也不报错
-    assert!(delete_download_tasks(&conn, &[a, b]).expect("again").is_empty());
+    assert!(delete_download_tasks(&conn, &[a, b])
+        .expect("again")
+        .is_empty());
     assert_eq!(list_download_tasks(&conn).expect("list").len(), 1);
 }
 
@@ -456,36 +504,55 @@ fn download_dedupe_offline_lookup_and_stale_cleanup() {
     let db_id = db_track_id(&t);
 
     // 没有任务时查不到
-    assert!(find_download_task(&conn, &db_id, "320").expect("find").is_none());
-    assert!(downloaded_file_for(&conn, &db_id).expect("offline").is_none());
+    assert!(find_download_task(&conn, &db_id, "320")
+        .expect("find")
+        .is_none());
+    assert!(downloaded_file_for(&conn, &db_id)
+        .expect("offline")
+        .is_none());
 
     let id = create_download_task(&conn, &t, "320", "p.part").expect("create");
     // 进行中的任务算去重命中
-    let hit = find_download_task(&conn, &db_id, "320").expect("find").expect("命中");
+    let hit = find_download_task(&conn, &db_id, "320")
+        .expect("find")
+        .expect("命中");
     assert_eq!(hit.id, id);
     // 音质不同不算命中
-    assert!(find_download_task(&conn, &db_id, "flac").expect("find").is_none());
+    assert!(find_download_task(&conn, &db_id, "flac")
+        .expect("find")
+        .is_none());
 
     // 下载中（downloading）→ 旧任务清理落成 paused
     update_download_progress(&conn, &id, 0.3).expect("progress");
     let n = mark_stale_downloads_paused(&conn).expect("stale");
     assert_eq!(n, 1);
-    let task = download_task_by_id(&conn, &id).expect("by id").expect("存在");
+    let task = download_task_by_id(&conn, &id)
+        .expect("by id")
+        .expect("存在");
     assert_eq!(task.status, "paused");
     assert!(task.error.is_some(), "应给出中断原因");
 
     // 完成后：去重仍命中（done），离线查找能拿到文件路径
     finish_download_task(&conn, &id, "D:\\dl\\x.flac", 999).expect("finish");
-    assert!(find_download_task(&conn, &db_id, "320").expect("find").is_some());
+    assert!(find_download_task(&conn, &db_id, "320")
+        .expect("find")
+        .is_some());
     assert_eq!(
-        downloaded_file_for(&conn, &db_id).expect("offline").as_deref(),
+        downloaded_file_for(&conn, &db_id)
+            .expect("offline")
+            .as_deref(),
         Some("D:\\dl\\x.flac")
     );
-    assert_eq!(downloaded_track_ids(&conn).expect("ids"), vec![db_id.clone()]);
+    assert_eq!(
+        downloaded_track_ids(&conn).expect("ids"),
+        vec![db_id.clone()]
+    );
 
     // 取消态不再挡新任务
     set_download_status(&conn, &id, "canceled", None).expect("cancel");
-    assert!(find_download_task(&conn, &db_id, "320").expect("find").is_none());
+    assert!(find_download_task(&conn, &db_id, "320")
+        .expect("find")
+        .is_none());
 }
 
 /// 播放统计：单次播放累计 / 概览 / 排名（DESIGN §5.3）
@@ -565,11 +632,15 @@ fn lists_keep_track_cover_url() {
         COVER
     );
     assert_eq!(
-        list_play_history(&conn, 10).expect("历史列表")[0].track.pic_url,
+        list_play_history(&conn, 10).expect("历史列表")[0]
+            .track
+            .pic_url,
         COVER
     );
     assert_eq!(
-        list_top_tracks(&conn, 10).expect("统计列表")[0].track.pic_url,
+        list_top_tracks(&conn, 10).expect("统计列表")[0]
+            .track
+            .pic_url,
         COVER
     );
     assert_eq!(
@@ -622,7 +693,9 @@ fn foreign_local_song_lands_in_liked_playlist() {
 
     // 收藏列表（按 pid）同样要带上它
     assert_eq!(
-        list_liked_songs(&conn, Some(LOCAL_PLATFORM)).expect("收藏列表").len(),
+        list_liked_songs(&conn, Some(LOCAL_PLATFORM))
+            .expect("收藏列表")
+            .len(),
         1
     );
 

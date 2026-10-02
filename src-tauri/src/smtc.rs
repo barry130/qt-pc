@@ -205,7 +205,11 @@ fn handle_event(
         E::Pause => engine.send(AudioCmd::Pause),
         E::Toggle => {
             let playing = engine.snapshot().status == PlaybackStatus::Playing;
-            engine.send(if playing { AudioCmd::Pause } else { AudioCmd::Play });
+            engine.send(if playing {
+                AudioCmd::Pause
+            } else {
+                AudioCmd::Play
+            });
         }
         E::Next => engine.send(AudioCmd::Next),
         E::Previous => engine.send(AudioCmd::Previous),

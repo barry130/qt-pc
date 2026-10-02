@@ -198,7 +198,10 @@ mod tests {
             .append(true)
             .open(path)
             .unwrap()
-            .set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs_since_epoch))
+            .set_modified(
+                std::time::SystemTime::UNIX_EPOCH
+                    + std::time::Duration::from_secs(secs_since_epoch),
+            )
             .unwrap();
     }
 
@@ -206,8 +209,14 @@ mod tests {
     fn parse_cache_limit_mb_falls_back_to_default() {
         assert_eq!(parse_cache_limit_mb(None), DEFAULT_AUDIO_CACHE_LIMIT_MB);
         assert_eq!(parse_cache_limit_mb(Some("")), DEFAULT_AUDIO_CACHE_LIMIT_MB);
-        assert_eq!(parse_cache_limit_mb(Some("  ")), DEFAULT_AUDIO_CACHE_LIMIT_MB);
-        assert_eq!(parse_cache_limit_mb(Some("abc")), DEFAULT_AUDIO_CACHE_LIMIT_MB);
+        assert_eq!(
+            parse_cache_limit_mb(Some("  ")),
+            DEFAULT_AUDIO_CACHE_LIMIT_MB
+        );
+        assert_eq!(
+            parse_cache_limit_mb(Some("abc")),
+            DEFAULT_AUDIO_CACHE_LIMIT_MB
+        );
         assert_eq!(parse_cache_limit_mb(Some("256")), 256);
         assert_eq!(parse_cache_limit_mb(Some(" 0 ")), 0);
     }

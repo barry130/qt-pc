@@ -6,7 +6,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::provider::types::{Track};
+use crate::provider::types::Track;
 
 // 跨域共享的小工具（`db_track_id` / `now_ms` / `track_from_row` / `LOCAL_PLATFORM` …）
 // 由 store/mod.rs 统一再导出，这里一次性引入，省得每个域各写一长串 use。
@@ -53,7 +53,11 @@ pub(crate) fn record_play_stat(
     upsert_tracks(conn, &[track])?;
     let id = db_track_id(track);
     let known: bool = conn
-        .query_row("SELECT 1 FROM tracks WHERE id = ?1", params![id], |_| Ok(()))
+        .query_row(
+            "SELECT 1 FROM tracks WHERE id = ?1",
+            params![id],
+            |_| Ok(()),
+        )
         .optional()?
         .is_some();
     if !known {
@@ -73,16 +77,16 @@ pub(crate) fn record_play_stat(
 
 /// 概览：总次数 / 总时长 / 曲目数 / 最近播放时间
 pub(crate) fn play_overview(conn: &Connection) -> Result<PlayOverview, rusqlite::Error> {
-    let (total_plays, total_ms, track_count, last_played_at): (i64, i64, i64, Option<i64>) =
-        conn.query_row(
-            "SELECT COALESCE(SUM(play_count), 0),
+    let (total_plays, total_ms, track_count, last_played_at): (i64, i64, i64, Option<i64>) = conn
+        .query_row(
+        "SELECT COALESCE(SUM(play_count), 0),
                     COALESCE(SUM(total_played_ms), 0),
                     COUNT(*),
                     MAX(last_played_at)
                FROM play_stats",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
-        )?;
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+    )?;
     Ok(PlayOverview {
         total_plays,
         total_ms,

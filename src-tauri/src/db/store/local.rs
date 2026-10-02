@@ -195,7 +195,10 @@ pub fn query_missing_local_tracks(conn: &Connection) -> Result<Vec<Track>, rusql
 
 /// 清理所有缺失的本地记录（连带级联删除歌单归属等关联行）。返回删除条数。
 pub fn purge_missing_local_tracks(conn: &Connection) -> Result<usize, rusqlite::Error> {
-    conn.execute("DELETE FROM tracks WHERE platform = 'local' AND missing = 1", [])
+    conn.execute(
+        "DELETE FROM tracks WHERE platform = 'local' AND missing = 1",
+        [],
+    )
 }
 
 /// 删本地记录的 SQL：优先按 `local_path` 匹配，老数据没写 `local_path` 时回退到主键
@@ -206,7 +209,10 @@ const DELETE_LOCAL_TRACK_SQL: &str =
 /// 删除一条本地曲目记录（连带级联删除歌单归属 / 收藏 / 历史等关联行）。
 /// 返回删除条数（0 表示该路径不在库里）。**不动磁盘文件**。
 pub fn delete_local_track(conn: &Connection, path: &str) -> Result<usize, rusqlite::Error> {
-    conn.execute(DELETE_LOCAL_TRACK_SQL, params![path, format!("local:{path}")])
+    conn.execute(
+        DELETE_LOCAL_TRACK_SQL,
+        params![path, format!("local:{path}")],
+    )
 }
 
 /// 批量删除本地记录（单事务，返回删除条数），供列表多选删除用。
@@ -218,7 +224,10 @@ pub fn delete_local_tracks(conn: &Connection, paths: &[String]) -> Result<usize,
     let tx = conn.unchecked_transaction()?;
     let mut removed = 0usize;
     for path in paths {
-        removed += tx.execute(DELETE_LOCAL_TRACK_SQL, params![path, format!("local:{path}")])?;
+        removed += tx.execute(
+            DELETE_LOCAL_TRACK_SQL,
+            params![path, format!("local:{path}")],
+        )?;
     }
     tx.commit()?;
     Ok(removed)

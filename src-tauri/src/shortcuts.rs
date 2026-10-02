@@ -109,7 +109,10 @@ pub fn register_shortcuts(app: &AppHandle, shortcuts: &Keymap) {
     let gs = app.global_shortcut();
     for (action, accelerator, enabled) in shortcuts {
         if !enabled {
-            log::info!("[shortcuts] {accelerator}（{}）已禁用，跳过注册", action.id());
+            log::info!(
+                "[shortcuts] {accelerator}（{}）已禁用，跳过注册",
+                action.id()
+            );
             continue;
         }
         let action = *action;
@@ -131,7 +134,11 @@ mod tests {
     #[test]
     fn defaults_cover_all_actions_and_exclude_ctrl_f() {
         let defaults = default_shortcuts();
-        assert_eq!(defaults.len(), 8, "§14.2 默认表 8 项（搜索 Ctrl+F 不注册全局）");
+        assert_eq!(
+            defaults.len(),
+            8,
+            "§14.2 默认表 8 项（搜索 Ctrl+F 不注册全局）"
+        );
         for (_, accel) in &defaults {
             assert!(!accel.contains('F'), "不得注册 Ctrl+F: {accel}");
         }

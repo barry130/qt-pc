@@ -2,9 +2,9 @@
 //! 菜单 = 播放/暂停、上一首、下一首、显示桌面歌词、显示主窗口、退出。
 //! 关闭主窗口默认最小化到托盘（§4 关闭行为），退出只能走托盘菜单。
 
-use tauri::AppHandle;
 use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem};
 use tauri::tray::{TrayIconBuilder, TrayIconEvent};
+use tauri::AppHandle;
 use tauri::{Emitter, Manager, Wry};
 
 use crate::lyric_window;

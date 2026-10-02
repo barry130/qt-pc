@@ -59,7 +59,11 @@ fn toggle_play(app: &AppHandle) {
         return;
     };
     let playing = state.engine.snapshot().status == PlaybackStatus::Playing;
-    state.engine.send(if playing { AudioCmd::Pause } else { AudioCmd::Play });
+    state.engine.send(if playing {
+        AudioCmd::Pause
+    } else {
+        AudioCmd::Play
+    });
 }
 
 /// 音量步进（0.1），夹在 0..=1

@@ -15,9 +15,9 @@
 
 #[cfg(target_os = "windows")]
 mod imp {
-    use std::time::Duration;
     use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
     use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
 
     use tauri::{AppHandle, Manager};
     use windows::core::{w, Interface};
@@ -32,8 +32,8 @@ mod imp {
     use windows::Win32::System::Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD};
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::Shell::{
-        ITaskbarList, ITaskbarList3, TaskbarList, THUMBBUTTON, THUMBBUTTONMASK, THB_FLAGS,
-        THB_ICON, THB_TOOLTIP, THBF_ENABLED, THBN_CLICKED,
+        ITaskbarList, ITaskbarList3, TaskbarList, THBF_ENABLED, THBN_CLICKED, THB_FLAGS, THB_ICON,
+        THB_TOOLTIP, THUMBBUTTON, THUMBBUTTONMASK,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallWindowProcW, CreateIconIndirect, IsWindowVisible, SetWindowLongPtrW, GWLP_WNDPROC,
@@ -88,25 +88,27 @@ mod imp {
         let _ = APP.set(app.clone());
 
         let app2 = app.clone();
-        let spawned = std::thread::Builder::new().name("taskbar".into()).spawn(move || {
-            let hwnd = HWND(raw as *mut core::ffi::c_void);
-            // 等窗口首次显示（任务栏按钮随之创建）再挂，太早会被 shell 静默丢掉
-            let mut visible = false;
-            for _ in 0..100 {
-                if unsafe { IsWindowVisible(hwnd).as_bool() } {
-                    visible = true;
-                    break;
+        let spawned = std::thread::Builder::new()
+            .name("taskbar".into())
+            .spawn(move || {
+                let hwnd = HWND(raw as *mut core::ffi::c_void);
+                // 等窗口首次显示（任务栏按钮随之创建）再挂，太早会被 shell 静默丢掉
+                let mut visible = false;
+                for _ in 0..100 {
+                    if unsafe { IsWindowVisible(hwnd).as_bool() } {
+                        visible = true;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
                 }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            if !visible {
-                log::warn!("[taskbar] 窗口 10s 内未显示，缩略图工具栏未挂载");
-                return;
-            }
-            // 再留一小段缓冲：窗口标记可见与任务栏按钮注册之间可能差一拍
-            std::thread::sleep(Duration::from_millis(300));
-            let _ = app2.run_on_main_thread(move || unsafe { add_buttons(raw) });
-        });
+                if !visible {
+                    log::warn!("[taskbar] 窗口 10s 内未显示，缩略图工具栏未挂载");
+                    return;
+                }
+                // 再留一小段缓冲：窗口标记可见与任务栏按钮注册之间可能差一拍
+                std::thread::sleep(Duration::from_millis(300));
+                let _ = app2.run_on_main_thread(move || unsafe { add_buttons(raw) });
+            });
         if spawned.is_err() {
             return Err(format!("等待线程创建失败: {:?}", spawned.err()));
         }
@@ -182,7 +184,10 @@ mod imp {
         OLD_PROC.store(old, Ordering::Release);
 
         if let Ok(mut guard) = STATE.lock() {
-            *guard = Some(Inner { hwnd: hwnd_raw, icons });
+            *guard = Some(Inner {
+                hwnd: hwnd_raw,
+                icons,
+            });
         }
 
         log::info!(
@@ -281,12 +286,11 @@ mod imp {
         if old == 0 {
             return LRESULT(0);
         }
-        let prev: Option<
-            unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
-        > = Some(core::mem::transmute::<
-            isize,
-            unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
-        >(old));
+        let prev: Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT> =
+            Some(core::mem::transmute::<
+                isize,
+                unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT,
+            >(old));
         CallWindowProcW(prev, hwnd, msg, wparam, lparam)
     }
 
@@ -392,8 +396,12 @@ mod imp {
         match glyph {
             Glyph::Play => tri(u, v, (0.30, 0.16), (0.30, 0.84), (0.80, 0.50)),
             Glyph::Pause => bar(u, v, 0.32, 0.44) || bar(u, v, 0.56, 0.68),
-            Glyph::Prev => bar(u, v, 0.22, 0.34) || tri(u, v, (0.80, 0.16), (0.80, 0.84), (0.34, 0.50)),
-            Glyph::Next => tri(u, v, (0.20, 0.16), (0.20, 0.84), (0.66, 0.50)) || bar(u, v, 0.66, 0.78),
+            Glyph::Prev => {
+                bar(u, v, 0.22, 0.34) || tri(u, v, (0.80, 0.16), (0.80, 0.84), (0.34, 0.50))
+            }
+            Glyph::Next => {
+                tri(u, v, (0.20, 0.16), (0.20, 0.84), (0.66, 0.50)) || bar(u, v, 0.66, 0.78)
+            }
         }
     }
 
@@ -404,9 +412,8 @@ mod imp {
 
     /// 三角形（重心法：三个叉积同号即在内部）
     fn tri(u: f32, v: f32, a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> bool {
-        let cross = |p: (f32, f32), q: (f32, f32)| {
-            (u - q.0) * (p.1 - q.1) - (p.0 - q.0) * (v - q.1)
-        };
+        let cross =
+            |p: (f32, f32), q: (f32, f32)| (u - q.0) * (p.1 - q.1) - (p.0 - q.0) * (v - q.1);
         let (d1, d2, d3) = (cross(a, b), cross(b, c), cross(c, a));
         let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
         let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;

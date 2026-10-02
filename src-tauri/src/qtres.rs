@@ -96,18 +96,19 @@ fn decode_res_path(path: &str) -> Option<(&'static str, String)> {
         3 => format!("{b64}="),
         _ => b64.to_string(),
     };
-    let bytes = base64::engine::general_purpose::URL_SAFE.decode(padded).ok()?;
+    let bytes = base64::engine::general_purpose::URL_SAFE
+        .decode(padded)
+        .ok()?;
     String::from_utf8(bytes).ok().map(|u| (kind, u))
 }
 
 fn placeholder() -> Response<Vec<u8>> {
     // 1×1 透明 PNG，避免 <img> onerror 抖动（DESIGN §6.13 失败兜底）
     let png: &[u8] = &[
-        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
-        0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
-        0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00,
-        0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00, 0x01, 0x00, 0x00,
-        0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49,
         0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
     ];
     Response::builder()
@@ -144,7 +145,10 @@ fn engine_page_response() -> Response<Vec<u8>> {
 fn meta_bundle_response() -> Response<Vec<u8>> {
     Response::builder()
         .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/javascript; charset=utf-8")
+        .header(
+            header::CONTENT_TYPE,
+            "application/javascript; charset=utf-8",
+        )
         // 100KB 量级的本地内嵌资源，no-store 代价可忽略；保证发版后即时生效
         .header(header::CACHE_CONTROL, "no-store")
         .body(META_BUNDLE_JS.as_bytes().to_vec())
@@ -168,7 +172,10 @@ fn valid_path_segment(seg: &str) -> bool {
 
 /// `/script/<code>/<file>`：只读分发 `%APPDATA%/QuietMusic/source-bundle/install/`
 /// 下的音源包文件。路径穿越在校验段名 + 规范化路径前缀双重拦截。
-fn handle_script_file<R: tauri::Runtime>(app: &tauri::AppHandle<R>, rest: &str) -> Response<Vec<u8>> {
+fn handle_script_file<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    rest: &str,
+) -> Response<Vec<u8>> {
     let Some((code, file)) = rest.split_once('/') else {
         return not_found();
     };
@@ -199,7 +206,10 @@ fn handle_script_file<R: tauri::Runtime>(app: &tauri::AppHandle<R>, rest: &str) 
     } else {
         "application/octet-stream"
     };
-    log::info!("[qtres] /script 分发: {code}/{file} ({} bytes)", bytes.len());
+    log::info!(
+        "[qtres] /script 分发: {code}/{file} ({} bytes)",
+        bytes.len()
+    );
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, content_type)
@@ -268,7 +278,11 @@ mod lru_simple {
 
     impl<K: std::hash::Hash + Eq + Clone, V> Lru<K, V> {
         pub fn new(cap: usize) -> Self {
-            Self { map: HashMap::new(), tick: 0, cap }
+            Self {
+                map: HashMap::new(),
+                tick: 0,
+                cap,
+            }
         }
 
         pub fn get(&mut self, k: &K) -> Option<&V> {
@@ -362,8 +376,10 @@ fn handle_qtres_sync<R: tauri::Runtime>(
     }
     let logged = original_url.clone();
     let resp = handle_cover(original_url);
-    log::info!("[qtres] cover kind={kind} status={} url={logged}",
-        resp.status().as_u16());
+    log::info!(
+        "[qtres] cover kind={kind} status={} url={logged}",
+        resp.status().as_u16()
+    );
     resp
 }
 
@@ -377,10 +393,7 @@ fn upgrade_to_https(url: &str) -> String {
 }
 
 /// 单一 URL 代取封面字节（成功且非空才返回 Some）。
-fn fetch_cover_bytes(
-    client: &reqwest::blocking::Client,
-    url: &str,
-) -> Option<Vec<u8>> {
+fn fetch_cover_bytes(client: &reqwest::blocking::Client, url: &str) -> Option<Vec<u8>> {
     client
         .get(url)
         .header("Referer", referer_for(url))
@@ -579,7 +592,9 @@ mod tests {
     fn host_whitelist_allows_qq_playlist_cover_cdns() {
         // QQ 推荐/搜索歌单的 imgurl 大多落 p.qpic.cn（还有 qpic.y.qq.com）。
         // p.qpic.cn 不以 qq.com 结尾，漏了 qpic.cn 这条歌单广场会满屏空白封面。
-        assert!(host_allowed("http://p.qpic.cn/music_cover/xFPOwViasj/600?n=1"));
+        assert!(host_allowed(
+            "http://p.qpic.cn/music_cover/xFPOwViasj/600?n=1"
+        ));
         assert!(host_allowed(
             "http://qpic.y.qq.com/music_cover/8eiaDBJ/300?n=1"
         ));

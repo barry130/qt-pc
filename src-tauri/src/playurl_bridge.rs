@@ -352,7 +352,10 @@ mod tests {
             let guard = PENDING.lock().unwrap();
             let table = guard.as_ref().unwrap();
             assert_eq!(table.by_key.len(), MAX_INFLIGHT, "淘汰后仍然守着上限");
-            assert!(!table.by_id.contains_key(&first_id), "淘汰项的 id 索引也清掉");
+            assert!(
+                !table.by_id.contains_key(&first_id),
+                "淘汰项的 id 索引也清掉"
+            );
         }
         reply(last_id, "http://ok".into());
         assert_eq!(rx.try_recv().expect("新请求应答"), "http://ok");

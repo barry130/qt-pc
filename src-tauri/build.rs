@@ -6,7 +6,10 @@ fn main() {
     // windows-app-manifest.xml，链接器会把它与 rustc 默认 manifest 合并。
     // rustc-link-arg 天然不作用于 build script 自身，且必须用绝对路径
     // （链接时 mt.exe 的工作目录不保证是包根目录）。
-    if std::env::var("CARGO_CFG_TARGET_OS").map(|v| v == "windows").unwrap_or(false) {
+    if std::env::var("CARGO_CFG_TARGET_OS")
+        .map(|v| v == "windows")
+        .unwrap_or(false)
+    {
         let manifest = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
             .join("windows-app-manifest.xml");
         println!("cargo:rustc-link-arg=/MANIFEST:EMBED");

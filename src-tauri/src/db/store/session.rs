@@ -6,7 +6,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::provider::types::{Track};
+use crate::provider::types::Track;
 
 // 跨域共享的小工具（`db_track_id` / `now_ms` / `track_from_row` / `LOCAL_PLATFORM` …）
 // 由 store/mod.rs 统一再导出，这里一次性引入，省得每个域各写一长串 use。
@@ -130,9 +130,7 @@ pub(crate) fn load_play_state(conn: &Connection) -> Result<Option<PlayState>, ru
             .unwrap_or(0),
         quality: get("quality")?.unwrap_or_else(|| "320".into()),
         play_mode: get("play_mode")?.unwrap_or_else(|| "listLoop".into()),
-        volume: get("volume")?
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0.8),
+        volume: get("volume")?.and_then(|v| v.parse().ok()).unwrap_or(0.8),
         muted: get("muted")?.map(|v| v == "1").unwrap_or(false),
     }))
 }

@@ -214,7 +214,10 @@ mod tests {
                 music_id: None,
             })
             .collect();
-        Queue { tracks, index: Some(0) }
+        Queue {
+            tracks,
+            index: Some(0),
+        }
     }
 
     #[test]

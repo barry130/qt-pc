@@ -6,7 +6,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::provider::types::{Track};
+use crate::provider::types::Track;
 
 // 跨域共享的小工具（`db_track_id` / `now_ms` / `track_from_row` / `LOCAL_PLATFORM` …）
 // 由 store/mod.rs 统一再导出，这里一次性引入，省得每个域各写一长串 use。
@@ -23,9 +23,7 @@ pub type MyPlaylist = PlaylistSummary;
 
 /// 我的歌单 = 云端卡片歌单 + 本地自建歌单（按 pid 去重），按创建时间倒序。
 #[allow(dead_code)]
-pub(crate) fn list_my_playlists(
-    conn: &Connection,
-) -> Result<Vec<MyPlaylist>, rusqlite::Error> {
+pub(crate) fn list_my_playlists(conn: &Connection) -> Result<Vec<MyPlaylist>, rusqlite::Error> {
     use std::collections::HashMap;
 
     // pid → 行（云端卡片先铺底，自建歌单覆盖同名条目并标记 is_local）
@@ -272,10 +270,7 @@ pub(crate) fn delete_playlist(conn: &Connection, pid: &str) -> Result<(), rusqli
     )?;
     conn.execute("DELETE FROM playlists WHERE pid = ?1", params![pid])?;
     // 同 pid 的云端卡片一并清理（幽灵歌单根因，见函数 doc）
-    conn.execute(
-        "DELETE FROM liked_playlists WHERE pid = ?1",
-        params![pid],
-    )?;
+    conn.execute("DELETE FROM liked_playlists WHERE pid = ?1", params![pid])?;
     Ok(())
 }
 
@@ -290,8 +285,7 @@ pub(crate) fn delete_playlist(conn: &Connection, pid: &str) -> Result<(), rusqli
 pub(crate) fn list_playlist_sync_rows(
     conn: &Connection,
 ) -> Result<Vec<(String, Option<i64>)>, rusqlite::Error> {
-    let mut stmt =
-        conn.prepare("SELECT pid, cloud_seq FROM playlists ORDER BY created_at ASC")?;
+    let mut stmt = conn.prepare("SELECT pid, cloud_seq FROM playlists ORDER BY created_at ASC")?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
@@ -317,16 +311,17 @@ pub(crate) fn mark_playlist_cloud_seq(
 
 /// 他端删除、本地跟随：按 pid 删自建行 + 摘归属 + 下线孤儿歌 + 清云端卡片。
 /// 与用户手动删除（`delete_playlist`）同构，只是入口在对账 / apply 链路。
-pub(crate) fn delete_playlist_follow_cloud(conn: &Connection, pid: &str) -> Result<(), rusqlite::Error> {
+pub(crate) fn delete_playlist_follow_cloud(
+    conn: &Connection,
+    pid: &str,
+) -> Result<(), rusqlite::Error> {
     delete_playlist(conn, pid)
 }
 
 /// 本地自建歌单列表（按更新时间倒序），附带曲目数。
 /// 只列本地自建。合并视图走 `list_my_playlists`，这个留给只关心本地的场景。
 #[allow(dead_code)]
-pub(crate) fn list_playlists(
-    conn: &Connection,
-) -> Result<Vec<PlaylistSummary>, rusqlite::Error> {
+pub(crate) fn list_playlists(conn: &Connection) -> Result<Vec<PlaylistSummary>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT p.id, p.pid, p.name,
                 (SELECT COUNT(*) FROM liked_songs ls

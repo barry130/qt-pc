@@ -28,7 +28,9 @@ use crate::AppState;
 /// 其他应用激活后仍会覆盖窗口，因此这里使用 Win32 SetWindowPos 强制系统级置顶。
 #[cfg(target_os = "windows")]
 fn force_windows_topmost(win: &tauri::WebviewWindow) -> Result<(), String> {
-    let hwnd = win.hwnd().map_err(|e| format!("获取歌词窗口句柄失败: {e}"))?;
+    let hwnd = win
+        .hwnd()
+        .map_err(|e| format!("获取歌词窗口句柄失败: {e}"))?;
     unsafe {
         SetWindowPos(
             hwnd,
@@ -46,7 +48,9 @@ fn force_windows_topmost(win: &tauri::WebviewWindow) -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 fn attach_lyric_to_taskbar(win: &tauri::WebviewWindow) -> Result<(), String> {
-    let hwnd = win.hwnd().map_err(|e| format!("获取歌词窗口句柄失败: {e}"))?;
+    let hwnd = win
+        .hwnd()
+        .map_err(|e| format!("获取歌词窗口句柄失败: {e}"))?;
     let taskbar = unsafe { FindWindowW(windows::core::w!("Shell_TrayWnd"), None) }
         .map_err(|e| format!("查找 Windows 任务栏窗口失败: {e}"))?;
     if taskbar.0.is_null() {
@@ -125,8 +129,7 @@ unsafe extern "system" fn foreground_changed(
 #[cfg(target_os = "windows")]
 static LYRIC_HWND: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 #[cfg(target_os = "windows")]
-static TOPMOST_GENERATION: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
+static TOPMOST_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(target_os = "windows")]
 fn start_topmost_guard(app: AppHandle) {
@@ -295,19 +298,23 @@ fn build_window(app: &AppHandle, state: &LyricWindowState) -> tauri::Result<taur
     if let Some(win) = app.get_webview_window(LYRIC_WINDOW_LABEL) {
         return Ok(win);
     }
-    WebviewWindowBuilder::new(app, LYRIC_WINDOW_LABEL, WebviewUrl::App("index.html".into()))
-        .title("轻听桌面歌词")
-        .position(state.x as f64, state.y as f64)
-        .inner_size(state.width as f64, state.height as f64)
-        .decorations(false)
-        .transparent(true)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .shadow(false)
-        .resizable(true)
-        .focused(false)
-        .visible(false)
-        .build()
+    WebviewWindowBuilder::new(
+        app,
+        LYRIC_WINDOW_LABEL,
+        WebviewUrl::App("index.html".into()),
+    )
+    .title("轻听桌面歌词")
+    .position(state.x as f64, state.y as f64)
+    .inner_size(state.width as f64, state.height as f64)
+    .decorations(false)
+    .transparent(true)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .shadow(false)
+    .resizable(true)
+    .focused(false)
+    .visible(false)
+    .build()
 }
 
 /// 显示歌词窗口（首次创建），返回应用后的状态
@@ -399,7 +406,9 @@ pub fn set_locked(app: &AppHandle, locked: bool) -> Result<LyricWindowState, Str
 /// css 颜色串基本校验：#hex / rgb()/rgba()/hsl() / 具名色，长度封顶
 fn valid_color(v: &str) -> bool {
     let v = v.trim();
-    !v.is_empty() && v.len() <= 64 && (v.starts_with('#') || v.contains('(') || v.chars().all(|c| c.is_ascii_alphanumeric()))
+    !v.is_empty()
+        && v.len() <= 64
+        && (v.starts_with('#') || v.contains('(') || v.chars().all(|c| c.is_ascii_alphanumeric()))
 }
 
 /// 样式补丁（字段级合并；置顶即时应用到窗口；穿透跟随锁定，不再单独设）

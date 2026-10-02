@@ -50,7 +50,11 @@ pub struct EqParams {
 
 impl Default for EqParams {
     fn default() -> Self {
-        Self { enabled: false, preamp_db: 0.0, gains_db: [0.0; 10] }
+        Self {
+            enabled: false,
+            preamp_db: 0.0,
+            gains_db: [0.0; 10],
+        }
     }
 }
 
@@ -65,7 +69,10 @@ pub struct FadeParams {
 
 impl Default for FadeParams {
     fn default() -> Self {
-        Self { enabled: false, duration_ms: 300 }
+        Self {
+            enabled: false,
+            duration_ms: 300,
+        }
     }
 }
 
@@ -115,7 +122,10 @@ impl AudioFx {
             loudnorm: AtomicBool::new(false),
             spectrum: AtomicBool::new(false),
             fade: RwLock::new(FadeParams::default()),
-            fade_cmd: RwLock::new(FadeCommand { kind: FadeKind::None, start_ms: 0 }),
+            fade_cmd: RwLock::new(FadeCommand {
+                kind: FadeKind::None,
+                start_ms: 0,
+            }),
         }
     }
 
@@ -159,21 +169,30 @@ impl AudioFx {
     /// 发起淡入（恢复播放 / 新曲自动播放）。
     pub fn begin_fade_in(&self, now_ms: u64) {
         if let Ok(mut cmd) = self.fade_cmd.write() {
-            *cmd = FadeCommand { kind: FadeKind::In, start_ms: now_ms };
+            *cmd = FadeCommand {
+                kind: FadeKind::In,
+                start_ms: now_ms,
+            };
         }
     }
 
     /// 发起淡出（暂停）。到期后引擎线程真正 pause 并调 [`Self::clear_fade`]。
     pub fn begin_fade_out(&self, now_ms: u64) {
         if let Ok(mut cmd) = self.fade_cmd.write() {
-            *cmd = FadeCommand { kind: FadeKind::Out, start_ms: now_ms };
+            *cmd = FadeCommand {
+                kind: FadeKind::Out,
+                start_ms: now_ms,
+            };
         }
     }
 
     /// 取消淡入淡出，增益立即回到 1（seek / 换曲 / 暂停完成时调用）。
     pub fn clear_fade(&self) {
         if let Ok(mut cmd) = self.fade_cmd.write() {
-            *cmd = FadeCommand { kind: FadeKind::None, start_ms: 0 };
+            *cmd = FadeCommand {
+                kind: FadeKind::None,
+                start_ms: 0,
+            };
         }
     }
 
@@ -184,7 +203,10 @@ impl AudioFx {
 
     /// 淡入淡出时长（ms；读不到锁时按 300 兜底，仅影响 deadline 精度）。
     pub fn fade_duration_ms(&self) -> u64 {
-        self.fade.read().map(|f| f.duration_ms.max(1)).unwrap_or(300)
+        self.fade
+            .read()
+            .map(|f| f.duration_ms.max(1))
+            .unwrap_or(300)
     }
 
     /// 当前音效状态快照（设置页回读）。
@@ -325,7 +347,12 @@ struct LoudNormState {
 
 impl LoudNormState {
     fn new() -> Self {
-        Self { mean_sq: 0.0, gain: 1.0, acc_sq: 0.0, acc_n: 0 }
+        Self {
+            mean_sq: 0.0,
+            gain: 1.0,
+            acc_sq: 0.0,
+            acc_n: 0,
+        }
     }
 
     #[inline]
@@ -505,9 +532,7 @@ impl SpectrumTap {
         // hann 窗：抑制 FFT 截断的频谱泄漏
         let n = SPECTRUM_FFT_SIZE as f32;
         self.window = (0..SPECTRUM_FFT_SIZE)
-            .map(|i| {
-                0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n).cos())
-            })
+            .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / n).cos()))
             .collect();
         self.re = vec![0.0; SPECTRUM_FFT_SIZE];
         self.im = vec![0.0; SPECTRUM_FFT_SIZE];
@@ -580,8 +605,6 @@ impl SpectrumTap {
         }
     }
 }
-
-
 
 // ---------- DspSource ----------
 
@@ -727,8 +750,7 @@ impl DspSource {
                 }
                 let per_sample_ms =
                     1000.0 / self.inner.sample_rate().get() as f32 / self.channels as f32;
-                let elapsed_ms = self.span_now_ms as f32
-                    + self.span_elapsed as f32 * per_sample_ms
+                let elapsed_ms = self.span_now_ms as f32 + self.span_elapsed as f32 * per_sample_ms
                     - self.fade_start_ms as f32;
                 let t = (elapsed_ms.max(0.0) / self.fade_dur_ms as f32).clamp(0.0, 1.0);
                 match self.fade_kind {
@@ -850,7 +872,9 @@ mod tests {
     #[test]
     fn fft_matches_naive_dft() {
         let n = 64;
-        let mut re: Vec<f32> = (0..n).map(|i| ((i * 37) % 13) as f32 * 0.17 - 1.0).collect();
+        let mut re: Vec<f32> = (0..n)
+            .map(|i| ((i * 37) % 13) as f32 * 0.17 - 1.0)
+            .collect();
         let mut im: Vec<f32> = (0..n).map(|i| ((i * 11) % 7) as f32 * 0.23 - 0.5).collect();
         fft_inplace(&mut re, &mut im);
         for k in 0..n {
@@ -858,14 +882,20 @@ mod tests {
             let mut expect_im = 0.0f32;
             for t in 0..n {
                 let ang = -2.0 * std::f32::consts::PI * (k * t) as f32 / n as f32;
-                let (x, y) = (((t * 37) % 13) as f32 * 0.17 - 1.0, ((t * 11) % 7) as f32 * 0.23 - 0.5);
+                let (x, y) = (
+                    ((t * 37) % 13) as f32 * 0.17 - 1.0,
+                    ((t * 11) % 7) as f32 * 0.23 - 0.5,
+                );
                 expect_re += x * ang.cos() - y * ang.sin();
                 expect_im += x * ang.sin() + y * ang.cos();
             }
             assert!(
                 (re[k] - expect_re).abs() < 1e-3 && (im[k] - expect_im).abs() < 1e-3,
                 "bin {k}: got ({}, {}), want ({}, {})",
-                re[k], im[k], expect_re, expect_im
+                re[k],
+                im[k],
+                expect_re,
+                expect_im
             );
         }
     }
@@ -891,7 +921,11 @@ mod tests {
             .iter()
             .position(|(lo, hi)| bin >= *lo && bin < *hi)
             .expect("1kHz 必须落在频段范围内");
-        assert!(bands[idx] > 0.9, "1kHz 满幅正弦应接近满格，实际 {}", bands[idx]);
+        assert!(
+            bands[idx] > 0.9,
+            "1kHz 满幅正弦应接近满格，实际 {}",
+            bands[idx]
+        );
     }
 
     /// 频段边界单调不重叠，覆盖 40Hz..16kHz
@@ -966,7 +1000,10 @@ mod tests {
                 low_peak = low_peak.max(y.abs());
             }
         }
-        assert!(low_peak < 1.05, "31Hz 远离 1kHz 峰值，增益应接近 1（实际 {low_peak}）");
+        assert!(
+            low_peak < 1.05,
+            "31Hz 远离 1kHz 峰值，增益应接近 1（实际 {low_peak}）"
+        );
     }
 
     // ---------- 响度归一化 ----------

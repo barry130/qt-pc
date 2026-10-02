@@ -13,4 +13,4 @@ pub mod state;
 pub use engine::{AudioCmd, AudioEngine, PlaySource};
 pub use fx::{AudioFx, DspSource, EqParams, FadeParams, FxState, SpectrumTap, EQ_BAND_HZ};
 pub use queue::Queue;
-pub use state::{PlaybackStateSnapshot, PlaybackStatus, PlayMode, Quality};
+pub use state::{PlayMode, PlaybackStateSnapshot, PlaybackStatus, Quality};

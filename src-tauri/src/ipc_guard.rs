@@ -84,9 +84,9 @@ where
         let label = invoke.message.webview_ref().label().to_owned();
         if !is_allowed(&label, &command) {
             log::warn!("[ipc] 拒绝来自窗口 {label} 的命令 {command}");
-            invoke.resolver.reject(format!(
-                "命令 {command} 不允许从窗口 {label} 调用"
-            ));
+            invoke
+                .resolver
+                .reject(format!("命令 {command} 不允许从窗口 {label} 调用"));
             return true;
         }
         handler(invoke)
@@ -136,10 +136,7 @@ mod tests {
     #[test]
     fn plugin_commands_go_to_tauri_acl() {
         // 事件是引擎页与主窗口 RPC 的命脉，必须原样放行
-        assert!(is_allowed(
-            RESTRICTED_WINDOW,
-            "plugin:event|listen"
-        ));
+        assert!(is_allowed(RESTRICTED_WINDOW, "plugin:event|listen"));
         assert!(is_allowed(RESTRICTED_WINDOW, "plugin:event|emit_to"));
         assert!(is_allowed(RESTRICTED_WINDOW, "core:window|hide"));
     }

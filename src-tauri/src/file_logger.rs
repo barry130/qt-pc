@@ -32,7 +32,11 @@ static LOGGER: OnceLock<Mutex<Inner>> = OnceLock::new();
 /// 初始化文件日志。`dir` 传 None（拿不到 APPDATA 等异常环境）时退化为仅
 /// stderr。必须在任何 log:: 宏调用之前执行。
 pub fn init(dir: Option<PathBuf>) {
-    let mut inner = Inner { dir: dir.clone(), file: None, written: 0 };
+    let mut inner = Inner {
+        dir: dir.clone(),
+        file: None,
+        written: 0,
+    };
     if let Some(dir) = dir {
         if fs::create_dir_all(&dir).is_ok() {
             let current = dir.join(CURRENT_NAME);
@@ -133,7 +137,10 @@ fn append_line(line: &str) {
             .unwrap_or(0);
     }
     if let Some(f) = inner.file.as_mut() {
-        let ok = f.write_all(line.as_bytes()).and_then(|_| f.write_all(b"\n")).is_ok();
+        let ok = f
+            .write_all(line.as_bytes())
+            .and_then(|_| f.write_all(b"\n"))
+            .is_ok();
         if ok {
             inner.written += need;
         } else {
@@ -161,7 +168,10 @@ fn rotate(dir: &PathBuf) {
             dir.join(format!("{CURRENT_NAME}.{}", i + 1)),
         );
     }
-    let _ = fs::rename(dir.join(CURRENT_NAME), dir.join(format!("{CURRENT_NAME}.1")));
+    let _ = fs::rename(
+        dir.join(CURRENT_NAME),
+        dir.join(format!("{CURRENT_NAME}.1")),
+    );
 }
 
 /// RUST_LOG 兼容（只认单词，`RUST_LOG=debug` 之类），默认 info——与原先

@@ -230,8 +230,19 @@ UPDATE tracks SET id = (SELECT new_id FROM kg_rename WHERE old_id = id) WHERE id
 DROP TABLE kg_rename;
 "#;
 
-pub(crate) const MIGRATIONS: &[(i64, &str)] =
-  &[(1, V1), (2, V2), (3, V3), (4, V4), (5, V5), (6, V6), (7, V7), (8, V8), (9, V9), (10, V10), (11, V11)];
+pub(crate) const MIGRATIONS: &[(i64, &str)] = &[
+    (1, V1),
+    (2, V2),
+    (3, V3),
+    (4, V4),
+    (5, V5),
+    (6, V6),
+    (7, V7),
+    (8, V8),
+    (9, V9),
+    (10, V10),
+    (11, V11),
+];
 
 const V1: &str = r#"
 CREATE TABLE tracks (
@@ -619,9 +630,7 @@ fn bind_liked_songs_to_playlists(conn: &Connection) -> Result<(), rusqlite::Erro
         return Ok(());
     }
 
-    conn.execute_batch(
-        "CREATE INDEX IF NOT EXISTS idx_liked_songs_pid ON liked_songs(pid);",
-    )?;
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_liked_songs_pid ON liked_songs(pid);")?;
 
     // 存量只迁一次：迁移完 playlist_tracks 就是历史遗留表，
     // 再迁会把用户后来手动移出去的歌又搬回来。
@@ -745,7 +754,9 @@ mod tests {
         // 重复执行不报错（幂等）
         run(&conn).unwrap();
         let v: i64 = conn
-            .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r.get(0))
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(v, CURRENT_VERSION);
     }
@@ -786,21 +797,32 @@ mod tests {
             )
             .unwrap();
         }
-        conn.execute_batch(&format!("BEGIN;
+        conn.execute_batch(&format!(
+            "BEGIN;
 {V11}
-COMMIT;")).unwrap();
+COMMIT;"
+        ))
+        .unwrap();
 
         // 只剩大写那一条；引用全部改指过去，历史/队列没被级联删掉
         let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM tracks WHERE platform='kg'", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM tracks WHERE platform='kg'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(n, 1);
         let hist: String = conn
-            .query_row("SELECT track_id FROM play_history WHERE id='h1'", [], |r| r.get(0))
+            .query_row("SELECT track_id FROM play_history WHERE id='h1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(hist, upper);
         let queued: String = conn
-            .query_row("SELECT track_id FROM play_queue WHERE position=0", [], |r| r.get(0))
+            .query_row(
+                "SELECT track_id FROM play_queue WHERE position=0",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(queued, upper);
         let stats: i64 = conn
@@ -809,11 +831,16 @@ COMMIT;")).unwrap();
         assert_eq!(stats, 1);
 
         // 幂等：再跑一次不报错、结果不变
-        conn.execute_batch(&format!("BEGIN;
+        conn.execute_batch(&format!(
+            "BEGIN;
 {V11}
-COMMIT;")).unwrap();
+COMMIT;"
+        ))
+        .unwrap();
         let n2: i64 = conn
-            .query_row("SELECT COUNT(*) FROM tracks WHERE platform='kg'", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM tracks WHERE platform='kg'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(n2, 1);
     }
@@ -845,16 +872,23 @@ COMMIT;")).unwrap();
             rusqlite::params![lower, now],
         )
         .unwrap();
-        conn.execute_batch(&format!("BEGIN;
+        conn.execute_batch(&format!(
+            "BEGIN;
 {V11}
-COMMIT;")).unwrap();
+COMMIT;"
+        ))
+        .unwrap();
 
         let track_id: String = conn
-            .query_row("SELECT id FROM tracks WHERE platform='kg'", [], |r| r.get(0))
+            .query_row("SELECT id FROM tracks WHERE platform='kg'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(track_id, upper);
         let hist: String = conn
-            .query_row("SELECT track_id FROM play_history WHERE id='h1'", [], |r| r.get(0))
+            .query_row("SELECT track_id FROM play_history WHERE id='h1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(hist, upper);
         let stat: String = conn

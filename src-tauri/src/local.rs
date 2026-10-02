@@ -119,14 +119,12 @@ pub fn collect_audio_files(root: &Path) -> Vec<PathBuf> {
 }
 
 /// 递归实现。`on_entry` 每访问一个目录条目回调一次（整盘扫描的进度用）。
-fn collect_into(
-    dir: &Path,
-    out: &mut Vec<PathBuf>,
-    depth: usize,
-    on_entry: &mut dyn FnMut(&Path),
-) {
+fn collect_into(dir: &Path, out: &mut Vec<PathBuf>, depth: usize, on_entry: &mut dyn FnMut(&Path)) {
     if depth > MAX_DEPTH {
-        log::warn!("[local] 目录层级超过 {MAX_DEPTH}，已停止深入: {}", dir.display());
+        log::warn!(
+            "[local] 目录层级超过 {MAX_DEPTH}，已停止深入: {}",
+            dir.display()
+        );
         return;
     }
     // 目录读不了（权限 / 被删除 / 设备未就绪）→ 记日志并跳过，不让扫描整体失败
@@ -273,7 +271,10 @@ pub fn list_drives() -> Vec<String> {
 
 /// 组装入库行：优先 symphonia 元数据，缺失字段回落到文件名解析。
 fn build_row(path: &Path, path_str: String) -> LocalTrackRow {
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default();
     let (fallback_singer, fallback_title) = parse_file_stem(stem);
     let (title, singer, album, duration_secs) = match read_metadata(path) {
         Some(m) => (
@@ -428,7 +429,8 @@ fn pick_cover(rev: &MetadataRevision, best: &mut Option<(String, Vec<u8>)>) {
 }
 
 /// 标签值转字符串；二进制等不可展示的类型直接丢弃。
-fn tag_string(value: &Value) -> Option<String> {    match value {
+fn tag_string(value: &Value) -> Option<String> {
+    match value {
         Value::String(s) => Some(s.clone()),
         Value::Flag | Value::Binary(_) => None,
         other => Some(other.to_string()),
@@ -607,7 +609,10 @@ mod tests {
         assert!(!is_too_short(&row(1_000), 0));
         // 开启 60s：已知且 <= 60s 丢弃，> 60s 保留
         assert!(is_too_short(&row(12_000), 60), "12s 应被丢弃");
-        assert!(is_too_short(&row(60_000), 60), "整 60s 按「大于 60s」应丢弃");
+        assert!(
+            is_too_short(&row(60_000), 60),
+            "整 60s 按「大于 60s」应丢弃"
+        );
         assert!(!is_too_short(&row(60_001), 60), "60s 出头应保留");
         assert!(!is_too_short(&row(240_000), 60), "长曲应保留");
         // 时长未知（读不到元数据）：保留，避免误伤
@@ -757,7 +762,9 @@ mod tests {
 
         let tracks = query_local_tracks(&conn).expect("query");
         assert_eq!(tracks.len(), 2);
-        assert!(tracks.iter().all(|t| t.platform == crate::provider::types::SourceId::Local));
+        assert!(tracks
+            .iter()
+            .all(|t| t.platform == crate::provider::types::SourceId::Local));
         assert!(tracks.iter().all(|t| t.pic_url.is_empty()));
         assert!(tracks.iter().all(|t| t.music_id.is_none()));
         // id 必须是绝对路径，引擎直接拿它当播放路径用
@@ -768,9 +775,11 @@ mod tests {
         // 重复扫描：更新而非插入重复行
         upsert_local_tracks(&conn, &rows).expect("upsert again");
         let total: i64 = conn
-            .query_row("SELECT COUNT(*) FROM tracks WHERE platform='local'", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM tracks WHERE platform='local'",
+                [],
+                |r| r.get(0),
+            )
             .expect("count");
         assert_eq!(total, 2, "重复扫描不应产生重复行");
 
@@ -806,12 +815,9 @@ mod tests {
         // 只扫描 in_scope，且文件已删 → 只标记 in_scope 的记录
         std::fs::remove_file(&a).expect("删除");
         let present: HashSet<String> = HashSet::new();
-        let marked = mark_missing_local_tracks(
-            &conn,
-            &[in_scope.to_string_lossy().to_string()],
-            &present,
-        )
-        .expect("mark");
+        let marked =
+            mark_missing_local_tracks(&conn, &[in_scope.to_string_lossy().to_string()], &present)
+                .expect("mark");
         assert_eq!(marked, 1);
 
         let left = query_local_tracks(&conn).expect("query");

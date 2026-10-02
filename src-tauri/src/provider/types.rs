@@ -101,7 +101,11 @@ mod tests {
     fn parse_rejects_unknown() {
         assert_eq!(SourceId::parse(""), None);
         assert_eq!(SourceId::parse("netease"), None);
-        assert_eq!(SourceId::parse("Local"), None, "大小写敏感，与 Display 一致");
+        assert_eq!(
+            SourceId::parse("Local"),
+            None,
+            "大小写敏感，与 Display 一致"
+        );
     }
 
     /// parse 与 Display 必须互为逆运算（否则落库键与回读解析会错位）。

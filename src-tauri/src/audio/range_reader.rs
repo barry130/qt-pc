@@ -207,7 +207,10 @@ pub fn open(
         .map_err(|e| {
             // 完整地址只进日志；抛给上层的错误不带 URL（含后端/存储域名）
             log::warn!("[audio] 打开音频流失败: {url} ({e})");
-            io::Error::other(format!("打开音频流失败: {}", crate::astral::sanitize_err(e)))
+            io::Error::other(format!(
+                "打开音频流失败: {}",
+                crate::astral::sanitize_err(e)
+            ))
         })?;
     let status = resp.status();
     if !status.is_success() {
@@ -266,7 +269,9 @@ pub fn open(
     std::thread::Builder::new()
         .name("audio-downloader".into())
         .spawn(move || {
-            let _guard = DownloaderGuard { shared: Arc::clone(&dl_shared) };
+            let _guard = DownloaderGuard {
+                shared: Arc::clone(&dl_shared),
+            };
             run_downloader(dl_shared, dl_url, dl_client, resp);
         })?;
 
@@ -305,10 +310,7 @@ fn run_downloader(
         // （§6.12：落在未就绪区间且服务端支持 Range → 发起新 Range 请求并重定位下载点）
         // 流已 EOF 时即使 want == pos 也要重发：连接可能被提前掐断，重连补数据
         let want = shared.desired.load(Ordering::SeqCst);
-        if shared.supports_ranges
-            && !shared.is_ready_at(want)
-            && (want != pos || eof)
-        {
+        if shared.supports_ranges && !shared.is_ready_at(want) && (want != pos || eof) {
             match issue_range(&client, &url, want) {
                 Ok(resp) => {
                     body = Box::new(resp);
@@ -463,10 +465,7 @@ impl Seek for HttpRangeReader {
             SeekFrom::Current(d) => self.pos as i64 + d,
         };
         if new_pos < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "seek 到负位置",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "seek 到负位置"));
         }
         self.pos = new_pos as u64;
         // seek 到未就绪区间 → 通知下载线程重定位（字节精确）
@@ -517,10 +516,7 @@ impl HttpRangeReader {
                 .unwrap();
             drop(g);
             if timeout.timed_out() && Instant::now() >= deadline && !shared.is_ready_at(pos) {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "等待音频数据超时",
-                ));
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "等待音频数据超时"));
             }
         }
     }

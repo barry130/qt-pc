@@ -4,7 +4,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::provider::types::{Track};
+use crate::provider::types::Track;
 
 // 跨域共享的小工具（`db_track_id` / `now_ms` / `track_from_row` / `LOCAL_PLATFORM` …）
 // 由 store/mod.rs 统一再导出，这里一次性引入，省得每个域各写一长串 use。
@@ -50,7 +50,14 @@ pub(crate) fn create_download_task(
         "INSERT INTO download_tasks (id, track_id, platform, quality, status, progress,
                                      part_path, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?6)",
-        params![id, db_track_id(track), track.platform.to_string(), quality, part_path, now],
+        params![
+            id,
+            db_track_id(track),
+            track.platform.to_string(),
+            quality,
+            part_path,
+            now
+        ],
     )?;
     Ok(id)
 }
@@ -111,7 +118,8 @@ pub(crate) fn fail_download_task(
 }
 
 /// 下载任务的公共查询列（`list` / `by_id` / `by_track` 共用，保证映射口径一致）。
-const DOWNLOAD_SELECT_COLUMNS: &str = "d.id, d.quality, d.status, d.progress, d.file_path, d.file_size,
+const DOWNLOAD_SELECT_COLUMNS: &str =
+    "d.id, d.quality, d.status, d.progress, d.file_path, d.file_size,
             d.error, d.part_path, d.total_bytes, d.created_at, d.updated_at,
             t.id, t.platform, t.title, t.singer, t.album, t.duration_ms, t.music_id";
 
@@ -196,9 +204,11 @@ pub(crate) fn find_download_task(
             AND d.status IN ('pending', 'downloading', 'paused', 'done')
           LIMIT 1"
     );
-    conn.query_row(&sql, params![db_track_id, quality], |row| map_download_row(row))
-        .optional()
-        .map(Option::flatten)
+    conn.query_row(&sql, params![db_track_id, quality], |row| {
+        map_download_row(row)
+    })
+    .optional()
+    .map(Option::flatten)
 }
 
 /// 通用状态更新（暂停 / 取消 / 重试 / 失败共用）。`error = None` 时清空错误。
@@ -216,10 +226,7 @@ pub(crate) fn set_download_status(
 }
 
 /// 重试前重置：回到 pending、清进度与错误（文件由下载器按 `.part` 续传决定去留）。
-pub(crate) fn reset_download_for_retry(
-    conn: &Connection,
-    id: &str,
-) -> Result<(), rusqlite::Error> {
+pub(crate) fn reset_download_for_retry(conn: &Connection, id: &str) -> Result<(), rusqlite::Error> {
     conn.execute(
         "UPDATE download_tasks
             SET status = 'pending', progress = 0, error = NULL, updated_at = ?1

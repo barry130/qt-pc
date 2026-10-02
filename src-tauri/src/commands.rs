@@ -15,8 +15,8 @@ use crate::provider::ProviderError;
 use crate::{quality_str, resolve_play_url_script};
 use tauri::{Emitter, State};
 
-use crate::AppState;
 use crate::db::store::{DownloadTask, HistoryItem, PlaylistSummary};
+use crate::AppState;
 
 // ---------- 音源脚本内置方法（插件化方案 v3 · 试点） ----------
 //
@@ -79,9 +79,8 @@ pub(crate) async fn source_builtin_request(
     if !ALLOWED_REQUEST_METHODS.contains(&method.as_str()) {
         return Err(format!("不支持的请求方法 {method}"));
     }
-    let timeout = std::time::Duration::from_millis(
-        options.and_then(|o| o.timeout_ms).unwrap_or(15_000),
-    );
+    let timeout =
+        std::time::Duration::from_millis(options.and_then(|o| o.timeout_ms).unwrap_or(15_000));
     let mut req = source_builtin_client()
         .request(
             reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?,
@@ -96,10 +95,7 @@ pub(crate) async fn source_builtin_request(
     if let Some(body) = options.and_then(|o| o.body.as_deref()) {
         req = req.body(body.to_string());
     }
-    let res = req
-        .send()
-        .await
-        .map_err(crate::astral::sanitize_err)?;
+    let res = req.send().await.map_err(crate::astral::sanitize_err)?;
     // 正文是一次性读进内存的：先按 content-length 拦一次超大响应
     if let Some(len) = res.content_length() {
         if len > MAX_RESPONSE_BYTES {
@@ -116,12 +112,9 @@ pub(crate) async fn source_builtin_request(
     // 上游 content-type 不可靠（网易歌单接口回 text/plain、QQ 回 x-javascript、
     // 酷狗回 text/html），对齐蓝本 http.ts 的行为：不看 content-type 直接尝试
     // JSON 解析，失败则原样字符串。
-    let text = res
-        .text()
-        .await
-        .map_err(crate::astral::sanitize_err)?;
-    let body = serde_json::from_str::<serde_json::Value>(&text)
-        .unwrap_or(serde_json::Value::String(text));
+    let text = res.text().await.map_err(crate::astral::sanitize_err)?;
+    let body =
+        serde_json::from_str::<serde_json::Value>(&text).unwrap_or(serde_json::Value::String(text));
     Ok(SourceResponse {
         status_code: status,
         headers,
@@ -265,10 +258,7 @@ pub async fn cmd_previous(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command(rename = "set_play_mode")]
-pub async fn cmd_set_play_mode(
-    state: State<'_, AppState>,
-    mode: PlayMode,
-) -> Result<(), String> {
+pub async fn cmd_set_play_mode(state: State<'_, AppState>, mode: PlayMode) -> Result<(), String> {
     state.engine.send(AudioCmd::SetPlayMode(mode));
     Ok(())
 }
@@ -292,10 +282,7 @@ pub async fn cmd_clear_queue(state: State<'_, AppState>) -> Result<(), String> {
 
 /// 下一首播放：插到当前曲目之后，不打断当前播放。
 #[tauri::command(rename = "queue_add_next")]
-pub async fn cmd_queue_add_next(
-    state: State<'_, AppState>,
-    track: Track,
-) -> Result<(), String> {
+pub async fn cmd_queue_add_next(state: State<'_, AppState>, track: Track) -> Result<(), String> {
     state.engine.send(AudioCmd::AddNext(Box::new(track)));
     Ok(())
 }
@@ -312,21 +299,14 @@ pub async fn cmd_queue_append(
 
 /// 移除队列中的某一项。
 #[tauri::command(rename = "queue_remove_at")]
-pub async fn cmd_queue_remove_at(
-    state: State<'_, AppState>,
-    index: u32,
-) -> Result<(), String> {
+pub async fn cmd_queue_remove_at(state: State<'_, AppState>, index: u32) -> Result<(), String> {
     state.engine.send(AudioCmd::RemoveAt(index as usize));
     Ok(())
 }
 
 /// 拖动排序：把 from 位置的曲目移到 to。
 #[tauri::command(rename = "queue_move")]
-pub async fn cmd_queue_move(
-    state: State<'_, AppState>,
-    from: u32,
-    to: u32,
-) -> Result<(), String> {
+pub async fn cmd_queue_move(state: State<'_, AppState>, from: u32, to: u32) -> Result<(), String> {
     state.engine.send(AudioCmd::MoveItem {
         from: from as usize,
         to: to as usize,
@@ -395,10 +375,10 @@ pub async fn cmd_restore_last_session(
         return Ok(None);
     };
     let s = &session.state;
-    let play_mode: PlayMode = serde_json::from_value(serde_json::json!(s.play_mode))
-        .unwrap_or(PlayMode::ListLoop);
-    let quality: Quality = serde_json::from_value(serde_json::json!(s.quality))
-        .unwrap_or(Quality::High);
+    let play_mode: PlayMode =
+        serde_json::from_value(serde_json::json!(s.play_mode)).unwrap_or(PlayMode::ListLoop);
+    let quality: Quality =
+        serde_json::from_value(serde_json::json!(s.quality)).unwrap_or(Quality::High);
     // 引擎应装上的那一曲（RestoreSession 处理完 track_id 就位）
     let expected_track = session.tracks.get(s.index).map(|t| t.id.clone());
     state.engine.send(AudioCmd::RestoreSession {
@@ -474,7 +454,10 @@ pub async fn cmd_set_sleep_timer(
     remaining_ms: Option<u64>,
     after_track: bool,
 ) -> Result<(), String> {
-    state.engine.send(AudioCmd::SetSleepTimer { remaining_ms, after_track });
+    state.engine.send(AudioCmd::SetSleepTimer {
+        remaining_ms,
+        after_track,
+    });
     Ok(())
 }
 
@@ -566,7 +549,12 @@ pub async fn cmd_audio_cache_stats(
                 web_count += c;
             }
         }
-        Ok(AudioCacheStats { total_bytes, file_count, web_bytes, web_count })
+        Ok(AudioCacheStats {
+            total_bytes,
+            file_count,
+            web_bytes,
+            web_count,
+        })
     })
     .await
     .map_err(|e| format!("统计缓存失败: {e}"))?
@@ -586,7 +574,10 @@ pub async fn cmd_clear_audio_cache(
         .unwrap_or(None);
     tauri::async_runtime::spawn_blocking(move || {
         let (freed, failed) = crate::cache::clear_dir_files(&dir, busy.as_deref());
-        Ok(AudioCacheClearResult { freed_bytes: freed, failed_count: failed })
+        Ok(AudioCacheClearResult {
+            freed_bytes: freed,
+            failed_count: failed,
+        })
     })
     .await
     .map_err(|e| format!("清理缓存失败: {e}"))?
@@ -600,9 +591,7 @@ pub async fn cmd_clear_audio_cache(
 /// ClearBrowsingDataAll（那会把用户数据一起清掉）。
 /// 正在运行时个别文件被占用删不掉，计入 failedCount。
 #[tauri::command(rename = "clear_web_cache")]
-pub async fn cmd_clear_web_cache(
-    app: tauri::AppHandle,
-) -> Result<AudioCacheClearResult, String> {
+pub async fn cmd_clear_web_cache(app: tauri::AppHandle) -> Result<AudioCacheClearResult, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let base = webview_profile_dir(&app)?;
         let mut freed = 0u64;
@@ -612,7 +601,10 @@ pub async fn cmd_clear_web_cache(
             freed += f;
             failed += fl;
         }
-        Ok(AudioCacheClearResult { freed_bytes: freed, failed_count: failed })
+        Ok(AudioCacheClearResult {
+            freed_bytes: freed,
+            failed_count: failed,
+        })
     })
     .await
     .map_err(|e| format!("清理网页缓存失败: {e}"))?
@@ -621,10 +613,7 @@ pub async fn cmd_clear_web_cache(
 /// 设置播放缓存体积上限（MB，0 = 不限）。引擎侧落 settings 并立即修剪；
 /// 之后每挂载一条新流都会自动检查（LRU 清最旧，跳过在播文件）。
 #[tauri::command(rename = "set_audio_cache_limit")]
-pub async fn cmd_set_audio_cache_limit(
-    state: State<'_, AppState>,
-    mb: u64,
-) -> Result<(), String> {
+pub async fn cmd_set_audio_cache_limit(state: State<'_, AppState>, mb: u64) -> Result<(), String> {
     state.engine.send(AudioCmd::SetCacheLimit(mb));
     Ok(())
 }
@@ -688,11 +677,13 @@ pub async fn cmd_list_shortcuts(
         let entries: Vec<crate::shortcuts::ShortcutEntry> =
             crate::shortcuts::load_shortcuts(db.as_deref())
                 .into_iter()
-                .map(|(action, accelerator, enabled)| crate::shortcuts::ShortcutEntry {
-                    id: action.id().to_string(),
-                    accelerator,
-                    enabled,
-                })
+                .map(
+                    |(action, accelerator, enabled)| crate::shortcuts::ShortcutEntry {
+                        id: action.id().to_string(),
+                        accelerator,
+                        enabled,
+                    },
+                )
                 .collect();
         entries
     })
@@ -729,11 +720,13 @@ pub async fn cmd_save_shortcuts(
 
     Ok(keymap
         .into_iter()
-        .map(|(action, accelerator, enabled)| crate::shortcuts::ShortcutEntry {
-            id: action.id().to_string(),
-            accelerator,
-            enabled,
-        })
+        .map(
+            |(action, accelerator, enabled)| crate::shortcuts::ShortcutEntry {
+                id: action.id().to_string(),
+                accelerator,
+                enabled,
+            },
+        )
         .collect())
 }
 
@@ -741,18 +734,13 @@ pub async fn cmd_save_shortcuts(
 
 /// 读外观偏好；未设置过返回默认值（跟随系统 + 默认皮肤）。
 #[tauri::command(rename = "get_appearance")]
-pub async fn cmd_get_appearance(
-    state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
+pub async fn cmd_get_appearance(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     let Some(db) = &state.db else {
         return Ok(default_appearance());
     };
-    let saved = db.with(|c| {
-        crate::db::store::get_setting(c, "appearance")
-    })?;
+    let saved = db.with(|c| crate::db::store::get_setting(c, "appearance"))?;
     match saved {
-        Some(json) => serde_json::from_str(&json)
-            .map_err(|e| format!("外观偏好解析失败: {e}")),
+        Some(json) => serde_json::from_str(&json).map_err(|e| format!("外观偏好解析失败: {e}")),
         None => Ok(default_appearance()),
     }
 }
@@ -763,8 +751,8 @@ pub async fn cmd_set_appearance(
     state: State<'_, AppState>,
     appearance: serde_json::Value,
 ) -> Result<(), String> {
-    let json = serde_json::to_string(&appearance)
-        .map_err(|e| format!("外观偏好序列化失败: {e}"))?;
+    let json =
+        serde_json::to_string(&appearance).map_err(|e| format!("外观偏好序列化失败: {e}"))?;
     let Some(db) = &state.db else {
         return Ok(()); // 数据库不可用时只保持本次会话内存值
     };
@@ -786,7 +774,9 @@ fn default_appearance() -> serde_json::Value {
 // 每个请求的 X-App-Ut / X-App-Version / X-Device / X-OS 由 astral.rs::client_headers() 统一注入
 
 #[tauri::command(rename = "astral_app_update")]
-pub async fn cmd_astral_app_update(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub async fn cmd_astral_app_update(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
     state.astral.app_update(crate::astral::version_code()).await
 }
 
@@ -801,7 +791,9 @@ pub async fn cmd_astral_check_official_version(
 }
 
 #[tauri::command(rename = "astral_github_accels")]
-pub async fn cmd_astral_github_accels(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub async fn cmd_astral_github_accels(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
     state.astral.github_accels().await
 }
 
@@ -832,12 +824,9 @@ pub async fn cmd_download_update_file(
     //（后端给了 MD5 或目标是自有 CDN 才允许明文 —— 见 net_guard 的规则说明）
     let has_hash = md5.as_deref().is_some_and(|s| !s.trim().is_empty());
     let checked = crate::net_guard::ensure_installer_url(&url, has_hash)?;
-    let result = crate::astral::AstralClient::download_update_file(
-        &http_client,
-        checked.as_str(),
-        &app,
-    )
-    .await;
+    let result =
+        crate::astral::AstralClient::download_update_file(&http_client, checked.as_str(), &app)
+            .await;
     let (path, final_url) = match result {
         Ok(p) => (p, checked),
         Err(first_err) => {
@@ -845,8 +834,7 @@ pub async fn cmd_download_update_file(
             //（拼前缀的链接失败几乎都是加速节点劣化；直链本身失败时重试同样没坏处）
             let original_raw = crate::astral::AstralClient::strip_accel_prefix(&url);
             if original_raw != url {
-                let original =
-                    crate::net_guard::ensure_installer_url(&original_raw, has_hash)?;
+                let original = crate::net_guard::ensure_installer_url(&original_raw, has_hash)?;
                 log::warn!("[update] 加速下载失败（{first_err}），降级原始直链重试");
                 let p = crate::astral::AstralClient::download_update_file(
                     &http_client,
@@ -915,8 +903,7 @@ pub async fn cmd_run_update_installer(app: tauri::AppHandle, path: String) -> Re
     // 命令一旦能执行任意路径 + 传参，就等于把"启动本机任意程序"开放出去
     //（这也是 ipc_guard 里必须把本命令挡在音源引擎窗口之外的原因）。
     let expected = crate::astral::update_installer_path();
-    let got = std::fs::canonicalize(&path)
-        .map_err(|e| format!("安装包路径无效（{path}）：{e}"))?;
+    let got = std::fs::canonicalize(&path).map_err(|e| format!("安装包路径无效（{path}）：{e}"))?;
     let want = std::fs::canonicalize(&expected)
         .map_err(|e| format!("更新临时目录里没有安装包（{}）：{e}", expected.display()))?;
     if got != want {
@@ -968,7 +955,10 @@ pub async fn cmd_run_update_browser(url: String) -> Result<(), String> {
         };
         // 该 API 的约定：返回值 <= 32 表示失败（32 以后的整数才是成功句柄）
         if ret.0 as isize <= 32 {
-            return Err(format!("打开浏览器失败（ShellExecuteW 返回 {}）", ret.0 as isize));
+            return Err(format!(
+                "打开浏览器失败（ShellExecuteW 返回 {}）",
+                ret.0 as isize
+            ));
         }
         Ok(())
     }
@@ -989,12 +979,16 @@ pub async fn cmd_astral_active_messages(
 }
 
 #[tauri::command(rename = "astral_message_center")]
-pub async fn cmd_astral_message_center(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub async fn cmd_astral_message_center(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
     state.astral.message_center().await
 }
 
 #[tauri::command(rename = "astral_unread_count")]
-pub async fn cmd_astral_unread_count(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+pub async fn cmd_astral_unread_count(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
     state.astral.unread_count().await
 }
 
@@ -1023,7 +1017,10 @@ pub async fn cmd_astral_submit_feedback(
     content: String,
     contact: String,
 ) -> Result<serde_json::Value, String> {
-    state.astral.submit_feedback(&kind, &title, &content, &contact).await
+    state
+        .astral
+        .submit_feedback(&kind, &title, &content, &contact)
+        .await
 }
 
 #[tauri::command(rename = "astral_my_feedback")]
@@ -1087,12 +1084,16 @@ pub async fn cmd_get_app_version() -> std::collections::HashMap<String, serde_js
 // ---------- 桌面歌词窗口（DESIGN §4.2 / §10 / §11.7） ----------
 
 #[tauri::command(rename = "show_desktop_lyric")]
-pub async fn cmd_show_desktop_lyric(app: tauri::AppHandle) -> Result<crate::lyric_window::LyricWindowState, String> {
+pub async fn cmd_show_desktop_lyric(
+    app: tauri::AppHandle,
+) -> Result<crate::lyric_window::LyricWindowState, String> {
     crate::lyric_window::show(&app)
 }
 
 #[tauri::command(rename = "hide_desktop_lyric")]
-pub async fn cmd_hide_desktop_lyric(app: tauri::AppHandle) -> Result<crate::lyric_window::LyricWindowState, String> {
+pub async fn cmd_hide_desktop_lyric(
+    app: tauri::AppHandle,
+) -> Result<crate::lyric_window::LyricWindowState, String> {
     crate::lyric_window::hide(&app)
 }
 
@@ -1227,11 +1228,9 @@ pub async fn cmd_get_local_tracks(state: State<'_, AppState>) -> Result<Vec<Trac
     let Some(db) = state.db.clone() else {
         return Ok(Vec::new());
     };
-    tauri::async_runtime::spawn_blocking(move || {
-        db.with(crate::db::store::query_local_tracks)
-    })
-    .await
-    .map_err(|e| format!("读取本地曲目失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || db.with(crate::db::store::query_local_tracks))
+        .await
+        .map_err(|e| format!("读取本地曲目失败: {e}"))?
 }
 
 /// 读本地曲目的文件大小 / 修改时间（供按大小、修改时间排序）。
@@ -1242,11 +1241,9 @@ pub async fn cmd_get_local_track_files(
     let Some(db) = state.db.clone() else {
         return Ok(Vec::new());
     };
-    tauri::async_runtime::spawn_blocking(move || {
-        db.with(crate::db::store::query_local_track_files)
-    })
-    .await
-    .map_err(|e| format!("读取本地曲目文件属性失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || db.with(crate::db::store::query_local_track_files))
+        .await
+        .map_err(|e| format!("读取本地曲目文件属性失败: {e}"))?
 }
 
 /// 读缺失的本地曲目（扫描后文件已不在的记录），供本地曲库「体检」用。
@@ -1266,9 +1263,7 @@ pub async fn cmd_get_missing_local_tracks(
 
 /// 清理所有缺失的本地记录（连带级联删除关联行），返回删除条数。
 #[tauri::command(rename = "purge_missing_local_tracks")]
-pub async fn cmd_purge_missing_local_tracks(
-    state: State<'_, AppState>,
-) -> Result<usize, String> {
+pub async fn cmd_purge_missing_local_tracks(state: State<'_, AppState>) -> Result<usize, String> {
     let Some(db) = state.db.clone() else {
         return Ok(0);
     };
@@ -1308,10 +1303,7 @@ pub async fn cmd_get_scan_dirs(state: State<'_, AppState>) -> Result<Vec<String>
 
 /// 添加扫描目录（已存在则幂等刷新 last_scan_at）。
 #[tauri::command(rename = "add_scan_dir")]
-pub async fn cmd_add_scan_dir(
-    state: State<'_, AppState>,
-    path: String,
-) -> Result<(), String> {
+pub async fn cmd_add_scan_dir(state: State<'_, AppState>, path: String) -> Result<(), String> {
     if !std::path::Path::new(&path).exists() {
         return Err(format!("目录不存在: {path}"));
     }
@@ -1327,10 +1319,7 @@ pub async fn cmd_add_scan_dir(
 
 /// 移除扫描目录（只删清单条目，不动已入库曲目）。
 #[tauri::command(rename = "remove_scan_dir")]
-pub async fn cmd_remove_scan_dir(
-    state: State<'_, AppState>,
-    path: String,
-) -> Result<(), String> {
+pub async fn cmd_remove_scan_dir(state: State<'_, AppState>, path: String) -> Result<(), String> {
     let Some(db) = state.db.clone() else {
         return Ok(());
     };
@@ -1440,7 +1429,9 @@ pub async fn cmd_add_favorite(
     let for_db = track.clone();
     let target = pid.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| crate::db::store::add_tracks_to_playlist(conn, &target, std::slice::from_ref(&for_db)))
+        db.with(|conn| {
+            crate::db::store::add_tracks_to_playlist(conn, &target, std::slice::from_ref(&for_db))
+        })
     })
     .await
     .map_err(|e| format!("收藏失败: {e}"))?;
@@ -1465,9 +1456,7 @@ pub async fn cmd_remove_favorite(
     let for_db = track.clone();
     let target = pid.clone();
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| {
-            crate::db::store::remove_liked_song(conn, &for_db, target.as_deref())
-        })
+        db.with(|conn| crate::db::store::remove_liked_song(conn, &for_db, target.as_deref()))
     })
     .await
     .map_err(|e| format!("取消收藏失败: {e}"))?
@@ -1533,7 +1522,9 @@ async fn push_like_song(
     let queued_body = crate::astral::like_song_body_for_queue(&payload);
     if let Err(e) = state.astral.like_song(payload).await {
         // 失败入队：同目标键只留最新操作，断网重放后即最终状态
-        enqueue_like_op_on_error(state, "song", action, &platform, &track.id, move || queued_body);
+        enqueue_like_op_on_error(state, "song", action, &platform, &track.id, move || {
+            queued_body
+        });
         log::warn!("[like] 推送收藏({action})失败，已入离线队列: {e}");
     }
 }
@@ -1578,7 +1569,10 @@ async fn push_like_songs_batch(
             ));
         }
         if let Err(e) = state.astral.like_batch(ops).await {
-            log::warn!("[like] 批量推送收藏失败 {} 条，整批入离线队列: {e}", queued.len());
+            log::warn!(
+                "[like] 批量推送收藏失败 {} 条，整批入离线队列: {e}",
+                queued.len()
+            );
             for (action, platform, sid, body) in queued {
                 enqueue_like_op_on_error(state, "song", &action, &platform, &sid, move || body);
             }
@@ -1625,9 +1619,7 @@ pub async fn cmd_favorite_playlist(
     let count = play_count.unwrap_or_default();
     let (p, pid, title) = (platform.clone(), id.clone(), name.clone());
     let result = tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| {
-            crate::db::store::add_liked_playlist(conn, &p, &pid, &title, &pic, &count)
-        })
+        db.with(|conn| crate::db::store::add_liked_playlist(conn, &p, &pid, &title, &pic, &count))
     })
     .await
     .map_err(|e| format!("收藏歌单失败: {e}"))?;
@@ -1667,11 +1659,9 @@ pub async fn cmd_list_favorite_playlists(
     let Some(db) = state.db.clone() else {
         return Ok(Vec::new());
     };
-    tauri::async_runtime::spawn_blocking(move || {
-        db.with(crate::db::store::list_liked_playlists)
-    })
-    .await
-    .map_err(|e| format!("读取收藏歌单失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || db.with(crate::db::store::list_liked_playlists))
+        .await
+        .map_err(|e| format!("读取收藏歌单失败: {e}"))?
 }
 
 #[tauri::command(rename = "is_playlist_favorited")]
@@ -1759,10 +1749,7 @@ pub async fn cmd_list_favorites(
 
 /// 单曲是否已收藏（播放页收藏按钮态）。
 #[tauri::command(rename = "is_favorite")]
-pub async fn cmd_is_favorite(
-    state: State<'_, AppState>,
-    track: Track,
-) -> Result<bool, String> {
+pub async fn cmd_is_favorite(state: State<'_, AppState>, track: Track) -> Result<bool, String> {
     let Some(db) = state.db.clone() else {
         return Ok(false);
     };
@@ -1795,11 +1782,9 @@ pub async fn cmd_clear_history(state: State<'_, AppState>) -> Result<(), String>
     let Some(db) = state.db.clone() else {
         return Ok(());
     };
-    tauri::async_runtime::spawn_blocking(move || {
-        db.with(crate::db::store::clear_play_history)
-    })
-    .await
-    .map_err(|e| format!("清空播放历史失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || db.with(crate::db::store::clear_play_history))
+        .await
+        .map_err(|e| format!("清空播放历史失败: {e}"))?
 }
 
 // ---------- 我的歌单（DESIGN §5.3） ----------
@@ -1882,7 +1867,11 @@ pub async fn cmd_set_playlist_cover(
         "png" => "png",
         "jpg" | "jpeg" => "jpg",
         "webp" => "webp",
-        other => return Err(format!("暂不支持的图片格式 .{other}，仅支持 png / jpg / webp")),
+        other => {
+            return Err(format!(
+                "暂不支持的图片格式 .{other}，仅支持 png / jpg / webp"
+            ))
+        }
     };
     let covers_dir = crate::app_paths::data_root(&app).join("playlist-covers");
     let dest = covers_dir.join(format!("{pid}.{mime_ext}"));
@@ -1988,11 +1977,10 @@ pub async fn cmd_list_my_playlists(
         return Ok(Vec::new());
     };
     // 合并视图：本地歌单（platform=local）+ 收藏的在线歌单
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        db.with(crate::db::store::list_my_playlists)
-    })
-    .await
-    .map_err(|e| format!("读取我的歌单失败: {e}"))?;
+    let result =
+        tauri::async_runtime::spawn_blocking(move || db.with(crate::db::store::list_my_playlists))
+            .await
+            .map_err(|e| format!("读取我的歌单失败: {e}"))?;
     match &result {
         Ok(v) => log::info!(
             "[db] 我的歌单 {} 条（本地 {} / 在线 {}）",
@@ -2057,9 +2045,7 @@ pub async fn cmd_remove_track_from_playlist(
     };
     let for_db = track.clone();
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| {
-            crate::db::store::remove_track_from_playlist(conn, &id, &for_db)
-        })
+        db.with(|conn| crate::db::store::remove_track_from_playlist(conn, &id, &for_db))
     })
     .await
     .map_err(|e| format!("从歌单移除歌曲失败: {e}"))?
@@ -2169,8 +2155,7 @@ fn sanitize_file_name(s: &str) -> String {
     let cleaned: String = s
         .chars()
         .filter(|c| {
-            !matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
-                && !c.is_control()
+            !matches!(c, '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|') && !c.is_control()
         })
         .collect();
     let trimmed = cleaned.trim().to_string();
@@ -2207,14 +2192,11 @@ fn audio_ext_from_url(url: &str, quality: &str) -> String {
 /// 读取「下载文件名格式」设置：artist=歌手-歌名（默认），song=歌名-歌手。
 /// 仅影响设置变更后新开始的下载；已存在的任务沿用原保存路径。
 fn download_name_format(state: &AppState) -> String {
-    let v = state
-        .db
-        .clone()
-        .and_then(|db| {
-            db.with(|c| crate::db::store::get_setting(c, "downloadNameFormat"))
-                .ok()
-                .flatten()
-        });
+    let v = state.db.clone().and_then(|db| {
+        db.with(|c| crate::db::store::get_setting(c, "downloadNameFormat"))
+            .ok()
+            .flatten()
+    });
     match v.as_deref() {
         Some("song") => "song".to_string(),
         _ => "artist".to_string(),
@@ -2322,9 +2304,7 @@ pub async fn cmd_reset_download_dir(state: State<'_, AppState>) -> Result<String
 }
 
 #[tauri::command(rename = "list_downloads")]
-pub async fn cmd_list_downloads(
-    state: State<'_, AppState>,
-) -> Result<Vec<DownloadTask>, String> {
+pub async fn cmd_list_downloads(state: State<'_, AppState>) -> Result<Vec<DownloadTask>, String> {
     let Some(db) = state.db.clone() else {
         return Ok(Vec::new());
     };
@@ -2385,10 +2365,7 @@ pub async fn cmd_delete_downloads(
     ids: Vec<String>,
     delete_file: bool,
 ) -> Result<usize, String> {
-    let ids: Vec<String> = ids
-        .into_iter()
-        .filter(|s| !s.trim().is_empty())
-        .collect();
+    let ids: Vec<String> = ids.into_iter().filter(|s| !s.trim().is_empty()).collect();
     if ids.is_empty() {
         return Ok(0);
     }
@@ -2430,11 +2407,9 @@ pub async fn cmd_list_downloaded_track_ids(
     let Some(db) = state.db.clone() else {
         return Ok(Vec::new());
     };
-    tauri::async_runtime::spawn_blocking(move || {
-        db.with(crate::db::store::downloaded_track_ids)
-    })
-    .await
-    .map_err(|e| format!("读取已下载列表失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || db.with(crate::db::store::downloaded_track_ids))
+        .await
+        .map_err(|e| format!("读取已下载列表失败: {e}"))?
 }
 
 /// 开始下载一首歌，返回任务 id。
@@ -2468,15 +2443,18 @@ pub async fn cmd_start_download(
     .await
     .map_err(|e| format!("查询下载任务失败: {e}"))??;
     if let Some(task) = existing {
-        log::info!("[download] 已有任务 {}，复用（status={}）", task.id, task.status);
+        log::info!(
+            "[download] 已有任务 {}，复用（status={}）",
+            task.id,
+            task.status
+        );
         return Ok(task.id);
     }
 
     // 取址放在建任务之前：失败就干净报错，不留悬挂任务
-    let (url, _fetched) =
-        resolve_play_url_script(&app, &state.url_cache, &track, quality)
-            .await
-            .map_err(|e| format!("取播放地址失败: {e}"))?;
+    let (url, _fetched) = resolve_play_url_script(&app, &state.url_cache, &track, quality)
+        .await
+        .map_err(|e| format!("取播放地址失败: {e}"))?;
 
     let dir = download_dir(&state)?;
     let name_fmt = download_name_format(&state);
@@ -2529,7 +2507,13 @@ pub async fn cmd_pause_download(
         return Err("数据库不可用".to_string());
     };
     state.downloads.request_stop(&id);
-    set_download_state(&db, &id, download::status::PAUSED, Some("已暂停，点击「继续」接着下载")).await?;
+    set_download_state(
+        &db,
+        &id,
+        download::status::PAUSED,
+        Some("已暂停，点击「继续」接着下载"),
+    )
+    .await?;
     let _ = app.emit(EVENT_DOWNLOADS_CHANGED, ());
     Ok(())
 }
@@ -2649,10 +2633,7 @@ fn remove_local_file(path: &str) -> Result<bool, String> {
 
 /// 在资源管理器中定位已下载文件（Windows 用 explorer /select）。
 #[tauri::command(rename = "reveal_download")]
-pub async fn cmd_reveal_download(
-    state: State<'_, AppState>,
-    id: String,
-) -> Result<(), String> {
+pub async fn cmd_reveal_download(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let Some(db) = state.db.clone() else {
         return Err("数据库不可用".to_string());
     };
@@ -2780,7 +2761,8 @@ async fn launch_download(
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "artist".to_string());
-            let final_path = unique_download_path(&dir, &track, quality_str(quality), &url, &name_fmt);
+            let final_path =
+                unique_download_path(&dir, &track, quality_str(quality), &url, &name_fmt);
             let part = download::part_path_for(&final_path);
             (final_path, part)
         }
@@ -2838,9 +2820,7 @@ async fn persist_session(db: &Option<Arc<crate::db::Database>>, session: &AuthSe
         }
     };
     let _ = tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| {
-            crate::db::store::set_setting(conn, SETTING_ASTRAL_SESSION, &value)
-        })
+        db.with(|conn| crate::db::store::set_setting(conn, SETTING_ASTRAL_SESSION, &value))
     })
     .await;
 }
@@ -2902,9 +2882,7 @@ pub async fn cmd_astral_logout(state: State<'_, AppState>) -> Result<(), String>
 /// 顺手清掉本地会话和 satoken，界面才不会一直显示「已登录」而接口全 401。
 /// 网络不可达属于另一类错误，不清会话——断网不该把人登出。
 #[tauri::command(rename = "astral_me")]
-pub async fn cmd_astral_me(
-    state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
+pub async fn cmd_astral_me(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     match state.astral.me().await {
         Ok(v) if !v.is_null() => Ok(v),
         Ok(v) => {
@@ -2929,9 +2907,7 @@ pub async fn cmd_astral_me(
 
 /// 用旧 token 换新会话（satoken 过期时前端调这个，不用重新输密码）
 #[tauri::command(rename = "astral_refresh")]
-pub async fn cmd_astral_refresh(
-    state: State<'_, AppState>,
-) -> Result<AuthSession, String> {
+pub async fn cmd_astral_refresh(state: State<'_, AppState>) -> Result<AuthSession, String> {
     let session = state.astral.refresh().await?;
     persist_session(&state.db, &session).await;
     Ok(session)
@@ -2939,16 +2915,12 @@ pub async fn cmd_astral_refresh(
 
 /// 本地保存的会话（可能已过期，是否过期看 `is_valid`）
 #[tauri::command(rename = "astral_session")]
-pub async fn cmd_astral_session(
-    state: State<'_, AppState>,
-) -> Result<Option<AuthSession>, String> {
+pub async fn cmd_astral_session(state: State<'_, AppState>) -> Result<Option<AuthSession>, String> {
     let Some(db) = state.db.clone() else {
         return Ok(None);
     };
     tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| {
-            crate::db::store::get_setting(conn, SETTING_ASTRAL_SESSION)
-        })
+        db.with(|conn| crate::db::store::get_setting(conn, SETTING_ASTRAL_SESSION))
     })
     .await
     .map_err(|e| format!("读取本地会话失败: {e}"))?
@@ -2980,10 +2952,7 @@ pub async fn cmd_astral_change_password(
     password: String,
     code: String,
 ) -> Result<serde_json::Value, String> {
-    state
-        .astral
-        .change_password(&email, &password, &code)
-        .await
+    state.astral.change_password(&email, &password, &code).await
 }
 
 #[tauri::command(rename = "astral_update_profile")]
@@ -3197,7 +3166,11 @@ pub async fn cmd_like_apply(
                     // 云端只摘掉变更里指定的那一个 pid（后端删歌单级联软删
                     // (sid,pid) 行时，每行都带 pid）：歌还有别的归属就留着。
                     // 没带 pid 的删除（整首取消收藏）才整首下线。
-                    let pid = if c.pid.is_empty() { None } else { Some(c.pid.as_str()) };
+                    let pid = if c.pid.is_empty() {
+                        None
+                    } else {
+                        Some(c.pid.as_str())
+                    };
                     crate::db::store::remove_liked_song(conn, &track, pid)?;
                     applied += 1;
                 } else if c.pid.is_empty() {
@@ -3238,8 +3211,8 @@ pub async fn cmd_like_flush_pending(state: State<'_, AppState>) -> Result<u32, S
     let ops = tauri::async_runtime::spawn_blocking(move || {
         db_for_list.with(crate::db::store::list_pending_like_ops)
     })
-        .await
-        .map_err(|e| format!("读取离线队列失败: {e}"))??;
+    .await
+    .map_err(|e| format!("读取离线队列失败: {e}"))??;
     let now = crate::astral::now_ms();
     // 退避中的条目本轮不动（保持原有 next_retry_at），其余按入队序进批
     let eligible: Vec<crate::db::store::PendingLikeOp> = ops
@@ -3254,7 +3227,14 @@ pub async fn cmd_like_flush_pending(state: State<'_, AppState>) -> Result<u32, S
         match serde_json::from_str::<serde_json::Value>(&op.payload_json) {
             Ok(mut body) if body.is_object() => {
                 body["type"] = serde_json::json!(op.kind.clone());
-                ready.push((op.id, op.kind, op.action, op.payload_json, op.retry_count, body));
+                ready.push((
+                    op.id,
+                    op.kind,
+                    op.action,
+                    op.payload_json,
+                    op.retry_count,
+                    body,
+                ));
             }
             _ => {
                 log::warn!("[like] 离线队列 payload 损坏 id={} 退避保留", op.id);
@@ -3317,7 +3297,9 @@ pub async fn cmd_like_flush_pending(state: State<'_, AppState>) -> Result<u32, S
                                     == Some("local")
                             })
                             .and_then(|body| {
-                                body.get("pid").and_then(serde_json::Value::as_str).map(str::to_string)
+                                body.get("pid")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_string)
                             })
                     })
                     .map(|pid| (pid, seq))
@@ -3345,7 +3327,10 @@ pub async fn cmd_like_flush_pending(state: State<'_, AppState>) -> Result<u32, S
             Err(e) => {
                 // 整批退避保留。批内 op 顺序语义被中断，后续批次也不能越过它上送
                 //（否则后端按到达序分配 seq 会乱序），整轮停，等恢复后重放
-                log::warn!("[like] 离线批量重放失败 {} 条，整批退避保留: {e}", chunk.len());
+                log::warn!(
+                    "[like] 离线批量重放失败 {} 条，整批退避保留: {e}",
+                    chunk.len()
+                );
                 let deferral: Vec<(String, i64)> = chunk
                     .iter()
                     .map(|(id, .., retries, _)| (id.clone(), *retries))
@@ -3354,7 +3339,9 @@ pub async fn cmd_like_flush_pending(state: State<'_, AppState>) -> Result<u32, S
                 if let Err(e2) = tauri::async_runtime::spawn_blocking(move || {
                     db2.with(|conn| {
                         for (id, retries) in &deferral {
-                            if let Err(e) = crate::db::store::defer_pending_like_op(conn, id, *retries) {
+                            if let Err(e) =
+                                crate::db::store::defer_pending_like_op(conn, id, *retries)
+                            {
                                 log::warn!("[like] 离线队列退避登记失败: {e}");
                             }
                         }
@@ -3439,18 +3426,20 @@ pub async fn cmd_like_reconcile(state: State<'_, AppState>) -> Result<u32, Strin
 
     // 2) 本地数据 + 同步游标（判定「删除事件是否已被增量通道消费过」的界尺）
     let db_for_read = db.clone();
-    let locals = tauri::async_runtime::spawn_blocking(move || db_for_read.with(|conn| {
-        // (pid, cloud_seq)：自建歌单 + 云端确认点（机制 B）
-        let pls = crate::db::store::list_playlist_sync_rows(conn)?;
-        // 云端卡片歌单（收藏的在线歌单 + 他端建的自建歌单）
-        let cards = crate::db::store::list_liked_playlists(conn)?;
-        let cursor = crate::db::store::get_setting(conn, "like.sync.seq")?
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(0);
-        // (sid, platform, name, singer, album, hash, pic, 主归属 pid)
-        let songs = crate::db::store::list_liked_songs_raw(conn)?;
-        Ok::<_, rusqlite::Error>((pls, cards, cursor, songs))
-    }))
+    let locals = tauri::async_runtime::spawn_blocking(move || {
+        db_for_read.with(|conn| {
+            // (pid, cloud_seq)：自建歌单 + 云端确认点（机制 B）
+            let pls = crate::db::store::list_playlist_sync_rows(conn)?;
+            // 云端卡片歌单（收藏的在线歌单 + 他端建的自建歌单）
+            let cards = crate::db::store::list_liked_playlists(conn)?;
+            let cursor = crate::db::store::get_setting(conn, "like.sync.seq")?
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0);
+            // (sid, platform, name, singer, album, hash, pic, 主归属 pid)
+            let songs = crate::db::store::list_liked_songs_raw(conn)?;
+            Ok::<_, rusqlite::Error>((pls, cards, cursor, songs))
+        })
+    })
     .await
     .map_err(|e| format!("读本地收藏失败: {e}"))?
     .map_err(|e| format!("读本地收藏失败: {e}"))?;
@@ -3586,7 +3575,11 @@ pub async fn cmd_like_reconcile(state: State<'_, AppState>) -> Result<u32, Strin
             album: album.clone(),
             pic_url: pic.clone(),
             duration: 0.0,
-            music_id: if hash.is_empty() { None } else { Some(hash.clone()) },
+            music_id: if hash.is_empty() {
+                None
+            } else {
+                Some(hash.clone())
+            },
         };
         missing += 1;
         backfill.push((track, "add".to_string(), Some(pid.clone())));
@@ -3599,10 +3592,7 @@ pub async fn cmd_like_reconcile(state: State<'_, AppState>) -> Result<u32, Strin
 }
 
 /// 按 pid 读自建歌单名（对账补推元数据用）。空串 = 没这行。
-fn playlist_name_by_pid(
-    conn: &rusqlite::Connection,
-    pid: &str,
-) -> Result<String, rusqlite::Error> {
+fn playlist_name_by_pid(conn: &rusqlite::Connection, pid: &str) -> Result<String, rusqlite::Error> {
     use rusqlite::OptionalExtension;
     conn.query_row(
         "SELECT name FROM playlists WHERE pid = ?1",
@@ -3620,10 +3610,7 @@ fn pls_cloud_alive(
     pls: &[(String, Option<i64>)],
     server_pids: &HashSet<String>,
 ) -> bool {
-    server_pids.contains(pid)
-        || pls
-            .iter()
-            .any(|(p, _)| p == pid && server_pids.contains(p))
+    server_pids.contains(pid) || pls.iter().any(|(p, _)| p == pid && server_pids.contains(p))
 }
 
 /// 换账号登录时清空本地收藏（LIKE_SYNC_DESIGN.md §6 的 PC 版）：
@@ -3750,7 +3737,10 @@ mod tests {
     fn ext_comes_from_url_path() {
         // 无损地址（四源实测都是 .flac），即使音质串是 320 也按 URL 走
         assert_eq!(
-            audio_ext_from_url("http://kw-er.kuwo.cn/abc/resource/1/trackmedia/F000.flac", "flac"),
+            audio_ext_from_url(
+                "http://kw-er.kuwo.cn/abc/resource/1/trackmedia/F000.flac",
+                "flac"
+            ),
             "flac"
         );
         assert_eq!(
@@ -3772,10 +3762,7 @@ mod tests {
         assert_eq!(audio_ext_from_url("https://cdn/track/file", "flac"), "flac");
         assert_eq!(audio_ext_from_url("https://cdn/track/file", "320"), "mp3");
         // 非音频后缀（如已失效的重定向地址）也走音质兜底
-        assert_eq!(
-            audio_ext_from_url("https://cdn/x.html", "flac"),
-            "flac"
-        );
+        assert_eq!(audio_ext_from_url("https://cdn/x.html", "flac"), "flac");
         assert_eq!(audio_ext_from_url("https://cdn/x.html", "128"), "mp3");
     }
 
@@ -3804,10 +3791,16 @@ mod tests {
         std::fs::write(&f, b"x").expect("写入");
 
         let path = f.to_string_lossy().to_string();
-        assert!(remove_local_file(&path).expect("首次删除"), "首次应真的删掉文件");
+        assert!(
+            remove_local_file(&path).expect("首次删除"),
+            "首次应真的删掉文件"
+        );
         assert!(!f.exists(), "文件应已不存在");
         // 再删一次：幂等，返回 false 而不是报错
-        assert!(!remove_local_file(&path).expect("重复删除应静默"), "文件已不在应返回 false");
+        assert!(
+            !remove_local_file(&path).expect("重复删除应静默"),
+            "文件已不在应返回 false"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

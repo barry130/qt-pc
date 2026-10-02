@@ -4,7 +4,7 @@
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::provider::types::{Track};
+use crate::provider::types::Track;
 
 // 跨域共享的小工具（`db_track_id` / `now_ms` / `track_from_row` / `LOCAL_PLATFORM` …）
 // 由 store/mod.rs 统一再导出，这里一次性引入，省得每个域各写一长串 use。
@@ -36,7 +36,10 @@ pub(crate) fn record_play_history(conn: &Connection, track: &Track) -> Result<()
         return Ok(());
     }
     let now = now_ms();
-    conn.execute("DELETE FROM play_history WHERE track_id = ?1", params![db_id])?;
+    conn.execute(
+        "DELETE FROM play_history WHERE track_id = ?1",
+        params![db_id],
+    )?;
     conn.execute(
         "INSERT INTO play_history (id, track_id, played_at, played_duration_ms, completed)
          VALUES (?1, ?2, ?3, 0, 0)",

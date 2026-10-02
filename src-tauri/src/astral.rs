@@ -308,7 +308,9 @@ pub(crate) fn sanitize_err(e: impl std::fmt::Display) -> String {
         };
         if scheme > 0 {
             let end = rest[scheme..]
-                .find([' ', '\t', '\r', '\n', '"', '\'', '(', ')', '<', '>', ',', '[', ']', '{', '}'])
+                .find([
+                    ' ', '\t', '\r', '\n', '"', '\'', '(', ')', '<', '>', ',', '[', ']', '{', '}',
+                ])
                 .map_or(rest.len(), |p| p + scheme);
             out.push('…');
             rest = &rest[end..];
@@ -598,9 +600,15 @@ impl AstralClient {
         if let Some(body) = json_body {
             req = req.json(&body);
         }
-        let resp = req.send().await.map_err(|e| format!("Astral 请求失败: {}", sanitize_err(e)))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("Astral 请求失败: {}", sanitize_err(e)))?;
         let status = resp.status();
-        let body: Value = resp.json().await.map_err(|e| format!("Astral 响应解析失败({status}): {e}"))?;
+        let body: Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("Astral 响应解析失败({status}): {e}"))?;
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(ERR_UNAUTHORIZED.to_string());
         }
@@ -623,7 +631,8 @@ impl AstralClient {
     }
 
     async fn get(&self, path: &str, query: &[(&str, &str)], auth: bool) -> Result<Value, String> {
-        self.request(reqwest::Method::GET, path, query, None, &[], auth).await
+        self.request(reqwest::Method::GET, path, query, None, &[], auth)
+            .await
     }
 
     /// 免认证 POST（音源包装载结果上报等公开端点）
@@ -639,8 +648,10 @@ impl AstralClient {
         extra_headers: &[(&'static str, String)],
         auth: bool,
     ) -> Result<Value, String> {
-        let headers: Vec<(&str, &str)> =
-            extra_headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let headers: Vec<(&str, &str)> = extra_headers
+            .iter()
+            .map(|(k, v)| (*k, v.as_str()))
+            .collect();
         self.request(reqwest::Method::POST, path, &[], Some(body), &headers, auth)
             .await
     }
@@ -650,7 +661,12 @@ impl AstralClient {
     /// 登录。成功即把 token 装进客户端（后续请求自动带 satoken）。
     pub async fn login(&self, username: &str, password: &str) -> Result<AuthSession, String> {
         let data = self
-            .post_json("app/user/login", json!({ "username": username, "password": password }), &[], false)
+            .post_json(
+                "app/user/login",
+                json!({ "username": username, "password": password }),
+                &[],
+                false,
+            )
             .await?;
         let session = parse_session(&data)?;
         self.set_session(&session);
@@ -726,8 +742,13 @@ impl AstralClient {
     /// 发送邮箱验证码。`scene` 是邮件模板业务标识（见 [`MAIL_SCENE_CHANGE_PW`]），
     /// 不是邮件正文：它同时决定模板渲染和验证码的存取 key。
     pub async fn send_email_code(&self, email: &str, scene: &str) -> Result<Value, String> {
-        self.post_json("app/user/email", json!({ "email": email, "body": scene }), &[], false)
-            .await
+        self.post_json(
+            "app/user/email",
+            json!({ "email": email, "body": scene }),
+            &[],
+            false,
+        )
+        .await
     }
 
     /// 邮箱验证码改密码
@@ -773,17 +794,18 @@ impl AstralClient {
     /// 增量拉取收藏变更：返回 (changes, maxSeq)。游标存在调用方。
     pub async fn like_changes(&self, since: i64) -> Result<(Vec<Value>, i64), String> {
         let data = self
-            .get("app/user/like/changes", &[("since", &since.to_string())], true)
+            .get(
+                "app/user/like/changes",
+                &[("since", &since.to_string())],
+                true,
+            )
             .await?;
         let changes = data
             .get("changes")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let max_seq = data
-            .get("maxSeq")
-            .and_then(Value::as_i64)
-            .unwrap_or(since);
+        let max_seq = data.get("maxSeq").and_then(Value::as_i64).unwrap_or(since);
         Ok((changes, max_seq))
     }
 
@@ -855,7 +877,12 @@ impl AstralClient {
     /// 头像回执登记（app/user/avatar/complete），返回头像 URL（即版本）。
     pub async fn avatar_complete(&self, upload_id: &str) -> Result<String, String> {
         let data = self
-            .post_json("app/user/avatar/complete", json!({ "uploadId": upload_id }), &[], true)
+            .post_json(
+                "app/user/avatar/complete",
+                json!({ "uploadId": upload_id }),
+                &[],
+                true,
+            )
             .await?;
         Self::url_of(&data)
     }
@@ -886,7 +913,12 @@ impl AstralClient {
     }
 
     /// 歌单封面回执登记，返回封面 URL。
-    pub async fn cover_complete(&self, pid: &str, platform: &str, upload_id: &str) -> Result<String, String> {
+    pub async fn cover_complete(
+        &self,
+        pid: &str,
+        platform: &str,
+        upload_id: &str,
+    ) -> Result<String, String> {
         let data = self
             .request(
                 reqwest::Method::POST,
@@ -995,7 +1027,11 @@ impl AstralClient {
             "png" => "image/png",
             "jpg" | "jpeg" => "image/jpeg",
             "webp" => "image/webp",
-            other => return Err(format!("暂不支持的图片格式 .{other}，仅支持 png / jpg / webp")),
+            other => {
+                return Err(format!(
+                    "暂不支持的图片格式 .{other}，仅支持 png / jpg / webp"
+                ))
+            }
         };
         let meta = std::fs::metadata(path).map_err(|_| format!("读不到文件：{path}"))?;
         // 大小上限放在预检里：不合格的图片不必白跑一趟取凭证的网络请求
@@ -1040,7 +1076,12 @@ impl AstralClient {
     }
 
     /// 歌单封面上传一条龙，返回封面 URL。
-    pub async fn upload_cover_file(&self, pid: &str, platform: &str, path: &str) -> Result<String, String> {
+    pub async fn upload_cover_file(
+        &self,
+        pid: &str,
+        platform: &str,
+        path: &str,
+    ) -> Result<String, String> {
         let (name, mime, size) = Self::image_meta(path, "cover")?;
         let t = self.cover_ticket(pid, platform, &name, &mime, size).await?;
         let bytes = Self::read_image_bytes(path).await?;
@@ -1091,7 +1132,11 @@ impl AstralClient {
         let code_str = version_code.to_string();
         self.get(
             "app/version/check",
-            &[("type", UPDATE_TYPE), ("version", &code_str), ("versionName", version_name)],
+            &[
+                ("type", UPDATE_TYPE),
+                ("version", &code_str),
+                ("versionName", version_name),
+            ],
             false,
         )
         .await
@@ -1288,7 +1333,8 @@ impl AstralClient {
                 });
             }
         } {
-            file.write_all(&chunk).map_err(|e| format!("写入失败: {e}"))?;
+            file.write_all(&chunk)
+                .map_err(|e| format!("写入失败: {e}"))?;
             written += chunk.len() as u64;
             let percent = if total > 0 {
                 (written * 100).div_ceil(total)
@@ -1351,18 +1397,14 @@ impl AstralClient {
                 sig.len()
             ));
         }
-        let file =
-            std::fs::read(path).map_err(|e| format!("读取安装包失败: {e}"))?;
+        let file = std::fs::read(path).map_err(|e| format!("读取安装包失败: {e}"))?;
         ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &pubkey)
             .verify(&file, &sig)
             .map_err(|_| "安装包签名不匹配（文件可能被篡改）".to_string())
     }
 
     /// 用内嵌公钥（[`UPDATE_SIGN_PUBKEY_B64`]）校验安装包签名
-    pub fn verify_installer_signature(
-        path: &std::path::Path,
-        sig_b64: &str,
-    ) -> Result<(), String> {
+    pub fn verify_installer_signature(path: &std::path::Path, sig_b64: &str) -> Result<(), String> {
         Self::verify_installer_signature_with(path, sig_b64, UPDATE_SIGN_PUBKEY_B64)
     }
 
@@ -1378,17 +1420,20 @@ impl AstralClient {
                 .map_err(|e| format!("读取文件失败: {e}"))?
                 .len();
             if actual != expect as u64 {
-                return Err(format!("文件大小不符：期望 {expect} 字节，实际 {actual} 字节"));
+                return Err(format!(
+                    "文件大小不符：期望 {expect} 字节，实际 {actual} 字节"
+                ));
             }
         }
         if let Some(expect) = expect_md5.filter(|s| !s.is_empty()) {
             use md5::Digest;
-            let mut file =
-                std::fs::File::open(path).map_err(|e| format!("读取文件失败: {e}"))?;
+            let mut file = std::fs::File::open(path).map_err(|e| format!("读取文件失败: {e}"))?;
             let mut hasher = md5::Md5::default();
             let mut buf = [0u8; 65536];
             loop {
-                let n = file.read(&mut buf).map_err(|e| format!("读取文件失败: {e}"))?;
+                let n = file
+                    .read(&mut buf)
+                    .map_err(|e| format!("读取文件失败: {e}"))?;
                 if n == 0 {
                     break;
                 }
@@ -1406,16 +1451,26 @@ impl AstralClient {
 
     pub async fn active_messages(&self, version_code: i64) -> Result<Value, String> {
         let code_str = version_code.to_string();
-        self.get("app/message/active", &[("versionCode", &code_str), ("channel", MESSAGE_CHANNEL)], false)
-            .await
+        self.get(
+            "app/message/active",
+            &[("versionCode", &code_str), ("channel", MESSAGE_CHANNEL)],
+            false,
+        )
+        .await
     }
 
     pub async fn message_center(&self) -> Result<Value, String> {
-        self.get("app/message/center", &[("channel", MESSAGE_CHANNEL)], true).await
+        self.get("app/message/center", &[("channel", MESSAGE_CHANNEL)], true)
+            .await
     }
 
     pub async fn unread_count(&self) -> Result<Value, String> {
-        self.get("app/message/unread-count", &[("channel", MESSAGE_CHANNEL)], true).await
+        self.get(
+            "app/message/unread-count",
+            &[("channel", MESSAGE_CHANNEL)],
+            true,
+        )
+        .await
     }
 
     /// 已读回执：body {ids: []}
@@ -1442,9 +1497,14 @@ impl AstralClient {
         }
         // App 端上报走 AppStatController：/api/v1/app/stat/report（旧 /api/v1/stat/report
         // 已废弃，见该控制器注释）。base_url 已含 /api/v1/，拼相对路径 app/stat/report
-        self.post_json("app/stat/report", serde_json::json!({ "events": events }), &[], false)
-            .await
-            .map(|_| ())
+        self.post_json(
+            "app/stat/report",
+            serde_json::json!({ "events": events }),
+            &[],
+            false,
+        )
+        .await
+        .map(|_| ())
     }
 
     // ---------- 反馈（客户端信息头由 request() 统一注入） ----------
@@ -1466,7 +1526,10 @@ impl AstralClient {
     pub async fn my_feedback(&self, page_num: i64, page_size: i64) -> Result<Value, String> {
         self.get(
             "app/feedback/my",
-            &[("pageNum", &page_num.to_string()), ("pageSize", &page_size.to_string())],
+            &[
+                ("pageNum", &page_num.to_string()),
+                ("pageSize", &page_size.to_string()),
+            ],
             true,
         )
         .await
@@ -1475,7 +1538,10 @@ impl AstralClient {
     pub async fn public_feedback(&self, page_num: i64, page_size: i64) -> Result<Value, String> {
         self.get(
             "app/feedback/public",
-            &[("pageNum", &page_num.to_string()), ("pageSize", &page_size.to_string())],
+            &[
+                ("pageNum", &page_num.to_string()),
+                ("pageSize", &page_size.to_string()),
+            ],
             true,
         )
         .await
@@ -1486,7 +1552,8 @@ impl AstralClient {
     }
 
     pub async fn feedback_replies(&self, id: i64) -> Result<Value, String> {
-        self.get(&format!("app/feedback/{id}/replies"), &[], true).await
+        self.get(&format!("app/feedback/{id}/replies"), &[], true)
+            .await
     }
 
     pub async fn reply_feedback(&self, feedback_id: i64, content: &str) -> Result<Value, String> {
@@ -1569,7 +1636,9 @@ fn windows_registry_string(name: &str) -> Option<String> {
     if len == 0 {
         return None;
     }
-    String::from_utf16(&buf[..len]).ok().filter(|s| !s.is_empty())
+    String::from_utf16(&buf[..len])
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 /// 操作系统描述（`X-OS` 的值）。
@@ -1577,8 +1646,7 @@ fn windows_registry_string(name: &str) -> Option<String> {
 /// （音频驱动 / WebView2 的差异常常只体现在内部版本号上）；注册表读不到时退化为 `Windows`。
 #[cfg(target_os = "windows")]
 fn os_description() -> String {
-    let product = windows_registry_string("ProductName")
-        .unwrap_or_else(|| "Windows".to_string());
+    let product = windows_registry_string("ProductName").unwrap_or_else(|| "Windows".to_string());
     let display = windows_registry_string("DisplayVersion").unwrap_or_default();
     let build = windows_registry_string("CurrentBuildNumber").unwrap_or_default();
     let mut out = product;
@@ -1731,7 +1799,8 @@ mod tests {
         assert_eq!(CLIENT_UT, "app-windows");
         assert_eq!(UPDATE_TYPE, "1103");
         assert_eq!(MESSAGE_CHANNEL, "pc");
-        let events = vec![serde_json::json!({ "evt": "launcher", "ts": 1, "deviceId": "d", "ut": "x" })];
+        let events =
+            vec![serde_json::json!({ "evt": "launcher", "ts": 1, "deviceId": "d", "ut": "x" })];
         let mut events = events;
         for evt in events.iter_mut() {
             evt["ut"] = Value::String(CLIENT_UT.to_string());
@@ -1868,7 +1937,10 @@ mod tests {
         let bad_sig = format!("{}A", &sig[..sig.len() - 1]);
         assert!(AstralClient::verify_installer_signature_with(&file, &bad_sig, pk).is_err());
         // 换成内嵌正式公钥 → 拒绝（测试密钥签的东西不认）
-        assert!(AstralClient::verify_installer_signature_with(&file, sig, UPDATE_SIGN_PUBKEY_B64).is_err());
+        assert!(
+            AstralClient::verify_installer_signature_with(&file, sig, UPDATE_SIGN_PUBKEY_B64)
+                .is_err()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1962,7 +2034,10 @@ mod tests {
         let e2 = "Astral 请求失败: https://storage.canace.icu/p/xyz/1 超时";
         assert_eq!(sanitize_err(e2), "Astral 请求失败: … 超时");
         // 无 URL 原样通过；中文/尾部 URL 也能处理
-        assert_eq!(sanitize_err("manifest 解析失败: invalid type"), "manifest 解析失败: invalid type");
+        assert_eq!(
+            sanitize_err("manifest 解析失败: invalid type"),
+            "manifest 解析失败: invalid type"
+        );
         assert_eq!(sanitize_err("拉取 https://x.cn/a 失败"), "拉取 … 失败");
     }
 
@@ -2031,10 +2106,9 @@ mod tests {
         assert_eq!(size, 9);
 
         // 实读：正常文件原样读回（走 spawn_blocking，不占 async 线程）
-        let bytes = tauri::async_runtime::block_on(AstralClient::read_image_bytes(
-            small.to_str().unwrap(),
-        ))
-        .expect("read");
+        let bytes =
+            tauri::async_runtime::block_on(AstralClient::read_image_bytes(small.to_str().unwrap()))
+                .expect("read");
         assert_eq!(bytes, b"png-bytes");
 
         // 超限文件：稀疏文件（set_len 不真占磁盘）也会在读之前/读之中被挡住
@@ -2045,10 +2119,9 @@ mod tests {
             .expect("set_len");
         let err = AstralClient::image_meta(big.to_str().unwrap(), "avatar").unwrap_err();
         assert!(err.contains("图片过大"), "预检文案: {err}");
-        let err = tauri::async_runtime::block_on(AstralClient::read_image_bytes(
-            big.to_str().unwrap(),
-        ))
-        .unwrap_err();
+        let err =
+            tauri::async_runtime::block_on(AstralClient::read_image_bytes(big.to_str().unwrap()))
+                .unwrap_err();
         assert!(err.contains("图片过大"), "实读文案: {err}");
         assert!(err.contains("8 MiB"), "上限要写清楚: {err}");
 
