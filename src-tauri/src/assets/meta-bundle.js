@@ -3046,3 +3046,4 @@ export {
   PLAY_PACK_MISSING_MESSAGE,
   registerQtEntries
 };
+/*__QT_SIGN__{"alg":"ed25519","sig":"iFNVJHkFkt5xSPF58mLfmv75KL5R5OCygj3fSMOZ3LEPWY0w/2sdvOQ3mj4e0EPu/qJfNh5ZM+HXgaAgAzggDw=="}*/

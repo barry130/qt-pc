@@ -47,6 +47,11 @@ jobs:
         with:
           workspaces: src-tauri
 
+      # Rust 测试不过不发版（ci.yml 常跑，但 tag 可能从没进过 CI 的提交打出——
+      # 2026-10-08 审计补充：发版门此前只挡了前端测试）
+      - name: Run cargo tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
       # 本机 pnpm tauri build 有 argv0 解析 bug；`pnpm exec + --runner cargo`
       # 是 docs/PACKAGING.md 步骤 2 验证过的路径（CI 上同样成立）
       - name: 构建 NSIS 安装包

@@ -42,8 +42,9 @@ use crate::source_pack_header::{
 };
 use crate::{source_bundle, AppState};
 
-/// 音源包宿主契约版本（bundle 要求更高时拒绝加载）。
-pub const HOST_API_VERSION: i64 = 1;
+// 宿主契约版本取 app_config（app.config.json 单一来源生成）；本文件旧版本曾
+// 重复手写字面量，会随 sync 漂移 —— 2026-10-08 审计修复，改引用不复制。
+use crate::app_config::HOST_API_VERSION;
 
 /// 状态结构版本（v3 统一包模型）
 const STATE_SCHEMA: i64 = 3;
