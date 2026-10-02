@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { BarChart3, ChevronRight, Disc3, FileMusic, Flame, PackageOpen, Sparkles } from "lucide-react";
 import type { Chart, Playlist, Track } from "@/types";
-import { SOURCE_DISPLAY } from "@/types";
+import { useSourceLabel } from "@/stores/sourceRegistry";
 import * as sourceApi from "@/source-scripts";
 import { getRecommendations } from "@/source-scripts";
 import { engineSnapshot } from "@/source-engine/client";
@@ -104,8 +104,9 @@ export function DiscoverPage(): React.JSX.Element {
     };
   }, []);
 
+  const activeSourceLabel = useSourceLabel(activeSourceId);
   const sourceLabel =
-    activeSourceId === "local" ? "本地音乐" : SOURCE_DISPLAY[activeSourceId];
+    activeSourceId === "local" ? "本地音乐" : activeSourceLabel;
 
   return (
     <div className="h-full min-w-0 overflow-y-auto pb-6">

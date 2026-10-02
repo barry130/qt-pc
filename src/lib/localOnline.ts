@@ -1,5 +1,6 @@
 import * as sourceApi from "@/source-scripts";
 import { playUrlHitLine } from "@/source-scripts/playurl-line";
+import { registryHasSource } from "@/stores/sourceRegistry";
 import type { PlayUrlLine } from "@/source-engine/client";
 import type { Lyric, Quality, SourceId, Track } from "@/types";
 
@@ -63,19 +64,18 @@ export function resolveLocalOnlineMeta(
   return task;
 }
 
-const ONLINE_SOURCES: ReadonlyArray<Exclude<SourceId, "local">> = ["wyy", "qq", "kw", "kg"];
-
 /** 跨源兜底命中信息：target = 实际在播的源；song = 线路上精确命中的那首歌（旧引擎页为 null） */
 export interface CrossSourceHit {
   target: SourceId;
   song: Track | null;
 }
 
-/** 从命中线路解析跨源兜底（id 形如 `cross:kw`，targetSong 是命中的歌，可能为 null） */
+/** 从命中线路解析跨源兜底（id 形如 `cross:kw`，targetSong 是命中的歌，可能为 null）。
+ *  目标源必须仍在数据包注册表里声明（包下线某源后，旧缓存线路不再算数）。 */
 export function crossSourceHitFromLine(line: PlayUrlLine | null, currentPlatform: SourceId): CrossSourceHit | null {
   if (line === null || !line.id.startsWith("cross:")) return null;
   const target = line.id.slice("cross:".length);
-  if (!(ONLINE_SOURCES as readonly string[]).includes(target) || target === currentPlatform) {
+  if (target === "local" || target === currentPlatform || !registryHasSource(target)) {
     return null;
   }
   return { target: target as SourceId, song: crossSongToTrack(line.targetSong, target as SourceId) };

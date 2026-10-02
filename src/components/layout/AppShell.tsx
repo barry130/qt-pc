@@ -22,6 +22,7 @@ import { SourceUpdatePrompt } from "@/components/SourceUpdatePrompt";
 import { MetaPackGuide } from "@/components/MetaPackGuide";
 import { useAppearanceStore } from "@/stores/appearance";
 import { usePlayerStore } from "@/stores/player";
+import { useSourceRegistryStore } from "@/stores/sourceRegistry";
 import { useDownloadsStore } from "@/stores/downloads";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { initStat, trackStatPage } from "@/lib/stat";
@@ -46,6 +47,12 @@ export function AppShell(): React.JSX.Element {
   useUpdateCheck();
   // 播放音源包启动静默检查（只更新已装的官方包；未安装时不打扰）
   useSourceUpdateCheck();
+  // 音源/音质注册表：数据包声明的清单是所有音源选项的唯一来源，启动拉一次
+  // （幂等；引擎未就绪时保持未加载，后续 ensure/refresh 会再试）
+  const ensureRegistry = useSourceRegistryStore((s) => s.ensure);
+  useEffect(() => {
+    void ensureRegistry();
+  }, [ensureRegistry]);
 
   const bgImage = useAppearanceStore((s) => s.preference.bgImage);
   // 无封面 URL 的曲目（部分 wyy 曲 picUrl 为空）不渲染背景，避免退化成固定 --primary 色

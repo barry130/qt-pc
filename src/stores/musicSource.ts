@@ -51,23 +51,21 @@ const PERSIST_VERSION = 1;
 /** 真正落盘的字段（只存状态，不存 setter；也不存将来可能加的派生/大字段） */
 type PersistedMusicSource = Pick<MusicSourceStore, "activeSourceId" | "aggregateMode">;
 
-/** 运行时可接受的音源 id（SourceId 是类型，运行时要自己列一份用来校验存档） */
-const VALID_SOURCE_IDS: readonly SourceId[] = ["wyy", "qq", "kw", "kg", "local"];
-
 /**
  * 把任意版本 / 被手改过的存档收敛成合法结构。
  * 为什么必须做：存档是用户可编辑的（devtools / 旧版本写入），
- * 一个非法 activeSourceId 会让所有页面按未知音源请求而**没有报错**，
+ * 一个非字符串的 activeSourceId 会让所有页面按未知音源请求而**没有报错**，
  * 排查成本极高；这里退回默认值，行为可预期。
+ *
+ * id 的**清单校验**不在这里做：音源列表由数据包注册表声明
+ * （stores/sourceRegistry.ts），加载完成后由它把已下线的 id 纠正为
+ * 数据包里的第一个音源（见 validateActiveSource）。
  */
 function sanitizePersisted(raw: unknown): PersistedMusicSource {
   const src = (raw ?? {}) as Partial<Record<keyof PersistedMusicSource, unknown>>;
   const id = src.activeSourceId;
   return {
-    activeSourceId:
-      typeof id === "string" && (VALID_SOURCE_IDS as readonly string[]).includes(id)
-        ? (id as SourceId)
-        : "wyy",
+    activeSourceId: typeof id === "string" && id.length > 0 ? id : "wyy",
     aggregateMode: typeof src.aggregateMode === "boolean" ? src.aggregateMode : false,
   };
 }

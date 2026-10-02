@@ -25,7 +25,8 @@ import { usePlayerStore } from "@/stores/player";
 import { useAuthStore, isAdmin } from "@/stores/auth";
 import { CollectButton } from "@/components/player/CollectButton";
 import { DownloadButton } from "@/components/mine/DownloadButton";
-import { QUALITY_OPTIONS, qualityShort } from "@/lib/quality";
+import { qualityOptionsFromRegistry } from "@/lib/quality";
+import { useSourceRegistryStore } from "@/stores/sourceRegistry";
 import { SPEED_OPTIONS, speedLabel } from "@/lib/fx";
 import type { Quality } from "@/types";
 import { useInterpolatedPosition } from "@/hooks/useInterpolatedPosition";
@@ -529,6 +530,12 @@ function QualityMenu(props: { current: Quality }): React.JSX.Element {
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const boxRef = useRef<HTMLDivElement | null>(null);
+  // 档位清单来自数据包注册表（未就绪时 qualityOptionsFromRegistry 兜底三档）
+  const options = qualityOptionsFromRegistry(
+    useSourceRegistryStore((s) => s.qualities),
+  );
+  const shortOf = (q: Quality): string =>
+    options.find((o) => o.value === q)?.short ?? q;
 
   // 点外面 / Esc 收起
   useEffect(() => {
@@ -559,7 +566,7 @@ function QualityMenu(props: { current: Quality }): React.JSX.Element {
     <div ref={boxRef} className="relative">
       <button
         type="button"
-        aria-label={`音质：${qualityShort(props.current)}（只对当前这首歌生效）`}
+        aria-label={`音质：${shortOf(props.current)}（只对当前这首歌生效）`}
         title="音质（只对当前这首歌生效，默认音质在设置里改）"
         aria-haspopup="menu"
         aria-expanded={open}
@@ -574,14 +581,14 @@ function QualityMenu(props: { current: Quality }): React.JSX.Element {
             : "bg-secondary/40 text-foreground/80 hover:bg-secondary/60",
         )}
       >
-        {qualityShort(props.current)}
+        {shortOf(props.current)}
       </button>
       {open ? (
         <div
           role="menu"
           className="absolute bottom-full right-0 z-30 mb-2 w-32 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg"
         >
-          {QUALITY_OPTIONS.map((o) => (
+          {options.map((o) => (
             <button
               key={o.value}
               type="button"

@@ -57,12 +57,28 @@ describe("musicSource persist 版本与校验（P2-8）", () => {
   });
 
   it("当前版本但字段非法 → 收敛为默认值", async () => {
-    // 版本号一致 → zustand 不会调 migrate，只有 merge 里的 sanitize 能兜住
+    // 版本号一致 → zustand 不会调 migrate，只有 merge 里的 sanitize 能兜住。
+    // 音源 id 的清单校验已移交数据包注册表（stores/sourceRegistry.ts 的
+    // validateActiveSource 在注册表加载后纠正已下线的 id），sanitize 只拦
+    // 结构性非法值（非字符串/空串）并回退默认值。
     const s = await hydrateWith({
       state: { activeSourceId: "bogus", aggregateMode: "yes" },
       version: 1,
     });
-    expect(s).toEqual({ activeSourceId: "wyy", aggregateMode: false });
+    expect(s).toEqual({ activeSourceId: "bogus", aggregateMode: false });
+  });
+
+  it("activeSourceId 非字符串/空串 → 回退默认 wyy", async () => {
+    const a = await hydrateWith({
+      state: { activeSourceId: 42, aggregateMode: false },
+      version: 1,
+    });
+    expect(a.activeSourceId).toBe("wyy");
+    const b = await hydrateWith({
+      state: { activeSourceId: "", aggregateMode: false },
+      version: 1,
+    });
+    expect(b.activeSourceId).toBe("wyy");
   });
 
   it("无版本号的旧存档（v0）也走 sanitize，且合法值原样保留", async () => {

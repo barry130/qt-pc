@@ -1,8 +1,17 @@
-/** 源 ID，与 DESIGN §6.4 一致（serde rename_all = "lowercase"） */
-export type SourceId = "wyy" | "qq" | "kw" | "kg" | "local";
+/**
+ * 源 ID。**清单由数据包注册表声明**（`__qtEntries.sourceRegistry()` →
+ * stores/sourceRegistry.ts），本端不内置音源列表；`"local"` 是保留值（本地
+ * 曲库，不走在线接口）。注意：Rust 侧 `provider::types::SourceId` 是封闭
+ * 枚举，**全新 id** 要真正可播/可收藏还需在 Rust `parse()` 补一枚（存量
+ * 四源 + local 不受影响；下线某个源只需数据包不再声明，UI 随之消失）。
+ */
+export type SourceId = string;
 
-/** 音质，serde 值直接对齐 "128" / "320" / "flac" */
-export type Quality = "128" | "320" | "flac";
+/**
+ * 音质 id。档位清单同样由数据包注册表声明；可播值受 Rust serde 枚举约束
+ * （"128" / "320" / "flac"，判口径见 lib/quality.ts 的 isQuality）。
+ */
+export type Quality = string;
 
 export type PlaybackStatus =
   | "stopped"
@@ -231,12 +240,25 @@ export interface QueueChanged {
   index: number | null;
 }
 
-export const SOURCE_DISPLAY: Record<Exclude<SourceId, "local">, string> = {
-  wyy: "音源一",
-  qq: "音源二",
-  kw: "音源三",
-  kg: "音源四",
-};
+/** 数据包注册表声明的音源：展示名/短名/色值，数组顺序即 UI 展示顺序 */
+export interface RegistrySource {
+  id: string;
+  name: string;
+  short: string;
+  color: string;
+}
+
+/** 数据包注册表声明的音质档位 */
+export interface RegistryQuality {
+  id: string;
+  name: string;
+}
+
+/** 数据包注册表（source-scripts 的 getSourceRegistry 解析产物） */
+export interface SourceRegistry {
+  sources: RegistrySource[];
+  qualities: RegistryQuality[];
+}
 
 /** 外观偏好（DESIGN §9.2 AppearancePreference，存 SQLite settings 表） */
 export interface AppearancePreference {

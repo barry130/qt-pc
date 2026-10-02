@@ -27,6 +27,7 @@ import type {
   PlaylistCategory,
   Quality,
   SourceId,
+  SourceRegistry,
   Track,
 } from "@/types";
 import type {
@@ -180,7 +181,7 @@ export async function searchAllMusicSources(
 }
 
 /** 聚合搜索的分批结果：单源一批，platform 已归属到每首曲目。
- *  source 不含 "local"（bundle 里的 searchAll 只搜在线源），可直接喂 SOURCE_DISPLAY。 */
+ *  source 不含 "local"（bundle 里的 searchAll 只搜在线源），展示名走注册表。 */
 export interface SearchSourceBatch {
   source: Exclude<SourceId, "local">;
   tracks: Track[];
@@ -501,15 +502,61 @@ export async function getLatestSongs(
   return list.map((m) => toAppTrack(m, source));
 }
 
+// ---------- 注册表 ----------
+
+/**
+ * 数据包声明的音源/音质清单（`__qtEntries.sourceRegistry`）。
+ * 音源 id/名称/色值与音质档位的**唯一真源**在 qt-sources 的 registry.ts，
+ * 宿主 UI 的选项列表一律从这里取。引擎未就绪 / 旧版内置包无该入口 /
+ * 返回结构不符 → null（调用方按空清单处理，本地音乐不受影响）。
+ */
+export async function getSourceRegistry(): Promise<SourceRegistry | null> {
+  try {
+    return await sourceCall<SourceRegistry>("sourceRegistry", {}, (p) => {
+      const sources = p.sources;
+      const qualities = p.qualities;
+      if (!Array.isArray(sources) || !Array.isArray(qualities)) return undefined;
+      const srcOk = sources.every(
+        (s) =>
+          s && typeof s === "object" &&
+          typeof (s as RegistryLike).id === "string" &&
+          typeof (s as RegistryLike).name === "string",
+      );
+      const qOk = qualities.every(
+        (q) =>
+          q && typeof q === "object" &&
+          typeof (q as RegistryLike).id === "string" &&
+          typeof (q as RegistryLike).name === "string",
+      );
+      if (!srcOk || !qOk || sources.length === 0) return undefined;
+      return { sources: sources as SourceRegistry["sources"], qualities: qualities as SourceRegistry["qualities"] };
+    });
+  } catch {
+    // 引擎启动中 / 入口不存在（升级前的旧内置包）：不算错误，交给上层重试
+    return null;
+  }
+}
+
+/** getSourceRegistry 里做形状校验用的最小结构 */
+interface RegistryLike {
+  id: unknown;
+  name: unknown;
+}
+
 export async function getAllLatestSongs(
   limit: number,
   offset: number,
 ): Promise<Track[]> {
-  // 不走 bundle 的 allLatest 入口：它返回的 MusicInfo 不带 platform，四源混批后
+  // 不走 bundle 的 allLatest 入口：它返回的 MusicInfo 不带 platform，多源混批后
   // 无法归属（取链依赖 platform），安卓端同样绕过它。这里逐源调 latest 入口，
   // 交错合并在宿主侧做（与蓝本同口径：wyy/kg 带 offset，单源失败跳过）。
-  const perSource = Math.ceil(limit / 4) + 1;
-  const sources: SourceId[] = ["wyy", "qq", "kw", "kg"];
+  // 源清单来自数据包注册表——包里少了谁，这里就少拉谁。
+  const registry = await getSourceRegistry();
+  const sources: SourceId[] = (registry?.sources ?? [])
+    .map((s) => s.id)
+    .filter((id) => id !== "local");
+  if (sources.length === 0) return [];
+  const perSource = Math.ceil(limit / sources.length) + 1;
   const batches = await Promise.all(
     sources.map(async (source) => {
       const pageOffset = source === "wyy" || source === "kg" ? offset : 0;

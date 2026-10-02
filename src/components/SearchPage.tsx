@@ -3,7 +3,7 @@ import { errMsg } from "@/lib/utils";
 import { Play, Search, SearchX, X } from "lucide-react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import type { Album, Artist, Playlist, Track } from "@/types";
-import { SOURCE_DISPLAY } from "@/types";
+import { useSourceLabelFn } from "@/stores/sourceRegistry";
 import * as sourceApi from "@/source-scripts";
 import type { SearchSourceBatch } from "@/source-scripts";
 import { usePlayerStore } from "@/stores/player";
@@ -46,6 +46,7 @@ export function SearchPage(): React.JSX.Element {
   const urlParams = useSearch({ strict: false }) as { q?: string };
   const navigate = useNavigate();
   const activeSourceId = useMusicSourceStore((s) => s.activeSourceId);
+  const sourceLabel = useSourceLabelFn();
   const aggregateMode = useMusicSourceStore((s) => s.aggregateMode);
   const setAggregateMode = useMusicSourceStore((s) => s.setAggregateMode);
 
@@ -343,7 +344,7 @@ export function SearchPage(): React.JSX.Element {
               <div key={batch.source}>
                 <div className="flex items-center gap-2 border-b border-border/60 bg-secondary/30 px-4 py-1.5">
                   <span className="text-xs font-medium text-muted-foreground">
-                    {SOURCE_DISPLAY[batch.source] ?? batch.source}
+                    {sourceLabel(batch.source)}
                   </span>
                   <span className="text-[10px] text-muted-foreground/70">
                     {batch.tracks.length} 首
@@ -354,7 +355,7 @@ export function SearchPage(): React.JSX.Element {
                     key={`${batch.source}-${t.id}-${i}`}
                     track={t}
                     active={currentTrackId === t.id}
-                    badge={SOURCE_DISPLAY[batch.source]}
+                    badge={sourceLabel(batch.source)}
                     onPlay={() => void playQueue(songs, start + i)}
                   />
                 ))}

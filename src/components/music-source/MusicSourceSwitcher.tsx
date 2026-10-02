@@ -1,21 +1,27 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, ChevronDown } from "lucide-react";
 import { useMusicSourceStore } from "@/stores/musicSource";
-import { SOURCE_DISPLAY, type SourceId } from "@/types";
+import { useSourceRegistryStore, useSourceLabel } from "@/stores/sourceRegistry";
 import { cn } from "@/lib/utils";
 
 /**
  * 标题栏音源切换器（DESIGN §6.2）——音源全局状态的唯一入口。
- * M1 仅 wyy 已接入 Provider；其余源选择后内容请求会返回 Unsupported 并提示。
+ * 选项清单来自数据包注册表（stores/sourceRegistry.ts），本端不内置音源列表；
+ * 注册表未加载完成前列表为空，当前项展示名兜底「未知」。
  */
-
-const SOURCES = Object.keys(SOURCE_DISPLAY) as Array<Exclude<SourceId, "local">>;
 
 export function MusicSourceSwitcher(): React.JSX.Element {
   const activeSourceId = useMusicSourceStore((s) => s.activeSourceId);
   const setActiveSource = useMusicSourceStore((s) => s.setActiveSource);
+  const sources = useSourceRegistryStore((s) => s.sources);
+  const ensureRegistry = useSourceRegistryStore((s) => s.ensure);
+  const activeLabel = useSourceLabel(activeSourceId);
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    void ensureRegistry();
+  }, [ensureRegistry]);
 
   useEffect(() => {
     if (!open) return;
@@ -41,7 +47,7 @@ export function MusicSourceSwitcher(): React.JSX.Element {
           open && "bg-accent",
         )}
       >
-        音源：{activeSourceId === "local" ? "本地" : SOURCE_DISPLAY[activeSourceId]}
+        音源：{activeLabel}
         <ChevronDown className="h-3 w-3 opacity-60" />
       </button>
 
@@ -52,23 +58,26 @@ export function MusicSourceSwitcher(): React.JSX.Element {
           // 透明度也别太靠页：80% 会让下面的内容明显透上来
           className="absolute left-1/2 top-full z-50 mt-1 w-36 -translate-x-1/2 overflow-hidden rounded-xl border border-border bg-popover/95 py-1 shadow-2xl backdrop-blur-xl"
         >
-          {SOURCES.map((id) => (
-            <li key={id}>
+          {sources.length === 0 && (
+            <li className="px-3 py-1.5 text-xs text-muted-foreground">数据包未就绪</li>
+          )}
+          {sources.map((s) => (
+            <li key={s.id}>
               <button
                 type="button"
                 role="option"
-                aria-selected={id === activeSourceId}
+                aria-selected={s.id === activeSourceId}
                 onClick={() => {
-                  setActiveSource(id);
+                  setActiveSource(s.id);
                   setOpen(false);
                 }}
                 className={cn(
                   "flex w-full items-center justify-between px-3 py-1.5 text-xs transition-colors hover:bg-secondary hover:text-foreground",
-                  id === activeSourceId ? "text-primary" : "text-popover-foreground",
+                  s.id === activeSourceId ? "text-primary" : "text-popover-foreground",
                 )}
               >
-                <span>{SOURCE_DISPLAY[id]}</span>
-                {id === activeSourceId && (
+                <span>{s.name}</span>
+                {s.id === activeSourceId && (
                   <Check className="h-3.5 w-3.5 text-primary" aria-hidden />
                 )}
               </button>

@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { Check, Disc3, FolderPlus } from "lucide-react";
-import type { SourceId } from "@/types";
 import * as ipc from "@/services/ipc";
 import { useMusicSourceStore } from "@/stores/musicSource";
+import { useSourceRegistryStore } from "@/stores/sourceRegistry";
 
 /** 引导完成标记（settings 表 key，DESIGN §12 首次启动引导）。
  *  真正的定义在 `@/lib/storageKeys`：AppShell 也要用它，而 AppShell 静态 import
@@ -11,16 +11,8 @@ import { useMusicSourceStore } from "@/stores/musicSource";
 export { ONBOARDING_KEY } from "@/lib/storageKeys";
 import { ONBOARDING_KEY } from "@/lib/storageKeys";
 
-// 引导让用户挑「默认音乐来源」：本地音乐是推荐默认（应用定位本地播放器），
-// 在线音源仅作可选项（搜索/歌单等数据功能开箱即用；在线试听需在
-// 「设置 → 音源包」安装播放音源包后才可用）
-const SOURCES: { id: SourceId; name: string; desc: string }[] = [
-  { id: "local", name: "本地音乐", desc: "播放自己电脑里的音乐（推荐）" },
-  { id: "wyy", name: "音源一", desc: "曲库全、歌单丰富" },
-  { id: "kw", name: "音源二", desc: "搜索稳定、新歌快" },
-  { id: "qq", name: "音源三", desc: "版权多、榜单全" },
-  { id: "kg", name: "音源四", desc: "曲库广、翻唱多" },
-];
+/** 在线源卡片文案：清单（名称）来自数据包注册表，引导只补充统一的说明 */
+const ONLINE_SOURCE_DESC = "在线音乐源，可搜索、听歌单";
 
 /**
  * 首次启动引导（路由 /onboarding）。
@@ -31,6 +23,9 @@ export function OnboardingPage(): React.JSX.Element {
   const navigate = useNavigate();
   const activeSourceId = useMusicSourceStore((s) => s.activeSourceId);
   const setActiveSource = useMusicSourceStore((s) => s.setActiveSource);
+  // 在线音源卡片来自数据包注册表（本地音乐固定第一张；引擎装载后自动出现）
+  const onlineSources = useSourceRegistryStore((s) => s.sources);
+  const ensureRegistry = useSourceRegistryStore((s) => s.ensure);
 
   const [step, setStep] = useState(0);
   const [saving, setSaving] = useState(false);
@@ -39,6 +34,7 @@ export function OnboardingPage(): React.JSX.Element {
   // 收敛到本地音乐；在线音源需要用户在引导里主动选择才切换。
   useEffect(() => {
     setActiveSource("local");
+    void ensureRegistry();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -87,7 +83,24 @@ export function OnboardingPage(): React.JSX.Element {
               之后随时可以在发现页顶部切换
             </p>
             <div className="mt-4 grid grid-cols-2 gap-2">
-              {SOURCES.map((s) => {
+              <button
+                type="button"
+                onClick={() => setActiveSource("local")}
+                className={`relative col-span-2 rounded-lg border p-3 text-left transition-colors ${
+                  activeSourceId === "local"
+                    ? "border-primary bg-primary/10"
+                    : "border-border hover:bg-secondary"
+                }`}
+              >
+                <div className="text-sm font-medium">本地音乐</div>
+                <div className="mt-0.5 text-[11px] text-muted-foreground">
+                  播放自己电脑里的音乐（推荐）
+                </div>
+                {activeSourceId === "local" && (
+                  <Check className="absolute right-2 top-2 h-3.5 w-3.5 text-primary" />
+                )}
+              </button>
+              {onlineSources.map((s) => {
                 const active = activeSourceId === s.id;
                 return (
                   <button
@@ -98,11 +111,11 @@ export function OnboardingPage(): React.JSX.Element {
                       active
                         ? "border-primary bg-primary/10"
                         : "border-border hover:bg-secondary"
-                    } ${s.id === "local" ? "col-span-2" : ""}`}
+                    }`}
                   >
                     <div className="text-sm font-medium">{s.name}</div>
                     <div className="mt-0.5 text-[11px] text-muted-foreground">
-                      {s.desc}
+                      {ONLINE_SOURCE_DESC}
                     </div>
                     {active && (
                       <Check className="absolute right-2 top-2 h-3.5 w-3.5 text-primary" />

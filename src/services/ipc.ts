@@ -26,6 +26,7 @@ import type {
   Track,
   UpdateDownloadProgress,
 } from "@/types";
+import { isQuality } from "@/lib/quality";
 
 /**
  * M0-M2 IPC 契约。命令名与 Rust 侧 `#[tauri::command]` 一一对应；
@@ -412,7 +413,9 @@ export async function resetDownloadDir(): Promise<string> {
 /** 默认下载音质（settings 表 downloadQuality，缺省 320） */
 export async function getDownloadQuality(): Promise<Quality> {
   const v = await getSetting(DOWNLOAD_QUALITY_KEY);
-  return v === "128" || v === "320" || v === "flac" ? v : "320";
+  // 口径见 lib/quality.ts 的 isQuality：菜单档位由数据包注册表声明，
+  // 但落库值必须是 Rust 可播的三档之一
+  return isQuality(v) ? v : "320";
 }
 
 /** 设置里的默认下载音质：所有下载入口（列表 / 播放条）都从这里取值 */

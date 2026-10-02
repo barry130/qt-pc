@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 import { errMsg } from "@/lib/utils";
 import { useNavigate } from "@tanstack/react-router";
-import type { MyPlaylistSummary, SourceId } from "@/types";
-import { SOURCE_DISPLAY } from "@/types";
+import type { MyPlaylistSummary } from "@/types";
+import { useSourceLabelFn } from "@/stores/sourceRegistry";
 import * as ipc from "@/services/ipc";
 import { pullLikes } from "@/stores/auth";
 import { qtresCoverUrl } from "@/lib/lrc";
@@ -277,6 +277,8 @@ function Group(props: {
   /** 本地自建歌单换封面；不传则不显示入口（在线歌单封面归音源/云端所有） */
   onChangeCover?: (p: MyPlaylistSummary) => void;
 }): React.JSX.Element {
+  // 在线歌单的源展示名走数据包注册表（stores/sourceRegistry）
+  const sourceLabel = useSourceLabelFn();
   return (
     <div className="pb-2">
       <h2 className="px-4 pb-1 pt-3 text-xs text-muted-foreground">
@@ -317,10 +319,7 @@ function Group(props: {
                   <div className="text-xs text-muted-foreground">
                     {p.platform === ipc.LOCAL_PLATFORM
                       ? `${p.trackCount} 首`
-                      : `在线 · ${
-                          SOURCE_DISPLAY[p.platform as Exclude<SourceId, "local">] ??
-                          p.platform
-                        }`}
+                      : `在线 · ${sourceLabel(p.platform)}`}
                   </div>
                 </button>
               )}

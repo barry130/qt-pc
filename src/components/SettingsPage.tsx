@@ -40,7 +40,8 @@ import {
   type SourcePackVo,
 } from "@/source-scripts/source-update";
 import { SKINS, getSkin } from "@/lib/skins";
-import { QUALITY_OPTIONS } from "@/lib/quality";
+import { isQuality, qualityOptionsFromRegistry } from "@/lib/quality";
+import { useSourceRegistryStore } from "@/stores/sourceRegistry";
 import {
   EQ_BANDS,
   EQ_GAIN_LIMIT_DB,
@@ -686,7 +687,7 @@ function PlaybackSection(): React.JSX.Element {
       setDevices(list);
       setCurrent(snap?.outputDevice ?? "");
       if (snap?.speed) setSpeedState(snap.speed);
-      if (savedQuality === "128" || savedQuality === "320" || savedQuality === "flac") {
+      if (savedQuality !== null && savedQuality !== undefined && isQuality(savedQuality)) {
         setQuality(savedQuality);
       }
     } catch (err) {
@@ -1179,6 +1180,10 @@ function formatBytes(bytes: number): string {
   disabled?: boolean;
   onChange: (q: Quality) => void;
 }): React.JSX.Element {
+  // 档位清单来自数据包注册表（未就绪时 qualityOptionsFromRegistry 兜底三档）
+  const options = qualityOptionsFromRegistry(
+    useSourceRegistryStore((s) => s.qualities),
+  );
   return (
     <select
       value={props.value}
@@ -1187,7 +1192,7 @@ function formatBytes(bytes: number): string {
       onChange={(e) => props.onChange(e.target.value as Quality)}
       className="rounded-md border border-input bg-background px-2 py-1.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
     >
-      {QUALITY_OPTIONS.map((o) => (
+      {options.map((o) => (
         <option key={o.value} value={o.value}>
           {o.label}（{o.short}）
         </option>

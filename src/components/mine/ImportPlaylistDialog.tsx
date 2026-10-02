@@ -1,7 +1,10 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { errMsg } from "@/lib/utils";
-import type { Playlist, SourceId } from "@/types";
-import { SOURCE_DISPLAY } from "@/types";
+import type { Playlist } from "@/types";
+import {
+  useSourceRegistryStore,
+  useSourceLabelFn,
+} from "@/stores/sourceRegistry";
 import {
   importPlaylist,
   importPlaylistSongs,
@@ -10,14 +13,12 @@ import { parsePlaylistInput } from "@/lib/playlist-link";
 import * as sourceApi from "@/source-scripts";
 import * as ipc from "@/services/ipc";
 
-/** 可导入的四个在线源（与 SOURCE_DISPLAY 同序） */
-const PLATFORMS: Exclude<SourceId, "local">[] = ["wyy", "qq", "kg", "kw"];
-
 /**
  * 导入歌单弹窗（对齐 qt-uniappx 歌单导入页的两个去向）：
  * - 导入歌曲：解析链接 → 拉全量曲目预览 → 新建/选一个我方歌单整单拷入；
  * - 收藏歌单：解析链接 → 收藏在线歌单（只落元数据，曲目打开详情时再取）。
  * 识别不出平台（纯数字 ID）时可手动指定；完成后由调用方负责刷新与跳转。
+ * 可选平台来自数据包注册表（未就绪时只剩自动识别）。
  */
 export function ImportPlaylistDialog(props: {
   onClose: () => void;
@@ -26,9 +27,12 @@ export function ImportPlaylistDialog(props: {
   /** 导入歌曲模式完成（targetId = 我方歌单 pid） */
   onSongsImported?: (targetId: string) => void;
 }): React.JSX.Element {
+  const sources = useSourceRegistryStore((s) => s.sources);
+  const ensureRegistry = useSourceRegistryStore((s) => s.ensure);
+  const sourceLabel = useSourceLabelFn();
   const [mode, setMode] = useState<"songs" | "collect">("songs");
   const [text, setText] = useState("");
-  const [platform, setPlatform] = useState<"" | Exclude<SourceId, "local">>("");
+  const [platform, setPlatform] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // 导入歌曲模式：解析出的预览（含全量曲目）与目标选择
@@ -41,6 +45,11 @@ export function ImportPlaylistDialog(props: {
   const [result, setResult] = useState<string | null>(null);
 
   const forced = platform === "" ? undefined : platform;
+
+  // 平台清单来自数据包注册表：挂载时拉一次（幂等），加载后选项自动出现
+  useEffect(() => {
+    void ensureRegistry();
+  }, [ensureRegistry]);
 
   /** 解析输入 → 拉详情预览（导入歌曲模式做全量预览） */
   const parse = async (): Promise<void> => {
@@ -174,16 +183,14 @@ export function ImportPlaylistDialog(props: {
         <div className="mt-2 flex items-center gap-2">
           <span className="shrink-0 text-xs text-muted-foreground">平台</span>
           <select
-            value={platform}
-            onChange={(e) =>
-              setPlatform(e.target.value as "" | Exclude<SourceId, "local">)
-            }
+            value={sources.some((s) => s.id === platform) ? platform : ""}
+            onChange={(e) => setPlatform(e.target.value)}
             className="h-8 flex-1 rounded-md border border-input bg-background px-2 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             <option value="">自动识别（链接）</option>
-            {PLATFORMS.map((p) => (
-              <option key={p} value={p}>
-                {SOURCE_DISPLAY[p]}
+            {sources.map((s) => (
+              <option key={s.id} value={s.id}>
+                {s.name}
               </option>
             ))}
           </select>
@@ -210,7 +217,7 @@ export function ImportPlaylistDialog(props: {
               <div className="min-w-0">
                 <p className="truncate text-sm font-medium">{preview.name}</p>
                 <p className="mt-0.5 text-xs text-muted-foreground">
-                  {SOURCE_DISPLAY[preview.platform as Exclude<SourceId, "local">]}
+                  {sourceLabel(preview.platform)}
                   {preview.tracks ? ` · ${preview.tracks.length} 首` : ""}
                 </p>
               </div>
