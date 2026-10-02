@@ -2,8 +2,8 @@
 
 pub mod app_config;
 pub mod app_paths;
-pub mod audio;
 pub mod astral;
+pub mod audio;
 pub mod cache;
 pub mod commands;
 pub mod db;
@@ -14,9 +14,10 @@ pub mod local;
 pub mod lyric_window;
 pub mod media;
 pub mod net_guard;
+pub mod pack_safety;
 pub mod pack_signature;
-pub mod provider;
 pub mod playurl_bridge;
+pub mod provider;
 pub mod qtres;
 pub mod shortcuts;
 pub mod smtc;
@@ -63,11 +64,7 @@ pub(crate) async fn resolve_play_url_script(
     track: &Track,
     quality: Quality,
 ) -> CmdResult<(String, u64)> {
-    let key = PlayUrlCache::cache_key(
-        &track.platform.to_string(),
-        &track.id,
-        quality_str(quality),
-    );
+    let key = PlayUrlCache::cache_key(&track.platform.to_string(), &track.id, quality_str(quality));
     if let Some((url, fetched_at)) = cache.get(&key) {
         return Ok((url, fetched_at));
     }
@@ -113,9 +110,10 @@ pub fn run() {
         }))
         .register_asynchronous_uri_scheme_protocol("qtres", qtres::handle_qtres)
         // 开机自启（设置页「通用」分区读写；Windows 实现为注册表 Run 键）
-        .plugin(
-            tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None),
-        )
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None,
+        ))
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         // 本地音乐文件夹选择（/library/folders 用它的目录选择对话框）
         .plugin(tauri_plugin_dialog::init())
@@ -193,19 +191,15 @@ pub fn run() {
 
             // 回填上次的登录会话（token 存 settings 表），没过期才装进客户端
             if let Some(db) = &db {
-                match db.with(|conn| {
-                    crate::db::store::get_setting(conn, "astral.session")
-                }) {
-                    Ok(Some(json)) => {
-                        match serde_json::from_str::<astral::AuthSession>(&json) {
-                            Ok(session) if session.is_valid() => {
-                                astral.set_session(&session);
-                                log::info!("[astral] 已恢复上次登录会话");
-                            }
-                            Ok(_) => log::info!("[astral] 上次会话已过期，需要重新登录"),
-                            Err(e) => log::warn!("[astral] 会话解析失败: {e}"),
+                match db.with(|conn| crate::db::store::get_setting(conn, "astral.session")) {
+                    Ok(Some(json)) => match serde_json::from_str::<astral::AuthSession>(&json) {
+                        Ok(session) if session.is_valid() => {
+                            astral.set_session(&session);
+                            log::info!("[astral] 已恢复上次登录会话");
                         }
-                    }
+                        Ok(_) => log::info!("[astral] 上次会话已过期，需要重新登录"),
+                        Err(e) => log::warn!("[astral] 会话解析失败: {e}"),
+                    },
                     Ok(None) => {}
                     Err(e) => log::warn!("[astral] 读取会话失败: {e}"),
                 }

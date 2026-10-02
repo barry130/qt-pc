@@ -63,6 +63,53 @@
         throw new Error("__TAURI_INTERNALS__ 注入失败");
       }
 
+      /**
+       * 运行时网络收紧（内容安全的第二道闸，与安装期静态扫描互为冗余）：
+       * 播放包/数据包在本页上下文里求值执行，若无限制则可以直接用
+       * fetch/XHR/WebSocket 绕过 builtin_request 的协议/内网校验自由外联。
+       *
+       * 放行面（本页自身的运行需要）：
+       * - 同源站内路径（"/meta-bundle.js"、"/script/…" 的 fetch 装载）；
+       * - Tauri IPC 端点（http(s)://ipc.localhost、ipc:// —— invoke 底层走 fetch）。
+       * 其余一律拒绝（全局 fetch、XHR、WebSocket、EventSource、Worker、sendBeacon）。
+       */
+      function lockDownNetwork() {
+        const IPC_PREFIXES = [
+          "http://ipc.localhost",
+          "https://ipc.localhost",
+          "ipc://",
+        ];
+        const nativeFetch = window.fetch ? window.fetch.bind(window) : null;
+        window.fetch = function (input, init) {
+          let url = "";
+          try {
+            url = typeof input === "string" ? input : (input && input.url) || String(input);
+          } catch {
+            url = "";
+          }
+          const sameOriginPath = url.startsWith("/") && !url.startsWith("//");
+          const isIpc = IPC_PREFIXES.some((p) => url.startsWith(p));
+          if (!sameOriginPath && !isIpc) {
+            return Promise.reject(
+              new Error("音源包环境禁止直接网络请求，请使用 host.request"),
+            );
+          }
+          if (!nativeFetch) return Promise.reject(new Error("fetch 不可用"));
+          return nativeFetch(input, init);
+        };
+        const deny = (name) =>
+          function () {
+            throw new Error("音源包环境禁止使用 " + name);
+          };
+        try { window.XMLHttpRequest = deny("XMLHttpRequest"); } catch {}
+        try { delete window.WebSocket; } catch {}
+        try { delete window.EventSource; } catch {}
+        try { delete window.Worker; } catch {}
+        try { delete window.SharedWorker; } catch {}
+        try { navigator.sendBeacon = undefined; } catch {}
+      }
+      lockDownNetwork();
+
       async function emitToMain(event, payload) {
         try {
           await invoke("plugin:event|emit_to", {
