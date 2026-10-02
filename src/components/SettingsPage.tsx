@@ -24,13 +24,19 @@ import {
   applySourceUpdate,
   discoverSourceUpdates,
   getSourceState,
-  installSourceFromLocalFile,
-  installSourceFromUrl,
+  installSourceLabel,
+  installStagedSource,
+  isPackLinkUrl,
   kindLabel,
+  lastErrorSummary,
   offerLabel,
   packDisplayName,
   packVersionLabel,
+  shortUpdateDate,
+  stageSourceFromFile,
+  stageSourceFromUrl,
   uninstallSourcePack,
+  type PackPreviewVo,
   type SourcePackVo,
 } from "@/source-scripts/source-update";
 import { SKINS, getSkin } from "@/lib/skins";
@@ -1198,13 +1204,18 @@ function packLabel(p: SourcePackVo): string {
 /** 卸载按钮的「两击确认」状态：null = 未武装；否则记录包 id 与计时器 */
 type ArmedUninstall = { packId: string; timer: number };
 
+/** 本会话已提示过的剪贴板链接（同一链接只提示一次，忽略/安装都算） */
+const PROMPTED_CLIPBOARD_LINKS = new Set<string>();
+
 /** 音源包设置（v3 统一包模型，与 uniappx 设置面板同口径）：
  *  - 数据包/播放包同构：单文件 js、首行 __QT_PACK__ 包头自描述身份；
  *  - 数据槽 = 内置基线 + 可选安装的数据包覆盖（单选，随时切回基线）；
  *  - 播放槽 = 用户安装的播放包（不随应用分发，多包共存其一生效）；
  *  - 更新发现三通道合一（每包 updateUrl / 基线 / 官方 manifest），
  *    只提示不自动装，这里可以逐条应用；
- *  - 安装入口：https 直链 / 本地文件（系统选择框）；卸载两击确认。
+ *  - 安装入口：https 直链 / 本地文件（系统选择框），先预览确认再落盘
+ *    （包头 id 自称官方包时显著警示），剪贴板有包链接时主动询问；
+ *    卸载两击确认。
  *  状态事实来源是 Rust state.json（v3）；安装/切换/卸载后 Rust 广播
  *  source-pack-changed / source-meta-changed，引擎页热切换生效——
  *  不重启应用、不打断播放。 */
@@ -1223,6 +1234,12 @@ function SourcePackageSection(): React.JSX.Element {
   const [url, setUrl] = useState("");
   const [installing, setInstalling] = useState(false);
   const [armed, setArmed] = useState<ArmedUninstall | null>(null);
+  /** 安装预览现场（非 null = 预览确认弹窗开着） */
+  const [preview, setPreview] = useState<PackPreviewVo | null>(null);
+  /** 预览确认后的落盘安装中 */
+  const [confirming, setConfirming] = useState(false);
+  /** 剪贴板检测到的音源包链接（非 null = 询问弹窗开着） */
+  const [clipTip, setClipTip] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -1252,6 +1269,44 @@ function SourcePackageSection(): React.JSX.Element {
     },
     [armed],
   );
+
+  // 剪贴板链接检测：设置页音源包区挂载 / 窗口重新聚焦时读一次剪贴板，
+  // 是「https … .js」直链且本会话没提示过 → 询问是否安装（确认后仍走预览）。
+  // WebView2 未聚焦/无权限时 readText 会 reject，静默降级不打扰。
+  const clipboardBusy = installing || confirming || busy;
+  useEffect(() => {
+    let disposed = false;
+    const checkClipboard = (): void => {
+      if (disposed || clipboardBusy || preview || clipTip !== null) return;
+      void (async () => {
+        let text = "";
+        try {
+          text = await navigator.clipboard.readText();
+        } catch {
+          return; // 读不到（未聚焦/权限）就当没有
+        }
+        const link = text.trim();
+        if (
+          disposed ||
+          clipboardBusy ||
+          preview ||
+          clipTip !== null ||
+          !isPackLinkUrl(link) ||
+          PROMPTED_CLIPBOARD_LINKS.has(link)
+        ) {
+          return;
+        }
+        PROMPTED_CLIPBOARD_LINKS.add(link);
+        if (!disposed) setClipTip(link);
+      })();
+    };
+    checkClipboard();
+    window.addEventListener("focus", checkClipboard);
+    return () => {
+      disposed = true;
+      window.removeEventListener("focus", checkClipboard);
+    };
+  }, [clipboardBusy, preview, clipTip]);
 
   const run = async (action: () => Promise<string>): Promise<void> => {
     setBusy(true);
@@ -1317,45 +1372,68 @@ function SourcePackageSection(): React.JSX.Element {
       : `已卸载${kindLabel(pack.kind)}`;
   };
 
-  const installUrl = async (): Promise<void> => {
+  /** 预览安装第一步：拉全文+静态校验，把预览信息交给确认弹窗（不落盘） */
+  const stageFromLink = (link: string): void => {
+    if (busy || installing || confirming || preview) return;
+    setInstalling(true);
+    void (async () => {
+      try {
+        setPreview(await stageSourceFromUrl(link));
+      } catch (e) {
+        setMessage(`获取包信息失败：${stripErrorUrls(String(e))}`);
+      } finally {
+        setInstalling(false);
+      }
+    })();
+  };
+
+  const installUrl = (): void => {
     const trimmed = url.trim();
     if (!trimmed) {
       setMessage("请先粘贴音源包 .js 直链");
       return;
     }
-    setInstalling(true);
-    try {
-      const outcome = await installSourceFromUrl(trimmed);
-      setUrl("");
-      await refresh();
-      setMessage(
-        `${kindLabel(outcome.kind)}已安装${outcome.activated ? "并生效" : "，列表中可启用"}`,
-      );
-    } catch (e) {
-      setMessage(`安装失败：${stripErrorUrls(String(e))}`);
-    } finally {
-      setInstalling(false);
-    }
+    stageFromLink(trimmed);
   };
 
   const installLocal = (): void => {
-    if (busy || installing) return;
+    if (busy || installing || confirming || preview) return;
     setInstalling(true);
     void (async () => {
       try {
-        const outcome = await installSourceFromLocalFile();
-        if (!outcome) {
+        const staged = await stageSourceFromFile();
+        if (!staged) {
           setMessage(""); // 用户取消选择，不打扰
           return;
         }
+        setPreview(staged);
+      } catch (e) {
+        setMessage(`获取包信息失败：${stripErrorUrls(String(e))}`);
+      } finally {
+        setInstalling(false);
+      }
+    })();
+  };
+
+  /** 预览确认：按一次性 token 落盘安装（官方 id 冒充警示已在弹窗给过） */
+  const confirmInstall = (): void => {
+    const staged = preview;
+    if (!staged || confirming) return;
+    setConfirming(true);
+    void (async () => {
+      try {
+        const outcome = await installStagedSource(staged.token);
+        setPreview(null);
+        setUrl("");
         await refresh();
         setMessage(
           `${kindLabel(outcome.kind)}已安装${outcome.activated ? "并生效" : "，列表中可启用"}`,
         );
       } catch (e) {
+        setPreview(null);
         setMessage(`安装失败：${stripErrorUrls(String(e))}`);
       } finally {
-        setInstalling(false);
+        setConfirming(false);
       }
     })();
   };
@@ -1495,11 +1573,11 @@ function SourcePackageSection(): React.JSX.Element {
           />
           <button
             type="button"
-            onClick={() => void installUrl()}
-            disabled={busy || installing || !url.trim()}
+            onClick={installUrl}
+            disabled={busy || installing || confirming || !url.trim()}
             className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
           >
-            {installing ? "安装中…" : "安装"}
+            {installing ? "获取包信息…" : "安装"}
           </button>
         </div>
       </SettingRow>
@@ -1510,13 +1588,127 @@ function SourcePackageSection(): React.JSX.Element {
         <button
           type="button"
           onClick={installLocal}
-          disabled={busy || installing}
+          disabled={busy || installing || confirming}
           className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
         >
-          {installing ? "安装中…" : "选择文件…"}
+          {installing ? "获取包信息…" : "选择文件…"}
         </button>
       </SettingRow>
+      {clipTip !== null && !preview && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-sm rounded-xl border border-border bg-card p-4 shadow-lg">
+            <div className="text-sm font-medium text-foreground">
+              检测到剪贴板有音源包链接
+            </div>
+            <p className="mt-1 break-all font-mono text-xs text-muted-foreground">
+              {clipTip}
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">是否安装？</p>
+            <div className="mt-3 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setClipTip(null)}
+                className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent"
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const link = clipTip;
+                  setClipTip(null);
+                  if (link) stageFromLink(link);
+                }}
+                className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent"
+              >
+                安装
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {preview && (
+        <InstallPreviewDialog
+          preview={preview}
+          busy={confirming}
+          onConfirm={confirmInstall}
+          onCancel={() => setPreview(null)}
+        />
+      )}
       {message && <div className="py-3 text-xs text-muted-foreground">{message}</div>}
+    </div>
+  );
+}
+
+/**
+ * 安装预览确认弹窗（URL/本地文件安装的必经一步；manifest 通道的更新确认
+ * 已含版本信息，不走这里）。id 自称官方包时给显著警示、确认键改「仍要安装」。
+ */
+function InstallPreviewDialog(props: {
+  preview: PackPreviewVo;
+  busy: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}): React.JSX.Element {
+  const p = props.preview;
+  const rows: Array<[string, React.ReactNode]> = [
+    ["类型", kindLabel(p.kind)],
+    ["名称", p.name.trim() || kindLabel(p.kind)],
+    [
+      "版本",
+      p.versionName.trim() ? `${p.versionName} (code ${p.versionCode})` : `v${p.versionCode}`,
+    ],
+    ["包 id", <span key="id" className="font-mono">{p.id}</span>],
+    [
+      "来源",
+      p.channel === "file"
+        ? `本地文件 ${p.reference}`
+        : p.reference || "—",
+    ],
+  ];
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+      <div className="w-full max-w-sm rounded-xl border border-border bg-card p-4 shadow-lg">
+        <div className="text-sm font-medium text-foreground">安装音源包</div>
+        <div className="mt-2 flex flex-col gap-1 text-xs">
+          {rows.map(([key, value]) => (
+            <div key={key} className="flex gap-2">
+              <span className="w-10 shrink-0 text-muted-foreground">{key}</span>
+              <span className="min-w-0 flex-1 break-all">{value}</span>
+            </div>
+          ))}
+        </div>
+        {p.installedCode > 0 ? (
+          <p className="mt-2 text-[11px] text-muted-foreground">
+            将替换已安装的 v{p.installedCode}（同 id 原位更新）
+          </p>
+        ) : null}
+        {p.spoofOfficial ? (
+          <div className="mt-2 rounded-lg bg-destructive/10 px-3 py-2 text-[11px] leading-relaxed text-destructive">
+            该文件自称官方包。官方包只应来自应用内官方渠道更新；如非你主动从官方获取，请取消
+          </div>
+        ) : null}
+        <div className="mt-3 flex items-center justify-end gap-2">
+          <button
+            type="button"
+            onClick={props.onCancel}
+            disabled={props.busy}
+            className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+          >
+            取消
+          </button>
+          <button
+            type="button"
+            onClick={props.onConfirm}
+            disabled={props.busy}
+            className={`rounded-md px-3 py-1.5 text-xs font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50 ${
+              p.spoofOfficial ? "bg-destructive" : "bg-primary"
+            }`}
+          >
+            {props.busy ? "安装中…" : p.spoofOfficial ? "仍要安装" : "安装"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -1535,6 +1727,12 @@ function PackRow(props: {
     props.pack.kind === "play" && props.checked && props.armed
       ? "卸载后在线播放将不可用"
       : "";
+  // 次级信息行：安装来源 · 更新日期 ·（可选）上次失败摘要
+  const metaBits = [
+    installSourceLabel(props.pack.installSource),
+    shortUpdateDate(props.pack.updatedAt),
+  ].filter(Boolean);
+  const errSummary = lastErrorSummary(props.pack.lastError);
   return (
     <div className="flex flex-col gap-1">
       <div className="flex items-center gap-2 text-xs">
@@ -1562,6 +1760,12 @@ function PackRow(props: {
           {props.armed ? "确认卸载" : "卸载"}
         </button>
       </div>
+      {metaBits.length > 0 ? (
+        <span className="pl-5 text-[11px] text-muted-foreground">
+          {metaBits.join(" · ")}
+          {errSummary ? ` · 上次失败：${errSummary}` : ""}
+        </span>
+      ) : null}
       {activePlayWarn ? (
         <span className="pl-5 text-[11px] text-destructive">{activePlayWarn}</span>
       ) : null}

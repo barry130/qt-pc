@@ -580,6 +580,21 @@ export async function sourceInstallLocalFile(): Promise<unknown> {
   return invoke("source_install_local_file");
 }
 
+/** 安装预览 ①（直链）：下载全文并暂存，返回预览信息；确认前不落盘 */
+export async function sourceStageFromUrl(url: string): Promise<unknown> {
+  return invoke("source_stage_from_url", { url });
+}
+
+/** 安装预览 ②（本地文件）：选择并读入文件后暂存（用户取消返回 null） */
+export async function sourceStageFromFile(): Promise<unknown> {
+  return invoke("source_stage_from_file");
+}
+
+/** 安装预览 ③：预览确认后按 token 落盘安装（token 一次性） */
+export async function sourceInstallStaged(token: string): Promise<unknown> {
+  return invoke("source_install_staged", { token });
+}
+
 /** 启用包（packId 空串 = 切回空位：meta=内置基线 / play=未装，须传 kind） */
 export async function sourceActivatePack(
   packId: string,

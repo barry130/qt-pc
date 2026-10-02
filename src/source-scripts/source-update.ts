@@ -49,6 +49,14 @@ export interface SourcePackVo {
   skipCodes: number[];
   /** 上次 updateUrl 探测时间（4h 节流） */
   lastProbeAt: number;
+  /** 安装来源："" 未知 / "url" 直链 / "file" 本地文件 / "manifest" 官方通道更新 */
+  installSource: string;
+  /** 安装来源展示（直链 URL 或文件名；官方通道更新后为空） */
+  installRef: string;
+  /** 最近一次装载/冒烟/更新失败摘要（空 = 无；成功生效时清除） */
+  lastError: string;
+  /** 最近一次失败时间（unix 毫秒；0 = 无） */
+  lastErrorAt: number;
 }
 
 /** 与 Rust SourceBundleState serde 对齐（v3 统一包模型） */
@@ -102,6 +110,28 @@ export interface InstallOutcomeVo {
   pack: SourcePackVo;
 }
 
+/**
+ * 安装预览信息（Rust PackPreview；URL/本地文件安装先预览确认再落盘）。
+ * spoofOfficial = 包头 id 自称 play-official/meta-official 而来源又不是
+ * 官方渠道 → UI 要给冒充警示、确认键改「仍要安装」。
+ */
+export interface PackPreviewVo {
+  /** 暂存 token（一次性；确认安装时传回 sourceInstallStaged） */
+  token: string;
+  kind: SourcePackKind;
+  id: string;
+  name: string;
+  versionCode: number;
+  versionName: string;
+  /** url / file */
+  channel: string;
+  /** 来源展示（完整 URL 或文件名） */
+  reference: string;
+  spoofOfficial: boolean;
+  /** 已安装同 id 包的版本（0 = 未装过） */
+  installedCode: number;
+}
+
 export function kindLabel(kind: SourcePackKind | string): string {
   return kind === "meta" ? "数据包" : "播放包";
 }
@@ -153,6 +183,61 @@ export async function installSourceFromUrl(url: string): Promise<InstallOutcomeV
 export async function installSourceFromLocalFile(): Promise<InstallOutcomeVo | null> {
   const outcome = await ipc.sourceInstallLocalFile();
   return (outcome ?? null) as InstallOutcomeVo | null;
+}
+
+/** 安装预览 ①（直链）：下载全文并暂存，返回预览信息；确认前不落盘 */
+export async function stageSourceFromUrl(url: string): Promise<PackPreviewVo> {
+  return (await ipc.sourceStageFromUrl(url)) as PackPreviewVo;
+}
+
+/** 安装预览 ②（本地文件）：选文件并读入后暂存（用户取消返回 null） */
+export async function stageSourceFromFile(): Promise<PackPreviewVo | null> {
+  const preview = await ipc.sourceStageFromFile();
+  return (preview ?? null) as PackPreviewVo | null;
+}
+
+/** 安装预览 ③：预览弹窗确认后按 token 落盘安装（token 一次性，过期需重新预览） */
+export async function installStagedSource(token: string): Promise<InstallOutcomeVo> {
+  return (await ipc.sourceInstallStaged(token)) as InstallOutcomeVo;
+}
+
+/** 列表「安装来源」标签（未知来源显示 — ） */
+export function installSourceLabel(source: string): string {
+  switch (source) {
+    case "url":
+      return "链接安装";
+    case "file":
+      return "本地安装";
+    case "manifest":
+      return "官方渠道";
+    default:
+      return "—";
+  }
+}
+
+/** updatedAt（unix 秒）→ 短日期 MM-DD（列表次级信息行用） */
+export function shortUpdateDate(unixSecs: number): string {
+  if (!unixSecs) {
+    return "";
+  }
+  const d = new Date(unixSecs * 1000);
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${mm}-${dd}`;
+}
+
+/** last_error 摘要（>40 字截断加省略号；空串原样返回） */
+export function lastErrorSummary(error: string): string {
+  const text = (error ?? "").trim();
+  if (!text) {
+    return "";
+  }
+  return text.length > 40 ? `${text.slice(0, 40)}…` : text;
+}
+
+/** 剪贴板链接判定：https 直链、路径以 .js 结尾（允许 ?query） */
+export function isPackLinkUrl(text: string): boolean {
+  return /^https:\/\/\S+\.js(\?\S*)?$/i.test(text.trim());
 }
 
 /** 切换生效包（kind 决定槽位：play → 热切换+冒烟；meta → 重装 meta 槽）；

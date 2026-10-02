@@ -7,10 +7,17 @@ import {
   HOST_API_VERSION,
   activateSourcePack,
   installSourceFromLocalFile,
+  installSourceLabel,
+  installStagedSource,
+  isPackLinkUrl,
   kindLabel,
+  lastErrorSummary,
   offerLabel,
   packDisplayName,
   packVersionLabel,
+  shortUpdateDate,
+  stageSourceFromFile,
+  stageSourceFromUrl,
   type PackUpdateOfferVo,
   type SourcePackVo,
 } from "@/source-scripts/source-update";
@@ -22,6 +29,9 @@ vi.mock("@/services/ipc", () => ({
   sourceApplyUpdate: vi.fn(),
   sourceInstallFromUrl: vi.fn(),
   sourceInstallLocalFile: vi.fn(),
+  sourceStageFromUrl: vi.fn(),
+  sourceStageFromFile: vi.fn(),
+  sourceInstallStaged: vi.fn(),
   sourceActivatePack: vi.fn(),
   sourceUninstallPack: vi.fn(),
 }));
@@ -39,6 +49,10 @@ function pack(overrides: Partial<SourcePackVo> = {}): SourcePackVo {
     updatedAt: 1_800_000_000,
     skipCodes: [],
     lastProbeAt: 0,
+    installSource: "url",
+    installRef: "https://cdn.example/play-bundle.js",
+    lastError: "",
+    lastErrorAt: 0,
     ...overrides,
   };
 }
@@ -98,6 +112,37 @@ describe("source-update 文案 helper（v3）", () => {
     );
     expect(text).toBe("数据包有新版本：内置基线 → v2（官方数据包）");
   });
+
+  it("4c. installSourceLabel 四种来源", () => {
+    expect(installSourceLabel("url")).toBe("链接安装");
+    expect(installSourceLabel("file")).toBe("本地安装");
+    expect(installSourceLabel("manifest")).toBe("官方渠道");
+    expect(installSourceLabel("")).toBe("—");
+  });
+
+  it("4d. shortUpdateDate unix 秒 → MM-DD（本地时区构造，测试跨时区稳定）", () => {
+    const local = new Date(2026, 8, 2, 12, 0, 0); // 2026-09-02 正午
+    expect(shortUpdateDate(Math.floor(local.getTime() / 1000))).toBe("09-02");
+    expect(shortUpdateDate(0)).toBe("");
+  });
+
+  it("4e. lastErrorSummary 40 字内原样、超长截断加省略号、空安全", () => {
+    expect(lastErrorSummary("  装载失败：SyntaxError  ")).toBe("装载失败：SyntaxError");
+    const over = "x".repeat(41);
+    expect(lastErrorSummary(over)).toBe(`${"x".repeat(40)}…`);
+    expect(lastErrorSummary("x".repeat(40))).toBe("x".repeat(40));
+    expect(lastErrorSummary("")).toBe("");
+  });
+
+  it("4f. isPackLinkUrl 只认 https 直链 .js（允许 ?query）", () => {
+    expect(isPackLinkUrl("https://cdn.example/play-bundle.js")).toBe(true);
+    expect(isPackLinkUrl("https://cdn.example/a/play-bundle.js?v=2")).toBe(true);
+    expect(isPackLinkUrl("  https://cdn.example/x.JS  ")).toBe(true);
+    expect(isPackLinkUrl("http://cdn.example/play-bundle.js")).toBe(false);
+    expect(isPackLinkUrl("https://cdn.example/play-bundle.jsp")).toBe(false);
+    expect(isPackLinkUrl("看看这个 https://cdn.example/play-bundle.js")).toBe(false);
+    expect(isPackLinkUrl("")).toBe(false);
+  });
 });
 
 describe("source-update IPC 包装（v3）", () => {
@@ -129,5 +174,54 @@ describe("source-update IPC 包装（v3）", () => {
     };
     vi.spyOn(ipc, "sourceInstallLocalFile").mockResolvedValue(outcome);
     expect(await installSourceFromLocalFile()).toEqual(outcome);
+  });
+
+  it("8. stageSourceFromUrl 透传 URL、返回预览对象", async () => {
+    const preview = {
+      token: "t-1",
+      kind: "play",
+      id: "play-x",
+      name: "X",
+      versionCode: 2,
+      versionName: "",
+      channel: "url",
+      reference: "https://cdn.example/x.js",
+      spoofOfficial: false,
+      installedCode: 0,
+    };
+    const spy = vi.spyOn(ipc, "sourceStageFromUrl").mockResolvedValue(preview);
+    expect(await stageSourceFromUrl("https://cdn.example/x.js")).toEqual(preview);
+    expect(spy).toHaveBeenCalledWith("https://cdn.example/x.js");
+  });
+
+  it("9. stageSourceFromFile 取消返回 null、有文件返回预览", async () => {
+    vi.spyOn(ipc, "sourceStageFromFile").mockResolvedValue(null);
+    expect(await stageSourceFromFile()).toBeNull();
+    const preview = {
+      token: "t-2",
+      kind: "meta",
+      id: "meta-official",
+      name: "官方数据包",
+      versionCode: 1,
+      versionName: "m.1",
+      channel: "file",
+      reference: "meta-bundle.js",
+      spoofOfficial: true,
+      installedCode: 0,
+    };
+    vi.spyOn(ipc, "sourceStageFromFile").mockResolvedValue(preview);
+    expect(await stageSourceFromFile()).toEqual(preview);
+  });
+
+  it("10. installStagedSource 按一次性 token 落盘", async () => {
+    const outcome = {
+      kind: "play",
+      activated: true,
+      replaced: false,
+      pack: pack(),
+    };
+    const spy = vi.spyOn(ipc, "sourceInstallStaged").mockResolvedValue(outcome);
+    expect(await installStagedSource("t-1")).toEqual(outcome);
+    expect(spy).toHaveBeenCalledWith("t-1");
   });
 });
