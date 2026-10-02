@@ -6,8 +6,8 @@ import { PackageOpen, X } from "lucide-react";
  * 「未安装播放音源包」播放时提示（双音源包架构）。
  *
  * 在线取链需要播放音源包（高风险，不随应用分发）；resolvePlayUrl 识别到
- * 内置数据包的缺包错误后会派发 window 事件 `qt-play-pack-missing`，这里弹
- * 一条可操作提示——只提示「需要安装」并跳转到 设置 → 音源包（提示里不内置
+ * 数据包的缺包错误后会派发 window 事件 `qt-play-pack-missing`，这里弹
+ * 一条可操作提示——只提示「需要安装」并跳转到 设置 → 音源包（提示里不带
  * 任何下载链接，安装动作完全由用户发起）。
  */
 export function PlayPackPrompt(): React.JSX.Element | null {

@@ -3,9 +3,9 @@
  *
  * 页面一律从这里调"在线源"动作，不直接 import ipc 里的对应命令。
  * 在线能力拆成两个包，都由引擎窗口装载：
- * - **数据包**（meta-bundle.js，低风险）：搜索/歌单/榜单/歌词/封面，随应用
- *   内置，无需安装；
- * - **播放包**（play-bundle.js，高风险）：取链线路，不内置，用户在
+ * - **数据包**（meta-bundle.js，低风险）：搜索/歌单/榜单/歌词/封面，不内置，
+ *   用户在「设置 → 音源包」安装（官方 manifest 或直链），未装 = 数据面下线；
+ * - **播放包**（play-bundle.js，高风险）：取链线路，同样不内置，用户在
  *   「设置 → 音源包」自行安装（官方 manifest 或直链），可多包共存。
  * 应用侧只保留 astral 后端与引擎两条网络通道——平台官方接口、聚合线路等
  * URL 只允许出现在音源包构建产物里（qt-sources，scripts/build-sources.mjs）。
@@ -42,7 +42,7 @@ import { PER_SOURCE_TIMEOUT_MS, withTimeoutMs } from "@/source-scripts/qt-contra
 
 // ---------- 引擎调用 ----------
 
-/** 引擎（内置数据包）不可用时抛的错：按引擎生命周期给出可操作的原因 */
+/** 引擎（数据包）不可用时抛的错：按引擎生命周期给出可操作的原因 */
 function engineError(entry: string): Error {
   const snap = engineSnapshot();
   switch (snap.phase) {
@@ -339,7 +339,7 @@ export async function getArtistSongs(
 // ---------- 取链（脚本预解析 + 回填引擎缓存） ----------
 
 /**
- * 内置数据包取链入口的「未装播放包」错误标记。
+ * 数据包取链入口的「未装播放包」错误标记。
  * 与 qt-sources meta-entries.ts 的 PLAY_PACK_MISSING_MESSAGE 前缀保持一致：
  * 引擎页 resolve 失败时把错误文本带回来，这里据此弹安装引导。
  */
@@ -354,7 +354,7 @@ function maybeEmitPlayPackMissing(errText: string): void {
 
 /**
  * 预解析播放地址（播放动作发起前调用）：
- * 只走音源引擎窗口——数据包内置，播放包按本地状态装配，就绪才参与，
+ * 只走音源引擎窗口——数据包/播放包都按本地安装状态装配，就绪才参与，
  * 超时/失败静默。解析结果回填 Rust 引擎的 PlayUrl 缓存，引擎播放时命中
  * 缓存直接使用。包内自带多线路换源与跨源兜底；返回空串 = 本次取链失败
  * （由引擎兜底/报错）。
@@ -507,7 +507,7 @@ export async function getLatestSongs(
 /**
  * 数据包声明的音源/音质清单（`__qtEntries.sourceRegistry`）。
  * 音源 id/名称/色值与音质档位的**唯一真源**在 qt-sources 的 registry.ts，
- * 宿主 UI 的选项列表一律从这里取。引擎未就绪 / 旧版内置包无该入口 /
+ * 宿主 UI 的选项列表一律从这里取。引擎未就绪 / 旧版数据包无该入口 /
  * 返回结构不符 → null（调用方按空清单处理，本地音乐不受影响）。
  */
 export async function getSourceRegistry(): Promise<SourceRegistry | null> {
@@ -532,7 +532,7 @@ export async function getSourceRegistry(): Promise<SourceRegistry | null> {
       return { sources: sources as SourceRegistry["sources"], qualities: qualities as SourceRegistry["qualities"] };
     });
   } catch {
-    // 引擎启动中 / 入口不存在（升级前的旧内置包）：不算错误，交给上层重试
+    // 引擎启动中 / 入口不存在（旧版数据包）：不算错误，交给上层重试
     return null;
   }
 }

@@ -52,8 +52,8 @@ export function DiscoverPage(): React.JSX.Element {
   const [songs, setSongs] = useState<Track[]>([]);
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
   const [charts, setCharts] = useState<Chart[]>([]);
-  // 引擎相位 + 播放包装配状态：数据包内置恒可用；error（引擎异常）或
-  // ready 但未装配播放包时，在线试听不可用 → 给「去安装播放包」引导卡
+  // 引擎相位 + 播放包装配状态：数据面由已装数据包提供（不内置）；error（引擎
+  // 异常）或 ready 但未装配播放包时，在线试听不可用 → 给「去安装播放包」引导卡
   const [enginePhase, setEnginePhase] = useState<string | null>("booting");
   const [playPackMissing, setPlayPackMissing] = useState(false);
 
@@ -133,9 +133,20 @@ export function DiscoverPage(): React.JSX.Element {
         </div>
       </section>
 
-      {/* 未装播放包引导：搜索/歌单等数据功能正常（数据包内置），
-          只是在线试听需要播放音源包（应用不内置，需自行安装） */}
-      {(enginePhase === "error" || playPackMissing) && (
+      {/* 未装播放包引导（引擎正常、只缺播放包时才显示）：数据功能不受影响，
+          只是在线试听需要播放音源包（应用不内置，需自行安装）；
+          引擎 error 的数据面不可用引导卡在上面单独一张 */}
+      {enginePhase === "error" && (
+        <section className="mt-4 px-5">
+          <div className="flex flex-wrap items-center gap-3 rounded-xl border border-border bg-card/70 px-4 py-3">
+            <PackageOpen className="h-4 w-4 shrink-0 text-primary" />
+            <div className="min-w-0 flex-1 text-xs leading-relaxed text-muted-foreground">
+              音源引擎未能启动，搜索、歌单、榜单、歌词与在线试听暂不可用；请重启应用重试。
+            </div>
+          </div>
+        </section>
+      )}
+      {enginePhase !== "error" && playPackMissing && (
         <section className="mt-4 px-5">
           <div className="flex flex-wrap items-center gap-3 rounded-xl border border-border bg-card/70 px-4 py-3">
             <PackageOpen className="h-4 w-4 shrink-0 text-primary" />

@@ -2,10 +2,10 @@
  * 音源引擎窗口 RPC 封装（双音源包架构）。
  *
  * 引擎窗口（label "source-engine"，见 src-tauri/src/source_window.rs）加载
- * qtres:// 内嵌引擎页：先 import **内置** meta-bundle.js（数据接口：搜索/
- * 歌单/专辑/歌手/榜单/歌词/封面），再按本地状态装配用户安装的播放音源包
- * （play-bundle.js，取链）。主窗口与它只走事件（source-engine-request →
- * source-engine-response）：
+ * qtres:// 内嵌引擎页：先装载用户安装的数据包（install/<id>/meta-bundle.js，
+ * 数据接口：搜索/歌单/专辑/歌手/榜单/歌词/封面；未装 = 数据面下线），
+ * 再按本地状态装配用户安装的播放音源包（play-bundle.js，取链）。主窗口与
+ * 它只走事件（source-engine-request → source-engine-response）：
  *   - kind "status"：查询引擎生命周期（booting/ready/error）与当前生效播放包
  *     ——引擎启动早于主窗口前端，boot 时推送的状态事件会错过，绑定后主动查询；
  *   - kind "resolve"：取链（url "" = 失败/无可用层；line = 本次命中的音源线路，
@@ -41,7 +41,7 @@ interface EngineReply {
   error?: string | null;
 }
 
-/** 引擎当前装配的播放包快照（status 应答附带；meta 包内置于应用不在此列） */
+/** 引擎当前装配的播放包快照（status 应答附带；数据包不在引擎侧装配，不在此列） */
 export interface EnginePackSnapshot {
   id: string;
   code: number;
@@ -145,6 +145,30 @@ let bound = false;
 let binding: Promise<void> | null = null;
 /** null = 尚未查询过（绑定后/resets 后由 refreshPhase 填充） */
 let phase: EnginePhase | null = null;
+
+/** 引擎相位变化订阅（组件/Store 用，返回取消函数）。引擎 error 后经后台重探
+ *  自愈回 ready 不广播 source-pack-changed——注册表 Store 等依赖方借此补取。 */
+type PhaseListener = (phase: EnginePhase | null) => void;
+const phaseListeners = new Set<PhaseListener>();
+
+export function onEnginePhaseChange(fn: PhaseListener): () => void {
+  phaseListeners.add(fn);
+  return () => phaseListeners.delete(fn);
+}
+
+/** 相位唯一写入口：变化时通知订阅方（订阅方异常不拖垮引擎层） */
+function setPhase(next: EnginePhase | null): void {
+  if (phase === next) return;
+  phase = next;
+  for (const fn of phaseListeners) {
+    try {
+      fn(next);
+    } catch {
+      // ignore
+    }
+  }
+}
+
 let remoteCode: number | null = null;
 let engineDetail: string | null = null;
 let enginePack: EnginePackSnapshot | null = null;
@@ -230,12 +254,12 @@ async function refreshPhase(): Promise<void> {
       continue;
     }
     if (p !== null) {
-      phase = p;
+      setPhase(p);
       return;
     }
     failures += 1;
     if (failures >= STATUS_QUERY_MAX_FAILURES) {
-      phase = "error";
+      setPhase("error");
       // 终态会一直短路所有调用 → 挂后台重探，等引擎页解冻/就绪后自动恢复
       scheduleReprobe();
       return;
@@ -259,7 +283,7 @@ async function ensureBound(): Promise<void> {
       // 下次取链前重新查询；在途请求不拆——引擎页 onRequest 全程在线，应答
       // 要么来自旧包（已发出的取链）要么等新包装好后正常返回。
       await listen("source-pack-changed", () => {
-        phase = null;
+        setPhase(null);
         remoteCode = null;
         engineDetail = null;
         enginePack = null;
@@ -269,7 +293,7 @@ async function ensureBound(): Promise<void> {
       bound = true;
     })().catch(() => {
       binding = null;
-      phase = "error";
+      setPhase("error");
       engineDetail = "event listen failed";
       scheduleReprobe();
     });
@@ -388,10 +412,10 @@ export async function engineInvoke(
     .catch(() => null);
   if (!answer) return null;
   if (answer.error) {
-    // 入口不存在 = 应用内置数据包与前端不同步（正常发版不会发生），
-    // 提示升级应用而不是让用户去更新音源包
+    // 入口不存在 = 当前生效的数据包（meta 包，可独立于应用更新）缺少该入口，
+    // 提示更新/重装数据包——旧话术「升级应用」只适用于内置包时代，已失真
     if (answer.error.includes("入口不存在")) {
-      throw new Error(`当前应用缺少「${entry}」接口，请升级应用后再试`);
+      throw new Error(`当前数据包缺少「${entry}」接口，请到「设置 → 音源包」更新数据包`);
     }
     throw new Error(`音源接口执行失败：${stripErrorUrls(answer.error)}`);
   }

@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { listen } from "@tauri-apps/api/event";
 import type { RegistryQuality, RegistrySource } from "@/types";
 import { getSourceRegistry } from "@/source-scripts";
+import { onEnginePhaseChange } from "@/source-engine/client";
 import { useMusicSourceStore } from "@/stores/musicSource";
 
 /**
@@ -9,13 +10,13 @@ import { useMusicSourceStore } from "@/stores/musicSource";
  *
  * 数据包经 `__qtEntries.sourceRegistry()` 声明音源（id/名称/短名/色值，
  * 顺序即 UI 展示顺序）与音质档位；后续新增/下线音源、调整音质只需发新
- * 数据包。PC 的数据包随应用内置，清单实际随应用版本变化；引擎未就绪或
- * 旧版包无该入口时列表为空且 ready=false，各页面选项为空、展示名兜底
- * 「未知」，本地音乐不受影响。
+ * 数据包。PC 的数据包在线安装（不随应用内置），清单随安装/升级的数据包
+ * 版本变化；引擎未就绪或旧版包无该入口时列表为空且 ready=false，各页面
+ * 选项为空、展示名兜底「未知」，本地音乐不受影响。
  *
  * 刷新时机：AppShell 挂载后 ensure()（幂等，成功过就不再请求）；引擎
- * phase 复位（播放包安装/切换触发的 source-pack-changed）后由下次
- * ensure/refresh 兜住。
+ * phase 变为 ready（onEnginePhaseChange，含 error→ready 自愈）与播放包
+ * 安装/切换触发的复位后由下次 ensure/refresh 兜住。
  */
 interface SourceRegistryStore {
   /** 数据包声明的音源清单（顺序即切换器/引导页的展示顺序） */
@@ -50,12 +51,27 @@ function bindPackListener(): void {
   });
 }
 
+/** 引擎 error→ready 自愈（后台重探恢复）不广播 source-pack-changed——直接
+ *  订阅引擎相位：转 ready 且注册表还没取到时立刻补取，避免「引擎恢复了、
+ *  音源清单却一直空到下一次手动刷新」。模块内只绑一次。 */
+let phaseHookBound = false;
+function bindPhaseHook(): void {
+  if (phaseHookBound) return;
+  phaseHookBound = true;
+  onEnginePhaseChange((p) => {
+    if (p !== "ready") return;
+    if (useSourceRegistryStore.getState().ready) return;
+    void useSourceRegistryStore.getState().ensure();
+  });
+}
+
 async function load(set: (partial: Partial<SourceRegistryStore>) => void): Promise<void> {
   bindPackListener();
+  bindPhaseHook();
   try {
     const registry = await getSourceRegistry();
     if (registry === null) {
-      // 引擎未就绪 / 旧内置包无入口：清空并保持未就绪，下次 ensure 再试
+      // 引擎未就绪 / 旧版数据包无入口：清空并保持未就绪，下次 ensure 再试
       set({ sources: [], qualities: [], ready: false });
       return;
     }
