@@ -19,6 +19,7 @@ import { useUpdateCheck } from "@/hooks/useUpdateCheck";
 import { useSourceUpdateCheck } from "@/hooks/useSourceUpdateCheck";
 import { PlayPackPrompt } from "@/components/PlayPackPrompt";
 import { SourceUpdatePrompt } from "@/components/SourceUpdatePrompt";
+import { MetaPackGuide } from "@/components/MetaPackGuide";
 import { useAppearanceStore } from "@/stores/appearance";
 import { usePlayerStore } from "@/stores/player";
 import { useDownloadsStore } from "@/stores/downloads";
@@ -214,6 +215,8 @@ export function AppShell(): React.JSX.Element {
         <PlayPackPrompt />
         {/* 音源包更新提示（发现可用更新时逐条确认，数据包优先） */}
         <SourceUpdatePrompt />
+        {/* 未装数据包时的首页全屏引导（在线安装官方数据包） */}
+        <MetaPackGuide />
       </ErrorBoundary>
 
       {/* 8 向 resize 命中区（fixed 覆盖层，最后挂载保证在最上） */}

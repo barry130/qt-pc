@@ -1,7 +1,9 @@
-//! 音源引擎窗口（双音源包架构）：
-//! 隐藏 webview，加载 qtres:// 引擎页（qtres.rs 内嵌 glue），页面里先 import
-//! 内置 meta-bundle.js（数据接口），再按本地状态装配播放音源包。主窗口经事件
-//! 与之 RPC（src/source-engine/client.ts），取链失败回退本地播放，不阻塞。
+//! 音源引擎窗口（双音源包架构，均在线安装、不再内置基线）：
+//! 隐藏 webview，加载 qtres:// 引擎页（qtres.rs 内嵌 glue），页面里按本地
+//! 状态装载生效数据包（meta-bundle.js，数据接口），再装配播放音源包。
+//! 未装数据包 = 数据面下线（页面进 ready 态，数据接口按「未安装」口径报错；
+//! 主窗口首页全屏引导安装）。主窗口经事件与之 RPC
+//! （src/source-engine/client.ts），取链失败回退本地播放，不阻塞。
 //!
 //! - 与 lyric_window 同模式：动态创建、不进 tauri.conf.json、常驻不退出
 //! - 换播放包 = Rust 广播 `source-pack-changed` → 引擎页在同一上下文里

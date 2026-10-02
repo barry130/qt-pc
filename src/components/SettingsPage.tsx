@@ -1209,9 +1209,9 @@ const PROMPTED_CLIPBOARD_LINKS = new Set<string>();
 
 /** 音源包设置（v3 统一包模型，与 uniappx 设置面板同口径）：
  *  - 数据包/播放包同构：单文件 js、首行 __QT_PACK__ 包头自描述身份；
- *  - 数据槽 = 内置基线 + 可选安装的数据包覆盖（单选，随时切回基线）；
+ *  - 数据槽 = 在线安装的数据包（不内置；未装 = 数据面下线，首页全屏引导）；
  *  - 播放槽 = 用户安装的播放包（不随应用分发，多包共存其一生效）；
- *  - 更新发现三通道合一（每包 updateUrl / 基线 / 官方 manifest），
+ *  - 更新发现双通道合一（每包 updateUrl / 官方 manifest），
  *    只提示不自动装，这里可以逐条应用；
  *  - 安装入口：https 直链 / 本地文件（系统选择框），先预览确认再落盘
  *    （包头 id 自称官方包时显著警示），剪贴板有包链接时主动询问；
@@ -1222,16 +1222,16 @@ const PROMPTED_CLIPBOARD_LINKS = new Set<string>();
 function SourcePackageSection(): React.JSX.Element {
   const local = useSourceUpdateStore((s) => s.local);
   const offers = useSourceUpdateStore((s) => s.offers);
-  const baselineMeta = useSourceUpdateStore((s) => s.baselineMeta);
   const message = useSourceUpdateStore((s) => s.message);
   const busy = useSourceUpdateStore((s) => s.busy);
   const setBusy = useSourceUpdateStore((s) => s.setBusy);
   const setMessage = useSourceUpdateStore((s) => s.setMessage);
   const setLocal = useSourceUpdateStore((s) => s.setLocal);
   const setOffers = useSourceUpdateStore((s) => s.setOffers);
-  const setBaselineMeta = useSourceUpdateStore((s) => s.setBaselineMeta);
   const dropOffer = useSourceUpdateStore((s) => s.dropOffer);
   const [url, setUrl] = useState("");
+  /** 安装入口模式：从链接 / 从本地文件（同一条设置行内切换） */
+  const [installMode, setInstallMode] = useState<"url" | "file">("url");
   const [installing, setInstalling] = useState(false);
   const [armed, setArmed] = useState<ArmedUninstall | null>(null);
   /** 安装预览现场（非 null = 预览确认弹窗开着） */
@@ -1323,7 +1323,6 @@ function SourcePackageSection(): React.JSX.Element {
   const check = async (): Promise<string> => {
     const result = await discoverSourceUpdates(true);
     setOffers(result.offers);
-    setBaselineMeta(result.baselineMeta);
     await refresh();
     if (!result.offers.length) return "已是最新（没有可用更新）";
     return `发现 ${result.offers.length} 个可用更新，逐条确认后应用`;
@@ -1339,7 +1338,7 @@ function SourcePackageSection(): React.JSX.Element {
     return `${kindLabel(outcome.kind)}已更新到 v${outcome.pack.versionCode}（${outcome.pack.name}）`;
   };
 
-  /** 启用包 / 切回内置基线（packId 空串 + kind=meta） */
+  /** 启用包 / 停用数据槽（packId 空串 + kind=meta = 停用数据包，数据面下线） */
   const activate = async (
     packId: string,
     kind: "meta" | "play",
@@ -1347,7 +1346,7 @@ function SourcePackageSection(): React.JSX.Element {
     await activateSourcePack(packId, kind);
     await refresh();
     if (kind === "meta") {
-      return packId ? "已切换生效数据包" : "已切回内置基线数据包";
+      return packId ? "已切换生效数据包" : "已停用数据包（在线数据不可用）";
     }
     return "已切换生效播放包";
   };
@@ -1445,7 +1444,7 @@ function SourcePackageSection(): React.JSX.Element {
   const activePlay = playPacks.find((p) => p.id === local?.activeId) ?? null;
   const metaStatus = activeMeta
     ? packLabel(activeMeta)
-    : `内置基线${baselineMeta ? ` · ${baselineMeta.name} ${baselineMeta.versionName} (code ${baselineMeta.code})` : ""}`;
+    : "未安装（在线搜索/歌单不可用）";
   const playStatus = activePlay
     ? packLabel(activePlay)
     : "未安装（在线播放不可用）";
@@ -1454,7 +1453,7 @@ function SourcePackageSection(): React.JSX.Element {
     <div className="max-w-xl divide-y divide-border">
       <SettingRow
         title="数据包"
-        description="搜索/歌单/歌词/封面等数据源。内置基线随应用发版，可另装数据包覆盖。"
+        description="搜索/歌单/歌词/封面等数据源。不随应用分发，在线安装（首页引导或下方入口）。"
       >
         <span className="font-mono text-xs text-muted-foreground">{metaStatus}</span>
       </SettingRow>
@@ -1471,7 +1470,7 @@ function SourcePackageSection(): React.JSX.Element {
         <div className="flex w-full flex-col gap-2">
           {packs.length === 0 && (
             <span className="text-xs text-muted-foreground">
-              还没有安装任何音源包（数据接口使用内置基线，正常可用）
+              还没有安装任何音源包（在线搜索/歌单不可用，本地音乐不受影响）
             </span>
           )}
           {metaPacks.length > 0 && (
@@ -1494,13 +1493,13 @@ function SourcePackageSection(): React.JSX.Element {
               <input
                 type="radio"
                 name="active-meta-pack"
-                aria-label="启用内置基线数据包"
+                aria-label="停用数据包"
                 checked={!local?.activeMetaId}
                 onChange={() => void run(() => activate("", "meta"))}
                 disabled={busy}
               />
               <span className="flex-1 font-mono text-muted-foreground">
-                内置基线（随应用分发）
+                停用数据包（在线搜索/歌单不可用）
               </span>
             </div>
           )}
@@ -1561,38 +1560,59 @@ function SourcePackageSection(): React.JSX.Element {
         </div>
       </SettingRow>
       <SettingRow
-        title="从链接安装"
-        description="粘贴音源包 .js 直链（https）安装；数据包/播放包自动识别。"
+        title="安装音源包"
+        description="从链接粘贴 .js 直链（https），或从本地选择文件；数据包/播放包自动识别。"
       >
         <div className="flex w-full flex-col gap-2">
-          <input
-            value={url}
-            onChange={(e) => setUrl(e.target.value)}
-            placeholder="https://…/play-bundle.js"
-            className="w-full rounded-md border border-border px-3 py-1.5 text-xs"
-          />
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setInstallMode("url")}
+              disabled={busy || installing || confirming}
+              aria-pressed={installMode === "url"}
+              className={
+                "rounded-md border px-2.5 py-1 text-xs transition-colors disabled:opacity-50 " +
+                (installMode === "url"
+                  ? "border-primary bg-primary/10 text-primary"
+                  : "border-border text-muted-foreground hover:bg-accent hover:text-foreground")
+              }
+            >
+              从链接
+            </button>
+            <button
+              type="button"
+              onClick={() => setInstallMode("file")}
+              disabled={busy || installing || confirming}
+              aria-pressed={installMode === "file"}
+              className={
+                "rounded-md border px-2.5 py-1 text-xs transition-colors disabled:opacity-50 " +
+                (installMode === "file"
+                  ? "border-primary bg-primary/10 text-primary"
+                  : "border-border text-muted-foreground hover:bg-accent hover:text-foreground")
+              }
+            >
+              从本地文件
+            </button>
+          </div>
+          {installMode === "url" ? (
+            <input
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              placeholder="https://…/play-bundle.js"
+              className="w-full rounded-md border border-border px-3 py-1.5 text-xs"
+            />
+          ) : null}
           <button
             type="button"
-            onClick={installUrl}
-            disabled={busy || installing || confirming || !url.trim()}
+            onClick={installMode === "url" ? installUrl : installLocal}
+            disabled={
+              busy || installing || confirming || (installMode === "url" && !url.trim())
+            }
             className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
           >
-            {installing ? "获取包信息…" : "安装"}
+            {installing ? "获取包信息…" : installMode === "url" ? "安装" : "选择文件…"}
           </button>
         </div>
-      </SettingRow>
-      <SettingRow
-        title="从本地文件安装"
-        description="选择本地 .js 音源包文件安装（适合手动下载/离线分发）。"
-      >
-        <button
-          type="button"
-          onClick={installLocal}
-          disabled={busy || installing || confirming}
-          className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
-        >
-          {installing ? "获取包信息…" : "选择文件…"}
-        </button>
       </SettingRow>
       {clipTip !== null && !preview && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">

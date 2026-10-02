@@ -3,9 +3,9 @@
 //! ## 为什么需要它
 //!
 //! 音源引擎窗口（label = `source-engine`，见 [`crate::source_window`]）会把
-//! **第三方播放音源包求值进自己的 JS 运行环境**执行（引擎页先 import 内置
-//! `/meta-bundle.js`，再由其 `installPlayPack` 用 new Function 执行
-//! `/script/<包目录>/play-bundle.js` 全文）。该窗口与主窗口共用同一张
+//! **第三方播放音源包求值进自己的 JS 运行环境**执行（引擎页先 import 已安装
+//! 数据包的 `/script/<id>/meta-bundle.js`，再由其 `installPlayPack` 用
+//! new Function 执行播放包全文）。该窗口与主窗口共用同一张
 //! 命令注册表，而 Tauri 的 ACL 只对**插件命令**生效：应用自身命令要走 ACL，
 //! 必须存在 app ACL 清单（本项目没有 `permissions/` 目录），并且窗口来源要
 //! 被判为「非本地」——而 Windows 下 `qtres://` 页面会被规范化成
@@ -52,7 +52,7 @@ pub(crate) const ENGINE_ALLOWED_COMMANDS: &[&str] = &[
     "source_pack_load_failed",
     // meta 槽装载成功上报（数据包更新现场收摊）
     "source_meta_loaded",
-    // meta 槽装载失败上报（回滚/回退内置基线）
+    // meta 槽装载失败上报（回滚更新现场/清空数据槽）
     "source_meta_load_failed",
     // 上报取链结果（官方播放包健康度统计）
     "source_report",

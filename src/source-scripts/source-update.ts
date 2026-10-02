@@ -4,10 +4,12 @@
  * 每个包 = 单文件 js，首行 `__QT_PACK__` 包头自描述身份；数据包（meta）与
  * 播放包（play）共用同一条安装/更新/启停/卸载管线，只有槽位不同：
  *
- * - 数据槽 activeMetaId：内置基线永远兜底（null = 基线），数据包可运行时装；
+ * - 数据槽 activeMetaId：数据包不再内置，在线安装（null = 未装，数据面下线，
+ *   首页全屏引导安装）；
  * - 播放槽 activeId：播放包不随应用分发，用户安装，多包共存其一生效；
- * - 更新发现（discoverSourceUpdates）三通道合一（每包 updateUrl 自探测 /
- *   基线 meta 的 updateUrl / astral manifest），**只提示不自动装**；
+ * - 更新发现（discoverSourceUpdates）双通道合一（每包 updateUrl 自探测 /
+ *   astral manifest），**只提示不自动装**；未装官方包时 manifest 也下发
+ *   首装 offer（currentCode=0，由首页引导消费）；
  * - 应用更新（applySourceUpdate）：下载 → 包头与 offer 完全一致 → 安装；
  *   失败自动回滚并拉黑该版本（Rust source_install.rs 完成）。
  *
@@ -23,7 +25,7 @@ import * as ipc from "@/services/ipc";
  */
 export const HOST_API_VERSION = 1;
 
-/** 包类型：meta = 数据包（低风险，内置基线兜底）；play = 播放包（高风险，不内置） */
+/** 包类型：meta = 数据包（低风险）；play = 播放包（高风险）。均不内置，在线安装 */
 export type SourcePackKind = "meta" | "play";
 
 /** 已安装的音源包（与 Rust SourcePackMeta serde 对齐，v3） */
@@ -65,39 +67,29 @@ export interface SourceStateVo {
   packs: SourcePackVo[];
   /** 播放槽：生效播放包 id（null = 未装） */
   activeId: string | null;
-  /** 数据槽：生效数据包 id（null = 内置基线） */
+  /** 数据槽：生效数据包 id（null = 未装，数据面下线） */
   activeMetaId: string | null;
   lastCheckAt: number;
 }
 
-/** 更新 offer（发现三通道归一后的统一形状） */
+/** 更新 offer（发现双通道归一后的统一形状） */
 export interface PackUpdateOfferVo {
   kind: SourcePackKind;
   /** 目标包 id */
   targetId: string;
+  /** 本地当前版本（0 = 未安装，首装引导） */
   currentCode: number;
   newCode: number;
   newName: string;
   notes: string;
-  /** self（包自身 updateUrl / 基线）/ manifest（astral 官方通道） */
+  /** self（包自身 updateUrl）/ manifest（astral 官方通道） */
   channel: "self" | "manifest" | string;
   url: string;
-  /** true = 从内置基线升到第一个数据包 */
-  fromBaseline: boolean;
-}
-
-/** 内置数据包基线的身份（qtres 内嵌 meta-bundle.js 的包头） */
-export interface BaselineMetaVo {
-  id: string;
-  code: number;
-  name: string;
-  versionName: string;
 }
 
 /** source_discover_updates 的返回 */
 export interface DiscoverResultVo {
   offers: PackUpdateOfferVo[];
-  baselineMeta: BaselineMetaVo | null;
 }
 
 /** 安装结果（Rust InstallOutcome） */
@@ -147,11 +139,11 @@ export function packVersionLabel(pack: SourcePackVo): string {
 }
 
 /**
- * 提示文案：`数据包有新版本：v内置基线 → v2（官方数据包）`。
- * 与 uniappx offerLabel 同口径。
+ * 提示文案：`数据包有新版本：v2026100101 → v2026100201（官方数据包）`；
+ * 未装（currentCode=0）时 from 显示「未安装」。
  */
 export function offerLabel(offer: PackUpdateOfferVo): string {
-  const from = offer.fromBaseline ? "内置基线" : `v${offer.currentCode}`;
+  const from = offer.currentCode > 0 ? `v${offer.currentCode}` : "未安装";
   return `${kindLabel(offer.kind)}有新版本：${from} → v${offer.newCode}（${offer.newName}）`;
 }
 
@@ -243,7 +235,7 @@ export function isPackLinkUrl(text: string): boolean {
 }
 
 /** 切换生效包（kind 决定槽位：play → 热切换+冒烟；meta → 重装 meta 槽）；
- *  packId 空串 + kind = 切回空位（meta=内置基线 / play=未装） */
+ *  packId 空串 + kind = 切回空位（数据面下线/播放未装） */
 export async function activateSourcePack(
   packId: string,
   kind?: SourcePackKind,
@@ -251,7 +243,8 @@ export async function activateSourcePack(
   await ipc.sourceActivatePack(packId, kind);
 }
 
-/** 卸载包（数据包卸载后数据槽回内置基线；卸载生效中的播放包后在线播放不可用） */
+/** 卸载包（卸载生效中的数据包后数据面下线，首页引导重新出现；
+ *  卸载生效中的播放包后在线播放不可用） */
 export async function uninstallSourcePack(packId: string): Promise<void> {
   await ipc.sourceUninstallPack(packId);
 }

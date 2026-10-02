@@ -5,14 +5,16 @@
 //!   自描述包头（[`crate::source_pack_header`]）；meta（数据包）与 play
 //!   （播放包）走**同一条**安装/更新/启停/卸载管线，只有槽位不同；
 //! - `state.json` schema 3：packs[]（多包共存）+ activeId（播放槽，None =
-//!   未装）+ activeMetaId（数据槽，None = 内置基线）+ lastCheckAt；
+//!   未装）+ activeMetaId（数据槽，None = 未装数据包——数据面下线，前端
+//!   首页全屏引导安装）+ lastCheckAt；
 //! - 安装：`install/<id>/{meta,play}-bundle.js` 落盘（旧产物备份 `.prev`）；
 //!   同 id 原位更新；播放包安装顺手清掉残留 chain.json；
 //! - 生效门：只有「槽位空着或本来就生效的是它」才自动上位，不抢用户选择；
-//! - 更新发现（`source_discover_updates`）三通道合一：① 每个包自身
-//!   updateUrl 的 Range 探测（4h 节流）② 无数据包生效时内置基线 meta 的
-//!   updateUrl ③ astral manifest（发布/平台/宿主契约门槛）。同 id 多通道
-//!   取最高 versionCode。**发现只提示不自动装**（前端逐条确认）；
+//! - 更新发现（`source_discover_updates`）双通道合一：① 每个包自身
+//!   updateUrl 的 Range 探测（4h 节流）② astral manifest（发布/平台/宿主
+//!   契约门槛；未装官方包 current=0 也下发首装引导）。同 id 多通道取最高
+//!   versionCode。**发现只提示不自动装**（前端逐条确认；首装数据包由
+//!   首页引导消费同一批 offer）；
 //! - `source_apply_update`：下载 → 包头必须与 offer 的 id/kind/versionCode
 //!   完全一致 → 按更新安装（isUpdate）。更新失败（引擎装载/冒烟炸了）由
 //!   `source_pack_load_failed` / `source_meta_load_failed` 自动回滚 `.prev`
@@ -141,7 +143,7 @@ pub struct SourceBundleState {
     pub packs: Vec<SourcePackMeta>,
     /// 播放槽：生效播放包 id（None = 未装任何播放包，取链按「未安装」口径）
     pub active_id: Option<String>,
-    /// 数据槽：生效数据包 id（None = 内置基线 meta-bundle）
+    /// 数据槽：生效数据包 id（None = 未装数据包，数据面下线）
     pub active_meta_id: Option<String>,
     pub last_check_at: i64,
 }
@@ -589,8 +591,8 @@ fn validate_pack_text(dir: &Path, text: &str) -> Result<PackHeader, String> {
 /// `.prev`。`channel`/`reference` 记录安装来源（观测用，见 SourcePackMeta）：
 /// - 首装 / 手动重装：按实际渠道写（url+URL / file+文件名 / ""=来源不明）；
 /// - 更新 + 官方 manifest 通道：改写为 manifest + 空 ref；
-/// - 更新 + 自管通道（包自身 updateUrl / 基线）：保留原安装来源；
-///   无旧记录（基线升格）视为官方数据包本体 → manifest。
+/// - 更新 + 自管通道（包自身 updateUrl）：保留原安装来源；
+///   无旧记录（首装 offer 走 apply）视为官方数据包本体 → manifest。
 ///
 /// 步骤：解析包头 → 播放包标记校验 → id 冲突校验 → 旧产物备份 `.prev` →
 /// 落盘 → putPack → 播放包清残留 chain.json → prune → 生效门 → 落盘状态。
@@ -630,7 +632,7 @@ fn install_pack_at(
         } else if is_update {
             match old_pack.as_ref() {
                 Some(old) => (old.install_source.clone(), old.install_ref.clone()),
-                // 自管更新但无旧记录（内置基线升格）= 官方数据包本体
+                // 自管更新但无旧记录（首装 offer 走 apply）= 官方数据包本体
                 None => (INSTALL_SOURCE_MANIFEST.to_string(), String::new()),
             }
         } else {
@@ -1032,17 +1034,9 @@ async fn probe_pack_header(url: &str) -> Result<Option<PackHeader>, String> {
     Ok(parse_pack_header(first_line))
 }
 
-/// 内置基线 meta 的包头（qtres 内嵌资产；旧基线无包头 → None）
-fn baseline_meta_header() -> Option<PackHeader> {
-    static CACHE: OnceLock<Option<PackHeader>> = OnceLock::new();
-    CACHE
-        .get_or_init(|| parse_pack_header(crate::qtres::meta_bundle_js()))
-        .clone()
-}
-
 // ---------- 更新发现 ----------
 
-/// 更新 offer（发现三通道归一后的统一形状；前端逐条确认后 apply）
+/// 更新 offer（发现双通道归一后的统一形状；前端逐条确认后 apply）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PackUpdateOffer {
@@ -1054,11 +1048,9 @@ pub struct PackUpdateOffer {
     pub new_code: i64,
     pub new_name: String,
     pub notes: String,
-    /// `self`（包自身 updateUrl / 基线）/ `manifest`（astral）
+    /// `self`（包自身 updateUrl）/ `manifest`（astral）
     pub channel: String,
     pub url: String,
-    /// true = 从内置基线升到第一个数据包
-    pub from_baseline: bool,
 }
 
 impl PackUpdateOffer {
@@ -1116,10 +1108,10 @@ fn release_available(release: &SourceRelease) -> bool {
         && release.host_api_version <= HOST_API_VERSION
 }
 
-/// 更新发现（三通道归一，**只提示不安装**）：
+/// 更新发现（双通道归一，**只提示不安装**）：
 /// ① 每个已装包自身 updateUrl 的 Range 包头探测（4h/包 节流，force 可越过）；
-/// ② 无数据包生效时，内置基线 meta 包头的 updateUrl（fromBaseline）；
-/// ③ astral manifest（play 产物版本 = release 版本；meta 产物需包头探测）。
+/// ② astral manifest（play 产物版本 = release 版本；meta 产物需包头探测；
+///    未装官方包 current=0 也下发首装 offer——数据包首装由首页全屏引导消费）。
 /// 同 targetId 多通道取 newCode 最高；meta 通道排在前面（先更数据包）。
 async fn discover_updates(
     app: &AppHandle,
@@ -1164,7 +1156,6 @@ async fn discover_updates(
                     notes: header.notes,
                     channel: "self".to_string(),
                     url: pack.update_url.trim().to_string(),
-                    from_baseline: false,
                 });
             }
             Ok(_) => {}
@@ -1175,44 +1166,10 @@ async fn discover_updates(
     }
     state.last_check_at = now;
 
-    // ② 内置基线 meta 的 updateUrl（仅当没有数据包生效；首装数据包场景）
-    let baseline = baseline_meta_header();
-    if state.active_meta_id.is_none() {
-        if let Some(b) = &baseline {
-            if !b.update_url.trim().is_empty() {
-                match probe_pack_header(b.update_url.trim()).await {
-                    Ok(Some(header))
-                        if header.id == b.id
-                            && header.kind == PACK_KIND_META
-                            && header.version_code > b.version_code =>
-                    {
-                        offers.push(PackUpdateOffer {
-                            kind: PACK_KIND_META.to_string(),
-                            target_id: b.id.clone(),
-                            current_code: b.version_code,
-                            new_code: header.version_code,
-                            new_name: if header.version_name.is_empty() {
-                                format!("code {}", header.version_code)
-                            } else {
-                                header.version_name
-                            },
-                            notes: header.notes,
-                            channel: "self".to_string(),
-                            url: b.update_url.trim().to_string(),
-                            from_baseline: true,
-                        });
-                    }
-                    Ok(_) => {}
-                    Err(e) => log::info!("[source-bundle] 基线 meta 探测失败: {e}"),
-                }
-            }
-        }
-    }
-
-    // ③ astral manifest（官方包通道：play-official / meta-official）
+    // ② astral manifest（官方包通道：play-official / meta-official）
     match fetch_manifest(astral).await {
         Ok(Some(release)) if release_available(&release) => {
-            // 播放包产物：release 版本即包版本（首装 current=0 也下发引导）
+            // 播放包产物：release 版本即包版本（未装 current=0 也下发首装引导）
             if let Some(art) = release.artifacts.iter().find(|a| a.path == ARTIFACT_PLAY) {
                 let installed = state.pack(OFFICIAL_PLAY_ID);
                 let current = installed.map(|p| p.version_code).unwrap_or(0);
@@ -1233,19 +1190,17 @@ async fn discover_updates(
                         notes: release.notes.clone(),
                         channel: "manifest".to_string(),
                         url: art.url.clone(),
-                        from_baseline: false,
                     });
                 }
             }
-            // 数据包产物：manifest 只有产物清单，版本要探测包头才知道
+            // 数据包产物：manifest 只有产物清单，版本要探测包头才知道；
+            // 未装 current=0 也下发（首页全屏引导消费的就是这条首装 offer）
             if let Some(art) = release.artifacts.iter().find(|a| a.path == ARTIFACT_META) {
                 if let Ok(Some(header)) = probe_pack_header(&art.url).await {
                     if header.kind == PACK_KIND_META && header.id == OFFICIAL_META_ID {
                         let current = state
-                            .active_meta_pack()
-                            .filter(|p| p.id == OFFICIAL_META_ID)
+                            .pack(OFFICIAL_META_ID)
                             .map(|p| p.version_code)
-                            .or_else(|| baseline.as_ref().map(|b| b.version_code))
                             .unwrap_or(0);
                         let skip = state
                             .pack(OFFICIAL_META_ID)
@@ -1270,7 +1225,6 @@ async fn discover_updates(
                                 notes: release.notes.clone(),
                                 channel: "manifest".to_string(),
                                 url: art.url.clone(),
-                                from_baseline: false,
                             });
                         }
                     }
@@ -1300,20 +1254,12 @@ async fn discover_updates(
     merged.sort_by_key(|o| if o.kind == PACK_KIND_META { 0 } else { 1 });
 
     save_state(&dir, &state)?;
-    let baseline_meta = baseline.map(|b| {
-        json!({
-            "id": b.id,
-            "code": b.version_code,
-            "name": b.name,
-            "versionName": b.version_name,
-        })
-    });
     log::info!(
         "[source-bundle] 更新发现完成：{} 个 offer（{} 次自探测，manifest 已查）",
         merged.len(),
         probes
     );
-    Ok(json!({ "offers": merged, "baselineMeta": baseline_meta }))
+    Ok(json!({ "offers": merged }))
 }
 
 // ---------- 命令 ----------
@@ -1365,7 +1311,7 @@ pub async fn cmd_source_apply_update(
         .pack(&offer.target_id)
         .map(|p| p.version_code);
     // 官方 manifest 通道更新 → 安装来源改写为 manifest；自管通道（包自身
-    // updateUrl / 基线）保留原安装来源（install_pack_at 内处理）
+    // updateUrl）保留原安装来源（install_pack_at 内处理）
     let channel = if offer.channel == "manifest" {
         INSTALL_SOURCE_MANIFEST
     } else {
@@ -1598,9 +1544,9 @@ pub async fn cmd_source_install_staged(app: AppHandle, token: String) -> Result<
 /// 切换生效包（设置页单选；kind 决定槽位与广播）：
 /// - play → activeId + `source-pack-changed`（引擎热装载 + 冒烟）；
 /// - meta → activeMetaId + `source-meta-changed`（引擎重装 meta 槽并复验契约，
-///   失败会经 source_meta_load_failed 自动回退内置基线）；
-/// - packId 为空 + kind 指明槽位 → 切回空位（meta = 内置基线；play = 未装），
-///   设置页「内置基线」单选项走这条路径。
+///   失败会经 source_meta_load_failed 自动回滚/清槽）；
+/// - packId 为空 + kind 指明槽位 → 切回空位（数据面下线：在线搜索/歌单不可
+///   用，本地音乐不受影响；首页引导随之出现）。
 #[tauri::command(rename = "source_activate_pack")]
 pub async fn cmd_source_activate_pack(
     app: AppHandle,
@@ -1643,8 +1589,8 @@ pub async fn cmd_source_activate_pack(
 }
 
 /// 卸载包（删目录 + 出列表；生效位若指向它则清空该槽——不自动顺延，
-/// 由用户在设置页选择下一个）。数据包卸载后数据槽回到内置基线；
-/// 卸载生效中的播放包后在线播放不可用（设置页有提示文案）。
+/// 由用户在设置页选择下一个）。卸载生效中的数据包后数据面下线（首页引导
+/// 重新出现）；卸载生效中的播放包后在线播放不可用（设置页有提示文案）。
 #[tauri::command(rename = "source_uninstall_pack")]
 pub async fn cmd_source_uninstall_pack(app: AppHandle, pack_id: String) -> Result<Value, String> {
     let dir = source_bundle::bundle_dir(&app);
@@ -1715,7 +1661,7 @@ pub async fn cmd_source_pack_verified(app: AppHandle, pack_id: String) -> Result
 }
 
 /// 引擎 meta 槽装载成功上报（引擎页调用）：清更新现场 + 清失败记录 + 记日志。
-/// packId 为空串 = 内置基线。
+/// packId 为空串 = 防御口径（未装数据包时引擎不上报）。
 #[tauri::command(rename = "source_meta_loaded")]
 pub async fn cmd_source_meta_loaded(
     app: AppHandle,
@@ -1729,7 +1675,7 @@ pub async fn cmd_source_meta_loaded(
     log::info!(
         "[source-bundle] meta 槽已装载：{} v{}",
         if pack_id.is_empty() {
-            "内置基线"
+            "（未装数据包）"
         } else {
             &pack_id
         },
@@ -1787,9 +1733,10 @@ pub async fn cmd_source_pack_load_failed(
     Ok(json!({ "handled": true, "reverted": false }))
 }
 
-/// 数据包（meta 槽）装载失败上报（引擎页调用，引擎页已自行回退内置基线保数据面）：
+/// 数据包（meta 槽）装载失败上报（引擎页调用；引擎页已自行下线数据面：
+/// entries 清空，数据接口按「未安装」口径报错）：
 /// - 更新现场 → 回滚 `.prev` / 摘除首装 + 拉黑，广播 meta-changed 装回旧版；
-/// - 手动启用失败 → 数据槽清空（= 内置基线）。
+/// - 手动启用失败 → 数据槽清空（未装态，首页引导重新出现）。
 /// 两种情况都把失败摘要记到包记录 last_error（广播前写，刷新即可见）。
 #[tauri::command(rename = "source_meta_load_failed")]
 pub async fn cmd_source_meta_load_failed(
@@ -1818,7 +1765,7 @@ pub async fn cmd_source_meta_load_failed(
         state.active_meta_id = None;
         save_state(&dir, &state)?;
         broadcast_meta_changed(&app);
-        return Ok(json!({ "handled": true, "reverted": false, "fallbackBaseline": true }));
+        return Ok(json!({ "handled": true, "reverted": false, "slotCleared": true }));
     }
     Ok(json!({ "handled": true, "reverted": false }))
 }
@@ -2522,7 +2469,7 @@ mod tests {
     #[test]
     fn fresh_install_without_old_record_self_channel_is_manifest() {
         let dir = tmp_dir("src-bl");
-        // 基线升格：自管更新但无旧记录 → 视作官方数据包本体。
+        // 首装 offer 走 apply（is_update 但无旧记录）→ 视作官方数据包本体。
         // 旁路签名闸门：这里测的是来源归属语义，且模拟的是签名落地前的
         // 历史安装路径（闸门本身的验证见 official_pack_gate_* 测试）
         let _gate = SignatureGateBypass::new();

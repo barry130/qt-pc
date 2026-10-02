@@ -561,7 +561,7 @@ export async function sourceState(): Promise<unknown> {
   return invoke("source_state");
 }
 
-/** 更新发现（force=true 越过节流；返回 offers + baselineMeta） */
+/** 更新发现（force=true 越过节流；返回 offers，未装官方包含首装 offer） */
 export async function sourceDiscoverUpdates(force: boolean): Promise<unknown> {
   return invoke("source_discover_updates", { force });
 }
@@ -595,7 +595,7 @@ export async function sourceInstallStaged(token: string): Promise<unknown> {
   return invoke("source_install_staged", { token });
 }
 
-/** 启用包（packId 空串 = 切回空位：meta=内置基线 / play=未装，须传 kind） */
+/** 启用包（packId 空串 = 切回空位：数据面下线/播放未装，须传 kind） */
 export async function sourceActivatePack(
   packId: string,
   kind?: "meta" | "play",

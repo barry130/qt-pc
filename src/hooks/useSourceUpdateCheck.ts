@@ -1,10 +1,11 @@
 /**
- * 音源包启动静默检查（v3 统一包模型，与 qt-uniappx App.uvue 启动检查同口径）：
+ * 音源包启动静默检查（v3 统一包模型）：
  * - 启动延迟几秒做一次**发现**（discoverSourceUpdates(false)，4h/包 节流在
  *   Rust 生效），失败完全静默（后端没起/离线都正常）；
  * - 发现只提示不自动装：offers 进全局 store，由 SourceUpdatePrompt 逐条
- *   向用户确认（数据包优先）；
- * - 顺带刷新本地状态（设置页/红点消费）。
+ *   向用户确认（数据包优先）；meta 首装 offer（currentCode=0）不算更新，
+ *   由首页全屏引导 MetaPackGuide 消费，不进提示条；
+ * - 顺带刷新本地状态（设置页/红点/引导消费）。
  */
 import { useEffect } from "react";
 import {
@@ -24,8 +25,9 @@ export function useSourceUpdateCheck(): void {
         try {
           const result = await discoverSourceUpdates(false);
           const store = useSourceUpdateStore.getState();
-          store.setOffers(result.offers);
-          store.setBaselineMeta(result.baselineMeta);
+          store.setOffers(
+            result.offers.filter((o) => !(o.kind === "meta" && o.currentCode === 0)),
+          );
           store.setLocal(await getSourceState());
         } catch {
           // 发现失败完全静默（后端没起/离线都正常）

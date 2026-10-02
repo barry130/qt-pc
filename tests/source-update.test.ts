@@ -67,7 +67,6 @@ function offer(overrides: Partial<PackUpdateOfferVo> = {}): PackUpdateOfferVo {
     notes: "",
     channel: "self",
     url: "https://cdn.example/play-bundle.js",
-    fromBaseline: false,
     ...overrides,
   };
 }
@@ -98,7 +97,7 @@ describe("source-update 文案 helper（v3）", () => {
     );
   });
 
-  it("4b. offerLabel 数据包基线通道：内置基线 → new", () => {
+  it("4b. offerLabel 数据包首装（currentCode=0）：未安装 → new", () => {
     const text = offerLabel(
       offer({
         kind: "meta",
@@ -107,10 +106,9 @@ describe("source-update 文案 helper（v3）", () => {
         newCode: 2,
         newName: "官方数据包",
         channel: "manifest",
-        fromBaseline: true,
       }),
     );
-    expect(text).toBe("数据包有新版本：内置基线 → v2（官方数据包）");
+    expect(text).toBe("数据包有新版本：未安装 → v2（官方数据包）");
   });
 
   it("4c. installSourceLabel 四种来源", () => {
@@ -150,7 +148,7 @@ describe("source-update IPC 包装（v3）", () => {
     vi.clearAllMocks();
   });
 
-  it("5. activateSourcePack 透传 packId + kind（空串 = 切回内置基线）", async () => {
+  it("5. activateSourcePack 透传 packId + kind（空串 = 切回空位/停用）", async () => {
     const spy = vi.spyOn(ipc, "sourceActivatePack").mockResolvedValue(undefined);
     await activateSourcePack("", "meta");
     await activateSourcePack("play-official", "play");

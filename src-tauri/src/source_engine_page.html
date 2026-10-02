@@ -9,17 +9,18 @@
       音源引擎页（v3 统一包模型，与 qt-uniappx services/source-engine.uts 同口径）：
       - 由 qtres:// 协议内嵌提供（无 CSP 注入 → 可自由动态 import）；
       - __TAURI_INTERNALS__ 由 Tauri 注入（withGlobalTauri 仍为 false，不用全局 API）；
-      - 数据槽（meta）：内置基线 meta-bundle.js 永远兜底；用户安装的数据包
-        （install/<id>/meta-bundle.js，首行 __QT_PACK__ 包头）可覆盖基线——
-        activeMetaId 指向它时本页动态 import（?v=versionCode 破缓存）、复验
-        bundleInfo 契约；装载失败 → source_meta_load_failed（Rust 回滚/回退）
-        + 本页立刻回退基线，数据接口永不下线；
+      - 数据槽（meta）：不再内置基线——数据包（install/<id>/meta-bundle.js，
+        首行 __QT_PACK__ 包头）完全在线安装；activeMetaId 指向它时本页动态
+        import（?v=versionCode 破缓存）、复验 bundleInfo 契约；未装 = 数据面
+        下线（搜索/歌单/歌词等按「未安装」口径报错，本地音乐不受影响）；
+        装载失败 → source_meta_load_failed（Rust 回滚/清槽）+ 本页下线数据面；
       - 播放槽（play）：用户安装的播放包（install/<id>/play-bundle.js）多包
         共存、其一生效；本页用 installPlayPack 在 meta 上下文里求值装配，
         换包 = Rust 广播 source-pack-changed → 本页热切换，不需要重启应用；
         生效时跑真实取链冒烟（搜索“晴天”前 5 首任一取链 + Range 预检通过）；
       - 未安装播放包 ≠ 引擎失败：数据接口照常工作，仅取链入口按统一口径报错
         （主窗口据此引导去设置页安装，见 client.ts / PLAY_PACK_MISSING_MESSAGE）；
+        同理未安装数据包 ≠ 引擎失败：本地音乐不受影响，主窗口首页全屏引导安装。
       - 主窗口侧封装见 src/source-engine/client.ts。
     -->
     <script type="module">
@@ -42,15 +43,15 @@
 
       /** meta 注册出的数据入口（搜索/歌单/…/installPlayPack/getPlayUrl） */
       let entries = null;
-      /** meta 槽已装载快照：{id: ""(基线)|包id, code, revision} */
+      /** meta 槽已装载快照：{id: ""(未装)|包id, code, revision} */
       let metaLoaded = { id: "", code: 0, revision: "" };
-      /** 数据包装载失败原因（已回退基线时记录，装配成功后清空） */
+      /** 数据包装载失败原因（装载成功/未装时为 null） */
       let metaError = null;
       /** 当前已装配的播放包（null = 未装配） */
       let activePack = null;
       /** 播放包装配失败原因（装配成功后清空；不阻断数据接口） */
       let packError = null;
-      /** 页面生命周期：booting → ready | error（仅基线 meta 自身失败才 error） */
+      /** 页面生命周期：booting → ready | error（仅宿主钩子注入失败才 error） */
       let phase = "booting";
       let phaseDetail = null;
 
@@ -69,7 +70,7 @@
        * fetch/XHR/WebSocket 绕过 builtin_request 的协议/内网校验自由外联。
        *
        * 放行面（本页自身的运行需要）：
-       * - 同源站内路径（"/meta-bundle.js"、"/script/…" 的 fetch 装载）；
+       * - 同源站内路径（"/script/…" 的 fetch 装载）；
        * - Tauri IPC 端点（http(s)://ipc.localhost、ipc:// —— invoke 底层走 fetch）。
        * 其余一律拒绝（全局 fetch、XHR、WebSocket、EventSource、Worker、sendBeacon）。
        */
@@ -180,8 +181,9 @@
         }
       }
 
-      /** 计算 meta 槽目标：activeMetaId 指向的数据包，否则内置基线。
-       *  包版 URL 带 ?v=versionCode 破 import 缓存（同 id 原位更新后必须重新求值）。 */
+      /** 计算 meta 槽目标：activeMetaId 指向的数据包；未装（url 空串）=
+       *  数据面下线，不再是内置基线。包版 URL 带 ?v=versionCode 破 import
+       *  缓存（同 id 原位更新后必须重新求值）。 */
       function metaTarget(state) {
         const active = state && typeof state.activeMetaId === "string" ? state.activeMetaId : "";
         if (active) {
@@ -199,17 +201,23 @@
             };
           }
         }
-        return { id: "", code: 0, url: "/meta-bundle.js" };
+        return { id: "", code: 0, url: "" };
       }
 
       /**
        * 装载 meta 槽（boot 与每次 source-meta-changed 共用）：
-       * 取目标文本（no-store）→ 包版校验包头身份 → 动态 import → bundleInfo
-       * 契约自检（name=meta-bundle 且 hostApiVersion=1）。任何失败抛错由
-       * 调用方决定回退/上报；基线 URL 的模块图固定，import 天然幂等。
+       * 未装 → 清空数据面（entries=null，干净态不报错）；装了 → 取目标文本
+       * （no-store）→ 包版校验包头身份 → 动态 import → bundleInfo 契约自检
+       * （name=meta-bundle 且 hostApiVersion=1）。装载失败抛错由调用方上报。
        */
       async function loadMeta(state) {
         const target = metaTarget(state);
+        if (!target.url) {
+          entries = null;
+          metaLoaded = { id: "", code: 0, revision: "" };
+          metaError = null;
+          return;
+        }
         const res = await fetch(target.url, { cache: "no-store" });
         if (!res.ok) throw new Error("数据包文件读取失败: HTTP " + res.status);
         const text = await res.text();
@@ -254,14 +262,17 @@
         }).catch(() => {});
       }
 
-      /** 数据包装载失败 → 上报 + 立刻回退内置基线（数据接口永不下线） */
-      async function fallbackBaseline(state, detail) {
+      /** 数据包装载失败 → 上报 + 本页立刻下线数据面（entries 清空，数据接口
+       *  按「未安装」口径报错）。Rust 收到后按更新现场回滚 .prev / 清空数据槽
+       *  并广播 source-meta-changed，本页 onMetaChanged 装回旧版或进入未装态。 */
+      async function metaFailed(state, detail) {
+        entries = null;
+        metaLoaded = { id: "", code: 0, revision: "" };
         metaError = detail;
         await invoke("source_meta_load_failed", {
           packId: metaTarget(state).id,
           error: detail,
         }).catch(() => {});
-        await loadMeta({ ...(state || {}), activeMetaId: null });
       }
 
       /** 根目录 chain.json 覆盖层（开发/调链用；无则用播放包内置默认链） */
@@ -298,6 +309,13 @@
        * - smoke=true 时追加真实取链冒烟；通过后 source_pack_verified 收摊更新现场。
        */
       async function applyActivePack(state, smoke) {
+        // 数据面未就绪（未装数据包/装载失败）：installPlayPack 与冒烟都依赖
+        // meta entries，装配无从谈起——回到「未装配」态且不误报播放包失败。
+        if (!entries) {
+          activePack = null;
+          packError = null;
+          return;
+        }
         const packs = (state && state.packs) || [];
         const pack = packs.find((p) => p && p.id === state.activeId && p.kind === "play") || null;
         if (!pack) {
@@ -418,16 +436,16 @@
             invoke("builtin_request", { url, options: options || null }),
           platform: 1103,
         };
-        // 2) meta 槽：生效数据包 → 失败立刻回退内置基线（数据接口永不下线）
+        // 2) meta 槽：未装 = 数据面下线（干净态）；装载失败 → 上报 + 下线
         const state = await readState();
         try {
           await loadMeta(state);
         } catch (err) {
           const detail = String((err && err.message) || err);
-          await fallbackBaseline(state, detail);
-          phaseDetail = "数据包装载失败已回退内置基线: " + detail;
+          await metaFailed(state, detail);
+          phaseDetail = "数据包装载失败: " + detail;
         }
-        // 3) 播放槽（未装 = 数据接口照常，取链按「未安装」口径报错）
+        // 3) 播放槽（meta 数据面就绪才装配；未装 meta 时取链同样按「未安装」口径报错）
         await applyActivePack(
           state,
           new URLSearchParams(location.search).get("smoke") === "1",
@@ -462,7 +480,13 @@
           try {
             const name = payload.entry == null ? "" : String(payload.entry);
             const fn = entries ? entries[name] : null;
-            if (typeof fn !== "function") throw new Error("入口不存在: " + name);
+            if (typeof fn !== "function") {
+              throw new Error(
+                entries
+                  ? "入口不存在: " + name
+                  : "未安装数据包，数据接口不可用（首页可安装）: " + name,
+              );
+            }
             result = await fn(payload.args || {});
           } catch (err) {
             error = String((err && err.message) || err);
@@ -477,6 +501,9 @@
         let url = "";
         let line = null;
         let error = null;
+        if (!entries) {
+          error = "未安装数据包，在线播放不可用（首页可安装）";
+        }
         try {
           if (entries && typeof payload.source === "string") {
             const song = payload.song || {};
@@ -524,8 +551,8 @@
           await loadMeta(state);
         } catch (err) {
           const detail = String((err && err.message) || err);
-          await fallbackBaseline(state, detail);
-          phaseDetail = "数据包装载失败已回退内置基线: " + detail;
+          await metaFailed(state, detail);
+          phaseDetail = "数据包装载失败: " + detail;
         }
         await applyActivePack(state, false);
         await report("ready", { detail: packError || metaError || phaseDetail || null });
