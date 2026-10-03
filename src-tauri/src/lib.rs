@@ -57,7 +57,15 @@ type CmdResult<T> = Result<T, ProviderError>;
 /// 取播放地址（脚本线路）：缓存（10 分钟）命中直接返回；未命中经 playurl_bridge
 /// 问前端脚本包（前端按「换源顺序」跨源解析），拿到后写入缓存。
 /// R1：只进进程内存，不写 SQLite。原生 Rust Provider 已删除，
-/// 前端脚本线路是唯一的第三方取链路径（未就绪 / 超时 / 空串 = 无地址）。
+/// 前端脚本线路是唯一的第三方取链路径。
+///
+/// **失败必须分级**（2026-10-03 弱网修复）：`ask_frontend` 的三种结果映射到
+/// 两种语义完全不同的错误 ——
+/// · `NoUrl`（脚本链跑完但没地址）→ `NoPlayableUrl`：**内容问题**，这首都
+///   没有可播地址，应该跳下一首、计入熔断；
+/// · `Stalled`（等待超时 / 前端未就绪）→ `ResolveStalled`：**环境问题**，
+///   等一会儿可能就好，绝不能计入熔断，否则弱网 5 首就把自动切歌关死
+///   （`ProviderError::is_stalled` 是引擎侧判据的唯一来源）。
 pub(crate) async fn resolve_play_url_script(
     app: &tauri::AppHandle,
     cache: &PlayUrlCache,
@@ -68,12 +76,11 @@ pub(crate) async fn resolve_play_url_script(
     if let Some((url, fetched_at)) = cache.get(&key) {
         return Ok((url, fetched_at));
     }
-    let url = crate::playurl_bridge::ask_frontend(app, track, quality)
-        .await
-        .ok_or(ProviderError::NoPlayableUrl)?;
-    if url.is_empty() {
-        return Err(ProviderError::NoPlayableUrl);
-    }
+    let url = match crate::playurl_bridge::ask_frontend(app, track, quality).await {
+        crate::playurl_bridge::AskOutcome::Url(url) => url,
+        crate::playurl_bridge::AskOutcome::NoUrl => return Err(ProviderError::NoPlayableUrl),
+        crate::playurl_bridge::AskOutcome::Stalled => return Err(ProviderError::ResolveStalled),
+    };
     cache.set(key.clone(), url.clone());
     // fetched_at 由 set 写入当前时间；这里再读一次拿到真实时间戳
     let fetched_at = cache.get(&key).map(|(_, at)| at).unwrap_or(0);

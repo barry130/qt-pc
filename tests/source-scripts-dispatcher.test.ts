@@ -25,6 +25,8 @@ const engineMock = vi.hoisted(() => ({
   calls: [] as Array<{ entry: string; args: Record<string, unknown> }>,
 }));
 vi.mock("@/source-engine/client", () => ({
+  /** 与真实实现同源的数据接口默认超时（单源常量，避免 mock 缺导出） */
+  INVOKE_TIMEOUT_MS: 20_000,
   engineInvoke: async (entry: string, args: Record<string, unknown>) => {
     engineMock.calls.push({ entry, args });
     return engineMock.invokeResult;
@@ -35,6 +37,7 @@ vi.mock("@/source-engine/client", () => ({
       url: engineMock.resolveUrl,
       line: engineMock.resolveLine,
       error: engineMock.resolveError,
+      stalled: false,
     };
   },
   engineSnapshot: () => ({
@@ -226,7 +229,7 @@ describe("source-scripts dispatcher（纯音源包：app 只经引擎调用）",
     clearPlayUrlLines();
   });
 
-  it("resolvePlayUrl（预解析）：local 源直接报错不预取链", async () => {
+  it("resolvePlayUrl（预解析）：local 源返回空串不预取链（内容问题，stalled=false）", async () => {
     const ipc = await import("@/services/ipc");
     const backfillSpy = vi.spyOn(ipc, "setResolvedPlayUrl").mockResolvedValue(undefined);
     const mod = await import("@/source-scripts");
@@ -240,9 +243,11 @@ describe("source-scripts dispatcher（纯音源包：app 只经引擎调用）",
       duration: 0,
       musicId: null,
     };
-    await expect(mod.resolvePlayUrl(track, "128")).rejects.toThrow(
-      "local 源不支持该动作",
-    );
+    // 2026-10-03 弱网修复后的契约：local 不走脚本取链也不抛错——
+    // 返回空串且 stalled=false（内容问题）；store 侧 preResolvePlayUrl
+    // 在更外层就已跳过 local，这里是最后一道防线
+    await expect(mod.resolvePlayUrl(track, "128")).resolves.toBe("");
+    expect(engineMock.calls.length).toBe(0);
     expect(backfillSpy).not.toHaveBeenCalled();
     backfillSpy.mockRestore();
   });

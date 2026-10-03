@@ -406,7 +406,11 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
       set({ session, profile, loading: false });
       // 收藏归属检查（换号清库）+ 新账号的收藏同步，失败不影响登录
       await handleLikeOwnerSwitch(profile);
-      void syncLikesWithReconcile().catch(() => {});
+      // 与 init 路径同口径：失败写 like.lastError 留排查线索（见 init 内注释）
+      void syncLikesWithReconcile().catch((err) => {
+        console.warn("[like] 登录后收藏同步失败", err);
+        void ipc.setSetting("like.lastError", errMsg(err)).catch(() => {});
+      });
     } catch (err) {
       set({
         loading: false,
@@ -429,7 +433,11 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
       const profile = await ipc.astralMe().catch(() => null);
       set({ session, profile, loading: false });
       await handleLikeOwnerSwitch(profile);
-      void syncLikesWithReconcile().catch(() => {});
+      // 与 init/login 路径同口径：失败写 like.lastError 留排查线索
+      void syncLikesWithReconcile().catch((err) => {
+        console.warn("[like] 注册后收藏同步失败", err);
+        void ipc.setSetting("like.lastError", errMsg(err)).catch(() => {});
+      });
     } catch (err) {
       set({
         loading: false,

@@ -837,10 +837,6 @@ export async function revealLogs(): Promise<void> {
 
 // ---------- 播放 / 队列 ----------
 
-export async function playTrack(track: Track): Promise<void> {
-  return invoke("play_track", { track });
-}
-
 export async function playQueue(
   tracks: Track[],
   startIndex: number,
@@ -912,10 +908,6 @@ export async function pause(): Promise<void> {
 
 export async function resume(): Promise<void> {
   return invoke("resume");
-}
-
-export async function stop(): Promise<void> {
-  return invoke("stop");
 }
 
 export async function seek(positionMs: number): Promise<void> {

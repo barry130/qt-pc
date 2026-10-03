@@ -32,6 +32,16 @@ async function preResolvePlayUrl(
   }
 }
 
+/**
+ * 播放动作代际号：每个用户播放动作（点歌/切歌）入场时自增。
+ *
+ * 播放动作都先 `await preResolvePlayUrl`（最坏 8s 取链）再发 IPC，弱网下这个
+ * 窗口很长 —— 快速点歌 A→B 时，A 的动作若后完成，会把「播 A」的 IPC 迟到发出，
+ * 最终播放的是先点的 A。动作在每个 await 之后校验代际，被更新动作超越即放弃，
+ * 保证「最后一次点击获胜」。
+ */
+let playActionSeq = 0;
+
 interface PlayerStore {
   state: PlaybackState | null;
   /**
@@ -243,38 +253,48 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
   },
 
   play: async (track) => {
+    const gen = ++playActionSeq;
     await preResolvePlayUrl(track, get().state);
+    if (gen !== playActionSeq) return;
     await ipc.playQueue([track], 0);
   },
 
   playQueue: async (tracks, startIndex) => {
+    const gen = ++playActionSeq;
     await preResolvePlayUrl(tracks[startIndex], get().state);
+    if (gen !== playActionSeq) return;
     await ipc.playQueue(tracks, startIndex);
   },
 
   playAt: async (index) => {
+    const gen = ++playActionSeq;
     const { queue } = get();
     await preResolvePlayUrl(queue[index], get().state);
+    if (gen !== playActionSeq) return;
     await ipc.playAt(index);
   },
 
   nextTrack: async () => {
+    const gen = ++playActionSeq;
     // 顺序/循环模式可提前算出下一首并预解析；随机模式留给引擎自行解析
     const st = get().state;
     const { queue, queueIndex } = get();
     if (st && queue.length > 0 && queueIndex !== null && st.playMode !== "random") {
       const nextIndex = (queueIndex + 1) % queue.length;
       await preResolvePlayUrl(queue[nextIndex], st);
+      if (gen !== playActionSeq) return;
     }
     await ipc.next();
   },
 
   prevTrack: async () => {
+    const gen = ++playActionSeq;
     const st = get().state;
     const { queue, queueIndex } = get();
     if (st && queue.length > 0 && queueIndex !== null) {
       const prevIndex = (queueIndex - 1 + queue.length) % queue.length;
       await preResolvePlayUrl(queue[prevIndex], st);
+      if (gen !== playActionSeq) return;
     }
     await ipc.previous();
   },

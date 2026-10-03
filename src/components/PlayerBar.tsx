@@ -524,9 +524,13 @@ function DesktopLyricButton(): React.JSX.Element {
     <ControlButton
       label={on ? "关闭桌面歌词" : "开启桌面歌词"}
       active={on}
-      onClick={() => void (on ? hideDesktopLyric() : showDesktopLyric()).then(
-        (s) => setOn(s.visible),
-      )}
+      onClick={() =>
+        void (on ? hideDesktopLyric() : showDesktopLyric())
+          .then((s) => setOn(s.visible))
+          // 功能开关失败不值得弹全局「致命错误」浮层：保持当前状态即可
+          // （与同文件 setSpeed 等按钮的 .catch(() => {}) 口径一致）
+          .catch(() => {})
+      }
     >
       <Captions className="h-4 w-4" />
     </ControlButton>
@@ -542,29 +546,13 @@ function QualityMenu(props: { current: Quality }): React.JSX.Element {
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const boxRef = useRef<HTMLDivElement | null>(null);
+  useDismissOnOutside(boxRef, open, () => setOpen(false));
   // 档位清单来自数据包注册表（未就绪时 qualityOptionsFromRegistry 兜底三档）
   const options = qualityOptionsFromRegistry(
     useSourceRegistryStore((s) => s.qualities),
   );
   const shortOf = (q: Quality): string =>
     options.find((o) => o.value === q)?.short ?? q;
-
-  // 点外面 / Esc 收起
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent): void => {
-      if (boxRef.current && !boxRef.current.contains(e.target as Node)) setOpen(false);
-    };
-    const onKey = (e: KeyboardEvent): void => {
-      if (e.key === "Escape") setOpen(false);
-    };
-    window.addEventListener("mousedown", onDown);
-    window.addEventListener("keydown", onKey);
-    return () => {
-      window.removeEventListener("mousedown", onDown);
-      window.removeEventListener("keydown", onKey);
-    };
-  }, [open]);
 
   const pick = (q: Quality): void => {
     setOpen(false);
@@ -847,23 +835,7 @@ function PlayUrlButton(props: { url: string | null; line: string; miss: string }
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const boxRef = useRef<HTMLDivElement | null>(null);
-
-  // 点外面 / Esc 收起
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent): void => {
-      if (boxRef.current && !boxRef.current.contains(e.target as Node)) setOpen(false);
-    };
-    const onKey = (e: KeyboardEvent): void => {
-      if (e.key === "Escape") setOpen(false);
-    };
-    window.addEventListener("mousedown", onDown);
-    window.addEventListener("keydown", onKey);
-    return () => {
-      window.removeEventListener("mousedown", onDown);
-      window.removeEventListener("keydown", onKey);
-    };
-  }, [open]);
+  useDismissOnOutside(boxRef, open, () => setOpen(false));
 
   // 收起时把「已复制」复位，下次打开是干净状态
   useEffect(() => {

@@ -162,14 +162,20 @@ fn handle_script_file<R: tauri::Runtime>(
     }
     let install_root = source_bundle::bundle_dir(app).join("install");
     let target = install_root.join(code).join(file);
-    // 规范化前缀校验：兜底防符号链接/编码绕过
-    if !starts_with_canonical(&target, &install_root) {
-        log::warn!("[qtres] /script 规范化校验失败: {}", target.display());
-        return not_found();
-    }
+    // 先判「文件本身合不合规」，再做前缀校验。顺序不能反：
+    // starts_with_canonical 内部用 canonicalize()，而**目标不存在时它返回 Err**，
+    // 会被误判成「路径越界」。而 chain.json 在播放包安装时是被有意删掉的
+    // （见 source_install：播放包自包含默认 chain，残留 overlay 属旧版本），
+    // 于是每次启动都会稳定打一条假 WARN，污染取链故障窗口的日志。
+    // 先过 metadata 这一关，就只剩「文件真实存在却越界」这种真可疑情况才告警。
     match std::fs::metadata(&target) {
         Ok(m) if m.is_file() && m.len() <= SCRIPT_FILE_MAX => {}
         _ => return not_found(),
+    }
+    // 规范化前缀校验：兜底防符号链接/编码绕过
+    if !starts_with_canonical(&target, &install_root) {
+        log::warn!("[qtres] /script 路径越界拒绝: {}", target.display());
+        return not_found();
     }
     let Ok(bytes) = std::fs::read(&target) else {
         return not_found();
@@ -203,8 +209,11 @@ fn not_found() -> Response<Vec<u8>> {
 }
 
 /// 目标路径是否落在 root 之内：先词法规范化（消化 "." / ".." 段），
-/// 再与规范化后的 root 比对。目标不存在（canonicalize 失败）返回 false——
-/// 调用方（/script 分发）对不存在一律 not found，无需区分。
+/// 再与规范化后的 root 比对。
+///
+/// 注意：目标不存在时 canonicalize() 失败，此处返回 false。**调用方必须先确认
+/// 文件存在再调本函数**，否则「文件不存在」会被误当成「路径越界」而误报
+/// （`/script` 分发里 chain.json 就是这种常态——播放包安装时有意删除）。
 fn starts_with_canonical(target: &Path, root: &Path) -> bool {
     use std::path::Component;
     let Ok(root_c) = root.canonicalize() else {
@@ -383,7 +392,7 @@ fn fetch_cover_bytes(client: &reqwest::blocking::Client, url: &str) -> Option<Ve
 fn handle_cover(original_url: String) -> Response<Vec<u8>> {
     // 缓存命中
     {
-        let mut guard = COVER_CACHE.lock().unwrap();
+        let mut guard = COVER_CACHE.lock().unwrap_or_else(|p| p.into_inner());
         let cache = guard.get_or_insert_with(|| lru_simple::Lru::new(COVER_CACHE_MAX));
         if let Some(bytes) = cache.get(&original_url) {
             return image_response(bytes.clone(), &original_url);
@@ -415,7 +424,7 @@ fn handle_cover(original_url: String) -> Response<Vec<u8>> {
         Some(data) if !data.is_empty() => {
             let url_for_cache = original_url.clone();
             {
-                let mut guard = COVER_CACHE.lock().unwrap();
+                let mut guard = COVER_CACHE.lock().unwrap_or_else(|p| p.into_inner());
                 let cache = guard.get_or_insert_with(|| lru_simple::Lru::new(COVER_CACHE_MAX));
                 cache.insert(url_for_cache, data.clone());
             }
@@ -480,6 +489,28 @@ mod tests {
         assert!(!starts_with_canonical(&escape, &root));
         std::fs::write(tmp.join("secret.txt"), "x").unwrap();
         assert!(!starts_with_canonical(&escape, &root));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 回归：文件不存在时 starts_with_canonical 返回 false（canonicalize 失败）。
+    ///
+    /// 这个语义曾导致每次启动都打一条假 WARN —— chain.json 在播放包安装时
+    /// 被有意删除，`/script/play-official/chain.json` 每次都请求，必然 404。
+    /// 调用方（handle_script_file）因此**必须先过 metadata 再做前缀校验**。
+    /// 本测试把这个约束钉住：谁把顺序换回去，这里就该红。
+    #[test]
+    fn missing_file_is_not_reported_as_traversal() {
+        let tmp = std::env::temp_dir().join(format!("ll-qtres-missing-{}", std::process::id()));
+        let root = tmp.join("install");
+        let code_dir = root.join("play-official");
+        std::fs::create_dir_all(&code_dir).unwrap();
+        // 目录存在、文件不存在（= 安装播放包后的常态）
+        let absent = code_dir.join("chain.json");
+        assert!(!absent.exists());
+        assert!(!starts_with_canonical(&absent, &root));
+        // 但 handle_script_file 的新顺序下，这条请求会静默 404 而非告警：
+        // metadata 阶段就返回，不会走到前缀校验。
+        assert!(std::fs::metadata(&absent).map(|m| m.is_file()).unwrap_or(false) == false);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

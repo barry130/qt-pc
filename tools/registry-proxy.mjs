@@ -17,7 +17,15 @@ const UPSTREAM_API = "https://rsproxy.cn/api/v1/crates";
 
 const server = http.createServer(async (req, res) => {
   try {
-    const url = req.url ?? "";
+    // cargo（sparse 协议）有时会发**绝对形式**的请求目标，即 req.url 形如
+    // `http://127.0.0.1:8650/index/as/yn/async-trait` —— 带 scheme+host 前缀。
+    // 直接 startsWith("/index/") 会漏判 → 落到 404 → cargo 报
+    // 「no matching package named `xxx` found」，而代理日志里能看到请求确实到了。
+    // 这里统一剥掉 scheme+host，只留 path。
+    let url = req.url ?? "";
+    const abs = url.match(/^https?:\/\/[^/]+(\/.*)$/);
+    if (abs) url = abs[1];
+    console.log(`[mirror] ${req.method} ${url}`);
 
     // 1) 稀疏索引 config.json：把 dl/api 指回本地
     if (url === "/index/config.json") {

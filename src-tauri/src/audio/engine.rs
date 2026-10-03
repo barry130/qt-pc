@@ -15,7 +15,7 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rodio::{Decoder, Player, Source};
 
@@ -142,11 +142,35 @@ pub enum AudioCmd {
         message: String,
         /// 触发时是否处于「应当继续播放」的语义（自动切歌 / 在播时换曲）
         autoplay: bool,
+        /// 本次失败是否只是**环境问题**（弱网 / 引擎卡 / 取链等待超时）。
+        /// true 时不把这首拉进 `failed_tracks`、不计入连续失败熔断 ——
+        /// 「等久了」不等于「这首歌坏了」。见 `ProviderError::is_stalled`。
+        stalled: bool,
         /// 加载代次：过期的失败回执直接丢弃（用户早已切到别的歌）
         gen: u64,
     },
     /// 装配 / 卸载系统媒体控制（SMTC）。启动时由 lib.rs 注入。
-    SetSmtc(Option<crate::smtc::SmtcHandle>),
+    SetSmtc(Option<crate::smtc::SmtcHandle>),    /// 弱网原地重试：延迟到达后重试**同一首**（`schedule_stalled_retry` 投递）。
+    /// 与 `LoadFailed` 不同，它不换歌、不动熔断计数。
+    StalledRetry {
+        track_id: String,
+        /// 投递时的加载代次：不匹配说明期间用户已切歌/重载，直接丢弃
+        gen: u64,
+    },
+    /// 恢复探测成功（`schedule_recovery_probe` 投递）：重开自动切歌并把
+    /// 当前曲重新拉起来。gen == 0 表示不校验代次（探测针对队列当前曲）。
+    Recovered { gen: u64 },
+    /// 输出流/音频回调线程出事（cpal 流错误，或 panic 钩子捕获到 cpal 线程 panic）。
+    ///
+    /// 这两种情况下 `PlaybackStatus` 仍然是 Playing、位置却已经冻住，前端和
+    /// 指标都看不出任何异常 —— 必须由引擎主动兜底（见 `watch_pipeline`）。
+    StreamError {
+        /// 原始错误文案（只进日志与错误态，不含 URL）
+        message: String,
+        /// true = 音频回调线程已经 panic 退出。此时输出流不可能再出声音，
+        /// 软重载（重新挂源）也拉不动它（没有回调来拉样本）→ 必须直接重建输出流。
+        fatal: bool,
+    },
     Shutdown,
 }
 
@@ -161,6 +185,31 @@ pub struct AudioEngine {
     /// 正在播放的流所对应的磁盘缓存文件（cmd_clear_audio_cache 跳过它，
     /// Windows 上删被占用的文件会失败）
     cache_file: Arc<Mutex<Option<PathBuf>>>,
+}
+
+/// 音频回调线程（cpal 的 `cpal_wasapi_out` / `cpal_wasapi_in` 等）panic 的上报通道。
+///
+/// 为什么单独留这条：cpal 的输出流线程跑的就是**拉样本回调**
+/// （`run_output(run_context, &mut data_callback, ..)`），解码器 panic 会顺着回调
+/// 打死整条线程 —— 而 cpal 既不会重建线程，也不会调 error callback。结果
+/// rodio 的 `Player::get_pos()`（位置）与 `Player::empty()`（曲终判定）双双冻结，
+/// 引擎收不到任何信号，表现为「播到一半卡死，按播放键也没反应」。
+/// file_logger 的全局 panic 钩子认出线程名后经这里投一条 StreamError 进来。
+static AUDIO_THREAD_PANIC_TX: std::sync::OnceLock<Sender<AudioCmd>> = std::sync::OnceLock::new();
+
+/// 由全局 panic 钩子调用（见 `file_logger::install_panic_hook`）。
+///
+/// **只能在 panic 钩子里用**：不加锁、不写日志、不分配大对象，只往无界 channel
+/// 投一条消息（引擎线程收到后做重活）。`msg` 形如
+/// `cpal_wasapi_out: attempt to subtract with overflow at ...`。
+pub fn notify_audio_thread_panic(msg: &str) {
+    let Some(tx) = AUDIO_THREAD_PANIC_TX.get() else {
+        return;
+    };
+    let _ = tx.send(AudioCmd::StreamError {
+        message: msg.to_string(),
+        fatal: true,
+    });
 }
 
 impl AudioEngine {
@@ -178,6 +227,8 @@ impl AudioEngine {
         let queue = Arc::new(Mutex::new(Queue::default()));
         let fx = Arc::new(AudioFx::new());
         let cache_file = Arc::new(Mutex::new(None));
+        // 注册音频线程 panic 上报通道（先于线程启动；重复启动时以第一次为准）
+        let _ = AUDIO_THREAD_PANIC_TX.set(tx.clone());
 
         let tx_thread = tx.clone();
         let queue_thread = Arc::clone(&queue);
@@ -287,6 +338,9 @@ struct EngineInner {
     auto_next: bool,
     /// 连续播放失败计数（成功挂载播放或手动播放时清零）
     fail_streak: u32,
+    /// 弱网（取链等待超时）连续重试同一首的次数（成功播放 / 换歌 / 手动播放时清零）。
+    /// 与 `fail_streak` 分开：前者是「网络还没好，再等等」，后者是「歌有问题，换下一首」。
+    stall_retry: u32,
     /// 系统媒体控制（SMTC）句柄；None = 不可用（非 Windows / 初始化失败）
     smtc: Option<crate::smtc::SmtcHandle>,
     /// 加载代次：每次发起新的「取址+构建解码器」链就 +1。LoadReady /
@@ -313,6 +367,8 @@ struct EngineInner {
     cache_file: Arc<Mutex<Option<PathBuf>>>,
     /// 播放缓存体积上限（MB，0 = 不限；启动从 settings 恢复，SetCacheLimit 改）
     cache_limit_mb: u64,
+    /// 位置冻结看门狗：回调线程死了 / 解码卡住时唯一的破裂信号（见 StallWatch）
+    watch: StallWatch,
 }
 
 impl EngineInner {
@@ -343,12 +399,17 @@ impl EngineInner {
     }
 
     fn queue_emit(&self) {
-        let q = self.queue.lock().unwrap();
+        // 锁内只取数据，emit（含整队列序列化）放在锁外：大队列时 json 序列化
+        // 可能毫秒级，别拉长临界区（引擎线程与命令线程都会调本函数）
+        let (tracks, index) = {
+            let q = self.queue.lock().unwrap();
+            (q.tracks.clone(), q.index)
+        };
         let _ = self.app.emit(
             "queue-changed",
             serde_json::json!({
-                "tracks": q.tracks,
-                "index": q.index.map(|i| i as u32),
+                "tracks": tracks,
+                "index": index.map(|i| i as u32),
             }),
         );
     }
@@ -366,6 +427,7 @@ impl EngineInner {
     /// URL 缓存，几乎瞬时），音量/播放态一并迁移。失败时保留旧流不动 ——
     /// 切设备失败不该让播放中断。
     fn rebuild_output(&mut self, choice: Option<&str>) -> Result<(), String> {
+        // 重建出来的流同样要挂错误回调：否则「看门狗重建过的流」又变成哑巴
         let new_stream = match choice {
             Some(name) => {
                 let device = cpal::default_host()
@@ -379,10 +441,11 @@ impl EngineInner {
                     .ok_or_else(|| format!("找不到输出设备：{name}"))?;
                 rodio::DeviceSinkBuilder::from_device(device)
                     .map_err(|e| e.to_string())?
+                    .with_error_callback(stream_error_callback(self.tx.clone()))
                     .open_stream()
                     .map_err(|e| e.to_string())?
             }
-            None => rodio::DeviceSinkBuilder::open_default_sink().map_err(|e| e.to_string())?,
+            None => open_default_stream(self.tx.clone())?,
         };
         let new_sink = rodio::Player::connect_new(new_stream.mixer());
 
@@ -552,6 +615,38 @@ struct EngineDeps {
     db: Option<Arc<Database>>,
 }
 
+/// 输出流错误回调：转成引擎命令。
+///
+/// rodio 的默认回调只 `eprintln!`（`stream.rs::default_error_callback`），应用侧
+/// 对「输出流坏死」一无所知 —— 这正是播放静默卡死能瞒过所有监控的原因。
+/// 回调里**不写日志**（可能跑在音频实时线程上），只投一条 channel 消息。
+fn stream_error_callback(tx: Sender<AudioCmd>) -> impl FnMut(cpal::StreamError) + Send + 'static {
+    move |e| {
+        let _ = tx.send(AudioCmd::StreamError {
+            message: e.to_string(),
+            fatal: false,
+        });
+    }
+}
+
+/// 打开默认输出流：首选「默认设备 + 错误回调」，失败再回落到 rodio 的设备枚举兜底
+/// （兜底路径用的是 rodio 默认错误回调，只打 stderr —— 但「能出声」优先于「能上报」）。
+fn open_default_stream(tx: Sender<AudioCmd>) -> Result<rodio::MixerDeviceSink, String> {
+    match rodio::DeviceSinkBuilder::from_default_device()
+        .map_err(|e| e.to_string())
+        .and_then(|b| {
+            b.with_error_callback(stream_error_callback(tx))
+                .open_stream()
+                .map_err(|e| e.to_string())
+        }) {
+        Ok(s) => Ok(s),
+        Err(e) => {
+            log::warn!("[device] 默认设备直开失败（{e}），回落到设备枚举兜底");
+            rodio::DeviceSinkBuilder::open_default_sink().map_err(|e| e.to_string())
+        }
+    }
+}
+
 fn run_engine(deps: EngineDeps) {
     let EngineDeps {
         app,
@@ -566,7 +661,7 @@ fn run_engine(deps: EngineDeps) {
         db,
     } = deps;
     // MixerDeviceSink / Player 只能在音频线程创建和持有（非 Send）
-    let _stream = match rodio::DeviceSinkBuilder::open_default_sink() {
+    let _stream = match open_default_stream(tx.clone()) {
         Ok(s) => s,
         Err(e) => {
             log::error!("音频输出设备初始化失败: {e}");
@@ -588,7 +683,6 @@ fn run_engine(deps: EngineDeps) {
         // pool_idle_timeout 计时器不走，醒来后池仍认为连接"新鲜"），新请求复用
         // 它们就挂满超时才报错。pool_max_idle_per_host(0) 让每个请求建新连接，
         // 醒来后要么立刻连成功、要么 connect_timeout 快速失败 —— 不再复用死连接。
-        // 假死防护另由 range_reader 的 per-request 8s 总超时兜底（超时→重试→重连）。
         .pool_max_idle_per_host(0)
         .connect_timeout(Duration::from_secs(8))
         .build()
@@ -616,6 +710,7 @@ fn run_engine(deps: EngineDeps) {
         failed_tracks: HashSet::new(),
         auto_next: true,
         fail_streak: 0,
+        stall_retry: 0,
         smtc: None,
         load_gen: 0,
         last_persist: None,
@@ -630,6 +725,7 @@ fn run_engine(deps: EngineDeps) {
         cache_file,
         // 真正的值从 settings 恢复；这里与 cache::DEFAULT_AUDIO_CACHE_LIMIT_MB 对齐
         cache_limit_mb: crate::cache::DEFAULT_AUDIO_CACHE_LIMIT_MB,
+        watch: StallWatch::default(),
     };
 
     let mut inner = inner;
@@ -787,6 +883,9 @@ fn run_engine(deps: EngineDeps) {
                 advance(&mut inner, true);
             } else if is_still_playing {
                 emit_position_tick(&mut inner);
+                // 位置冻结看门狗：回调线程死了 / 解码卡住时 `sink.empty()` 也是
+                // false，只有「位置不再推进」这一个信号能识破（见 watch_pipeline）
+                watch_pipeline(&mut inner);
             }
             // 心跳：每 5s 补发一次全量快照。事件是"语义变化才推送"，
             // 前端一旦漏收（启动竞态 / WebView 重载），播放条会停在
@@ -795,6 +894,19 @@ fn run_engine(deps: EngineDeps) {
                 inner.publish();
                 last_publish = std::time::Instant::now();
             }
+        }
+
+        // 只有「此刻确实在播」才该看到位置推进。其余状态（暂停 / 缓冲 / 加载中 /
+        // 错误 / 停止）位置本来就不动，一律重建看门狗窗口基准 —— 否则
+        // 「暂停 30s 再按播放」会被当成冻结 30s 直接触发恢复。
+        // reset 只清窗口：hits 与 dead 判定跨重载延续，恢复阶梯才不会被自己打断。
+        if inner
+            .state
+            .read()
+            .map(|st| st.status != PlaybackStatus::Playing)
+            .unwrap_or(true)
+        {
+            inner.watch.reset();
         }
     }
 }
@@ -846,6 +958,9 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                     let pos = inner.state.read().unwrap().position_ms;
                     inner.auto_next = true;
                     inner.fail_streak = 0;
+                    inner.stall_retry = 0;
+                    // 用户手动播 = 明确意图：看门狗判定也清零（给这条管线一次干净的机会）
+                    inner.watch.clear();
                     load_queue_track(inner, track, true, pos);
                 } else {
                     inner.mutate(|st| st.status = PlaybackStatus::Stopped);
@@ -951,6 +1066,8 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             inner.failed_tracks.clear();
             inner.auto_next = true;
             inner.fail_streak = 0;
+            inner.stall_retry = 0;
+            inner.watch.clear();
             let mut q = inner.queue.lock().unwrap();
             q.set(tracks, index);
             let current = q.current().cloned();
@@ -979,6 +1096,8 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                 // （覆盖「线路恢复后老歌被永久跳过」）
                 inner.auto_next = true;
                 inner.fail_streak = 0;
+                inner.stall_retry = 0;
+                inner.watch.clear();
                 inner.failed_tracks.remove(&track.id);
                 play_queue_track(inner, track);
             }
@@ -1230,6 +1349,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             track_id,
             message,
             autoplay,
+            stalled,
             gen,
         } => {
             if gen != inner.load_gen {
@@ -1245,18 +1365,76 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                 // 自动下一首标识关闭（熔断已触发）就不跳，保持错误态等用户处理；
                 // autoplay=false 的加载（启动恢复/暂停态重载）本来就不在自动链上
                 if autoplay && inner.auto_next {
-                    inner.fail_streak += 1;
-                    if inner.fail_streak >= FAIL_STREAK_LIMIT {
-                        inner.auto_next = false;
-                        inner.fail_streak = 0;
-                        let notice = format!("连续{FAIL_STREAK_LIMIT}首播放失败，已停止自动切歌");
-                        log::warn!("[queue] {notice}");
-                        inner.mutate(|st| st.error = Some(notice.clone()));
-                        // 自动切歌多发生在后台，应用内错误条看不到，走系统通知告知
-                        notify_failure(&inner.app, &notice);
+                    if stalled {
+                        // 环境问题：原地重试同一首，绝不换歌、绝不计入熔断。
+                        // 这是弱网修复的核心——过去弱网超时被当成「歌坏了」，
+                        // 于是连跳 5 首把自动切歌关掉，再也回不来。
+                        schedule_stalled_retry(inner, &track_id);
                     } else {
-                        skip_if_recoverable(inner, &track_id, autoplay);
+                        inner.fail_streak += 1;
+                        if inner.fail_streak >= FAIL_STREAK_LIMIT {
+                            inner.auto_next = false;
+                            inner.fail_streak = 0;
+                            let notice = format!(
+                                "连续{FAIL_STREAK_LIMIT}首播放失败，已停止自动切歌"
+                            );
+                            log::warn!("[queue] {notice}");
+                            inner.mutate(|st| st.error = Some(notice.clone()));
+                            // 自动切歌多发生在后台，应用内错误条看不到，走系统通知告知
+                            notify_failure(&inner.app, &notice);
+                            // 网络/音源恢复后自动重开（不强求用户手动操作）
+                            schedule_recovery_probe(inner);
+                        } else {
+                            skip_if_recoverable(inner, &track_id, autoplay);
+                        }
                     }
+                }
+            }
+        }
+        AudioCmd::StalledRetry { track_id, gen } => {
+            if gen != inner.load_gen {
+                log::info!("[queue] 丢弃过期的弱网重试 track={track_id}");
+            } else {
+                // 只在仍是当前曲时才重试（用户在延迟期间手动切了别的歌就不动）
+                let is_current = inner
+                    .queue
+                    .lock()
+                    .unwrap()
+                    .current()
+                    .map(|t| t.id == track_id)
+                    .unwrap_or(false);
+                if !is_current {
+                    log::info!("[queue] 弱网重试时当前曲已变，丢弃 track={track_id}");
+                } else {
+                    // 先出借用再play_queue_track（它要&mut inner）
+                    let track = inner.queue.lock().unwrap().current().cloned();
+                    if let Some(track) = track {
+                        log::info!("[queue] 弱网重试：{track_id}");
+                        play_queue_track(inner, track);
+                    }
+                }
+            }
+        }
+        AudioCmd::Recovered { gen } => {
+            if gen != 0 && gen != inner.load_gen {
+                log::info!("[queue] 丢弃过期的恢复探测回执");
+            } else {
+                // 网络/音源已恢复：重开自动切歌并把当前曲重新拉起来。
+                // 过去熔断是单向门，只能靠用户手动操作，这里让它自愈。
+                inner.auto_next = true;
+                inner.fail_streak = 0;
+                inner.stall_retry = 0;
+                inner.watch.clear();
+                inner.failed_tracks.clear();
+                inner.mutate(|st| {
+                    st.error = None;
+                });
+                let track = inner.queue.lock().unwrap().current().cloned();
+                if let Some(track) = track {
+                    log::info!("[queue] 网络已恢复，重新播放当前曲 {}", track.id);
+                    play_queue_track(inner, track);
+                } else {
+                    log::info!("[queue] 网络已恢复，队列为空不重放");
                 }
             }
         }
@@ -1264,6 +1442,13 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             inner.smtc = handle;
             // 立即把当前状态推给系统面板，避免注入前已播的曲目信息缺失
             inner.publish();
+        }
+        AudioCmd::StreamError { message, fatal } => {
+            log::error!("[audio] 输出流不可用（fatal={fatal}）：{message}");
+            // 这一刻 PlaybackStatus 可能仍是 Playing、位置也已经冻住，前端完全
+            // 看不出异常。交给看门狗：缩短判定窗口，fatal（回调线程已死）时跳过
+            // 软重载直接重建输出流 —— 没有回调来拉样本，重新挂源是白费。
+            inner.watch.mark_dead(fatal);
         }
         AudioCmd::Shutdown => return true,
     }
@@ -1369,6 +1554,178 @@ fn advance(inner: &mut EngineInner, auto: bool) {
 /// 就关闭 auto_next 并发系统通知，防止死歌队列一首接一首白等取链无限空转。
 const FAIL_STREAK_LIMIT: u32 = 5;
 
+/// 弱网原地重试：首次失败后等这么久再试**同一首**（指数退避，封顶见下）。
+const STALLED_RETRY_BASE_MS: u64 = 3_000;
+/// 弱网连续重试上限：超过就不再自动重试（避免网络长时间不可用时空转）。
+const STALLED_RETRY_LIMIT: u32 = 3;
+/// 弱网重试的退避封顶。
+const STALLED_RETRY_MAX_MS: u64 = 20_000;
+
+// ---------- 位置冻结看门狗（2026-10-03「播到一半卡死」修复） ----------
+
+/// 位置冻结的正常判定窗口。
+///
+/// **必须大于 `range_reader::FIRST_PACKET_TIMEOUT`（8s）**：解码发生在 cpal 回调
+/// 线程里，等网络数据时回调会阻塞在 `HttpRangeReader::read` 上（单次上限 8s），
+/// 那段时间位置本来就不会动 —— 窗口比它短会把「正常的网络等待」误判成死流。
+const STALL_POS_TIMEOUT: Duration = Duration::from_secs(12);
+/// 已判明输出流出过事（cpal 流错误 / 回调线程 panic）后的加速窗口。
+/// 仍取 8s：一次正常的阻塞读可能就要等满 8s，不能再短。
+const STALL_DEAD_TIMEOUT: Duration = Duration::from_secs(8);
+/// 冻结恢复的尝试上限：命中 1 次软重载、2 次重建输出流、3 次放弃。
+const STALL_RECOVER_LIMIT: u32 = 3;
+
+/// 播放位置冻结看门狗状态。
+///
+/// rodio 0.22 的样本拉取发生在 cpal 音频回调线程里，于是「回调线程死了」与
+/// 「解码器卡住」在引擎侧是**同一个症状**：墙上时钟在走、`get_pos()` 不动、
+/// `sink.empty()` 永远 false。唯一可靠的判据只有「位置多久没变了」。
+#[derive(Default)]
+struct StallWatch {
+    /// 上次观测到的位置与观测时刻；None = 还没有基准（离开 Playing 后重建）
+    probe: Option<(u64, Instant)>,
+    /// 连续冻结命中次数：位置一推进就清零（恢复阶梯要跨重载延续，见 reset）
+    hits: u32,
+    /// 输出流已报错/回调线程已 panic，且**此后没有再产出过样本**。
+    /// 置位后判定窗口缩短，并跳过软重载（没有回调来拉新源，软重载是白费）。
+    /// 唯一的清除方式：位置真的又推进了（poll 里），或用户手动发起播放（clear）。
+    dead: bool,
+}
+
+impl StallWatch {
+    /// 判定窗口：报过错的流用 8s，正常流用 12s
+    fn window(&self) -> Duration {
+        if self.dead {
+            STALL_DEAD_TIMEOUT
+        } else {
+            STALL_POS_TIMEOUT
+        }
+    }
+
+    /// 离开 Playing（Loading / Paused / Stopped / Error）时重建窗口基准。
+    /// **不清 hits、不清 dead** —— 恢复阶梯必须跨「重载 → Loading → Playing」延续，
+    /// 清掉就变成「无限软重载」。
+    fn reset(&mut self) {
+        self.probe = None;
+    }
+
+    /// 用户手动发起播放：整条管线给一次干净判定（连 hits 一起清）。
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// 输出流报错 / 回调线程 panic。
+    /// `fatal` 时把 hits 预置到 1，让下一次命中直接落到「重建输出流」——
+    /// 回调线程已经死掉的情况下软重载纯属浪费一个窗口。
+    fn mark_dead(&mut self, fatal: bool) {
+        self.dead = true;
+        if fatal && self.hits == 0 {
+            self.hits = 1;
+        }
+    }
+
+    /// 录入一次观测。返回 `Some(hits)` = 已判定冻结并已消费窗口（调用方去做恢复）。
+    fn poll(&mut self, pos_ms: u64, now: Instant) -> Option<u32> {
+        match self.probe {
+            // 位置变了（前进，或用户往回拖）→ 管线是活的
+            Some((last, _)) if pos_ms != last => {
+                self.probe = Some((pos_ms, now));
+                self.hits = 0;
+                self.dead = false;
+                None
+            }
+            Some((_, at)) if now.duration_since(at) >= self.window() => {
+                self.hits += 1;
+                self.probe = Some((pos_ms, now));
+                Some(self.hits)
+            }
+            Some(_) => None,
+            None => {
+                // 首次观测只建基准：不知道位置静止了多久，不能立刻开火
+                self.probe = Some((pos_ms, now));
+                None
+            }
+        }
+    }
+}
+
+/// 弱网原地重试同一首（2026-10-03 弱网修复）。
+///
+/// 与 `skip_if_recoverable` 的根本区别：**不换歌、不计入熔断**。
+/// 取链等待超时是环境问题（弱网/引擎卡），换一首大概率同样超时 ——
+/// 过去正是「换 5 首 → 打满熔断 → 自动切歌关死」把弱网放大成永久不可用。
+/// 这里改成等网络缓一会儿再试同一首，弱网下的真实体验从「连跳 5 首后停摆」
+/// 变成「这一首多等几秒」。
+///
+/// 退避且限次：网络长时间不可用时不会无限空转；`stall_retry` 达到上限后
+/// 停在错误态等用户操作（此时不拉黑本首，用户手动播即可再试）。
+fn schedule_stalled_retry(inner: &mut EngineInner, track_id: &str) {
+    let attempt = inner.stall_retry;
+    if attempt >= STALLED_RETRY_LIMIT {
+        log::warn!(
+            "[queue] 曲目 {track_id} 连续{STALLED_RETRY_LIMIT}次因网络超时，已停止自动重试"
+        );
+        return;
+    }
+    let delay = STALLED_RETRY_BASE_MS.saturating_mul(1u64 << attempt).min(STALLED_RETRY_MAX_MS);
+    inner.stall_retry = attempt + 1;
+    log::info!("[queue] 网络较慢，{delay}ms 后重试同一首（{}/{STALLED_RETRY_LIMIT}）", attempt + 1);
+
+    // 重试要走引擎命令通道（load_queue_track 需要 &mut EngineInner），
+    // 且必须带代次：延迟期间用户可能已切歌/暂停，到时由 gen 不匹配丢弃。
+    let tx = inner.tx.clone();
+    let id = track_id.to_string();
+    let gen = inner.load_gen;
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        let _ = tx.send(AudioCmd::StalledRetry {
+            track_id: id,
+            gen,
+        });
+    });
+}
+
+/// 熔断后的恢复探测：网络/音源恢复时自动重开自动切歌。
+///
+/// 过去熔断是单向门——只有用户手动播歌才会重开（`Play`/`SetQueue`/`PlayAt`
+/// 里的 `auto_next = true`）。用户反馈「网络一差整晚都放不回来」正是这条：
+/// 网络在 20:24 恢复，但 20:16 已经熔断，没人操作就永远停在错误态。
+///
+/// 这里挂一个后台探测：按 `RECOVERY_PROBE_BASE_MS` 起指数退避，探测到
+/// 取链成功（真拿到地址）就重开 `auto_next` 并把当前曲重新拉起来。
+/// 探测本身是**真的取一次链**，不是空转计时器——判据可靠，也顺带验证恢复。
+const RECOVERY_PROBE_BASE_MS: u64 = 15_000;
+const RECOVERY_PROBE_MAX_MS: u64 = 120_000;
+/// 恢复探测的尝试上限：超过就彻底交给用户（避免长期不可用时反复取链）。
+const RECOVERY_PROBE_LIMIT: u32 = 8;
+
+fn schedule_recovery_probe(inner: &EngineInner) {
+    let app = inner.app.clone();
+    let tx = inner.tx.clone();
+    let cache = Arc::clone(&inner.url_cache);
+    let queue = Arc::clone(&inner.queue);
+    let track = queue.lock().unwrap().current().cloned();
+    let Some(track) = track else {
+        return;
+    };
+    let quality = inner.state.read().unwrap().quality.into_provider();
+    tauri::async_runtime::spawn(async move {
+        let mut delay = RECOVERY_PROBE_BASE_MS;
+        for attempt in 1..=RECOVERY_PROBE_LIMIT {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            // 探测：真取一次链。成功说明网络与音源都回来了。
+            let probe = crate::resolve_play_url_script(&app, &cache, &track, quality).await;
+            if probe.is_ok() {
+                let _ = tx.send(AudioCmd::Recovered { gen: 0 });
+                log::info!("[queue] 第{attempt}次恢复探测成功，重开自动切歌");
+                return;
+            }
+            delay = (delay * 2).min(RECOVERY_PROBE_MAX_MS);
+        }
+        log::warn!("[queue] 恢复探测 {RECOVERY_PROBE_LIMIT} 次仍未成功，等待用户手动播放");
+    });
+}
+
 /// 发系统通知（Windows toast 等）。自动切歌熔断发生在后台，应用内错误条看不到。
 /// 未安装/未初始化通知插件时 show() 返回 Err，静默忽略即可。
 fn notify_failure(app: &tauri::AppHandle, body: &str) {
@@ -1436,6 +1793,66 @@ fn skip_if_recoverable(inner: &mut EngineInner, track_id: &str, autoplay: bool) 
         play_queue_track(inner, track);
     }
     inner.persist_queue();
+}
+
+/// 位置冻结看门狗（2026-10-03「播到一半卡死、无任何报错」修复）。
+///
+/// 只在 Playing 时调用。命中后按软 → 硬阶梯恢复：
+/// ① `load_queue_track` 软重载（换新连接、不动输出流）
+/// ② `rebuild_output` 重建输出流（回调线程已死时的唯一出路，也会重建 Player 状态）
+/// ③ 放弃：置错误态 + 系统通知，等用户操作（不再是无声无息地钉死）
+///
+/// ②会 drop 旧的 cpal `Stream`，而 cpal 的 `Drop` 会 `join` 流线程 —— 若回调正卡在
+/// 网络读上，引擎线程会被短暂阻塞（上限 = `FIRST_PACKET_TIMEOUT` 8s）。回调线程已经
+/// panic 死掉时 join 立即返回，也就是**最需要重建的那种情况不会阻塞**。
+fn watch_pipeline(inner: &mut EngineInner) {
+    let window = inner.watch.window();
+    let frozen_ms = content_pos_ms(inner);
+    let Some(hits) = inner.watch.poll(frozen_ms, Instant::now()) else {
+        return;
+    };
+    let Some(track) = inner.queue.lock().unwrap().current().cloned() else {
+        log::warn!("[watchdog] 播放位置冻结在 {frozen_ms}ms，但队列为空，跳过恢复");
+        return;
+    };
+
+    if hits >= STALL_RECOVER_LIMIT {
+        // 软重载 + 重建输出流都没救回来：停在错误态并发系统通知（后台播放时
+        // 应用内错误条看不见），用户手动播一次即重新走一遍完整链路。
+        let notice = format!(
+            "播放卡住（位置停在 {}s）且自动恢复失败，请重新播放",
+            frozen_ms / 1000
+        );
+        log::error!("[watchdog] {notice}");
+        inner.watch.clear();
+        inner.mutate(|st| {
+            st.status = PlaybackStatus::Error;
+            st.error = Some(notice.clone());
+        });
+        notify_failure(&inner.app, &notice);
+        return;
+    }
+
+    if hits == 1 {
+        log::warn!(
+            "[watchdog] 播放位置停在 {frozen_ms}ms 已 {}s 未推进，重走加载链（软恢复）track={}",
+            window.as_secs(),
+            track.id
+        );
+        // start_ms 用冻结位置：救回来之后就地从原进度续播，不用用户重听
+        load_queue_track(inner, track, true, frozen_ms);
+        return;
+    }
+
+    log::warn!(
+        "[watchdog] 软恢复后位置仍未推进，重建输出流（音频回调线程疑似已死）track={}",
+        track.id
+    );
+    let choice = inner.output_choice.clone();
+    if let Err(e) = inner.rebuild_output(choice.as_deref()) {
+        // 重建失败不在这里重试：下一个窗口（hits=3）会走放弃分支
+        log::error!("[watchdog] 重建输出流失败: {e}");
+    }
 }
 
 fn go_previous(inner: &mut EngineInner) {
@@ -1615,20 +2032,33 @@ impl LoadJob {
                                     Err(e2) => self.dispatch_load_failed(
                                         "load",
                                         &format!("打开音频流失败: {first_err}；重取后仍失败: {e2}"),
+                                        // 两次开流都失败：地址拿到了却读不出流，属内容/
+                                        // 死链问题（拉黑这首），不算环境问题
+                                        false,
                                     ),
                                 }
                             }
                             Err(e2) => self.dispatch_load_failed(
                                 "load",
                                 &format!("打开音频流失败: {first_err}；重取播放地址失败: {e2}"),
+                                // 重取时若等链超时，说明弱网仍在延续 —— 按环境问题处理，
+                                // 不把这首拉黑（否则弱网批量歌曲被永久列黑名单）
+                                e2.is_stalled(),
                             ),
                         }
                     }
                 }
             }
             Err(e) => {
-                log::error!("自动取址失败: {e}");
-                self.dispatch_load_failed("resolve", &format!("{e}"));
+                // 弱网（Stalled）与「音源没这首」（NoPlayableUrl）分开走：
+                // 前者不拉黑本首、不计熔断，只提示网络慢并原地重试。
+                let stalled = e.is_stalled();
+                if stalled {
+                    log::warn!("[queue] 取链等待超时（环境问题，不计入熔断）: {e}");
+                } else {
+                    log::error!("自动取址失败: {e}");
+                }
+                self.dispatch_load_failed("resolve", &format!("{e}"), stalled);
             }
         }
     }
@@ -1650,7 +2080,8 @@ impl LoadJob {
     async fn build_and_dispatch(self, source: PlaySource, is_local: bool, fetched_at: Option<u64>) {
         match self.try_build(&source).await {
             Ok(built) => self.dispatch_ready(built, is_local, fetched_at, None),
-            Err(e) => self.dispatch_load_failed("load", &e),
+            // 本地文件读不出来是内容问题，不算环境问题
+            Err(e) => self.dispatch_load_failed("load", &e, false),
         }
     }
 
@@ -1683,35 +2114,55 @@ impl LoadJob {
     }
 
     /// 回发失败：广播 audio-error + LoadFailed，由引擎统一置错误态并决定跳过。
-    fn dispatch_load_failed(self, kind: &'static str, detail: &str) {
-        let message = format!("该歌曲暂时无法播放（{detail}）");
+    ///
+    /// `stalled` = 本次失败只是环境问题（弱网/引擎卡），不是「这首歌坏了」。
+    /// 引擎侧据此不把这首拉进 `failed_tracks`、不计入连续失败熔断。
+    fn dispatch_load_failed(self, kind: &'static str, detail: &str, stalled: bool) {
+        let message = if stalled {
+            format!("网络较慢，正在重试（{detail}）")
+        } else {
+            format!("该歌曲暂时无法播放（{detail}）")
+        };
         let _ = self.app.emit(
             "audio-error",
             serde_json::json!({
                 "trackId": self.track.id,
                 "kind": kind,
                 "message": message,
+                "stalled": stalled,
             }),
         );
         let _ = self.tx.send(AudioCmd::LoadFailed {
             track_id: self.track.id.clone(),
             message,
             autoplay: self.autoplay,
+            stalled,
             gen: self.gen,
         });
     }
 }
 
-/// 挂载已构建好的解码器（LoadReady 到达时调用）。
-/// 网络 IO（打开流 + 首包探测）已在 blocking 线程池完成，这里只剩纯内存
-/// 操作 —— 引擎线程绝不能阻塞，否则休眠唤醒后的死连接会卡死整个控制面。
-#[allow(clippy::too_many_arguments)]
+/// 两次后台修剪的最小间隔：修剪本身很快，但每次换曲挂载都起一条 OS 线程
+/// 纯属 churn；连点换曲的挂载风暴只需一次修剪兜底
+const PRUNE_MIN_INTERVAL_MS: u64 = 5_000;
+static LAST_PRUNE: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
 /// 后台跑一遍缓存修剪（换曲挂载新流 / 上限调低 / 启动时都会调）：
 /// 磁盘 IO 不进引擎线程，免得卡 25ms 的播放节拍。
 /// 上限为 0（不限）时直接不做事；在播流的缓存文件经 cache_file 传入永不删。
 fn spawn_cache_prune(inner: &EngineInner) {
     if inner.cache_limit_mb == 0 {
         return;
+    }
+    {
+        let mut last = LAST_PRUNE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(t) = *last {
+            if t.elapsed() < std::time::Duration::from_millis(PRUNE_MIN_INTERVAL_MS) {
+                return;
+            }
+        }
+        *last = Some(std::time::Instant::now());
     }
     let dir = inner.cache_dir.clone();
     let limit = inner.cache_limit_mb;
@@ -1721,13 +2172,21 @@ fn spawn_cache_prune(inner: &EngineInner) {
         .spawn(move || {
             let (freed, removed) = crate::cache::prune_audio_cache(&dir, limit, keep.as_deref());
             if removed > 0 {
+                // 稳态下这行每次换曲都会出现：流缓存文件一落盘就是**全长**
+                // （range_reader 按 Content-Length 预分配，见 open() 的 set_len），
+                // 而 total 把删不掉的在播文件也算在内 —— 于是每次挂载新流都会把
+                // 最旧的一个挤出去。不是异常，把口径一起打出来省得再被问一次。
                 log::info!(
-                    "[cache] 超出上限，清理最旧的流缓存：释放 {freed} 字节 / {removed} 个文件"
+                    "[cache] 流缓存超出上限（{limit}MB），清理最旧的：释放 {freed} 字节 / {removed} 个文件"
                 );
             }
         });
 }
 
+/// 挂载已构建好的解码器（LoadReady 到达时调用）。
+/// 网络 IO（打开流 + 首包探测）已在 blocking 线程池完成，这里只剩纯内存
+/// 操作 —— 引擎线程绝不能阻塞，否则休眠唤醒后的死连接会卡死整个控制面。
+#[allow(clippy::too_many_arguments)]
 fn mount_decoder(
     inner: &mut EngineInner,
     track: &Track,
@@ -1744,6 +2203,10 @@ fn mount_decoder(
     // 成功挂载 = 这首能播：重开自动切歌熔断（连续失败计数一并清零）
     inner.auto_next = true;
     inner.fail_streak = 0;
+    inner.stall_retry = 0;
+    // 这里**刻意不动** inner.watch：软恢复（看门狗命中第 1 次）也是走这条挂载路径，
+    // 清掉 hits 就变成「每 12s 软重载一次」的无限循环，永远升不到重建输出流那一步。
+    // 看门狗判定只由「位置真的推进」或「用户手动发起播放」清零。
     inner.sink.clear();
     // 倍速挂在 rodio Player 的控制链上（对 append 进来的源全局生效）；
     // DspSource 包在解码器外提供 EQ / 响度归一化 / 淡入淡出
@@ -1959,5 +2422,95 @@ mod duration_tests {
     fn metadata_duration_keeps_long_tracks() {
         // 3 小时的现场集：仍在合理范围内，保留
         assert_eq!(meta_duration_ms(&track_with_duration(10_800.0)), 10_800_000);
+    }
+}
+
+#[cfg(test)]
+mod stall_watch_tests {
+    use super::{StallWatch, STALL_DEAD_TIMEOUT, STALL_POS_TIMEOUT};
+
+    /// 位置持续推进 → 永不命中（正常播放不能被看门狗打扰）
+    #[test]
+    fn progressing_position_never_fires() {
+        let mut w = StallWatch::default();
+        let t0 = std::time::Instant::now();
+        for step in 0..40u32 {
+            let at = t0 + STALL_POS_TIMEOUT * 10 * step;
+            assert_eq!(w.poll(u64::from(step) * 250, at), None);
+        }
+    }
+
+    /// 首次观测只建基准，不立刻开火（不知道已经静止了多久）
+    #[test]
+    fn first_observation_only_baselines() {
+        let mut w = StallWatch::default();
+        let t0 = std::time::Instant::now();
+        assert_eq!(w.poll(1_000, t0), None);
+        // 窗口内不动：仍然不动手
+        assert_eq!(w.poll(1_000, t0 + STALL_POS_TIMEOUT - std::time::Duration::from_millis(1)), None);
+        // 满窗口 → 命中第 1 次
+        assert_eq!(w.poll(1_000, t0 + STALL_POS_TIMEOUT), Some(1));
+        // 再等一个窗口 → 命中第 2 次（阶梯要能升级）
+        assert_eq!(w.poll(1_000, t0 + STALL_POS_TIMEOUT * 2), Some(2));
+    }
+
+    /// 位置恢复推进 → hits 清零，重新开始计数
+    #[test]
+    fn progress_resets_hits() {
+        let mut w = StallWatch::default();
+        let t0 = std::time::Instant::now();
+        w.poll(0, t0);
+        assert_eq!(w.poll(0, t0 + STALL_POS_TIMEOUT), Some(1));
+        // 救回来了一点点：判定必须清零
+        assert_eq!(w.poll(500, t0 + STALL_POS_TIMEOUT), None);
+        assert_eq!(w.poll(500, t0 + STALL_POS_TIMEOUT * 3), Some(1));
+    }
+
+    /// 用户往回拖（位置变小）也算「管线活着」，不能被当成冻结
+    #[test]
+    fn backward_jump_counts_as_alive() {
+        let mut w = StallWatch::default();
+        let t0 = std::time::Instant::now();
+        w.poll(60_000, t0);
+        assert_eq!(w.poll(5_000, t0 + STALL_POS_TIMEOUT), None);
+    }
+
+    /// reset 只清窗口基准，不清 hits/dead —— 恢复阶梯必须跨 Loading 延续
+    #[test]
+    fn reset_keeps_verdict() {
+        let mut w = StallWatch::default();
+        let t0 = std::time::Instant::now();
+        w.mark_dead(true);
+        w.poll(0, t0);
+        w.reset();
+        assert_eq!(w.hits, 1, "reset 不能清掉恢复进度");
+        assert!(w.dead, "reset 不能清掉死流判定");
+        // 用户手动播才允许整条清零
+        w.clear();
+        assert_eq!(w.hits, 0);
+        assert!(!w.dead);
+    }
+
+    /// fatal（回调线程 panic）→ 窗口缩短，且下一次命中直接落在「重建输出流」档
+    #[test]
+    fn fatal_panic_shifts_to_rebuild_window() {
+        let mut w = StallWatch::default();
+        let t0 = std::time::Instant::now();
+        w.poll(0, t0);
+        w.mark_dead(true);
+        assert_eq!(w.window(), STALL_DEAD_TIMEOUT);
+        // 短窗口即可命中，且 hits 已经是 2 = 重建档
+        assert_eq!(w.poll(0, t0 + STALL_DEAD_TIMEOUT), Some(2));
+    }
+
+    /// 非 fatal（cpal 流错误）只缩短窗口，不跳过软重载
+    #[test]
+    fn non_fatal_error_keeps_soft_reload() {
+        let mut w = StallWatch::default();
+        let t0 = std::time::Instant::now();
+        w.poll(0, t0);
+        w.mark_dead(false);
+        assert_eq!(w.window(), STALL_DEAD_TIMEOUT);
+        assert_eq!(w.poll(0, t0 + STALL_DEAD_TIMEOUT), Some(1));
     }
 }

@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, emit, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { resolvePlayUrl } from "@/source-scripts";
+import { resolvePlayUrlDetailed } from "@/source-scripts";
 import { playUrlHitLine } from "@/source-scripts/playurl-line";
 import type { Quality, Track } from "@/types";
 
@@ -26,14 +26,24 @@ interface PlayUrlRequest {
 
 async function answer(req: PlayUrlRequest): Promise<void> {
   let url = "";
+  // 本次失败是否只是环境问题（弱网 / 引擎页未就绪 / 应答超时）。
+  // 引擎据此不把这首拉黑、不计入连续失败熔断（2026-10-03 弱网修复）。
+  let stalled = false;
   try {
     // resolvePlayUrl 内部已做源门禁（local 直接报错）并回填引擎缓存
-    url = await resolvePlayUrl(req.track, req.quality);
+    const res = await resolvePlayUrlDetailed(req.track, req.quality);
+    url = res.url;
+    stalled = res.stalled;
   } catch {
     url = "";
+    stalled = true;
   }
   // 迟到的应答（引擎已超时回落）在 Rust 侧按 requestId 找不到条目，静默忽略
-  await invoke("resolve_play_url_reply", { requestId: req.requestId, url }).catch(() => {});
+  await invoke("resolve_play_url_reply", {
+    requestId: req.requestId,
+    url,
+    stalled,
+  }).catch(() => {});
   // 桌面歌词窗口读不到宿主侧的线路记忆（各窗口独立 JS 上下文），广播命中线路供它
   // 判断「当前地址是否跨源兜底」并按目标源重取歌词；主窗口自己读 playurl-line 即可
   void emit("play-url-line", {

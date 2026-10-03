@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { errMsg } from "@/lib/utils";
 import { Play, Search, SearchX, X } from "lucide-react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
@@ -65,6 +65,8 @@ export function SearchPage(): React.JSX.Element {
   const [suggestOpen, setSuggestOpen] = useState(false);
   const playQueue = usePlayerStore((s) => s.playQueue);
   const currentTrackId = usePlayerStore((s) => s.state?.trackId ?? null);
+  // 搜索代际号（见 run 内注释）：ref 不触发渲染，只作过期判定
+  const runSeqRef = useRef(0);
 
   // 搜索历史只在挂载时读一次（增删在本地改完同步落盘）
   useEffect(() => {
@@ -95,11 +97,17 @@ export function SearchPage(): React.JSX.Element {
     async (kw: string, t: Tab, aggregate: boolean): Promise<void> => {
       const trimmed = kw.trim();
       if (!trimmed) return;
+      // 代际守卫：快速改词/切页签/切音源会并发触发多次 run，引擎调用最坏
+      // 20s 才落定 —— 后完成的旧请求若不作废，会把新词的结果覆盖回旧词的。
+      // 每次入场自增，写 state 前校验，过期请求静默放弃
+      const gen = ++runSeqRef.current;
       setSearching(true);
       setError(null);
+      const stale = (): boolean => gen !== runSeqRef.current;
       try {
         if (t === "song" && aggregate) {
           const batches = await sourceApi.searchAllBatches(trimmed, 1, 30);
+          if (stale()) return;
           setAggBatches(batches);
           setSongs(batches.flatMap((b) => b.tracks));
         } else {
@@ -107,32 +115,38 @@ export function SearchPage(): React.JSX.Element {
           switch (t) {
             case "song": {
               const r = await sourceApi.searchMusic(trimmed, activeSourceId, 1, 30);
+              if (stale()) return;
               setSongs(Array.isArray(r) ? r : []);
               break;
             }
             case "playlist": {
               const r = await sourceApi.searchPlaylists(activeSourceId, trimmed, 1, 20);
+              if (stale()) return;
               setPlaylists(Array.isArray(r) ? r : []);
               break;
             }
             case "artist": {
               const r = await sourceApi.searchArtists(activeSourceId, trimmed, 1, 20);
+              if (stale()) return;
               setArtists(Array.isArray(r) ? r : []);
               break;
             }
             case "album": {
               const r = await sourceApi.searchAlbums(activeSourceId, trimmed, 1, 20);
+              if (stale()) return;
               setAlbums(Array.isArray(r) ? r : []);
               break;
             }
           }
         }
+        if (stale()) return;
         setSearched(true);
       } catch (err) {
+        if (stale()) return;
         setError(errMsg(err));
         setSearched(true);
       } finally {
-        setSearching(false);
+        if (gen === runSeqRef.current) setSearching(false);
       }
     },
     [activeSourceId],
@@ -146,10 +160,17 @@ export function SearchPage(): React.JSX.Element {
       setSuggestOpen(false);
       // 历史只记「主动发起的搜索」：前进/后退复现 URL 不算，避免污染历史
       void addSearchHistory(trimmed).then(() => getSearchHistory()).then(setHistory).catch(() => {});
-      void navigate({ to: "/search", search: { q: trimmed } });
-      void run(trimmed, tab, aggregateMode);
+      // 只负责导航，让下方 URL effect 统一触发搜索：这里再 run 一次会对
+      // 同一次提交打两遍引擎请求（q 相同时 effect 也会跑）。
+      // 例外：提交的关键词与当前 URL 相同时 navigate 不会引发 effect，
+      // 主动补一次 run，保证「重复回车 = 重新搜索」的手感
+      if (trimmed === (urlParams.q?.trim() ?? "")) {
+        void run(trimmed, tab, aggregateMode);
+      } else {
+        void navigate({ to: "/search", search: { q: trimmed } });
+      }
     },
-    [aggregateMode, navigate, run, tab],
+    [aggregateMode, navigate, run, tab, urlParams.q],
   );
 
   // URL q 变化（前进 / 后退 / 标题栏搜索框）、页签切换、聚合开关 → 触发搜索

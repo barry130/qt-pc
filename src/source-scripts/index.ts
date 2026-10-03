@@ -36,7 +36,7 @@ import type {
   MusicInfo,
   Source,
 } from "@/source-scripts/qt-contract/contract";
-import { engineInvoke, engineResolve, engineSnapshot } from "@/source-engine/client";
+import { engineInvoke, engineResolve, engineSnapshot, INVOKE_TIMEOUT_MS } from "@/source-engine/client";
 import { rememberPlayUrlLine, rememberPlayUrlMiss } from "./playurl-line";
 import { PER_SOURCE_TIMEOUT_MS, withTimeoutMs } from "@/source-scripts/qt-contract/timeout";
 
@@ -74,7 +74,9 @@ async function sourceCall<T>(
 ): Promise<T> {
   let payload: Record<string, unknown> | null;
   try {
-    payload = await engineInvoke(entry, args, timeoutMs ?? 20_000);
+    // 默认超时单源于 client.ts 的 INVOKE_TIMEOUT_MS：此前这里重复定义
+    // 20_000 字面量，client 调整时这里会静默漂移
+    payload = await engineInvoke(entry, args, timeoutMs ?? INVOKE_TIMEOUT_MS);
   } catch (err) {
     // bundle 明确报错（入口不存在 / 入口内部失败）：带出原文，便于定位与提示更新
     throw new Error(`音源包调用失败：${err instanceof Error ? err.message : String(err)}`);
@@ -171,15 +173,6 @@ export async function searchMusic(
   return list.map((m) => toAppTrack(m, source));
 }
 
-export async function searchAllMusicSources(
-  keyword: string,
-  page: number,
-  size: number,
-): Promise<Track[]> {
-  const batches = await searchAllBatches(keyword, page, size);
-  return batches.flatMap((b) => b.tracks);
-}
-
 /** 聚合搜索的分批结果：单源一批，platform 已归属到每首曲目。
  *  source 不含 "local"（bundle 里的 searchAll 只搜在线源），展示名走注册表。 */
 export interface SearchSourceBatch {
@@ -189,7 +182,7 @@ export interface SearchSourceBatch {
 
 /**
  * 聚合搜索（保留分批结构）：搜索页「聚合」模式按源分组展示用。
- * 与 searchAllMusicSources 同一个 bundle 入口，只是不做拍平合并 ——
+ * 与单源 search 同一个 bundle 入口，只是打多源 ——
  * UI 需要知道每条结果来自哪个源来分组/打标。
  */
 export async function searchAllBatches(
@@ -363,7 +356,28 @@ export async function resolvePlayUrl(
   track: Track,
   quality: Quality,
 ): Promise<string> {
-  ensureScript(track.platform);
+  return (await resolvePlayUrlDetailed(track, quality)).url;
+}
+
+/**
+ * 预解析播放地址，**带失败分级**（2026-10-03 弱网修复）。
+ *
+ * `stalled = true` 表示本次失败是环境问题（弱网 / 引擎页未就绪 / 应答超时），
+ * 而非「这个音源确实给不出这首歌的地址」。引擎侧据此不把曲目拉黑、
+ * 不计入连续失败熔断——弱网下 5 首超时就关掉自动切歌，正是用户反馈的
+ * 「网络质量差一点就疯狂不可用」。
+ */
+export async function resolvePlayUrlDetailed(
+  track: Track,
+  quality: Quality,
+): Promise<{ url: string; stalled: boolean }> {
+  let stalled = true;
+  try {
+    ensureScript(track.platform);
+  } catch {
+    // local 源不走脚本取链：是明确的用法错误（内容问题），不算环境问题
+    return { url: "", stalled: false };
+  }
   const source = track.platform as Source;
   try {
     const resolved = await engineResolve(source, fromAppTrack(track), quality);
@@ -372,19 +386,21 @@ export async function resolvePlayUrl(
       // 地址被引擎缓存复用，线路必须跟着地址走，不能只看最后一次取链
       rememberPlayUrlLine(track, quality, resolved.line);
       await ipc.setResolvedPlayUrl(track, quality, resolved.url);
-      return resolved.url;
+      return { url: resolved.url, stalled: false };
     }
     // 失败死因（逐线路 trace）也记下来：面板显示「上次取链死因」，
     // 否则「取不到地址」在 PC 上完全不可诊断（2026-09-24 kg 不换源即此类）
     rememberPlayUrlMiss(track, quality, resolved.error);
     maybeEmitPlayPackMissing(resolved.error);
+    stalled = resolved.stalled;
   } catch (e) {
     // 引擎层已尽力（多线路换源 + 跨源兜底）：本次播放失败
     const msg = e instanceof Error ? e.message : String(e);
     rememberPlayUrlMiss(track, quality, msg);
     maybeEmitPlayPackMissing(msg);
+    stalled = true;
   }
-  return "";
+  return { url: "", stalled };
 }
 
 // ---------- 歌词 / 封面 ----------
@@ -591,14 +607,6 @@ export async function getHotWords(source: SourceId): Promise<string[]> {
   return sourceCall<string[]>(
     "hotWords",
     { source },
-    (p) => p.list as string[] | undefined,
-  );
-}
-
-export async function getAllHotWords(): Promise<string[]> {
-  return sourceCall<string[]>(
-    "allHotWords",
-    {},
     (p) => p.list as string[] | undefined,
   );
 }

@@ -163,9 +163,13 @@ pub async fn cmd_script_bridge_ready() {
 
 /// 引擎 → 前端取链桥（playurl_bridge）：前端脚本包按 requestId 应答播放地址；
 /// 空串 = 前端解析失败，引擎把本次取链按失败处理。
+///
+/// `stalled` 由前端回传：本次失败是**环境问题**（弱网 / 引擎页未就绪 /
+/// 应答超时）而非「音源确实没这首」。引擎据此不把曲目拉黑、不计入连续
+/// 失败熔断（2026-10-03 弱网修复）—— 否则弱网 5 首就把自动切歌关死。
 #[tauri::command(rename = "resolve_play_url_reply")]
-pub async fn cmd_resolve_play_url_reply(request_id: u64, url: String) {
-    crate::playurl_bridge::reply(request_id, url);
+pub async fn cmd_resolve_play_url_reply(request_id: u64, url: String, stalled: bool) {
+    crate::playurl_bridge::reply(request_id, url, stalled);
 }
 
 #[tauri::command(rename = "invalidate_play_url")]
@@ -849,7 +853,15 @@ pub async fn cmd_download_update_file(
             }
         }
     };
-    crate::astral::AstralClient::verify_update_file(&path, md5.as_deref(), file_size)?;
+    // 校验是同步文件 IO（MD5 流式读 + ed25519 整读进内存）：几十 MB 的包直接跑在
+    // async worker 上会把 worker 占住到校验结束，与下载侧的 spawn_blocking 纪律
+    // 对齐，一并搬到阻塞池
+    let verify_path = path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::astral::AstralClient::verify_update_file(&verify_path, md5.as_deref(), file_size)
+    })
+    .await
+    .map_err(|e| format!("校验任务异常: {e}"))??;
     // ed25519 签名校验：MD5 只能防传输损坏，防不了分发链路被掉包。签名文件与
     // 安装包同址（URL + ".sig"）；缺 .sig / 验签失败都拒绝安装（否则攻击者
     // 换掉安装包再删掉 .sig 就绕过了）。
@@ -873,7 +885,13 @@ pub async fn cmd_download_update_file(
             }
         }
     };
-    crate::astral::AstralClient::verify_installer_signature(&path, &sig)?;
+    // ed25519 需要整包在内存里验（ring 不支持流式），同样走阻塞池（理由见上）
+    let sig_path = path.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::astral::AstralClient::verify_installer_signature(&sig_path, &sig)
+    })
+    .await
+    .map_err(|e| format!("校验任务异常: {e}"))??;
     crate::astral::mark_installer_signature_verified();
     log::info!("[update] 安装包 ed25519 签名校验通过");
     Ok(path.to_string_lossy().to_string())
@@ -1201,9 +1219,29 @@ pub async fn cmd_scan_library(
             });
         let present: std::collections::HashSet<String> =
             rows.iter().map(|r| r.path.clone()).collect();
+        // 分段持锁入库（每段一个事务）：db 是全进程单连接 Mutex，整库一次性
+        // upsert 会把锁一直握到入库完，期间引擎线程的 persist_state（每 5s 一次）
+        // 会被阻塞到 busy_timeout(5s)，播放控制命令跟着排队。分 500 条/段，
+        // 段间放锁让其他使用者插队；中途失败直接返回错误（不能继续跑
+        // mark_missing —— present 不完整会把没入库的曲目误标成缺失）
+        const UPSERT_CHUNK: usize = 500;
+        let mut upsert_failed = false;
+        let mut first_err: Option<String> = None;
+        for chunk in rows.chunks(UPSERT_CHUNK) {
+            if let Err(e) =
+                db.with(|conn| crate::db::store::upsert_local_tracks(conn, chunk))
+            {
+                log::error!("[local] 分段入库失败（段含 {} 条）: {e}", chunk.len());
+                upsert_failed = true;
+                first_err = Some(e);
+                break;
+            }
+        }
+        if upsert_failed {
+            return Err(first_err.unwrap_or_else(|| "本地曲目入库失败".to_string()));
+        }
         db.with(|conn| {
             crate::db::store::touch_scan_dirs(conn, &dirs)?;
-            crate::db::store::upsert_local_tracks(conn, &rows)?;
             let missing = crate::db::store::mark_missing_local_tracks(conn, &dirs, &present)?;
             if missing > 0 {
                 log::info!("[local] 标记缺失曲目 {missing} 条");

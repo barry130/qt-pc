@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { useAppearanceStore } from "@/stores/appearance";
 import { getSkin, hexToRgb, isLightColor } from "@/lib/skins";
+import type { AppearancePreference } from "@/types";
 
 /**
  * 外观偏好应用（DESIGN §9.2 / R7）：
@@ -19,6 +20,26 @@ import { getSkin, hexToRgb, isLightColor } from "@/lib/skins";
  * 35 时约 26%：壁纸能看清，同时给侧栏那几行导航文字留了压底。
  */
 const SIDEBAR_BG_ALPHA = 35;
+
+/**
+ * 非跟随封面时按皮肤主色明度设置 --primary-foreground（亮主色配深色前景）。
+ * useCoverColor 离开跟随态时也用它交还前景色管理权 —— 两处必须同一口径，
+ * 否则将来改这里会漏掉离开跟随态的恢复路径。
+ */
+export function applySkinPrimaryForeground(preference: AppearancePreference): void {
+  const skin = getSkin(preference.skinId, preference.customColor);
+  const isDark =
+    preference.mode === "dark" ||
+    (preference.mode === "system" &&
+      window.matchMedia("(prefers-color-scheme: dark)").matches);
+  const skinPrimary = isDark ? skin.primaryDark : skin.primaryLight;
+  const rgb = hexToRgb(skinPrimary);
+  document.documentElement.style.setProperty(
+    "--primary-foreground",
+    rgb && isLightColor(rgb[0], rgb[1], rgb[2]) ? "#1a1a1a" : "#ffffff",
+  );
+}
+
 export function useAppearanceEffect(): void {
   const preference = useAppearanceStore((s) => s.preference);
   const load = useAppearanceStore((s) => s.load);
@@ -86,11 +107,7 @@ export function useAppearanceEffect(): void {
       // 樱花 #f472b6 这些亮主色配白字只有 1.7~2.3:1，主色实心按钮上的图标文字会糊掉，
       // 也让「已开启」态失去对比。解析不出十六进制（非常规自定义色）时回退白字。
       if (!followCoverColor) {
-        const rgb = hexToRgb(skinPrimary);
-        root.style.setProperty(
-          "--primary-foreground",
-          rgb && isLightColor(rgb[0], rgb[1], rgb[2]) ? "#1a1a1a" : "#ffffff",
-        );
+        applySkinPrimaryForeground(preference);
       }
     };
 

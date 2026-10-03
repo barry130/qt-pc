@@ -19,9 +19,15 @@ export function usePlaybackEvents(): void {
     let disposed = false;
 
     const track = async (): Promise<void> => {
+      // 监听器就位后引擎是否已推过 queue-changed：推过就信任事件流，
+      // 不再用启动时的一次性 getQueue 快照覆盖（那份快照可能更旧）
+      let queueEventApplied = false;
       const u1 = await ipc.onPlaybackStateChanged((s) => applySnapshot(s));
       const u2 = await ipc.onPositionChanged((t) => applyTick(t));
-      const u3 = await ipc.onQueueChanged((q) => applyQueue(q));
+      const u3 = await ipc.onQueueChanged((q) => {
+        queueEventApplied = true;
+        applyQueue(q);
+      });
       const u4 = await ipc.onAudioError((e) => {
         console.error("[audio-error]", e.message);
       });
@@ -41,7 +47,7 @@ export function usePlaybackEvents(): void {
         const snap =
           restored && restored.track ? restored : await ipc.getPlaybackState();
         applySnapshot(snap);
-        applyQueue(await ipc.getQueue());
+        if (!queueEventApplied) applyQueue(await ipc.getQueue());
       } catch (err) {
         console.error("restore_last_session failed", err);
       }

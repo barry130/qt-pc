@@ -87,6 +87,13 @@ pub fn install_panic_hook() {
         if cfg!(debug_assertions) {
             eprintln!("{line}");
         }
+        // 音频回调线程（cpal_wasapi_out 等）panic：cpal 不会重建线程，也不会调
+        // rodio 的 error callback，输出流从此静默死亡、`Player::get_pos()`/`empty()`
+        // 双双冻结 —— 必须通知引擎去看门狗兜底（2026-10-03 卡死事故）。
+        // 这里只投一条无界 channel 消息：不加锁、不写日志，钩子里可安全调用。
+        if name.starts_with("cpal") {
+            crate::audio::engine::notify_audio_thread_panic(&format!("{name}: {msg}"));
+        }
     }));
 }
 
@@ -175,23 +182,19 @@ fn rotate(dir: &PathBuf) {
 }
 
 /// RUST_LOG 兼容（只认单词，`RUST_LOG=debug` 之类），默认 info——与原先
-/// env_logger 的 default_filter_or("info") 口径一致
+/// env_logger 的 default_filter_or("info") 口径一致。
+/// 只取首个逗号段做**精确**匹配：子串匹配会把 `RUST_LOG=info,wgpu=warn`
+/// 里的目标识别降成 Warn（丢了全局 info），`off` 等无法识别的词回落 info。
 fn level_from_env() -> log::LevelFilter {
-    let lower = std::env::var("RUST_LOG")
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    for (word, level) in [
-        ("trace", log::LevelFilter::Trace),
-        ("debug", log::LevelFilter::Debug),
-        ("warn", log::LevelFilter::Warn),
-        ("error", log::LevelFilter::Error),
-        ("info", log::LevelFilter::Info),
-    ] {
-        if lower.contains(word) {
-            return level;
-        }
+    let raw = std::env::var("RUST_LOG").unwrap_or_default();
+    let first = raw.split(',').next().unwrap_or("").trim().to_ascii_lowercase();
+    match first.as_str() {
+        "trace" => log::LevelFilter::Trace,
+        "debug" => log::LevelFilter::Debug,
+        "warn" => log::LevelFilter::Warn,
+        "error" => log::LevelFilter::Error,
+        _ => log::LevelFilter::Info,
     }
-    log::LevelFilter::Info
 }
 
 /// 本地时间戳 "YYYY-MM-DD HH:MM:SS.mmm"。Windows 用 GetLocalTime（应用只发

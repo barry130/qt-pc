@@ -81,7 +81,10 @@ export function QueuePanel(): React.JSX.Element | null {
 
   const dropAt = (to: number): void => {
     if (dragIndex !== null && to >= 0 && to < queue.length && dragIndex !== to) {
-      void ipc.queueMove(dragIndex, to);
+      void ipc.queueMove(dragIndex, to).catch((err) => {
+        // 拖拽排序失败不上浮全局错误浮层，留排查日志即可
+        console.error("[queue] 拖拽排序失败", err);
+      });
     }
     setDragIndex(null);
     setOverIndex(null);
@@ -102,6 +105,9 @@ export function QueuePanel(): React.JSX.Element | null {
     try {
       await ipc.queueRemoveIndices([...selected]);
       setSelecting(false);
+    } catch (err) {
+      // 批量删除失败不上浮全局错误浮层：与列表页就地报错对齐，留日志可排查
+      console.error("[queue] 批量删除失败", err);
     } finally {
       setDeleting(false);
     }
@@ -170,7 +176,11 @@ export function QueuePanel(): React.JSX.Element | null {
                   type="button"
                   aria-label="清空后续"
                   title="清空后续"
-                  onClick={() => void ipc.queueClearAfter()}
+                  onClick={() =>
+                    void ipc.queueClearAfter().catch((err) => {
+                      console.error("[queue] 清空后续失败", err);
+                    })
+                  }
                   className="rounded px-1.5 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
                 >
                   清空后续
@@ -181,7 +191,11 @@ export function QueuePanel(): React.JSX.Element | null {
                   type="button"
                   aria-label="清空队列"
                   title="清空队列"
-                  onClick={() => void ipc.clearQueue()}
+                  onClick={() =>
+                    void ipc.clearQueue().catch((err) => {
+                      console.error("[queue] 清空队列失败", err);
+                    })
+                  }
                   className="rounded p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
                 >
                   <Trash2 className="h-4 w-4" />

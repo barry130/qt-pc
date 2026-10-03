@@ -25,6 +25,33 @@ const MAX_BUFFER_BYTES: u64 = 100 * 1024 * 1024;
 const MAX_RETRIES: u32 = 3;
 /// 空洞待回填时空闲轮询间隔
 const IDLE_POLL: Duration = Duration::from_millis(100);
+/// 单个 HTTP 请求的**总量挂死保护**（宽上限，防线程永久阻塞，不是判活）。
+///
+/// blocking reqwest 只有「总超时」（覆盖到响应体读完）没有空闲读超时：设成
+/// FIRST_PACKET_TIMEOUT 的 8s 会把慢源大文件掐死在半路（spool 模式更是下载
+/// 超 8s 必失败）。这里放宽到 120s —— 只兜「连接僵死永不返回」的底，让下载
+/// 线程最终能带着 Err 退出；真正的**首包/假死判活**由解码侧 `ensure_ready`
+/// 的 FIRST_PACKET_TIMEOUT deadline 承担（8s 内等不到数据直接对用户报错，
+/// 不等 HTTP 层）。
+const HTTP_TOTAL_GUARD: Duration = Duration::from_secs(120);
+
+/// 响应体**单次读**的空闲超时（真・判活）。
+///
+/// reqwest blocking 没有空闲读超时，只有覆盖「建连 + 读完整个 body」的总超时；
+/// 服务端收下请求后既不回数据也不关连接时，`body.read()` 会一直阻塞 —— 上面
+/// 的 HTTP_TOTAL_GUARD 是挂在 request 上的总超时，而这个 body 已经在读了，
+/// 只能等它自己到点，最坏就是把下载线程按 120s 冻住。弱网下反复触发会把
+/// 缓冲卡成「有洞但不补齐」，解码侧只能靠 ensure_ready 判死后换源。
+///
+/// 所以这里用 `BodyReader` 把 body 挪进独立线程，用 channel 收包：下载线程侧
+/// 只做 `recv_timeout`，超时即判定连接假死，丢掉整个 reader（后台线程随 body 的
+/// 总超时自行退出）并按 Err 走既有的重连/重试路径。这比调 client 的
+/// `read_timeout` 更可靠 —— reqwest blocking 从未提供过该选项（本仓历史上也没
+/// 有）。空闲阈值取 20s：明显大于正常分片间隔（首包判活另有 ensure_ready 的
+/// 8s），又远小于 120s 总兜底，弱网下能及时暴露假死连接。
+const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+/// `BodyReader` 收包用的有界通道容量（1 帧 8KB，够了；上限防慢读方堆积内存）
+const BODY_CHANNEL_CAP: usize = 8;
 
 /// 有序、不相交的就绪字节区间集 `[start, end)`。下载线程写，读线程锁内等。
 #[derive(Default)]
@@ -128,7 +155,7 @@ impl RangeShared {
     }
 
     pub fn total_len(&self) -> Option<u64> {
-        *self.total_len.lock().unwrap()
+        *self.total_len.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     pub fn complete(&self) -> bool {
@@ -141,27 +168,27 @@ impl RangeShared {
 
     /// 已就绪字节总数（供 bufferedMs 估算）
     pub fn ready_bytes(&self) -> u64 {
-        self.ready.lock().unwrap().total_bytes()
+        self.ready.lock().unwrap_or_else(|p| p.into_inner()).total_bytes()
     }
 
     fn set_total(&self, len: u64) {
-        let mut t = self.total_len.lock().unwrap();
+        let mut t = self.total_len.lock().unwrap_or_else(|p| p.into_inner());
         if t.is_none() || t.is_some_and(|v| len > v) {
             *t = Some(len);
         }
     }
 
     fn add_ready(&self, start: u64, end: u64) {
-        self.ready.lock().unwrap().add(start, end);
+        self.ready.lock().unwrap_or_else(|p| p.into_inner()).add(start, end);
         self.ready_cv.notify_all();
     }
 
     fn is_ready_at(&self, pos: u64) -> bool {
-        self.ready.lock().unwrap().is_ready_at(pos)
+        self.ready.lock().unwrap_or_else(|p| p.into_inner()).is_ready_at(pos)
     }
 
     fn covers(&self, start: u64, end: u64) -> bool {
-        self.ready.lock().unwrap().covers(start, end)
+        self.ready.lock().unwrap_or_else(|p| p.into_inner()).covers(start, end)
     }
 
     fn wake_all(&self) {
@@ -197,12 +224,14 @@ pub fn open(
     }
 
     // 首个 Range 请求：bytes=0- 同时探测 Accept-Ranges 与总长。
-    // 超时与 FIRST_PACKET_TIMEOUT 对齐（8s）：休眠唤醒后的半死连接
-    // 要挂满超时才报错，超时越长失败链收敛越慢
+    // 判活不用短总超时：per-request .timeout() 覆盖到响应体读完，8s 会把慢源
+    // 大文件掐死在半路（spool 模式更是必失败）。这里只挂 HTTP_TOTAL_GUARD
+    // 兜「请求永不返回」的底；用户可见的首包判活由 ensure_ready 的 8s deadline
+    // 承担（见该函数与 HTTP_TOTAL_GUARD 的注释）
     let resp = client
         .get(url)
         .header("Range", "bytes=0-")
-        .timeout(FIRST_PACKET_TIMEOUT)
+        .timeout(HTTP_TOTAL_GUARD)
         .send()
         .map_err(|e| {
             // 完整地址只进日志；抛给上层的错误不带 URL（含后端/存储域名）
@@ -215,6 +244,17 @@ pub fn open(
     let status = resp.status();
     if !status.is_success() {
         return Err(io::Error::other(format!("音频流 HTTP {status}")));
+    }
+    // 206 时确认起点真的是 0（我们请求的就是 bytes=0-）：起点不符说明这响应
+    // 不是我们要的那段，喂给解码器就是错位数据（详见 issue_range 的说明）。
+    if status == reqwest::StatusCode::PARTIAL_CONTENT {
+        if let Some(start) = content_range_start(&resp) {
+            if start != 0 {
+                return Err(io::Error::other(format!(
+                    "音频流响应起点异常（Content-Range 起点 {start}）"
+                )));
+            }
+        }
     }
     let supports_ranges = status == reqwest::StatusCode::PARTIAL_CONTENT
         || resp
@@ -278,6 +318,100 @@ pub fn open(
     Ok((reader, shared))
 }
 
+/// 把 HTTP 响应体挪进独立线程、以有界通道回传的 `Read` 包装。
+///
+/// 存在的唯一理由：给 `body.read()` 加**空闲超时**。blocking reqwest 的
+/// `Response::read` 没有超时参数，服务端收下请求后既不发包也不关连接时它会一直
+/// 阻塞，把下载线程冻到 120s 的 HTTP_TOTAL_GUARD 才醒（弱网下频繁发生）。
+/// 把读操作丢到后台线程后，下载线程侧就能用 `recv_timeout` 主动判死并放弃该连接。
+///
+/// 语义：
+/// - 超时 → `TimedOut`（调用方按断流处理，重发 Range 或计数重试）
+/// - 通道断开（后台线程退出）→ `Ok(0)`，等价于原 body 的 EOF
+/// - 后台线程是 detached 的：被放弃后它会继续阻塞到 body 总超时再自然退出，
+///   不改内存安全性（它只持有 body 和 sender，不碰共享状态）
+struct BodyReader {
+    rx: std::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
+    pending: Vec<u8>,
+    off: usize,
+    /// 当前帧发完后是否已有 EOF 信号（后台线程在 EOF 后退出 → 通道断开）
+    done: bool,
+}
+
+/// `BodyReader::read` 的结果：区分「真 EOF」与「空闲超时」
+enum BodyRead {
+    Data(usize),
+    Eof,
+    TimedOut,
+}
+
+impl BodyReader {
+    /// 起一个 detach 的读线程把 `body` 的内容推入有界通道
+    fn new(mut body: Box<dyn Read + Send>) -> Self {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<Vec<u8>>>(BODY_CHANNEL_CAP);
+        let _ = std::thread::Builder::new()
+            .name("audio-body-read".into())
+            .spawn(move || {
+                let mut buf = vec![0u8; 64 * 1024];
+                loop {
+                    match body.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            // 通道断开 = 下载线程已放弃本连接，直接退出
+                            if tx.send(Ok(buf[..n].to_vec())).is_err() {
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
+                            break;
+                        }
+                    }
+                }
+            });
+        Self {
+            rx,
+            pending: Vec::new(),
+            off: 0,
+            done: false,
+        }
+    }
+
+    /// 带空闲超时的读：`Ok(0)` 只在真 EOF 时返回
+    fn read_with_timeout(&mut self, out: &mut [u8], idle: Duration) -> BodyRead {
+        if self.off >= self.pending.len() {
+            if self.done {
+                return BodyRead::Eof;
+            }
+            match self.rx.recv_timeout(idle) {
+                Ok(Ok(data)) => {
+                    if data.is_empty() {
+                        self.done = true;
+                        return BodyRead::Eof;
+                    }
+                    self.pending = data;
+                    self.off = 0;
+                }
+                Ok(Err(e)) => {
+                    // 读错误与「连接假死」在上层同路（都走重连），这里留一行日志区分
+                    log::warn!("[audio] 响应体读取失败: {e}");
+                    self.done = true;
+                    return BodyRead::TimedOut;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return BodyRead::TimedOut,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.done = true;
+                    return BodyRead::Eof;
+                }
+            }
+        }
+        let n = (self.pending.len() - self.off).min(out.len());
+        out[..n].copy_from_slice(&self.pending[self.off..self.off + n]);
+        self.off += n;
+        BodyRead::Data(n)
+    }
+}
+
 fn run_downloader(
     shared: Arc<RangeShared>,
     url: String,
@@ -295,7 +429,7 @@ fn run_downloader(
     let mut writer = file;
     let mut pos: u64 = 0;
     // 初始响应体就是从 0 开始的流（206 bytes=0- 或 200 全量）
-    let mut body: Box<dyn Read + Send> = Box::new(initial_resp);
+    let mut body = BodyReader::new(Box::new(initial_resp));
     let mut retries: u32 = 0;
     let mut buf = vec![0u8; 64 * 1024];
     // 流已读到 EOF 但文件尚未完整（存在空洞或被提前掐断）
@@ -313,7 +447,7 @@ fn run_downloader(
         if shared.supports_ranges && !shared.is_ready_at(want) && (want != pos || eof) {
             match issue_range(&client, &url, want) {
                 Ok(resp) => {
-                    body = Box::new(resp);
+                    body = BodyReader::new(Box::new(resp));
                     pos = want;
                     eof = false;
                     retries = 0;
@@ -337,12 +471,19 @@ fn run_downloader(
             continue;
         }
 
-        match body.read(&mut buf) {
-            Ok(0) => {
+        match body.read_with_timeout(&mut buf, READ_IDLE_TIMEOUT) {
+            BodyRead::Eof => {
                 // EOF：流到达文件尾。仅当就绪区间连续覆盖到总长才算完成；
                 // 存在空洞（前向 seek 跳过的区间）时转入空闲，等读取方触发回填。
+                // 注：判活是 BodyReader 的空闲读超时（READ_IDLE_TIMEOUT），卡死的
+                // 连接走 TimedOut 重试而不是伪装成 EOF —— 走到这里的 Eof 只可能是
+                // 服务端正常收尾（无 Content-Length 的 close-delimited 响应），
+                // 此时以已收字节数为总长是「信任收尾」的正确语义
                 eof = true;
                 let total = shared.total_len().unwrap_or(pos);
+                if shared.total_len().is_none() {
+                    log::warn!("[audio] 无 Content-Length 的流在 {pos} 字节处收尾（close-delimited）");
+                }
                 shared.set_total(total);
                 let _ = writer.set_len(total);
                 if shared.covers(0, total) {
@@ -352,7 +493,7 @@ fn run_downloader(
                 }
                 shared.wake_all();
             }
-            Ok(n) => {
+            BodyRead::Data(n) => {
                 if shared.total_len().is_some_and(|t| pos + n as u64 > t) {
                     // 超出声明的总长：视为异常，防止缓冲越界
                     shared.failed.store(true, Ordering::SeqCst);
@@ -371,8 +512,13 @@ fn run_downloader(
                 shared.wake_all();
                 retries = 0;
             }
-            Err(_) => {
+            BodyRead::TimedOut => {
+                // 空闲读超时（连接假死）与读错误同路：重连或计数重试
                 retries += 1;
+                log::warn!(
+                    "[audio] 响应体空闲超过 {}s，判定连接假死（pos={pos} 第 {retries} 次）",
+                    READ_IDLE_TIMEOUT.as_secs()
+                );
                 if retries >= MAX_RETRIES || !shared.supports_ranges {
                     shared.failed.store(true, Ordering::SeqCst);
                     shared.wake_all();
@@ -381,7 +527,7 @@ fn run_downloader(
                 std::thread::sleep(Duration::from_millis(500 * retries as u64));
                 // Range 模式从当前断点重连
                 match issue_range(&client, &url, pos) {
-                    Ok(resp) => body = Box::new(resp),
+                    Ok(resp) => body = BodyReader::new(Box::new(resp)),
                     Err(_) => continue,
                 }
             }
@@ -389,18 +535,61 @@ fn run_downloader(
     }
 }
 
+/// 断流重连用的 Range 请求。
+///
+/// **必须确认响应体真的从 `from` 开始**（2026-10-03 事故）：服务端偶尔会无视
+/// Range 头直接返回 200 + 整文件（CDN 回源、WAF 改写、签名 URL 换源都可能）。
+/// 把这种 body 当成「从 from 开始的字节」写进文件偏移 `from`，整条流从此字节错位；
+/// 解码器按错位数据切 FLAC 帧，最终在 symphonia 里以整数下溢 panic 打死音频回调
+/// 线程 —— 用户看到的是「播到一半卡死、没有任何报错」。
+/// 所以这里只接受 2xx 且（`from > 0` 时）必须是 206，Content-Range 起点不符即丢弃。
 fn issue_range(
     client: &reqwest::blocking::Client,
     url: &str,
     from: u64,
 ) -> Result<reqwest::blocking::Response, ()> {
-    client
+    let resp = client
         .get(url)
         .header("Range", format!("bytes={from}-"))
-        // 与首包超时对齐：断流重连也要快速落定，拖长只会推迟失败判定
-        .timeout(FIRST_PACKET_TIMEOUT)
+        // 宽总量挂死保护（HTTP_TOTAL_GUARD），不是判活：断流重连也要保证
+        // 下载线程最终能带着 Err 退出重试
+        .timeout(HTTP_TOTAL_GUARD)
         .send()
-        .map_err(|_| ())
+        .map_err(|_| ())?;
+    let status = resp.status();
+    // 4xx/5xx 的响应体绝不能当音频数据写进缓冲
+    if !status.is_success() {
+        log::warn!("[audio] 重连返回 HTTP {status}（请求 bytes={from}-），丢弃本次响应");
+        return Err(());
+    }
+    // from == 0 时 200（整文件）与 206 语义等价，可直接用；from > 0 时 200
+    // 意味着 body 从 0 开始，写进去就是错位数据，必须拒绝
+    if from > 0 && status != reqwest::StatusCode::PARTIAL_CONTENT {
+        log::warn!(
+            "[audio] 重连时服务端未按 Range 应答（HTTP {status}，请求 bytes={from}-），丢弃本次响应"
+        );
+        return Err(());
+    }
+    if let Some(start) = content_range_start(&resp) {
+        if start != from {
+            log::warn!(
+                "[audio] 重连响应起点不符（Content-Range 起点 {start} ≠ 请求 {from}），丢弃本次响应"
+            );
+            return Err(());
+        }
+    }
+    Ok(resp)
+}
+
+/// 取 `Content-Range: bytes start-end/total` 里的起点；头缺失或形态异常返回 None。
+fn content_range_start(resp: &reqwest::blocking::Response) -> Option<u64> {
+    parse_content_range_start(resp.headers().get("content-range")?.to_str().ok()?)
+}
+
+/// `content_range_start` 的纯解析部分（单测直接打它）。
+fn parse_content_range_start(raw: &str) -> Option<u64> {
+    let rest = raw.trim().strip_prefix("bytes")?;
+    rest.trim_start().split('-').next()?.trim().parse::<u64>().ok()
 }
 
 /// 供 rodio/symphonia 使用的 Read + Seek 包装。
@@ -434,7 +623,7 @@ impl Read for HttpRangeReader {
         }
 
         // 只读当前 pos 所在就绪区间的末端为止，绝不越过未就绪字节
-        let span_end = shared.ready.lock().unwrap().ready_upto(self.pos);
+        let span_end = shared.ready.lock().unwrap_or_else(|p| p.into_inner()).ready_upto(self.pos);
         let upper = total.unwrap_or(u64::MAX).min(span_end);
         let max = upper.saturating_sub(self.pos) as usize;
         let want = buf.len().min(max);
@@ -509,11 +698,14 @@ impl HttpRangeReader {
             // 通知下载线程重定位到读取位置
             shared.desired.store(pos, Ordering::SeqCst);
             shared.wake_all();
-            let guard = shared.ready.lock().unwrap();
+            let guard = shared.ready.lock().unwrap_or_else(|p| p.into_inner());
             let (g, timeout) = shared
                 .ready_cv
                 .wait_timeout(guard, Duration::from_millis(100))
-                .unwrap();
+                // 毒化容忍：持锁线程 panic 后 Condvar 返回 PoisonError，
+                // 就绪区间数据本身不受损，取回内部守卫继续等即可（与上方案
+                // file_logger/db/playurl_bridge 的口径一致），否则该请求永久挂起
+                .unwrap_or_else(|p| p.into_inner());
             drop(g);
             if timeout.timed_out() && Instant::now() >= deadline && !shared.is_ready_at(pos) {
                 return Err(io::Error::new(io::ErrorKind::TimedOut, "等待音频数据超时"));
@@ -556,5 +748,79 @@ mod tests {
         s.add(500, 1500); // 重叠合并
         assert_eq!(s.ready_upto(0), 1500);
         assert_eq!(s.total_bytes(), 1500);
+    }
+
+    /// Content-Range 起点解析：断流重连靠它判定「body 到底从哪开始」，
+    /// 判错就会把错位数据写进缓冲（2026-10-03 FLAC panic 事故的源头）。
+    #[test]
+    fn parse_content_range_start_variants() {
+        assert_eq!(parse_content_range_start("bytes 0-1023/4096"), Some(0));
+        assert_eq!(parse_content_range_start("bytes 1024-2047/4096"), Some(1024));
+        assert_eq!(parse_content_range_start("bytes  1024-2047/*"), Some(1024));
+        assert_eq!(parse_content_range_start("  bytes 4096-8191/8192  "), Some(4096));
+        // 形态异常一律 None（调用方只在拿到 Some 时做强校验）
+        assert_eq!(parse_content_range_start(""), None);
+        assert_eq!(parse_content_range_start("bytes */4096"), None);
+        assert_eq!(parse_content_range_start("items 0-1/2"), None);
+        assert_eq!(parse_content_range_start("bytes abc-2047/4096"), None);
+    }
+
+    /// 正常流：BodyReader 应按序吐字节，并把 EOF 稳定报成 Eof。
+    #[test]
+    fn body_reader_yields_bytes_then_eof() {
+        let src: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(vec![1u8, 2, 3, 4, 5]));
+        let mut body = BodyReader::new(src);
+        let mut out = [0u8; 8];
+        match body.read_with_timeout(&mut out, Duration::from_secs(5)) {
+            BodyRead::Data(n) => assert_eq!(&out[..n], &[1, 2, 3, 4, 5]),
+            _ => panic!("期望读到数据"),
+        }
+        assert!(matches!(
+            body.read_with_timeout(&mut out, Duration::from_secs(5)),
+            BodyRead::Eof
+        ));
+        // EOF 可重复读取，不应再次阻塞
+        assert!(matches!(
+            body.read_with_timeout(&mut out, Duration::from_secs(5)),
+            BodyRead::Eof
+        ));
+    }
+
+    /// 假死连接：服务端不关连接也不发数据 → 必须报 TimedOut 而不是把下载线程冻死。
+    #[test]
+    fn body_reader_reports_idle_timeout() {
+        /// 永不返回的 Read，模拟「连上了但不发包也不关连接」
+        struct BlackHole;
+        impl Read for BlackHole {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                std::thread::sleep(Duration::from_secs(30));
+                Ok(0)
+            }
+        }
+        let src: Box<dyn Read + Send> = Box::new(BlackHole);
+        let mut body = BodyReader::new(src);
+        let mut out = [0u8; 8];
+        let started = Instant::now();
+        let got = body.read_with_timeout(&mut out, Duration::from_millis(150));
+        assert!(matches!(got, BodyRead::TimedOut));
+        // 关键：判死必须发生在空闲阈值上，而不是被后台线程拖到 30s
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// 读侧缓冲区小于单帧时，帧内剩余字节必须留到下一次读，不能丢。
+    #[test]
+    fn body_reader_preserves_partial_frame() {
+        let src: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(vec![7u8; 100]));
+        let mut body = BodyReader::new(src);
+        let mut out = [0u8; 3];
+        match body.read_with_timeout(&mut out, Duration::from_secs(5)) {
+            BodyRead::Data(n) => assert_eq!(n, 3),
+            _ => panic!("期望读到数据"),
+        }
+        assert_eq!(out, [7, 7, 7]);
+        match body.read_with_timeout(&mut out, Duration::from_secs(5)) {
+            BodyRead::Data(n) => assert_eq!(n, 3),
+            _ => panic!("期望继续读到数据"),
+        }
     }
 }

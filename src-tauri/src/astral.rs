@@ -96,12 +96,15 @@ pub struct LikeSongPayload<'a> {
 }
 
 /// 登录会话。字段名与 qt-uniappx `services/auth.ts` 的 parseTokenResponse 对齐
-/// （后端返回 `token` / `refreshToken` / `expiresIn`）。
+/// （后端返回 `token` / `expiresIn`）。
+///
+/// 注：后端（astral）从不签发 refreshToken（全仓无下发/刷新端点，只有一条
+/// 字典类型定义），续期完全靠 satoken 主动刷新（见 `refresh`）——这里不设
+/// refresh_token 字段，避免误导后来者以为存在可用的刷新令牌。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthSession {
     pub token: String,
-    pub refresh_token: String,
     /// 过期时间（Unix 毫秒）。后端不返回 expiresIn 时按 7 天算，与移动端一致。
     pub expires_at: i64,
 }
@@ -178,20 +181,12 @@ fn parse_session(data: &Value) -> Result<AuthSession, String> {
     if token.is_empty() {
         return Err("登录响应里没有 token".to_string());
     }
-    // 后端不单独给 refreshToken 时，用 access token 顶上（与移动端降级策略一致）
-    let refresh_token = data
-        .get("refreshToken")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&token)
-        .to_string();
     let expires_in = data
         .get("expiresIn")
         .and_then(Value::as_i64)
         .unwrap_or(7 * 24 * 3600);
     Ok(AuthSession {
         token,
-        refresh_token,
         expires_at: now_ms() + expires_in * 1000,
     })
 }
@@ -264,6 +259,13 @@ pub fn installer_signature_verified() -> bool {
 
 pub(crate) fn mark_installer_signature_verified() {
     INSTALLER_SIGNATURE_VERIFIED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// 下载开始（固定路径文件被截断/重建）时复位标记：上一次「已验签」的字节
+/// 已不存在。不复位的话，二次下载中途失败（MD5/签名不过）后标记仍是 true，
+/// run_update_installer 会执行从未通过校验的字节
+pub(crate) fn reset_installer_signature_verified() {
+    INSTALLER_SIGNATURE_VERIFIED.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// 更新安装包的固定路径（下载写入与执行校验共用同一口径，避免两处各写一份）
@@ -1226,8 +1228,19 @@ impl AstralClient {
             return serde_json::json!({ "downloadUrl": download_url, "accelUsed": false });
         }
         let mut best: Option<(String, u128)> = None;
+        // 并发探测全部加速节点（文档一直写的是并发；此前实现是 for+await 串行，
+        // 每个探测 5s 超时，N 个节点最坏 5N 秒全程挂住命令）。spawn 后逐个收，
+        // 取最低延迟；个别任务异常按探测失败跳过
+        let mut handles = Vec::with_capacity(accels.len());
         for prefix in accels {
-            if let Some(latency) = Self::probe_accel(&prefix, download_url).await {
+            let target = download_url.to_string();
+            handles.push(tauri::async_runtime::spawn(async move {
+                let latency = Self::probe_accel(&prefix, &target).await;
+                (prefix, latency)
+            }));
+        }
+        for handle in handles {
+            if let Ok((prefix, Some(latency))) = handle.await {
                 if best.as_ref().map(|(_, l)| latency < *l).unwrap_or(true) {
                     best = Some((prefix, latency));
                 }
@@ -1307,6 +1320,9 @@ impl AstralClient {
         // 于是服务端下发的 `..\..\x.exe` 能写穿临时目录。
         let path = dir.join(UPDATE_INSTALLER_FILE_NAME);
 
+        // File::create 会截断/重建固定路径文件：此刻起旧文件字节作废，先复位
+        // 进程级验签标记（见 reset_installer_signature_verified 的注释）
+        reset_installer_signature_verified();
         let resp = http
             .get(url)
             .send()
@@ -1439,7 +1455,15 @@ impl AstralClient {
                 }
                 hasher.update(&buf[..n]);
             }
-            let actual = format!("{:x}", hasher.finalize());
+            // md-5 0.11（RustCrypto digest 0.11 系）把 finalize() 的返回类型换成了
+            // hybrid_array::Array，它**不再实现 LowerHex**，`format!("{:x}")` 编译不过。
+            // 这里自己转十六进制：只用 core，不依赖任何 digest 版本的格式化 impl，
+            // 以后再升 digest 也不用改这里。
+            let actual = hasher
+                .finalize()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
             if !actual.eq_ignore_ascii_case(expect) {
                 return Err(format!("MD5 校验不符：期望 {expect}，实际 {actual}"));
             }
@@ -1833,18 +1857,16 @@ mod tests {
     }
 
     #[test]
-    fn parse_session_reads_token_and_falls_back_to_access_token() {
+    fn parse_session_reads_token_and_defaults_expiry() {
         let data = serde_json::json!({ "token": "abc", "expiresIn": 3600 });
         let s = parse_session(&data).expect("解析会话");
         assert_eq!(s.token, "abc");
-        // 后端没单独给 refreshToken → 用 access token 顶上（与移动端降级策略一致）
-        assert_eq!(s.refresh_token, "abc");
         assert!(s.is_valid());
         assert!(s.expires_at > now_ms());
     }
 
     #[test]
-    fn parse_session_uses_refresh_token_when_present() {
+    fn parse_session_ignores_unknown_fields_and_defaults_expiry() {
         let data = serde_json::json!({
             "token": "access",
             "refreshToken": "refresh",
@@ -1852,7 +1874,6 @@ mod tests {
         });
         let s = parse_session(&data).expect("解析会话");
         assert_eq!(s.token, "access");
-        assert_eq!(s.refresh_token, "refresh");
         // 没给 expiresIn 时按 7 天兜底
         let no_expiry = serde_json::json!({ "token": "a" });
         let s2 = parse_session(&no_expiry).expect("解析会话");
@@ -1904,7 +1925,6 @@ mod tests {
         let client = AstralClient::new("http://localhost:1");
         let session = AuthSession {
             token: "t".to_string(),
-            refresh_token: "r".to_string(),
             expires_at: now_ms() + 3 * 60 * 60 * 1000,
         };
         client.set_session(&session);
@@ -1958,7 +1978,6 @@ mod tests {
     fn expired_session_is_not_valid() {
         let s = AuthSession {
             token: "t".to_string(),
-            refresh_token: "r".to_string(),
             expires_at: now_ms() - 1_000,
         };
         assert!(!s.is_valid());

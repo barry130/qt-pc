@@ -81,6 +81,25 @@ pub enum ProviderError {
     NoPlayableUrl,
     #[error("无结果")]
     Empty,
+    /// 取链链路**等待超时**（前端应答 / 引擎窗口 / 打开流都没在预算内答完）。
+    ///
+    /// 与 `NoPlayableUrl` 必须分开（2026-10-03 弱网修复）：后者是「音源确实
+    /// 给不出地址」，是内容问题；本变体是「网络慢/引擎卡」，等一会儿可能就好。
+    /// 早期实现两者都报 `NoPlayableUrl`，于是弱网时每首都被记成「歌坏了」——
+    /// 连续 5 首打满熔断把自动切歌关掉，弱网反而变成永久不可用。
+    #[error("网络较慢，取链超时")]
+    ResolveStalled,
+}
+
+impl ProviderError {
+    /// 本次失败是否**不该记为「这首歌坏了」**。
+    ///
+    /// 判据：等待链路超时（弱网/引擎卡）属于环境问题，重试有意义；
+    /// 内容问题（无地址/无结果/不支持/风控）是这首歌在这个音源的宿命。
+    /// 引擎据此决定要不要计入连续失败熔断与 `failed_tracks` 拉黑名单。
+    pub fn is_stalled(&self) -> bool {
+        matches!(self, ProviderError::ResolveStalled)
+    }
 }
 
 pub type ProviderResult<T> = Result<T, ProviderError>;

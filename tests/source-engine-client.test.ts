@@ -61,11 +61,17 @@ describe("source-engine client 生命周期恢复", () => {
     const client = await import("@/source-engine/client");
 
     // 1) 首次取链：status 查询两次超时（各 2.5s）→ phase 锁死 error，取链按失败回退
+    // （stalled=true：引擎无响应属环境问题，不计入熔断，2026-10-03 弱网修复）
     const first = client.engineResolve("qq", song, "128");
     await vi.advanceTimersByTimeAsync(2_600); // 第 1 次 status 超时
     await vi.advanceTimersByTimeAsync(400); // 重试间隔
     await vi.advanceTimersByTimeAsync(2_600); // 第 2 次 status 超时 → error
-    await expect(first).resolves.toEqual({ url: "", line: null, error: "" });
+    await expect(first).resolves.toEqual({
+      url: "",
+      line: null,
+      error: "",
+      stalled: true,
+    });
     expect(client.engineSnapshot().phase).toBe("error");
 
     // error 期间不再真的发取链请求（短路回退，不空等）
@@ -74,6 +80,7 @@ describe("source-engine client 生命周期恢复", () => {
       url: "",
       line: null,
       error: "",
+      stalled: true,
     });
     expect(h.emits.filter((e) => e.kind === "resolve").length).toBe(before);
 

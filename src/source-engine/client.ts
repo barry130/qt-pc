@@ -73,28 +73,52 @@ export interface EngineResolved {
    * 「酷狗失败却不换源」只能靠猜。
    */
   error: string;
+  /**
+   * 本次失败是**环境问题**（引擎未就绪 / 应答超时）而非「音源没这首」。
+   *
+   * 2026-10-03 弱网修复：弱网时 trace 里全是「超时未返回」，与「音源线路
+   * 确实答不出地址」在 url 上都表现为空串。上面这个区分让调用方能把
+   * 「等网络」与「换下一首」分开，不再把弱网当成歌坏从而打满熔断。
+   */
+  stalled: boolean;
 }
 
 /**
- * 取链 RPC 超时：引擎侧链预算默认 12s（chain.json budget.totalMs），
- * 留 3s 余量；超时即按本次取链失败处理（应用侧没有内置实现可回退），
- * 不等引擎慢尾。
+ * 取链 RPC 超时：**8s**。
  *
- * 与引擎→前端取链桥的关系（2026-10-02 修复不变量）：引擎主导换歌时，
- * 前端是被 Rust 的 `ask_frontend` 叫起来应答的，它的应答路径包含本超时
- * 全程 + 两次 IPC 往返。所以 `playurl_bridge.rs` 的 ASK_TIMEOUT 必须
- * **严格大于**本值（现为 20s = 15s + 5s 余量）；两边相等就是零余量，
- * 跑满链预算的慢取链会被桥判超时丢弃。改这里必须同步复核那边。
+ * 引擎侧链预算是 `CHAIN_BUDGET_MS = 5s`（chain.json budget.totalMs，
+ * 见 qt-sources/src/budget.ts），所以 8s = 5s 预算 + 3s 调度余量已经覆盖
+ * 「链跑满」的最坏情况。超时即按本次取链失败处理（没有内置实现可回退）。
+ *
+ * 为什么不再留 15s（2026-10-03 弱网修复）：弱网下链内 5s 预算必然烧光，
+ * 此时外层多等的每一秒都是纯白等——用户看到的是「每首卡十几秒才失败」，
+ * 连挂 5 首就凑满熔断，弱网被放大成「疯狂不可用」。收到 8s 让单首失败
+ * 更快落地，配合「超时不计入熔断、原地重试」才是正确的组合。
+ *
+ * 与引擎→前端取链桥的关系（不变量）：引擎主导换歌时，前端是被 Rust 的
+ * `ask_frontend` 叫起来应答的，它的应答路径包含本超时常程 + 两次 IPC 往返。
+ * 所以 `playurl_bridge.rs` 的 ASK_TIMEOUT 必须**严格大于**本值
+ * （现为 12s = 8s + 4s 余量）；两边相等就是零余量，跑满链预算的慢取链
+ * 会被桥判超时丢弃。改这里必须同步复核那边。
  */
-const RESOLVE_TIMEOUT_MS = 15_000;
+const RESOLVE_TIMEOUT_MS = 8_000;
 /**
  * 数据接口 RPC 超时：搜索/聚合类要打多平台 HTTP（单请求上限 15s），
  * 比取链宽松；超时按"引擎叫不动"处理（同样没有内置实现可回退）。
  */
-const INVOKE_TIMEOUT_MS = 20_000;
+export const INVOKE_TIMEOUT_MS = 20_000;
 /** 状态查询单次超时 / 重试上限（引擎启动毫秒级，上限只为防呆） */
 const STATUS_QUERY_TIMEOUT_MS = 2_500;
 const STATUS_QUERY_MAX_FAILURES = 2;
+/**
+ * booting 轮询总时长上限。引擎页活着但卡死在 boot（某个 bundle init 的
+ * await 永不落定）时，refreshPhase 会无限轮询，engineResolve/engineInvoke
+ * 里的 `await ensureBound()` 永不返回 —— 点歌、搜索全部静默挂死且没有任何
+ * 报错路径（Rust 桥 12s 兜底只覆盖取链应答路径，UI 直调的数据接口没有）。
+ * 到上限置 error（挂后台重探），调用方立刻拿到明确的失败。
+ */
+const BOOTING_POLL_MAX_MS = 10_000;
+const BOOTING_POLL_INTERVAL_MS = 400;
 
 /**
  * 引擎置 error 后的后台重探间隔（指数退避，封顶 ERROR_REPROBE_MAX_MS）。
@@ -249,30 +273,47 @@ function normalizeEnginePack(raw: unknown): EnginePackSnapshot | null {
 }
 
 /**
- * 刷新引擎生命周期：引擎启动中（booting）轮询直到终态；引擎不可达时
- * 有限重试后置 error（避免每次取链都空等）。
+ * 刷新引擎生命周期：引擎启动中（booting）轮询直到终态（总时长封顶，见
+ * BOOTING_POLL_MAX_MS）；引擎不可达时有限重试后置 error（避免每次取链都空等）。
+ * 并发调用共享同一次轮询（refreshing 去重）：否则每个并发调用者各起一个
+ * 轮询循环并持续叠加，引擎卡 boot 时循环数量随调用次数增长。
  */
+let refreshing: Promise<void> | null = null;
+
 async function refreshPhase(): Promise<void> {
-  let failures = 0;
-  for (;;) {
-    const p = await queryPhaseOnce();
-    if (p === "booting") {
-      await new Promise((r) => window.setTimeout(r, 400));
-      continue;
+  if (refreshing) return refreshing;
+  refreshing = (async () => {
+    let failures = 0;
+    const startedAt = Date.now();
+    for (;;) {
+      const p = await queryPhaseOnce();
+      if (p === "booting") {
+        if (Date.now() - startedAt >= BOOTING_POLL_MAX_MS) {
+          setPhase("error");
+          // 终态会一直短路所有调用 → 挂后台重探，等引擎页就绪后自动恢复
+          scheduleReprobe();
+          return;
+        }
+        await new Promise((r) => window.setTimeout(r, BOOTING_POLL_INTERVAL_MS));
+        continue;
+      }
+      if (p !== null) {
+        setPhase(p);
+        return;
+      }
+      failures += 1;
+      if (failures >= STATUS_QUERY_MAX_FAILURES) {
+        setPhase("error");
+        // 终态会一直短路所有调用 → 挂后台重探，等引擎页解冻/就绪后自动恢复
+        scheduleReprobe();
+        return;
+      }
+      await new Promise((r) => window.setTimeout(r, 300));
     }
-    if (p !== null) {
-      setPhase(p);
-      return;
-    }
-    failures += 1;
-    if (failures >= STATUS_QUERY_MAX_FAILURES) {
-      setPhase("error");
-      // 终态会一直短路所有调用 → 挂后台重探，等引擎页解冻/就绪后自动恢复
-      scheduleReprobe();
-      return;
-    }
-    await new Promise((r) => window.setTimeout(r, 300));
-  }
+  })().finally(() => {
+    refreshing = null;
+  });
+  return refreshing;
 }
 
 async function ensureBound(): Promise<void> {
@@ -348,7 +389,8 @@ function normalizeTargetSong(raw: unknown): MusicInfo | null {
  * url "" = 引擎不可用/解析失败/超时（调用方按本次取链失败处理）；
  * line = 本次命中的音源线路（管理端「当前播放地址」显示走的是哪条源），
  * null = 未知（包内 10 分钟缓存命中，或引擎页比宿主旧没有这个字段）；
- * error = 失败时的逐线路 trace（成功为空串）。
+ * error = 失败时的逐线路 trace（成功为空串）；
+ * stalled = 本次失败是环境问题（引擎未就绪/发不出去/超时）而非「音源没这首」。
  */
 export async function engineResolve(
   source: Source,
@@ -356,26 +398,33 @@ export async function engineResolve(
   quality: Quality,
 ): Promise<EngineResolved> {
   await ensureBound();
-  if (phase !== "ready") return { url: "", line: null, error: "" };
+  // 引擎未就绪：环境问题（弱网下引擎页可能被冻住），不是这首歌没地址
+  if (phase !== "ready") return { url: "", line: null, error: "", stalled: true };
   const requestId = ++seq;
   const reply = new Promise<EngineReply>((resolve) => pending.set(requestId, resolve));
   try {
     await emitRequest({ requestId, kind: "resolve", source, song, quality });
   } catch {
     pending.delete(requestId);
-    return { url: "", line: null, error: "" };
+    return { url: "", line: null, error: "", stalled: true };
   }
   const answer = await withTimeout(reply, RESOLVE_TIMEOUT_MS)
     .finally(() => pending.delete(requestId))
     .catch(() => null);
-  if (!answer) return { url: "", line: null, error: "" };
+  // 应答超时：链预算 5s 都烧光了还没回，判环境问题
+  if (!answer) return { url: "", line: null, error: "", stalled: true };
   const url = String(answer.url ?? "");
   const error = typeof answer.error === "string" ? answer.error : "";
   // 死因落控制台：面板只在 qt_admin 打开时才看得到，日志是排障的第一现场
   if (url.length === 0 && error.length > 0) {
     console.warn(`[playurl] 取链失败 ${source}:${song.id}@${quality} — ${error}`);
   }
-  return { url, line: normalizeLine(answer.line), error };
+  // 音源包在 trace 前缀打 `[网络]` 表示「整链没有一条线路拿到过响应」，
+  // 即本次全灭是弱网/引擎卡造成的环境问题，而不是这个音源没这首歌
+  // （见 qt-sources/src/actions/play-url.ts 的 noteSourceMissFiltered）。
+  // 据此让 stalled=true，引擎不把曲目拉黑、不计入熔断。
+  const stalled = url.length === 0 && /\[网络\]/.test(error);
+  return { url, line: normalizeLine(answer.line), error, stalled };
 }
 
 /** 引擎当前状态快照（设置页展示用） */

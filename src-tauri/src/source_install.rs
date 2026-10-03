@@ -1624,6 +1624,64 @@ pub async fn cmd_source_uninstall_pack(app: AppHandle, pack_id: String) -> Resul
     Ok(json!({ "uninstalled": pack_id, "kind": removed.kind }))
 }
 
+/// 该包是否是「它自己 kind 对应的当前生效包」。
+fn is_pack_active(state: &SourceBundleState, pack: &SourcePackMeta) -> bool {
+    if pack.kind == PACK_KIND_META {
+        state.active_meta_id.as_deref() == Some(pack.id.as_str())
+    } else {
+        state.active_id.as_deref() == Some(pack.id.as_str())
+    }
+}
+
+/// 是否存在该包的待生效现场（安装/更新时写入，成功收摊或失败回滚时消费）。
+fn has_pending(pack_id: &str) -> bool {
+    pending_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(pack_id)
+}
+
+/// 引擎页上报的可信级别。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReportTrust {
+    /// 该包确有待生效现场：上报可被完全采信（允许回滚 `.prev`、清空生效槽位）。
+    Full,
+    /// 无现场，但该包正是本 kind 的当前生效包：只允许「观测性」写入
+    /// （补名、记 last_error），**不得**回滚、不得清槽。
+    ObserveOnly,
+    /// 完全不可信：丢弃本次上报。
+    None,
+}
+
+/// 判定一次引擎页上报的可信级别。
+///
+/// 背景（P-IPC-2）：引擎页把音源包 `import()`/`new Function` 到同一个 JS realm
+/// 里求值，包脚本可以直接 `__TAURI_INTERNALS__.invoke` 调用引擎窗口白名单内的
+/// 任意命令（`__TAURI_INTERNALS__` 必须暴露，否则 fetch 型 invoke 不可用）。
+/// 因此这些回调**不能假定调用方就是引擎页**，只能依据宿主自身状态定级，否则
+/// 一个已生效的恶意播放包就能对任意 packId 抢先调 `source_pack_verified` 清掉
+/// 官方包的更新现场、或对**同槽位的其他包**伪造 `*_load_failed` 触发误回滚/误清槽。
+///
+/// 关键结构性事实（本判定的依据）：`applyActivePack` 在 `entries` 为空时直接返回
+/// （见 source_engine_page.html），而 `entries` 只在 meta 装载成功后才可能非空。
+/// 所以播放包代码**永远晚于 meta 装载**才开始执行 —— 等恶意播放包跑起来时，
+/// meta 槽的 pending 早已收摊。于是「要求存在 pending」这一条就能把所有
+/// 跨槽位/跨包的破坏性伪造全部挡住，而伪造者只剩「伤害自己」这一种可能。
+fn report_trust(state: &SourceBundleState, pack_id: &str) -> ReportTrust {
+    let Some(pack) = state.pack(pack_id) else {
+        return ReportTrust::None;
+    };
+    if has_pending(pack_id) {
+        return ReportTrust::Full;
+    }
+    // 无现场的合法场景：进程重启后 boot 期装配/装载失败（现场已在上次收摊）。
+    // 此时只认「本 kind 的当前生效包」，且只给观测性写入权限。
+    if is_pack_active(state, pack) {
+        return ReportTrust::ObserveOnly;
+    }
+    ReportTrust::None
+}
+
 /// 引擎装配成功后回填包自述名（v3 包头已带全量元信息，仅补空缺字段）。
 /// 注意：这里**不**清更新现场——describe 发生在冒烟之前，现场要留给
 /// 冒烟失败回滚用（冒烟通过后由 `source_pack_verified` 收摊）。
@@ -1636,6 +1694,14 @@ pub async fn cmd_source_pack_describe(
 ) -> Result<Value, String> {
     let dir = source_bundle::bundle_dir(&app);
     let mut state = load_state(&dir);
+    // 自述名会展示在设置页：只认有现场或正生效的包，防恶意包改写他人展示名
+    match report_trust(&state, &pack_id) {
+        ReportTrust::Full | ReportTrust::ObserveOnly => {}
+        ReportTrust::None => {
+            log::warn!("[source-bundle] 拒绝包自述上报（{pack_id}：非生效包且无现场）");
+            return Ok(json!({ "described": false }));
+        }
+    }
     let Some(pack) = state.packs.iter_mut().find(|p| p.id == pack_id) else {
         return Ok(json!({ "described": false }));
     };
@@ -1652,8 +1718,18 @@ pub async fn cmd_source_pack_describe(
 #[tauri::command(rename = "source_pack_verified")]
 pub async fn cmd_source_pack_verified(app: AppHandle, pack_id: String) -> Result<Value, String> {
     if !pack_id.is_empty() {
+        let dir = source_bundle::bundle_dir(&app);
+        let state = load_state(&dir);
+        // 收摊（清 pending）只允许有现场的包：否则恶意包可替别人把回滚现场抹掉
+        match report_trust(&state, &pack_id) {
+            ReportTrust::Full | ReportTrust::ObserveOnly => {}
+            ReportTrust::None => {
+                log::warn!("[source-bundle] 拒绝装配通过上报（{pack_id}：非生效包且无现场）");
+                return Ok(json!({ "verified": false }));
+            }
+        }
         clear_pending(&pack_id);
-        clear_pack_error_at(&source_bundle::bundle_dir(&app), &pack_id);
+        clear_pack_error_at(&dir, &pack_id);
     }
     Ok(json!({ "verified": true }))
 }
@@ -1667,8 +1743,18 @@ pub async fn cmd_source_meta_loaded(
     code: Option<i64>,
 ) -> Result<Value, String> {
     if !pack_id.is_empty() {
-        clear_pending(&pack_id);
-        clear_pack_error_at(&source_bundle::bundle_dir(&app), &pack_id);
+        let dir = source_bundle::bundle_dir(&app);
+        let state = load_state(&dir);
+        match report_trust(&state, &pack_id) {
+            ReportTrust::Full | ReportTrust::ObserveOnly => {
+                clear_pending(&pack_id);
+                clear_pack_error_at(&dir, &pack_id);
+            }
+            ReportTrust::None => {
+                log::warn!("[source-bundle] 拒绝 meta 装载上报（{pack_id}：非生效包且无现场）");
+                return Ok(json!({ "loaded": false }));
+            }
+        }
     }
     log::info!(
         "[source-bundle] meta 槽已装载：{} v{}",
@@ -1705,6 +1791,15 @@ pub async fn cmd_source_pack_load_failed(
         let _ = take_pending(&pack_id);
         return Ok(json!({ "handled": false }));
     };
+    // 可信级别：无现场且非生效包的上报一律丢弃（恶意播放包伪造他人失败 →
+    // 会误触发回滚/误记 last_error，并向后端灌假 smoke_failed）
+    let trust = report_trust(&state, &pack_id);
+    if trust == ReportTrust::None {
+        log::warn!(
+            "[source-bundle] 拒绝播放包装载失败上报（{pack_id}：非生效包且无现场）"
+        );
+        return Ok(json!({ "handled": false }));
+    }
     if pack.id == OFFICIAL_PLAY_ID {
         let result = if pending.as_ref().map(|p| p.is_update) == Some(true) {
             "smoke_failed"
@@ -1719,7 +1814,10 @@ pub async fn cmd_source_pack_load_failed(
         pack.version_code
     );
 
-    let is_update = pending.as_ref().map(|p| p.is_update) == Some(true);
+    // 回滚是破坏性动作：只允许「确有更新现场」的上报触发（见 report_trust 文档）。
+    // ObserveOnly（boot 期无现场）只记账，不动磁盘上的 .prev。
+    let is_update = trust == ReportTrust::Full
+        && pending.as_ref().map(|p| p.is_update) == Some(true);
     if is_update {
         let (reverted, blacklisted) = rollback_update_at(&dir, &pack_id);
         // 回滚后旧记录复活（首装型则已摘除）：把这次失败记在幸存记录上
@@ -1743,13 +1841,22 @@ pub async fn cmd_source_meta_load_failed(
     error: String,
 ) -> Result<Value, String> {
     let dir = source_bundle::bundle_dir(&app);
+    let state = load_state(&dir);
+    let trust = report_trust(&state, &pack_id);
+    if trust == ReportTrust::None {
+        log::warn!("[source-bundle] 拒绝数据包装载失败上报（{pack_id}：非生效包且无现场）");
+        return Ok(json!({ "handled": false }));
+    }
     let pending = pending_map()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&pack_id)
         .cloned();
     log::warn!("[source-bundle] 数据包装载失败（{pack_id}）: {error}");
-    let is_update = pending.as_ref().map(|p| p.is_update) == Some(true);
+    // 回滚/清槽都是破坏性动作：只有确有更新现场时（Full）才允许，
+    // 防恶意播放包对同槽位的其他数据包伪造失败触发误回滚/误清槽。
+    let is_update = trust == ReportTrust::Full
+        && pending.as_ref().map(|p| p.is_update) == Some(true);
     if is_update {
         let (reverted, blacklisted) = rollback_update_at(&dir, &pack_id);
         // 回滚后旧记录复活（首装型则已摘除）：把这次失败记在幸存记录上
@@ -1758,6 +1865,8 @@ pub async fn cmd_source_meta_load_failed(
         return Ok(json!({ "handled": true, "reverted": reverted, "blacklisted": blacklisted }));
     }
     note_pack_error_at(&dir, &pack_id, &error);
+    // 手动启用失败 → 清空数据槽。必须是「本次上报的包正是当前生效包」才清，
+    // 否则会变成任意包都能把别人的数据槽打掉（DoS）。
     let mut state = load_state(&dir);
     if state.active_meta_id.as_deref() == Some(&pack_id) {
         state.active_meta_id = None;
