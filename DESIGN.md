@@ -1330,20 +1330,25 @@ struct PlayUrlKey { platform: SourceId, track_id: String, quality: Quality }
 | 环境（`stalled`） | 取链桥超时 / 引擎相位未就绪 / emit 失败 / 前端 `[网络]` 标记 | **不计熔断**，指数退避原地重试同一首（3s → 6s → 12s，上限 20s，最多 3 次） |
 | 内容 | 引擎确实返回「无可用播放地址」（跨源全灭、地址失效） | 计入 `fail_streak`，跳过到下一首 |
 
+前端 `[网络]` 标记的判定（`qt-sources/src/actions/play-url.ts`）有两个来源，缺一不可：
+
+1. **trace 判据** `isNetworkOnlyFailure`：整链全灭且没有任何一条线路拿到过实质响应。白名单含「超时未返回 / 预算耗尽未跑 / 请求超时 / 超时 / err: / 死链」。**「空」故意不在白名单**——`searched: true` 的空是「搜索跑通了、目标平台确实没有这首」，属内容问题；弱网导致的搜索失败走「超时未返回」分支。
+2. **耗时判据**（2026-10-03 用户日志复盘补）：`budget.remainingMs <= budget.totalMs * 0.08` 即**预算烧光**。用户实测日志「`ERROR 自动取址失败: 无可用播放地址` 每 5s 一条」正是链跑满预算仍无地址，而 trace 里可能一条超时都没有（档内答空 + 跨源答空），单靠 trace 措辞判不出网络问题。耗时是客观事实，留 8% 余量避免「秒答空」被误判。
+
 熔断：`fail_streak >= FAIL_STREAK_LIMIT`（5）→ 关闭 `auto_next` 并发系统通知。修复前**所有**失败一律计数，弱网下每首约 5s（取链链内预算 `CHAIN_BUDGET_MS`）失败，连挂 5 首约 25s 就把自动切歌关死，且熔断是**单向门**——网络恢复后没人把播放拉回来，用户体感是「整晚放不回来」。
 
 配套的恢复探测：熔断后按 15s → 120s 退避**真的取一次链**判恢复（最多 8 次），成功后重开 `auto_next` 并把当前曲重新拉起。
 
-取链超时分层（不变量：外层必须严格大于内层）：
+取链超时分层（不变量：外层必须严格大于内层）。链内预算为「原源搜索 5s + 换源兜底 4s」两段（`IN_TIER_MS` = 5000，跨源 reserve = 4000）：
 
 ```text
-CHAIN_BUDGET_MS 5s（链内预算，四端共用 chain.json）
-      < RESOLVE_TIMEOUT_MS 8s（前端引擎等待 = 5s + 3s 调度余量）
-      < ASK_TIMEOUT 12s（Rust 桥等待 = 8s + 4s，含 set_resolved_play_url
+CHAIN_BUDGET_MS 9s + CHAIN_GRACE_MS 250ms = 9250ms（链内预算，四端共用 chain.json）
+      < RESOLVE_TIMEOUT_MS 9.5s（前端引擎等待 = 9250ms + 250ms 调度余量）
+      < ASK_TIMEOUT 14s（Rust 桥等待 = 9.5s + 4.5s，含 set_resolved_play_url
                          与 resolve_play_url_reply 两次 IPC 往返）
 ```
 
-修复前 `ASK_TIMEOUT` 与 `RESOLVE_TIMEOUT_MS` **相等**（都是 15s），前端必然在被判超时之后才把答案送回来，慢取链 100% 被丢弃——这是用户所说「15S 不对」的直接来源。App 侧同口径：`URL_FETCH_BUDGET_MS` 7s（硬上限）< `PLAY_TIMEOUT_MS` 12s < 原生 `RESOLVE_TIMEOUT_SECONDS` 15s。
+修复前 `ASK_TIMEOUT` 与 `RESOLVE_TIMEOUT_MS` **相等**（都是 15s），前端必然在被判超时之后才把答案送回来，慢取链 100% 被丢弃——这是用户所说「15S 不对」的直接来源。App 侧同口径：`URL_FETCH_BUDGET_MS` 10s（硬上限）< `PLAY_TIMEOUT_MS` 12s < 原生 `RESOLVE_TIMEOUT_SECONDS` 15s。
 
 另有播放位置冻结看门狗：位置 12s 不动 → 软重载；再 8s 不动 → 重建输出流；累计 3 次 → 报错并系统通知。`STALL_POS_TIMEOUT` 必须大于 `range_reader::FIRST_PACKET_TIMEOUT`（8s），否则会把正常的首包等待误判成冻结。
 

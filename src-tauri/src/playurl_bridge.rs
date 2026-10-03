@@ -13,7 +13,7 @@
 //! 就绪语义：前端主窗口挂载后调 `script_bridge_ready` 置位。启动恢复
 //! 播放等早于前端挂载的取链不等待、直接按失败处理。
 //!
-//! P2-5：在途请求表原来是"每个调用方一条 + 只靠 15s 超时清理"，
+//! P2-5：在途请求表原来是"每个调用方一条 + 只靠超时清理"，
 //! 前端长时间不响应期间会一直堆。现在：
 //! - **同键单飞合并**：同一 `platform:trackId:quality` 的并发取链只发一次
 //!   前端事件，多个调用方共享同一次应答（前端本来就是按 requestId 配对的
@@ -69,7 +69,7 @@ static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 
 /// 引擎等待前端应答的上限。
 ///
-/// **这里必须严格大于前端 `RESOLVE_TIMEOUT_MS`（现 8s）加两次 IPC 往返余量。**
+/// **这里必须严格大于前端 `RESOLVE_TIMEOUT_MS`（现 9.5s）加两次 IPC 往返余量。**
 /// 前端应答要走的完整路径是
 ///   引擎 → play_url_request → 前端 resolvePlayUrl → engineResolve
 ///   （等引擎窗口，见 qt-pc/src/source-engine/client.ts）→ set_resolved_play_url
@@ -78,14 +78,14 @@ static PENDING: Mutex<Option<Pending>> = Mutex::new(None);
 /// 应答必然晚于本超时到达，被当成"前端没答"丢弃，慢但能成功的取链就一律变成
 /// "该歌曲暂时无法播放"，连挂 5 首还会停掉自动切歌。
 ///
-/// 取值 12s = 8s + 4s（两次 IPC + 引擎页调度抖动）。改 client.ts 的
+/// 取值 14s = 9.5s + 4.5s（两次 IPC + 引擎页调度抖动）。改 client.ts 的
 /// `RESOLVE_TIMEOUT_MS` 时必须同步复核这里。
 ///
-/// 为什么不再放大到 20s：链内真实预算只有 `CHAIN_BUDGET_MS = 5s`
-/// （见 qt-sources/src/budget.ts），外层等 12s 已覆盖 5s 预算 + 调度抖动。
-/// 再大只是让「网络慢」变成「白等」——用户看到的是每首卡十几秒才失败，
+/// 为什么不再放大到 20s：链内真实预算只有 `CHAIN_BUDGET_MS = 9s` + 宽限 250ms
+/// （= 9250ms，见 qt-sources/src/budget.ts），外层等 14s 已覆盖 9250ms 预算 +
+/// 调度抖动。再大只是让「网络慢」变成「白等」——用户看到的是每首卡十几秒才失败，
 /// 5 首就是一分钟起步，那正是弱网下「疯狂不可用」的手感来源。
-const ASK_TIMEOUT: Duration = Duration::from_secs(12);
+const ASK_TIMEOUT: Duration = Duration::from_secs(14);
 
 /// 引擎取链的结果（`ask_frontend` 的返回）。
 ///
@@ -135,7 +135,7 @@ fn flight_key(track: &Track, quality: Quality) -> String {
 /// 摘掉一次在途请求（应答到达 / 超时 / 事件发送失败共用）。
 ///
 /// 只认 `by_id` 里记着的那次 request_id：如果这条已经被淘汰、同键又新建了
-/// 一次请求，旧调用方晚到的清理**不能**把新请求删掉（否则那个键会白等 15s）。
+/// 一次请求，旧调用方晚到的清理**不能**把新请求删掉（否则那个键会白等到 ASK_TIMEOUT）。
 fn take_flight(table: &mut Pending, request_id: u64) -> Option<Flight> {
     let key = table.by_id.remove(&request_id)?;
     match table.by_key.get(&key) {
