@@ -52,7 +52,6 @@ const HTTP_TOTAL_GUARD: Duration = Duration::from_secs(120);
 const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 /// `BodyReader` 收包用的有界通道容量（1 帧 8KB，够了；上限防慢读方堆积内存）
 const BODY_CHANNEL_CAP: usize = 8;
-
 /// 有序、不相交的就绪字节区间集 `[start, end)`。下载线程写，读线程锁内等。
 #[derive(Default)]
 struct ReadySpans {
@@ -377,7 +376,7 @@ impl BodyReader {
         }
     }
 
-    /// 带空闲超时的读：`Ok(0)` 只在真 EOF 时返回
+    /// 带空闲超时的读：只有真 EOF 才返回 `BodyRead::Eof`
     fn read_with_timeout(&mut self, out: &mut [u8], idle: Duration) -> BodyRead {
         if self.off >= self.pending.len() {
             if self.done {
