@@ -1037,11 +1037,18 @@ Sink.append(source)
 |---|---|
 | 服务端 `Accept-Ranges: none` 或返回 200 而非 206 | 退化为「先下完再播」，播放前显示缓冲进度 |
 | 首包超时（默认 8s） | 判定为不可播放，触发 `invalidate_play_url` + 重取一次 |
+| 响应体空闲读超时（20s） | 连接假死（收下请求后既不发包也不关连接）→ 走断流重连；连续 3 次广播 `audio-error` |
 | 播放中断流 | 已缓冲部分继续播放，同时后台重试；连续失败 3 次广播 `audio-error` |
 | 缓冲区大小 | 单曲上限 100MB（覆盖 FLAC），LRU 淘汰，总量上限在设置中可调（默认 2GB） |
 | 与下载功能的关系 | 用户点「下载」时若缓冲文件已完整，直接 `rename` 到下载目录，不重复拉流 |
 | 本地文件 | 直接 `File::open`，不进入该链路，也不参与 10 分钟失效判断 |
 | 起播延迟目标 | 首包到达即起播，目标 < 800ms（不含取址耗时）；不等整曲下载完 |
+
+HTTP 层超时的三个值互不替代，改一个必须复核另两个：`HTTP_TOTAL_GUARD`（120s，挂在
+request 上，只兜「请求永不返回」）、`READ_IDLE_TIMEOUT`（20s，`BodyReader` 的空闲读
+超时，真・判活）、`FIRST_PACKET_TIMEOUT`（8s，解码侧 `ensure_ready` 的用户可见首包
+判活）。`reqwest::blocking` 没有空闲读超时选项，所以 20s 那层是把响应体挪进独立线程、
+用有界通道 `recv_timeout` 实现的（`range_reader.rs` 的 `BodyReader`）。
 
 事件补充：`audio-buffering { trackId, bufferedMs, downloadedBytes, totalBytes }`，前端用于进度条的二级缓冲条与「缓冲中」状态。
 
@@ -1157,7 +1164,7 @@ Rust 查询 Track
    │
    ▼
 获取失败？
-   ├── 是：作废缓存 → 重新获取 → 仍失败则提示不可播放
+   ├── 是：作废缓存 → 重新获取 → 仍失败则按失败分类处理（见 §7.12）
    └── 否：继续
    │
    ▼
@@ -1313,6 +1320,32 @@ struct PlayUrlKey { platform: SourceId, track_id: String, quality: Quality }
 | seek / 切歌 | 立即 | 立即发一次 tick，取消插值 |
 
 误差来源与预算：音频输出缓冲延迟（约 20–40ms，可用固定偏移补偿）+ 事件传递（<5ms）+ 插值误差（<16ms），合计可控在 50ms 内。**桌面歌词窗口必须自行插值**，不能依赖主窗口转发（见 §10.2）。
+
+## 7.12 播放失败分类与自动切歌熔断（2026-10-03 弱网修复）
+
+播放失败分**环境**与**内容**两类，二者的处置相反，混在一起会把网络波动放大成「疯狂不可用」：
+
+| 分类 | 判定来源 | 处置 |
+|---|---|---|
+| 环境（`stalled`） | 取链桥超时 / 引擎相位未就绪 / emit 失败 / 前端 `[网络]` 标记 | **不计熔断**，指数退避原地重试同一首（3s → 6s → 12s，上限 20s，最多 3 次） |
+| 内容 | 引擎确实返回「无可用播放地址」（跨源全灭、地址失效） | 计入 `fail_streak`，跳过到下一首 |
+
+熔断：`fail_streak >= FAIL_STREAK_LIMIT`（5）→ 关闭 `auto_next` 并发系统通知。修复前**所有**失败一律计数，弱网下每首约 5s（取链链内预算 `CHAIN_BUDGET_MS`）失败，连挂 5 首约 25s 就把自动切歌关死，且熔断是**单向门**——网络恢复后没人把播放拉回来，用户体感是「整晚放不回来」。
+
+配套的恢复探测：熔断后按 15s → 120s 退避**真的取一次链**判恢复（最多 8 次），成功后重开 `auto_next` 并把当前曲重新拉起。
+
+取链超时分层（不变量：外层必须严格大于内层）：
+
+```text
+CHAIN_BUDGET_MS 5s（链内预算，四端共用 chain.json）
+      < RESOLVE_TIMEOUT_MS 8s（前端引擎等待 = 5s + 3s 调度余量）
+      < ASK_TIMEOUT 12s（Rust 桥等待 = 8s + 4s，含 set_resolved_play_url
+                         与 resolve_play_url_reply 两次 IPC 往返）
+```
+
+修复前 `ASK_TIMEOUT` 与 `RESOLVE_TIMEOUT_MS` **相等**（都是 15s），前端必然在被判超时之后才把答案送回来，慢取链 100% 被丢弃——这是用户所说「15S 不对」的直接来源。App 侧同口径：`URL_FETCH_BUDGET_MS` 7s（硬上限）< `PLAY_TIMEOUT_MS` 12s < 原生 `RESOLVE_TIMEOUT_SECONDS` 15s。
+
+另有播放位置冻结看门狗：位置 12s 不动 → 软重载；再 8s 不动 → 重建输出流；累计 3 次 → 报错并系统通知。`STALL_POS_TIMEOUT` 必须大于 `range_reader::FIRST_PACKET_TIMEOUT`（8s），否则会把正常的首包等待误判成冻结。
 
 ---
 
