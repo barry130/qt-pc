@@ -1573,6 +1573,26 @@ pub async fn cmd_source_activate_pack(
         return Err(format!("音源包不存在: {pack_id}"));
     };
     if pack.kind == PACK_KIND_META {
+        // 手动启用数据包 = 宿主发起的一次现场（P-IPC-2）：登记 pending 后，
+        // 引擎随后的装载失败上报才够得上 Full 信任（见 report_trust），从而按
+        // 既有语义把数据槽清空回「未装态」。is_update=false ⇒ 该上报只会清槽，
+        // 不会回滚 .prev、不会摘除包记录（手动装的包失败要留在列表里等用户处理）。
+        //
+        // 已经是生效包时不重复登记：引擎页 onMetaChanged 在「同 id 同 code 且
+        // entries 就绪」时幂等早退、不会回 source_meta_loaded，重复登记会让这次
+        // 现场永远收不了摊（滞留的现场虽因「已生效」不构成越权，但没必要留）。
+        if state.active_meta_id.as_deref() != Some(pack_id.as_str()) {
+            put_pending(
+                &pack_id,
+                PendingApply {
+                    kind: pack.kind.clone(),
+                    is_update: false,
+                    prev_pack: None,
+                    prev_active: state.active_id.clone(),
+                    prev_active_meta: state.active_meta_id.clone(),
+                },
+            );
+        }
         state.active_meta_id = Some(pack_id.clone());
     } else {
         state.active_id = Some(pack_id.clone());
@@ -1657,29 +1677,49 @@ enum ReportTrust {
 ///
 /// 背景（P-IPC-2）：引擎页把音源包 `import()`/`new Function` 到同一个 JS realm
 /// 里求值，包脚本可以直接 `__TAURI_INTERNALS__.invoke` 调用引擎窗口白名单内的
-/// 任意命令（`__TAURI_INTERNALS__` 必须暴露，否则 fetch 型 invoke 不可用）。
-/// 因此这些回调**不能假定调用方就是引擎页**，只能依据宿主自身状态定级，否则
-/// 一个已生效的恶意播放包就能对任意 packId 抢先调 `source_pack_verified` 清掉
-/// 官方包的更新现场、或对**同槽位的其他包**伪造 `*_load_failed` 触发误回滚/误清槽。
+/// 任意命令（`__TAURI_INTERNALS__` 必须暴露，否则 fetch 型 invoke 不可用），
+/// 甚至可以挂钩 `invoke` 观察/顶替引擎页自己的上报。因此这些回调**不能假定
+/// 调用方就是引擎页**，只能依据宿主自身状态定级。
 ///
-/// 关键结构性事实（本判定的依据）：`applyActivePack` 在 `entries` 为空时直接返回
-/// （见 source_engine_page.html），而 `entries` 只在 meta 装载成功后才可能非空。
-/// 所以播放包代码**永远晚于 meta 装载**才开始执行 —— 等恶意播放包跑起来时，
-/// meta 槽的 pending 早已收摊。于是「要求存在 pending」这一条就能把所有
-/// 跨槽位/跨包的破坏性伪造全部挡住，而伪造者只剩「伤害自己」这一种可能。
+/// 判定用的是两条宿主侧事实，缺一不可：
+/// 1. **该包是本 kind 的当前生效包**。引擎页只对生效包上报（`describe` /
+///    `verified` / `load_failed` 取 `state.activeId`，`meta_*` 取
+///    `state.activeMetaId`，见 source_engine_page.html），所以「生效」是上报者
+///    的必要条件。这一条同时挡住「替别的包收摊」：未启用包的现场不会被消费，
+///    可以长期滞留（见 `install_pack_at` 的生效门），若只看 pending，一个已生效
+///    的恶意播放包就能对那个滞留现场调 `source_pack_verified` 抹掉别人的更新
+///    现场、或调 `*_load_failed` 触发误回滚/误摘除。
+/// 2. **该包确有现场**（`PendingApply`）。
+///
+/// 两条同时成立才给 Full。此时上报只可能是「宿主刚发起的那次安装/启用」对应的
+/// 装载结果：现场只由 `install_pack_at`（安装/更新）与 `cmd_source_activate_pack`
+/// （手动启用数据包）建立，装载成功即被 `source_meta_loaded` /
+/// `source_pack_verified` 收摊。
+///
+/// 生效但无现场（例如 boot 期装载失败、或现场已被成功上报消费掉）只给
+/// ObserveOnly：补名、记 `last_error` 可以，回滚 `.prev` 与清空生效槽位不行。
+///
+/// boot **刻意不预置现场**：预置后一旦页面没走到那次上报就挂掉（`waitInternals`
+/// 超时、`source_state` 取值失败导致 `metaTarget.url` 为空而提前返回、页面异常），
+/// 现场会滞留整个会话，反而把伪造窗口从「一次安装/启用」放大成「整个会话」——
+/// 与收紧授权相反。代价是启动时装载失败不再自动清空数据槽（只记 `last_error`、
+/// 由引擎页自行下线数据面），这是有意的取舍：清槽/回滚只认宿主现场。
+///
+/// 残留风险（已知且有界）：现场存活期间，同一 realm 里正在运行的恶意播放包
+/// 理论上可以抢先顶替引擎页发出那一次上报（挂钩 `invoke`）。这需要「另一槽位
+/// 正好有一次安装/启用在进行中」这一窄窗口，且最多影响那次更新本身；同 realm
+/// 执行是既有设计取舍，彻底消除需要换 realm（见 pack_safety.rs 的说明）。
 fn report_trust(state: &SourceBundleState, pack_id: &str) -> ReportTrust {
     let Some(pack) = state.pack(pack_id) else {
         return ReportTrust::None;
     };
+    if !is_pack_active(state, pack) {
+        return ReportTrust::None;
+    }
     if has_pending(pack_id) {
         return ReportTrust::Full;
     }
-    // 无现场的合法场景：进程重启后 boot 期装配/装载失败（现场已在上次收摊）。
-    // 此时只认「本 kind 的当前生效包」，且只给观测性写入权限。
-    if is_pack_active(state, pack) {
-        return ReportTrust::ObserveOnly;
-    }
-    ReportTrust::None
+    ReportTrust::ObserveOnly
 }
 
 /// 引擎装配成功后回填包自述名（v3 包头已带全量元信息，仅补空缺字段）。
@@ -1865,14 +1905,21 @@ pub async fn cmd_source_meta_load_failed(
         return Ok(json!({ "handled": true, "reverted": reverted, "blacklisted": blacklisted }));
     }
     note_pack_error_at(&dir, &pack_id, &error);
-    // 手动启用失败 → 清空数据槽。必须是「本次上报的包正是当前生效包」才清，
-    // 否则会变成任意包都能把别人的数据槽打掉（DoS）。
-    let mut state = load_state(&dir);
-    if state.active_meta_id.as_deref() == Some(&pack_id) {
-        state.active_meta_id = None;
-        save_state(&dir, &state)?;
-        broadcast_meta_changed(&app);
-        return Ok(json!({ "handled": true, "reverted": false, "slotCleared": true }));
+    // 手动启用失败 → 清空数据槽。清槽同样是破坏性动作：只有本次上报的包
+    // **既生效又有现场**（Full）才允许——否则一个已生效的恶意播放包只要对
+    // 当前生效的数据包调一次本命令，就能把健康的数据面打到「未装态」（DoS）。
+    // 代价是启动时装载失败不再自动清槽（只记 last_error，引擎页自行下线数据面，
+    // 用户可在设置页改选/清空），这是有意的取舍：破坏性动作只认宿主现场。
+    if trust == ReportTrust::Full {
+        // note_pack_error_at 已把 last_error 落盘：这里必须重新读一次状态，
+        // 复用上面的旧快照回写会把刚写进去的失败摘要覆盖掉。
+        let mut state = load_state(&dir);
+        if state.active_meta_id.as_deref() == Some(&pack_id) {
+            state.active_meta_id = None;
+            save_state(&dir, &state)?;
+            broadcast_meta_changed(&app);
+            return Ok(json!({ "handled": true, "reverted": false, "slotCleared": true }));
+        }
     }
     Ok(json!({ "handled": true, "reverted": false }))
 }
@@ -1952,6 +1999,12 @@ mod tests {
     /// 签名闸门互斥锁：旁路类（BYPASS_SIGNATURE_GATE 计数 >0 期间）与
     /// 「必须拒绝」断言类测试互斥——cargo test 并发下，二者交错会让
     /// reject 测试恰好撞上别人的旁路窗口而随机失败。
+    ///
+    /// 兼作**官方保留 id 的安装互斥**：待生效现场（PENDING_APPLIES）是按包 id
+    /// 存的进程级全局表，多个测试安装同一个 `play-official` 时，任何一个的
+    /// `take_pending("play-official")` 都会抽走别人的现场，让「空槽上位后
+    /// 存在待生效现场」这类断言随机失败（2026-10 在 CPU 高负载下复现，
+    /// 227/228 间歇失败）。**凡安装 play-official 的测试都必须持有本锁。**
     static GATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// RAII 旁路：作用域内放行无签名官方包，离开作用域自动恢复硬校验。
@@ -2048,6 +2101,10 @@ mod tests {
 
     #[test]
     fn official_pack_gate_accepts_release_signed_vector() {
+        // 本测试装的是官方保留 id play-official，末尾 take_pending(OFFICIAL_PLAY_ID)
+        // 会抽走进程级全局表里的现场；不持锁就会把并发跑着的
+        // install_play_pack_activates_when_slot_empty 的断言抽空（见 GATE_TEST_LOCK 注释）。
+        let _lock = GATE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tmp_dir("gate-ok");
         install_pack_at(
             &dir,
@@ -2330,6 +2387,108 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// P-IPC-2 授权收紧的核心判据：上报可信级必须「生效 + 有现场」双条件。
+    /// 任缺其一都不许触发破坏性动作（回滚 .prev / 清空生效槽）。
+    #[test]
+    fn report_trust_requires_both_active_and_pending() {
+        let dir = tmp_dir("trust");
+        // 空槽安装 → 自动上位 + 有现场 ⇒ Full
+        install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_PLAY, "trust-a", 1, true),
+            false,
+            "",
+            "",
+        )
+        .unwrap();
+        let st = load_state(&dir);
+        assert_eq!(
+            report_trust(&st, "trust-a"),
+            ReportTrust::Full,
+            "生效 + 有现场"
+        );
+        // 现场被成功上报收摊后：仍生效但无现场 ⇒ ObserveOnly（只许补名/记 last_error）
+        take_pending("trust-a");
+        assert_eq!(
+            report_trust(&st, "trust-a"),
+            ReportTrust::ObserveOnly,
+            "生效但无现场不得回滚/清槽"
+        );
+        // 槽位被占，安装第二个包：不抢生效位，但同样留下现场。
+        // 这个「滞留现场」正是只认 pending 时的漏洞来源——必须判 None。
+        install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_PLAY, "trust-b", 1, true),
+            false,
+            "",
+            "",
+        )
+        .unwrap();
+        let st = load_state(&dir);
+        assert_eq!(st.active_id.as_deref(), Some("trust-a"));
+        assert!(has_pending("trust-b"), "被占槽的安装同样留下现场");
+        assert_eq!(
+            report_trust(&st, "trust-b"),
+            ReportTrust::None,
+            "非生效包即便有现场也不可信：滞留现场不可被他人（或自己）消费"
+        );
+        take_pending("trust-b");
+        // 记录不存在的包
+        assert_eq!(report_trust(&st, "ghost"), ReportTrust::None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 数据槽同理：生效判据按 kind 取对应槽位，跨 kind 不得串台。
+    #[test]
+    fn report_trust_covers_meta_slot() {
+        let dir = tmp_dir("trustm");
+        install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_META, "meta-trust-a", 1, false),
+            false,
+            "",
+            "",
+        )
+        .unwrap();
+        let st = load_state(&dir);
+        assert_eq!(st.active_meta_id.as_deref(), Some("meta-trust-a"));
+        assert_eq!(report_trust(&st, "meta-trust-a"), ReportTrust::Full);
+        take_pending("meta-trust-a");
+        assert_eq!(report_trust(&st, "meta-trust-a"), ReportTrust::ObserveOnly);
+        // 同 kind 槽位被占：第二个数据包有现场也不可信
+        install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_META, "meta-trust-b", 1, false),
+            false,
+            "",
+            "",
+        )
+        .unwrap();
+        let st = load_state(&dir);
+        assert_eq!(st.active_meta_id.as_deref(), Some("meta-trust-a"));
+        assert!(has_pending("meta-trust-b"));
+        assert_eq!(report_trust(&st, "meta-trust-b"), ReportTrust::None);
+        // 数据包不占播放槽：播放包照旧走 activeId 判生效
+        install_pack_at(
+            &dir,
+            &pack_text(PACK_KIND_PLAY, "play-trust-c", 1, true),
+            false,
+            "",
+            "",
+        )
+        .unwrap();
+        let st = load_state(&dir);
+        assert_eq!(report_trust(&st, "play-trust-c"), ReportTrust::Full);
+        assert_eq!(
+            report_trust(&st, "meta-trust-a"),
+            ReportTrust::ObserveOnly,
+            "播放包生效不影响数据包自身的可信级"
+        );
+        let _ = take_pending("meta-trust-b");
+        let _ = take_pending("play-trust-c");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn same_id_update_backs_up_prev_and_keeps_installed_at() {
         let dir = tmp_dir("install3");
@@ -2515,61 +2674,65 @@ mod tests {
     #[test]
     fn install_source_channels_url_self_manifest() {
         let dir = tmp_dir("src-ch");
-        let url = "https://example.com/play-x.js";
+        // 包 id 专用（play-ch）而非 play-x：待生效现场是按 id 存的进程级全局表，
+        // 与 same_id_update_backs_up_prev_and_keeps_installed_at 的 play-x 同名时，
+        // 本测试末尾的 take_pending 会把那边 rollback 要用的现场抽走，让
+        // `assert!(reverted && blacklisted)` 随机失败。
+        let url = "https://example.com/play-ch.js";
         // 首装（直链）：url + URL
         install_pack_at(
             &dir,
-            &pack_text(PACK_KIND_PLAY, "play-x", 1, true),
+            &pack_text(PACK_KIND_PLAY, "play-ch", 1, true),
             false,
             INSTALL_SOURCE_URL,
             url,
         )
         .unwrap();
-        take_pending("play-x");
+        take_pending("play-ch");
         let st = load_state(&dir);
-        let p = st.pack("play-x").unwrap();
+        let p = st.pack("play-ch").unwrap();
         assert_eq!(p.install_source, "url");
         assert_eq!(p.install_ref, url);
         // 自管更新（包自身 updateUrl 通道）：保留原安装来源
         install_pack_at(
             &dir,
-            &pack_text(PACK_KIND_PLAY, "play-x", 2, true),
+            &pack_text(PACK_KIND_PLAY, "play-ch", 2, true),
             true,
             "",
             "",
         )
         .unwrap();
-        take_pending("play-x");
+        take_pending("play-ch");
         let st = load_state(&dir);
-        let p = st.pack("play-x").unwrap();
+        let p = st.pack("play-ch").unwrap();
         assert_eq!(p.install_source, "url", "自管更新保留原来源");
         assert_eq!(p.install_ref, url);
         // 官方 manifest 通道更新：改写为 manifest + 空 ref
         install_pack_at(
             &dir,
-            &pack_text(PACK_KIND_PLAY, "play-x", 3, true),
+            &pack_text(PACK_KIND_PLAY, "play-ch", 3, true),
             true,
             INSTALL_SOURCE_MANIFEST,
             "",
         )
         .unwrap();
-        take_pending("play-x");
+        take_pending("play-ch");
         let st = load_state(&dir);
-        let p = st.pack("play-x").unwrap();
+        let p = st.pack("play-ch").unwrap();
         assert_eq!(p.install_source, "manifest");
         assert_eq!(p.install_ref, "");
         // 再来一次自管更新：仍保留（上一轮写入的）manifest 来源
         install_pack_at(
             &dir,
-            &pack_text(PACK_KIND_PLAY, "play-x", 4, true),
+            &pack_text(PACK_KIND_PLAY, "play-ch", 4, true),
             true,
             "",
             "",
         )
         .unwrap();
-        take_pending("play-x");
+        take_pending("play-ch");
         let st = load_state(&dir);
-        assert_eq!(st.pack("play-x").unwrap().install_source, "manifest");
+        assert_eq!(st.pack("play-ch").unwrap().install_source, "manifest");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
