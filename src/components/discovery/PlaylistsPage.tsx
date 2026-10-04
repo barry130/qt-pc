@@ -5,6 +5,7 @@ import { useNavigate } from "@tanstack/react-router";
 import type { Playlist, PlaylistCategory } from "@/types";
 import * as sourceApi from "@/source-scripts";
 import { useMusicSourceStore } from "@/stores/musicSource";
+import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 import { CoverCard, CoverGrid } from "./CoverCard";
 
 /**
@@ -177,6 +178,9 @@ function CategoryFilter(props: {
   const listRef = useRef<HTMLDivElement | null>(null);
   const [rowHeight, setRowHeight] = useState(0);
   const [fullHeight, setFullHeight] = useState(0);
+  // 本页在 keep-alive 里可能处于 display:none（用户在看别的页面）。
+  // 那种状态下一切几何量都是 0，量出来的结果会把 collapsible 永久钉成 false。
+  const active = useKeepAliveActive();
 
   const measure = useCallback((): void => {
     const list = listRef.current;
@@ -187,9 +191,14 @@ function CategoryFilter(props: {
     setFullHeight(list.scrollHeight);
   }, []);
 
+  // 分类数量变化、以及**本页重新可见**时都要重测。
+  // 只依赖 categories.length 是不够的：换源后新分类是在页面还隐藏着的时候
+  // 到达的（keep-alive 不卸载），那一帧量到的全是 0，等用户切回来时
+  // categories.length 没变、window 也没 resize，于是「更多」再也不会出现。
+  // 放在 useLayoutEffect 里保证在浏览器绘制前完成，切回来不会闪一下「全部展开」。
   useLayoutEffect(() => {
     measure();
-  }, [measure, categories.length]);
+  }, [measure, categories.length, active]);
 
   useEffect(() => {
     // 换行取决于容器宽度；字体缩放改的是 html 的 font-size，容器宽高不变，
@@ -201,11 +210,20 @@ function CategoryFilter(props: {
       attributes: true,
       attributeFilter: ["style"],
     });
+    // 再直接盯容器自身尺寸：display:none → 可见时它会从 0×0 变成真实尺寸，
+    // ResizeObserver 必然触发，是比「猜触发时机」更可靠的兜底。
+    let ro: ResizeObserver | null = null;
+    const list = listRef.current;
+    if (list && typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver(onResize);
+      ro.observe(list);
+    }
     return () => {
       window.removeEventListener("resize", onResize);
       mo.disconnect();
+      ro?.disconnect();
     };
-  }, [measure]);
+  }, [measure, active]);
 
   // 点击面板外面收起（标准下拉行为）
   useEffect(() => {
