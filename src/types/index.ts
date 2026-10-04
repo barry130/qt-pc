@@ -1,15 +1,20 @@
 /**
  * 源 ID。**清单由数据包注册表声明**（`__qtEntries.sourceRegistry()` →
  * stores/sourceRegistry.ts），本端不内置音源列表；`"local"` 是保留值（本地
- * 曲库，不走在线接口）。注意：Rust 侧 `provider::types::SourceId` 是封闭
- * 枚举，**全新 id** 要真正可播/可收藏还需在 Rust `parse()` 补一枚（存量
- * 四源 + local 不受影响；下线某个源只需数据包不再声明，UI 随之消失）。
+ * 曲库，不走在线接口，由宿主硬编码实现）。
+ *
+ * 2026-10 全开放：Rust 侧 `provider::types::SourceId` 已是开放字符串
+ * （`#[serde(transparent)]` newtype，只要求非空且不含 `:`——因为库表主键是
+ * `platform:id`）。**新增在线音源只需数据包在 registry.ts 加一行**，两端
+ * 宿主即刻可搜、可播、可收藏，无需发版；下线某源只需数据包不再声明，
+ * UI 随之消失（存量收藏/歌单里的孤儿行由 db/store/tracks.rs 静默跳过）。
  */
 export type SourceId = string;
 
 /**
- * 音质 id。档位清单同样由数据包注册表声明；可播值受 Rust serde 枚举约束
- * （"128" / "320" / "flac"，判口径见 lib/quality.ts 的 isQuality）。
+ * 音质 id。档位清单同样由数据包注册表声明；可播值由 Rust 侧开放接受
+ * （`Quality` 同为新type 字符串，非空即合法），判定口径见 lib/quality.ts
+ * 的 isQuality —— 那里只做形状校验，不再持有白名单。
  */
 export type Quality = string;
 
@@ -246,6 +251,18 @@ export interface RegistrySource {
   name: string;
   short: string;
   color: string;
+  /**
+   * 能力自述（包侧 platforms/*.ts 声明，宿主不再硬编码源 id）：
+   * latest() 的 offset 参数是否有分页语义（决定「最新音乐」是否透传 offset）。
+   * 旧版数据包不下发该字段，读取处按 false 兜底。
+   */
+  latestUsesOffset?: boolean;
+  /**
+   * 能力自述：搜索类接口的每页条数上限。上游对超限请求的处理各不相同
+   * （qq 要 100 会返回 0 条、酷狗恒给 30），宿主按此收敛每页条数，
+   * 「满页 = 还有下一页」的推断才成立。旧版包不下发时按 50 兜底。
+   */
+  searchPageMax?: number;
 }
 
 /** 数据包注册表声明的音质档位 */

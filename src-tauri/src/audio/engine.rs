@@ -503,7 +503,7 @@ impl EngineInner {
         let s = PlayState {
             index,
             position_ms: st.position_ms,
-            quality: quality_key(self.default_quality),
+            quality: quality_key(&self.default_quality),
             play_mode: mode_key(st.play_mode),
             volume: st.volume,
             muted: st.muted,
@@ -525,15 +525,17 @@ impl EngineInner {
     }
 }
 
-/// settings 中的 quality 键值：128 / 320 / flac
-fn quality_key(q: Quality) -> String {
-    serde_json::to_string(&q).unwrap().trim_matches('"').into()
+/// settings 中的 quality 键值：`128` / `320` / `flac` / 音源包声明的任意档位。
+///
+/// 宿主不再持有档位白名单，所以这里就是透传（serde 表示本身是透明字符串）。
+fn quality_key(q: &Quality) -> String {
+    q.as_str().to_string()
 }
 
 /// `quality_key` 的反操作：settings 里的字符串 → Quality，认不出来返回 None。
-/// 与 commands.rs 里恢复播放现场用的是同一套 serde 表示。
+/// 与 commands.rs 里恢复播放现场用的是同一套解析口径。
 fn parse_quality(s: &str) -> Option<Quality> {
-    serde_json::from_value::<Quality>(serde_json::json!(s)).ok()
+    Quality::parse(s)
 }
 
 /// settings 中的 play_mode 键值：sequence / listLoop / oneLoop / random
@@ -701,7 +703,7 @@ fn run_engine(deps: EngineDeps) {
         // None = 跟随系统默认；启动时从 settings 恢复用户上次的选择
         output_choice: None,
         // 真正的默认值在下面从 settings 读；这里与 PlaybackStateSnapshot 的默认值对齐
-        default_quality: Quality::High,
+        default_quality: Quality::default(),
         track_quality: None,
         current_device: String::new(),
         current_shared: None,
@@ -756,7 +758,7 @@ fn run_engine(deps: EngineDeps) {
     if let Some(db) = &inner.db {
         if let Ok(saved) = db.with(|c| store::get_setting(c, "quality")) {
             if let Some(q) = saved.as_deref().and_then(parse_quality) {
-                inner.default_quality = q;
+                inner.default_quality = q.clone();
                 inner.mutate(|st| st.quality = q);
             }
         }
@@ -1223,13 +1225,13 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
         }
         AudioCmd::SetDefaultQuality { quality } => {
             // 默认音质（设置页）：写 settings 以便重启保持，并对当前这首立即生效
-            inner.default_quality = quality;
             if let Some(db) = &inner.db {
-                if let Err(e) = db.with(|c| store::set_setting(c, "quality", &quality_key(quality)))
+                if let Err(e) = db.with(|c| store::set_setting(c, "quality", &quality_key(&quality)))
                 {
                     log::warn!("[db] 默认音质入库失败: {e}");
                 }
             }
+            inner.default_quality = quality;
             let current = inner.queue.lock().unwrap().current().cloned();
             if inner.track_quality.is_none() {
                 if let Some(track) = current {
@@ -1475,8 +1477,8 @@ fn play_queue_track(inner: &mut EngineInner, track: Track) {
 fn load_queue_track(inner: &mut EngineInner, track: Track, autoplay: bool, start_ms: u64) {
     // 有效音质：这首歌被播放条单独指定过就用指定的，否则用设置里的默认
     let quality = match &inner.track_quality {
-        Some((id, q)) if *id == track.id => *q,
-        _ => inner.default_quality,
+        Some((id, q)) if *id == track.id => q.clone(),
+        _ => inner.default_quality.clone(),
     };
     // 每次新加载推进代次：在途的旧加载结果回来时据此丢弃
     inner.load_gen += 1;
@@ -1708,13 +1710,14 @@ fn schedule_recovery_probe(inner: &EngineInner) {
     let Some(track) = track else {
         return;
     };
-    let quality = inner.state.read().unwrap().quality.into_provider();
+    let quality = inner.state.read().unwrap().quality.clone();
     tauri::async_runtime::spawn(async move {
         let mut delay = RECOVERY_PROBE_BASE_MS;
         for attempt in 1..=RECOVERY_PROBE_LIMIT {
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             // 探测：真取一次链。成功说明网络与音源都回来了。
-            let probe = crate::resolve_play_url_script(&app, &cache, &track, quality).await;
+            let probe =
+                crate::resolve_play_url_script(&app, &cache, &track, quality.clone()).await;
             if probe.is_ok() {
                 let _ = tx.send(AudioCmd::Recovered { gen: 0 });
                 log::info!("[queue] 第{attempt}次恢复探测成功，重开自动切歌");
@@ -1919,7 +1922,7 @@ fn spawn_resolve_and_load(
         http: inner.http.clone(),
         cache_dir: inner.cache_dir.clone(),
         history_db: inner.db.clone(),
-        quality: inner.state.read().unwrap().quality.into_provider(),
+        quality: inner.state.read().unwrap().quality.clone(),
         track,
         autoplay,
         start_ms,
@@ -1946,7 +1949,7 @@ struct LoadJob {
 impl LoadJob {
     async fn run(self) {
         // 本地曲目：Track.id 即文件绝对路径，无需 Provider 取址（DESIGN §13）
-        if self.track.platform == types::SourceId::Local {
+        if self.track.platform.is_local() {
             log::info!("[queue] local track path={}", self.track.id);
             let path = self.track.id.clone();
             self.build_and_dispatch(PlaySource::Local { path }, true, None)
@@ -1976,8 +1979,13 @@ impl LoadJob {
         // 取链（脚本线路）：缓存命中直接用（前端切歌时预解析回填）；未命中经
         // playurl_bridge 问前端脚本包，前端按「换源顺序」跨源解析后回填缓存。
         // 原生 Rust Provider 已删除，前端脚本线路是唯一的第三方取链路径。
-        let resolved =
-            crate::resolve_play_url_script(&self.app, &self.cache, &self.track, self.quality).await;
+        let resolved = crate::resolve_play_url_script(
+            &self.app,
+            &self.cache,
+            &self.track,
+            self.quality.clone(),
+        )
+        .await;
         match resolved {
             Ok((url, fetched_at)) => {
                 log::info!(
@@ -2004,16 +2012,16 @@ impl LoadJob {
                         // 签名 URL 已过期 —— 作废缓存重取一次再打开，仍失败才算真失败
                         log::warn!("[queue] 打开音频流失败（{first_err}），作废缓存 URL 重取一次");
                         let key = PlayUrlCache::cache_key(
-                            &self.track.platform.to_string(),
+                            self.track.platform.as_str(),
                             &self.track.id,
-                            crate::quality_str(self.quality),
+                            crate::quality_str(&self.quality),
                         );
                         self.cache.invalidate(&key);
                         match crate::resolve_play_url_script(
                             &self.app,
                             &self.cache,
                             &self.track,
-                            self.quality,
+                            self.quality.clone(),
                         )
                         .await
                         {
@@ -2396,7 +2404,7 @@ mod duration_tests {
     fn track_with_duration(seconds: f64) -> Track {
         Track {
             id: "1".into(),
-            platform: SourceId::Kg,
+            platform: SourceId::new("kg"),
             title: "测试".into(),
             singer: "".into(),
             album: "".into(),

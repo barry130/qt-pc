@@ -205,7 +205,7 @@ mod tests {
         let tracks: Vec<Track> = (0..n)
             .map(|i| Track {
                 id: i.to_string(),
-                platform: crate::provider::types::SourceId::Wyy,
+                platform: crate::provider::types::SourceId::new("wyy"),
                 title: format!("t{i}"),
                 singer: String::new(),
                 album: String::new(),
@@ -301,7 +301,7 @@ mod tests {
     fn track_of(id: &str) -> Track {
         Track {
             id: id.to_string(),
-            platform: crate::provider::types::SourceId::Wyy,
+            platform: crate::provider::types::SourceId::new("wyy"),
             title: id.to_string(),
             singer: String::new(),
             album: String::new(),

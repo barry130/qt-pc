@@ -120,7 +120,7 @@ pub fn query_local_tracks(conn: &Connection) -> Result<Vec<Track>, rusqlite::Err
         let db_id: String = row.get(0)?;
         out.push(Track {
             id: strip_local_prefix(&db_id),
-            platform: SourceId::Local,
+            platform: SourceId::local(),
             title: row.get(1)?,
             singer: row.get(2)?,
             album: row.get(3)?,
@@ -181,7 +181,7 @@ pub fn query_missing_local_tracks(conn: &Connection) -> Result<Vec<Track>, rusql
         let db_id: String = row.get(0)?;
         out.push(Track {
             id: strip_local_prefix(&db_id),
-            platform: SourceId::Local,
+            platform: SourceId::local(),
             title: row.get(1)?,
             singer: row.get(2)?,
             album: row.get(3)?,

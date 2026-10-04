@@ -764,7 +764,7 @@ mod tests {
         assert_eq!(tracks.len(), 2);
         assert!(tracks
             .iter()
-            .all(|t| t.platform == crate::provider::types::SourceId::Local));
+            .all(|t| t.platform.is_local()));
         assert!(tracks.iter().all(|t| t.pic_url.is_empty()));
         assert!(tracks.iter().all(|t| t.music_id.is_none()));
         // id 必须是绝对路径，引擎直接拿它当播放路径用

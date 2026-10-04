@@ -9,7 +9,7 @@ use crate::audio::engine::AudioCmd;
 use crate::audio::fx::{EqParams, FadeParams, FxState};
 use crate::audio::state::PlayMode;
 use crate::download::{self, DownloadJob, DownloadManager, DownloadOutcome};
-use crate::provider::types::{Quality, SourceId, Track};
+use crate::provider::types::{Quality, Track};
 use crate::provider::url_cache::PlayUrlCache;
 use crate::provider::ProviderError;
 use crate::{quality_str, resolve_play_url_script};
@@ -146,9 +146,9 @@ pub async fn cmd_set_resolved_play_url(
         return Ok(());
     }
     let key = PlayUrlCache::cache_key(
-        &track.platform.to_string(),
+        track.platform.as_str(),
         &track.id,
-        crate::quality_str(quality),
+        crate::quality_str(&quality),
     );
     state.url_cache.set(key, url);
     Ok(())
@@ -179,9 +179,9 @@ pub async fn cmd_invalidate_play_url(
     quality: Quality,
 ) -> Result<(), String> {
     let key = crate::provider::url_cache::PlayUrlCache::cache_key(
-        &track.platform.to_string(),
+        track.platform.as_str(),
         &track.id,
-        quality_str(quality),
+        quality_str(&quality),
     );
     state.url_cache.invalidate(&key);
     Ok(())
@@ -381,8 +381,8 @@ pub async fn cmd_restore_last_session(
     let s = &session.state;
     let play_mode: PlayMode =
         serde_json::from_value(serde_json::json!(s.play_mode)).unwrap_or(PlayMode::ListLoop);
-    let quality: Quality =
-        serde_json::from_value(serde_json::json!(s.quality)).unwrap_or(Quality::High);
+    // 音质档位由音源包声明，宿主不再持有白名单：只拒绝读不出来的空值。
+    let quality: Quality = Quality::parse(&s.quality).unwrap_or_default();
     // 引擎应装上的那一曲（RestoreSession 处理完 track_id 就位）
     let expected_track = session.tracks.get(s.index).map(|t| t.id.clone());
     state.engine.send(AudioCmd::RestoreSession {
@@ -392,7 +392,7 @@ pub async fn cmd_restore_last_session(
         play_mode,
         volume: s.volume.clamp(0.0, 1.0),
         muted: s.muted,
-        quality: quality.into(),
+        quality,
     });
     // mpsc 是异步的：这里**立刻** snapshot 会拿到 track=null 的默认快照，
     // 前端拿它 applySnapshot 会把引擎刚推的带曲目事件盖掉 ——
@@ -2462,13 +2462,13 @@ pub async fn cmd_start_download(
     track: Track,
     quality: Quality,
 ) -> Result<String, String> {
-    if track.platform == SourceId::Local {
+    if track.platform.is_local() {
         return Err("本地歌曲无需下载".to_string());
     }
     let Some(db) = state.db.clone() else {
         return Err("数据库不可用".to_string());
     };
-    let q_str = quality_str(quality).to_string();
+    let q_str = quality_str(&quality).to_string();
 
     // 去重先查：命中就复用原任务（已完成也复用，避免重复占空间）
     let db_id = crate::db::store::db_track_id(&track);
@@ -2783,7 +2783,7 @@ async fn launch_download(
     dir: PathBuf,
     existing_part: Option<String>,
 ) -> Result<(), String> {
-    let (url, _) = resolve_play_url_script(&app, &url_cache, &track, quality)
+    let (url, _) = resolve_play_url_script(&app, &url_cache, &track, quality.clone())
         .await
         .map_err(|e| format!("取播放地址失败: {e}"))?;
 
@@ -2800,7 +2800,7 @@ async fn launch_download(
                 .flatten()
                 .unwrap_or_else(|| "artist".to_string());
             let final_path =
-                unique_download_path(&dir, &track, quality_str(quality), &url, &name_fmt);
+                unique_download_path(&dir, &track, quality_str(&quality), &url, &name_fmt);
             let part = download::part_path_for(&final_path);
             (final_path, part)
         }
@@ -2829,14 +2829,10 @@ async fn launch_download(
     Ok(())
 }
 
-/// 任务里存的音质字符串（"128" / "320" / "flac"）→ provider Quality。
+/// 任务里存的音质字符串（`"128"` / `"320"` / `"flac"` / 音源包声明的任意档位）
+/// → provider Quality。
 fn parse_provider_quality(s: &str) -> Option<Quality> {
-    match s {
-        "128" => Some(Quality::Standard),
-        "320" => Some(Quality::High),
-        "flac" => Some(Quality::Lossless),
-        _ => None,
-    }
+    Quality::parse(s)
 }
 
 // ---------- Astral 账号（DESIGN §2.3.4；接口契约同 qt-uniappx AccountApi） ----------
@@ -3846,7 +3842,7 @@ mod tests {
     fn sample_track() -> Track {
         Track {
             id: "1".to_string(),
-            platform: SourceId::Kw,
+            platform: SourceId::new("kw"),
             title: "晴天".to_string(),
             singer: "周杰伦".to_string(),
             album: String::new(),

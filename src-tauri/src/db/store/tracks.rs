@@ -12,12 +12,12 @@ use crate::provider::types::{SourceId, Track};
 // 跨域共享的小工具（`db_track_id` / `now_ms` / `track_from_row` / `LOCAL_PLATFORM` …）
 // 由 store/mod.rs 统一再导出，这里一次性引入，省得每个域各写一长串 use。
 use super::*;
-/// 本地歌单的平台标识。
-pub(crate) const LOCAL_PLATFORM: &str = "local";
+/// 本地歌单的平台标识（宿主唯一硬编码的音源值，见 `provider::types::LOCAL_SOURCE`）。
+pub(crate) const LOCAL_PLATFORM: &str = crate::provider::types::LOCAL_SOURCE;
 
 /// tracks 表主键口径：`platform:原始id`（跨音源唯一）。
 pub(crate) fn db_track_id(track: &Track) -> String {
-    format!("{}:{}", track.platform, track.id)
+    format!("{}:{}", track.platform.as_str(), track.id)
 }
 
 /// 从 db 主键拆回 (platform, 原始id)。解析失败返回 None（脏数据直接跳过）。
@@ -32,7 +32,7 @@ pub(crate) fn split_db_track_id(db_id: &str) -> Option<(SourceId, String)> {
 pub(crate) fn upsert_tracks(conn: &Connection, tracks: &[&Track]) -> Result<(), rusqlite::Error> {
     let now = now_ms();
     for t in tracks {
-        if t.platform == SourceId::Local {
+        if t.platform.is_local() {
             continue;
         }
         let duration_ms = (t.duration * 1000.0) as i64;
@@ -71,7 +71,11 @@ pub(crate) fn upsert_tracks(conn: &Connection, tracks: &[&Track]) -> Result<(), 
 
 /// 把查询行还原成 Track：列序固定为
 /// (sid, platform, name, singer, album, pic_url, duration_ms, music_id)。
-/// 认不出来的音源直接跳过（脏数据不拖垮整个列表）。
+///
+/// 音源包全面开放后宿主不再认识平台清单，所以这里几乎不再丢弃任何行 ——
+/// 只有「空平台」或「含 `:` 的平台」会被跳过（后者会拆坏 `platform:id` 主键，
+/// 见 `split_db_track_id`）。此前这里是**静默丢行**的根因：音源包新增平台后，
+/// 该平台的曲目会从所有列表里无声消失。
 pub(crate) fn track_from_row(row: &rusqlite::Row<'_>) -> Result<Option<Track>, rusqlite::Error> {
     let platform: String = row.get(1)?;
     let Some(platform) = SourceId::parse(&platform) else {

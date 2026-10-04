@@ -25,36 +25,13 @@ pub enum PlayMode {
     Random,
 }
 
-/// serde 值对齐前端/移动端 "128" / "320" / "flac"（DESIGN §7.2 注）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Quality {
-    #[serde(rename = "128")]
-    Standard,
-    #[serde(rename = "320")]
-    High,
-    #[serde(rename = "flac")]
-    Lossless,
-}
-
-impl From<crate::provider::types::Quality> for Quality {
-    fn from(q: crate::provider::types::Quality) -> Self {
-        match q {
-            crate::provider::types::Quality::Standard => Quality::Standard,
-            crate::provider::types::Quality::High => Quality::High,
-            crate::provider::types::Quality::Lossless => Quality::Lossless,
-        }
-    }
-}
-
-impl Quality {
-    pub fn into_provider(self) -> crate::provider::types::Quality {
-        match self {
-            Quality::Standard => crate::provider::types::Quality::Standard,
-            Quality::High => crate::provider::types::Quality::High,
-            Quality::Lossless => crate::provider::types::Quality::Lossless,
-        }
-    }
-}
+/// 音质档位（serde 值对齐前端/移动端的 "128" / "320" / "flac"，
+/// 以及音源包声明的任意档位）。
+///
+/// 这里**不再**有第二份 `Quality` 枚举（音源包全面开放）：档位清单由音源包
+/// 声明，宿主只透传字符串，所以 `audio::state::Quality` 直接复用 provider
+/// 的那一个类型，`From` / `into_provider` 两层转换随之删除。
+pub use crate::provider::types::Quality;
 
 /// 全量快照，字段与 DESIGN §7.2 一一对应。
 #[derive(Debug, Clone, Serialize)]
@@ -102,7 +79,7 @@ impl Default for PlaybackStateSnapshot {
             volume: 0.8,
             muted: false,
             play_mode: PlayMode::ListLoop,
-            quality: Quality::High,
+            quality: Quality::default(),
             queue_index: None,
             queue_len: 0,
             is_local: false,

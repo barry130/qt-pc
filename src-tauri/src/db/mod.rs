@@ -89,7 +89,7 @@ mod tests {
     fn track(id: &str, title: &str) -> Track {
         Track {
             id: id.into(),
-            platform: SourceId::Wyy,
+            platform: SourceId::new("wyy"),
             title: title.into(),
             singer: "歌手".into(),
             album: "专辑".into(),

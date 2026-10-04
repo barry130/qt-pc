@@ -4,6 +4,7 @@ import { Play } from "lucide-react";
 import type { SourceId, Track } from "@/types";
 import * as sourceApi from "@/source-scripts";
 import { usePlayerStore } from "@/stores/player";
+import { useSearchPageMax } from "@/stores/sourceRegistry";
 import { usePagedList } from "@/hooks/usePagedList";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { TrackList } from "./TrackList";
@@ -20,8 +21,9 @@ import { BackButton } from "@/components/layout/BackButton";
  * **进页一次拉完**（usePagedList 的 `all` 模式）：早先是滚动续页，短歌手页还行，
  * 长歌手要一直下拉；现在并发把所有页取完再一次性列出，滚动条即全量。
  *
- * 每页条数必须走 `SEARCH_PAGE_MAX`：上游上限各不相同（qq 要 100 会返回 0 条、
- * 酷狗恒给 30），传超限值会让「满页 = 还有下一页」的推断失效。
+ * 每页条数走数据包声明的 `searchPageMax`（useSearchPageMax）：上游上限各不相同
+ * （qq 要 100 会返回 0 条、酷狗恒给 30），传超限值会让「满页 = 还有下一页」
+ * 的推断失效。宿主不再内置这张表。
  */
 export function ArtistPage(): React.JSX.Element {
   const { platform, id } = useParams({ strict: false }) as {
@@ -31,7 +33,7 @@ export function ArtistPage(): React.JSX.Element {
   const name = safeDecode(id);
   const playQueue = usePlayerStore((s) => s.playQueue);
   const [avatar, setAvatar] = useState("");
-  const pageSize = sourceApi.SEARCH_PAGE_MAX[platform] ?? 50;
+  const pageSize = useSearchPageMax(platform);
 
   const fetchPage = useCallback(
     async (page: number): Promise<Track[]> => {
@@ -46,7 +48,9 @@ export function ArtistPage(): React.JSX.Element {
   const { items: songs, loading, error, progress, reload } = usePagedList<Track>({
     fetchPage,
     keyOf: (t) => `${t.platform}:${t.id}`,
-    resetKey: `${platform}:${name}`,
+    // pageSize 也进 resetKey：注册表是异步到达的，首帧可能还是兜底值 50，
+    // 包声明的真实上限到位后必须整页重拉，否则第一页条数与后续页不一致。
+    resetKey: `${platform}:${name}:${pageSize}`,
     pageSize,
     mode: "all",
     // 歌手歌曲最多几千首（100/页 → 几十页），上限只是防上游 total 撒谎时打转

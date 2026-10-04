@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { listen } from "@tauri-apps/api/event";
 import type { RegistryQuality, RegistrySource } from "@/types";
-import { getSourceRegistry } from "@/source-scripts";
+import { DEFAULT_SEARCH_PAGE_MAX, getSourceRegistry } from "@/source-scripts";
 import { onEnginePhaseChange } from "@/source-engine/client";
 import { useMusicSourceStore } from "@/stores/musicSource";
 
@@ -147,4 +147,23 @@ export function useSourceColor(id: string): string {
   return useSourceRegistryStore((s) =>
     s.sources.find((item) => item.id === id)?.color ?? (id === "local" ? "#8b93a7" : "#8b92a1"),
   );
+}
+
+/**
+ * 该音源的搜索类接口每页条数上限 —— 由数据包声明（包侧 platforms/*.ts 的
+ * searchPageMax 自述），宿主不再内置「哪个源最多几条」的清单。
+ *
+ * 详情页（歌手/专辑）用它当每页条数：上游对超限请求的处理各不相同
+ * （qq 要 100 会返回 0 条、酷狗恒给 30），而 usePagedList 靠
+ * 「本页条数 === 请求条数」判断还有没有下一页，所以这个值必须等于上游真实上限。
+ * 注册表未就绪/旧版包未声明时退回 DEFAULT_SEARCH_PAGE_MAX。
+ */
+export function useSearchPageMax(id: string): number {
+  return useSourceRegistryStore((s) => {
+    if (id === "local") return DEFAULT_SEARCH_PAGE_MAX;
+    const declared = s.sources.find((item) => item.id === id)?.searchPageMax;
+    return typeof declared === "number" && Number.isFinite(declared) && declared > 0
+      ? Math.floor(declared)
+      : DEFAULT_SEARCH_PAGE_MAX;
+  });
 }

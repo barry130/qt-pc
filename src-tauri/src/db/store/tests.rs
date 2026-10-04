@@ -18,7 +18,7 @@ fn test_conn() -> Connection {
 fn track(id: &str, title: &str) -> Track {
     Track {
         id: id.to_string(),
-        platform: SourceId::Wyy,
+        platform: SourceId::new("wyy"),
         title: title.to_string(),
         singer: "测试歌手".to_string(),
         album: "测试专辑".to_string(),
@@ -361,12 +361,12 @@ fn history_limit_and_untracked_local_track() {
     // 本地曲目若未被扫描入库（tracks 无行、外键指向不存在），记历史应静默跳过
     let local = Track {
         id: "D:\\no-such-file.mp3".to_string(),
-        platform: SourceId::Local,
+        platform: SourceId::local(),
         ..track("local-1", "本地")
     };
     record_play_history(&conn, &local).expect("本地未入库时不应报错");
     let items = list_play_history(&conn, 0).expect("list");
-    assert!(items.iter().all(|it| it.track.platform != SourceId::Local));
+    assert!(items.iter().all(|it| !it.track.platform.is_local()));
 }
 
 /// 我的歌单：创建 / 加歌去重 / 顺序 / 移除 / 重命名 / 删除（DESIGN §5.3）
@@ -592,7 +592,7 @@ fn play_stats_skips_local_track_missing_from_library() {
     let conn = test_conn();
     let local = Track {
         id: "D:/music/未知.mp3".to_string(),
-        platform: SourceId::Local,
+        platform: SourceId::local(),
         title: "本地歌".to_string(),
         singer: String::new(),
         album: String::new(),
@@ -612,7 +612,7 @@ fn lists_keep_track_cover_url() {
     let conn = test_conn();
     let t = Track {
         id: "1001".to_string(),
-        platform: SourceId::Wyy,
+        platform: SourceId::new("wyy"),
         title: "晴天".to_string(),
         singer: "测试歌手".to_string(),
         album: "测试专辑".to_string(),
@@ -666,7 +666,7 @@ fn foreign_local_song_lands_in_liked_playlist() {
     // 手机端本地曲目的 id 形态（Android MediaStore id），且 pid 指向「我喜欢的歌曲」
     let phone_local = Track {
         id: "local_12345".to_string(),
-        platform: SourceId::Local,
+        platform: SourceId::local(),
         title: "人生路慢慢".to_string(),
         singer: "某某".to_string(),
         album: "某专辑".to_string(),
@@ -682,14 +682,14 @@ fn foreign_local_song_lands_in_liked_playlist() {
     assert_eq!(db_id, "local:local_12345");
     assert_eq!(
         split_db_track_id(&db_id),
-        Some((SourceId::Local, "local_12345".to_string()))
+        Some((SourceId::local(), "local_12345".to_string()))
     );
 
     // 歌单查询（PC「我喜欢的歌曲」页走的就是这条）必须能查到
     let songs = get_playlist_tracks(&conn, LOCAL_PLATFORM).expect("歌单曲目");
     assert_eq!(songs.len(), 1, "手机端收藏的本地歌应出现在我喜欢的歌曲里");
     assert_eq!(songs[0].title, "人生路慢慢");
-    assert_eq!(songs[0].platform, SourceId::Local);
+    assert!(songs[0].platform.is_local());
 
     // 收藏列表（按 pid）同样要带上它
     assert_eq!(

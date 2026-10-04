@@ -12,11 +12,25 @@
  * uniappx 接入时直接 import 本文件，禁止两端各写一份。
  */
 
-/** 平台：沿用两端现有取值（qt-pc SourceId / qt-uniappx Source 同源），零映射成本 */
-export type Source = "wyy" | "qq" | "kw" | "kg";
+/**
+ * 平台 id。**在线音源是开放字符串**：清单由数据包注册表声明
+ * （qt-sources/src/registry.ts 的 SOURCES），宿主不持有任何白名单——
+ * 新增/下线一个平台只改音源包，两端宿主无需发版。
+ *
+ * 唯一保留值是 `local`（本地曲库）：它不走任何在线接口，由宿主硬编码实现，
+ * 且**绝不允许出现在音源包注册表里**（包侧 platformModuleOf 对它返回 null）。
+ */
+export type Source = string;
 
-/** 音质：两端现值同口径（"128"/"320"/"flac"） */
-export type Quality = "128" | "320" | "flac";
+/** 本地曲库的保留源 id（宿主硬编码；与 Rust 的 provider::types::LOCAL_SOURCE 同值） */
+export const LOCAL_SOURCE = "local";
+
+/**
+ * 音质档位 id。同样是开放字符串：档位清单由音源包注册表声明
+ * （qt-sources/src/registry.ts 的 QUALITIES），宿主只做形状校验。
+ * 想在包里新增一档（如 "hires"）只需在包内加一行，两端宿主菜单自动出现。
+ */
+export type Quality = string;
 
 /** 曲目：qt-pc Track / qt-uniappx Song 的公共超集（两端各写少量字段映射） */
 export interface MusicInfo {

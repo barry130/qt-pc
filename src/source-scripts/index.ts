@@ -277,29 +277,42 @@ export async function getAlbumDetail(
 }
 
 /**
- * 搜索类接口的每页条数上限（2026-09-22 实测）。
+ * 搜索类接口的每页条数上限 —— **由音源包声明，宿主不再持有清单**。
  *
- * 上游对超限请求的处理方式完全不同，必须按音源取真实上限，
- * 「满页 = 还有下一页」的推断才成立（否则详情页会少一大截或一页不返回）：
- * - kw ：rn 无 100 上限（50/100/200 都给满）
- * - qq ：n=50 正常，n≥100 **返回 0 条**（接口当参数错误，不是空结果）
- * - kg ：pagesize 恒被截成 30（要 50/100/200 都只给 30）
- * - wyy：limit=100 正常，limit=200 **返回 0 条**
+ * 上游对超限请求的处理方式完全不同，必须按音源取真实上限，「满页 = 还有下一页」
+ * 的推断才成立（否则详情页会少一大截或一页不返回）。历史上这张表写死在宿主：
+ *   kw 100 / qq 50 / kg 30 / wyy 100（2026-09-22 实测：qq n≥100 返回 0 条、
+ *   kg pagesize 恒截成 30、wyy limit=200 返回 0 条）。
+ * 2026-10 全开放改造后，上限搬到包侧 platforms/*.ts 的 `searchPageMax` 自述，
+ * 经 `sourceRegistry` 入口下发；新增音源只需在包里声明，宿主自动跟随。
  *
- * 本地源（local）不走这些网络接口，取 50 兜底。
+ * 未声明（旧版数据包 / 引擎未就绪）时按 DEFAULT_SEARCH_PAGE_MAX 兜底；
+ * 本地源不走网络接口，同样取兜底值。
  */
-export const SEARCH_PAGE_MAX: Record<SourceId, number> = {
-  kw: 100,
-  qq: 50,
-  kg: 30,
-  wyy: 100,
-  local: 50,
-};
+export const DEFAULT_SEARCH_PAGE_MAX = 50;
+
+/** 注册表快照：getSourceRegistry 成功后写入，供同步读取每源能力自述（clamp 用）。
+ *  取失败时**保留上一次**——引擎重启窗口期沿用旧值比退回兜底更接近真实上限。 */
+let registrySnapshot: SourceRegistry | null = null;
+
+/** 该音源的每页条数上限（包侧声明 → 快照读取；未声明走兜底） */
+export function searchPageMaxOf(source: SourceId): number {
+  if (source === "local") return DEFAULT_SEARCH_PAGE_MAX;
+  const declared = registrySnapshot?.sources.find((s) => s.id === source)?.searchPageMax;
+  return typeof declared === "number" && Number.isFinite(declared) && declared > 0
+    ? Math.floor(declared)
+    : DEFAULT_SEARCH_PAGE_MAX;
+}
+
+/** 该音源的 latest() 是否透传 offset（包侧声明 → 快照读取；未声明按不透传） */
+export function latestUsesOffsetOf(source: SourceId): boolean {
+  return registrySnapshot?.sources.find((s) => s.id === source)?.latestUsesOffset === true;
+}
 
 /** 把调用方要的每页条数收敛到该音源的真实上限 */
 export function clampSearchPageSize(source: SourceId, size: number): number {
-  const max = SEARCH_PAGE_MAX[source];
-  return max != null && size > max ? max : size;
+  const max = searchPageMaxOf(source);
+  return size > max ? max : size;
 }
 
 /**
@@ -308,7 +321,7 @@ export function clampSearchPageSize(source: SourceId, size: number): number {
  * 音源侧没有「按歌手 id 取歌」的免费接口，包里是**按歌手名搜索**；
  * 第一页顺带返回歌手头像 picUrl（包内只查第一页）。
  * 调用方必须翻页 —— 只取第一页会永远只有一页的量（曾写死 50 首）；
- * 且必须用 `SEARCH_PAGE_MAX` 里的每页上限，传超限值会静默截断甚至返回空。
+ * 且必须用 `searchPageMaxOf` 给出的每页上限，传超限值会静默截断甚至返回空。
  */
 export async function getArtistSongs(
   source: SourceId,
@@ -528,7 +541,7 @@ export async function getLatestSongs(
  */
 export async function getSourceRegistry(): Promise<SourceRegistry | null> {
   try {
-    return await sourceCall<SourceRegistry>("sourceRegistry", {}, (p) => {
+    const registry = await sourceCall<SourceRegistry>("sourceRegistry", {}, (p) => {
       const sources = p.sources;
       const qualities = p.qualities;
       if (!Array.isArray(sources) || !Array.isArray(qualities)) return undefined;
@@ -547,6 +560,10 @@ export async function getSourceRegistry(): Promise<SourceRegistry | null> {
       if (!srcOk || !qOk || sources.length === 0) return undefined;
       return { sources: sources as SourceRegistry["sources"], qualities: qualities as SourceRegistry["qualities"] };
     });
+    // 能力自述（每页上限 / 是否透传 offset）靠这份快照同步读取：
+    // clampSearchPageSize / latestUsesOffsetOf 是同步 API，不能 await。
+    if (registry !== null) registrySnapshot = registry;
+    return registry;
   } catch {
     // 引擎启动中 / 入口不存在（旧版数据包）：不算错误，交给上层重试
     return null;
@@ -565,8 +582,8 @@ export async function getAllLatestSongs(
 ): Promise<Track[]> {
   // 不走 bundle 的 allLatest 入口：它返回的 MusicInfo 不带 platform，多源混批后
   // 无法归属（取链依赖 platform），安卓端同样绕过它。这里逐源调 latest 入口，
-  // 交错合并在宿主侧做（与蓝本同口径：wyy/kg 带 offset，单源失败跳过）。
-  // 源清单来自数据包注册表——包里少了谁，这里就少拉谁。
+  // 交错合并在宿主侧做（与蓝本同口径：只有自述支持翻页的源才透传 offset，
+  // 单源失败跳过）。源清单与「谁支持翻页」都来自数据包注册表。
   const registry = await getSourceRegistry();
   const sources: SourceId[] = (registry?.sources ?? [])
     .map((s) => s.id)
@@ -575,7 +592,9 @@ export async function getAllLatestSongs(
   const perSource = Math.ceil(limit / sources.length) + 1;
   const batches = await Promise.all(
     sources.map(async (source) => {
-      const pageOffset = source === "wyy" || source === "kg" ? offset : 0;
+      // 早期写死 `source === "wyy" || source === "kg"`；现在读包侧自述
+      // （platforms/*.ts 的 latestUsesOffset），新增源在包里声明即可。
+      const pageOffset = latestUsesOffsetOf(source) ? offset : 0;
       try {
         return {
           source,

@@ -34,7 +34,7 @@ use std::sync::Arc;
 use audio::engine::AudioEngine;
 use commands::*;
 use db::Database;
-use provider::types::{Quality, SourceId, Track};
+use provider::types::{Quality, Track};
 use provider::url_cache::PlayUrlCache;
 use provider::ProviderError;
 use tauri::{Emitter, Manager};
@@ -72,7 +72,7 @@ pub(crate) async fn resolve_play_url_script(
     track: &Track,
     quality: Quality,
 ) -> CmdResult<(String, u64)> {
-    let key = PlayUrlCache::cache_key(&track.platform.to_string(), &track.id, quality_str(quality));
+    let key = PlayUrlCache::cache_key(track.platform.as_str(), &track.id, quality_str(&quality));
     if let Some((url, fetched_at)) = cache.get(&key) {
         return Ok((url, fetched_at));
     }
@@ -87,12 +87,8 @@ pub(crate) async fn resolve_play_url_script(
     Ok((url, fetched_at))
 }
 
-pub(crate) fn quality_str(q: Quality) -> &'static str {
-    match q {
-        Quality::Standard => "128",
-        Quality::High => "320",
-        Quality::Lossless => "flac",
-    }
+pub(crate) fn quality_str(q: &Quality) -> &str {
+    q.as_str()
 }
 
 // ---------- 组装 ----------
@@ -436,18 +432,4 @@ pub fn run() {
         ]))
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
-}
-
-/// SourceId 用于缓存键时的字符串化（保持 wyy/qq/kw/kg）
-impl std::fmt::Display for SourceId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            SourceId::Wyy => "wyy",
-            SourceId::Qq => "qq",
-            SourceId::Kw => "kw",
-            SourceId::Kg => "kg",
-            SourceId::Local => "local",
-        };
-        f.write_str(s)
-    }
 }

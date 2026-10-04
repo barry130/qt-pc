@@ -413,8 +413,8 @@ export async function resetDownloadDir(): Promise<string> {
 /** 默认下载音质（settings 表 downloadQuality，缺省 320） */
 export async function getDownloadQuality(): Promise<Quality> {
   const v = await getSetting(DOWNLOAD_QUALITY_KEY);
-  // 口径见 lib/quality.ts 的 isQuality：菜单档位由数据包注册表声明，
-  // 但落库值必须是 Rust 可播的三档之一
+  // 口径见 lib/quality.ts 的 isQuality：档位清单由数据包注册表声明，
+  // 这里只拒空值（Rust 侧 Quality 已是开放字符串，包里声明什么就认什么）
   return isQuality(v) ? v : "320";
 }
 

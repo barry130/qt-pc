@@ -124,9 +124,9 @@ fn is_ready() -> bool {
 /// 单飞键：与播放地址缓存同口径（platform:trackId:quality）。
 /// 复用 `PlayUrlCache::cache_key` 是为了让"缓存未命中 → 问前端"和"同键合并"
 /// 永远是同一个键，改一处不会漏另一处。
-fn flight_key(track: &Track, quality: Quality) -> String {
+fn flight_key(track: &Track, quality: &Quality) -> String {
     crate::provider::url_cache::PlayUrlCache::cache_key(
-        &track.platform.to_string(),
+        track.platform.as_str(),
         &track.id,
         crate::quality_str(quality),
     )
@@ -255,7 +255,7 @@ pub async fn ask_frontend(app: &AppHandle, track: &Track, quality: Quality) -> A
         // 也不能计入熔断（否则冷启动弱网会一路熔断到停止自动切歌）。
         return AskOutcome::Stalled;
     }
-    let key = flight_key(track, quality);
+    let key = flight_key(track, &quality);
     let (tx, rx) = tokio::sync::oneshot::channel::<(String, bool)>();
     let (request_id, need_emit) = match register(key, tx) {
         Some(v) => v,

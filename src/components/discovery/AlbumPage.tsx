@@ -4,6 +4,7 @@ import { Play } from "lucide-react";
 import type { SourceId, Track } from "@/types";
 import * as sourceApi from "@/source-scripts";
 import { usePlayerStore } from "@/stores/player";
+import { useSearchPageMax } from "@/stores/sourceRegistry";
 import { usePagedList } from "@/hooks/usePagedList";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { TrackList } from "./TrackList";
@@ -18,8 +19,9 @@ import { BackButton } from "@/components/layout/BackButton";
  * 就退回展示搜索结果，不至于整页空白。
  *
  * **必须翻页**：接口一次只给一页，早先写死 page=1 + size=50，专辑永远只有 50 首。
- * 每页条数走 `SEARCH_PAGE_MAX`（上游上限各不相同：qq 要 100 会返回 0 条、
- * 酷狗恒给 30），传超限值会让「满页 = 还有下一页」的推断在第 1 页就误判到底。
+ * 每页条数走数据包声明的 `searchPageMax`（useSearchPageMax；上游上限各不相同：
+ * qq 要 100 会返回 0 条、酷狗恒给 30），传超限值会让「满页 = 还有下一页」的
+ * 推断在第 1 页就误判到底。宿主不再内置这张表。
  */
 export function AlbumPage(): React.JSX.Element {
   const { platform, id } = useParams({ strict: false }) as {
@@ -28,7 +30,7 @@ export function AlbumPage(): React.JSX.Element {
   };
   const name = safeDecode(id);
   const playQueue = usePlayerStore((s) => s.playQueue);
-  const pageSize = sourceApi.SEARCH_PAGE_MAX[platform] ?? 50;
+  const pageSize = useSearchPageMax(platform);
 
   // 是否按专辑名过滤在**第一页**定一次，后续页沿用同一判断：
   // 否则会出现「第 1 页全是搜索结果、第 2 页只剩匹配项」的前后不一致。
@@ -59,7 +61,10 @@ export function AlbumPage(): React.JSX.Element {
   } = usePagedList<Track>({
     fetchPage,
     keyOf: (t) => `${t.platform}:${t.id}`,
-    resetKey: `${platform}:${name}`,
+    // pageSize 也进 resetKey：注册表异步到达，首帧可能是兜底值 50，
+    // 包声明的真实上限到位后必须整页重拉（否则首页条数与后续页不一致，
+    // 且 useFilterRef 的「第一页定一次」判断会基于错误的分页粒度）。
+    resetKey: `${platform}:${name}:${pageSize}`,
     pageSize,
   });
 

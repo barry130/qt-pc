@@ -27,16 +27,21 @@ export interface QualityOption {
   short: string;
 }
 
-/** 可播音质口径：Rust serde 枚举只认 "128"/"320"/"flac"。数据包声明的新档位
- *  要等 Rust 侧扩展枚举后才会出现在菜单里（qualityOptionsFromRegistry 会过滤）；
- *  下线某档只需包里不再声明。 */
+/**
+ * 可播音质口径：**只做形状校验**（非空字符串）。
+ *
+ * 2026-10 全开放改造后，Rust 侧 `Quality` 已是开放 newtype 字符串
+ * （provider/types.rs），数据包声明什么档位就落库什么档位——这里不再持有
+ * "128"/"320"/"flac" 白名单，新增档位只改音源包即可。空值仍拒（DB/命令
+ * 层无法表达）。
+ */
 export function isQuality(v: unknown): v is Quality {
-  return v === "128" || v === "320" || v === "flac";
+  return typeof v === "string" && v.trim().length > 0;
 }
 
-/** 数据包注册表声明的档位 → 菜单选项：过滤到可播值（isQuality），名称按首个
- *  空格拆成「档名 + 短标」（包里是 “标准 128k” 这种写法）；全被过滤/未就绪时
- *  退回内置三档，注册表加载完成前菜单不至于空白。 */
+/** 数据包注册表声明的档位 → 菜单选项：名称按首个空格拆成「档名 + 短标」
+ *  （包里是 “标准 128k” 这种写法）；未就绪/为空时退回内置三档，
+ *  注册表加载完成前菜单不至于空白。 */
 export function qualityOptionsFromRegistry(qualities: RegistryQuality[]): QualityOption[] {
   const fromPack: QualityOption[] = [];
   for (const q of qualities) {
