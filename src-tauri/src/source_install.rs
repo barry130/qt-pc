@@ -2776,18 +2776,21 @@ mod tests {
             "play-e",
             "  装载失败：ReferenceError: x is not defined  ",
         );
-        let st = load_state(&dir);
-        let p = st.pack("play-e").unwrap();
-        assert_eq!(
-            p.last_error, "装载失败：ReferenceError: x is not defined",
-            "trim 后入库"
-        );
-        let stamped_at = p.last_error_at;
-        assert!(
-            stamped_at > 1_700_000_000_000,
-            "毫秒时间戳（unix 秒会是 10 位）"
-        );
-        drop(p);
+        // 用块作用域收束 p 对 st 的借用（原来写的是 drop(p)，但 p 是
+        // &SourcePackMeta，drop 一个引用是空操作，只会触发 dropping_references 警告）。
+        let stamped_at = {
+            let st = load_state(&dir);
+            let p = st.pack("play-e").unwrap();
+            assert_eq!(
+                p.last_error, "装载失败：ReferenceError: x is not defined",
+                "trim 后入库"
+            );
+            assert!(
+                p.last_error_at > 1_700_000_000_000,
+                "毫秒时间戳（unix 秒会是 10 位）"
+            );
+            p.last_error_at
+        };
         // 同一条失败不重复刷时间
         note_pack_error_at(&dir, "play-e", "装载失败：ReferenceError: x is not defined");
         let st = load_state(&dir);
