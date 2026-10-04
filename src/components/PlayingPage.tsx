@@ -141,7 +141,9 @@ export function PlayingPage(): React.JSX.Element {
 /** 黑胶唱片风格旋转封面（仅播放时旋转） */
 function VinylCover(props: { track: Track | null; playing: boolean }): React.JSX.Element {
   const { track, playing } = props;
-  const coverUrl = track ? qtresCoverUrl(track.picUrl) : null;
+  // 播放页封面最大显示 420px（clamp 上界），按 2× DPR 要 840 —— 传 900
+  // 让 Rust 侧向上游要这个尺寸，而不是把 1.9MB 原图整张拉下来
+  const coverUrl = track ? qtresCoverUrl(track.picUrl, 900) : null;
 
   return (
     <div className="relative">

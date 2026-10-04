@@ -101,8 +101,11 @@ export function formatTime(ms: number): string {
  * - Windows/WebView2 不认识自定义 scheme，必须用 http://qtres.localhost/<path>
  * - 其余平台为 qtres://localhost/<path>
  * Rust 侧 handle_qtres 对两种形式都用 uri().path() 解析，路径统一为 /cover/<base64url>。
+ *
+ * `px` 可选：目标边长（Rust 侧会按它向上游要缩略图，缺省 300 = 列表卡片 2×）。
+ * 播放页大图传 900。不传时不追加查询串，输出与旧版逐字节一致。
  */
-export function qtresCoverUrl(picUrl: string): string | null {
+export function qtresCoverUrl(picUrl: string, px?: number): string | null {
   if (!picUrl) return null;
   if (!/^https?:\/\//i.test(picUrl)) return null;
   try {
@@ -114,7 +117,8 @@ export function qtresCoverUrl(picUrl: string): string | null {
       .replace(/\+/g, "-")
       .replace(/\//g, "_")
       .replace(/=+$/, "");
-    const path = `cover/${b64}`;
+    const suffix = px ? `?w=${px}` : "";
+    const path = `cover/${b64}${suffix}`;
     if (typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent)) {
       return `http://qtres.localhost/${path}`;
     }
