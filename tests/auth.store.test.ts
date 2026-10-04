@@ -12,6 +12,11 @@ vi.mock("@/services/ipc", () => ({
   likePull: vi.fn(async () => ({ changes: [], maxSeq: 0 })),
   likePullAll: vi.fn(async () => ({ songs: [], playlists: [], maxSeq: 0 })),
   likeApply: vi.fn(async () => {}),
+  // syncLikesWithReconcile() 会先 await likeFlushPending() 再 pullLikes()。
+  // 漏了这两个 mock 的话它会抛 "No export is defined on the mock"，被
+  // .catch(() => {}) 吞掉，pullLikes() 整段静默跳过——测试照过但没覆盖到。
+  likeFlushPending: vi.fn(async () => 0),
+  likeReconcile: vi.fn(async () => 0),
 }));
 
 import * as ipc from "@/services/ipc";
