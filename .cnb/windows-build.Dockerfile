@@ -31,12 +31,27 @@ RUN node -v && npm -v && npm install -g pnpm@11.7.0 && pnpm --version
 # Debian 把 makensis 二进制放在 nsis、把 /usr/share/nsis 下的 Stubs/Plugins/Include
 # 放在 nsis-common，两个都显式装上（Ubuntu 通常 nsis 会依赖 nsis-common，Debian 这里不赌）。
 # Fedora 的 mingw64-nsis 是不完整的，不要用。
+#
+# 同时装 pkg-config 与 libayatana-appindicator3-dev：这是给 tauri-cli 自己用的
+# （不是给编译产物用的）。tauri-cli 源码 crates/tauri-cli/src/interface/rust.rs
+# 里 tauri_config_to_bundle_settings() 有一段 #[cfg(target_os = "linux")] ——
+# 判的是**宿主**平台，与目标 triple 无关：只要 app 开了 tray-icon feature
+# （本项目 src-tauri/Cargo.toml 正是 features = ["tray-icon"]），它就会跑
+# pkg-config --libs-only-L ayatana-appindicator3-0.1，找不到就退而查
+# appindicator3-0.1，再找不到直接 panic!("Can't detect any appindicator library")。
+# 换句话说：在 Linux 上交叉编译 Windows，也必须让宿主的 pkg-config 能查到这个库，
+# 否则 exe 都编完了还会在打包前崩掉。查出来的路径只用于填 deb/rpm/appimage 的
+# depends，对 NSIS 产物没有任何影响。设 TAURI_LINUX_AYATANA_APPINDICATOR=true
+# 也绕不开（那条分支同样要 expect 一次 get_library_path），所以只能装库。
 RUN apt-get update \
  && apt-get install -y --no-install-recommends nsis nsis-common \
+      pkg-config libayatana-appindicator3-dev \
  && rm -rf /var/lib/apt/lists/* \
  && makensis -VERSION \
  && ls /usr/share/nsis/Stubs | head -5 \
- && ls /usr/share/nsis/Plugins/x86-unicode | head -5
+ && ls /usr/share/nsis/Plugins/x86-unicode | head -5 \
+ && echo -n "pkg-config ayatana-appindicator3-0.1 -> " \
+ && pkg-config --libs-only-L ayatana-appindicator3-0.1
 
 # --- Rust 工具链：对齐 GitHub 侧的 stable，并补齐三个 Windows 目标 ---
 # tauri-cli 会先用 `rustup target list` 校验 --target，缺了会直接报
