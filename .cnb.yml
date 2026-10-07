@@ -260,11 +260,13 @@ ci-probe-x64:
             rustup target list --installed
             echo "--- nsis ---"
             makensis -VERSION
-            ls /usr/share/nsis/Stubs
-            ls /usr/share/nsis/Plugins/x86-unicode
-            echo "--- toolchain bins ---"
-            which clang clang-cl llvm-rc llvm-lib lld-link rc mt 2>&1 || true
-            ls -l /root/.cache/cargo-xwin/xwin 2>&1 || echo "(xwin cache 未预热，首次构建会下载)"
+            ls /usr/share/nsis/Stubs | head -3
+            ls /usr/share/nsis/Plugins/x86-unicode | head -3
+            echo "--- llvm 工具（找 mt.exe 替身用）---"
+            ls /usr/lib/llvm-*/bin/ 2>/dev/null | sort | head -60 || true
+            for t in llvm-mt llvm-cvtres llvm-rc clang-cl lld-link llvm-lib; do
+              printf '%-14s -> %s\n' "$t" "$(command -v $t || echo '(缺失)')"
+            done
         - name: 装依赖并构建前端
           script: |
             set -e
@@ -282,6 +284,19 @@ ci-probe-x64:
             CARGO_TARGET_DIR: /tmp/cargo-target/x64
           script: |
             set -e
+            # src-tauri/build.rs 用 /MANIFEST:EMBED + /MANIFESTINPUT 嵌入
+            # windows-app-manifest.xml（comctl32 v6 依赖，缺了 TaskDialogIndirect
+            # 会在启动时 STATUS_ENTRYPOINT_NOT_FOUND）。lld 处理 /MANIFESTINPUT
+            # 时会去 PATH 找 Windows 的 mt.exe，Linux 上当然没有。
+            # LLVM 自带的 llvm-mt / llvm-cvtres 就是 mt.exe / cvtres.exe 的
+            # 跨平台替身，链接成 Windows 名字即可让 lld 找到。
+            MT="$(command -v llvm-mt || true)"
+            CV="$(command -v llvm-cvtres || true)"
+            echo "llvm-mt=$MT  llvm-cvtres=$CV"
+            if [ -n "$MT" ]; then ln -sf "$MT" /usr/local/bin/mt.exe; fi
+            if [ -n "$CV" ]; then ln -sf "$CV" /usr/local/bin/cvtres.exe; fi
+            command -v mt.exe || echo "警告：没有 mt.exe 替身，链接期会失败"
+            command -v cvtres.exe || echo "警告：没有 cvtres.exe 替身"
             pnpm exec tauri build \
               --runner cargo-xwin \
               --target "$QT_TARGET" \
