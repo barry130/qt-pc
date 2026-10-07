@@ -1,0 +1,217 @@
+# 轻听（qt-pc）CNB 流水线
+#
+# 两条流水线：
+#   1) master 分支 push  → 前端静态检查（typecheck / 单测 / 前端产物）
+#   2) v* tag push       → 在 Linux 构建节点上交叉编译出 x64 / x86 / ARM64 三个
+#                          Windows NSIS 安装包，签名后发布到 CNB Release
+#
+# 为什么走 Linux 交叉编译
+# ----------------------
+# CNB 的 SaaS 托管节点只有 Linux（cnb:arch:amd64 / arm64），没有 Windows 托管节点，
+# 自托管 Windows Runner 需要组织侧开通。Tauri 官方支持在 Linux 上用 cargo-xwin 打
+# NSIS 安装包（bundler 源码注释原话："NSIS installers can be built in linux+macOS
+# using cargo-xwin"），所以这里用自定义镜像 .cnb/windows-build.Dockerfile：
+#   FROM messense/cargo-xwin:0.23.1  +  Node 22  +  pnpm  +  nsis  +  三个 rust target
+# MSI/WiX 在 Linux 上无法构建（bundler 里那段是 #[cfg(target_os = "windows")]），
+# 因此这里只出 NSIS —— 与仓库原本 bundle.targets: ["nsis"] 一致。
+#
+# 一次性准备（需要在 CNB 网页上做，本机令牌没有建仓库权限）
+# ----------------------------------------------------------
+#   1. 在组织 canace 下新建【密钥仓库】qt-secrets（类型选“密钥仓库”，不要建普通仓库）；
+#   2. 在里面新建 qt-pc.env.yml，内容：
+#        allow_slugs: [canace/qt-pc]
+#        allow_events: [tag_push]
+#        QT_UPDATE_SIGNING_KEY: <F:\qtMusic\qt-pc\.signing\ed25519.key 的 base64>
+#      取 base64：powershell 里
+#        [Convert]::ToBase64String([IO.File]::ReadAllBytes("F:\qtMusic\qt-pc\.signing\ed25519.key"))
+#      这个私钥对应的公钥必须等于 src-tauri/src/astral.rs 的 UPDATE_SIGN_PUBKEY_B64
+#      （"i6+KDVw2olPXumy/qlc9004hhQKMffU/6aUPtcugUCg="），否则应用内更新会验签失败。
+#   3. 仓库「设置」里确认已勾选「允许自动触发（云原生构建）」。
+#
+# 发布产物（每个都有同名 .sig，必须一起下载）
+#   QuietMusic_<version>_x64-setup.exe
+#   QuietMusic_<version>_x86-setup.exe
+#   QuietMusic_<version>_arm64-setup.exe
+
+# 复用片段：三个架构 job 只有 target/arch/xwin 三个环境变量不同。
+# 注意 YAML 的 `<<:` 合并键是浅合并，job 自己写了的键会整体覆盖锚点里的同名键，
+# 所以下面每个 job 都完整重写 env（不能指望锚点里的 env 被继承合并）。
+.arch-job: &arch-job
+  script: |
+    set -e
+    echo "==> 构建 $QT_ARCH ($QT_TARGET)"
+    pnpm exec tauri build \
+      --runner cargo-xwin \
+      --target "$QT_TARGET" \
+      --bundles nsis \
+      --config '{"build":{"beforeBuildCommand":""}}'
+    OUT="$CARGO_TARGET_DIR/$QT_TARGET/release/bundle/nsis"
+    ls -l "$OUT"
+    # 直接平铺到 artifacts/，不要按架构分子目录：
+    # 产物名里已经带 _x64/_x86/_arm64，不会重名；而 cnbcool/attachments 上传后附件名
+    # 取的是相对路径，子目录会让 Release 里的资产名变成 "artifacts/x64/xxx.exe"，
+    # 下载直链和「安装包同名 .sig」的约定都会对不上。
+    mkdir -p artifacts
+    cp "$OUT"/*-setup.exe artifacts/
+    ls -l artifacts
+
+master:
+  push:
+    - name: 前端检查
+      runner:
+        tags: cnb:arch:amd64
+        cpus: 4
+      git:
+        lfs: false
+        submodules: false
+      docker:
+        image: node:22
+      ifNewBranch: true
+      ifModify:
+        - "src/**"
+        - "src-tauri/**"
+        - "index.html"
+        - "package.json"
+        - "pnpm-lock.yaml"
+        - "vite.config.ts"
+        - "tsconfig.json"
+        - "app.config.json"
+        - ".cnb.yml"
+      stages:
+        - name: 安装依赖
+          script: |
+            set -e
+            npm install -g pnpm@10.12.1
+            pnpm install --frozen-lockfile
+        - name: 类型检查与单测
+          script: |
+            set -e
+            pnpm typecheck
+            pnpm test
+        - name: 前端产物
+          script: |
+            set -e
+            pnpm build
+            ls -l dist
+
+v*:
+  tag_push:
+    - name: Windows 安装包（x64 / x86 / ARM64）
+      runner:
+        tags: cnb:arch:amd64
+        cpus: 8
+      git:
+        lfs: false
+        submodules: false
+      lock:
+        key: qt-pc-release
+        cancel-in-progress: true
+      docker:
+        build:
+          dockerfile: .cnb/windows-build.Dockerfile
+          by:
+            - .cnb/windows-build.Dockerfile
+          versionBy:
+            - .cnb/windows-build.Dockerfile
+      imports:
+        - https://cnb.cool/canace/qt-secrets/-/blob/main/qt-pc.env.yml
+      stages:
+        - name: 校验 tag 与版本号一致
+          script: |
+            set -e
+            TAG="${CNB_BRANCH#v}"
+            VER=$(node -e 'process.stdout.write(require("./app.config.json").version.name)')
+            echo "tag=$CNB_BRANCH  app.config.json version=$VER"
+            if [ "$TAG" != "$VER" ]; then
+              echo "::error::tag($TAG) 与 app.config.json version.name($VER) 不一致，先改版本号再打 tag"
+              exit 1
+            fi
+        - name: 安装依赖并构建前端
+          script: |
+            set -e
+            npm install -g pnpm@10.12.1
+            pnpm install --frozen-lockfile
+            # 三个架构共用这一份 dist（后续 job 用 --config 把 beforeBuildCommand 置空，
+            # 否则每个 job 都会重新跑一次 pnpm build 并争抢同一个 dist 目录）
+            pnpm build
+            test -f dist/index.html
+            echo "dist 就绪"
+
+        # 三个架构并行。每个 job 用独立的 CARGO_TARGET_DIR，避免共享 target 目录互相
+        # 抢 cargo 文件锁、也避免 NSIS 中间目录（<out>/nsis/<arch>）被并发清理。
+        # 放 /tmp 而不是工作区：每个 job 是独立容器，target 目录不必跨任务共享，
+        # 留在工作区只会把几百 MB 中间产物塞进共享目录。
+        - name: 交叉编译三个架构
+          jobs:
+            x64:
+              <<: *arch-job
+              name: x64
+              env:
+                CARGO_TERM_COLOR: always
+                RUST_BACKTRACE: "1"
+                QT_ARCH: x64
+                QT_TARGET: x86_64-pc-windows-msvc
+                XWIN_ARCH: x86_64
+                CARGO_TARGET_DIR: /tmp/cargo-target/x64
+            x86:
+              <<: *arch-job
+              name: x86
+              env:
+                CARGO_TERM_COLOR: always
+                RUST_BACKTRACE: "1"
+                QT_ARCH: x86
+                QT_TARGET: i686-pc-windows-msvc
+                XWIN_ARCH: x86
+                CARGO_TARGET_DIR: /tmp/cargo-target/x86
+            arm64:
+              <<: *arch-job
+              name: ARM64
+              env:
+                CARGO_TERM_COLOR: always
+                RUST_BACKTRACE: "1"
+                QT_ARCH: arm64
+                QT_TARGET: aarch64-pc-windows-msvc
+                XWIN_ARCH: aarch64
+                CARGO_TARGET_DIR: /tmp/cargo-target/arm64
+
+        - name: 签名安装包
+          script: |
+            set -e
+            if [ -z "$QT_UPDATE_SIGNING_KEY" ]; then
+              echo "::error::缺少 QT_UPDATE_SIGNING_KEY（密钥仓库 canace/qt-secrets 的 qt-pc.env.yml）"
+              exit 1
+            fi
+            mkdir -p .signing
+            printf '%s' "$QT_UPDATE_SIGNING_KEY" | base64 -d > .signing/ed25519.key
+            chmod 600 .signing/ed25519.key
+            ls -l artifacts/
+            for f in artifacts/*-setup.exe; do
+              node scripts/update-sign.mjs sign "$f"
+              node scripts/update-sign.mjs verify "$f"
+            done
+            ls -l artifacts/
+
+        - name: 生成 Release 描述
+          script: |
+            set -e
+            node .cnb/make-release-notes.mjs artifacts release-notes.md
+            cat release-notes.md
+
+        # git:release 不支持上传附件，附件交给下一步的 cnbcool/attachments
+        - name: 创建 CNB Release
+          type: git:release
+          options:
+            title: 轻听 $CNB_BRANCH
+            descriptionFromFile: release-notes.md
+            overlying: false
+            latest: "true"
+
+        - name: 上传安装包与签名文件
+          image: cnbcool/attachments:latest
+          settings:
+            type: UPLOAD
+            tag: $CNB_BRANCH
+            token: $CNB_TOKEN
+            attachments:
+              - "./artifacts/*-setup.exe"
+              - "./artifacts/*-setup.exe.sig"
