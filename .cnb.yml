@@ -150,42 +150,38 @@ v*:
             test -f dist/index.html
             echo "dist 就绪"
 
-        # 三个架构并行。每个 job 用独立的 CARGO_TARGET_DIR，避免共享 target 目录互相
-        # 抢 cargo 文件锁、也避免 NSIS 中间目录（<out>/nsis/<arch>）被并发清理。
-        # 放 /tmp 而不是工作区：每个 job 是独立容器，target 目录不必跨任务共享，
-        # 留在工作区只会把几百 MB 中间产物塞进共享目录。
-        - name: 交叉编译三个架构
-          jobs:
-            x64:
-              <<: *arch-job
-              name: x64
-              env:
-                CARGO_TERM_COLOR: always
-                RUST_BACKTRACE: "1"
-                QT_ARCH: x64
-                QT_TARGET: x86_64-pc-windows-msvc
-                XWIN_ARCH: x86_64
-                CARGO_TARGET_DIR: /tmp/cargo-target/x64
-            x86:
-              <<: *arch-job
-              name: x86
-              env:
-                CARGO_TERM_COLOR: always
-                RUST_BACKTRACE: "1"
-                QT_ARCH: x86
-                QT_TARGET: i686-pc-windows-msvc
-                XWIN_ARCH: x86
-                CARGO_TARGET_DIR: /tmp/cargo-target/x86
-            arm64:
-              <<: *arch-job
-              name: ARM64
-              env:
-                CARGO_TERM_COLOR: always
-                RUST_BACKTRACE: "1"
-                QT_ARCH: arm64
-                QT_TARGET: aarch64-pc-windows-msvc
-                XWIN_ARCH: aarch64
-                CARGO_TARGET_DIR: /tmp/cargo-target/arm64
+        # 三个架构**串行**执行，不要用 jobs 并行。三架构并行探针实测：三个 job 跑在
+        # 同一个流水线容器里，会同时往 /root/.cache/cargo-xwin 解包同一批 MSVC SDK
+        # 的 MSI，互相踩踏 —— 报 "Failed to setup MSVC CRT / unable to remove invalid
+        # unpack dir / failed to splat Win11SDK_10.0.26100_headers.msi"，还有一个 job
+        # 被 OOM 杀掉（exit 137）。串行后首个架构解包一次，后续架构直接复用缓存。
+        - name: 交叉编译 x64
+          <<: *arch-job
+          env:
+            CARGO_TERM_COLOR: always
+            RUST_BACKTRACE: "1"
+            QT_ARCH: x64
+            QT_TARGET: x86_64-pc-windows-msvc
+            XWIN_ARCH: x86_64
+            CARGO_TARGET_DIR: /tmp/cargo-target/x64
+        - name: 交叉编译 x86
+          <<: *arch-job
+          env:
+            CARGO_TERM_COLOR: always
+            RUST_BACKTRACE: "1"
+            QT_ARCH: x86
+            QT_TARGET: i686-pc-windows-msvc
+            XWIN_ARCH: x86
+            CARGO_TARGET_DIR: /tmp/cargo-target/x86
+        - name: 交叉编译 ARM64
+          <<: *arch-job
+          env:
+            CARGO_TERM_COLOR: always
+            RUST_BACKTRACE: "1"
+            QT_ARCH: arm64
+            QT_TARGET: aarch64-pc-windows-msvc
+            XWIN_ARCH: aarch64
+            CARGO_TARGET_DIR: /tmp/cargo-target/arm64
 
         - name: 签名安装包
           script: |
@@ -274,35 +270,31 @@ ci-probe-x64:
             pnpm build
             test -f dist/index.html
             echo "dist 就绪"
-        - name: 交叉编译三个架构
-          jobs:
-            x64:
-              <<: *arch-job
-              name: x64
-              env:
-                CARGO_TERM_COLOR: always
-                RUST_BACKTRACE: "1"
-                QT_ARCH: x64
-                QT_TARGET: x86_64-pc-windows-msvc
-                XWIN_ARCH: x86_64
-                CARGO_TARGET_DIR: /tmp/cargo-target/x64
-            x86:
-              <<: *arch-job
-              name: x86
-              env:
-                CARGO_TERM_COLOR: always
-                RUST_BACKTRACE: "1"
-                QT_ARCH: x86
-                QT_TARGET: i686-pc-windows-msvc
-                XWIN_ARCH: x86
-                CARGO_TARGET_DIR: /tmp/cargo-target/x86
-            arm64:
-              <<: *arch-job
-              name: ARM64
-              env:
-                CARGO_TERM_COLOR: always
-                RUST_BACKTRACE: "1"
-                QT_ARCH: arm64
-                QT_TARGET: aarch64-pc-windows-msvc
-                XWIN_ARCH: aarch64
-                CARGO_TARGET_DIR: /tmp/cargo-target/arm64
+        # 串行三架构（并行会争抢 cargo-xwin 缓存，见上面正式流水线的说明）
+        - name: 交叉编译 x64
+          <<: *arch-job
+          env:
+            CARGO_TERM_COLOR: always
+            RUST_BACKTRACE: "1"
+            QT_ARCH: x64
+            QT_TARGET: x86_64-pc-windows-msvc
+            XWIN_ARCH: x86_64
+            CARGO_TARGET_DIR: /tmp/cargo-target/x64
+        - name: 交叉编译 x86
+          <<: *arch-job
+          env:
+            CARGO_TERM_COLOR: always
+            RUST_BACKTRACE: "1"
+            QT_ARCH: x86
+            QT_TARGET: i686-pc-windows-msvc
+            XWIN_ARCH: x86
+            CARGO_TARGET_DIR: /tmp/cargo-target/x86
+        - name: 交叉编译 ARM64
+          <<: *arch-job
+          env:
+            CARGO_TERM_COLOR: always
+            RUST_BACKTRACE: "1"
+            QT_ARCH: arm64
+            QT_TARGET: aarch64-pc-windows-msvc
+            XWIN_ARCH: aarch64
+            CARGO_TARGET_DIR: /tmp/cargo-target/arm64
