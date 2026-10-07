@@ -43,13 +43,27 @@ RUN node -v && npm -v && npm install -g pnpm@11.7.0 && pnpm --version
 # 否则 exe 都编完了还会在打包前崩掉。查出来的路径只用于填 deb/rpm/appimage 的
 # depends，对 NSIS 产物没有任何影响。设 TAURI_LINUX_AYATANA_APPINDICATOR=true
 # 也绕不开（那条分支同样要 expect 一次 get_library_path），所以只能装库。
+#
+# 还要装 nasm：aws-lc-sys（Cargo.lock 里 aws-lc-rs 1.18.1 -> aws-lc-sys 0.45.0，
+# 由 rustls 一类依赖带进来）在 **x86** 目标上必须用真正的 NASM 汇编器 ——
+# 它的 builder/cc_builder/win_x86.rs 列了 13 个 .asm（chacha-x86 / aesni-x86 /
+# bn-586 / co-586 / ghash-x86 / md5-586 / sha1-586 / sha256-586 / sha512-586 /
+# vpaes-x86 ...）。它自带的 builder/prebuilt-nasm/ 里**只有 x86_64 的 .obj**
+# （aesni-x86_64.obj 等 26 个），所以 x86_64 能靠预编译对象过关，i686 不能：
+# 缺 nasm 时直接 `thread 'main' panicked at builder/nasm_builder.rs:137:13:
+# NASM command not found! Build cannot continue.`（第五次探针实测，x64 过、x86 挂）。
+# arm64 不需要 nasm：win_aarch64.rs 用的是 .S，交给 clang 汇编。
+# 装上 nasm 后 x86_64 也会改用真 nasm（不再走预编译对象），顺带让它能应用
+# size-optimized 的 OPENSSL_SMALL 定义 —— 那正是它自己在
+# "Prebuilt NASM objects cannot apply size-optimization definitions" 里提示的。
 RUN apt-get update \
  && apt-get install -y --no-install-recommends nsis nsis-common \
-      pkg-config libayatana-appindicator3-dev \
+      pkg-config libayatana-appindicator3-dev nasm \
  && rm -rf /var/lib/apt/lists/* \
  && makensis -VERSION \
  && ls /usr/share/nsis/Stubs | head -5 \
  && ls /usr/share/nsis/Plugins/x86-unicode | head -5 \
+ && nasm -v \
  && echo -n "pkg-config ayatana-appindicator3-0.1 -> " \
  && PKG_CONFIG_ALLOW_SYSTEM_LIBS=1 pkg-config --libs-only-L ayatana-appindicator3-0.1
 
