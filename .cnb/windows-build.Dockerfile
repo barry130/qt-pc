@@ -21,7 +21,7 @@ FROM messense/cargo-xwin:0.23.1
 COPY --from=node:22-trixie-slim /usr/local/bin /usr/local/bin
 COPY --from=node:22-trixie-slim /usr/local/lib/node_modules /usr/local/lib/node_modules
 COPY --from=node:22-trixie-slim /usr/local/include/node /usr/local/include/node
-RUN node -v && npm -v && npm install -g pnpm@10.12.1 && pnpm --version
+RUN node -v && npm -v && npm install -g pnpm@11.7.0 && pnpm --version
 
 # --- NSIS：必须是「完整」发行版 ---
 # Tauri 在非 Windows 上只会去 PATH 找 makensis，不会自己下载 NSIS 工具链

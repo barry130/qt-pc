@@ -40,11 +40,15 @@
   script: |
     set -e
     echo "==> 构建 $QT_ARCH ($QT_TARGET)"
+    # beforeBuildCommand 用一条无害命令覆盖，不要写成空串也不要删掉这个键：
+    # tauri-cli 只要该键有值就会真的去执行，空串交给 sh 的结果是失败；而保留
+    # 默认的 `pnpm build` 会让三个并行 job 同时往同一个 dist 目录写。
+    # dist 已在上一 stage 构建好，这里让它空跑即可。
     pnpm exec tauri build \
       --runner cargo-xwin \
       --target "$QT_TARGET" \
       --bundles nsis \
-      --config '{"build":{"beforeBuildCommand":""}}'
+      --config '{"build":{"beforeBuildCommand":"echo dist-already-built"}}'
     OUT="$CARGO_TARGET_DIR/$QT_TARGET/release/bundle/nsis"
     ls -l "$OUT"
     # 直接平铺到 artifacts/，不要按架构分子目录：
@@ -126,13 +130,22 @@ v*:
               echo "::error::tag($TAG) 与 app.config.json version.name($VER) 不一致，先改版本号再打 tag"
               exit 1
             fi
+            # 签名密钥要在最后一步才用上，但三个架构要编 30 分钟以上。
+            # 这里先预警，避免等构建全跑完才在「签名安装包」阶段看到失败。
+            if [ -z "$QT_UPDATE_SIGNING_KEY" ]; then
+              echo "::warning::QT_UPDATE_SIGNING_KEY 未注入 —— 本次会在「签名安装包」阶段失败"
+              echo "::warning::请在组织 canace 下建密钥仓库 qt-secrets，放 qt-pc.env.yml："
+              echo "::warning::    allow_slugs: [canace/qt-pc]"
+              echo "::warning::    allow_events: [tag_push]"
+              echo "::warning::    QT_UPDATE_SIGNING_KEY: <.signing/ed25519.key 的 base64>"
+            fi
         - name: 安装依赖并构建前端
           script: |
             set -e
             npm install -g pnpm@11.7.0
             pnpm install --frozen-lockfile
-            # 三个架构共用这一份 dist（后续 job 用 --config 把 beforeBuildCommand 置空，
-            # 否则每个 job 都会重新跑一次 pnpm build 并争抢同一个 dist 目录）
+            # 三个架构共用这一份 dist（后续 job 用 --config 把 beforeBuildCommand
+            # 改成空跑命令，否则每个 job 都会重新跑一次 pnpm build 并争抢同一个 dist）
             pnpm build
             test -f dist/index.html
             echo "dist 就绪"
