@@ -45,7 +45,7 @@
     # is_like_clang() 为 false，于是该分支恒触发），而 cargo-xwin 传进来的仍是
     # clang-cl 风格的 `/imsvc <dir>`；GNU clang 把 /imsvc 当输入文件，直接报
     # `clang: error: no such file or directory: '/imsvc'`。
-    # 这里用 .cnb/clang-shim.sh 做垫片（把 /imsvc 改写成 -isystem 后原样转发）。
+    # 这里用 .cnb/clang-shim.sh 做垫片：/imsvc 改写成 -isystem、/FI 改写成 -include 后转发。
     # 只在 aarch64 目标启用：x64/x86 走 clang-cl，与这条 bug 无关。
     case "$QT_TARGET" in
       aarch64-*)
@@ -357,7 +357,7 @@ ci-probe-x64:
                 install -D -m 0755 .cnb/clang-shim.sh /tmp/clang-shim/clang
                 export QT_REAL_CLANG
                 export PATH="/tmp/clang-shim:$PATH"
-                echo "==> clang 垫片已启用，转发到 $QT_REAL_CLANG"
+                echo "==> clang 垫片已启用，转发到 $QT_REAL_CLANG"; export QT_SHIM_LOG=/tmp/clang-shim.log; sh .cnb/diag-arm64.sh || true; trap 'echo "--- shim 日志：走 GNU 驱动的 .S 调用 ---"; grep -- "\.S" /tmp/clang-shim.log 2>/dev/null | head -20' EXIT
                 ;;
             esac
             # 放在函数里再于 if 条件中调用：set -e 在条件上下文里不生效，
