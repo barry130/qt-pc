@@ -57,7 +57,10 @@ fn attach_lyric_to_taskbar(win: &tauri::WebviewWindow) -> Result<(), String> {
         return Err("未找到 Windows 任务栏窗口".to_string());
     }
     unsafe {
-        SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, taskbar.0 as isize);
+        // windows 0.62 在 32 位下把 SetWindowLongPtrW re-export 成 SetWindowLongW，
+        // 参数是 i32 而非 isize；用 `as _` 让编译器按目标指针宽度推断（x64/arm64 推成
+        // isize，i686 推成 i32），否则 i686 交叉编译报 E0308。
+        SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, taskbar.0 as _);
     }
     force_windows_topmost(win)
 }

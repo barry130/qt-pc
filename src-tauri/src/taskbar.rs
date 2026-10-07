@@ -177,7 +177,10 @@ mod imp {
 
         // 换窗口过程以接收按钮点击；失败也不回滚按钮（点了没反应而已）
         let proc_ptr: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT = wnd_proc;
-        let old = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, proc_ptr as usize as isize);
+        // 同 lyric_window.rs：32 位下该函数是 SetWindowLongW 的 re-export，入参 i32、
+        // 返回 i32。入参用 `as _` 自适应宽度；返回值显式 `as isize` 归一化回
+        // OLD_PROC: AtomicIsize 与后面 transmute::<isize, _> 需要的类型。
+        let old = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, proc_ptr as usize as _) as isize;
         if old == 0 {
             log::warn!("[taskbar] 窗口过程替换失败，缩略图按钮点击不会生效");
         }
