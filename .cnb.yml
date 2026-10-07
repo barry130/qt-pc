@@ -172,6 +172,11 @@ v*:
             QT_ARCH: x86
             QT_TARGET: i686-pc-windows-msvc
             XWIN_ARCH: x86
+            # i686 必须显式补 SSE2：cc-rs 1.6.0 给 clang-cl 传的是短横线形式的 "-arch:SSE2"，
+            # 而 clang-cl 只认 /arch:SSE2；命令行里又带 -Wno-unused-command-line-argument，
+            # 于是该参数被静默丢弃，aws-lc-sys 的 internal.h 直接 #error "x86 assembly requires SSE2"。
+            # 两个写法都给：不被识别的那个会被 -Wno-unused-command-line-argument 忽略，不影响构建。
+            CFLAGS: "-msse2 /arch:SSE2"
             CARGO_TARGET_DIR: /tmp/cargo-target/x86
         - name: 交叉编译 ARM64
           <<: *arch-job
@@ -288,6 +293,11 @@ ci-probe-x64:
             QT_ARCH: x86
             QT_TARGET: i686-pc-windows-msvc
             XWIN_ARCH: x86
+            # i686 必须显式补 SSE2：cc-rs 1.6.0 给 clang-cl 传的是短横线形式的 "-arch:SSE2"，
+            # 而 clang-cl 只认 /arch:SSE2；命令行里又带 -Wno-unused-command-line-argument，
+            # 于是该参数被静默丢弃，aws-lc-sys 的 internal.h 直接 #error "x86 assembly requires SSE2"。
+            # 两个写法都给：不被识别的那个会被 -Wno-unused-command-line-argument 忽略，不影响构建。
+            CFLAGS: "-msse2 /arch:SSE2"
             CARGO_TARGET_DIR: /tmp/cargo-target/x86
         - name: 交叉编译 ARM64
           <<: *arch-job
