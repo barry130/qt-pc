@@ -51,7 +51,7 @@ RUN apt-get update \
  && ls /usr/share/nsis/Stubs | head -5 \
  && ls /usr/share/nsis/Plugins/x86-unicode | head -5 \
  && echo -n "pkg-config ayatana-appindicator3-0.1 -> " \
- && pkg-config --libs-only-L ayatana-appindicator3-0.1
+ && PKG_CONFIG_ALLOW_SYSTEM_LIBS=1 pkg-config --libs-only-L ayatana-appindicator3-0.1
 
 # --- Rust 工具链：对齐 GitHub 侧的 stable，并补齐三个 Windows 目标 ---
 # tauri-cli 会先用 `rustup target list` 校验 --target，缺了会直接报
@@ -64,6 +64,22 @@ RUN rustup update stable \
  && rustup component add llvm-tools-preview \
  && rustup target add x86_64-pc-windows-msvc i686-pc-windows-msvc aarch64-pc-windows-msvc \
  && rustc --version && rustup target list --installed
+
+# --- mt.exe / cvtres.exe 替身：lld 处理 /MANIFESTINPUT 时必须能调到 mt.exe ---
+# src-tauri/build.rs 对 windows 目标会输出
+#   cargo:rustc-link-arg=/MANIFEST:EMBED
+#   cargo:rustc-link-arg=/MANIFESTINPUT:<abs>/windows-app-manifest.xml
+# （为了声明 comctl32 v6 依赖，缺了 TaskDialogIndirect 会在启动时报
+#  STATUS_ENTRYPOINT_NOT_FOUND）。lld-link 自己会生成 manifest，但一旦出现
+# /MANIFESTINPUT（要合并外部 XML），它就改为去 PATH 里找 Windows 的 mt.exe，
+# 找不到直接 `lld-link: error: unable to find mt.exe in PATH`，整个链接失败
+# （已在第一次探针里实测复现）。
+# LLVM 自带的 llvm-mt / llvm-cvtres 就是这两个工具的跨平台替身，软链成 Windows
+# 名字即可让 lld 找到。debian trixie 的 llvm 包已提供，无需额外安装。
+RUN ln -sf "$(command -v llvm-mt)" /usr/local/bin/mt.exe \
+ && ln -sf "$(command -v llvm-cvtres)" /usr/local/bin/cvtres.exe \
+ && echo "mt.exe      -> $(command -v mt.exe)" \
+ && echo "cvtres.exe  -> $(command -v cvtres.exe)"
 
 # --- 预热 Tauri 的 NSIS 插件缓存 ---
 # tauri-bundler 无论宿主平台都会去 GitHub 下 nsis_tauri_utils.dll 放到

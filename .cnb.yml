@@ -230,11 +230,11 @@ v*:
               - "./artifacts/*-setup.exe.sig"
 
 # ===== 探针（ci-probe-x64 分支专用，验证完删除）=====
-# 只验证「自定义镜像 + cargo-xwin 交叉编译 x64」这条最贵的链路能否跑通，
+# 只验证「自定义镜像 + cargo-xwin 交叉编译三架构」这条最贵的链路能否跑通，
 # 不做签名、不发布 Release，因此不需要 qt-secrets 密钥仓库。
 ci-probe-x64:
   push:
-    - name: 探针 x64 交叉编译
+    - name: 探针 三架构交叉编译
       runner:
         tags: cnb:arch:amd64
         cpus: 8
@@ -274,32 +274,35 @@ ci-probe-x64:
             pnpm build
             test -f dist/index.html
             echo "dist 就绪"
-        - name: 交叉编译 x64
-          env:
-            CARGO_TERM_COLOR: always
-            RUST_BACKTRACE: "1"
-            QT_ARCH: x64
-            QT_TARGET: x86_64-pc-windows-msvc
-            XWIN_ARCH: x86_64
-            CARGO_TARGET_DIR: /tmp/cargo-target/x64
-          script: |
-            set -e
-            # src-tauri/build.rs 用 /MANIFEST:EMBED + /MANIFESTINPUT 嵌入
-            # windows-app-manifest.xml（comctl32 v6 依赖，缺了 TaskDialogIndirect
-            # 会在启动时 STATUS_ENTRYPOINT_NOT_FOUND）。lld 处理 /MANIFESTINPUT
-            # 时会去 PATH 找 Windows 的 mt.exe，Linux 上当然没有。
-            # LLVM 自带的 llvm-mt / llvm-cvtres 就是 mt.exe / cvtres.exe 的
-            # 跨平台替身，链接成 Windows 名字即可让 lld 找到。
-            MT="$(command -v llvm-mt || true)"
-            CV="$(command -v llvm-cvtres || true)"
-            echo "llvm-mt=$MT  llvm-cvtres=$CV"
-            if [ -n "$MT" ]; then ln -sf "$MT" /usr/local/bin/mt.exe; fi
-            if [ -n "$CV" ]; then ln -sf "$CV" /usr/local/bin/cvtres.exe; fi
-            command -v mt.exe || echo "警告：没有 mt.exe 替身，链接期会失败"
-            command -v cvtres.exe || echo "警告：没有 cvtres.exe 替身"
-            pnpm exec tauri build \
-              --runner cargo-xwin \
-              --target "$QT_TARGET" \
-              --bundles nsis \
-              --config '{"build":{"beforeBuildCommand":"echo dist-already-built"}}'
-            ls -l "$CARGO_TARGET_DIR/$QT_TARGET/release/bundle/nsis"
+        - name: 交叉编译三个架构
+          jobs:
+            x64:
+              <<: *arch-job
+              name: x64
+              env:
+                CARGO_TERM_COLOR: always
+                RUST_BACKTRACE: "1"
+                QT_ARCH: x64
+                QT_TARGET: x86_64-pc-windows-msvc
+                XWIN_ARCH: x86_64
+                CARGO_TARGET_DIR: /tmp/cargo-target/x64
+            x86:
+              <<: *arch-job
+              name: x86
+              env:
+                CARGO_TERM_COLOR: always
+                RUST_BACKTRACE: "1"
+                QT_ARCH: x86
+                QT_TARGET: i686-pc-windows-msvc
+                XWIN_ARCH: x86
+                CARGO_TARGET_DIR: /tmp/cargo-target/x86
+            arm64:
+              <<: *arch-job
+              name: ARM64
+              env:
+                CARGO_TERM_COLOR: always
+                RUST_BACKTRACE: "1"
+                QT_ARCH: arm64
+                QT_TARGET: aarch64-pc-windows-msvc
+                XWIN_ARCH: aarch64
+                CARGO_TARGET_DIR: /tmp/cargo-target/arm64
