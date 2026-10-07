@@ -81,7 +81,7 @@ master:
         - name: 安装依赖
           script: |
             set -e
-            npm install -g pnpm@10.12.1
+            npm install -g pnpm@11.7.0
             pnpm install --frozen-lockfile
         - name: 类型检查与单测
           script: |
@@ -129,7 +129,7 @@ v*:
         - name: 安装依赖并构建前端
           script: |
             set -e
-            npm install -g pnpm@10.12.1
+            npm install -g pnpm@11.7.0
             pnpm install --frozen-lockfile
             # 三个架构共用这一份 dist（后续 job 用 --config 把 beforeBuildCommand 置空，
             # 否则每个 job 都会重新跑一次 pnpm build 并争抢同一个 dist 目录）
