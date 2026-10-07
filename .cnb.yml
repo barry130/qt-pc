@@ -15,18 +15,18 @@
 # MSI/WiX 在 Linux 上无法构建（bundler 里那段是 #[cfg(target_os = "windows")]），
 # 因此这里只出 NSIS —— 与仓库原本 bundle.targets: ["nsis"] 一致。
 #
-# 一次性准备（需要在 CNB 网页上做，本机令牌没有建仓库权限）
-# ----------------------------------------------------------
-#   1. 在组织 canace 下新建【密钥仓库】qt-secrets（类型选“密钥仓库”，不要建普通仓库）；
-#   2. 在里面新建 qt-pc.env.yml，内容：
-#        allow_slugs: [canace/qt-pc]
-#        allow_events: [tag_push]
-#        QT_UPDATE_SIGNING_KEY: <F:\qtMusic\qt-pc\.signing\ed25519.key 的 base64>
-#      取 base64：powershell 里
+# 一次性准备（在 CNB 网页上做）
+# ----------------------------
+#   1. 仓库「设置」→「环境变量」里新增 QT_UPDATE_SIGNING_KEY（类型选密文）：
 #        [Convert]::ToBase64String([IO.File]::ReadAllBytes("F:\qtMusic\qt-pc\.signing\ed25519.key"))
 #      这个私钥对应的公钥必须等于 src-tauri/src/astral.rs 的 UPDATE_SIGN_PUBKEY_B64
 #      （"i6+KDVw2olPXumy/qlc9004hhQKMffU/6aUPtcugUCg="），否则应用内更新会验签失败。
-#   3. 仓库「设置」里确认已勾选「允许自动触发（云原生构建）」。
+#   2. 仓库「设置」里确认已勾选「允许自动触发（云原生构建）」，否则 tag push 不触发流水线。
+#
+# 触发方式
+# --------
+#   只有 tag push（v*）会跑发布流水线、产出安装包并挂到 CNB Release；
+#   普通分支 push 不构建安装包。
 #
 # 发布产物（每个都有同名 .sig，必须一起下载）
 #   QuietMusic_<version>_x64-setup.exe
@@ -45,16 +45,23 @@
     # is_like_clang() 为 false，于是该分支恒触发），而 cargo-xwin 传进来的仍是
     # clang-cl 风格的 `/imsvc <dir>`；GNU clang 把 /imsvc 当输入文件，直接报
     # `clang: error: no such file or directory: '/imsvc'`。
-    # 这里用 .cnb/clang-shim.sh 做垫片：/imsvc 改写成 -isystem、/FI 改写成 -include 后转发。
-    # 只在 aarch64 目标启用：x64/x86 走 clang-cl，与这条 bug 无关。
+    # 这里用 .cnb/clang-shim.sh 做垫片，把 clang-cl 方言的参数翻译成 GNU 驱动能懂的写法
+    # （/imsvc→-isystem、/FI→-include、-Od→-O0、-W4/-DYNAMICBASE 丢弃…，完整表见该脚本）。
+    # 必须同时装成 `clang` 和 `clang-cl` 两个名字：ring 走 `clang`，而 aws-lc-sys 的
+    # find_clang_cl() 会把 CC 设成 `clang-cl`（builder/cc_builder.rs:1103-1119），
+    # 只装 `clang` 截不到后者 —— 第七次探针实测：/FI 被改写成功了（说明部分调用走了
+    # 垫片），但 jitterentropy 那批 `clang-cl` 调用没走垫片，`-Od` 原样落到 GNU 驱动上
+    # 报 `error: invalid integral value 'd' in '-Od'`。
+    # 只在 aarch64 目标启用：x64/x86 走真 clang-cl，与这条 bug 无关。
     case "$QT_TARGET" in
       aarch64-*)
         QT_REAL_CLANG="$(command -v clang)"
         test -n "$QT_REAL_CLANG"
         install -D -m 0755 .cnb/clang-shim.sh /tmp/clang-shim/clang
+        install -D -m 0755 .cnb/clang-shim.sh /tmp/clang-shim/clang-cl
         export QT_REAL_CLANG
         export PATH="/tmp/clang-shim:$PATH"
-        echo "==> clang 垫片已启用，转发到 $QT_REAL_CLANG"
+        echo "==> clang 垫片已启用（clang + clang-cl），转发到 $QT_REAL_CLANG"
         ;;
     esac
     # beforeBuildCommand 用一条无害命令覆盖，不要写成空串也不要删掉这个键：
@@ -134,8 +141,6 @@ v*:
             - .cnb/windows-build.Dockerfile
           versionBy:
             - .cnb/windows-build.Dockerfile
-      imports:
-        - https://cnb.cool/canace/qt-secrets/-/blob/main/qt-pc.env.yml
       stages:
         - name: 校验 tag 与版本号一致
           script: |
@@ -151,10 +156,8 @@ v*:
             # 这里先预警，避免等构建全跑完才在「签名安装包」阶段看到失败。
             if [ -z "$QT_UPDATE_SIGNING_KEY" ]; then
               echo "::warning::QT_UPDATE_SIGNING_KEY 未注入 —— 本次会在「签名安装包」阶段失败"
-              echo "::warning::请在组织 canace 下建密钥仓库 qt-secrets，放 qt-pc.env.yml："
-              echo "::warning::    allow_slugs: [canace/qt-pc]"
-              echo "::warning::    allow_events: [tag_push]"
-              echo "::warning::    QT_UPDATE_SIGNING_KEY: <.signing/ed25519.key 的 base64>"
+              echo "::warning::请在仓库「设置」→「环境变量」里配置 QT_UPDATE_SIGNING_KEY"
+              echo "::warning::    值为本机 .signing/ed25519.key 的 base64"
             fi
         - name: 安装依赖并构建前端
           script: |
@@ -209,7 +212,7 @@ v*:
           script: |
             set -e
             if [ -z "$QT_UPDATE_SIGNING_KEY" ]; then
-              echo "::error::缺少 QT_UPDATE_SIGNING_KEY（密钥仓库 canace/qt-secrets 的 qt-pc.env.yml）"
+              echo "::error::缺少 QT_UPDATE_SIGNING_KEY（请在仓库「设置」→「环境变量」里配置）"
               exit 1
             fi
             mkdir -p .signing
@@ -249,7 +252,7 @@ v*:
 
 # ===== 探针（ci-probe-x64 分支专用，验证完删除）=====
 # 只验证「自定义镜像 + cargo-xwin 交叉编译三架构」这条最贵的链路能否跑通，
-# 不做签名、不发布 Release，因此不需要 qt-secrets 密钥仓库。
+# 不做签名、不发布 Release，因此不需要 QT_UPDATE_SIGNING_KEY。
 ci-probe-x64:
   push:
     - name: 探针 x86+ARM64 交叉编译
@@ -355,9 +358,10 @@ ci-probe-x64:
                 QT_REAL_CLANG="$(command -v clang)"
                 test -n "$QT_REAL_CLANG"
                 install -D -m 0755 .cnb/clang-shim.sh /tmp/clang-shim/clang
+                install -D -m 0755 .cnb/clang-shim.sh /tmp/clang-shim/clang-cl
                 export QT_REAL_CLANG
                 export PATH="/tmp/clang-shim:$PATH"
-                echo "==> clang 垫片已启用，转发到 $QT_REAL_CLANG"; export QT_SHIM_LOG=/tmp/clang-shim.log; sh .cnb/diag-arm64.sh || true; trap 'echo "--- shim 日志：走 GNU 驱动的 .S 调用 ---"; grep -- "\.S" /tmp/clang-shim.log 2>/dev/null | head -20' EXIT
+                echo "==> clang 垫片已启用（clang + clang-cl），转发到 $QT_REAL_CLANG"; export QT_SHIM_LOG=/tmp/clang-shim.log; sh .cnb/diag-arm64.sh || true; trap 'echo "--- shim 日志：走 GNU 驱动的 .S 调用 ---"; grep -- "\.S" /tmp/clang-shim.log 2>/dev/null | head -20' EXIT
                 ;;
             esac
             # 放在函数里再于 if 条件中调用：set -e 在条件上下文里不生效，
