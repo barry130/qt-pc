@@ -10,3 +10,8 @@
 *.woff2 binary
 *.ttf binary
 *.otf binary
+
+# CI 里会被 exec 的 shell 脚本必须保持 LF：
+# 本机 core.autocrlf=true，在 Windows 上 checkout 后若再提交就会把 CRLF 带进仓库，
+# 容器里执行时 shebang 变成 "#!/bin/sh\r" → bad interpreter。
+.cnb/*.sh text eol=lf
