@@ -7,16 +7,19 @@ Windows 桌面端轻量级**本地音乐播放器**。基于 **Tauri 2 + React 1
 ## 功能特性
 
 - **本地音乐库**：扫描本地目录，读取元数据（MP3 / FLAC / WAV / OGG / AAC / M4A），支持目录级管理——**开箱即用，无需任何音源包**
-- **可扩展在线试听**：通过「设置 → 音源包」从链接安装音源包（官方包支持自动更新；也可粘贴自定义直链），统一搜索、播放、歌词、歌单，跨源自动回退取址
+- **可扩展在线试听**：通过「设置 → 音源包」从链接安装音源包（官方包支持自动更新；也可粘贴自定义直链），统一搜索、播放、歌词、歌单，跨源自动回退取址，当前源不支持时自动换源匹配同一首歌
 - **音质切换**：128K / 320K / 无损（FLAC），播放与下载音质相互独立
+- **音效 DSP**：十段均衡器（±12dB 防削波，含预设）、响度归一化、淡入淡出，倍速播放（默认倍速全局记忆）
 - **在线播放**：HTTP Range 流式读取 + 边下边播，拖动进度条即时定位
-- **播放体验**：播放队列、四种播放模式（顺序 / 列表循环 / 单曲循环 / 随机）、音量与静音
-- **桌面歌词**：独立置顶歌词窗口，支持锁定 / 穿透与自定义样式
+- **播放体验**：播放队列、四种播放模式（顺序 / 列表循环 / 单曲循环 / 随机）、音量与静音、播放条工具按钮自定义
+- **桌面歌词**：独立置顶歌词窗口，支持锁定 / 穿透、快捷键呼出（Ctrl+Alt+K）与自定义样式，逐行 / 逐字同步
+- **系统集成**：Windows 系统媒体控制（SMTC，媒体键 / 蓝牙耳机按键）、任务栏缩略图播放控制按钮、托盘菜单、开机自启
+- **屏蔽规则**：按歌手 / 关键词屏蔽不喜欢的歌曲（歌名 / 歌手拆词匹配，与移动端同口径）
 - **下载管理**：无损 / 高音质下载，进度写库、任务列表、去重命名
-- **收藏与歌单**：与后端账号云同步，本地 / 在线歌单统一组织
-- **听歌统计**：播放次数、时长、热门曲目与歌手排行
-- **自动更新**：官方版本校验 + 加速节点下载 + MD5 校验
-- **外观与快捷键**：浅色 / 深色 / 跟随系统、封面色取色主题、全局快捷键
+- **收藏与歌单**：与后端账号云同步，本地 / 在线歌单统一组织，收藏「同名不同源」查重提示，歌单分享链接导入
+- **听歌统计**：播放次数、时长、热门曲目与歌手排行；分享卡片（歌曲 / 歌词卡片导出）
+- **自动更新**：官方版本校验 + 加速节点下载 + MD5 校验；首次启动引导页
+- **外观与快捷键**：浅色 / 深色 / 跟随系统、封面色取色主题、全局快捷键、缓存管理（上限与分项清理）
 
 ## 技术栈
 
@@ -84,7 +87,7 @@ pnpm config:check    # 只校验（已挂进 pnpm build / pnpm test：手改派�
 ## 测试
 
 ```bash
-# 前端（Vitest，20 个测试文件）
+# 前端（Vitest，40 个测试文件）
 pnpm test
 pnpm typecheck
 
@@ -116,23 +119,26 @@ pnpm build          # 仅前端产物（会先跑 config:sync）
 qt-pc/
 ├── app.config.json          # ★ 唯一配置源：版本号 / 产品名 / ID / 后端地址 / 端口 / 宿主契约版本
 ├── src/                     # 前端（React）
-│   ├── components/          # UI 组件：common / layout / discovery / library / lyric / mine / player / update …
+│   ├── components/          # UI 组件：common / layout / discovery / library / lyric / mine / music-source / notice / onboarding / player / update …
 │   │   └── common/ErrorBoundary.tsx  # 渲染异常兜底（路由级 + 常驻页级）
-│   ├── hooks/               # 位置插值、播放事件订阅、分页列表等
-│   ├── lib/                 # 工具：router / lazyPage（路由级代码分割）/ lrc / skins / storageKeys …
+│   ├── hooks/               # 位置插值、播放事件订阅、分页列表、歌词偏移等
+│   ├── lib/                 # 工具：router / lazyPage（路由级代码分割）/ lrc / skins / storageKeys / source-switch …
 │   ├── services/ipc.ts      # 所有 Tauri invoke 的唯一出口
 │   ├── source-scripts/      # 音源包宿主 facade：统一入口 / 命中线路记账 / 版本检查 / qt-contract（宿主契约）
 │   ├── source-engine/       # 引擎页客户端（跑音源包取链）
-│   ├── stores/              # Zustand：播放状态 / 队列 / 认证 / 外观
+│   ├── stores/              # Zustand：播放 / 队列 / 认证 / 外观 / 屏蔽规则 / 下载 / 数据包注册 …
 │   └── types/               # 与 Rust serde 模型一一对应的 TS 类型
 ├── src-tauri/               # Rust 后端
-│   ├── src/audio/           # 音频引擎（专属线程 + 命令通道）、队列、HTTP Range 读取
+│   ├── src/audio/           # 音频引擎（专属线程 + 命令通道）、DSP 音效、队列、HTTP Range 读取
 │   ├── src/provider/        # 音源类型 / 取址缓存（原生 Provider 已删除，取链走音源包线路）
 │   ├── src/db/              # SQLite 存储与迁移
 │   │   └── store/           # 存取层按域拆分：tracks / local / likes / playlists / history / stats / downloads / session / settings
 │   ├── src/app_config.rs    # 配置生成物（唯一读取入口，勿手改）
 │   ├── src/ipc_guard.rs     # 命令调用来源校验（危险命令只允许主窗口调用）
 │   ├── src/net_guard.rs     # 出网请求校验（scheme / 私网地址 / host 白名单）
+│   ├── src/smtc.rs          # Windows 系统媒体控制（SMTC）与硬件媒体键
+│   ├── src/taskbar.rs       # 任务栏缩略图工具栏（播放控制三按钮）
+│   ├── src/lyric_window.rs  # 桌面歌词窗口（动态创建 / 锁定穿透 / 位置校验）
 │   ├── src/commands.rs      # Tauri 命令层
 │   ├── src/source_engine_page.html  # 引擎页（装载 bundle、注入 request 与 chain overlay）
 │   └── tests/               # 集成测试（真实链路 live_astral + FLAC 定位回归 flac_seek）
