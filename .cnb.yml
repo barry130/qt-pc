@@ -17,7 +17,12 @@
 #
 # 一次性准备（在 CNB 网页上做）
 # ----------------------------
-#   1. 仓库「设置」→「环境变量」里新增 QT_UPDATE_SIGNING_KEY（类型选密文）：
+#   1. 组织 canace 下的密钥仓库 qt-secrets 里放 qt-pc.env.yml，发布流水线通过下面的
+#      imports: 引用它，把 QT_UPDATE_SIGNING_KEY 注入构建环境。该文件内容：
+#        allow_slugs: [- canace/qt-pc]
+#        allow_events: [- tag_push]
+#        QT_UPDATE_SIGNING_KEY: <本机 .signing/ed25519.key 的 base64>
+#      取 base64：
 #        [Convert]::ToBase64String([IO.File]::ReadAllBytes("F:\qtMusic\qt-pc\.signing\ed25519.key"))
 #      这个私钥对应的公钥必须等于 src-tauri/src/astral.rs 的 UPDATE_SIGN_PUBKEY_B64
 #      （"i6+KDVw2olPXumy/qlc9004hhQKMffU/6aUPtcugUCg="），否则应用内更新会验签失败。
@@ -141,6 +146,8 @@ v*:
             - .cnb/windows-build.Dockerfile
           versionBy:
             - .cnb/windows-build.Dockerfile
+      imports:
+        - https://cnb.cool/canace/qt-secrets/-/blob/main/qt-pc.env.yml
       stages:
         - name: 校验 tag 与版本号一致
           script: |
@@ -156,7 +163,7 @@ v*:
             # 这里先预警，避免等构建全跑完才在「签名安装包」阶段看到失败。
             if [ -z "$QT_UPDATE_SIGNING_KEY" ]; then
               echo "::warning::QT_UPDATE_SIGNING_KEY 未注入 —— 本次会在「签名安装包」阶段失败"
-              echo "::warning::请在仓库「设置」→「环境变量」里配置 QT_UPDATE_SIGNING_KEY"
+              echo "::warning::请检查密钥仓库 canace/qt-secrets 的 qt-pc.env.yml 是否含 QT_UPDATE_SIGNING_KEY"
               echo "::warning::    值为本机 .signing/ed25519.key 的 base64"
             fi
         - name: 安装依赖并构建前端
