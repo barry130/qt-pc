@@ -45,19 +45,22 @@
   script: |
     set -e
     echo "==> 构建 $QT_ARCH ($QT_TARGET)"
-    # Windows AArch64 上 ring 0.17.14 会把 C 编译器强行换成 GNU 驱动 clang
-    # （ring/build.rs:562-568 的 FIXME 分支：cc-rs 把 clang-cl 归入 Msvc 家族，
-    # is_like_clang() 为 false，于是该分支恒触发），而 cargo-xwin 传进来的仍是
-    # clang-cl 风格的 `/imsvc <dir>`；GNU clang 把 /imsvc 当输入文件，直接报
-    # `clang: error: no such file or directory: '/imsvc'`。
-    # 这里用 .cnb/clang-shim.sh 做垫片，把 clang-cl 方言的参数翻译成 GNU 驱动能懂的写法
-    # （/imsvc→-isystem、/FI→-include、-Od→-O0、-W4/-DYNAMICBASE 丢弃…，完整表见该脚本）。
-    # 必须同时装成 `clang` 和 `clang-cl` 两个名字：ring 走 `clang`，而 aws-lc-sys 的
-    # find_clang_cl() 会把 CC 设成 `clang-cl`（builder/cc_builder.rs:1103-1119），
-    # 只装 `clang` 截不到后者 —— 第七次探针实测：/FI 被改写成功了（说明部分调用走了
-    # 垫片），但 jitterentropy 那批 `clang-cl` 调用没走垫片，`-Od` 原样落到 GNU 驱动上
-    # 报 `error: invalid integral value 'd' in '-Od'`。
-    # 只在 aarch64 目标启用：x64/x86 走真 clang-cl，与这条 bug 无关。
+    # Windows AArch64 上 C 代码有两个来源，需要的编译器模式正好相反，所以垫片
+    # .cnb/clang-shim.sh 按被调用的名字分两路（同一个脚本装成 clang 与 clang-cl）：
+    #   1) ring 0.17.14 会把 C 编译器强行换成 GNU 驱动 clang
+    #      （ring/build.rs:562-568 的 FIXME 分支条件是 !compiler.is_like_clang()，
+    #      而 cc-rs 把 clang-cl 归入 Msvc 家族、is_like_clang() 恒为 false），
+    #      aws-lc-sys 的 s2n-bignum 汇编也走 clang。此时 cargo-xwin 塞进来的仍是
+    #      clang-cl 风格的 `/imsvc <dir>`，aws-lc-sys 还会发 `/FI<头文件>`，
+    #      GNU clang 把它们当输入文件 → `no such file or directory: '/imsvc'`。
+    #      这一路把 `/imsvc`→`-isystem`、`/FI`→`-include` 后转发。
+    #   2) aws-lc-sys 的 C 代码（cargo-xwin 把 CC 设成 `clang-cl`）必须走真正的
+    #      MSVC/CL 语义：它按 is_cl_like 发 `-Od`/`-W4`（GNU 驱动报
+    #      `error: invalid integral value 'd' in '-Od'`），而 hrss.c 的
+    #      `uint16x8_t` 在 GNU 模式下会落到 `union __n128`，`a + b` 与 `v[i]`
+    #      全部编译失败。所以这一路 `exec $QT_REAL_CLANG --driver-mode=cl`，
+    #      只把 `-Od`→`/Od`、`-W4`→`/W4`、丢 `-DYNAMICBASE`。
+    # 只在 aarch64 目标启用：x64/x86 走镜像里真正的 clang-cl，与这两个坑无关。
     case "$QT_TARGET" in
       aarch64-*)
         QT_REAL_CLANG="$(command -v clang)"
@@ -368,7 +371,7 @@ ci-probe-x64:
                 install -D -m 0755 .cnb/clang-shim.sh /tmp/clang-shim/clang-cl
                 export QT_REAL_CLANG
                 export PATH="/tmp/clang-shim:$PATH"
-                echo "==> clang 垫片已启用（clang + clang-cl），转发到 $QT_REAL_CLANG"; export QT_SHIM_LOG=/tmp/clang-shim.log; sh .cnb/diag-arm64.sh || true; trap 'echo "--- shim 日志：走 GNU 驱动的 .S 调用 ---"; grep -- "\.S" /tmp/clang-shim.log 2>/dev/null | head -20' EXIT
+                echo "==> clang 垫片已启用（clang + clang-cl），转发到 $QT_REAL_CLANG"; export QT_SHIM_LOG=/tmp/clang-shim.log; sh .cnb/diag-arm64.sh || true; trap 'echo "--- shim 日志：首次调用的环境与 clang-cl 候选 ---"; head -30 /tmp/clang-shim.log 2>/dev/null; echo "--- shim 日志：最后 30 条调用（行首 cl/gcc = 模式）---"; tail -30 /tmp/clang-shim.log 2>/dev/null' EXIT
                 ;;
             esac
             # 放在函数里再于 if 条件中调用：set -e 在条件上下文里不生效，
