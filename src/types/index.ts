@@ -139,10 +139,56 @@ export interface PlayUrl {
   expiresAt: number;
 }
 
-/** 对齐 Rust `Lyric` */
+/**
+ * 对齐 Rust `Lyric`（Rust 侧是 commands.rs 里的临时结构，字段同名 camelCase）。
+ *
+ * 2026-10-06 追加两个**可选**面（与音源包契约 `ContractLyric` 同构）：
+ * - `wordByWord`：逐字歌词（QRC 行内格式 `[行起点ms,行时长ms]词(词起点ms,词时长ms)…`，
+ *   词起点相对行首）。有它播放页就逐字染色（卡拉 OK），没有就按整行高亮——纯装饰，
+ *   取不到绝不影响普通歌词显示。
+ * - `romanization`：罗马音 / 假名注音，普通 LRC 格式。日文歌才有，中文歌恒空串。
+ */
 export interface Lyric {
   lrc: string;
   translation: string;
+  /** 逐字歌词；无则空串 */
+  wordByWord?: string;
+  /** 罗马音歌词；无则空串 */
+  romanization?: string;
+}
+
+/** 对齐 Rust `db::store::LyricRecord`：落库的歌词正文，多带一个来源音源 */
+export interface LyricRecord extends Lyric {
+  /** 取词时的音源（换源兜底后是目标源） */
+  source: string;
+  /**
+   * 是不是用户在播放页「搜索歌词」手动挑的（V13 起）。
+   * true 时取词链路直接回读它、不打源站 —— 否则联网重取会拿回源站那份错词，
+   * 用户等于白换（桌面歌词窗口独立取词，表现就是「播放页换了、桌面歌词没换」）。
+   */
+  manual?: boolean;
+}
+
+// ---------- 不喜欢列表（对齐 Rust `db::store::DislikeRule`） ----------
+
+/** 屏蔽粒度：`song` = 这一首，`singer` = 这个人的所有歌 */
+export type DislikeKind = "song" | "singer";
+
+/**
+ * 一条屏蔽规则。
+ *
+ * `name` / `singer` 是 Rust 侧归一化后的**匹配键**（全角折叠 + 去标点），
+ * `nameRaw` / `singerRaw` 才是用户当初看到的那串字 —— 设置页要回显后者。
+ */
+export interface DislikeRule {
+  id: number;
+  kind: DislikeKind;
+  /** 归一化后的歌名 / 歌手名（`singer` 类型的规则用 name 存歌手词） */
+  name: string;
+  nameRaw: string;
+  singer: string;
+  singerRaw: string;
+  createdAt: number;
 }
 
 // ---------- 发现类统一模型（DESIGN §6.6） ----------
@@ -263,6 +309,28 @@ export interface RegistrySource {
    * 「满页 = 还有下一页」的推断才成立。旧版包不下发时按 50 兜底。
    */
   searchPageMax?: number;
+  /**
+   * 功能面自述（v4 契约起随 sourceRegistry 下发，包侧 registry.ts 的
+   * SourceFeatures）：该源有没有排行榜 / 歌单载体 / 歌手页 / 专辑 / 新歌流。
+   * 宿主据此显隐对应入口/区块/页签（stores/sourceRegistry.ts 的 useSourceSupports）。
+   * 旧版包不下发时读取处按「支持」兜底——展示门控的保守方向是不隐藏，
+   * 错误地隐藏入口比多显示一个空区块伤害大。
+   */
+  features?: {
+    charts?: boolean;
+    playlists?: boolean;
+    artist?: boolean;
+    album?: boolean;
+    latest?: boolean;
+  };
+  /**
+   * 该源播放/下载可用的音质档位（v5 契约；QUALITIES 的子集，按高到低排）。
+   * 宿主据此收敛音质选项：声明里没有的档位不展示（如 B 站音频流没有真
+   * 无损——flac 档只是最高档 AAC，就不展示 flac）。未声明（旧包）= 全部档位。
+   */
+  qualities?: string[];
+  /** 歌单广场排序选项（v5 契约；id 原样透传给 recommendations；空 = 不支持） */
+  playlistSorts?: { id: string; name: string }[];
 }
 
 /** 数据包注册表声明的音质档位 */

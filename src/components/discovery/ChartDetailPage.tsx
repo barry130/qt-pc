@@ -38,7 +38,9 @@ export function ChartDetailPage(props: {
         description: null,
       };
       try {
-        const all = await sourceApi.getAllCharts();
+        // 只查该音源自己的榜：详情页的 platform 就是来源音源，按源拉一次即可，
+        // 不必再拉全源榜单去找标题（排行榜页已改为按音源展示，聚合入口没必要）。
+        const all = await sourceApi.getCharts(platform as SourceId);
         const found = all.find((c) => c.platform === platform && c.id === id);
         if (!cancelled && found) chart = found;
       } catch {

@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { errMsg } from "@/lib/utils";
+import { findCrossSourceDup } from "@/lib/collect-dup";
+import { useSourceLabelFn } from "@/stores/sourceRegistry";
 import type { MyPlaylistSummary, Track } from "@/types";
 import * as ipc from "@/services/ipc";
 
@@ -14,11 +16,18 @@ export function AddToPlaylistButton(props: {
   const [open, setOpen] = useState(false);
   const [list, setList] = useState<MyPlaylistSummary[]>([]);
   const [tip, setTip] = useState<string | null>(null);
+  /** 「同名不同源」待确认（与播放条收藏同一个口径，见 lib/collect-dup） */
+  const [pending, setPending] = useState<{
+    playlist: MyPlaylistSummary;
+    dups: Track[];
+  } | null>(null);
   const ref = useRef<HTMLDivElement | null>(null);
+  const sourceLabel = useSourceLabelFn();
 
   // 展开时才拉取歌单列表，避免列表页首屏就发一堆请求
   useEffect(() => {
     if (!open) return;
+    setPending(null);
     void ipc
       .listMyPlaylists()
       // 在线歌单的曲目归音源管，本地加不进去 —— 只列本地歌单
@@ -36,10 +45,12 @@ export function AddToPlaylistButton(props: {
     return () => document.removeEventListener("mousedown", onDoc);
   }, [open]);
 
-  const add = async (p: MyPlaylistSummary): Promise<void> => {
+  const addTo = async (p: MyPlaylistSummary): Promise<void> => {
     setTip(null);
     try {
       await ipc.addTracksToPlaylist(p.pid, [track]);
+      // 提示行在弹层内（open 为 false 就不渲染），所以先留着弹层把它显示完再收
+      setPending(null);
       setTip(`已加入「${p.name}」`);
       window.setTimeout(() => {
         setTip(null);
@@ -48,6 +59,22 @@ export function AddToPlaylistButton(props: {
     } catch (err) {
       setTip(errMsg(err));
     }
+  };
+
+  /** 加入前查一次「同名不同源」：命中就先问一句，确认才真的写入 */
+  const add = async (p: MyPlaylistSummary): Promise<void> => {
+    setTip(null);
+    try {
+      const existing = await ipc.getPlaylistTracks(p.pid);
+      const dups = findCrossSourceDup(track, existing);
+      if (dups.length > 0) {
+        setPending({ playlist: p, dups });
+        return;
+      }
+    } catch {
+      // 查重失败不拦加入：重复顶多两行，拦住是功能不可用
+    }
+    await addTo(p);
   };
 
   return (
@@ -83,6 +110,47 @@ export function AddToPlaylistButton(props: {
               </button>
             ))
           )}
+          {/* 同名不同源确认条：替换掉歌单列表，避免用户在下面又点一个歌单把提示顶掉 */}
+          {pending !== null ? (
+            <div
+              data-testid="addto-dup-confirm"
+              className="border-t border-border px-2 py-2"
+            >
+              <p className="text-[11px] leading-snug text-foreground/90">
+                「{pending.playlist.name}」里已经有了
+                {pending.dups.length > 1 ? ` ${pending.dups.length} 首` : ""}同名的
+                {sourceLabel(pending.dups[0].platform)}版本
+                {pending.dups.length === 1 ? (
+                  <span className="text-muted-foreground">
+                    （{pending.dups[0].singer}）
+                  </span>
+                ) : null}
+                ，仍要收藏？
+              </p>
+              <div className="mt-1.5 flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void addTo(pending.playlist);
+                  }}
+                  className="flex-1 rounded border border-border px-2 py-1 text-[11px] transition-colors hover:bg-secondary"
+                >
+                  继续收藏
+                </button>
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setPending(null);
+                  }}
+                  className="flex-1 rounded border border-border px-2 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-secondary"
+                >
+                  取消
+                </button>
+              </div>
+            </div>
+          ) : null}
           {tip && (
             <div className="px-2 py-1 text-xs text-muted-foreground">{tip}</div>
           )}

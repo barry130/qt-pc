@@ -5,6 +5,10 @@
 //! - 自然播完（auto）：Sequence 末尾停止；ListLoop 循环；OneLoop 重播当前；Random 随机换曲
 //! - 手动 next / previous：均按列表顺序移动并循环（OneLoop 也不例外），
 //!   仅 Random 随机挑一首不同的曲子
+//!
+//! 屏蔽规则的适用范围只有「自动推进」：`next_index_skipping` 供 next 用（引擎线程带
+//! DislikeMatcher 调用），`previous_index` 不带跳过参数 —— 屏蔽语义是「别让它自动出现」，
+//! 不是「禁止聆听」，而上一首只由用户的「上一首」按钮触发，用户主动点的那首不该被拦。
 
 use crate::provider::types::Track;
 
@@ -79,6 +83,69 @@ impl Queue {
         }
     }
 
+    /// 计算下一首下标，并**跳过 `skip` 判为不想要的曲目**（不喜欢列表）。
+    ///
+    /// 与 `next_index` 的差别只在「要不要绕开某些下标」，其它语义（auto / 模式 / 越界）
+    /// 完全一致。单独成一个函数而不是在调用方 while 迭代，是因为 Random 模式每次
+    /// `next_index` 都重新掷骰 —— 循环调用它跳过屏蔽项会在小队列上撞概率性死循环。
+    ///
+    /// - `PlayMode::OneLoop` + auto **不跳过**：它的语义就是「反复播这一首」，
+    ///   绕开当前曲目等于取消 Loop。
+    /// - 走完一圈只剩屏蔽项时返回 None（= 停下），不去碰屏蔽的那几首 ——
+    ///   用户屏蔽它们就是为了不被自动播放到自己面前。
+    pub fn next_index_skipping(
+        &self,
+        mode: PlayMode,
+        auto: bool,
+        skip: impl Fn(&Track) -> bool,
+    ) -> Option<usize> {
+        let len = self.tracks.len();
+        let cur = self.index?;
+        let base = self.next_index(mode, auto)?;
+        if len <= 1 || !skip(&self.tracks[base]) {
+            return Some(base);
+        }
+        if matches!(mode, PlayMode::OneLoop) && auto {
+            return Some(base);
+        }
+        match mode {
+            PlayMode::Random => {
+                // 在「非当前 + 未屏蔽」的集合里重掷一次；全是屏蔽项就放弃（None）
+                let candidates: Vec<usize> = (0..len)
+                    .filter(|&i| i != cur && !skip(&self.tracks[i]))
+                    .collect();
+                if candidates.is_empty() {
+                    None
+                } else {
+                    Some(candidates[fastrand::usize(..candidates.len())])
+                }
+            }
+            _ => {
+                // 顺序推进：从 base 继续往后扫，跳过被屏蔽的下标，最多走一圈。
+                // 走回 cur 就直接播它 —— 用户明确点了「下一首」，此时剩下能播的只有
+                // 当前这首，让按了没反应才是最糟的体验。
+                let mut i = base;
+                for _ in 0..len {
+                    i += 1;
+                    if i >= len {
+                        if auto && matches!(mode, PlayMode::Sequence) {
+                            // 顺序播放自然播完到末尾就该停，不该绕回头
+                            return None;
+                        }
+                        i = 0;
+                    }
+                    if i == cur {
+                        return Some(i);
+                    }
+                    if !skip(&self.tracks[i]) {
+                        return Some(i);
+                    }
+                }
+                None
+            }
+        }
+    }
+
     /// 上一首下标（手动操作语义）：循环回末尾；Random 随机挑不同的
     pub fn previous_index(&self, mode: PlayMode) -> Option<usize> {
         let len = self.tracks.len();
@@ -115,6 +182,24 @@ impl Queue {
     /// 追加到队尾（「加入播放队列」）。不改变当前播放位置。
     pub fn append(&mut self, tracks: Vec<Track>) {
         self.tracks.extend(tracks);
+    }
+
+    /// 单曲播放用（DESIGN §11.2 `play_track`）：**不替换队列** —— 队列里已有同一首
+    /// （同 `id` + 同 `platform`）就返回它原来的下标，否则追加到队尾并返回新下标。
+    /// 只负责「找到或放下」，不碰 `self.index`：调用方拿到下标后再置当前曲目。
+    ///
+    /// 去重口径与移动端 `qt-uniappx` 的 `playSingle` 一致（按 id + platform 判重）：
+    /// 重复点同一首不该在队列里堆出第二条一模一样的记录。
+    pub fn append_or_find(&mut self, track: Track) -> usize {
+        if let Some(i) = self
+            .tracks
+            .iter()
+            .position(|t| t.id == track.id && t.platform == track.platform)
+        {
+            return i;
+        }
+        self.tracks.push(track);
+        self.tracks.len() - 1
     }
 
     /// 移除指定下标，并修正当前下标：移除当前曲目之前的项整体前移一位，
@@ -296,6 +381,89 @@ mod tests {
         assert_eq!(q.index, Some(2));
     }
 
+    // ---------- 跳过屏蔽曲目 ----------
+
+    /// 按 title 是否被判为「不想要的」屏蔽（测试用的 matcher 替身）。
+    fn skip_titled(banned: &'static [&'static str]) -> impl Fn(&Track) -> bool {
+        move |t: &Track| banned.contains(&t.title.as_str())
+    }
+
+    #[test]
+    fn skipping_next_scans_past_disliked_tracks() {
+        let q = queue_of(5);
+        let skip = skip_titled(&["t1", "t2"]);
+        // Sequence 从 0 出发：跳过 1、2，落在 3
+        assert_eq!(q.next_index_skipping(PlayMode::Sequence, true, &skip), Some(3));
+    }
+
+    #[test]
+    fn skipping_next_wraps_around_in_list_loop() {
+        let mut q = queue_of(4);
+        q.index = Some(3);
+        let skip = skip_titled(&["t0"]);
+        // 末尾 → 回绕到 0 但 0 被屏蔽 → 继续到 1
+        assert_eq!(q.next_index_skipping(PlayMode::ListLoop, true, &skip), Some(1));
+    }
+
+    #[test]
+    fn skipping_next_respects_sequence_end() {
+        let mut q = queue_of(3);
+        q.index = Some(1);
+        let skip = skip_titled(&["t2"]);
+        // 顺序播放到末尾即停，不该为了找一首能播的绕回开头
+        assert_eq!(q.next_index_skipping(PlayMode::Sequence, true, &skip), None);
+        // 手动 next 允许绕回
+        assert_eq!(q.next_index_skipping(PlayMode::Sequence, false, &skip), Some(0));
+    }
+
+    #[test]
+    fn skipping_next_keeps_one_loop_on_the_same_track() {
+        let mut q = queue_of(3);
+        q.index = Some(1);
+        let skip = skip_titled(&["t1"]);
+        // OneLoop 自然播完的语义就是「反复播这首」，绕开等于取消循环
+        assert_eq!(q.next_index_skipping(PlayMode::OneLoop, true, &skip), Some(1));
+    }
+
+    #[test]
+    fn skipping_next_in_random_never_picks_a_disliked_one() {
+        let q = queue_of(6);
+        let skip = skip_titled(&["t1", "t2", "t3", "t4", "t5"]);
+        // 只剩当前这首能播：非 OneLoop 的 Random 不许绕回（他会 Infinite Loop）
+        for _ in 0..30 {
+            assert!(q.next_index_skipping(PlayMode::Random, true, &skip).is_none());
+        }
+        let skip = skip_titled(&["t1", "t2"]);
+        for _ in 0..30 {
+            let pick = q.next_index_skipping(PlayMode::Random, true, &skip).unwrap();
+            assert!(pick != 0 && !banned_in(&q.tracks[pick].title, &["t1", "t2"]));
+        }
+    }
+
+    #[test]
+    fn skipping_next_returns_current_when_nothing_else_is_playable() {
+        let mut q = queue_of(3);
+        q.index = Some(0);
+        let skip = skip_titled(&["t1", "t2"]);
+        // 手动「下一首」：扫一圈只剩当前这首，也得让它按了有反应
+        assert_eq!(q.next_index_skipping(PlayMode::ListLoop, false, &skip), Some(0));
+    }
+
+    #[test]
+    fn skipping_next_without_any_rule_equals_plain_next() {
+        let mut q = queue_of(4);
+        q.index = Some(1);
+        let never = |_: &Track| false;
+        assert_eq!(
+            q.next_index_skipping(PlayMode::Sequence, true, &never),
+            q.next_index(PlayMode::Sequence, true)
+        );
+    }
+
+    fn banned_in(title: &str, list: &[&str]) -> bool {
+        list.contains(&title)
+    }
+
     // ---------- 队列编辑 ----------
 
     fn track_of(id: &str) -> Track {
@@ -420,5 +588,50 @@ mod tests {
         assert_eq!(q.index, Some(1));
         // 已在末尾 → 不移除
         assert_eq!(q.clear_after_current(), 0);
+    }
+
+    // ---------- 单曲播放（play_track） ----------
+
+    #[test]
+    fn append_or_find_appends_new_track_and_keeps_queue() {
+        let mut q = queue_of(3); // 0 1 2
+        let i = q.append_or_find(track_of("9"));
+        // 不替换队列：原有的三首还在，新歌追加到队尾
+        assert_eq!(i, 3);
+        assert_eq!(ids(&q), vec!["0", "1", "2", "9"]);
+        // 只找位置，不动当前曲目（置 index 是调用方的事）
+        assert_eq!(q.index, Some(0));
+    }
+
+    #[test]
+    fn append_or_find_reuses_existing_position() {
+        let mut q = queue_of(3);
+        assert_eq!(q.append_or_find(track_of("1")), 1);
+        // 已有 → 不重复入队
+        assert_eq!(ids(&q), vec!["0", "1", "2"]);
+    }
+
+    #[test]
+    fn append_or_find_dedupes_by_id_and_platform() {
+        // 同 id 不同平台是两首歌：不能互相顶掉
+        let mut q = Queue {
+            tracks: vec![track_of("7")],
+            index: Some(0),
+        };
+        let mut other = track_of("7");
+        other.platform = crate::provider::types::SourceId::new("kw");
+        assert_eq!(q.append_or_find(other), 1);
+        assert_eq!(ids(&q), vec!["7", "7"]);
+        assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn append_or_find_on_empty_queue_starts_at_zero() {
+        let mut q = Queue {
+            tracks: Vec::new(),
+            index: None,
+        };
+        assert_eq!(q.append_or_find(track_of("a")), 0);
+        assert_eq!(ids(&q), vec!["a"]);
     }
 }

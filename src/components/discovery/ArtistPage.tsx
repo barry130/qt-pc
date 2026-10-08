@@ -1,11 +1,12 @@
-import { useCallback, useState } from "react";
-import { useParams } from "@tanstack/react-router";
+import { useCallback, useEffect, useState } from "react";
+import { useParams, useSearch } from "@tanstack/react-router";
 import { Play } from "lucide-react";
 import type { SourceId, Track } from "@/types";
 import * as sourceApi from "@/source-scripts";
 import { usePlayerStore } from "@/stores/player";
 import { useSearchPageMax } from "@/stores/sourceRegistry";
-import { usePagedList } from "@/hooks/usePagedList";
+import { usePagedList, type PageResult } from "@/hooks/usePagedList";
+import { resolveArtistId } from "@/lib/artist-id";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { TrackList } from "./TrackList";
 import { ErrorRetry, TrackRowsSkeleton } from "./Skeletons";
@@ -14,9 +15,15 @@ import { BackButton } from "@/components/layout/BackButton";
 /**
  * 歌手页（路由 /artist/$platform/$id）。
  *
- * 音源侧没有「按歌手 id 取歌曲」的免费接口，所以这里用**歌手名搜索**来闭环：
- * URL 的 `$id` 位置放的是歌手名（encodeURIComponent 过），头像取包内 artistSongs
- * 第一页顺带返回的 picUrl，拿不到再退到首曲封面。
+ * 2026-10-06：新跳转把**歌手真实 id** 放 search 参数 `?id=`，名字放 `?name=`；
+ * 有 id 时包里走按 id 取作品（wyy/kw/kg/qq 都有端点），不再把同名歌手的歌混进来。
+ *
+ * 没有 `?id=` 时（老书签、从列表/播放条/常听歌手点歌手名进来，URL 上只有名字）
+ * 先经 `resolveArtistId` 按名字查一次歌手补上 id 再取作品 —— 包里拿不到 id 会
+ * 退回「把歌手名当关键词全局搜索」，那是无过滤的搜索结果，第 1 页最相关、
+ * 越往后越跑偏（翻唱 / 合作 / 同名歌手），用户看到的就是「后面的歌跟歌手没关系」。
+ * 补不到 id（接口没实现 / 风控）就按老路走名字搜索，两条路都不会白屏。
+ * 头像取包内 artistSongs 第一页顺带返回的 picUrl，拿不到再退到首曲封面。
  *
  * **进页一次拉完**（usePagedList 的 `all` 模式）：早先是滚动续页，短歌手页还行，
  * 长歌手要一直下拉；现在并发把所有页取完再一次性列出，滚动条即全量。
@@ -30,36 +37,64 @@ export function ArtistPage(): React.JSX.Element {
     platform: SourceId;
     id: string;
   };
-  const name = safeDecode(id);
+  const search = useSearch({ strict: false }) as { name?: string; id?: string };
+  const rawName = typeof search.name === "string" ? search.name : "";
+  const artistId = typeof search.id === "string" && search.id.length > 0 ? search.id : "";
+  // 没有 ?name= 说明是老链接：$id 位置放的是名字，解码后当名字用，且没有真 id。
+  const name = rawName.length > 0 ? rawName : safeDecode(id);
   const playQueue = usePlayerStore((s) => s.playQueue);
   const [avatar, setAvatar] = useState("");
   const pageSize = useSearchPageMax(platform);
 
   const fetchPage = useCallback(
-    async (page: number): Promise<Track[]> => {
-      const res = await sourceApi.getArtistSongs(platform, name, page, pageSize);
+    async (page: number): Promise<PageResult<Track>> => {
+      // 没带真 id（从列表点歌手名 / 播放条歌手按钮 / 常听歌手进来）时先补一次：
+      // 包里拿不到 id 会退回「把歌手名当关键词全局搜索」，越往后越跑偏。
+      const id =
+        artistId.length > 0 ? artistId : await resolveArtistId(platform, name);
+      const res = await sourceApi.getArtistSongs(platform, name, page, pageSize, id);
       // 头像只有第一页带（包内行为），顺路存下来
       if (page <= 1) setAvatar(res.picUrl);
-      return res.songs;
+      // 把包给的 hasMore 原样交给任务：歌手作品是过滤型列表，逐页条数不齐，
+      // 按「不满一页 = 到底」推断会在中途收尾（详见 source-scripts 的 hasMoreOf）
+      return { list: res.songs, hasMore: res.hasMore };
     },
-    [platform, name, pageSize],
+    [platform, name, pageSize, artistId],
   );
 
-  const { items: songs, loading, error, progress, reload } = usePagedList<Track>({
+  // 缓存键：与 resetKey 同口径（音源 + 歌手名 + 每页条数 + 歌手 id）。
+  // 命中缓存任务时不再发请求；即使中途离开页面，后台也继续跑完并留在缓存里。
+  const cacheKey = `artist:${platform}:${name}:${pageSize}:${artistId}`;
+
+  const { items: songs, loading, error, finished, reload } = usePagedList<Track>({
     fetchPage,
     keyOf: (t) => `${t.platform}:${t.id}`,
     // pageSize 也进 resetKey：注册表是异步到达的，首帧可能还是兜底值 50，
     // 包声明的真实上限到位后必须整页重拉，否则第一页条数与后续页不一致。
-    resetKey: `${platform}:${name}:${pageSize}`,
+    resetKey: `${platform}:${name}:${pageSize}:${artistId}`,
     pageSize,
     mode: "all",
+    cacheKey,
     // 歌手歌曲最多几千首（100/页 → 几十页），上限只是防上游 total 撒谎时打转
     maxPages: 60,
   });
 
+  // 头像只有第 1 页带回来：命中缓存时根本不会再调 fetchPage，
+  // 所以按同一个键另存一份，第二次进页头像不能丢。
+  useEffect(() => {
+    const cached = AVATAR_CACHE.get(cacheKey);
+    if (cached !== undefined && cached.length > 0) setAvatar(cached);
+    else setAvatar("");
+  }, [cacheKey]);
+
+  useEffect(() => {
+    if (avatar.length > 0) rememberAvatar(cacheKey, avatar);
+  }, [cacheKey, avatar]);
+
   const cover = avatar || songs.find((t) => t.picUrl)?.picUrl || "";
   const coverUrl = cover ? qtresCoverUrl(cover) : null;
-  const loadingAll = progress !== null;
+  // 收尾前才显示进度（以前只看 progress !== null，拉完也永远停不掉）
+  const loadingAll = !finished;
 
   return (
     <div className="flex h-full min-w-0 flex-col">
@@ -164,6 +199,23 @@ function LoadBar(): React.JSX.Element {
       <div className="qm-progress-bar absolute inset-y-0 w-1/3 bg-primary" />
     </div>
   );
+}
+
+/**
+ * 歌手头像缓存（进程内，随退出回收）：头像只跟着第 1 页回来，
+ * 而歌曲命中缓存后不会再取第 1 页 —— 不另存一份的话，第二次进页头像就没了。
+ */
+const AVATAR_CACHE = new Map<string, string>();
+const AVATAR_CACHE_CAP = 64;
+
+function rememberAvatar(key: string, url: string): void {
+  AVATAR_CACHE.delete(key);
+  AVATAR_CACHE.set(key, url);
+  while (AVATAR_CACHE.size > AVATAR_CACHE_CAP) {
+    const oldest = AVATAR_CACHE.keys().next().value;
+    if (oldest === undefined) break;
+    AVATAR_CACHE.delete(oldest);
+  }
 }
 
 /** URL 里可能不是合法百分号编码，解码失败就按原样用 */

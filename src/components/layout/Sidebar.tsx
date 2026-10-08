@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import { useMusicSourceStore } from "@/stores/musicSource";
 import { useAppearanceStore } from "@/stores/appearance";
-import { useSourceLabel } from "@/stores/sourceRegistry";
+import { useSourceLabel, useSourceSupports, useAnySourceSupports } from "@/stores/sourceRegistry";
 import { cn } from "@/lib/utils";
 import { migrateLegacyStorageKey } from "@/lib/legacy-storage";
 
@@ -73,6 +73,21 @@ export function Sidebar(): React.JSX.Element {
   const hasBgImage = useAppearanceStore((s) => Boolean(s.preference.bgImage));
   const sourceName = useSourceLabel(activeSourceId);
 
+  // 功能面门控（v4 契约）：数据包声明当前源有没有新歌流/歌单载体、还有没有
+  // 任何源有榜单。不支持的入口整行消失（页面数据取自当前源，留着就是死入口）；
+  // 未声明（旧包）一律按支持处理，侧栏与门控上线前完全一致。
+  const showDaily = useSourceSupports(activeSourceId, "latest");
+  const showPlaylists = useSourceSupports(activeSourceId, "playlists");
+  // 榜单页虽然跟随当前音源展示，但页面顶部有音源切换器，点进去还能切到别的源，
+  // 所以按「还有任何源有榜单」保留入口（与每日新歌/歌单广场的按当前源门控不同）
+  const showCharts = useAnySourceSupports("charts");
+  const onlineItems = ONLINE_ITEMS.filter((item) => {
+    if (item.to === "/daily") return showDaily;
+    if (item.to === "/playlists") return showPlaylists;
+    if (item.to === "/charts") return showCharts;
+    return true;
+  });
+
   useEffect(() => {
     writeCollapsed(collapsed);
   }, [collapsed]);
@@ -89,7 +104,7 @@ export function Sidebar(): React.JSX.Element {
           不再单独一节 + 横向隔离线。内容超出时靠 overflow 滚动。 */}
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-2 py-3">
         <NavGroup title={`在线 · ${sourceName}`} collapsed={collapsed}>
-          {ONLINE_ITEMS.map((item) => (
+          {onlineItems.map((item) => (
             <NavLink key={item.to} item={item} collapsed={collapsed} />
           ))}
         </NavGroup>

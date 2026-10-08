@@ -26,7 +26,7 @@
 | 反馈客户端头 `X-App-Ut` / `X-App-Version` / `X-Device` / `X-OS` | ✅ 成立，与接口统计共用一套（`ClientHeaders`），`X-Device`/`X-OS` 落 `sys_feedback` | `AppFeedbackController.submit()` |
 | 更新包校验字段 | ✅ **已存在** `md5` 与 `fileSize` | `QtAppUpdate` 实体 |
 | 双链接下载 `browserUrl` / `isGithub` | ✅ **已落地**（非待开发） | `QtAppUpdate` 实体 + `QtAppService.getUpdate()` 注释 |
-| 旧通知接口 `/api/v1/user/notice/**` | ⚠️ 已 `@Deprecated`，PC 不得使用 | `QtUserNoticeController` |
+| 旧通知接口 `/api/v1/user/notice/**` | ⚠️ 后端已删除（2026 清理），PC 不得使用 | 原 `QtUserNoticeController`，统一通知走 `app/message/**` |
 | Astral 提供音乐内容代理 | ❌ 不提供，结论正确 | 全量 Mapping 扫描无音乐内容接口 |
 
 **新增结论（原文未写明，实现前必须知道）：**
@@ -648,6 +648,57 @@ Windows 平台注意事项（原文未覆盖，均为实测坑点）：
 | LyricButton | 开关桌面歌词 |
 | SpectrumToggle | 开关频谱 |
 
+播放队列的开启态**只点亮按钮本身**：`QueueButton` 走 `ControlButton` 的 `emphasis`，
+展开时和「桌面歌词」开启态同一套填充（`bg-primary/60` + `text-primary-foreground` +
+`shadow-[0_2px_8px_color-mix(...)]`），收起时回到 hover 浅底那一套。用户口径
+（m04741）：「我要和左边桌面歌词打开后效果一样就行」。
+播放条**整条底色不随队列开关变化**，恒为半透明 `bg-card/70`（下垫 `backdrop-blur-xl`
+独立层）。曾经试过两种「整条变色」方案均被否决，勿再重试：①把 `bg-card/70` 做成不透明的
+`bg-card` —— 浅色主题下 `--card` 是纯白 `oklch(1 0 0)`、`--background` 几乎同色，
+是视觉 no-op（实测反馈「打开了没有变色」）；②整条换 `bg-secondary` 加投影 ——
+能看见，但不是用户要的东西（「和刚刚有什么区别」）。
+播放页不渲染队列面板（`AppShell` 里 `!isPlayingPage` 才挂 `QueuePanel`），且那里的播放条
+走封面色渐变，不受此开关影响。回归测试 `tests/playerbar.queue-button.test.tsx`。
+
+**播放页禁用队列按钮**（用户 m04913「增加在播放页时不允许点击播放列表按钮」）：
+`QueueButton` 在 `isPlayingPage` 时 `disabled` + 去掉 `emphasis`（铺主色会读成「队列正开着」，
+而播放页根本没有队列可开），`aria-label` 改为「播放队列（播放页不可用）」，样式走
+`cursor-not-allowed opacity-40 hover:bg-transparent`。回归测试同上文件最后三条用例。
+
+**长列表滚动**（用户 m05249「长列表右边的进度条无法下滑，导致滚轮滚动很慢；也没有回到顶部的按钮」）：
+
+1. **滚动条加宽加亮**（`src/index.css`）：6px / 18% 不透明度 → 10px / 35%（hover 55%、
+   按下 75%），thumb 留 2px 透明内衬，视觉粗细仍是那条细线、**命中区按 10px 算**。
+   原先太细太淡，鼠标抓不住，拖不动就只能靠滚轮，于是「滚动很慢」。
+   加宽后槽位变化会挤动内容，故给所有纵向滚动容器统一加 `scrollbar-gutter: stable`
+   （`@layer base` 里 `:where(.overflow-y-auto, .overflow-auto)`，不再由各页面自己写）。
+2. **滚轮加速**（`src/hooks/useContentScroll.ts`）：位移按 `WHEEL_FACTOR = 2.2` 放大，
+   `deltaMode=LINE` 先按 40px/行折算，单次封顶 600px。用**倍数**而不是固定步长，
+   是因为触控板每次事件只有几像素但触发很密，固定步长会变成「一格飞一屏」。
+   取**最内层**纵向滚动容器，保持「内层吃到底也不连带滚外层」的默认语义；
+   遇到**横向可滚容器直接让路**（`lib/scroll.ts` 的 `deferToHorizontal`），否则会抢在
+   `HorizontalScroller` 前面把整页滚走，首页卡片行就永远横滚不了。
+3. **回到顶部**：`components/layout/ScrollTopLayer.tsx` 挂在 `<main>` 里，滚过一屏的
+   60%（最多 240px）才出现，点击 `scrollTo({ top: 0, behavior: "smooth" })`。
+   位置固定在**内容区**右下角 —— 播放队列是 `<main>` 的兄弟节点，面板展开时按钮
+   自动停在面板左侧，不会钻到面板底下。
+
+   两件事都在内容区根节点上用**原生捕获监听**完成（`scroll` **不冒泡**，只有捕获
+   阶段能在祖先上收到），十几个长列表页面因此不必逐个挂 ref、逐个改。
+   回归测试 `tests/content-scroll.test.tsx`。
+
+
+（`draggable` / `dragover` / `drop`）。原因（用户 m04913「拖拽排序无反应」的根因）：
+Tauri 在 Windows 上会把自己注册的 OLE `IDropTarget` 装到窗口的每个子 HWND 上
+（`wry` 的 `drag_drop.rs` 用 `EnumChildWindows` 逐个 `RevokeDragDrop` + `RegisterDragDrop`），
+该 target 只认 `CF_HDROP`（外部文件拖入），页面内的 `dragstart` / `dragover` / `drop` 全被
+压掉。本项目没有任何文件拖入消费方（`src-tauri/src` 里 grep `FileDrop|DragDrop` 零命中），
+因此 `tauri.conf.json` 的 `dragDropEnabled: true` 是纯负担 —— 但改它要重编译 Rust 侧，
+故前端绕开：行上挂 `data-queue-index`，按下后位移越过 4px 阈值才进入拖动态，
+落点用 `document.elementFromPoint` 做真实命中测试（**不能**用回调自带的下标 ——
+`setPointerCapture` 之后 `pointermove` 全部重定向到起始行，拿到的永远是起点），
+抬手提交 `ipc.queueMove(from, to)`。回归测试 `tests/queue-panel-drag.test.tsx`。
+
 ---
 
 ## 6. 音源切换设计（Music Source）
@@ -1149,7 +1200,7 @@ pub struct PlaybackState {
 ## 7.3 播放流程
 
 ```text
-前端 play_track(trackId)
+前端 play_track(trackId)　// 单曲播放：入队（队里已有则复用原位置）后开播，不清空列表
    │
    ▼
 Rust 查询 Track
@@ -2305,8 +2356,8 @@ Provider.lyric() （wyy 额外取 translation）
 
 | Command | 入参 | 出参 |
 |---|---|---|
-| `play_track` | `trackId` | `PlaybackState` |
-| `play_queue` | `trackIds, startIndex, startPositionMs?` | `PlaybackState` |
+| `play_track` | `track, quality` | `PlaybackState`。单曲播放：**不替换播放列表**，队里已有这首（同 `id` + `platform`）就播它原来那条，否则追加到队尾再播；整列表入队见 `play_queue` |
+| `play_queue` | `trackIds, startIndex, startPositionMs?` | `PlaybackState`。整表替换队列（「播放全部」） |
 | `play_at` | `queueIndex` | `PlaybackState` |
 | `next` | 无 | `PlaybackState` |
 | `previous` | 无 | `PlaybackState` |

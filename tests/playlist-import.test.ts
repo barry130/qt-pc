@@ -13,11 +13,16 @@ vi.mock("@/services/ipc", () => ({
   createPlaylist: vi.fn(),
   addTracksToPlaylist: vi.fn(),
 }));
+// 歌单链接解析已下沉到数据包（source-scripts.parseSheetInput），这里给它补桩：
+// 本文件测的是「导入编排」而非解析本身（解析单测在 qt-sources/tests/sheet-
+// import.test.ts）。桩实现不能写在下面的工厂里 —— vi.mock 会被提升到 import
+// 之前，那时还拿不到上面 import 的函数；统一在 beforeEach 里挂（见下）。
 vi.mock("@/source-scripts", () => ({
   getPlaylistDetail: vi.fn(),
+  parseSheetInput: vi.fn(),
 }));
 
-import type { Playlist, Track } from "@/types";
+import type { Playlist, SourceId, Track } from "@/types";
 import { importPlaylistSongs } from "@/lib/playlist-import";
 import * as ipc from "@/services/ipc";
 import * as sourceApi from "@/source-scripts";
@@ -50,6 +55,12 @@ function detail(overrides: Partial<Playlist> = {}): Playlist {
 describe("importPlaylistSongs 导入歌曲编排", () => {
   beforeEach(() => {
     vi.mocked(sourceApi.getPlaylistDetail).mockReset();
+    // 解析桩：走本地 playlist-link，行为与包还没接管时一致
+    vi.mocked(sourceApi.parseSheetInput).mockReset();
+    vi.mocked(sourceApi.parseSheetInput).mockImplementation(
+      (text: string, fallback?: SourceId) =>
+        Promise.resolve(parsePlaylistInput(text, fallback as never)),
+    );
     vi.mocked(ipc.createPlaylist).mockReset();
     vi.mocked(ipc.addTracksToPlaylist).mockReset();
   });

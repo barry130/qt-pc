@@ -14,6 +14,10 @@ import { LocalCover } from "@/components/library/LocalCover";
  *
  * 队列 2.0 新增：单曲移除、拖动排序、下一首播放、清空后续；
  * 批量管理：多选（含全选）后一次移除，走 queue_remove_indices 单事件重排。
+ *
+ * 拖动排序走 **pointer 事件自绘**，不用 draggable / dragover / drop（见下方
+ * startPointerDrag 的注释）：Tauri 在 Windows 上会把整个窗口的 OLE IDropTarget
+ * 换成自己的，页面内的 HTML5 拖放事件被它压掉，表现为「拖了没反应」。
  */
 export function QueuePanel(): React.JSX.Element | null {
   const queue = usePlayerStore((s) => s.queue);
@@ -33,7 +37,16 @@ export function QueuePanel(): React.JSX.Element | null {
   // 拖动排序：dragIndex 为被拖的行，overIndex 为当前悬停的行
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [overIndex, setOverIndex] = useState<number | null>(null);
-
+  // 本次按下的原始信息（起始行 / 起始 Y / 是否已越过阈值）。用 ref 而非 state：
+  // move 事件每帧都来，走 state 会丢帧且闭包里读到的常是旧值。
+  const dragRef = useRef<{
+    pointerId: number;
+    index: number;
+    startY: number;
+    active: boolean;
+  } | null>(null);
+  // 刚拖完立即抬手时浏览器仍会补一个 click，用它吃掉（否则拖完会顺手切歌）
+  const justDraggedRef = useRef(false);
   // 批量管理：选择模式下的已选下标集合（按移除前位置发给引擎）
   const [selecting, setSelecting] = useState(false);
   const [selected, setSelected] = useState<Set<number>>(new Set());
@@ -79,15 +92,93 @@ export function QueuePanel(): React.JSX.Element | null {
 
   if (!open) return null;
 
+  /**
+   * 拖动排序的落点提交。
+   *
+   * 不用 HTML5 拖放（draggable / dragover / drop）：Tauri 在 Windows 上会把自己
+   * 的 OLE IDropTarget 注册到窗口的每个子 HWND 上（`wry` 的 drag_drop.rs 用
+   * EnumChildWindows 逐个 RevokeDragDrop + RegisterDragDrop），而这个 target 只认
+   * CF_HDROP（外部文件拖入），页面内的 dragstart/dragover/drop 全被它压掉 ——
+   * 表现就是「拖了没反应」。本项目也没有任何文件拖入消费方，所以改成 pointer
+   * 事件自绘（与播放条的进度条 / 音量条同一套写法），彻底绕开那套机制。
+   */
   const dropAt = (to: number): void => {
-    if (dragIndex !== null && to >= 0 && to < queue.length && dragIndex !== to) {
-      void ipc.queueMove(dragIndex, to).catch((err) => {
+    const from = dragRef.current?.index ?? dragIndex;
+    if (from !== null && to >= 0 && to < queue.length && from !== to) {
+      void ipc.queueMove(from, to).catch((err) => {
         // 拖拽排序失败不上浮全局错误浮层，留排查日志即可
         console.error("[queue] 拖拽排序失败", err);
       });
+      justDraggedRef.current = true;
     }
+    dragRef.current = null;
     setDragIndex(null);
     setOverIndex(null);
+  };
+
+  /**
+   * 按下手柄：先只登记起点，等移动超过阈值（4px）才真正进入拖动态 ——
+   * 否则普通点击切歌会被判成一次零位移拖拽。
+   *
+   * 按下点落在行内按钮上（「下一首」/「移除」）不启动拖拽，让按钮自己处理点击。
+   */
+  const startPointerDrag = (e: React.PointerEvent, i: number): void => {
+    if (selecting || e.button !== 0) return;
+    const el = e.target as HTMLElement | null;
+    if (el?.closest("button")) return;
+    dragRef.current = {
+      pointerId: e.pointerId,
+      index: i,
+      startY: e.clientY,
+      active: false,
+    };
+    justDraggedRef.current = false;
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+
+  /**
+   * 命中测试：指针下面那一行的下标。
+   *
+   * 不能用回调自带的 i —— 一旦 setPointerCapture，后续 pointermove 全部重定向到
+   * 捕获元素（也就是起始行），拿到的永远是起点下标。故按坐标做真实命中测试，
+   * 行上挂 data-queue-index 供查找；指针飘到列表外时返回 null，保留上一次落点。
+   */
+  const indexAtPoint = (x: number, y: number): number | null => {
+    const el = document.elementFromPoint(x, y) as HTMLElement | null;
+    const row = el?.closest("[data-queue-index]") as HTMLElement | null;
+    if (!row) return null;
+    const raw = Number(row.dataset.queueIndex);
+    return Number.isInteger(raw) ? raw : null;
+  };
+
+  const movePointerDrag = (e: React.PointerEvent): void => {
+    const d = dragRef.current;
+    if (!d || d.pointerId !== e.pointerId) return;
+    // 越过阈值才点亮拖动态：避免手抖把点击吃掉，也避免误触就整行变淡
+    if (!d.active) {
+      if (Math.abs(e.clientY - d.startY) < 4) return;
+      d.active = true;
+    }
+    if (dragIndex !== d.index) setDragIndex(d.index);
+    const over = indexAtPoint(e.clientX, e.clientY) ?? overIndex;
+    if (over !== null && over !== overIndex) setOverIndex(over);
+  };
+
+  const endPointerDrag = (e: React.PointerEvent): void => {
+    const d = dragRef.current;
+    if (!d || d.pointerId !== e.pointerId) return;
+    if (d.active) {
+      const over = indexAtPoint(e.clientX, e.clientY) ?? overIndex ?? d.index;
+      dropAt(over);
+    } else {
+      // 没越过阈值＝这是一次点击，交给 onClick 走切歌
+      dragRef.current = null;
+      setDragIndex(null);
+      setOverIndex(null);
+    }
+    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    }
   };
 
   const toggleOne = (i: number): void => {
@@ -225,21 +316,23 @@ export function QueuePanel(): React.JSX.Element | null {
               ref={i === activeIndex ? currentRef : null}
               role="button"
               tabIndex={0}
-              draggable={!selecting}
-              onDragStart={() => setDragIndex(i)}
-              onDragEnd={() => {
-                setDragIndex(null);
-                setOverIndex(null);
+              // 拖动排序走 pointer 自绘（见 startPointerDrag）：行上挂下标供命中测试
+              data-queue-index={i}
+              draggable={false}
+              onDragStart={(e) => e.preventDefault()}
+              onPointerDown={(e) => startPointerDrag(e, i)}
+              onPointerMove={(e) => movePointerDrag(e)}
+              onPointerUp={(e) => endPointerDrag(e)}
+              onPointerCancel={(e) => endPointerDrag(e)}
+              onClick={() => {
+                // 刚拖完的那一下 click 是浏览器补的，不当作切歌
+                if (justDraggedRef.current) {
+                  justDraggedRef.current = false;
+                  return;
+                }
+                if (selecting) toggleOne(i);
+                else void playAt(i);
               }}
-              onDragOver={(e) => {
-                e.preventDefault();
-                if (overIndex !== i) setOverIndex(i);
-              }}
-              onDrop={(e) => {
-                e.preventDefault();
-                dropAt(i);
-              }}
-              onClick={() => (selecting ? toggleOne(i) : void playAt(i))}
               onKeyDown={(e) => {
                 if (e.key === "Enter" || e.key === " ") {
                   e.preventDefault();

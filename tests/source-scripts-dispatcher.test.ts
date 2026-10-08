@@ -19,6 +19,12 @@ const engineMock = vi.hoisted(() => ({
   resolveUrl: "",
   /** 命中线路（bundle getPlayUrl 应答里的 line；null = 未知） */
   resolveLine: null as { id: string; name: string; kind: string } | null,
+  /** 包按源声明的 Referer（宿主取字节时要带；空串 = 不发） */
+  resolveReferer: "",
+  /** 包侧 Range 预检实测的文件总长（null = 没读到） */
+  resolveSize: null as number | null,
+  /** 按实测码率重标后的档位（空串 = 未重标；只降不升） */
+  resolveActualQuality: "",
   /** 失败死因（bundle getPlayUrl 抛出的逐线路 trace） */
   resolveError: "",
   resolveThrows: false,
@@ -38,6 +44,9 @@ vi.mock("@/source-engine/client", () => ({
       line: engineMock.resolveLine,
       error: engineMock.resolveError,
       stalled: false,
+      referer: engineMock.resolveReferer,
+      size: engineMock.resolveSize,
+      actualQuality: engineMock.resolveActualQuality,
     };
   },
   engineSnapshot: () => ({
@@ -55,6 +64,8 @@ describe("source-scripts dispatcher（纯音源包：app 只经引擎调用）",
     engineMock.detail = null;
     engineMock.invokeResult = null;
     engineMock.resolveUrl = "";
+    engineMock.resolveSize = null;
+    engineMock.resolveActualQuality = "";
     engineMock.resolveThrows = false;
     engineMock.calls.length = 0;
   });
@@ -80,7 +91,7 @@ describe("source-scripts dispatcher（纯音源包：app 只经引擎调用）",
     expect(result[0]?.description).toBeNull();
     expect(engineMock.calls).toContainEqual({
       entry: "recommendations",
-      args: { source: "wyy", category: null, page: 1 },
+      args: { source: "wyy", category: null, page: 1, sort: "" },
     });
   });
 
@@ -116,6 +127,9 @@ describe("source-scripts dispatcher（纯音源包：app 只经引擎调用）",
   it("resolvePlayUrl（预解析）：引擎解析成功后回填引擎缓存", async () => {
     engineMock.phase = "ready";
     engineMock.resolveUrl = "http://dl.music.example/song.mp3";
+    engineMock.resolveReferer = "https://www.bilibili.com/";
+    engineMock.resolveSize = 8_734_208;
+    engineMock.resolveActualQuality = "320";
     const ipc = await import("@/services/ipc");
     const backfillSpy = vi.spyOn(ipc, "setResolvedPlayUrl").mockResolvedValue(undefined);
     const mod = await import("@/source-scripts");
@@ -131,8 +145,20 @@ describe("source-scripts dispatcher（纯音源包：app 只经引擎调用）",
     };
     const url = await mod.resolvePlayUrl(track, "128");
     expect(url).toBe("http://dl.music.example/song.mp3");
-    expect(backfillSpy).toHaveBeenCalledWith(track, "128", "http://dl.music.example/song.mp3");
+    // 回填必须把 referer 一起带给引擎缓存：宿主播放/下载自己向 CDN 取字节，
+    // 拿不到"声明它的那一侧"（B 站部分 CDN 无 Referer 直接 403）；
+    // size / actualQuality 同属「取链诚实性」（2026-10-06）：前者是下载进度
+    // 分母，后者让「请求 flac 实际拿到 320k」不再被命名成 .flac。
+    expect(backfillSpy).toHaveBeenCalledWith(
+      track,
+      "128",
+      "http://dl.music.example/song.mp3",
+      "https://www.bilibili.com/",
+      8_734_208,
+      "320",
+    );
     backfillSpy.mockRestore();
+    engineMock.resolveReferer = "";
   });
 
   it("resolvePlayUrl（预解析）：命中线路随地址一起记，管理端按曲目+音质读回", async () => {

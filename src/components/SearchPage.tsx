@@ -3,7 +3,7 @@ import { errMsg } from "@/lib/utils";
 import { Play, Search, SearchX, X } from "lucide-react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import type { Album, Artist, Playlist, Track } from "@/types";
-import { useSourceLabelFn } from "@/stores/sourceRegistry";
+import { useSourceLabelFn, useSourceSupports } from "@/stores/sourceRegistry";
 import * as sourceApi from "@/source-scripts";
 import type { SearchSourceBatch } from "@/source-scripts";
 import { usePlayerStore } from "@/stores/player";
@@ -50,6 +50,23 @@ export function SearchPage(): React.JSX.Element {
   const aggregateMode = useMusicSourceStore((s) => s.aggregateMode);
   const setAggregateMode = useMusicSourceStore((s) => s.setAggregateMode);
 
+  // 功能面门控（v4 契约）：数据包声明当前源有没有歌单载体/歌手页/专辑，
+  // 不支持的结果页签直接不渲染（这三类按当前源搜索，搜了也永远是空列表）；
+  // 未声明（旧包）一律按支持处理。「歌曲」恒在——单曲搜索是所有源的必备能力。
+  const supportsPlaylists = useSourceSupports(activeSourceId, "playlists");
+  const supportsArtist = useSourceSupports(activeSourceId, "artist");
+  const supportsAlbum = useSourceSupports(activeSourceId, "album");
+  const tabs = useMemo(
+    () =>
+      TABS.filter((t) => {
+        if (t.key === "playlist") return supportsPlaylists;
+        if (t.key === "artist") return supportsArtist;
+        if (t.key === "album") return supportsAlbum;
+        return true;
+      }),
+    [supportsPlaylists, supportsArtist, supportsAlbum],
+  );
+
   const [keyword, setKeyword] = useState(urlParams.q ?? "");
   const [tab, setTab] = useState<Tab>("song");
   const [songs, setSongs] = useState<Track[]>([]);
@@ -63,10 +80,16 @@ export function SearchPage(): React.JSX.Element {
   const [history, setHistory] = useState<string[]>([]);
   const [hotWords, setHotWords] = useState<string[]>([]);
   const [suggestOpen, setSuggestOpen] = useState(false);
-  const playQueue = usePlayerStore((s) => s.playQueue);
+  const play = usePlayerStore((s) => s.play);
   const currentTrackId = usePlayerStore((s) => s.state?.trackId ?? null);
   // 搜索代际号（见 run 内注释）：ref 不触发渲染，只作过期判定
   const runSeqRef = useRef(0);
+
+  // 当前页签被功能面挤掉（切音源/换包后）时回退「歌曲」，
+  // 否则内容区会停在一个已不渲染的页签上
+  useEffect(() => {
+    if (!tabs.some((t) => t.key === tab)) setTab("song");
+  }, [tabs, tab]);
 
   // 搜索历史只在挂载时读一次（增删在本地改完同步落盘）
   useEffect(() => {
@@ -212,13 +235,15 @@ export function SearchPage(): React.JSX.Element {
   /**
    * 歌手 / 专辑都跳各自的详情页（路由 /artist、/album），不再直接取歌播放：
    * 详情页能先看清单再决定播不播，也和歌单的交互保持一致。
-   * 音源没有「按 id 取歌」的免费接口，所以 URL 的 $id 位置放名字（encode 过），
-   * 详情页内部再按名字搜歌闭环 —— 见对应页面的注释。
+   * 2026-10-06：歌手页已支持按真实 id 取作品，这里把 id 放 `?id=`、名字放 `?name=`，
+   * `$id` 位置仍放（encode 过的）名字 —— 详情页没有 `?name=` 时会把它当名字用，
+   * 老书签和只有名字的跳转（TrackList）照样能进，见 ArtistPage 注释。
    */
   const openArtist = (a: Artist): void => {
     void navigate({
       to: "/artist/$platform/$id",
       params: { platform: a.platform, id: encodeURIComponent(a.name) },
+      search: { id: a.id, name: a.name },
     });
   };
 
@@ -235,12 +260,11 @@ export function SearchPage(): React.JSX.Element {
     (tab === "artist" && artists.length === 0) ||
     (tab === "album" && albums.length === 0);
 
-  // 聚合模式下按源分组渲染（拍平后的整份列表作为播放队列上下文）
+  // 聚合模式下按源分组渲染（每行只播自己这一首，不再需要跨组的拍平下标）
   const aggGroups =
     tab === "song" && aggregateMode && aggBatches !== null
       ? aggBatches.filter((b) => b.tracks.length > 0)
       : [];
-  let aggOffset = 0;
 
   return (
     <div className="flex h-full min-w-0 flex-col">
@@ -296,7 +320,7 @@ export function SearchPage(): React.JSX.Element {
       </div>
 
       <div className="flex items-center gap-1 border-b border-border px-4 py-2">
-        {TABS.map((t) => (
+        {tabs.map((t) => (
           <button
             key={t.key}
             type="button"
@@ -359,8 +383,6 @@ export function SearchPage(): React.JSX.Element {
         {/* 聚合模式：按源分组，行上带源标 */}
         {!error && aggGroups.length > 0 &&
           aggGroups.map((batch) => {
-            const start = aggOffset;
-            aggOffset += batch.tracks.length;
             return (
               <div key={batch.source}>
                 <div className="flex items-center gap-2 border-b border-border/60 bg-secondary/30 px-4 py-1.5">
@@ -377,7 +399,7 @@ export function SearchPage(): React.JSX.Element {
                     track={t}
                     active={currentTrackId === t.id}
                     badge={sourceLabel(batch.source)}
-                    onPlay={() => void playQueue(songs, start + i)}
+                    onPlay={() => void play(t)}
                   />
                 ))}
               </div>
@@ -392,7 +414,7 @@ export function SearchPage(): React.JSX.Element {
               key={`${t.id}-${i}`}
               track={t}
               active={currentTrackId === t.id}
-              onPlay={() => void playQueue(songs, i)}
+              onPlay={() => void play(t)}
             />
           ))}
 

@@ -7,7 +7,6 @@
 import type { Playlist, SourceId } from "@/types";
 import * as ipc from "@/services/ipc";
 import * as sourceApi from "@/source-scripts";
-import { parsePlaylistInput } from "@/lib/playlist-link";
 
 export interface PlaylistImportResult {
   /** 远端歌单详情（含名称/封面/播放量） */
@@ -27,7 +26,9 @@ export async function importPlaylist(
   text: string,
   forced?: SourceId,
 ): Promise<PlaylistImportResult> {
-  const parsed = parsePlaylistInput(text, forced);
+  // 2026-10-06：解析改走音源包的 parseSheet 入口（两端唯一权威实现），
+  // 老包环境下 source-scripts 内部自动回退到 PC 本地那份
+  const parsed = await sourceApi.parseSheetInput(text, forced);
   if (!parsed) {
     throw new Error("无法识别歌单链接或 ID，请检查输入或手动选择平台");
   }
@@ -81,7 +82,7 @@ export async function importPlaylistSongs(
   forced: SourceId | undefined,
   target: ImportSongsTarget,
 ): Promise<ImportSongsResult> {
-  const parsed = parsePlaylistInput(text, forced);
+  const parsed = await sourceApi.parseSheetInput(text, forced);
   if (!parsed) {
     throw new Error("无法识别歌单链接或 ID，请检查输入或手动选择平台");
   }

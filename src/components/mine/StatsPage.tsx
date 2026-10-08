@@ -17,6 +17,7 @@ import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
  */
 export function StatsPage(): React.JSX.Element {
   const navigate = useNavigate();
+  const play = usePlayerStore((s) => s.play);
   const playQueue = usePlayerStore((s) => s.playQueue);
 
   const [overview, setOverview] = useState<PlayOverview | null>(null);
@@ -110,12 +111,7 @@ export function StatsPage(): React.JSX.Element {
                   <li key={`${it.track.id}-${i}`}>
                     <button
                       type="button"
-                      onClick={() =>
-                        void playQueue(
-                          tracks.map((x) => x.track),
-                          i,
-                        )
-                      }
+                      onClick={() => void play(it.track)}
                       className="flex w-full items-center gap-3 border-b border-border/50 py-2 text-left text-sm transition-colors hover:bg-secondary"
                     >
                       <span className="w-5 shrink-0 text-xs tabular-nums text-muted-foreground">

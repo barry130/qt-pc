@@ -5,6 +5,10 @@
 //! - HTTP 状态 / Content-Type / 字节数三重校验，错误页不会被当作音频存下来。
 //! - 断点续传：暂停后保留 `.part`，继续时带 `Range` 从已有字节接着写。
 //! - 网络类错误自动退避重试（最多 3 次）；HTTP 4xx 属于确定性失败，直接报错。
+//! - 并发闸门：同时最多跑 N 个任务（N 默认 3，可选 1–6，见 `DEFAULT_CONCURRENCY`）。
+//!   批量下载不限流会被音源/CDN 判成爬虫封 IP —— LX Music 就栽过（issue #1992），
+//!   之后把默认并发压到 3 并在设置页限制 1–6。本项目封面代取（`qtres.rs` 的
+//!   `COVER_FETCH_CONCURRENCY`）也走同一套思路，这里补齐下载侧。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -12,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tauri::Emitter;
+use tokio::sync::Notify;
 
 use crate::db::Database;
 
@@ -25,52 +30,266 @@ pub mod status {
     pub const CANCELED: &str = "canceled";
 }
 
-/// 退避重试的最大尝试次数（含首次）。
+/// 退避重试的最大尝试次数（含首次）。注意：这是**单个任务**的重试次数，
+/// 与下面的并发上限是两回事，别混。
 const MAX_ATTEMPTS: u32 = 3;
+
+/// 同时下载数的默认值。3 是 LX Music 的默认值（它曾因批量下载被封 IP）。
+pub const DEFAULT_CONCURRENCY: usize = 3;
+
+/// 同时下载数的可选下限 / 上限（与设置页 UI、`cmd_set_download_concurrency` 一致）。
+pub const MIN_CONCURRENCY: usize = 1;
+pub const MAX_CONCURRENCY: usize = 6;
+
+/// 把任意来源（设置表里的字符串、命令参数）的并发数夹到合法范围。
+/// 单一真源：命令层、启动时读设置、测试都走这里，避免三处各写一遍 clamp。
+pub fn clamp_concurrency(n: usize) -> usize {
+    n.clamp(MIN_CONCURRENCY, MAX_CONCURRENCY)
+}
 
 /// 下载状态变化广播给前端的事件名（主窗口刷新列表 / 已下载标记用）。
 pub const EVENT_DOWNLOADS_CHANGED: &str = "downloads-changed";
 
-/// 进行中任务的取消旗标登记表。暂停与取消共用同一个旗标，
+/// 并发闸门。用「配置上限 + 在跑计数」两个整数表达并发，而不是直接拿
+/// `tokio::sync::Semaphore` 的许可数当上限：设置页允许**运行中**改并发数，
+/// 而信号量的许可被在跑任务借走后，下调时 `forget_permits` 只能收回**空闲**
+/// 许可，会出现「设成 1 了却还在跑 3 个、而且再也降不下来」的隐性失效。
+/// 这里改上限即刻生效，且不打断在跑的任务（不能凭空掐掉用户已在等的下载）。
+struct Gate {
+    state: Mutex<GateState>,
+    /// 空出并发位 / 上限变化 / 取消排队时叫醒等待者
+    wake: Notify,
+}
+
+struct GateState {
+    limit: usize,
+    running: usize,
+}
+
+impl Gate {
+    fn new(limit: usize) -> Self {
+        Self {
+            state: Mutex::new(GateState {
+                limit: clamp_concurrency(limit),
+                running: 0,
+            }),
+            wake: Notify::new(),
+        }
+    }
+
+    fn limit(&self) -> usize {
+        self.state.lock().unwrap().limit
+    }
+
+    fn running(&self) -> usize {
+        self.state.lock().unwrap().running
+    }
+
+    /// 改并发上限。下调不打断在跑的任务，只是它们结束后不再补位。
+    fn set_limit(&self, n: usize) {
+        self.state.lock().unwrap().limit = clamp_concurrency(n);
+        // 叫醒所有排队者重算：下调后可能已超额（它们得继续睡），
+        // 上调后有空位（它们应该立刻开工）。
+        self.wake.notify_waiters();
+    }
+
+    /// 尝试占一个并发位；满了返回 false。
+    fn try_enter(&self) -> bool {
+        let mut st = self.state.lock().unwrap();
+        if st.running < st.limit {
+            st.running += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn release(&self) {
+        {
+            let mut st = self.state.lock().unwrap();
+            // saturating_sub 兜底：即使计数被弄脏也不至于下溢成天文数字
+            st.running = st.running.saturating_sub(1);
+        }
+        // 只叫一个 —— 空出来的位子只够一个排队者
+        self.wake.notify_one();
+    }
+}
+
+/// 并发位凭证：持有它代表占着一个并发名额，drop 即归还。
+/// 下载中途失败 / 被取消 / panic 展开都会走到 `Drop`，并发位不会泄漏。
+pub struct Slot {
+    /// 该任务的取消旗标（暂停 / 取消共用），下载循环按它中止
+    pub cancel: Arc<AtomicBool>,
+    gate: Arc<Gate>,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.gate.release();
+    }
+}
+
+/// `enter` 的三种结果。把「满了」和「已取消」分开，是因为前者要接着排队，
+/// 后者必须立刻收工 —— 混成一个 bool 会让排队循环分不清该睡还是该退。
+enum Enter {
+    Entered(Slot),
+    Full,
+    Canceled,
+}
+
+/// 进行中任务的取消旗标登记表 + 并发闸门。暂停与取消共用同一个旗标，
 /// 区别只在收尾时 `.part` 留不留（由调用方按最终状态决定）。
-#[derive(Default)]
 pub struct DownloadManager {
     active: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    gate: Arc<Gate>,
+}
+
+impl Default for DownloadManager {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl DownloadManager {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_concurrency(DEFAULT_CONCURRENCY)
     }
 
-    /// 登记一个正在执行的任务并返回它的取消旗标。
+    pub fn with_concurrency(n: usize) -> Self {
+        Self {
+            active: Mutex::new(HashMap::new()),
+            gate: Arc::new(Gate::new(n)),
+        }
+    }
+
+    /// 登记一个正在执行（或正在排队）的任务并返回它的取消旗标。
+    ///
+    /// 已登记过的 id **复用**原旗标而不是换一个新的：同一个任务重复入队时，
+    /// 之前那次 `request_stop` 置起的旗标不能被悄悄抹掉，否则「取消」会失效。
     fn register(&self, id: &str) -> Arc<AtomicBool> {
-        let flag = Arc::new(AtomicBool::new(false));
         self.active
             .lock()
             .unwrap()
-            .insert(id.to_string(), Arc::clone(&flag));
-        flag
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
+    }
+
+    /// 预登记：在 `spawn` 之前先占住登记表，让任务从「已建任务」这一刻起就能被
+    /// 暂停 / 取消打断。否则 spawn 到 `begin` 之间那一小段窗口里 `request_stop`
+    /// 会返回 false（用户点了暂停却还在下）。返回的旗标由 `begin` 复用，
+    /// 所以这里置起的取消在排队时同样有效。
+    pub fn reserve(&self, id: &str) -> Arc<AtomicBool> {
+        self.register(id)
+    }
+
+    /// 撤销一次尚未进入 `begin` 的预登记（spawn 的任务在排队前就失败时用）。
+    pub fn release(&self, id: &str) {
+        self.unregister(id);
     }
 
     fn unregister(&self, id: &str) {
         self.active.lock().unwrap().remove(id);
     }
 
-    /// 请求停止（暂停 / 取消）。返回该任务当前是否真的在下载中。
+    /// 请求停止（暂停 / 取消）。返回该任务当前是否真的在下载（或正在排队）。
     pub fn request_stop(&self, id: &str) -> bool {
-        let map = self.active.lock().unwrap();
-        match map.get(id) {
-            Some(flag) => {
-                flag.store(true, Ordering::SeqCst);
-                true
+        let hit = {
+            let map = self.active.lock().unwrap();
+            match map.get(id) {
+                Some(flag) => {
+                    flag.store(true, Ordering::SeqCst);
+                    true
+                }
+                None => false,
             }
-            None => false,
+        };
+        if hit {
+            // 叫醒还在排队的等待者，让它们立刻看到旗标收工。
+            // 不叫醒也不会出错（一旦有任务结束腾出位置，排队者同样会看到旗标），
+            // 但那样「取消一个排队中的任务」要等下一个下载结束才生效，体感是卡住。
+            self.gate.wake.notify_waiters();
+        }
+        hit
+    }
+
+    /// 任务是否已登记（在下载**或**在排队）。排队中也算 —— 否则连点两次
+    /// 「继续」会往闸门里排两个重复任务，白白占一个并发位。
+    pub fn is_active(&self, id: &str) -> bool {
+        self.active.lock().unwrap().contains_key(id)
+    }
+
+    /// 排队等一个并发位。返回 `None` = 任务在排队期间被暂停 / 取消，
+    /// 调用方不得再启动它（登记表已由本函数清理，调用方无需再 unregister）。
+    pub async fn begin(self: &Arc<Self>, id: &str) -> Option<Slot> {
+        let cancel = self.register(id);
+        // 排队前先看一次：任务可能在建任务与 spawn 之间就被暂停了
+        if cancel.load(Ordering::SeqCst) {
+            self.unregister(id);
+            return None;
+        }
+        loop {
+            match self.enter(&cancel) {
+                Enter::Entered(slot) => return Some(slot),
+                Enter::Canceled => {
+                    self.unregister(id);
+                    return None;
+                }
+                Enter::Full => {}
+            }
+            // 满了：注册等待者再睡。`enable()` 必须在 `await` 之前 ——
+            // 通知若落在「建 future」与「开始等」之间就会被丢掉，排队任务会一直
+            // 睡到某个下载结束才醒（结果仍正确，但「取消排队中的任务」就不即时了）。
+            let notified = self.gate.wake.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            // 注册完再查一次：取消（或腾位）可能恰好发生在 enable() 之前，
+            // 那次通知我们没登记、收不到，只能靠自己重查补上。
+            match self.enter(&cancel) {
+                Enter::Entered(slot) => return Some(slot),
+                Enter::Canceled => {
+                    self.unregister(id);
+                    return None;
+                }
+                Enter::Full => {}
+            }
+            notified.await;
         }
     }
 
-    pub fn is_active(&self, id: &str) -> bool {
-        self.active.lock().unwrap().contains_key(id)
+    /// 抢一个并发位，并确认自己没被取消。
+    fn enter(&self, cancel: &Arc<AtomicBool>) -> Enter {
+        if cancel.load(Ordering::SeqCst) {
+            return Enter::Canceled;
+        }
+        if !self.gate.try_enter() {
+            return Enter::Full;
+        }
+        // 抢到位子后再确认一次：可能刚好在 try_enter 与这次检查之间被取消，
+        // 那就把位子还回去 —— 绝不能带着「已取消」的旗标开始下载。
+        if cancel.load(Ordering::SeqCst) {
+            self.gate.release();
+            return Enter::Canceled;
+        }
+        Enter::Entered(Slot {
+            cancel: Arc::clone(cancel),
+            gate: Arc::clone(&self.gate),
+        })
+    }
+
+    /// 改并发上限（设置页改「同时下载数」时调用）。
+    pub fn set_concurrency(&self, n: usize) {
+        self.gate.set_limit(n);
+    }
+
+    /// 当前配置的并发上限。
+    pub fn concurrency(&self) -> usize {
+        self.gate.limit()
+    }
+
+    /// 当前真正在下载的任务数（不含排队的）。
+    pub fn running(&self) -> usize {
+        self.gate.running()
     }
 }
 
@@ -88,6 +307,18 @@ pub enum DownloadOutcome {
 pub struct DownloadJob {
     pub task_id: String,
     pub url: String,
+    /// 取这个地址时要带的 Referer（音源包按源声明，空串 = 不发）。
+    ///
+    /// 下载器自己向 CDN 取字节，拿不到"声明它的那一侧"；B 站部分 CDN 节点
+    /// 没有 Referer 直接 403 text/html，而 403 不在 `status_retryable` 里，
+    /// 会被判 Fatal —— 表现为"取链成功但下载必失败"。
+    pub referer: String,
+    /// 取链时 Range 预检实测到的文件总字节数（音源包 `probeMedia` 量出来的；
+    /// `None` = 当时没读到 `Content-Range` 的 total）。
+    ///
+    /// 只在响应不带 `Content-Length`（分块传输 / 服务端省头）时拿来当进度
+    /// 分母的兜底，不参与"下载是否完整"的判定 —— 那个判定只认实际字节数。
+    pub declared_size: Option<u64>,
     /// 最终成品路径
     pub final_path: PathBuf,
     /// `.part` 临时路径（断点续传就续写它）
@@ -138,13 +369,37 @@ enum AttemptError {
 }
 
 /// 执行一个下载任务（自动重试）。返回结果前会把状态写回数据库。
+///
+/// 并发闸门就在这个函数的入口：拿不到并发位就排队等着。放在这里而不是
+/// 两个调用点各自 acquire，是为了让「启动下载」只有一条路径 ——
+/// 漏改一处就等于闸门失效。
 pub async fn run_job(
     app: tauri::AppHandle,
     db: Arc<Database>,
     manager: Arc<DownloadManager>,
     job: DownloadJob,
 ) -> DownloadOutcome {
-    let cancel = manager.register(&job.task_id);
+    match manager.begin(&job.task_id).await {
+        // 排队期间任务已登记（`is_active` 为真），所以暂停 / 取消能打断排队中的任务；
+        // 若在排队时被取消，命令层已写好终态（paused / canceled），这里什么都不写。
+        Some(slot) => run_job_with_slot(app, db, manager, job, slot).await,
+        None => DownloadOutcome::Stopped,
+    }
+}
+
+/// 已持有并发位时的执行入口。
+///
+/// 「继续 / 重试」那条路径要**先取址再下载**，取址本身也是对音源的一次请求，
+/// 所以由调用方先 `begin` 拿到位子、连取址一起算进闸门，再调这里；
+/// 这样批量继续 20 个任务不会先把 20 个取址请求同时打出去。
+pub async fn run_job_with_slot(
+    app: tauri::AppHandle,
+    db: Arc<Database>,
+    manager: Arc<DownloadManager>,
+    job: DownloadJob,
+    slot: Slot,
+) -> DownloadOutcome {
+    let cancel = Arc::clone(&slot.cancel);
     let mut last_err = String::from("下载失败");
     let mut outcome = DownloadOutcome::Failed(last_err.clone());
 
@@ -205,7 +460,10 @@ pub async fn run_job(
         DownloadOutcome::Stopped => {}
     }
 
+    // 先摘登记表再还并发位：反过来的话，排队者可能在新任务已开工的同时
+    // 被旧任务的 unregister 摘掉旗标，取消就落到空处了。
     manager.unregister(&job.task_id);
+    drop(slot);
     let _ = app.emit(EVENT_DOWNLOADS_CHANGED, ());
     outcome
 }
@@ -234,6 +492,11 @@ async fn attempt_once(
         .build()
         .map_err(|e| AttemptError::Fatal(format!("初始化下载客户端失败: {e}")))?;
     let mut req = client.get(&job.url);
+    // Referer 由音源包下发（空串 = 该源没声明，不发这个头）。
+    // B 站部分 CDN 节点无它直接 403，403 不在 status_retryable 里 → 会被判 Fatal。
+    if !job.referer.is_empty() {
+        req = req.header("Referer", &job.referer);
+    }
     if offset > 0 {
         req = req.header("Range", format!("bytes={offset}-"));
     }
@@ -270,7 +533,13 @@ async fn attempt_once(
     }
 
     let remaining = resp.content_length().unwrap_or(0);
-    let total = if remaining > 0 { offset + remaining } else { 0 };
+    let total = if remaining > 0 {
+        offset + remaining
+    } else {
+        // 服务端没给 Content-Length（分块传输 / 省头）时用取链预检量到的总长兜底，
+        // 好让下载页仍有进度条；量不到就还是 0（未知，只显示已下载字节）。
+        job.declared_size.unwrap_or(0)
+    };
     if total > 0 {
         let task_id = job.task_id.clone();
         let _ = with_db(db, move |c| {
@@ -379,6 +648,8 @@ async fn with_db<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
 
     #[test]
     fn part_path_is_suffixed_next_to_target() {
@@ -431,7 +702,161 @@ mod tests {
         assert!(m.is_active("t1"));
         assert!(m.request_stop("t1"));
         assert!(flag.load(Ordering::SeqCst), "旗标应被置起");
+        // 重复登记必须复用同一个旗标：换一个新的会把已置起的取消旗标悄悄抹掉，
+        // 表现为「暂停了却还在下」。
+        let again = m.register("t1");
+        assert!(Arc::ptr_eq(&flag, &again));
+        assert!(again.load(Ordering::SeqCst));
         m.unregister("t1");
         assert!(!m.is_active("t1"));
+    }
+
+    #[test]
+    fn concurrency_is_clamped_to_supported_range() {
+        assert_eq!(DEFAULT_CONCURRENCY, 3);
+        assert_eq!(clamp_concurrency(0), MIN_CONCURRENCY);
+        assert_eq!(clamp_concurrency(1), 1);
+        assert_eq!(clamp_concurrency(6), MAX_CONCURRENCY);
+        assert_eq!(clamp_concurrency(99), MAX_CONCURRENCY);
+        assert_eq!(DownloadManager::new().concurrency(), DEFAULT_CONCURRENCY);
+        assert_eq!(DownloadManager::with_concurrency(0).concurrency(), 1);
+    }
+
+    /// 闸门核心行为：上限为 2 时第 3 个任务必须等待，而不是一起冲上去。
+    #[tokio::test]
+    async fn gate_allows_only_configured_concurrency() {
+        let m = Arc::new(DownloadManager::with_concurrency(2));
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for i in 0..3 {
+            let m = Arc::clone(&m);
+            let running = Arc::clone(&running);
+            let peak = Arc::clone(&peak);
+            handles.push(tokio::spawn(async move {
+                let slot = m.begin(&format!("t{i}")).await?;
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                // 模拟一次真实的下载耗时（不碰网络）
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                running.fetch_sub(1, Ordering::SeqCst);
+                drop(slot);
+                Some(())
+            }));
+        }
+        // 前两个在跑、第三个还在排队 —— 这一步就是「第 3 个必须等待」的断言
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(m.running(), 2, "上限 2 时最多只该有 2 个在跑");
+        for h in handles {
+            assert!(h.await.unwrap().is_some(), "三个任务最终都该拿到并发位");
+        }
+        assert_eq!(peak.load(Ordering::SeqCst), 2, "第 3 个必须等前两个之一结束");
+        assert_eq!(m.running(), 0, "全部结束后并发位必须归还");
+    }
+
+    /// 并发位凭证靠 `Drop` 归还：失败（提前 return）与取消（置旗标）两条路径
+    /// 都不能泄漏并发位，否则下载几次之后闸门就永久卡死。
+    #[tokio::test]
+    async fn slot_is_returned_after_failure_and_cancel() {
+        let m = Arc::new(DownloadManager::with_concurrency(1));
+        let a = m.begin("a").await.expect("空闸门应立即拿到位子");
+        assert_eq!(m.running(), 1);
+        // 失败路径：任务中途出错直接 return，凭证随之 drop
+        drop(a);
+        assert_eq!(m.running(), 0, "失败后并发位必须归还");
+
+        // 取消路径：旗标置起后凭证照样归还
+        let b = m.begin("b").await.expect("空出来的位子应立即拿到");
+        assert!(m.request_stop("b"), "在下载的任务必须能被取消");
+        assert!(b.cancel.load(Ordering::SeqCst));
+        drop(b);
+        assert_eq!(m.running(), 0, "取消后并发位必须归还");
+
+        // 归还干净了：闸门仍能正常工作
+        let c = m.begin("c").await.expect("归还后应能再拿到位子");
+        drop(c);
+        assert_eq!(m.running(), 0);
+    }
+
+    /// 取消一个**还在排队、尚未拿到并发位**的任务：它不得启动，也不占并发位。
+    #[tokio::test]
+    async fn queued_task_can_be_canceled_before_it_starts() {
+        let m = Arc::new(DownloadManager::with_concurrency(1));
+        let held = m.begin("running").await.expect("占住唯一的并发位");
+
+        let m2 = Arc::clone(&m);
+        let queued = tokio::spawn(async move { m2.begin("queued").await });
+        // 让排队任务先跑到「登记完、正在等」的位置
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert!(
+            m.is_active("queued"),
+            "排队中的任务也必须在登记表里，否则暂停 / 取消够不着它"
+        );
+        assert_eq!(m.running(), 1, "排队中的任务不占并发位");
+
+        assert!(m.request_stop("queued"), "排队中的任务必须能被取消");
+        let slot = queued.await.unwrap();
+        assert!(slot.is_none(), "排队中被取消的任务不得启动");
+        assert!(!m.is_active("queued"), "被取消后应从登记表摘除");
+        assert_eq!(m.running(), 1, "被取消的排队任务不该占位子");
+
+        // 取消不会影响正主
+        drop(held);
+        assert_eq!(m.running(), 0);
+    }
+
+    /// 提高上限要立刻叫醒排队者（否则用户把 1 改成 6 之后毫无反应）。
+    #[tokio::test]
+    async fn raising_limit_wakes_queued_task() {
+        let m = Arc::new(DownloadManager::with_concurrency(1));
+        let held = m.begin("a").await.expect("占住唯一的并发位");
+
+        let m2 = Arc::clone(&m);
+        let queued = tokio::spawn(async move { m2.begin("b").await });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(m.running(), 1, "上限 1 时第 2 个只能排队");
+
+        m.set_concurrency(2);
+        let slot = queued
+            .await
+            .unwrap()
+            .expect("提高上限后排队任务应立刻开工");
+        assert_eq!(m.running(), 2);
+        drop(slot);
+        drop(held);
+        assert_eq!(m.running(), 0);
+    }
+
+    /// 下调上限不掐断在跑的任务，但后续补位立刻按新上限来。
+    #[tokio::test]
+    async fn lowering_limit_keeps_running_and_applies_to_next() {
+        let m = Arc::new(DownloadManager::with_concurrency(3));
+        let a = m.begin("a").await.unwrap();
+        let b = m.begin("b").await.unwrap();
+        let c = m.begin("c").await.unwrap();
+        assert_eq!(m.running(), 3);
+
+        m.set_concurrency(1);
+        assert_eq!(m.concurrency(), 1);
+        assert_eq!(m.running(), 3, "下调上限不该掐断用户已经在等的下载");
+
+        drop(a);
+        drop(b);
+        assert_eq!(m.running(), 1);
+
+        // 已经到新上限了：第 4 个必须排队
+        let m2 = Arc::clone(&m);
+        let queued = tokio::spawn(async move { m2.begin("d").await });
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(m.running(), 1);
+
+        drop(c);
+        let slot = queued
+            .await
+            .unwrap()
+            .expect("腾出位子后排队任务应开工");
+        assert_eq!(m.running(), 1);
+        drop(slot);
+        assert_eq!(m.running(), 0);
     }
 }

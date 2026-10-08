@@ -1,11 +1,14 @@
 import { memo, useCallback, useEffect, useRef } from "react";
 import { useNavigate } from "@tanstack/react-router";
-import { ListEnd, Play } from "lucide-react";
+import { Ban, ListEnd, Play } from "lucide-react";
 import type { Track } from "@/types";
 import { qtresCoverUrl, formatTime } from "@/lib/lrc";
 import { usePlayerStore } from "@/stores/player";
 import { trackDbId, useDownloadsStore } from "@/stores/downloads";
+import { useDislikesStore } from "@/stores/dislikes";
+import { useDislikeFlags } from "@/hooks/useDislikeFlags";
 import * as ipc from "@/services/ipc";
+import { errMsg } from "@/lib/utils";
 import { AddToPlaylistButton } from "../mine/AddToPlaylistButton";
 import { DownloadButton } from "../mine/DownloadButton";
 import { LocalCover } from "../library/LocalCover";
@@ -13,8 +16,9 @@ import { RowActions } from "../common/RowActions";
 
 /**
  * 曲目列表（发现类页面共用：榜单详情 / 歌单详情 / 新歌速递 / 收藏 / 历史 / 本地）。
- * 点击整行走 `playQueue(tracks, i)`，把当前列表整体入队并从该首开始播放
- * （DESIGN §11.2：列表播放语义，而不是单曲替换队列）。
+ * 点击整行走 `play(track)`：把这一首加入播放列表并播放 —— 队里已有它就播原来那条，
+ * 否则追加到队尾；**不清空**正在排队的整张列表。整体入队（替换队列）只在页面顶部的
+ * 「播放全部」按钮上（`playQueue(tracks, 0)`，DESIGN §11.2 的列表播放语义）。
  *
  * 传了 `onRemove` 时每行右侧出现「移除」按钮（收藏、我的歌单等可编辑列表用）；
  * 为此行容器用 `div[role=button]` 而非 `button`，避免按钮嵌套。
@@ -84,10 +88,13 @@ export function TrackList(props: {
   const selection = selectionProp ?? local?.selection;
   // 本地曲库页的朴素行：无封面、无下载标记（对齐下载管理的行模板）
   const plainRow = local?.plainRow === true;
-  const playQueue = usePlayerStore((s) => s.playQueue);
+  const play = usePlayerStore((s) => s.play);
   const currentTrackId = usePlayerStore((s) => s.state?.trackId ?? null);
   const downloaded = useDownloadsStore((s) => s.downloaded);
   const active = useDownloadsStore((s) => s.active);
+  const rulesVersion = useDislikesStore((s) => s.version);
+  // 哪些行中了屏蔽规则：一次 IPC 查整张列表（判定规则在 Rust 侧，前端猜不出来）
+  const dislikeFlags = useDislikeFlags(tracks, rulesVersion);
 
   /**
    * 回调放 ref、只暴露 `useCallback` 包出来的稳定引用：调用方（各页面）几乎都在
@@ -113,6 +120,38 @@ export function TrackList(props: {
   const handleToggle = useCallback((id: string) => latest.current.onToggle?.(id), []);
   const handleChanged = useCallback(() => latest.current.onChanged?.(), []);
   const handleError = useCallback((msg: string) => latest.current.onError?.(msg), []);
+  // 行Hover 一屏通常没有几条不同的 suspicion, 但 Hover 回调必须落到 set-ipc 上
+  const banSong = useDislikesStore((s) => s.banSong);
+  const banSinger = useDislikesStore((s) => s.banSinger);
+  const unbanSong = useDislikesStore((s) => s.unbanSong);
+  const handleDislikeError = useCallback((msg: string) => {
+    latest.current.onError?.(msg);
+  }, []);
+  const handleBanSong = useCallback(
+    (t: Track) => {
+      banSong(t).catch((err) => handleDislikeError(errMsg(err)));
+    },
+    [banSong, handleDislikeError],
+  );
+  const handleBanSinger = useCallback(
+    (singer: string) => {
+      banSinger(singer).catch((err) => handleDislikeError(errMsg(err)));
+    },
+    [banSinger, handleDislikeError],
+  );
+  const handleUnban = useCallback(
+    (t: Track) => {
+      unbanSong(t)
+        .then((ok) => {
+          if (!ok) {
+            // 重启后 / 换设备进了同一个账号的心净列表 → 本地查不到规则 id
+            latest.current.onError?.("这条屏蔽规则不在这台设备上（请在设置页管理）");
+          }
+        })
+        .catch((err) => handleDislikeError(errMsg(err)));
+    },
+    [unbanSong, handleDislikeError],
+  );
 
   if (tracks.length === 0) {
     return (
@@ -132,14 +171,17 @@ export function TrackList(props: {
             key={`${t.id}-${i}`}
             track={t}
             index={i}
-            tracks={tracks}
             active={currentTrackId === t.id}
             downloaded={isDownloaded}
             downloading={!isDownloaded && active.has(dbId)}
+            disliked={dislikeFlags[i] === true}
             showIndex={showIndex}
             plainRow={plainRow}
             // 本地行：悬停按钮换成「播放」，行尾带定位 / 删除
             localRow={local !== undefined && t.platform === "local"}
+            onBanSong={handleBanSong}
+            onBanSinger={handleBanSinger}
+            onUnban={handleUnban}
             showAddToPlaylist={showAddToPlaylist}
             showDownload={showDownload}
             selectionIds={selection?.ids}
@@ -150,7 +192,7 @@ export function TrackList(props: {
             onRemove={handleRemove}
             onChanged={handleChanged}
             onError={handleError}
-            playQueue={playQueue}
+            play={play}
           />
         );
       })}
@@ -161,14 +203,24 @@ export function TrackList(props: {
 interface TrackRowProps {
   track: Track;
   index: number;
-  /** 整个列表（点击整行 = 从这首起播放当前列表）；引用在列表变化前保持稳定 */
-  tracks: Track[];
+  /**
+   * 整个列表（保留仅为 `memo` 的引用稳定性：点击整行只播这一首，不再整列表入队）。
+   */
+  tracks?: Track[];
   active: boolean;
   downloaded: boolean;
   downloading: boolean;
   showIndex: boolean;
   plainRow: boolean;
   localRow: boolean;
+  /** 这一行是否命中了屏蔽规则（淡化显示 + 行尾按钮变「取消屏蔽」） */
+  disliked: boolean;
+  /** 屏蔽这首歌 */
+  onBanSong: (track: Track) => void;
+  /** 屏蔽这首歌的歌手（整串歌手一起） */
+  onBanSinger: (singer: string) => void;
+  /** 取消这首的屏蔽 */
+  onUnban: (track: Track) => void;
   showAddToPlaylist: boolean;
   showDownload: boolean;
   /** 批量选择集合；省略则不显示复选框 */
@@ -178,20 +230,23 @@ interface TrackRowProps {
   onRemove: (track: Track) => void;
   onChanged: () => void;
   onError: (msg: string) => void;
-  playQueue: (tracks: Track[], index: number) => Promise<void> | void;
+  play: (track: Track) => Promise<void>;
 }
 
 const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element {
   const {
     track: t,
     index: i,
-    tracks,
     active: activeRow,
     downloaded: isDownloaded,
     downloading: isDownloading,
     showIndex,
     plainRow,
     localRow,
+    disliked,
+    onBanSong,
+    onBanSinger,
+    onUnban,
     showAddToPlaylist,
     showDownload,
     selectionIds,
@@ -200,7 +255,7 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
     onRemove,
     onChanged,
     onError,
-    playQueue,
+    play,
   } = props;
   const navigate = useNavigate();
   const cover = qtresCoverUrl(t.picUrl);
@@ -208,16 +263,18 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
     <div
       role="button"
       tabIndex={0}
-      onClick={() => void playQueue(tracks, i)}
+      onClick={() => void play(t)}
       onKeyDown={(e) => {
         if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
-          void playQueue(tracks, i);
+          void play(t);
         }
       }}
       className={`cv-row group flex w-full cursor-pointer items-center gap-3 px-4 py-2 text-left transition-colors hover:bg-secondary ${
         activeRow ? "bg-secondary/60" : ""
-      }`}
+        // 被屏蔽的行压暗：还能点、还能播（规则只是「别自动出现」），
+        // 但要让人一眼看出它不在常规轮换里
+      } ${disliked ? "opacity-40" : ""}`}
     >
       {/* 左侧固定槽位：批量选择时放复选框，否则放序号 / 播放态均衡条。
           复选框放在槽位里（而不是另起一列），否则槽位空着还要多占一份
@@ -269,7 +326,8 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
           )}
         </div>
         <div className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
-          {/* 歌手 / 专辑可点进对应页面（音源没有按 id 的接口，用名字搜索闭环）。
+          {/* 歌手 / 专辑可点进对应页面（曲目上只有歌手名没有歌手 id，这里是名字搜索闭环：
+               ArtistPage 没有 ?name= 时把 $id 位置的名字当名字用、不传 id）。
               本地曲目不走在线搜索，退化成纯文本。 */}
           {t.singer ? (
             t.platform === "local" ? (
@@ -330,7 +388,7 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
           onClick={(e) => {
             e.stopPropagation();
             if (localRow) {
-              void playQueue(tracks, i);
+              void play(t);
             } else {
               void ipc.queueAddNext(t);
             }
@@ -350,6 +408,28 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
           className="rounded p-1 text-muted-foreground transition-colors hover:bg-background hover:text-foreground"
         >
           <ListEnd className="h-3.5 w-3.5" />
+        </button>
+        {/* 屏蔽：已命中规则时按钮变成「取消屏蔽」，让上一次误操作能就地回滚。
+            屏蔽歌手的入口藏在 alt 点击里 —— 行已经很挤了，而屏蔽歌手是不可逆的
+            重操作，给它一个裸露按钮会让人手滑。 */}
+        <button
+          type="button"
+          title={disliked ? "取消屏蔽" : "屏蔽这首歌"}
+          aria-label={disliked ? "取消屏蔽" : "屏蔽这首歌"}
+          data-testid={disliked ? "row-unban" : "row-ban"}
+          onClick={(e) => {
+            e.stopPropagation();
+            if (disliked) {
+              onUnban(t);
+            } else if (e.altKey && t.singer) {
+              onBanSinger(t.singer);
+            } else {
+              onBanSong(t);
+            }
+          }}
+          className="rounded p-1 text-muted-foreground transition-colors hover:bg-background hover:text-foreground"
+        >
+          <Ban className="h-3.5 w-3.5" />
         </button>
       </div>
       <span className="shrink-0 text-xs tabular-nums text-muted-foreground">

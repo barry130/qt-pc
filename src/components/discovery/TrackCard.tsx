@@ -4,7 +4,7 @@ import { qtresCoverUrl } from "@/lib/lrc";
 
 /**
  * 横向歌曲卡片（首页「新歌速递」）。
- * 点击整卡从该曲开始播放整组（playQueue），hover 显示播放按钮。
+ * 点击整卡只播这一首（播放列表只留它），hover 显示播放按钮。
  * 封面经 qtres:// 走 Rust 侧 Range 透传（DESIGN §6.13，带 Referer 防盗链）。
  */
 export function TrackCard(props: {

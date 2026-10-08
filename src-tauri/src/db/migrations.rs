@@ -242,6 +242,8 @@ pub(crate) const MIGRATIONS: &[(i64, &str)] = &[
     (9, V9),
     (10, V10),
     (11, V11),
+    (12, V12),
+    (13, V13),
 ];
 
 const V1: &str = r#"
@@ -455,8 +457,49 @@ CREATE TABLE stat_queue (
 );
 "#;
 
+/// v12：不喜欢列表（屏蔽规则）。
+///
+/// 对齐 lx-music-desktop 的 `dislike_list`，但修掉它两个坑：
+/// - LX 的 delete / update / clear dbHelper 被整体注释掉了，规则**只能追加或整体覆盖**，
+///   用户无法逐条删除；这里 `id` 是真主键，逐条删除是一等公民；
+/// - LX 的匹配是纯 `lower + trim`，没有任何归一化，全角/繁体/多歌手写法差一点就漏匹配；
+///   这里 `name` / `singer` 两列存**归一化后的匹配键**（算法见 `db/store/dislikes.rs`
+///   的 `normalize_key`），`*_raw` 列只用于设置页回显用户当初看到的那串字。
+///
+/// 这里**刻意不加** `REFERENCES tracks(id)`：屏蔽规则描述的是「这首歌我不想听」，
+/// 与它有没有进过曲库无关；跟着 tracks 级联会在曲目被清理时把用户的偏好一起删掉。
+const V12: &str = r#"
+CREATE TABLE dislike_rules (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind       TEXT NOT NULL CHECK (kind IN ('song', 'singer')),
+  name       TEXT NOT NULL,
+  name_raw   TEXT NOT NULL,
+  singer     TEXT NOT NULL DEFAULT '',
+  singer_raw TEXT NOT NULL DEFAULT '',
+  created_at INTEGER NOT NULL,
+  UNIQUE (kind, name, singer)
+);
+"#;
+
+/// V13：歌词正文的「用户手动挑的」标记。
+///
+/// 背景：自动取词只认当前源（或跨源兜底目标源）上同一首歌的词，源站把词挂到别的
+/// 版本（live / 翻唱 / 专辑版）时就会拿到空词或错词，此时用户会在播放页手动搜一个
+/// 候选换上。换上的词落库后有个缺口：`lyrics` 表原来只有正文和 `source`，看不出
+/// 这行是「自动取的」还是「用户挑的」，取词链路因此只能把库里的词当断网兜底——
+/// 联网时照旧打源站，拿回源站那份错词，用户的选择等于白换（桌面歌词窗口是独立
+/// WebView，自己走一遍取词链路，表现就是「播放页换了、桌面歌词没换」）。
+///
+/// 加一列 `manual` 把两类行分开：手动挑的写 1，自动取的写 0。取词链路开头先看这列，
+/// 是 1 就直接回读、连源站都不打——用户的选择优先级高于源站，且跨会话/跨窗口一致。
+///
+/// `NOT NULL DEFAULT 0`：老行自动归为「自动取的」，语义不变。
+const V13: &str = r#"
+ALTER TABLE lyrics ADD COLUMN manual INTEGER NOT NULL DEFAULT 0;
+"#;
+
 /// 当前程序支持的最新 schema 版本。
-pub(crate) const CURRENT_VERSION: i64 = 11;
+pub(crate) const CURRENT_VERSION: i64 = 13;
 
 /// 建表 schema_migrations 并把所有未应用版本按序执行。
 pub(crate) fn run(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -930,6 +973,7 @@ COMMIT;"
             "play_queue",
             "search_history",
             "stat_queue",
+            "dislike_rules",
         ] {
             assert!(names.iter().any(|n| n == table), "缺少表 {table}");
         }

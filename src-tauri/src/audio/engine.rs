@@ -38,7 +38,17 @@ use super::state::{PlayMode, PlaybackStateSnapshot, PlaybackStatus, Quality};
 #[serde(tag = "kind", rename_all = "camelCase")]
 #[allow(non_snake_case)]
 pub enum PlaySource {
-    Online { url: String, fetchedAt: u64 },
+    Online {
+        url: String,
+        fetchedAt: u64,
+        /// 取这个地址时要带的 Referer（音源包按源声明，空串 = 不发）。
+        ///
+        /// 由音源包下发、随地址一起缓存：range_reader 自己向 CDN 取字节，
+        /// 拿不到"声明它的那一侧"；B 站部分 CDN 节点没有它直接 403。
+        /// `serde(default)` 让旧前端/旧缓存快照（没有这个字段）仍能反序列化。
+        #[serde(default)]
+        referer: String,
+    },
     Local { path: String },
 }
 
@@ -72,6 +82,9 @@ pub enum AudioCmd {
         tracks: Vec<Track>,
         index: usize,
     },
+    /// 单曲播放：**不替换队列** —— 队里已有这首（同 id + 同 platform）就播它原来那条，
+    /// 否则追加到队尾再播。用户点某一首不该冲掉正在排队的整张列表。
+    PlayTrack(Box<Track>),
     /// 下一首播放：插到当前曲目之后（不打断当前播放）
     AddNext(Box<Track>),
     /// 加入队尾（不打断当前播放）
@@ -171,6 +184,9 @@ pub enum AudioCmd {
         /// 软重载（重新挂源）也拉不动它（没有回调来拉样本）→ 必须直接重建输出流。
         fatal: bool,
     },
+    /// 不喜欢列表变了（加/删/清空）：重新装载内存镜像。
+    /// 屏蔽规则一改就把自动切歌立刻对齐，不用等下一轮播完。
+    ReloadDislikes,
     Shutdown,
 }
 
@@ -369,6 +385,14 @@ struct EngineInner {
     cache_limit_mb: u64,
     /// 位置冻结看门狗：回调线程死了 / 解码卡住时唯一的破裂信号（见 StallWatch）
     watch: StallWatch,
+    /// 不喜欢列表的内存镜像（`db::store::DislikeMatcher`）。
+    ///
+    /// **为什么是内存镜像而不是每次现查库**：`advance` 在播放线程里跑，
+    /// 每次自然播完切歌都 `db.with()` 会引入 SQLite 锁竞争 —— 而这条路径是
+    /// 「每首歌播完都要走一次」的热路径。规则改动由 `ReloadDislikes` 命令推过来，
+    /// 改的又是几十条的小表，成本可以忽略。库不可用时保持空集：**宁可多放一首，
+    /// 也不能把自动切歌弄坏**。
+    dislikes: crate::db::store::DislikeMatcher,
 }
 
 impl EngineInner {
@@ -395,6 +419,23 @@ impl EngineInner {
             0.0
         } else {
             st.volume.clamp(0.0, 1.0)
+        }
+    }
+
+    /// 从库里重装不喜欢列表的内存镜像。
+    ///
+    /// 失败时保留旧集合（而不是清空）：一次偶发的 SQLite 忙不该让刚屏蔽的歌
+    /// 立刻又冒出来。
+    fn reload_dislikes(&mut self) {
+        if let Some(db) = &self.db {
+            match db.with(crate::db::store::DislikeMatcher::load) {
+                Ok(set) => {
+                    let n = set.len();
+                    self.dislikes = set;
+                    log::info!("[dislike] 已装载 {n} 条屏蔽规则");
+                }
+                Err(e) => log::warn!("[dislike] 装载不喜欢列表失败，保留旧集合: {e}"),
+            }
         }
     }
 
@@ -728,6 +769,7 @@ fn run_engine(deps: EngineDeps) {
         // 真正的值从 settings 恢复；这里与 cache::DEFAULT_AUDIO_CACHE_LIMIT_MB 对齐
         cache_limit_mb: crate::cache::DEFAULT_AUDIO_CACHE_LIMIT_MB,
         watch: StallWatch::default(),
+        dislikes: crate::db::store::DislikeMatcher::empty(),
     };
 
     let mut inner = inner;
@@ -799,6 +841,8 @@ fn run_engine(deps: EngineDeps) {
             inner.cache_limit_mb = crate::cache::parse_cache_limit_mb(saved.as_deref());
         }
     }
+    // 装载不喜欢列表（空 Tableau = 什么都不屏蔽）
+    inner.reload_dislikes();
     // 启动先修剪一遍缓存（超限时清最旧；后台线程做，不挡引擎起播）
     spawn_cache_prune(&inner);
     // 心跳用：上次补发全量快照的时刻（防前端漏收事件后状态停死）
@@ -1081,6 +1125,28 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             }
             inner.persist_queue();
         }
+        AudioCmd::PlayTrack(track) => {
+            // 与 PlayAt 同源：用户明确点了某一首 = 新一轮手动播放，
+            // 重开熔断、清失败记录、给这首歌第二次机会。
+            // 不碰 track_quality（那是「这首单独指定音质」，与队列无关）。
+            let track = {
+                let mut q = inner.queue.lock().unwrap();
+                let i = q.append_or_find(*track);
+                q.index = Some(i);
+                q.current().cloned()
+            };
+            inner.sync_queue_to_snapshot();
+            inner.queue_emit();
+            if let Some(track) = track {
+                inner.auto_next = true;
+                inner.fail_streak = 0;
+                inner.stall_retry = 0;
+                inner.watch.clear();
+                inner.failed_tracks.remove(&track.id);
+                play_queue_track(inner, track);
+            }
+            inner.persist_queue();
+        }
         AudioCmd::PlayAt(index) => {
             let track = {
                 let mut q = inner.queue.lock().unwrap();
@@ -1104,6 +1170,9 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                 play_queue_track(inner, track);
             }
             inner.persist_queue();
+        }
+        AudioCmd::ReloadDislikes => {
+            inner.reload_dislikes();
         }
         AudioCmd::Next => advance(inner, false),
         AudioCmd::Previous => go_previous(inner),
@@ -1519,7 +1588,7 @@ fn advance(inner: &mut EngineInner, auto: bool) {
     let mode = inner.state.read().unwrap().play_mode;
     let next = {
         let q = inner.queue.lock().unwrap();
-        q.next_index(mode, auto)
+        q.next_index_skipping(mode, auto, |t| inner.dislikes.matches(t))
     };
     log::info!("[queue] advance(auto={auto}, mode={mode:?}) -> {next:?}");
     match next {
@@ -1987,7 +2056,10 @@ impl LoadJob {
         )
         .await;
         match resolved {
-            Ok((url, fetched_at)) => {
+            Ok(hit) => {
+                let url = hit.url;
+                let referer = hit.referer;
+                let fetched_at = hit.fetched_at;
                 log::info!(
                     "[queue] resolve ok track={} url_host={}",
                     self.track.id,
@@ -2002,6 +2074,7 @@ impl LoadJob {
                 let source = PlaySource::Online {
                     url,
                     fetchedAt: fetched_at,
+                    referer,
                 };
                 match self.try_build(&source).await {
                     Ok(built) => {
@@ -2025,10 +2098,14 @@ impl LoadJob {
                         )
                         .await
                         {
-                            Ok((url2, fetched_at2)) => {
+                            Ok(hit2) => {
+                                let url2 = hit2.url;
+                                let referer2 = hit2.referer;
+                                let fetched_at2 = hit2.fetched_at;
                                 let source2 = PlaySource::Online {
                                     url: url2.clone(),
                                     fetchedAt: fetched_at2,
+                                    referer: referer2,
                                 };
                                 match self.try_build(&source2).await {
                                     Ok(built2) => self.dispatch_ready(
@@ -2322,9 +2399,9 @@ fn build_decoder(
             let duration = resolve_duration_ms(&decoder, track);
             Ok((Box::new(decoder), None, duration))
         }
-        PlaySource::Online { url, .. } => {
+        PlaySource::Online { url, referer, .. } => {
             let (reader, shared) =
-                range_reader::open(url, http, cache_dir).map_err(|e| e.to_string())?;
+                range_reader::open(url, referer, http, cache_dir).map_err(|e| e.to_string())?;
             // 总字节数（Content-Length）是 symphonia FLAC 二分定位的必要输入：
             // 缺了它 demuxer 会直接判 Unseekable。注意 with_byte_len 同时置 seekable=true；
             // 服务端没给长度时保持默认不可 seek（前向仍可线性扫描，回退才会失败）。

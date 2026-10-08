@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowRightToLine,
+  AudioWaveform,
   Captions,
   Check,
   Link2,
@@ -8,37 +9,57 @@ import {
   Music,
   Pause,
   Play,
+  RefreshCw,
   Repeat,
   Repeat1,
+  Share2,
   Shuffle,
   SkipBack,
   SkipForward,
+  SlidersHorizontal,
+  ThumbsDown,
   Timer,
+  User,
   Volume1,
   Volume2,
   VolumeX,
 } from "lucide-react";
 import { useNavigate, useRouter, useRouterState } from "@tanstack/react-router";
 import { listen } from "@tauri-apps/api/event";
-import type { PointerEvent as ReactPointerEvent } from "react";
+import type {
+  MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent,
+} from "react";
 import { usePlayerStore } from "@/stores/player";
 import { useAuthStore, isAdmin } from "@/stores/auth";
+import { useDislikesStore } from "@/stores/dislikes";
 import { CollectButton } from "@/components/player/CollectButton";
 import { DownloadButton } from "@/components/mine/DownloadButton";
+import {
+  replaceCurrentWithCandidate,
+  SourceSwitchPanel,
+} from "@/components/player/SourceSwitchPanel";
+import { ShareCardPanel } from "@/components/player/ShareCardPanel";
 import { qualityOptionsFromRegistry } from "@/lib/quality";
-import { useSourceRegistryStore } from "@/stores/sourceRegistry";
+import { PLAYER_BAR_BUTTONS, splitPlayerBarButtons } from "@/lib/player-bar";
+import { useSourceQualities } from "@/stores/sourceRegistry";
+import { usePlayerBarStore } from "@/stores/playerBar";
+import { useDismissOnOutside } from "@/hooks/useDismissOnOutside";
 import { SPEED_OPTIONS, speedLabel } from "@/lib/fx";
-import type { Quality } from "@/types";
+import type { Quality, Track } from "@/types";
 import { useInterpolatedPosition } from "@/hooks/useInterpolatedPosition";
 import { formatTime, qtresCoverUrl } from "@/lib/lrc";
 import { playUrlLine, playUrlMiss } from "@/source-scripts/playurl-line";
 import { cn } from "@/lib/utils";
 import {
+  checkDisliked,
   getDesktopLyricState,
+  getFxState,
   getPlaybackState,
   hideDesktopLyric,
   onLyricWindowChanged,
   setSleepTimer,
+  setSpectrum,
   setSpeed,
   setTrackQuality,
   showDesktopLyric,
@@ -81,6 +102,118 @@ export function PlayerBar(): React.JSX.Element {
   // qt_admin 专属：播放地址调试入口只向内部账号展示
   const profile = useAuthStore((s) => s.profile);
   const showPlayUrl = isAdmin(profile);
+
+  // 播放条按钮开关（设置 → 播放条）：只存「展示中的按钮 id」（见 lib/player-bar.ts），
+  // 名额上限（非音量 ≤10）在 store.toggle 里把守；按钮行为一律不变
+  const visibleButtons = usePlayerBarStore((s) => s.visible);
+  const loadBarButtons = usePlayerBarStore((s) => s.load);
+  useEffect(() => {
+    void loadBarButtons();
+  }, [loadBarButtons]);
+  const visibleBarIds = useMemo(() => {
+    return PLAYER_BAR_BUTTONS.filter((meta) => {
+      if (meta.adminOnly && !showPlayUrl) return false;
+      return visibleButtons.includes(meta.id);
+    }).map((meta) => meta.id);
+    // 注意：这里**不**看有没有曲目 / 是不是本地音乐（倍速、下载、音质在那些
+    // 情况下不渲染）。左右分列按配置算，位置只随开关变化；若跟着瞬时状态算，
+    // 每次开播/停播都会让播放模式这类按钮在左右之间跳一次。
+  }, [visibleButtons, showPlayUrl]);
+  const { left: leftBarButtons, right: rightBarButtons } = useMemo(
+    () => splitPlayerBarButtons(visibleBarIds),
+    [visibleBarIds],
+  );
+
+  /**
+   * 播放条上的可配置按钮：key 用按钮 id（左右两组各自 map，需要稳定 key）。
+   * 条件渲染与 lib/player-bar.ts 里 visibleBarIds 的判断保持一致。
+   */
+  const renderBarButton = (id: string): React.ReactNode => {
+    switch (id) {
+      case "playUrl":
+        return (
+          <PlayUrlButton
+            key="playUrl"
+            url={state?.playUrl ?? null}
+            line={playUrlLine(track, state?.quality ?? null)}
+            miss={playUrlMiss(track, state?.quality ?? null)}
+          />
+        );
+      // 倍速：放在收藏左边（用户习惯位）；菜单向上弹出
+      case "speed":
+        return track ? <SpeedMenu key="speed" current={state?.speed ?? 1} /> : null;
+      // 睡眠定时：倍速与收藏之间（用户习惯位）
+      case "sleep":
+        return (
+          <SleepTimerMenu
+            key="sleep"
+            remainingMs={state?.sleepTimerMs ?? null}
+            afterTrack={state?.sleepAfterTrack ?? false}
+          />
+        );
+      // 收藏：点开是本地歌单清单，勾上/取消即收藏/取消收藏
+      case "collect":
+        return <CollectButton key="collect" track={track} />;
+      case "mode":
+        return (
+          <PlayModeButton
+            key="mode"
+            mode={state?.playMode ?? "listLoop"}
+            onCycle={() => void cyclePlayMode()}
+          />
+        );
+      case "desktopLyric":
+        return <DesktopLyricButton key="desktopLyric" />;
+      case "queue":
+        // emphasis：展开态和「桌面歌词」开启态同一套点亮（用户 m04741 口径：
+        // 「我要和左边桌面歌词打开后效果一样就行」）。队列面板本身在右侧，
+        // 按钮点亮是让用户一眼看出「队列正开着」。
+        //
+        // 播放页禁用（用户 m04913）：QueuePanel 是 AppShell 主区里的布局级面板，
+        // 而播放页走 isPlayingPage 分支根本不渲染它 —— 在那儿点这个按钮只会有
+        // 一个亮起来的图标、面板永远不出现，等同于坏按钮，故直接置灰不可点。
+        return (
+          <ControlButton
+            key="queue"
+            label={isPlayingPage ? "播放队列（播放页不可用）" : "播放队列"}
+            active={queueOpen}
+            emphasis={!isPlayingPage}
+            disabled={isPlayingPage}
+            onClick={toggleQueue}
+          >
+            <ListMusic className="h-4 w-4" />
+          </ControlButton>
+        );
+      case "download":
+        return track ? <DownloadButton key="download" track={track} variant="icon" /> : null;
+      case "quality":
+        return track && track.platform !== "local" ? (
+          <QualityMenu key="quality" current={state?.quality ?? "320"} platform={track.platform} />
+        ) : null;
+      // 屏蔽（不喜欢）：点一下屏蔽这首歌（Alt+点击屏蔽歌手），已屏蔽时变成取消屏蔽
+      case "dislike":
+        return track ? <DislikeButton key="dislike" track={track} /> : null;
+      // 频谱背景开关：与设置页频谱开关同一个引擎侧后端（setSpectrum）
+      case "spectrum":
+        return <SpectrumButton key="spectrum" />;
+      // 均衡器入口：跳设置页音效节（引擎侧 DSP 的 EQ / 响度归一化都在那）
+      case "equalizer":
+        return <EqualizerButton key="equalizer" />;
+      // 分享：复制歌曲信息到剪贴板（PC 没有分享面板，用复制兜底）
+      case "share":
+        return track ? <ShareButton key="share" track={track} /> : null;
+      // 换源：当前源不支持这首歌时，在其他音源里搜同一首并展示，点选后就地替换
+      case "source":
+        return track ? <SourceSwitchButton key="source" track={track} /> : null;
+      // 歌手：跳歌手页。本地曲目没有音源端点可查，直接不渲染（见 ArtistButton 注释）
+      case "artist":
+        return track && track.platform !== "local" ? (
+          <ArtistButton key="artist" track={track} />
+        ) : null;
+      default:
+        return null;
+    }
+  };
 
   // 自愈：拿不到曲目时（事件丢失/快照被覆盖的兜底）主动拉一次实时快照，
   // 拿到曲目为止；正常时这个 effect 空转。注意**不能**豁免 stopped——
@@ -185,6 +318,12 @@ export function PlayerBar(): React.JSX.Element {
         // 于是向上弹的收藏 / 音质菜单被页面内容整个遮住，表现是「点了没反应」。
         // 与 TitleBar 的 z-20 同理（见 TitleBar.tsx 同位置注释）。
         "relative z-20 flex h-[80px] shrink-0 items-center gap-4 border-t px-4",
+        // 播放条的底色**不**跟队列开关联动：用户口径（m04741「我要和左边桌面歌词
+        // 打开后效果一样就行」）指的是队列按钮**自身点亮**——和桌面歌词按钮开启态
+        // 同一套填充（见下方 "queue" 分支的 emphasis），不是整条换表面。
+        // 先前试过整条换 bg-secondary / 提高不透明度，都被判定为「没有变色」/「不是
+        // 我要的」。播放页不渲染队列面板（AppShell 里 !isPlayingPage 才挂
+        // QueuePanel），且那里播放条走自己的封面色渐变，本分支不受影响。
         isPlayingPage ? "" : "border-border bg-card/70",
       )}
       style={
@@ -250,60 +389,42 @@ export function PlayerBar(): React.JSX.Element {
 
       {/* 控制 + 进度 */}
       <div className="flex min-w-0 flex-1 flex-col items-center gap-1">
-        <div className="flex items-center gap-3">
-          {/* qt_admin 专属：播放地址入口（图标按钮，点击展开当前实际播放地址） */}
-          {showPlayUrl && (
-            <PlayUrlButton
-              url={state?.playUrl ?? null}
-              line={playUrlLine(track, state?.quality ?? null)}
-              miss={playUrlMiss(track, state?.quality ?? null)}
-            />
-          )}
-          {/* 倍速：放在收藏左边（用户习惯位）；菜单向上弹出 */}
-          {track && <SpeedMenu current={state?.speed ?? 1} />}
-          {/* 睡眠定时：倍速与复制链接（播放地址）之间（用户习惯位） */}
-          <SleepTimerMenu
-            remainingMs={state?.sleepTimerMs ?? null}
-            afterTrack={state?.sleepAfterTrack ?? false}
-          />
-          {/* 收藏：点开是本地歌单清单，勾上/取消即收藏/取消收藏 */}
-          <CollectButton track={track} />
-          <PlayModeButton mode={state?.playMode ?? "listLoop"} onCycle={() => void cyclePlayMode()} />
-          <ControlButton label="上一首" onClick={() => void prevTrack()}>
-            <SkipBack className="h-4 w-4" />
-          </ControlButton>
-          <button
-            type="button"
-            aria-label={playing ? "暂停" : "播放"}
-            onClick={() => void toggle()}
-            disabled={!track}
-            className={cn(
-              // 辉光颜色跟 --primary 走（color-mix 派生），换肤/换主色时不会留旧色残影
-              "flex h-12 w-12 items-center justify-center rounded-full bg-gradient-to-br from-primary to-primary/80 text-primary-foreground shadow-[0_4px_14px_color-mix(in_srgb,var(--primary)_32%,transparent),0_2px_4px_rgba(0,0,0,0.12),inset_0_1px_2px_rgba(255,255,255,0.2)] transition-all hover:shadow-[0_6px_18px_color-mix(in_srgb,var(--primary)_42%,transparent),0_3px_6px_rgba(0,0,0,0.15),inset_0_1px_2px_rgba(255,255,255,0.25)] hover:scale-105 active:shadow-[inset_0_2px_6px_rgba(0,0,0,0.25)] disabled:cursor-not-allowed disabled:opacity-40",
-              loading && "animate-pulse",
-            )}
-          >
-            {playing ? (
-              <Pause className="h-5 w-5" />
-            ) : (
-              <Play className="h-5 w-5 translate-x-0.5" />
-            )}
-          </button>
-          <ControlButton label="下一首" onClick={() => void nextTrack()}>
-            <SkipForward className="h-4 w-4" />
-          </ControlButton>
-          <DesktopLyricButton />
-          <ControlButton
-            label="播放队列"
-            active={queueOpen}
-            onClick={toggleQueue}
-          >
-            <ListMusic className="h-4 w-4" />
-          </ControlButton>
-          {track && <DownloadButton track={track} variant="icon" />}
-          {track && track.platform !== "local" && (
-            <QualityMenu current={state?.quality ?? "320"} />
-          )}
+        {/* 三栏栅格：两侧各占 1fr、中间栏 auto 放「上一首/播放/下一首」——
+            播放键因此恒在中间栏正中，左右按钮的条数与宽窄都推不偏它 */}
+        <div className="grid w-full grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3">
+          {/* 可配置按钮分列在播放键两侧（设置 → 播放条 逐个开关）：
+              条数由 lib/player-bar.ts 的 splitPlayerBarButtons 按数量均分 */}
+          <div className="flex items-center justify-end gap-3">
+            {leftBarButtons.map(renderBarButton)}
+          </div>
+          <div className="flex items-center gap-3">
+            <ControlButton label="上一首" onClick={() => void prevTrack()}>
+              <SkipBack className="h-4 w-4" />
+            </ControlButton>
+            <button
+              type="button"
+              aria-label={playing ? "暂停" : "播放"}
+              onClick={() => void toggle()}
+              disabled={!track}
+              className={cn(
+                // 辉光颜色跟 --primary 走（color-mix 派生），换肤/换主色时不会留旧色残影
+                "flex h-12 w-12 items-center justify-center rounded-full bg-gradient-to-br from-primary to-primary/80 text-primary-foreground shadow-[0_4px_14px_color-mix(in_srgb,var(--primary)_32%,transparent),0_2px_4px_rgba(0,0,0,0.12),inset_0_1px_2px_rgba(255,255,255,0.2)] transition-all hover:shadow-[0_6px_18px_color-mix(in_srgb,var(--primary)_42%,transparent),0_3px_6px_rgba(0,0,0,0.15),inset_0_1px_2px_rgba(255,255,255,0.25)] hover:scale-105 active:shadow-[inset_0_2px_6px_rgba(0,0,0,0.25)] disabled:cursor-not-allowed disabled:opacity-40",
+                loading && "animate-pulse",
+              )}
+            >
+              {playing ? (
+                <Pause className="h-5 w-5" />
+              ) : (
+                <Play className="h-5 w-5 translate-x-0.5" />
+              )}
+            </button>
+            <ControlButton label="下一首" onClick={() => void nextTrack()}>
+              <SkipForward className="h-4 w-4" />
+            </ControlButton>
+          </div>
+          <div className="flex items-center gap-3">
+            {rightBarButtons.map(renderBarButton)}
+          </div>
         </div>
 
         {/* 进度条：外层 16px 高命中区，轨道 hover 从 6px 长到 8px 并浮现拖块；
@@ -355,8 +476,12 @@ export function PlayerBar(): React.JSX.Element {
         </div>
       </div>
 
-      {/* 音量 */}
-      <VolumeControl />
+      {/* 音量：固定在播放条最右侧，不参与左右分列（设置 → 播放条 可隐藏）。
+          容器定宽 w-56 与左侧封面区等宽：两侧等宽，中间控制区的中点才落在窗口中点，
+          否则播放键会被挤偏（音量控件本身只有 w-32，右侧比左侧窄） */}
+      <div className="flex w-56 shrink-0 items-center justify-end">
+        {visibleBarIds.includes("volume") && <VolumeControl />}
+      </div>
     </div>
   );
 }
@@ -524,6 +649,7 @@ function DesktopLyricButton(): React.JSX.Element {
     <ControlButton
       label={on ? "关闭桌面歌词" : "开启桌面歌词"}
       active={on}
+      emphasis
       onClick={() =>
         void (on ? hideDesktopLyric() : showDesktopLyric())
           .then((s) => setOn(s.visible))
@@ -540,16 +666,17 @@ function DesktopLyricButton(): React.JSX.Element {
 /**
  * 音质入口（播放条）：只改**当前这首**，不写设置里的默认音质
  * —— 默认值在设置页改，换歌后自动回到默认。
- * 菜单向上弹（播放条贴在窗口底部）。
+ * 选项按当前歌曲的源收敛（v5 契约：包侧声明了该源可用档位，如 B 站无真
+ * 无损就不显示 flac；未声明 = 全部档位）。菜单向上弹（播放条贴在窗口底部）。
  */
-function QualityMenu(props: { current: Quality }): React.JSX.Element {
+function QualityMenu(props: { current: Quality; platform: string }): React.JSX.Element {
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const boxRef = useRef<HTMLDivElement | null>(null);
   useDismissOnOutside(boxRef, open, () => setOpen(false));
-  // 档位清单来自数据包注册表（未就绪时 qualityOptionsFromRegistry 兜底三档）
+  // 档位清单来自数据包注册表并按当前歌曲的源过滤（未就绪时 qualityOptionsFromRegistry 兜底三档）
   const options = qualityOptionsFromRegistry(
-    useSourceRegistryStore((s) => s.qualities),
+    useSourceQualities(props.platform),
   );
   const shortOf = (q: Quality): string =>
     options.find((o) => o.value === q)?.short ?? q;
@@ -572,14 +699,7 @@ function QualityMenu(props: { current: Quality }): React.JSX.Element {
         aria-expanded={open}
         disabled={busy}
         onClick={() => setOpen((v) => !v)}
-        className={cn(
-          "flex h-9 min-w-12 items-center justify-center rounded-full px-2.5 text-xs font-medium tabular-nums transition-all disabled:opacity-50",
-          // 当前是 FLAC（无损）时用主色填充，和播放条的其它开启态保持一致；
-          // 只改文字颜色在浅底/封面色调底上会被背景吃掉。80% 填充比实心浅一档。
-          props.current === "flac"
-            ? "bg-primary/80 text-primary-foreground shadow-[0_2px_10px_color-mix(in_srgb,var(--primary)_35%,transparent)] hover:brightness-110"
-            : "bg-secondary/40 text-foreground/80 hover:bg-secondary/60",
-        )}
+        className="flex h-9 min-w-12 items-center justify-center rounded-full px-2.5 text-xs font-medium tabular-nums transition-all disabled:opacity-50 text-foreground/80 hover:bg-secondary/50 hover:text-foreground"
       >
         {shortOf(props.current)}
       </button>
@@ -613,29 +733,6 @@ function QualityMenu(props: { current: Quality }): React.JSX.Element {
   );
 }
 
-/** 播放条弹出菜单通用收起逻辑：点外面 / Esc 收起（音质 / 倍速 / 睡眠定时共用） */
-function useDismissOnOutside(
-  ref: React.RefObject<HTMLElement | null>,
-  open: boolean,
-  onClose: () => void,
-): void {
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent): void => {
-      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
-    };
-    const onKey = (e: KeyboardEvent): void => {
-      if (e.key === "Escape") onClose();
-    };
-    window.addEventListener("mousedown", onDown);
-    window.addEventListener("keydown", onKey);
-    return () => {
-      window.removeEventListener("mousedown", onDown);
-      window.removeEventListener("keydown", onKey);
-    };
-  }, [ref, open, onClose]);
-}
-
 /**
  * 倍速入口（播放条）：写引擎并持久化（重启保持、对所有歌生效），
  * 与「音质」不同——音质菜单只改当前这首，默认音质在设置页。
@@ -659,12 +756,7 @@ function SpeedMenu(props: { current: number }): React.JSX.Element {
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
-        className={cn(
-          "flex h-9 min-w-12 items-center justify-center rounded-full px-2.5 text-xs font-medium tabular-nums transition-all",
-          props.current !== 1
-            ? "bg-primary/80 text-primary-foreground shadow-[0_2px_10px_color-mix(in_srgb,var(--primary)_35%,transparent)] hover:brightness-110"
-            : "bg-secondary/40 text-foreground/80 hover:bg-secondary/60",
-        )}
+        className="flex h-9 min-w-12 items-center justify-center rounded-full px-2.5 text-xs font-medium tabular-nums text-foreground/80 transition-all hover:bg-secondary/50 hover:text-foreground"
       >
         {speedLabel(props.current)}
       </button>
@@ -749,6 +841,7 @@ function SleepTimerMenu(props: {
       <ControlButton
         label={title}
         active={armed}
+        emphasis
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
@@ -818,7 +911,11 @@ function PlayModeButton(props: {
   }[props.mode];
   const { Icon, label } = meta;
   return (
-    <ControlButton label={`播放模式：${label}`} onClick={props.onCycle} active={props.mode !== "listLoop"}>
+    <ControlButton
+      label={`播放模式：${label}`}
+      onClick={props.onCycle}
+      active={props.mode !== "listLoop"}
+    >
       <Icon className="h-4 w-4" />
     </ControlButton>
   );
@@ -916,15 +1013,222 @@ function PlayUrlButton(props: { url: string | null; line: string; miss: string }
   );
 }
 
+/**
+ * 屏蔽（不喜欢）按钮：点一下屏蔽当前这首歌（Alt+点击屏蔽歌手，与曲目行的
+ * 约定一致），已屏蔽时点一下就地取消（规则 id 走 dislikes store 的会话内反查表）。
+ * Alt+点击同样是 toggle：歌手已被屏蔽就撤销整串歌手的规则，不是单向「屏蔽」。
+ * 「已屏蔽」判定不在前端自己算 —— 归一化/后缀剥离在 Rust 侧，只发一次
+ * check_disliked（单曲版），规则集合变化（version）后重新判定。
+ */
+function DislikeButton(props: { track: Track }): React.JSX.Element {
+  const [disliked, setDisliked] = useState(false);
+  // 规则增删后重新判定（哪怕是别的入口改的）
+  const version = useDislikesStore((s) => s.version);
+  const singer = props.track.singer;
+  const singerBanned = useDislikesStore((s) => (singer ? s.singerBanned(singer) : false));
+
+  useEffect(() => {
+    let disposed = false;
+    checkDisliked([props.track])
+      .then((res) => {
+        if (!disposed) setDisliked(Array.isArray(res) && res[0] === true);
+      })
+      .catch(() => {
+        if (!disposed) setDisliked(false);
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [props.track, version]);
+
+  const onToggle = (e: ReactMouseEvent): void => {
+    e.stopPropagation();
+    const store = useDislikesStore.getState();
+    if (e.altKey && singer) {
+      // 歌手级 toggle：一整串歌手（A/B/C）的规则一起进、一起退
+      if (singerBanned) void store.unbanSinger(singer);
+      else void store.banSinger(singer);
+      return;
+    }
+    if (disliked) {
+      void store.unbanSong(props.track);
+    } else {
+      void store.banSong(props.track);
+    }
+  };
+
+  const singerLabel = singerBanned
+    ? "取消屏蔽歌手"
+    : "屏蔽这首歌（Alt+点击屏蔽歌手）";
+  return (
+    <ControlButton
+      label={disliked ? "取消屏蔽" : singerLabel}
+      active={disliked || singerBanned}
+      emphasis
+      tone="destructive"
+      onClick={onToggle}
+    >
+      <ThumbsDown className="h-4 w-4" />
+    </ControlButton>
+  );
+}
+
+/**
+ * 频谱背景开关：与设置页频谱开关同一个后端（ipc.setSpectrum），关闭时引擎
+ * 不做任何频谱计算；SpectrumBackground 在停发事件后自行归零，无需额外同步。
+ */
+function SpectrumButton(): React.JSX.Element {
+  const [on, setOn] = useState(false);
+
+  useEffect(() => {
+    let disposed = false;
+    void getFxState()
+      .then((fx) => {
+        if (!disposed) setOn(fx.spectrum === true);
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+    };
+  }, []);
+
+  const toggleSpectrum = (): void => {
+    const next = !on;
+    setOn(next);
+    void setSpectrum(next).catch(() => setOn(!next));
+  };
+
+  return (
+    <ControlButton label="频谱背景" active={on} emphasis onClick={toggleSpectrum}>
+      <AudioWaveform className="h-4 w-4" />
+    </ControlButton>
+  );
+}
+
+/**
+ * 歌手入口（对齐 qt-uniappx 播放页的 artist 工具）：打开当前歌曲的歌手页。
+ *
+ * 曲目上只有歌手名没有歌手 id（`Track.singer`），所以跟移动端一样走**名字搜索**
+ * 闭环：把 encode 过的名字放在 `$id` 位置，ArtistPage 没有 `?id=` 时会把它当名字
+ * 用（见 ArtistPage / SearchPage.openArtist 的注释），不会白屏。
+ *
+ * 本地曲目不渲染这个按钮：歌手页要打音源包的 getArtistSongs，local 源没有这个
+ * 端点（TrackList 里本地曲目的歌手也不做成链接，同一口径）。
+ */
+function ArtistButton(props: { track: Track }): React.JSX.Element {
+  const navigate = useNavigate();
+  return (
+    <ControlButton
+      label={`歌手：${props.track.singer}`}
+      onClick={() =>
+        void navigate({
+          to: "/artist/$platform/$id",
+          params: { platform: props.track.platform, id: encodeURIComponent(props.track.singer) },
+        })
+      }
+    >
+      <User className="h-4 w-4" />
+    </ControlButton>
+  );
+}
+
+/** 均衡器入口：跳设置页音效节（EQ / 响度归一化 / 淡入淡出都在那） */
+function EqualizerButton(): React.JSX.Element {
+  const navigate = useNavigate();
+  return (
+    <ControlButton
+      label="均衡器 / 音效"
+      onClick={() => void navigate({ to: "/settings/$section", params: { section: "sound" } })}
+    >
+      <SlidersHorizontal className="h-4 w-4" />
+    </ControlButton>
+  );
+}
+
+/**
+ * 分享按钮（用户 m07452 的「9=分享」，m10417 改成图片卡片）：PC 没有系统分享面板，
+ * 照移动端做成「卡片预览 + 复制图片 / 保存 PNG」的弹层 —— 分享出去的是图，不是一行文字。
+ */
+function ShareButton(props: { track: Track }): React.JSX.Element {
+  const [open, setOpen] = useState(false);
+  const boxRef = useRef<HTMLDivElement | null>(null);
+  useDismissOnOutside(boxRef, open, () => setOpen(false));
+
+  return (
+    <div ref={boxRef} className="relative">
+      <ControlButton label="分享" active={open} onClick={() => setOpen((v) => !v)}>
+        <Share2 className="h-4 w-4" />
+      </ControlButton>
+      {open ? (
+        <div className="absolute bottom-full left-1/2 z-30 mb-2 -translate-x-1/2 rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-lg">
+          <ShareCardPanel track={props.track} />
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * 换源按钮：点开向上弹候选面板（聚合搜索其他音源的同一首歌，见
+ * SourceSwitchPanel），点选后就地替换 —— 队列位置不动；点外面/Esc 收起。
+ */
+function SourceSwitchButton(props: { track: Track }): React.JSX.Element {
+  const [open, setOpen] = useState(false);
+  const boxRef = useRef<HTMLDivElement | null>(null);
+  useDismissOnOutside(boxRef, open, () => setOpen(false));
+
+  return (
+    <div ref={boxRef} className="relative">
+      <ControlButton label="换源" active={open} onClick={() => setOpen((v) => !v)}>
+        <RefreshCw className="h-4 w-4" />
+      </ControlButton>
+      {open ? (
+        <div className="absolute bottom-full left-1/2 z-30 mb-2 -translate-x-1/2 rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-lg">
+          <SourceSwitchPanel
+            track={props.track}
+            onPick={(candidate) => {
+              setOpen(false);
+              void replaceCurrentWithCandidate(candidate);
+            }}
+          />
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
 function ControlButton(props: {
   label: string;
+  /** 开启态语义：只写 aria-pressed，**不再决定外观**（外观由 emphasis 决定） */
   active?: boolean;
-  onClick?: () => void;
+  /**
+   * 开启态是否铺底色。开启态本身就是状态的按钮用它（睡眠定时 / 收藏 / 播放 /
+   * 桌面歌词 / 频谱 / 不喜欢 / 播放队列）；
+   * 播放模式 / 播放地址虽有开启态，但不铺底色——弹层本身就是提示。
+   */
+  emphasis?: boolean;
+  /**
+   * 填充色。「不喜欢」开启态是负面状态，铺主色会读成「已开启某个功能」，
+   * 故走 destructive 那一套；其余铺主色（默认）。
+   */
+  tone?: "primary" | "destructive";
+  /** 禁用：点了不会有实际效果的场景（如播放页的队列按钮）用它，置灰且不可点 */
+  disabled?: boolean;
+  onClick?: (e: ReactMouseEvent) => void;
   /** 透传给底层 button 的 menu 语义（带弹出菜单的按钮用） */
   ariaHasPopup?: "menu";
   ariaExpanded?: boolean;
   children: React.ReactNode;
 }): React.JSX.Element {
+  const filled = props.active === true && props.emphasis === true;
+  const fill =
+    props.tone === "destructive"
+      ? // 屏蔽态：红底。同样的 60% 填充与收敛辉光，只是换到 destructive 色系，
+        // 与主色状态按钮的观感保持一致，不会被读成「开启了某个功能」。
+        // 前景写死白色：项目只定义了 --destructive，没有 destructive-foreground，
+        // 两种主题下的红（oklch 0.58 / #ef4444）配白字对比度都够。
+        "bg-destructive/60 text-white shadow-[0_2px_8px_color-mix(in_srgb,var(--destructive)_25%,transparent)] hover:brightness-110 active:brightness-95"
+      : "bg-primary/60 text-primary-foreground shadow-[0_2px_8px_color-mix(in_srgb,var(--primary)_25%,transparent)] hover:brightness-110 active:brightness-95";
   return (
     <button
       type="button"
@@ -933,17 +1237,17 @@ function ControlButton(props: {
       aria-pressed={props.active}
       aria-haspopup={props.ariaHasPopup}
       aria-expanded={props.ariaExpanded}
+      disabled={props.disabled}
       onClick={props.onClick}
       className={cn(
         "flex h-9 w-9 items-center justify-center rounded-full transition-all",
-        // 开启态用「主色填充 + 主色辉光」：以前只把图标改成 text-primary，
-        // 在亮主色皮肤（森林/暖阳/深海/樱花）和播放页的封面色调底上几乎看不出来。
-        // 填充 + 辉光是不依赖底色的明确信号，也和侧边栏选中项、播放键的视觉语言一致。
-        // 80% 透明度让填充比实心浅一档（用户反馈实心太重），辉光同步收敛；
-        // 中央播放键保持实心，主次层级反而更清楚。
-        props.active
-          ? "bg-primary/80 text-primary-foreground shadow-[0_2px_10px_color-mix(in_srgb,var(--primary)_35%,transparent)] hover:brightness-110 active:brightness-95"
-          : "bg-secondary/40 text-foreground/80 shadow-[0_2px_4px rgba(0,0,0,0.1),0_4px_8px rgba(0,0,0,0.05)] hover:bg-secondary/60 hover:shadow-[0_3px_6px rgba(0,0,0,0.12),0_6px_12px rgba(0,0,0,0.06)] active:shadow-[inset_0_2px_4px rgba(0,0,0,0.12)] dark:bg-card/15 dark:shadow-[0_2px_4px rgba(0,0,0,0.3),0_4px_8px rgba(0,0,0,0.2)] dark:hover:shadow-[0_3px_6px rgba(0,0,0,0.4),0_6px_12px rgba(0,0,0,0.3)] dark:active:shadow-[inset_0_2px_4px rgba(0,0,0,0.4)]",
+        // 其余按钮一律不铺底色（用户口径：除四个状态按钮外不要背景色），
+        // 只留 hover 浮出的浅底做可点提示。
+        // 开启态填充从 80% 降到 60%（用户反馈「选中的颜色再浅一点」），
+        // 辉光同步收敛——中央播放键仍是实心，主次层级不受影响。
+        filled ? fill : "text-foreground/80 hover:bg-secondary/50 hover:text-foreground active:bg-secondary/70",
+        // 禁用态：压暗 + 去掉交互反馈，跟其余按钮的 hover 浅底区分开
+        props.disabled === true && "cursor-not-allowed opacity-40 hover:bg-transparent",
       )}
     >
       {props.children}

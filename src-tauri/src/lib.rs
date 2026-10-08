@@ -35,7 +35,7 @@ use audio::engine::AudioEngine;
 use commands::*;
 use db::Database;
 use provider::types::{Quality, Track};
-use provider::url_cache::PlayUrlCache;
+use provider::url_cache::{PlayUrlCache, ResolvedPlayUrl};
 use provider::ProviderError;
 use tauri::{Emitter, Manager};
 
@@ -71,20 +71,30 @@ pub(crate) async fn resolve_play_url_script(
     cache: &PlayUrlCache,
     track: &Track,
     quality: Quality,
-) -> CmdResult<(String, u64)> {
+) -> CmdResult<ResolvedPlayUrl> {
     let key = PlayUrlCache::cache_key(track.platform.as_str(), &track.id, quality_str(&quality));
-    if let Some((url, fetched_at)) = cache.get(&key) {
-        return Ok((url, fetched_at));
+    if let Some(hit) = cache.get(&key) {
+        return Ok(hit);
     }
-    let url = match crate::playurl_bridge::ask_frontend(app, track, quality).await {
-        crate::playurl_bridge::AskOutcome::Url(url) => url,
+    let reply = match crate::playurl_bridge::ask_frontend(app, track, quality).await {
+        crate::playurl_bridge::AskOutcome::Url {
+            url,
+            referer,
+            size,
+            actual_quality,
+        } => crate::provider::url_cache::ResolvedPlayUrl {
+            url,
+            referer,
+            size,
+            actual_quality,
+            fetched_at: 0,
+        },
         crate::playurl_bridge::AskOutcome::NoUrl => return Err(ProviderError::NoPlayableUrl),
         crate::playurl_bridge::AskOutcome::Stalled => return Err(ProviderError::ResolveStalled),
     };
-    cache.set(key.clone(), url.clone());
+    cache.set(key.clone(), reply);
     // fetched_at 由 set 写入当前时间；这里再读一次拿到真实时间戳
-    let fetched_at = cache.get(&key).map(|(_, at)| at).unwrap_or(0);
-    Ok((url, fetched_at))
+    cache.get(&key).ok_or(ProviderError::NoPlayableUrl)
 }
 
 pub(crate) fn quality_str(q: &Quality) -> &str {
@@ -225,6 +235,17 @@ pub fn run() {
                     Err(e) => log::warn!("[download] 中断任务清理失败: {e}"),
                     _ => {}
                 }
+                // 回填用户设置的「同时下载数」（settings 表 key = download.maxConcurrent）。
+                // 必须在这里做而不是在 manage() 之前：AppState 还没建，拿不到闸门。
+                match commands::load_download_concurrency(db) {
+                    Ok(Some(n)) => {
+                        let n = download::clamp_concurrency(n);
+                        app.state::<AppState>().downloads.set_concurrency(n);
+                        log::info!("[download] 同时下载数 = {n}");
+                    }
+                    Ok(None) => {}
+                    Err(e) => log::warn!("[download] 读取同时下载数失败: {e}"),
+                }
             }
 
             tray::create_tray(&handle);
@@ -331,6 +352,18 @@ pub fn run() {
             cmd_set_desktop_lyric_bounds,
             cmd_reset_desktop_lyric,
             cmd_open_lyric_settings,
+            cmd_get_lyric_offset,
+            cmd_set_lyric_offset,
+            cmd_save_lyric,
+            cmd_get_lyric,
+            cmd_save_binary_file,
+            cmd_list_dislikes,
+            cmd_add_dislike_song,
+            cmd_add_dislike_singer,
+            cmd_remove_dislike_singer,
+            cmd_remove_dislike_rule,
+            cmd_clear_dislikes,
+            cmd_check_disliked,
             cmd_astral_app_update,
             cmd_astral_check_official_version,
             cmd_astral_github_accels,
@@ -429,6 +462,8 @@ pub fn run() {
             cmd_get_download_dir,
             cmd_choose_download_dir,
             cmd_reset_download_dir,
+            cmd_get_download_concurrency,
+            cmd_set_download_concurrency,
         ]))
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

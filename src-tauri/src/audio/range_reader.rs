@@ -127,6 +127,11 @@ impl ReadySpans {
 /// 跨线程共享状态：下载线程写，读线程等。
 pub struct RangeShared {
     url: String,
+    /// 取这个地址时要带的 Referer（音源包按源声明，空串 = 不发）。
+    ///
+    /// 首个请求和后续每个 Range 重发都要带上：B 站部分 CDN 节点没有它直接
+    /// 403 text/html，表现为"取链成功、播放打不开"。
+    referer: String,
     file_path: PathBuf,
     supports_ranges: bool,
     ready: Mutex<ReadySpans>,
@@ -208,8 +213,12 @@ impl Drop for DownloaderGuard {
 
 /// 打开远程音频：发首个 Range 请求，创建缓冲文件，启动后台下载线程。
 /// 返回 (reader, shared)；reader 随后包进 BufReader 交给 Decoder。
+///
+/// `referer` = 音源包按源声明的 Referer（空串 = 不发）。B 站部分 CDN 节点
+/// 没有它直接 403，所以首个请求与后续每个 Range 重发都要带上。
 pub fn open(
     url: &str,
+    referer: &str,
     client: &reqwest::blocking::Client,
     cache_dir: &Path,
 ) -> io::Result<(HttpRangeReader, Arc<RangeShared>)> {
@@ -227,9 +236,11 @@ pub fn open(
     // 大文件掐死在半路（spool 模式更是必失败）。这里只挂 HTTP_TOTAL_GUARD
     // 兜「请求永不返回」的底；用户可见的首包判活由 ensure_ready 的 8s deadline
     // 承担（见该函数与 HTTP_TOTAL_GUARD 的注释）
-    let resp = client
-        .get(url)
-        .header("Range", "bytes=0-")
+    let mut first = client.get(url).header("Range", "bytes=0-");
+    if !referer.is_empty() {
+        first = first.header("Referer", referer);
+    }
+    let resp = first
         .timeout(HTTP_TOTAL_GUARD)
         .send()
         .map_err(|e| {
@@ -276,6 +287,7 @@ pub fn open(
 
     let shared = Arc::new(RangeShared {
         url: url.to_string(),
+        referer: referer.to_string(),
         file_path: file_path.clone(),
         supports_ranges,
         ready: Mutex::new(ReadySpans::default()),
@@ -444,7 +456,7 @@ fn run_downloader(
         // 流已 EOF 时即使 want == pos 也要重发：连接可能被提前掐断，重连补数据
         let want = shared.desired.load(Ordering::SeqCst);
         if shared.supports_ranges && !shared.is_ready_at(want) && (want != pos || eof) {
-            match issue_range(&client, &url, want) {
+            match issue_range(&client, &url, &shared.referer, want) {
                 Ok(resp) => {
                     body = BodyReader::new(Box::new(resp));
                     pos = want;
@@ -525,7 +537,7 @@ fn run_downloader(
                 }
                 std::thread::sleep(Duration::from_millis(500 * retries as u64));
                 // Range 模式从当前断点重连
-                match issue_range(&client, &url, pos) {
+                match issue_range(&client, &url, &shared.referer, pos) {
                     Ok(resp) => body = BodyReader::new(Box::new(resp)),
                     Err(_) => continue,
                 }
@@ -545,11 +557,16 @@ fn run_downloader(
 fn issue_range(
     client: &reqwest::blocking::Client,
     url: &str,
+    referer: &str,
     from: u64,
 ) -> Result<reqwest::blocking::Response, ()> {
-    let resp = client
-        .get(url)
-        .header("Range", format!("bytes={from}-"))
+    let mut req = client.get(url).header("Range", format!("bytes={from}-"));
+    // Referer 由音源包下发（空串 = 不发）。断流重连是**新的一次请求**，
+    // 首个请求带了这里就必须带 —— B 站部分 CDN 节点缺它一律 403。
+    if !referer.is_empty() {
+        req = req.header("Referer", referer);
+    }
+    let resp = req
         // 宽总量挂死保护（HTTP_TOTAL_GUARD），不是判活：断流重连也要保证
         // 下载线程最终能带着 Err 退出重试
         .timeout(HTTP_TOTAL_GUARD)

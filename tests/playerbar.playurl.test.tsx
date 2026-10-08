@@ -24,7 +24,9 @@ vi.mock("@tanstack/react-router", () => ({
 
 import { PlayerBar } from "@/components/PlayerBar";
 import { clearPlayUrlLines, rememberPlayUrlLine } from "@/source-scripts/playurl-line";
+import { PLAYER_BAR_DEFAULT_VISIBLE } from "@/lib/player-bar";
 import { useAuthStore } from "@/stores/auth";
+import { usePlayerBarStore } from "@/stores/playerBar";
 import { usePlayerStore } from "@/stores/player";
 import type { PlaybackState, Track } from "@/types";
 
@@ -78,6 +80,12 @@ beforeEach(() => {
   clearPlayUrlLines();
   usePlayerStore.setState({ state: snapshot("http://dl.music.example/weiguang.mp3") });
   useAuthStore.setState({ profile: { roles: ["qt_admin"] } });
+  // m07452 起「播放地址」默认关闭（默认只开 收藏/播放模式/桌面歌词/下载/音质/音量），
+  // 这几条用例专门测它，显式放进可见白名单
+  usePlayerBarStore.setState({
+    visible: ["playUrl", ...PLAYER_BAR_DEFAULT_VISIBLE],
+    loaded: true,
+  });
 });
 
 describe("播放地址面板：音源线路", () => {

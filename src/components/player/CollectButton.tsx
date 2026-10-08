@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { errMsg } from "@/lib/utils";
 import { Check, Heart, Plus } from "lucide-react";
+import { findCrossSourceDup } from "@/lib/collect-dup";
+import { useSourceLabelFn } from "@/stores/sourceRegistry";
 import type { MyPlaylistSummary, Track } from "@/types";
 import * as ipc from "@/services/ipc";
 
@@ -21,7 +23,17 @@ export function CollectButton(props: { track: Track | null }): React.JSX.Element
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [newName, setNewName] = useState("");
+  /**
+   * 「同名不同源」待确认：目标歌单里已经有另一平台的同一首歌时先拦一下，
+   * 用户点「继续收藏」才真的写入（收藏表按 platform+id 唯一，两首能共存，
+   * 界面上就是重复的两行 —— 加入前提示比加完再删轻松得多）。
+   */
+  const [pending, setPending] = useState<{
+    playlist: MyPlaylistSummary;
+    dups: Track[];
+  } | null>(null);
   const ref = useRef<HTMLDivElement | null>(null);
+  const sourceLabel = useSourceLabelFn();
 
   // 当前曲目是否已被收藏（面板没开时也要能点亮红心）
   const [liked, setLiked] = useState(false);
@@ -66,8 +78,10 @@ export function CollectButton(props: { track: Track | null }): React.JSX.Element
   }, [open, track, reload]);
 
   // 曲目切了就把面板收起，避免对着上一首歌操作
+  // （pending 也必须一起清：待确认的是上一首歌的重名，留着会确认错对象）
   useEffect(() => {
     setOpen(false);
+    setPending(null);
   }, [track]);
 
   // 点击外部关闭
@@ -80,19 +94,17 @@ export function CollectButton(props: { track: Track | null }): React.JSX.Element
     return () => document.removeEventListener("mousedown", onDoc);
   }, [open]);
 
-  const toggle = async (p: MyPlaylistSummary): Promise<void> => {
+  const addTo = async (p: MyPlaylistSummary): Promise<void> => {
     if (!track || busy) return;
     setBusy(true);
     setError(null);
     try {
-      if (selected.includes(p.pid)) {
-        await ipc.removeFavorite(track, p.pid);
-      } else {
-        await ipc.addFavorite(track, p.pid);
-      }
+      await ipc.addFavorite(track, p.pid);
       await reload();
       // 归属变了，红心状态以库里的为准
       setLiked(await ipc.isFavorite(track).catch(() => false));
+      setPending(null);
+      setOpen(false);
     } catch (err) {
       setError(errMsg(err));
     } finally {
@@ -100,9 +112,45 @@ export function CollectButton(props: { track: Track | null }): React.JSX.Element
     }
   };
 
+  const toggle = async (p: MyPlaylistSummary): Promise<void> => {
+    if (!track || busy) return;
+    // 取消收藏不需要查重：那是减操作，不会造成重复
+    if (selected.includes(p.pid)) {
+      setBusy(true);
+      setError(null);
+      try {
+        await ipc.removeFavorite(track, p.pid);
+        await reload();
+        setLiked(await ipc.isFavorite(track).catch(() => false));
+      } catch (err) {
+        setError(errMsg(err));
+      } finally {
+        setBusy(false);
+      }
+      return;
+    }
+    // 加入前查一次重：歌单里已有别的音源的同一首歌就先问一句
+    setBusy(true);
+    setError(null);
+    try {
+      const existing = await ipc.getPlaylistTracks(p.pid);
+      const dups = findCrossSourceDup(track, existing);
+      if (dups.length > 0) {
+        setPending({ playlist: p, dups });
+        return;
+      }
+    } catch {
+      // 查重失败不拦收藏：重复顶多是两行，拦住是功能不可用。按没查到处理
+    } finally {
+      setBusy(false);
+    }
+    await addTo(p);
+  };
+
   const createAndCollect = async (): Promise<void> => {
     const n = newName.trim();
     if (!track || !n || busy) return;
+    // 新建的歌单必然是空的，不需要查重
     setBusy(true);
     setError(null);
     try {
@@ -128,7 +176,7 @@ export function CollectButton(props: { track: Track | null }): React.JSX.Element
         disabled={!track}
         onClick={() => setOpen((v) => !v)}
         className={[
-          "flex h-8 w-8 items-center justify-center rounded-full transition-colors hover:bg-secondary",
+          "flex h-8 w-8 items-center justify-center rounded-full transition-colors hover:bg-secondary/50",
           liked ? "text-primary" : "text-foreground/80",
           !track && "cursor-not-allowed opacity-40",
         ].join(" ")}
@@ -173,6 +221,45 @@ export function CollectButton(props: { track: Track | null }): React.JSX.Element
               })
             )}
           </div>
+
+          {/* 同名不同源确认条：替换掉歌单列表，避免用户在下面又点另一个歌单
+              把这个提示顶掉（确认错对象） */}
+          {pending !== null ? (
+            <div
+              data-testid="collect-dup-confirm"
+              className="border-t border-border px-2 py-2"
+            >
+              <p className="text-[11px] leading-snug text-foreground/90">
+                「{pending.playlist.name}」里已经有了
+                {pending.dups.length > 1 ? ` ${pending.dups.length} 首` : ""}同名的
+                {sourceLabel(pending.dups[0].platform)}版本
+                {pending.dups.length === 1 ? (
+                  <span className="text-muted-foreground">
+                    （{pending.dups[0].singer}）
+                  </span>
+                ) : null}
+                ，仍要收藏？
+              </p>
+              <div className="mt-2 flex items-center gap-1.5">
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => void addTo(pending.playlist)}
+                  className="flex-1 rounded border border-border px-2 py-1 text-[11px] transition-colors hover:bg-secondary disabled:opacity-50"
+                >
+                  继续收藏
+                </button>
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => setPending(null)}
+                  className="flex-1 rounded border border-border px-2 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-secondary disabled:opacity-50"
+                >
+                  取消
+                </button>
+              </div>
+            </div>
+          ) : null}
 
           <div className="mt-1 flex items-center gap-1 border-t border-border pt-1">
             <input

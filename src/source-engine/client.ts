@@ -31,6 +31,12 @@ interface EngineReply {
   url?: string;
   /** 本次取链命中的音源线路（bundle 的 getPlayUrl 应答里的 line） */
   line?: unknown;
+  /** 宿主取这个地址的字节时要带的 Referer（包按源声明；空串/缺失 = 不发） */
+  referer?: string;
+  /** Range 预检实测的文件总字节数（null/缺失 = 这次没读到总长，按未知处理） */
+  size?: number | null;
+  /** 按实测码率重标后的档位（包侧 snapQualityToMeasured；空串/缺失 = 未重标） */
+  actualQuality?: string;
   phase?: EnginePhase;
   code?: number | null;
   detail?: string | null;
@@ -81,6 +87,30 @@ export interface EngineResolved {
    * 「等网络」与「换下一首」分开，不再把弱网当成歌坏从而打满熔断。
    */
   stalled: boolean;
+  /**
+   * 宿主拿着这个地址去 CDN 取字节时要带的 Referer；空串 = 不发。
+   *
+   * 由音源包按源声明（qt-sources 的 SOURCE_REFERERS），不是宿主按域名猜出来的：
+   * B 站实测部分 CDN 节点（cn-sh-cc-01-*.bilivideo.com）无 Referer 直接
+   * 403 text/html，而播放（range_reader）与下载（download.rs）此前都不发
+   * 这个头。包声明、宿主照做——新增源不必再改宿主。
+   */
+  referer: string;
+  /**
+   * Range 预检实测到的文件总字节数；null = 这次没读到总长（上游没回
+   * Content-Range，或引擎页比宿主旧没有这个字段），一律按「未知」处理。
+   *
+   * 用途：下载前就知道这首到底多大，以及给 actualQuality 当依据。
+   */
+  size: number | null;
+  /**
+   * 按实测码率重标之后的档位（包侧 snapQualityToMeasured：**只降不升**）。
+   *
+   * 空串 = 未重标（请求档就是实测档，或这次没测出体积）。
+   * 用途：下载命名与下载质量字段不再写请求档——请求 flac 拿到 320k 时，
+   * 以前会把文件名写成 `.flac`，是虚标。
+   */
+  actualQuality: string;
 }
 
 /**
@@ -401,22 +431,25 @@ export async function engineResolve(
 ): Promise<EngineResolved> {
   await ensureBound();
   // 引擎未就绪：环境问题（弱网下引擎页可能被冻住），不是这首歌没地址
-  if (phase !== "ready") return { url: "", line: null, error: "", stalled: true };
+  if (phase !== "ready") return failedResolve();
   const requestId = ++seq;
   const reply = new Promise<EngineReply>((resolve) => pending.set(requestId, resolve));
   try {
     await emitRequest({ requestId, kind: "resolve", source, song, quality });
   } catch {
     pending.delete(requestId);
-    return { url: "", line: null, error: "", stalled: true };
+    return failedResolve();
   }
   const answer = await withTimeout(reply, RESOLVE_TIMEOUT_MS)
     .finally(() => pending.delete(requestId))
     .catch(() => null);
   // 应答超时：链预算 5s 都烧光了还没回，判环境问题
-  if (!answer) return { url: "", line: null, error: "", stalled: true };
+  if (!answer) return failedResolve();
   const url = String(answer.url ?? "");
   const error = typeof answer.error === "string" ? answer.error : "";
+  const referer = typeof answer.referer === "string" ? answer.referer : "";
+  const size = typeof answer.size === "number" && Number.isFinite(answer.size) ? answer.size : null;
+  const actualQuality = typeof answer.actualQuality === "string" ? answer.actualQuality : "";
   // 死因落控制台：面板只在 qt_admin 打开时才看得到，日志是排障的第一现场
   if (url.length === 0 && error.length > 0) {
     console.warn(`[playurl] 取链失败 ${source}:${song.id}@${quality} — ${error}`);
@@ -426,7 +459,12 @@ export async function engineResolve(
   // （见 qt-sources/src/actions/play-url.ts 的 noteSourceMissFiltered）。
   // 据此让 stalled=true，引擎不把曲目拉黑、不计入熔断。
   const stalled = url.length === 0 && /\[网络\]/.test(error);
-  return { url, line: normalizeLine(answer.line), error, stalled };
+  return { url, line: normalizeLine(answer.line), error, stalled, referer, size, actualQuality };
+}
+
+/** 取链失败/未就绪的统一应答（没有地址，也就没有体积与实测档位） */
+function failedResolve(): EngineResolved {
+  return { url: "", line: null, error: "", stalled: true, referer: "", size: null, actualQuality: "" };
 }
 
 /** 引擎当前状态快照（设置页展示用） */

@@ -1,0 +1,44 @@
+{
+  "_note": "屏蔽匹配算法的跨端向量表：qt-pc 的 Rust 实现（src-tauri/src/db/store/dislikes.rs，测试 dislikes_parity_matches_fixture）与 qt-uniappx 的 UTS 移植（stores/dislike-match.ts，npm run check:dislike）必须对同一份文件给出完全相同的结果。改任一端算法先改这里的 expect，并把另一份拷贝同步成字节相同（工具会比对 sha）。新增一条记得两端都跑。",
+  "normalize": [
+    { "input": "", "expect": "" },
+    { "input": "稻香", "expect": "稻香" },
+    { "input": " 稻 香 ", "expect": "稻香" },
+    { "input": "Ｄｏｎ＇ｔ　Ｂｒｅａｋ", "expect": "dontbreak" },
+    { "input": "Hello, World!", "expect": "helloworld" },
+    { "input": "Taylor Swift", "expect": "taylorswift" },
+    { "input": "晴天　", "expect": "晴天" },
+    { "input": "Ａ-Ｂ", "expect": "ab" },
+    { "input": "周杰伦/费玉清", "expect": "周杰伦费玉清" },
+    { "input": "Re:Re:", "expect": "rere" },
+    { "input": "Три Волхва", "expect": "триволхва" },
+    { "input": "Ｔｅｓｔ　Ｃａｓｅ", "expect": "testcase" }
+  ],
+  "strip": [
+    { "input": "普通歌名", "expect": "普通歌名" },
+    { "input": "稻香 (Live)", "expect": "稻香" },
+    { "input": "稻香（现场版）", "expect": "稻香" },
+    { "input": "稻香[Live]【现场】", "expect": "稻香" },
+    { "input": "A(B)C", "expect": "AC" },
+    { "input": "Unbalanced(括号", "expect": "Unbalanced" },
+    { "input": "歌名（备注）尾巴", "expect": "歌名尾巴" }
+  ],
+  "split": [
+    { "input": "", "expect": [] },
+    { "input": "、，", "expect": [] },
+    { "input": "周杰伦", "expect": ["周杰伦"] },
+    { "input": "  周杰伦  ", "expect": ["周杰伦"] },
+    { "input": "周杰伦、方文山", "expect": ["周杰伦", "方文山"] },
+    { "input": "A, B / C & D", "expect": ["a", "b", "c", "d"] },
+    { "input": "周杰伦＆方文山", "expect": ["周杰伦", "方文山"] },
+    { "input": "A　B", "expect": ["a", "b"] },
+    { "input": "Taylor Swift", "expect": ["taylorswift"] }
+  ],
+  "splitRaw": [
+    { "input": "、", "expect": [] },
+    { "input": "周杰伦、方文山", "expect": ["周杰伦", "方文山"] },
+    { "input": " A , B ", "expect": ["A", "B"] },
+    { "input": "A　B", "expect": ["A", "B"] },
+    { "input": "Taylor Swift", "expect": ["Taylor Swift"] }
+  ]
+}

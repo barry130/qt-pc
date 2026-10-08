@@ -15,12 +15,15 @@ import {
 } from "lucide-react";
 import type { DesktopLyricState, Track } from "@/types";
 import { MarqueeLine } from "./MarqueeLine";
+import { LyricOffsetControl } from "./LyricOffsetControl";
+import { useLyricOffset } from "@/hooks/useLyricOffset";
 import {
   getDesktopLyricState,
   getPlaybackState,
   getQueue,
   hideDesktopLyric,
   next,
+  onLyricManuallyPicked,
   openLyricSettings,
   pause,
   previous,
@@ -34,8 +37,16 @@ import {
   setDesktopLyricStyle,
 } from "@/services/ipc";
 import { listen } from "@tauri-apps/api/event";
-import { findActiveIndex, mergeTranslation, parseLrc, type LyricLine } from "@/lib/lrc";
-import { crossSourceHitFromLine, getPlaybackLyric } from "@/lib/localOnline";
+import {
+  findActiveIndex,
+  karaokeFillRatio,
+  mergeRomanization,
+  mergeTranslation,
+  parseLrc,
+  parseWordByWordLrc,
+  type LyricLine,
+} from "@/lib/lrc";
+import { crossSourceHitFromLine, dropCachedLyric, getPlaybackLyric } from "@/lib/localOnline";
 import type { PlayUrlLine } from "@/source-engine/client";
 
 /**
@@ -97,6 +108,11 @@ export function LyricWindow(): React.JSX.Element {
   const [hasTrack, setHasTrack] = useState(false);
   const [paused, setPaused] = useState(false);
   const [activeIdx, setActiveIdx] = useState(-1);
+  // 逐字行的整行卡拉 OK 填充比例（0~1）：非逐字行恒 1（整行渐变高亮，老行为）
+  const [fillRatio, setFillRatio] = useState(1);
+  // 当前曲目的 React 状态：只为驱动歌词偏移的重读（useLyricOffset 依赖它）。
+  // 其余逻辑仍走 currentTrackRef（回调里读最新值，不受渲染时序影响）。
+  const [currentTrack, setCurrentTrack] = useState<Track | null>(null);
   // 工具条：悬停即现；右键可固定（再次右键收起）
   const [hovered, setHovered] = useState(false);
   const [pinned, setPinned] = useState(false);
@@ -105,8 +121,17 @@ export function LyricWindow(): React.JSX.Element {
   const playingRef = useRef(false);
   const linesRef = useRef<LyricLine[]>([]);
   const activeIdxRef = useRef(-1);
+  // rAF 里比较填充比例用 ref，避免每帧读 state
+  const fillRatioRef = useRef(1);
+  // rAF 里读偏移用 ref：偏移在另一个组件里改，闭包捕获的旧值会让歌词一直不同步
+  const offsetRef = useRef(0);
   const rafRef = useRef(0);
   const lyricAreaRef = useRef<HTMLDivElement | null>(null);
+
+  // 桌面歌词窗口与主窗口是两个独立 WebView（各持一份 store），所以偏移也要自己
+  // 去库里读一遍，不能复用主窗口的内存值。
+  const lyricOffset = useLyricOffset(currentTrack);
+  offsetRef.current = lyricOffset.offsetMs;
 
   // 工具条：悬停即现；右键可固定（再次右键收起）；锁定时整体隐藏（防误触，
   // 解锁走托盘勾选 / 设置页 / Ctrl+Alt+K）
@@ -138,6 +163,7 @@ export function LyricWindow(): React.JSX.Element {
   // 曲目变化 → 一次性拉整篇歌词（含换源兜底：按目标源取词）
   const loadLyricFor = useCallback(async (track: Track | null): Promise<void> => {
     currentTrackRef.current = track;
+    setCurrentTrack(track);
     const key = trackKey(track);
     if (!track || key.length === 0) {
       setHasTrack(false);
@@ -152,7 +178,12 @@ export function LyricWindow(): React.JSX.Element {
       const lyric = await getPlaybackLyric(track, cross);
       // 过期取词不应用（换源后旧源的慢响应不得回填，最后应用的必须是对应源的）
       if (seq !== lyricSeq.current) return;
-      const merged = mergeTranslation(parseLrc(lyric.lrc), lyric.translation);
+      // 有逐字就按逐字行渲染（自带时间轴），没有就解析普通 LRC——与播放页同口径。
+      // 逐字在这里用于主行的整行卡拉 OK 填充（rAF 里按词时间轴推进渐变分界，
+      // 不逐词拆 span：桌面歌词字小、带描边/阴影/跑马灯，按词渲染得不偿失）。
+      const wbw = lyric.wordByWord ?? "";
+      const base = wbw.length > 0 ? parseWordByWordLrc(wbw) : parseLrc(lyric.lrc);
+      const merged = mergeRomanization(mergeTranslation(base, lyric.translation), lyric.romanization ?? "");
       linesRef.current = merged;
       setLines(merged);
     } catch {
@@ -249,6 +280,21 @@ export function LyricWindow(): React.JSX.Element {
             }
           }),
         );
+        // 用户在播放页手动挑了一份歌词：本窗口那份进程内缓存已经是旧词，
+        // 丢掉再按同一个 key 重取 —— 取词链路会回读到刚落库的新词
+        //（仅 React 侧重渲染是不够的，两边是独立 WebView，各持一份 lyricCache）
+        unlisten.push(
+          await onLyricManuallyPicked((payload) => {
+            const track = currentTrackRef.current;
+            if (track === null || payload.trackId !== trackKey(track)) return;
+            const key = trackKey(track);
+            dropCachedLyric(
+              track,
+              crossSourceHitFromLine(crossLineByTrack.current.get(key) ?? null, track.platform),
+            );
+            void loadLyricFor(track);
+          }),
+        );
       } catch (e) {
         throw new Error(`桌面歌词事件订阅注册失败：${String(e)}`);
       }
@@ -263,14 +309,27 @@ export function LyricWindow(): React.JSX.Element {
   // —— rAF 插值：仅可见时运行（R4） ——
   useEffect(() => {
     const tick = (): void => {
-      if (linesRef.current.length > 0) {
+      const ls = linesRef.current;
+      if (ls.length > 0) {
         const { positionMs, receivedAt } = baseRef.current;
         const now =
           positionMs + (playingRef.current ? performance.now() - receivedAt : 0);
-        const idx = findActiveIndex(linesRef.current, now);
+        const pos = now - offsetRef.current;
+        const idx = findActiveIndex(ls, pos);
         if (idx !== activeIdxRef.current) {
           activeIdxRef.current = idx;
           setActiveIdx(idx);
+        }
+        // 逐字行：主行按已唱比例整行填充。0.4% 量子化——比一个字还窄，
+        // 观感连续，又能少触发几次 React 渲染。
+        const line = idx >= 0 ? ls[idx] : null;
+        const nextFill =
+          line !== null && line.words !== undefined && line.words.length > 0
+            ? Math.round(karaokeFillRatio(line, pos - line.timeMs) * 250) / 250
+            : 1;
+        if (nextFill !== fillRatioRef.current) {
+          fillRatioRef.current = nextFill;
+          setFillRatio(nextFill);
         }
       }
       rafRef.current = requestAnimationFrame(tick);
@@ -407,8 +466,12 @@ export function LyricWindow(): React.JSX.Element {
   const showSecond = ui.lineMode === "two-lines";
   const showThird = ui.lineMode === "three-lines";
   const mainText = hasTrack ? (current?.text || "… 间奏 …") : "轻听 · 桌面歌词";
+  // 第二行：有罗马音（日文歌假名注音）就显示罗马音，否则仍是译文，都没有才退下一句
   const secondText = hasTrack
-    ? (current?.translation || (showSecond ? nextLine?.text : undefined) || "")
+    ? current?.romanization ||
+      current?.translation ||
+      (showSecond ? nextLine?.text : undefined) ||
+      ""
     : "播放音乐时显示逐行歌词";
   const prevText = hasTrack ? (prev?.text ?? "") : "";
   const thirdText = hasTrack ? (nextLine?.text ?? "") : "";
@@ -429,10 +492,17 @@ export function LyricWindow(): React.JSX.Element {
     paintOrder: "stroke",
     filter: ui.shadow ? "drop-shadow(0 1px 3px rgba(0,0,0,0.7))" : undefined,
   };
-  // 当前行 = 渐变高亮；非当前行 = 单色
+  // 当前行 = 渐变高亮；非当前行 = 单色。逐字行把渐变压进「已唱」的那段：
+  // 分界点随词时间轴推进（fillRatio 来自 rAF），未唱部分走 inactiveColor ——
+  // 网易云桌面歌词的卡拉 OK 观感；非逐字行保持整行渐变（老行为不变）。
+  const karaokeActive =
+    hasTrack && current !== null && current.words !== undefined && current.words.length > 0;
+  const fillPct = Math.round(fillRatio * 1000) / 10;
   const currentStyle: React.CSSProperties = {
     ...baseText,
-    backgroundImage: `linear-gradient(90deg, ${ui.gradient[0]}, ${ui.gradient[1]})`,
+    backgroundImage: karaokeActive
+      ? `linear-gradient(90deg, ${ui.gradient[0]} 0%, ${ui.gradient[1]} ${fillPct}%, ${ui.inactiveColor} ${fillPct}%, ${ui.inactiveColor} 100%)`
+      : `linear-gradient(90deg, ${ui.gradient[0]}, ${ui.gradient[1]})`,
     WebkitBackgroundClip: "text",
     backgroundClip: "text",
     color: "transparent",
@@ -518,6 +588,11 @@ export function LyricWindow(): React.JSX.Element {
             >
               {ui.locked ? <Lock size={15} /> : <LockOpen size={15} />}
             </ToolButton>
+            <LyricOffsetControl
+              offset={lyricOffset}
+              compact
+              className="pointer-events-auto"
+            />
             <ToolButton title="歌词设置" onClick={() => void openLyricSettings().catch(() => {})}>
               <Settings size={15} />
             </ToolButton>

@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Ban, ExternalLink, X } from "lucide-react";
 import { errMsg, stripErrorUrls } from "@/lib/utils";
+import {
+  OFFICIAL_AGREEMENT_URL,
+  OFFICIAL_FEEDBACK_URL,
+  OFFICIAL_PRIVACY_URL,
+  OFFICIAL_SITE_URL,
+  OFFICIAL_SOURCE_SETUP_URL,
+} from "@/lib/official-site";
 import { useNavigate } from "@tanstack/react-router";
 import { getAllWindows } from "@tauri-apps/api/window";
 import { listen } from "@tauri-apps/api/event";
@@ -41,7 +49,17 @@ import {
 } from "@/source-scripts/source-update";
 import { SKINS, getSkin } from "@/lib/skins";
 import { isQuality, qualityOptionsFromRegistry } from "@/lib/quality";
-import { useSourceRegistryStore } from "@/stores/sourceRegistry";
+import { useSourceQualities, useSourceRegistryStore } from "@/stores/sourceRegistry";
+import { useMusicSourceStore } from "@/stores/musicSource";
+import { useDislikesStore } from "@/stores/dislikes";
+import { usePlayerBarStore } from "@/stores/playerBar";
+import { useAuthStore, isAdmin } from "@/stores/auth";
+import {
+  countPlayerBarVisible,
+  PLAYER_BAR_BUTTONS,
+  PLAYER_BAR_MAX_VISIBLE,
+  playerBarCounts,
+} from "@/lib/player-bar";
 import {
   EQ_BANDS,
   EQ_GAIN_LIMIT_DB,
@@ -93,14 +111,23 @@ function SettingRow(props: {
   );
 }
 
-function Switch(props: { checked: boolean; onToggle: () => void }): React.JSX.Element {
+function Switch(props: {
+  checked: boolean;
+  onToggle: () => void;
+  /** 置灰停用（如名额满了的「开启」动作）；停用时点按无效 */
+  disabled?: boolean;
+}): React.JSX.Element {
   return (
     <button
       type="button"
       role="switch"
       aria-checked={props.checked}
-      onClick={props.onToggle}
-      className={`relative h-5 w-9 rounded-full transition-colors ${
+      aria-disabled={props.disabled}
+      disabled={props.disabled}
+      onClick={() => {
+        if (!props.disabled) props.onToggle();
+      }}
+      className={`relative h-5 w-9 rounded-full transition-colors disabled:opacity-40 disabled:hover:cursor-not-allowed ${
         props.checked ? "bg-primary" : "bg-muted-foreground/30"
       }`}
     >
@@ -793,6 +820,62 @@ function PlaybackSection(): React.JSX.Element {
   );
 }
 
+/**
+ * 播放条按钮（设置 → 播放条）：播放条上除「上一首 / 播放 / 下一首」以外的
+ * 按钮都能自行开关。开关存「展示中的按钮 id」（见 lib/player-bar.ts），
+ * 默认只开 收藏 / 播放模式 / 桌面歌词 / 下载 / 音质 / 音量（用户 m07452），
+ * 非音量按钮最多展示 10 个 —— 名额满了其余开关置灰，先关一个再开。
+ * 「播放链接」是 qt_admin 专属入口，只对内部账号列出。
+ */
+function PlayerBarSection(): React.JSX.Element {
+  const visible = usePlayerBarStore((s) => s.visible);
+  const loaded = usePlayerBarStore((s) => s.loaded);
+  const load = usePlayerBarStore((s) => s.load);
+  const toggle = usePlayerBarStore((s) => s.toggle);
+  const profile = useAuthStore((s) => s.profile);
+  const admin = isAdmin(profile);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const items = PLAYER_BAR_BUTTONS.filter((b) => !b.adminOnly || admin);
+  // 非音量的已展示名额（音量在 slot:"end"，不占名额）：满了之后「开启」动作置灰。
+  // 计数走 lib 的统一口径（按声明元数据判 counted，非 admin 时 playUrl 不进 items）
+  const countedVisible = countPlayerBarVisible(
+    items.filter((b) => visible.includes(b.id)).map((b) => b.id),
+  );
+  const full = countedVisible >= PLAYER_BAR_MAX_VISIBLE;
+
+  return (
+    <div className="max-w-xl">
+      <p className="pb-2 pt-1 text-xs text-muted-foreground">
+        播放条上除「上一首 / 播放 / 下一首」以外的按钮都能自行开关；关掉后剩下的按钮按数量自动
+        分到播放键两侧，中间的播放键保持居中。默认只开收藏 / 播放模式 / 桌面歌词 / 下载 / 音质 /
+        音量，其余默认关闭。除音量外最多同时展示 {PLAYER_BAR_MAX_VISIBLE} 个，名额满了先关一个
+        再开。无曲目时不显示倍速 / 下载 / 音质，本地音乐不显示音质，与开关无关。当前已展示
+        {countedVisible}/{PLAYER_BAR_MAX_VISIBLE} 个。
+      </p>
+      <div className="divide-y divide-border">
+        {items.map((b) => {
+          const checked = visible.includes(b.id);
+          const counted = playerBarCounts(b.id);
+          return (
+            <SettingRow key={b.id} title={b.label} description={b.hint}>
+              <Switch
+                checked={checked}
+                disabled={!checked && counted && full}
+                onToggle={() => toggle(b.id)}
+              />
+            </SettingRow>
+          );
+        })}
+      </div>
+      {!loaded && <p className="py-2 text-xs text-muted-foreground">正在读取播放条设置…</p>}
+    </div>
+  );
+}
+
 /** 音效设置：均衡器 / 响度归一化 / 淡入淡出（引擎侧 DSP，立即生效） */
 function SoundSection(): React.JSX.Element {
   const [fx, setFx] = useState<FxState | null>(null);
@@ -983,21 +1066,28 @@ function SoundSection(): React.JSX.Element {
 
 /** 通用设置：开机自启 / 缓存管理（播放缓存上限 + 分项清理） */
 
-/** 播放缓存上限档位（MB；"0" = 不限）。与 cache.rs 的语义一致 */
+/** 播放缓存上限档位（MB；"0" = 不限）。与 cache.rs 的语义一致；
+ *  "custom" = 手工输入档（非数字值，点它出输入框，实际值存 settings 的数字串） */
 const CACHE_LIMIT_OPTIONS: { value: string; label: string }[] = [
   { value: "256", label: "256M" },
   { value: "512", label: "512M" },
   { value: "1024", label: "1G" },
   { value: "2048", label: "2G" },
   { value: "0", label: "不限" },
+  { value: "custom", label: "自定义" },
 ];
 /** settings 里没有上限记录时的默认档（cache.rs DEFAULT_AUDIO_CACHE_LIMIT_MB） */
 const CACHE_LIMIT_DEFAULT = "512";
+/** 手工输入档的取值范围：非负整数 MB（0 = 不限），上界 1TB 够任何磁盘用 */
+const CACHE_LIMIT_CUSTOM_MAX_MB = 1048576;
 
 function GeneralSection(): React.JSX.Element {
   const [autostart, setAutostartState] = useState<boolean | null>(null);
   const [cache, setCache] = useState<AudioCacheStats | null>(null);
   const [limit, setLimit] = useState<string | null>(null);
+  // 手工输入档：true 时「自定义」段选中并显示输入框（当前值不在档位里也进入此态）
+  const [customMode, setCustomMode] = useState(false);
+  const [customDraft, setCustomDraft] = useState("");
   // 分项清理：勾选要清的内容（默认两项都清）
   const [clearAudio, setClearAudio] = useState(true);
   const [clearWeb, setClearWeb] = useState(true);
@@ -1011,10 +1101,17 @@ function GeneralSection(): React.JSX.Element {
       .then(setAutostartState)
       .catch(() => setAutostartState(false));
     void refreshCache();
-    // 上限档回显：脏数据/缺项都回落默认档（与引擎侧 parse 口径一致）
+    // 上限档回显：脏数据/缺项都回落默认档（与引擎侧 parse 口径一致）。
+    // 当前值不在档位里（含脏数据）→ 进手工输入态并回显原值
     void ipc
       .getSetting("cache.audioLimitMb")
-      .then((raw) => setLimit(raw && raw.trim() ? raw.trim() : CACHE_LIMIT_DEFAULT))
+      .then((raw) => {
+        const v = raw && raw.trim() ? raw.trim() : CACHE_LIMIT_DEFAULT;
+        setLimit(v);
+        const preset = CACHE_LIMIT_OPTIONS.some((o) => o.value !== "custom" && o.value === v);
+        setCustomMode(!preset);
+        setCustomDraft(preset ? "" : v);
+      })
       .catch(() => setLimit(CACHE_LIMIT_DEFAULT));
   }, []);
 
@@ -1047,6 +1144,22 @@ function GeneralSection(): React.JSX.Element {
       setLimit(prev);
       setError(errMsg(err));
     }
+  };
+
+  /** 手工输入档提交：非负整数 MB（0 = 不限），非法值红字提示、不动原值 */
+  const applyCustomLimit = async (): Promise<void> => {
+    const raw = customDraft.trim();
+    if (!/^\d+$/.test(raw)) {
+      if (raw.length > 0) setError("缓存上限需为非负整数（MB，0 = 不限）");
+      return;
+    }
+    const mb = Number(raw);
+    if (mb > CACHE_LIMIT_CUSTOM_MAX_MB) {
+      setError(`缓存上限最大 ${CACHE_LIMIT_CUSTOM_MAX_MB} MB`);
+      return;
+    }
+    if (limit !== null && mb === Number(limit)) return; // 没改不重复下发
+    await changeLimit(raw);
   };
 
   const clearCache = async (): Promise<void> => {
@@ -1105,11 +1218,43 @@ function GeneralSection(): React.JSX.Element {
         {limit === null ? (
           <span className="text-xs text-muted-foreground">…</span>
         ) : (
-          <Segmented
-            value={limit}
-            options={CACHE_LIMIT_OPTIONS}
-            onChange={(v) => void changeLimit(v)}
-          />
+          <div className="flex items-center gap-2">
+            <Segmented
+              value={customMode ? "custom" : limit}
+              options={CACHE_LIMIT_OPTIONS}
+              onChange={(v) => {
+                if (v === "custom") {
+                  // 只切到输入态、不改值：当前数字带进输入框方便微调
+                  setCustomMode(true);
+                  setCustomDraft(limit !== null && !Number.isNaN(Number(limit)) ? limit : "");
+                  return;
+                }
+                setCustomMode(false);
+                void changeLimit(v);
+              }}
+            />
+            {customMode && (
+              <span className="flex items-center gap-1">
+                <input
+                  type="number"
+                  inputMode="numeric"
+                  value={customDraft}
+                  placeholder="512"
+                  onChange={(e) => {
+                    setCustomDraft(e.target.value);
+                    setError(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void applyCustomLimit();
+                  }}
+                  onBlur={() => void applyCustomLimit()}
+                  autoFocus
+                  className="w-20 rounded-md border border-border bg-transparent px-2 py-1 text-xs outline-none focus:border-primary"
+                />
+                <span className="text-xs text-muted-foreground">MB</span>
+              </span>
+            )}
+          </div>
         )}
       </SettingRow>
       <SettingRow
@@ -1175,15 +1320,28 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-/** 音质下拉（设置页两处共用：默认播放 / 默认下载） */function QualitySelect(props: {
+/** 音质下拉（设置页两处共用：默认播放 / 默认下载） */
+function QualitySelect(props: {
   value: Quality;
   disabled?: boolean;
   onChange: (q: Quality) => void;
 }): React.JSX.Element {
-  // 档位清单来自数据包注册表（未就绪时 qualityOptionsFromRegistry 兜底三档）
-  const options = qualityOptionsFromRegistry(
-    useSourceRegistryStore((s) => s.qualities),
-  );
+  // 档位清单来自数据包注册表，并按**当前选中的音源**收敛（v5 契约：包侧
+  // 声明了该源可用档位，如 B 站无真无损就不显示 flac；未声明 = 全部档位。
+  // 未就绪时 qualityOptionsFromRegistry 兜底三档）
+  const activeId = useMusicSourceStore((s) => s.activeSourceId);
+  const globalQualities = useSourceRegistryStore((s) => s.qualities);
+  const options = qualityOptionsFromRegistry(useSourceQualities(activeId));
+  let shown = options;
+  if (!options.some((o) => o.value === props.value)) {
+    // 换源后残留的旧默认值可能不在该源档位里：仍保留显示（用全局注册表名），
+    // 避免 select 显示出与实际存储不符的假值；播放/下载发起时会按源钳到可用档
+    const declared = globalQualities.filter((q) => q.id === props.value);
+    const fallback =
+      qualityOptionsFromRegistry(declared).find((o) => o.value === props.value) ??
+      { value: props.value, label: props.value, short: props.value.toUpperCase() };
+    shown = [fallback, ...options];
+  }
   return (
     <select
       value={props.value}
@@ -1192,7 +1350,7 @@ function formatBytes(bytes: number): string {
       onChange={(e) => props.onChange(e.target.value as Quality)}
       className="rounded-md border border-input bg-background px-2 py-1.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
     >
-      {options.map((o) => (
+      {shown.map((o) => (
         <option key={o.value} value={o.value}>
           {o.label}（{o.short}）
         </option>
@@ -1619,6 +1777,13 @@ function SourcePackageSection(): React.JSX.Element {
           </button>
         </div>
       </SettingRow>
+      {/* 装包/换源/音质/排错的完整说明只在官网维护一份，客户端给个入口即可 */}
+      <SettingRow
+        title="如何设置音源"
+        description="三种安装方式、切换默认音源、音质选择与装不上排查"
+      >
+        <ExternalLinkButton label="查看教程" url={OFFICIAL_SOURCE_SETUP_URL} />
+      </SettingRow>
       {clipTip !== null && !preview && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
           <div className="w-full max-w-sm rounded-xl border border-border bg-card p-4 shadow-lg">
@@ -1853,7 +2018,41 @@ function AboutSection(): React.JSX.Element {
       {result && (
         <div className="py-3 text-xs text-muted-foreground">{result}</div>
       )}
+      {/* 官网条款与开源信息：协议正文、隐私说明与仓库地址都只在官网维护一份，
+          客户端只保留入口，避免两边各写一份然后慢慢对不上 */}
+      <SettingRow title="项目介绍与开源地址" description="功能说明、截图与三个仓库的地址">
+        <ExternalLinkButton label="打开官网" url={OFFICIAL_SITE_URL} />
+      </SettingRow>
+      <SettingRow title="用户协议" description="使用本软件前请先阅读">
+        <ExternalLinkButton label="查看" url={OFFICIAL_AGREEMENT_URL} />
+      </SettingRow>
+      <SettingRow title="隐私政策" description="收集哪些数据、如何使用与保留">
+        <ExternalLinkButton label="查看" url={OFFICIAL_PRIVACY_URL} />
+      </SettingRow>
+      <SettingRow
+        title="意见反馈"
+        description="GitHub / CNB 双渠道提交 Issue 或 PR"
+      >
+        <ExternalLinkButton label="前往反馈" url={OFFICIAL_FEEDBACK_URL} />
+      </SettingRow>
     </div>
+  );
+}
+
+/** 打开官网页面的按钮：统一走 openExternalUrl（系统默认浏览器），失败静默不打断设置页 */
+function ExternalLinkButton(props: {
+  label: string;
+  url: string;
+}): React.JSX.Element {
+  return (
+    <button
+      type="button"
+      onClick={() => void ipc.openExternalUrl(props.url).catch(() => undefined)}
+      className="flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent"
+    >
+      {props.label}
+      <ExternalLink className="h-3.5 w-3.5 text-muted-foreground" />
+    </button>
   );
 }
 
@@ -2054,24 +2253,40 @@ function ShortcutSection(): React.JSX.Element {
   );
 }
 
+/**
+ * 超过这个数就要二次确认。
+ *
+ * 批量下载不限流会被音源 / CDN 当成爬虫：LX Music 就是因为默认放开并发被临时封过 IP
+ * （issue #1992，34 条讨论），它同样把 3 当成「安全线」、>3 才弹确认。这里对齐这个口径。
+ */
+const SAFE_DOWNLOAD_CONCURRENCY = 3;
+
+/** 可选的同时下载数，与 Rust `download::MIN/MAX_CONCURRENCY` 一致 */
+const CONCURRENCY_CHOICES = [1, 2, 3, 4, 5, 6];
+
 /** 下载设置：保存位置（默认安装目录/Download，可选任意位置） */
 function DownloadSection(): React.JSX.Element {
   const [dir, setDir] = useState("");
   const [quality, setQuality] = useState<Quality>("320");
   const [nameFormat, setNameFormat] = useState<"artist" | "song">("artist");
+  const [concurrency, setConcurrency] = useState(ipc.DEFAULT_DOWNLOAD_CONCURRENCY);
+  // 选了 >3 时先挂在这里等用户确认。沿用全项目唯一的二次确认手法：原地换文案再点第二下
+  const [pendingConcurrency, setPendingConcurrency] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async (): Promise<void> => {
     try {
-      const [d, q, f] = await Promise.all([
+      const [d, q, f, c] = await Promise.all([
         ipc.getDownloadDir(),
         ipc.getDownloadQuality(),
         ipc.getDownloadNameFormat(),
+        ipc.getDownloadConcurrency(),
       ]);
       setDir(d);
       setQuality(q);
       setNameFormat(f);
+      setConcurrency(c);
     } catch (err) {
       setError(errMsg(err));
     }
@@ -2132,6 +2347,31 @@ function DownloadSection(): React.JSX.Element {
     }
   };
 
+  const applyConcurrency = async (n: number): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    try {
+      // Rust 侧会再夹一次到 1–6，并以实际生效值回传（避免前后端口径漂移）
+      setConcurrency(await ipc.setDownloadConcurrency(n));
+      setPendingConcurrency(null);
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const chooseConcurrency = (n: number): void => {
+    // 3 以内直接生效；>3 先弹确认 —— 批量下载不限流会被音源/CDN 判成爬虫，
+    // LX Music 就因此被封过 IP（issue #1992），它同样把 >3 做成需要确认。
+    if (n > SAFE_DOWNLOAD_CONCURRENCY) {
+      setPendingConcurrency(n);
+      return;
+    }
+    setPendingConcurrency(null);
+    void applyConcurrency(n);
+  };
+
   return (
     <div className="max-w-xl divide-y divide-border">
       <SettingRow
@@ -2188,6 +2428,179 @@ function DownloadSection(): React.JSX.Element {
           <option value="song">歌名 - 歌手</option>
         </select>
       </SettingRow>
+      <SettingRow
+        title="同时下载数"
+        description="批量下载时最多同时进行几个任务，超出的排队等待。数字越大越快，但也更容易被音源限流甚至封 IP，建议不超过 3。"
+      >
+        <div className="flex items-center gap-2">
+          {CONCURRENCY_CHOICES.map((n) => {
+            const active = concurrency === n;
+            // 待确认的那一项原地变文案 + 变红，点第二下才真正提交
+            const confirming = pendingConcurrency === n;
+            return (
+              <button
+                key={n}
+                type="button"
+                onClick={() => chooseConcurrency(n)}
+                disabled={busy}
+                aria-label={confirming ? `确认将同时下载数改为 ${n}` : `同时下载数 ${n}`}
+                aria-pressed={active}
+                className={
+                  confirming
+                    ? "rounded-md border border-destructive px-3 py-1.5 text-xs text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
+                    : active
+                      ? "rounded-md border border-primary bg-primary/10 px-3 py-1.5 text-xs font-medium text-primary transition-colors disabled:opacity-50"
+                      : "rounded-md border border-border px-3 py-1.5 text-xs transition-colors hover:bg-accent disabled:opacity-50"
+                }
+              >
+                {confirming ? `${n} 个？` : String(n)}
+              </button>
+            );
+          })}
+        </div>
+      </SettingRow>
+      {pendingConcurrency !== null && (
+        <p className="py-2 text-xs text-destructive">
+          同时下载 {pendingConcurrency} 个可能被音源判定为异常流量并临时封禁 IP，再点一次「
+          {pendingConcurrency} 个？」确认。
+        </p>
+      )}
+      {error && <p className="py-2 text-xs text-destructive">{error}</p>}
+    </div>
+  );
+}
+
+/**
+ * 不喜欢列表（屏蔽规则）管理。
+ *
+ * 规则按「歌名 + 歌手」匹配而不按曲目 id —— id 是音源私有的，同一首歌换源兜底后
+ * id 与 platform 都会变，按 id 屏蔽等于换个源就失效。代价是匹配必须容许吵闹，
+ * 归一化那套在 Rust 侧 `db/store/dislikes.rs`，这里只管展示与删除。
+ *
+ * LX 的 `dislike_list` 把 delete/update/clear 三个 dbHelper 整体注释掉了，用户只能
+ * 追加或整体覆盖；我们这里 `id` 是真主键，逐条删除是一等公民。
+ */
+function DislikeSection(): React.JSX.Element {
+  const rules = useDislikesStore((s) => s.rules);
+  const loaded = useDislikesStore((s) => s.loaded);
+  const refresh = useDislikesStore((s) => s.refresh);
+  const unbanById = useDislikesStore((s) => s.unbanById);
+  const clearAll = useDislikesStore((s) => s.clearAll);
+  const [busy, setBusy] = useState(false);
+  // 「清空全部」不可恢复，沿用全项目唯一的二次确认手法：原地换文案再点第二下
+  const [confirming, setConfirming] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const unban = async (id: number): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    try {
+      await unbanById(id);
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const removeAll = async (): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    try {
+      await clearAll();
+      setConfirming(false);
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="max-w-xl divide-y divide-border">
+      <SettingRow
+        title="屏蔽规则"
+        description="屏蔽后，这些歌 / 这个人的歌不会再出现在列表与自动播放里（手动点播仍可播放）。"
+      >
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <span>{loaded ? `${rules.length} 条` : "…"}</span>
+          {rules.length > 0 && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => {
+                if (confirming) {
+                  void removeAll();
+                } else {
+                  setConfirming(true);
+                }
+              }}
+              className={`rounded-md border px-2 py-1 text-xs transition-colors disabled:opacity-50 ${
+                confirming
+                  ? "border-destructive text-destructive hover:bg-destructive/10"
+                  : "border-border text-muted-foreground hover:bg-accent hover:text-foreground"
+              }`}
+            >
+              {confirming ? "确认清空全部？" : "清空"}
+            </button>
+          )}
+        </div>
+      </SettingRow>
+      <div className="py-3">
+        {!loaded ? (
+          <p className="text-xs text-muted-foreground">加载中…</p>
+        ) : rules.length === 0 ? (
+          <p className="text-xs text-muted-foreground">
+            还没有屏蔽任何歌曲。在曲目行悬停时的「屏蔽」按钮可以加进来。
+          </p>
+        ) : (
+          <ul className="flex flex-col divide-y divide-border">
+            {rules.map((r) => (
+              <li
+                key={r.id}
+                className="flex items-center gap-2 py-2 text-xs"
+                data-testid="dislike-rule"
+              >
+                <Ban className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                <span className="min-w-0 flex-1 truncate">
+                  {r.kind === "song" && r.singerRaw
+                    ? `${r.nameRaw} · ${r.singerRaw}`
+                    : r.nameRaw}
+                </span>
+                <span
+                  className="shrink-0 rounded bg-secondary px-1 py-px text-[10px] text-muted-foreground"
+                  title={
+                    r.kind === "singer"
+                      ? "这位歌手的所有歌都不会自动出现"
+                      : "这首歌（含同名不同版本）不会自动出现"
+                  }
+                >
+                  {r.kind === "singer" ? "歌手" : "歌曲"}
+                </span>
+                <button
+                  type="button"
+                  aria-label={`取消屏蔽 ${r.nameRaw}`}
+                  title="取消屏蔽"
+                  disabled={busy}
+                  onClick={() => void unban(r.id)}
+                  className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-background hover:text-foreground disabled:opacity-50"
+                >
+                  <X className="h-3.5 w-3.5" />
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+      {confirming && (
+        <p className="pb-2 text-xs text-muted-foreground">
+          清空后全部规则不可恢复；点空白处切换到别的分区会自动取消这次确认。
+        </p>
+      )}
       {error && <p className="py-2 text-xs text-destructive">{error}</p>}
     </div>
   );
@@ -2198,8 +2611,10 @@ const SECTION_TITLES: Record<string, string> = {
   appearance: "外观",
   "desktop-lyric": "桌面歌词",
   playback: "播放",
+  "player-bar": "播放条",
   sound: "音效",
   download: "下载",
+  dislike: "不喜欢列表",
   "source-package": "音源包",
   shortcut: "快捷键",
   about: "关于",
@@ -2255,10 +2670,14 @@ export function SettingsPage(props: { section: string }): React.JSX.Element {
         <DesktopLyricSection />
       ) : props.section === "playback" ? (
         <PlaybackSection />
+      ) : props.section === "player-bar" ? (
+        <PlayerBarSection />
       ) : props.section === "sound" ? (
         <SoundSection />
       ) : props.section === "download" ? (
         <DownloadSection />
+      ) : props.section === "dislike" ? (
+        <DislikeSection />
       ) : props.section === "source-package" ? (
         <SourcePackageSection />
       ) : props.section === "shortcut" ? (

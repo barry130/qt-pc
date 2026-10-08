@@ -11,7 +11,12 @@
 //!
 //! MV/视频代理（`mv/` Range 透传）已随 MV 功能一并删除。
 //!
-//! 白名单：只允许已知音源 CDN 域名，防止歌词/皮肤数据把它当任意代理。
+//! 域名策略（2026-10 起放开）：不再维护音源 CDN 后缀白名单，任何**公网**
+//! http(s) 主机都代取；只保留「协议限 http(s) + 主机必须公网」两道硬底线
+//! （非白名单，是地址形态校验：挡 file: 读盘与内网 SSRF）。历史教训是每接
+//! 一个新音源/新 CDN 就要补一条后缀，漏一条的表现就是整排封面空白
+//! （QQ 榜单 y.gtimg.cn、QQ 歌单 p.qpic.cn、B 站 hdslb.com、咪咕 d.musicapp.migu.cn
+//! 都踩过）。
 
 use base64::Engine as _;
 use std::collections::HashMap;
@@ -20,25 +25,6 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::http::{header, Request, Response, StatusCode};
 use crate::source_bundle;
-
-/// 允许代取的封面域名后缀（wyy + qq + kw + kg 的图片 CDN 及其通用回退）
-const ALLOWED_HOST_SUFFIXES: &[&str] = &[
-    "music.126.net",
-    "163.com",
-    "qq.com",
-    // 榜单封面走 y.gtimg.cn（不是 *.qq.com），少了这条排行榜整排都是空白
-    "gtimg.cn",
-    // QQ 歌单/推荐封面 CDN 是 p.qpic.cn / qpic.y.qq.com，qpic.cn 不以 qq.com 结尾，
-    // 少了这条歌单广场一大片封面全是空白
-    "qpic.cn",
-    "kuwo.cn",
-    "kwcdn.kuwo.cn",
-    "kugou.com",
-    "kgimg.com",
-    // Astral 账号头像：后端 astral.canace.cn / 存储 storage.canace.icu
-    "canace.cn",
-    "canace.icu",
-];
 
 /// 内存封面缓存：URL → bytes。
 ///
@@ -245,8 +231,24 @@ where
 /// 网易云两种形态都要处理：裸 URL 直接追加 `?param=WxH`；已经带
 /// `imageView=1&thumbnail=800y800` 的必须**改写 thumbnail 的值**，
 /// 实测在其后追加 `&param=` 无效（仍是 954970 字节）。
+///
+/// B 站 `i*.hdslb.com` 是第三种形态：尺寸写在**路径后缀**里
+/// （`@300w_300h_1c.webp`），实测同一张封面 249985 字节 → 3208 字节（约 78×），
+/// 改格式后缀还能顺带拿到 webp。同一_URL 已带 `@` 后缀时不再追加（可能来自
+/// 音源方已经压好的封面）。
 fn sized_cover_url(url: &str, px: u32) -> String {
     let lower = url.to_ascii_lowercase();
+    if lower.contains("hdslb.com") {
+        // 已有 @ 尺寸后缀的原样返回（可能是音源方指定的裁剪）
+        if url.contains('@') {
+            return url.to_string();
+        }
+        // 后缀要贴在**路径**末尾：带查询串时插到 ? 之前，否则会被当成查询串的值
+        return match url.find('?') {
+            Some(pos) => format!("{}@{px}w_{px}h_1c.webp{}", &url[..pos], &url[pos..]),
+            None => format!("{url}@{px}w_{px}h_1c.webp"),
+        };
+    }
     if !(lower.contains("music.126.net") || lower.contains("163.com")) {
         return url.to_string();
     }
@@ -287,35 +289,28 @@ fn referer_for(url: &str) -> &'static str {
         "https://www.kugou.com/"
     } else if lower.contains("kuwo.cn") {
         "https://www.kuwo.cn/"
+    } else if lower.contains("hdslb.com") || lower.contains("bilivideo") {
+        // B 站 CDN：封面实测四种头都放行（Referer 无所谓），但音频直链只有带
+        // Referer 才不会 403，这里统一补上不影响封面、也对齐播放侧口径
+        "https://www.bilibili.com/"
     } else {
         "https://music.163.com/"
     }
 }
 
+/// 代取准入：只要求「公网 + http(s)」，不再要求域名落在音源 CDN 白名单里。
+///
+/// 依据（2026-10 决定）：qtres 只代取图片，图片 URL 全部来自音源接口，而各家
+/// 图床互相之间并不共享域名，每接一个源/换一次 CDN 都要补一条后缀；漏配的表现
+/// 是整排封面空白（排行榜、歌单广场、咪咕都踩过），代价远大于收益。真正的底线
+/// 只有两条：协议必须是 http(s)（`file:` 能读本机文件、`data:` 能绕来源），主机
+/// 必须是公网地址（挡住把本机/内网服务当跳板）。这两条直接复用 [`crate::net_guard`]。
 fn host_allowed(url: &str) -> bool {
-    // 取 host 部分
-    let rest = match url.split_once("://") {
-        Some((_, r)) => r,
-        None => return false,
-    };
-    // host 大小写不敏感（HOST 头本来就允许大写，别让大写 host 无辜被拒）
-    let host = rest.split('/').next().unwrap_or("").to_ascii_lowercase();
-    // 去掉端口（含 IPv6 字面量的 [::1]:80 形式：白名单里没有 IP，遇 [ 一律不放行）
-    let host = if host.starts_with('[') {
-        return false;
-    } else {
-        host.split(':').next().unwrap_or("")
-    };
-    // 后缀必须落在**点边界**上：原来 `host.ends_with("qq.com")` 会把
-    // `evilqq.com` / `notqq.com` 判为放行，等于把白名单架空（任何人注册一个
-    // 以 qq.com 结尾的域名就能借 qtres 代取任意内容）。这里要求 host 恰好等于
-    // 后缀，或以 `.后缀` 结尾（不分配字符串，逐字节比边界）。
-    ALLOWED_HOST_SUFFIXES.iter().any(|sfx| {
-        host == *sfx
-            || (host.len() > sfx.len()
-                && host.ends_with(sfx)
-                && host.as_bytes()[host.len() - sfx.len() - 1] == b'.')
-    })
+    match crate::net_guard::ensure_http_url(url) {
+        // is_public_host 自己处理 IPv4/IPv6 字面量、localhost、单标签主机与各保留段
+        Ok(parsed) => crate::net_guard::is_public_host(parsed.host_str().unwrap_or_default()),
+        Err(_) => false,
+    }
 }
 
 /// 解码 `cover/` 路径（base64url，可无填充）→ 原始 URL
@@ -592,7 +587,8 @@ fn handle_qtres_sync<R: tauri::Runtime>(
         return placeholder();
     };
     if !host_allowed(&original_url) {
-        log::warn!("[qtres] 封面域名不在白名单，拒绝代取: {original_url}");
+        // 放开域名白名单后，这里只剩两种可能：非 http(s) 协议，或主机是内网/本机
+        log::warn!("[qtres] 代取地址不合法（非公网 http(s)），拒绝: {original_url}");
         return placeholder();
     }
     let logged = original_url.clone();
@@ -809,31 +805,61 @@ mod tests {
         assert!(decode_res_path("/unknown/xxx").is_none());
     }
 
+    /// 放开后**不再**按域名后缀判定：任何公网 http(s) 主机都能代取。
+    ///
+    /// 这条测试同时锁住"放开但不裸奔"：非 http(s) 协议、内网/本机主机仍必须被拒。
     #[test]
-    fn host_whitelist_rejects_foreign_hosts() {
-        assert!(host_allowed("https://p1.music.126.net/abc.jpg"));
-        assert!(host_allowed("https://imge.kugou.com/a.jpg"));
-        assert!(!host_allowed("https://evil.example.com/a.jpg"));
-        assert!(!host_allowed("file:///C:/Windows/system32"));
+    fn cover_proxy_allows_any_public_host_but_blocks_local() {
+        // 各源图床（含咪咕、QQ 榜单 y.gtimg.cn、QQ 歌单 p.qpic.cn —— 这三条历史
+        // 上都因为漏配后缀而整排空白）
+        for url in [
+            "https://p1.music.126.net/abc.jpg",
+            "https://imge.kugou.com/a.jpg",
+            "https://y.gtimg.cn/music/photo_new/T003R300x300M000002D6X7w0nrufd.jpg",
+            "http://p.qpic.cn/music_cover/xFPOwViasj/600?n=1",
+            "http://qpic.y.qq.com/music_cover/8eiaDBJ/300?n=1",
+            "https://i1.hdslb.com/bfs/a.jpg",
+            "https://d.musicapp.migu.cn/data/oss/resource/00/2z/m2/7e.webp",
+            "http://astral.canace.cn/files/avatar/1.png",
+            "https://storage.canace.icu/p/xyz/avatar.png",
+            // 没在白名单里出现过的陌生域名，也一样放行（这正是放开的目的）
+            "https://evil.example.com/a.jpg",
+        ] {
+            assert!(host_allowed(url), "{url} 是公网 http(s)，应放行");
+        }
+        // 硬底线一：协议必须是 http(s)
+        for url in [
+            "file:///C:/Windows/system32",
+            "data:image/png;base64,AAAA",
+            "ftp://example.com/a.jpg",
+            "javascript:alert(1)",
+        ] {
+            assert!(!host_allowed(url), "{url} 非 http(s)，应拒绝");
+        }
+        // 硬底线二：主机必须公网（挡本机/内网跳板与 SSRF）
+        for url in [
+            "http://127.0.0.1:27000/a.jpg",
+            "http://10.0.0.5/a.jpg",
+            "http://192.168.1.9/a.jpg",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://localhost/a.jpg",
+            "http://[::1]/a.jpg",
+            "http://intranet/a.jpg",
+            "file://127.0.0.1/a.jpg",
+        ] {
+            assert!(!host_allowed(url), "{url} 指向内网/本机，应拒绝");
+        }
     }
 
+    /// 放开的边界：后缀陷阱在旧白名单下才是问题（`evilqq.com` 曾能被
+    /// `ends_with("qq.com")` 放行），现在不按后缀判，但**也不能**因为放开就
+    /// 把不合法的 URL 字面量当成合法目标。
     #[test]
-    fn host_whitelist_allows_astral_avatar_hosts() {
-        // 账号头像走 qtres 代取：后端 astral.canace.cn / 存储 storage.canace.icu，
-        // 不在白名单会被拦成破图（标题栏头像回退到 logo）。
-        assert!(host_allowed("http://astral.canace.cn/files/avatar/1.png"));
-        assert!(host_allowed("https://storage.canace.icu/p/xyz/avatar.png"));
+    fn cover_proxy_rejects_malformed_urls() {
+        for url in ["", "not a url", "example.com/a.jpg", "https://"] {
+            assert!(!host_allowed(url), "{url:?} 不是合法 http(s) 地址，应拒绝");
+        }
     }
-
-    #[test]
-    fn host_whitelist_allows_qq_chart_covers() {
-        // 榜单封面域名是 y.gtimg.cn，跟歌曲封面的 y.qq.com 不是一个后缀。
-        // 之前漏了这条，QQ 排行榜的图片全被拦截成空白图。
-        assert!(host_allowed(
-            "http://y.gtimg.cn/music/photo_new/T003R300x300M000002D6X7w0nrufd.jpg"
-        ));
-    }
-
     #[test]
     fn upgrade_to_https_only_rewrites_plain_http() {
         assert_eq!(
@@ -844,18 +870,6 @@ mod tests {
             upgrade_to_https("https://p1.music.126.net/a.jpg"),
             "https://p1.music.126.net/a.jpg"
         );
-    }
-
-    #[test]
-    fn host_whitelist_allows_qq_playlist_cover_cdns() {
-        // QQ 推荐/搜索歌单的 imgurl 大多落 p.qpic.cn（还有 qpic.y.qq.com）。
-        // p.qpic.cn 不以 qq.com 结尾，漏了 qpic.cn 这条歌单广场会满屏空白封面。
-        assert!(host_allowed(
-            "http://p.qpic.cn/music_cover/xFPOwViasj/600?n=1"
-        ));
-        assert!(host_allowed(
-            "http://qpic.y.qq.com/music_cover/8eiaDBJ/300?n=1"
-        ));
     }
 
     /// 封面缓存淘汰：超容量时按"最旧"**批量**淘汰，容量上限绝不被突破，
@@ -922,6 +936,21 @@ mod tests {
             sized_cover_url("https://img1.163.com/a.jpg", 300),
             "https://img1.163.com/a.jpg?param=300y300"
         );
+        // B 站：尺寸 + 格式都写在路径后缀 @WxH_1c.webp（实测 249985 → 3208 字节）
+        assert_eq!(
+            sized_cover_url("https://i1.hdslb.com/bfs/archive/6770f3a.jpg", 300),
+            "https://i1.hdslb.com/bfs/archive/6770f3a.jpg@300w_300h_1c.webp"
+        );
+        // 带查询串时后缀插到 ? 之前，不能落进查询串里
+        assert_eq!(
+            sized_cover_url("https://i1.hdslb.com/bfs/a.jpg?x=1", 256),
+            "https://i1.hdslb.com/bfs/a.jpg@256w_256h_1c.webp?x=1"
+        );
+        // 已带 @ 后缀：原样返回，不叠加
+        assert_eq!(
+            sized_cover_url("https://i1.hdslb.com/bfs/a.jpg@672w_378h_1c.webp", 300),
+            "https://i1.hdslb.com/bfs/a.jpg@672w_378h_1c.webp"
+        );
         // 其它图床（酷我/QQ/酷狗/Astral）完全不动：实测都不吃尺寸参数
         for url in [
             "https://zimg.kuwo.cn/bang/9/2/x.png",
@@ -931,6 +960,23 @@ mod tests {
         ] {
             assert_eq!(sized_cover_url(url, 300), url, "不应改写 {url}");
         }
+    }
+
+    /// B 站封面走 qtres 代取（整列封面空白的历史事故），并校验 Referer 分支
+    #[test]
+    fn covers_from_bilibili_are_allowed() {
+        for url in [
+            "https://i1.hdslb.com/bfs/archive/6770f3a7d60f21469194251726588cee3b8bdb45.jpg",
+            "https://i0.hdslb.com/bfs/face/deadbeef.jpg",
+            "https://i2.hdslb.com/bfs/archive/x.jpg@300w_300h_1c.webp",
+        ] {
+            assert!(host_allowed(url), "应放行 {url}");
+        }
+        // Referer 也要走 B 站那支，不能兜底成网易云
+        assert_eq!(
+            referer_for("https://i1.hdslb.com/bfs/a.jpg"),
+            "https://www.bilibili.com/"
+        );
     }
 
     /// 目标边长查询串：缺省 300，合法值夹到 64..1200，非法值回落缺省。

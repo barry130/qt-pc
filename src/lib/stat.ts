@@ -4,7 +4,7 @@ import * as ipc from "@/services/ipc";
 /**
  * 桌面端使用统计上报（STATS_DESIGN.md §4.1 事件模型 / §7 采集行为）。
  *
- * 后端契约：POST /api/v1/stat/report（匿名免登录），事件字段见后端 StatEventDTO：
+ * 后端契约：POST /api/v1/app/stat/report（匿名免登录），事件字段见后端 StatEventDTO：
  * evt/ts/deviceId/appVersion/model/os/page/duration/ch/errorType/message/stack/release/extra。
  * ut 不用客户端管——Rust 侧 report_stats 统一强制 app-windows。
  *

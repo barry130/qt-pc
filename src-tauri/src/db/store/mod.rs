@@ -18,7 +18,8 @@
 //! - `stats`：听歌统计；
 //! - `downloads`：下载任务；
 //! - `session`：播放队列与播放现场存档；
-//! - `settings`：settings 键值读写。
+//! - `settings`：settings 键值读写；
+//! - `lyrics`：歌词正文落库（`lyrics`）与逐曲目歌词偏移 / 关联本地歌词文件（`lyric_settings`）。
 //!
 //! ## 歌单的唯一定位（DESIGN §5.3 修订）
 //! 歌单是唯一的组织单位，收藏不能脱离歌单存在。每个歌单由
@@ -30,10 +31,12 @@
 //! 收藏歌曲用 `liked_songs.pid` 归属到歌单；散装收藏（没指定歌单、
 //! 或云端同步回来的）挂在「我喜欢的歌曲」下，即 `("local", "local")`。
 
+pub(crate) mod dislikes;
 pub(crate) mod downloads;
 pub(crate) mod history;
 pub(crate) mod likes;
 pub(crate) mod local;
+pub(crate) mod lyrics;
 pub(crate) mod playlists;
 pub(crate) mod session;
 pub(crate) mod settings;
@@ -42,10 +45,12 @@ pub(crate) mod tracks;
 
 // 各域条目原样再导出：`crate::db::store::upsert_tracks` 这类既有调用路径因此保持不变，
 // 外部调用点（commands.rs / audio/engine.rs / local.rs …）一行都不用改。
+pub(crate) use dislikes::*;
 pub(crate) use downloads::*;
 pub(crate) use history::*;
 pub(crate) use likes::*;
 pub(crate) use local::*;
+pub(crate) use lyrics::*;
 pub(crate) use playlists::*;
 pub(crate) use session::*;
 pub(crate) use settings::*;

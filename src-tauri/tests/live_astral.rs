@@ -62,8 +62,8 @@ fn live_update_check_version_and_messages() {
             "ut": "app-windows", "appVersion": version_name(),
         });
         match client.report_stats(vec![evt]).await {
-            Ok(()) => println!("[live] stat/report 成功"),
-            Err(e) => println!("[live] stat/report 失败: {e}"),
+            Ok(()) => println!("[live] app/stat/report 成功"),
+            Err(e) => println!("[live] app/stat/report 失败: {e}"),
         }
 
         // 需登录接口：无 satoken 时应得到明确错误而非 panic

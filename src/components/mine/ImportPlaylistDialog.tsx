@@ -9,7 +9,6 @@ import {
   importPlaylist,
   importPlaylistSongs,
 } from "@/lib/playlist-import";
-import { parsePlaylistInput } from "@/lib/playlist-link";
 import * as sourceApi from "@/source-scripts";
 import * as ipc from "@/services/ipc";
 
@@ -60,7 +59,7 @@ export function ImportPlaylistDialog(props: {
     setPreview(null);
     setResult(null);
     try {
-      const parsed = parsePlaylistInput(input, forced);
+      const parsed = await sourceApi.parseSheetInput(input, forced);
       if (!parsed) {
         throw new Error("无法识别歌单链接或 ID，可试试手动选择平台");
       }

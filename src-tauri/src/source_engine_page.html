@@ -457,7 +457,8 @@
       /** 主窗口 RPC：source-engine-request → source-engine-response。
        *  kind "status" = 查询当前生命周期（client 绑定晚于引擎启动也能对齐状态）；
        *  kind "resolve" = 取链（url "" = 失败/未装播放包；line = 本次命中的线路，
-       *                    null = 未知；error = 逐线路 trace 或「未安装」口径）；
+       *                    null = 未知；referer = 宿主取字节要带的头（空串 = 不发）；
+        *                    error = 逐线路 trace 或「未安装」口径）；
        *  kind "invoke"  = 数据接口（meta 入口名 + JSON 参数，result 为 JSON 文本）。 */
       async function onRequest(event) {
         const payload = (event && event.payload) || {};
@@ -495,12 +496,22 @@
           return;
         }
         // 取链统一走 meta 的 getPlayUrl（未装播放包时它按统一口径抛错）：
-        // 应答里 url + line（本次命中的线路 {id,name,kind}）；失败带 error =
-        // 逐线路 trace（哪条线死链/超时/预算耗尽未跑、跨源兜底有没有跑）或
-        // 「未安装播放音源包：…」的安装引导。
+        // 应答里 url + line（本次命中的线路 {id,name,kind}）+ referer（宿主取
+        // 字节要带的头，空串 = 不发）+ size/actualQuality（Range 预检实测的
+        // 文件总字节数与按实测码率重标后的档位，见《MusicFree 对照》§4 第 3 项）；
+        // 失败带 error = 逐线路 trace（哪条线死链/超时/预算耗尽未跑、跨源兜底有没有跑）
+        // 或「未安装播放音源包：…」的安装引导。
         let url = "";
         let line = null;
         let error = null;
+        // referer：宿主（播放 range_reader / 下载 download.rs）拿这个地址去 CDN
+        // 取字节时要带的头，由包按源声明下发；空串 = 不发（宿主不许自己按域名猜）
+        let referer = "";
+        // size / actualQuality：包侧 Range 预检的实测结果，原样转发给宿主。
+        // size 为 null = 本次没读到总长（206 无 content-range、403/416 放行），
+        // actualQuality 此时等于请求档 —— 上层按请求档处理，不许自己猜一个。
+        let size = null;
+        let actualQuality = "";
         if (!entries) {
           error = "未安装数据包，在线播放不可用（首页可安装）";
         }
@@ -520,13 +531,27 @@
             );
             url = parsed.url || "";
             line = parsed.line || null;
+            referer = typeof parsed.referer === "string" ? parsed.referer : "";
+            size = typeof parsed.size === "number" && isFinite(parsed.size) ? parsed.size : null;
+            actualQuality = typeof parsed.actualQuality === "string" ? parsed.actualQuality : "";
           }
         } catch (err) {
           url = "";
           line = null;
+          referer = "";
+          size = null;
+          actualQuality = "";
           error = String((err && err.message) || err);
         }
-        await emitToMain("source-engine-response", { requestId, url, line, error });
+        await emitToMain("source-engine-response", {
+          requestId,
+          url,
+          line,
+          error,
+          referer,
+          size,
+          actualQuality,
+        });
       }
 
       /** Rust 在包列表/播放槽变化后广播：热切换播放包，无需重启应用 */

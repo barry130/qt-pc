@@ -15,6 +15,26 @@ fn test_conn() -> Connection {
     conn
 }
 
+/// 供各域自己的 `#[cfg(test)]` 复用（当前 `tests.rs` 是被多个域共享的孩子列表）：
+/// 不想把 `test_conn` 复制到每个域文件里。
+pub(crate) fn new_conn() -> Connection {
+    test_conn()
+}
+
+/// 构造一首指定歌名/歌手的曲目（ Preset 平台 wyy，其余字段与上方的 `track()` 一致）。
+pub(crate) fn sample_track_with(title: &str, singer: &str) -> Track {
+    Track {
+        id: format!("sample-{title}"),
+        platform: SourceId::new("wyy"),
+        title: title.to_string(),
+        singer: singer.to_string(),
+        album: "测试专辑".to_string(),
+        pic_url: String::new(),
+        duration: 210.0,
+        music_id: None,
+    }
+}
+
 fn track(id: &str, title: &str) -> Track {
     Track {
         id: id.to_string(),
@@ -708,4 +728,149 @@ fn foreign_local_song_lands_in_liked_playlist() {
         )
         .expect("count tracks");
     assert_eq!(track_rows, 0, "外部本地曲目不应污染 tracks 表");
+}
+
+// ---------- 歌词域：lyric_settings.offset_ms 与 lyrics 落库 ----------
+
+/// 偏移读写往返 + 越界夹紧 + 未入库曲目静默跳过。
+#[test]
+fn lyric_offset_roundtrip() {
+    let conn = test_conn();
+    let t = track("1001", "偏移测试");
+    upsert_tracks(&conn, &[&t]).expect("upsert track");
+    let id = db_track_id(&t);
+
+    // 没设过 → 0
+    assert_eq!(get_lyric_offset(&conn, &id).expect("read"), 0);
+
+    set_lyric_offset(&conn, &id, 500).expect("set 500");
+    assert_eq!(get_lyric_offset(&conn, &id).expect("read"), 500);
+
+    // 负偏移（歌词提前）
+    set_lyric_offset(&conn, &id, -800).expect("set -800");
+    assert_eq!(get_lyric_offset(&conn, &id).expect("read"), -800);
+
+    // 越界夹紧到 ±MAX，不报错也不原样存
+    set_lyric_offset(&conn, &id, MAX_OFFSET_MS + 50_000).expect("set over");
+    assert_eq!(get_lyric_offset(&conn, &id).expect("read"), MAX_OFFSET_MS);
+    set_lyric_offset(&conn, &id, -MAX_OFFSET_MS - 50_000).expect("set under");
+    assert_eq!(get_lyric_offset(&conn, &id).expect("read"), -MAX_OFFSET_MS);
+
+    // 曲目未入库（本地文件不写 tracks）：撞外键会炸，必须静默跳过
+    let ghost = "local:/mnt/music/ghost.mp3";
+    set_lyric_offset(&conn, ghost, 300).expect("set ghost must not error");
+    assert_eq!(
+        get_lyric_offset(&conn, ghost).expect("read ghost"),
+        0,
+        "未入库曲目的偏移不该留下脏行"
+    );
+}
+
+/// 歌词正文落库与回读（取词失败的兜底来源），含逐字 / 罗马音两列。
+#[test]
+fn lyric_body_roundtrip() {
+    let conn = test_conn();
+    let t = track("1002", "落库测试");
+    upsert_tracks(&conn, &[&t]).expect("upsert track");
+    let id = db_track_id(&t);
+
+    assert!(
+        get_lyric(&conn, &id).expect("read").is_none(),
+        "初始应无歌词"
+    );
+
+    upsert_lyric(
+        &conn,
+        &id,
+        "[00:01.00]a",
+        "[1000,500]a(0,500)",
+        "[00:01.00]译文",
+        "[00:01.00]a-romaji",
+        "wyy",
+        false,
+    )
+    .expect("upsert");
+    let got = get_lyric(&conn, &id).expect("read").expect("应有歌词");
+    assert_eq!(got.lrc, "[00:01.00]a");
+    assert_eq!(got.word_lrc, "[1000,500]a(0,500)");
+    assert_eq!(got.translation, "[00:01.00]译文");
+    assert_eq!(got.romaji, "[00:01.00]a-romaji");
+    assert_eq!(got.source, "wyy");
+    assert!(!got.manual, "自动取的词不该带手动标记");
+
+    // 再写一次是覆盖（换源后重取），不是追加。
+    // 逐字 / 罗马音**必须跟着一起被覆盖成空**：它们的时间轴是跟主词配套的，
+    // 换源后主词已换成另一份，留着旧源的逐字只会错位。
+    upsert_lyric(&conn, &id, "[00:02.00]b", "", "", "", "kw", false).expect("upsert again");
+    let got2 = get_lyric(&conn, &id).expect("read").expect("应有歌词");
+    assert_eq!(got2.lrc, "[00:02.00]b");
+    assert_eq!(got2.source, "kw", "来源应更新为换源后的目标源");
+    assert_eq!(got2.word_lrc, "", "换源后旧逐字不得残留（时间轴会错位）");
+    assert_eq!(got2.romaji, "");
+
+    // 未入库曲目同样静默跳过
+    upsert_lyric(&conn, "local:/ghost.mp3", "x", "", "", "", "local", false)
+        .expect("ghost upsert");
+    assert!(get_lyric(&conn, "local:/ghost.mp3")
+        .expect("read")
+        .is_none());
+}
+
+/// 手动挑的歌词带 `manual = 1`，且自动取词重新落库时把标记交回 0。
+///
+/// 这个标记决定取词链路要不要打源站（见 `fetchPlaybackLyric`）：手动挑过就一直回读它，
+/// 于是**交回 0 这一步不能漏** —— 漏了等于用户的选择永久粘在这首歌上，以后再怎么
+/// 换源、换版本都只能看到当年那份词。
+#[test]
+fn lyric_manual_flag_roundtrip() {
+    let conn = test_conn();
+    let t = track("1004", "手动换词");
+    upsert_tracks(&conn, &[&t]).expect("upsert track");
+    let id = db_track_id(&t);
+
+    // 用户在播放页「搜索歌词」挑了一份 → manual = true
+    upsert_lyric(&conn, &id, "[00:01.00]a", "", "", "", "kg", true).expect("manual upsert");
+    let got = get_lyric(&conn, &id).expect("read").expect("应有歌词");
+    assert!(got.manual, "手动挑的词应带 manual 标记");
+    assert_eq!(got.source, "kg");
+
+    // 换源后自动重取 → 必须交回 false，否则手动选择永久粘住
+    upsert_lyric(&conn, &id, "[00:02.00]b", "", "", "", "wyy", false).expect("auto upsert");
+    let got2 = get_lyric(&conn, &id).expect("read").expect("应有歌词");
+    assert!(!got2.manual, "自动取词必须把 manual 交回 false");
+    assert_eq!(got2.lrc, "[00:02.00]b");
+}
+
+/// 逐字 / 罗马音两列真的落库、且对外 JSON 字段名是 wordByWord / romanization。
+///
+/// 列名（`word_lrc` / `romaji`）是 V11 迁移定的，对外字段名跟音源包契约
+/// `ContractLyric` 对齐 —— 这层改名靠 `#[serde(rename)]`，序列化错一个字母前端就静默拿不到，
+/// 所以单独立一个测试钉住。
+#[test]
+fn lyric_record_serializes_word_by_word_and_romaji() {
+    let conn = test_conn();
+    let t = track("1003", "逐字序列化");
+    upsert_tracks(&conn, &[&t]).expect("upsert track");
+    let id = db_track_id(&t);
+
+    upsert_lyric(
+        &conn,
+        &id,
+        "[00:01.00]a",
+        "[1000,500]a(0,500)",
+        "",
+        "[00:01.00]a-romaji",
+        "qq",
+        false,
+    )
+    .expect("upsert");
+    let got = get_lyric(&conn, &id).expect("read").expect("应有歌词");
+    let json = serde_json::to_value(&got).expect("serialize");
+    assert_eq!(json["wordByWord"], "[1000,500]a(0,500)");
+    assert_eq!(json["romanization"], "[00:01.00]a-romaji");
+    assert_eq!(json["lrc"], "[00:01.00]a");
+    assert!(
+        json.get("word_lrc").is_none() && json.get("wordLrc").is_none(),
+        "不该把库里的列名漏到前端契约里：{json}"
+    );
 }

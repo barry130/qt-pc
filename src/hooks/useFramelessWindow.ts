@@ -99,7 +99,10 @@ export function useTitleBarDrag(): {
   }, []);
 
   const onDoubleClick = useCallback((): void => {
-    void getCurrentWindow().toggleMaximize();
+    // 双击最大化失败只影响这次手势，别冒泡成未处理拒绝弹全局浮层
+    void getCurrentWindow()
+      .toggleMaximize()
+      .catch(() => {});
   }, []);
 
   return { ref, onDoubleClick };

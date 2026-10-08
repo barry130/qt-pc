@@ -1,16 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { errMsg } from "@/lib/utils";
+import {
+  appendUnique,
+  clearPagedAllJob,
+  createPagedAllJob,
+  splitPage,
+  startPagedAllJob,
+  type PagedAllState,
+  type PageResult,
+} from "@/lib/paged-all";
 
-/** 一页的返回：只有列表，或列表 + 是否还有下一页（拿不到就按「满页 = 还有」推断） */
-export type PageResult<T> = T[] | { list: T[]; hasMore: boolean };
-
-function splitPage<T>(result: PageResult<T>, size: number): { list: T[]; hasMore: boolean } {
-  if (Array.isArray(result)) {
-    return { list: result, hasMore: result.length >= size };
-  }
-  const list = Array.isArray(result.list) ? result.list : [];
-  return { list, hasMore: result.hasMore };
-}
+// 分页原语（PageResult / splitPage / appendUnique）与 all 模式的取数任务都住在
+// @/lib/paged-all：任务要能在组件卸载后继续跑完并缓存，不能挂在 hook 生命周期上。
+// 这里再导出一次，页面侧不用改 import。
+export type { PageResult } from "@/lib/paged-all";
 
 /**
  * 分页列表。两种收尾方式，由 `mode` 决定：
@@ -42,6 +45,12 @@ export function usePagedList<T>(options: {
   concurrency?: number;
   /** all 模式的页数上限（安全阀），默认 120 页 */
   maxPages?: number;
+  /**
+   * all 模式的缓存键（如 `artist:kw:周杰伦:50:`）。
+   * 给了就按 key 复用任务：组件卸载后后台继续跑完，下次进同页直接拿全量；
+   * reload 会丢掉这个 key 重拉。不给就一次性（卸载即取消）。
+   */
+  cacheKey?: string;
 }): {
   items: T[];
   /** 首屏加载中（用于骨架屏）；all 模式在整轮拉完前都为 true */
@@ -52,11 +61,14 @@ export function usePagedList<T>(options: {
   hasMore: boolean;
   /** all 模式进度：已完成页数 / 已知总页数（总页数未知时为 null） */
   progress: { done: number; total: number | null } | null;
+  /** all 模式是否收尾。进度条/「正在加载其余」必须看它，光看 progress 收不掉 */
+  finished: boolean;
   /** 挂在列表末尾，进入视口即加载下一页（仅 scroll 模式有意义） */
   sentinelRef: React.RefObject<HTMLDivElement | null>;
   reload: () => void;
 } {
   const { resetKey, mode = "scroll", pageSize } = options;
+  const isAll = mode === "all";
 
   // fetchPage / keyOf 多为内联箭头（每次渲染都是新函数），用 ref 读，
   // 否则 effect 依赖它们会无限重跑。
@@ -69,7 +81,10 @@ export function usePagedList<T>(options: {
   const sizeRef = useRef(pageSize);
   const concurrency = options.concurrency ?? 6;
   const maxPages = options.maxPages ?? 120;
+  const cacheKey = options.cacheKey;
+  const cacheKeyRef = useRef(cacheKey);
   useEffect(() => {
+    cacheKeyRef.current = options.cacheKey;
     fetchRef.current = options.fetchPage;
     keyRef.current = options.keyOf;
     sizeRef.current = pageSize;
@@ -101,10 +116,25 @@ export function usePagedList<T>(options: {
     const first = cursor.page <= 1;
     setView((v) => (first ? { ...EMPTY_VIEW } : { ...v, loading: true, error: null }));
 
-    if (mode === "all" && first) {
-      void fetchAllPages();
+    if (isAll && first) {
+      // all 模式交给模块级任务（@/lib/paged-all）：卸载只退订，任务继续跑到收尾
+      // 并按 cacheKey 缓存到退出 —— 来回切歌手页不再从头重拉几千首。
+      const opts = {
+        fetchPage: (p: number) => fetchRef.current(p),
+        keyOf: (item: T) => keyRef.current(item),
+        pageSize: sizeRef.current,
+        concurrency,
+        maxPages,
+      };
+      const job =
+        cacheKey !== undefined && cacheKey.length > 0
+          ? startPagedAllJob<T>(cacheKey, opts)
+          : createPagedAllJob<T>(opts);
+      const unsubscribe = job.subscribe((s) =>
+        setView({ ...s, hasMore: false }),
+      );
       return () => {
-        cancelled = true;
+        unsubscribe();
       };
     }
 
@@ -131,6 +161,7 @@ export function usePagedList<T>(options: {
           error: null,
           hasMore,
           progress: null,
+          finished: true,
         });
       } catch (err) {
         if (cancelled) return;
@@ -145,111 +176,26 @@ export function usePagedList<T>(options: {
           // 出错后不再自动翻页，避免反复失败刷请求；重试走 reload
           hasMore: false,
           progress: null,
+          finished: true,
         });
       }
     })();
-
-    /**
-     * all 模式：并发把 1..N 页全部拉完。
-     *
-     * 先单独拉第 1 页：拿到 total 才知道要拉多少页（且首屏能立刻显示）。
-     * 之后按 concurrency 分片并发，每完成一页就增量合并 + 更新进度，
-     * 用户能看到「已加载 3200/9204」而不是干等。
-     * 任何一页失败：已拿到的照常显示，只记错误提示，不再往后加页。
-     */
-    async function fetchAllPages(): Promise<void> {
-      let done = 0;
-      let total: number | null = null;
-      let acc: T[] = [];
-      let failed: string | null = null;
-      // 与 acc 同步维护的 key 集合（见 appendUnique 的说明）
-      let seen = new Set<string>();
-
-      const publish = (): void => {
-        itemsRef.current = acc;
-        seenRef.current = seen;
-        setView({
-          items: acc,
-          loading: done === 0,
-          error: failed,
-          hasMore: false,
-          progress: { done, total },
-        });
-      };
-
-      try {
-        const firstResult = await fetchRef.current(1);
-        if (cancelled) return;
-        const firstPage = splitPage(firstResult, sizeRef.current);
-        acc = firstPage.list;
-        seen = new Set(acc.map(keyRef.current));
-        done = 1;
-        total = firstPage.hasMore ? null : 1;
-        publish();
-
-        if (firstPage.hasMore) {
-          // 最后一页不满 = 到底；先探测第 2 页决定还要不要继续
-          const second = await fetchRef.current(2);
-          if (cancelled) return;
-          const secondPage = splitPage(second, sizeRef.current);
-          acc = appendUnique(acc, secondPage.list, keyRef.current, seen);
-          done = 2;
-          publish();
-
-          if (secondPage.hasMore) {
-            // 总数未知（契约只给 hasMore）：按 maxPages 上限一直拉，直到空页或不满页
-            let nextPage = 3;
-            while (!cancelled && nextPage <= maxPages) {
-              const batch: number[] = [];
-              for (let i = 0; i < concurrency && nextPage <= maxPages; i++) {
-                batch.push(nextPage++);
-              }
-              const settled = await Promise.all(
-                batch.map(async (page) => {
-                  try {
-                    return { page, result: await fetchRef.current(page) };
-                  } catch {
-                    return { page, result: null };
-                  }
-                }),
-              );
-              if (cancelled) return;
-              let exhausted = false;
-              for (const entry of settled) {
-                if (entry.result === null) {
-                  failed = "部分页加载失败，列表可能不完整";
-                  exhausted = true;
-                  continue;
-                }
-                const page = splitPage(entry.result, sizeRef.current);
-                acc = appendUnique(acc, page.list, keyRef.current, seen);
-                done++;
-                if (!page.hasMore || page.list.length === 0) exhausted = true;
-              }
-              publish();
-              if (exhausted) break;
-            }
-          }
-        }
-      } catch (err) {
-        if (cancelled) return;
-        failed = errMsg(err);
-      }
-      if (cancelled) return;
-      publish();
-    }
 
     return () => {
       cancelled = true;
     };
     // cursor.nonce 让 reload() 即使页码没变也能重跑
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cursor.key, cursor.page, cursor.nonce, mode]);
+  }, [cursor.key, cursor.page, cursor.nonce, isAll, cacheKey]);
 
   const reload = useCallback(() => {
     setView(EMPTY_VIEW);
     itemsRef.current = [];
     seenRef.current = new Set();
+    // all 模式：缓存任务必须一起丢掉，否则「重试」会立刻拿回旧结果
+    if (cacheKeyRef.current !== undefined && cacheKeyRef.current.length > 0) {
+      clearPagedAllJob(cacheKeyRef.current);
+    }
     // nonce 自增 → effect 必跑（即使 page 已经是 1 也能重拉）
     setCursor((c) => ({ ...c, page: 1, nonce: c.nonce + 1 }));
   }, []);
@@ -283,17 +229,14 @@ export function usePagedList<T>(options: {
     error: view.error,
     hasMore: view.hasMore,
     progress: view.progress,
+    finished: view.finished,
     sentinelRef,
     reload,
   };
 }
 
-interface View<T> {
-  items: T[];
-  loading: boolean;
-  error: string | null;
+interface View<T> extends PagedAllState<T> {
   hasMore: boolean;
-  progress: { done: number; total: number | null } | null;
 }
 
 /**
@@ -308,32 +251,5 @@ const EMPTY_VIEW: View<never> = {
   error: null,
   hasMore: false,
   progress: null,
+  finished: false,
 };
-
-/**
- * 追加去重。`seen` 由调用方传入并**就地更新**（其中包含 `prev` 的全部 key）：
- * 以前每追加一页都 `new Set(prev.map(keyOf))` 全量重建，60 页 × 50 条的规模下
- * 是纯粹的 O(n²) 重复扫描。
- *
- * 万一 `seen` 与 `prev` 对不上（理论不该发生：列表只经这里合并），按 prev 重建一次，
- * 保证结果永远正确——宁可多扫一次，也不能漏去重或放进重复项。
- */
-function appendUnique<T>(
-  prev: T[],
-  next: T[],
-  keyOf: (item: T) => string,
-  seen: Set<string>,
-): T[] {
-  if (seen.size !== prev.length) {
-    seen.clear();
-    for (const item of prev) seen.add(keyOf(item));
-  }
-  const out = [...prev];
-  for (const item of next) {
-    const key = keyOf(item);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(item);
-  }
-  return out;
-}

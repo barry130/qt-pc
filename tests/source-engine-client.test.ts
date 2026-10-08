@@ -71,6 +71,10 @@ describe("source-engine client 生命周期恢复", () => {
       line: null,
       error: "",
       stalled: true,
+      referer: "",
+      // 取链诚实性（2026-10-06）：引擎无响应时体积与实测档一律「未知」
+      size: null,
+      actualQuality: "",
     });
     expect(client.engineSnapshot().phase).toBe("error");
 
@@ -81,6 +85,9 @@ describe("source-engine client 生命周期恢复", () => {
       line: null,
       error: "",
       stalled: true,
+      referer: "",
+      size: null,
+      actualQuality: "",
     });
     expect(h.emits.filter((e) => e.kind === "resolve").length).toBe(before);
 

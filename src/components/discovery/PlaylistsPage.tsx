@@ -5,6 +5,7 @@ import { useNavigate } from "@tanstack/react-router";
 import type { Playlist, PlaylistCategory } from "@/types";
 import * as sourceApi from "@/source-scripts";
 import { useMusicSourceStore } from "@/stores/musicSource";
+import { usePlaylistSorts, useSourceRegistryStore } from "@/stores/sourceRegistry";
 import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 import { CoverCard, CoverGrid } from "./CoverCard";
 
@@ -20,16 +21,22 @@ import { CoverCard, CoverGrid } from "./CoverCard";
 export function PlaylistsPage(): React.JSX.Element {
   const navigate = useNavigate();
   const activeSourceId = useMusicSourceStore((s) => s.activeSourceId);
+  // 排序选项来自数据包注册表（v5 契约；未声明 = 空 = 不渲染选择器）
+  const sorts = usePlaylistSorts(activeSourceId);
+  // 注册表世代：装/卸/换数据包后 +1。本页 keep-alive 常驻，不盯世代的话，
+  // 卸载包后旧分类与歌单列表会一直残留（activeSourceId 不变，effect 永不重跑）。
+  const metaGeneration = useSourceRegistryStore((s) => s.generation);
 
   const [categories, setCategories] = useState<PlaylistCategory[]>([]);
   const [category, setCategory] = useState<string | null>(null);
+  const [sort, setSort] = useState("");
   const [page, setPage] = useState(1);
   const [items, setItems] = useState<Playlist[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(true);
 
-  // 音源切换 → 重取分类并回到「全部」第一页
+  // 音源切换 / 数据包变化 → 重取分类并回到「全部」第一页
   useEffect(() => {
     let cancelled = false;
     setCategories([]);
@@ -48,14 +55,20 @@ export function PlaylistsPage(): React.JSX.Element {
     return () => {
       cancelled = true;
     };
-  }, [activeSourceId]);
+  }, [activeSourceId, metaGeneration]);
+
+  // 排序随源声明变化（切源/换包后）：当前排序不在声明里就回退到第一项
+  useEffect(() => {
+    if (sorts.length > 0 && !sorts.some((s) => s.id === sort)) setSort(sorts[0]!.id);
+    if (sorts.length === 0 && sort !== "") setSort("");
+  }, [sorts, sort]);
 
   const load = useCallback(
     async (cat: string | null, p: number): Promise<void> => {
       setLoading(true);
       setError(null);
       try {
-        const list = await sourceApi.getRecommendations(activeSourceId, cat, p);
+        const list = await sourceApi.getRecommendations(activeSourceId, cat, p, sort);
         const arr = Array.isArray(list) ? list : [];
         setItems((prev) => {
           if (p <= 1) return arr;
@@ -74,7 +87,7 @@ export function PlaylistsPage(): React.JSX.Element {
         setLoading(false);
       }
     },
-    [activeSourceId],
+    [activeSourceId, sort],
   );
 
   useEffect(() => {
@@ -109,10 +122,31 @@ export function PlaylistsPage(): React.JSX.Element {
     setHasMore(true);
   };
 
+  /** 切换排序（v5 契约：id 原样透传给包侧 recommendations），重拉第一页 */
+  const pickSort = (id: string): void => {
+    if (id === sort) return;
+    setSort(id);
+    setPage(1);
+    setItems([]);
+    setHasMore(true);
+  };
+
   return (
     <div className="flex h-full min-w-0 flex-col">
       <div className="border-b border-border px-4 py-3">
         <h1 className="text-base font-medium">歌单广场</h1>
+        {sorts.length > 1 && (
+          <div className="mt-2 flex items-center gap-1.5">
+            {sorts.map((s) => (
+              <CategoryChip
+                key={s.id}
+                active={sort === s.id}
+                label={s.name}
+                onClick={() => pickSort(s.id)}
+              />
+            ))}
+          </div>
+        )}
         {categories.length > 0 && (
           <CategoryFilter categories={categories} category={category} onPick={pick} />
         )}

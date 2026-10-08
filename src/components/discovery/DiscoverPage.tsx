@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { BarChart3, ChevronRight, Disc3, FileMusic, Flame, PackageOpen, Sparkles } from "lucide-react";
 import type { Chart, Playlist, Track } from "@/types";
-import { useSourceLabel } from "@/stores/sourceRegistry";
+import { useSourceLabel, useSourceRegistryStore, useSourceSupports } from "@/stores/sourceRegistry";
 import * as sourceApi from "@/source-scripts";
 import { getRecommendations } from "@/source-scripts";
 import { engineSnapshot } from "@/source-engine/client";
@@ -17,7 +17,8 @@ import { TrackCard } from "./TrackCard";
  *
  * 布局自上而下：Hero（当前音源 + 快捷入口）→ 热门榜单（横向大卡）→
  * 新歌速递（横向歌曲卡）→ 推荐歌单（网格）。
- * 榜单用四源聚合命令，新歌与推荐歌单跟随全局音源（§6.4 要点 5）。
+ * 三个区块统一跟随全局音源（§6.4 要点 5）：榜单此前用四源聚合命令，但点进详情
+ * 后该 chart 可能不属于当前源、详情页拉不到标题，故一并改为按源取。
  * 任一区块失败只降级为空区块，不弹全局错误（首页是聚合视图，允许部分为空）。
  */
 
@@ -47,7 +48,26 @@ const QUICK_LINKS = [
 export function DiscoverPage(): React.JSX.Element {
   const navigate = useNavigate();
   const activeSourceId = useMusicSourceStore((s) => s.activeSourceId);
-  const playQueue = usePlayerStore((s) => s.playQueue);
+  const play = usePlayerStore((s) => s.play);
+
+  // 功能面门控（v4 契约）：数据包声明当前源有没有新歌流/歌单载体、还有没有
+  // 任何源有榜单。不支持的区块/快捷入口直接不渲染，也不发对应请求；
+  // 未声明（旧包）一律按支持处理，页面与门控上线前完全一致。
+  const showLatest = useSourceSupports(activeSourceId, "latest");
+  const showPlaylists = useSourceSupports(activeSourceId, "playlists");
+  // 热门榜单区块跟随当前音源（getCharts(activeSourceId)），按当前源判断
+  const showCharts = useSourceSupports(activeSourceId, "charts");
+  const quickLinks = QUICK_LINKS.filter((item) => {
+    if (item.to === "/daily") return showLatest;
+    if (item.to === "/playlists") return showPlaylists;
+    if (item.to === "/charts") return showCharts;
+    return true;
+  });
+
+  // 注册表世代：装/卸/换数据包后 +1。本页是 keep-alive 常驻页，effect 依赖
+  // 只有 activeSourceId 的话，卸载包后旧榜单/歌单/新歌会一直残留（id 没变、
+  // 门控对空注册表保守放行，两个依赖都不动，effect 永不重跑）。
+  const metaGeneration = useSourceRegistryStore((s) => s.generation);
 
   const [songs, setSongs] = useState<Track[]>([]);
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
@@ -69,17 +89,22 @@ export function DiscoverPage(): React.JSX.Element {
     return () => window.clearInterval(timer);
   }, []);
 
-  // 新歌速递 + 推荐歌单（跟随音源）
+  // 新歌速递 + 推荐歌单（跟随音源；功能面声明不支持时跳过请求，区块同步隐藏）
   useEffect(() => {
     let cancelled = false;
     setSongs([]);
     setPlaylists([]);
+    if (!showLatest && !showPlaylists) return;
     void (async () => {
       const [s, p] = await Promise.all([
-        sourceApi.getLatestSongs(activeSourceId, 20, 0).catch(() => [] as Track[]),
+        showLatest
+          ? sourceApi.getLatestSongs(activeSourceId, 20, 0).catch(() => [] as Track[])
+          : ([] as Track[]),
         // 插件化试点：推荐歌单经 source-scripts 统一入口分发
         // （scheme=script 走共享脚本包，否则原 Rust 通道），其余调用不变
-        getRecommendations(activeSourceId, null, 1).catch(() => [] as Playlist[]),
+        showPlaylists
+          ? getRecommendations(activeSourceId, null, 1).catch(() => [] as Playlist[])
+          : ([] as Playlist[]),
       ]);
       // IPC 在测试/异常环境下可能返回非数组，这里统一兜底（页面只做展示，允许区块为空）
       if (cancelled) return;
@@ -90,19 +115,24 @@ export function DiscoverPage(): React.JSX.Element {
     return () => {
       cancelled = true;
     };
-  }, [activeSourceId]);
+  }, [activeSourceId, showLatest, showPlaylists, metaGeneration]);
 
-  // 热门榜单（四源聚合，不随音源变化）
+  // 热门榜单 —— 跟随当前音源（与 /charts 页面同口径；全源聚合会混入其它源的榜，
+  // 点进详情后该 chart 不属于当前源，详情页拿不到标题）。没有任何源有榜单时跳过。
   useEffect(() => {
     let cancelled = false;
+    setCharts([]);
+    if (!showCharts) return;
     void (async () => {
-      const c = await sourceApi.getAllCharts().catch(() => [] as Chart[]);
+      const c = await sourceApi
+        .getCharts(activeSourceId)
+        .catch(() => [] as Chart[]);
       if (!cancelled) setCharts(Array.isArray(c) ? c.slice(0, 10) : []);
     })();
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [showCharts, activeSourceId, metaGeneration]);
 
   const activeSourceLabel = useSourceLabel(activeSourceId);
   const sourceLabel =
@@ -118,7 +148,7 @@ export function DiscoverPage(): React.JSX.Element {
             当前音源：{sourceLabel} · 榜单聚合四个音源，新歌与推荐歌单随音源切换
           </p>
           <div className="mt-4 flex flex-wrap gap-2">
-            {QUICK_LINKS.map((item) => (
+            {quickLinks.map((item) => (
               <button
                 key={item.to}
                 type="button"
@@ -167,7 +197,8 @@ export function DiscoverPage(): React.JSX.Element {
         </section>
       )}
 
-      {/* 热门榜单 */}
+      {/* 热门榜单（跟随当前音源；当前源没声明榜单时整块隐藏） */}
+      {showCharts && (
       <section className="mt-6 px-5">
         <SectionTitle
           title="热门榜单"
@@ -207,8 +238,10 @@ export function DiscoverPage(): React.JSX.Element {
           </HorizontalScroller>
         )}
       </section>
+      )}
 
-      {/* 新歌速递 */}
+      {/* 新歌速递（跟随当前源；当前源无新歌流时整块隐藏） */}
+      {showLatest && (
       <section className="mt-6 px-5">
         <SectionTitle
           title="新歌速递"
@@ -231,14 +264,16 @@ export function DiscoverPage(): React.JSX.Element {
               <TrackCard
                 key={`${t.id}-${i}`}
                 track={t}
-                onPlay={() => void playQueue(songs, i)}
+                onPlay={() => void play(t)}
               />
             ))}
           </HorizontalScroller>
         )}
       </section>
+      )}
 
-      {/* 推荐歌单 */}
+      {/* 推荐歌单（跟随当前源；当前源无歌单载体时整块隐藏） */}
+      {showPlaylists && (
       <section className="mt-6 px-5">
         <SectionTitle
           title="推荐歌单"
@@ -274,6 +309,7 @@ export function DiscoverPage(): React.JSX.Element {
           </CoverGrid>
         )}
       </section>
+      )}
     </div>
   );
 }

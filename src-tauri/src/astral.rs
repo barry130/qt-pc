@@ -1520,7 +1520,7 @@ impl AstralClient {
             }
         }
         // App 端上报走 AppStatController：/api/v1/app/stat/report（旧 /api/v1/stat/report
-        // 已废弃，见该控制器注释）。base_url 已含 /api/v1/，拼相对路径 app/stat/report
+        // 已删除）。base_url 已含 /api/v1/，拼相对路径 app/stat/report
         self.post_json(
             "app/stat/report",
             serde_json::json!({ "events": events }),

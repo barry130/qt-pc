@@ -200,7 +200,7 @@ PC 端第一版必须对接以下现有接口：
 2. 使用 `updatedSeq` 作为用户维度同步游标。
 3. 常规同步调用 `like/changes?since=cursor`。
 4. 首次登录或游标丢失时调用 `like/list` 全量分页拉取。
-5. 旧的 `getLikeList` 和 `uploadLikeList` 仅作兼容，不作为 PC 新客户端主流程。
+5. 旧的 `getLikeList` 与 `uploadLikeList` 后端已删除，PC 新客户端不得再调用。
 
 #### 2.4.2.1 接口实测结论（修订 A1，对照 astral 源码核对）
 
@@ -213,7 +213,7 @@ PC 端第一版必须对接以下现有接口：
 
 响应包装器有三种（`QtRestResp` / `FeedbackRestResp` / `Result`），字段结构一致为 `{code, msg, data}`，业务成功码为 `200`（兼容 `0`），`401` 表示登录失效需刷新 token。
 
-PC 端**需要后端配合的只有一项**：反馈的 `X-Platform` 目前后端不做枚举校验，可直接接收 `windows`，但管理端展示与数据字典（`dict-init.sql`）中若要显示「Windows」文案，需补一条字典数据。
+PC 端**需要后端配合的只有一项**：反馈平台标识走统一客户端系统头 `X-App-Ut: app-windows`（与统计事件 `ut` 同值，后端 `ClientHeaders` 已支持该枚举，`X-Platform` 仅后端为兼容遗留客户端保留的兜底头，PC 客户端不再发送），但管理端展示与数据字典（`dict-init.sql`）中若要显示「Windows」文案，需补一条字典数据。
 
 #### 2.4.3 接口适配状态
 
@@ -223,7 +223,7 @@ PC 端**需要后端配合的只有一项**：反馈的 `X-Platform` 目前后�
 | Astral 不承载音乐内容 | 后端只有账号、收藏、反馈、通知、更新、统计 | PC 不要求 Astral 新增音乐内容代理 |
 | 通知渠道 | 后端已支持 `channel=app/pc/web/all` | PC 消息接口固定传 `channel=pc` |
 | 更新接口已支持 Windows | `type=1101/1102/1103` | PC 固定使用 `type=1103` |
-| 反馈平台标识 | 移动端传 `android / ios` | PC 需要传 `windows`，后端应允许该值 |
+| 反馈平台标识 | 移动端走 `X-App-Ut: app-android / app-ios` | PC 走 `X-App-Ut: app-windows`（与统计 `ut` 同值，后端已支持该值；`X-Platform` 仅后端兼容兜底，客户端不再发送） |
 | 统计平台 | 后端已支持 `ut=app-windows` | PC 统计事件固定传 `ut=app-windows` |
 | 音源显示名 | 代码中默认“音源一/二/三/四” | PC 支持中性名与真实名切换，默认与移动端一致 |
 
@@ -997,7 +997,7 @@ PC 版复用 Astral 轻听账号体系，不新建账号系统。账号用于收
 11. 富文本公告渲染。
 12. 置顶消息优先展示。
 13. 反馈请求携带 Windows 平台信息：
-    - `X-Platform: windows`
+    - `X-App-Ut: app-windows`（统一客户端系统头，与统计事件 `ut` 同值；`X-Platform` 仅后端为兼容遗留客户端保留的兜底头，PC 不再发送）
     - `X-OS`
     - `X-Device`
     - `X-App-Version`

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import type {
   AppearancePreference,
   AppUpdateInfo,
@@ -16,8 +16,10 @@ import type {
   AuthSession,
   DesktopLyricState,
   DesktopLyricStylePatch,
+  DislikeRule,
   DownloadTask,
   HistoryItem,
+  LyricRecord,
   MyPlaylistSummary,
   PlaybackState,
   PositionChanged,
@@ -33,13 +35,31 @@ import { isQuality } from "@/lib/quality";
  * 全部走 invoke，前端不直接发任何外部网络请求（CSP 不放开外部域名）。
  */
 
-/// 取链脚本化（方案 v3）：把共享脚本包解析出的地址回填 Rust 引擎缓存
+/// 取链脚本化（方案 v3）：把共享脚本包解析出的地址回填 Rust 引擎缓存。
+/// `referer` = 宿主取这个地址时要带的头（包按源声明，空串 = 不发）；
+/// 引擎缓存里的地址后续由播放/下载直接向 CDN 取字节，头必须跟着地址一起存。
+///
+/// `size` / `actualQuality` 同属「取链诚实性」（2026-10-06）：
+/// size = 包侧 Range 预检实测的文件总长（null = 没读到），下载进度与
+/// 「服务端不给 Content-Length」时的分母靠它；actualQuality = 按实测码率
+/// 重标后的档位（**只降不升**，空串 = 未重标），下载命名用它而非请求档，
+/// 否则请求 flac 实际拿到 320k 会被命名成 `.flac` 虚标。
 export async function setResolvedPlayUrl(
   track: Track,
   quality: Quality,
   url: string,
+  referer = "",
+  size: number | null = null,
+  actualQuality = "",
 ): Promise<void> {
-  return invoke("set_resolved_play_url", { track, quality, url });
+  return invoke("set_resolved_play_url", {
+    track,
+    quality,
+    url,
+    referer,
+    size,
+    actualQuality,
+  });
 }
 
 
@@ -434,6 +454,36 @@ export async function setDownloadNameFormat(format: DownloadNameFormat): Promise
   await setSetting(DOWNLOAD_NAME_FORMAT_KEY, format);
 }
 
+/** 同时下载数的合法范围（与 Rust `download::MIN/MAX_CONCURRENCY`、设置页选项一致） */
+export const MIN_DOWNLOAD_CONCURRENCY = 1;
+export const MAX_DOWNLOAD_CONCURRENCY = 6;
+/** 默认同时下载数，与 Rust `download::DEFAULT_CONCURRENCY` 一致 */
+export const DEFAULT_DOWNLOAD_CONCURRENCY = 3;
+
+/**
+ * 同时下载数（1–6）。
+ *
+ * 这个值由 Rust 侧的并发闸门持有（`DownloadManager`），不走 `getSetting`：
+ * 闸门内存里的值才是权威值 —— 用户刚改完立刻再读，不该被库里可能写失败的
+ * 旧记录盖回去。Rust 负责持久化（settings key `download.maxConcurrent`）
+ * 与启动回填，前端只管读写命令。
+ */
+export async function getDownloadConcurrency(): Promise<number> {
+  const n = await invoke<number>("get_download_concurrency");
+  // 兜一层：命令层已夹过，但万一后端返回脏值也不该把 UI 带偏
+  if (!Number.isFinite(n)) return DEFAULT_DOWNLOAD_CONCURRENCY;
+  return Math.min(MAX_DOWNLOAD_CONCURRENCY, Math.max(MIN_DOWNLOAD_CONCURRENCY, Math.round(n)));
+}
+
+/** 设置同时下载数（越界会被 Rust 夹到 1–6），返回实际生效的值 */
+export async function setDownloadConcurrency(n: number): Promise<number> {
+  const clamped = Math.min(
+    MAX_DOWNLOAD_CONCURRENCY,
+    Math.max(MIN_DOWNLOAD_CONCURRENCY, Math.round(n)),
+  );
+  return invoke<number>("set_download_concurrency", { n: clamped });
+}
+
 /** 默认播放音质（设置页）：写 settings，重启后保持，并对当前曲目立即生效 */
 export async function setDefaultQuality(quality: Quality): Promise<void> {
   return invoke("set_default_quality", { quality });
@@ -653,6 +703,31 @@ export async function pickImage(title = "选择图片"): Promise<string | null> 
   return Array.isArray(result) ? (result[0] ?? null) : result;
 }
 
+/** 打开系统「另存为」对话框（分享卡片保存 PNG 用）；用户取消返回 null */
+export async function pickSavePath(
+  defaultPath: string,
+  title = "保存文件",
+): Promise<string | null> {
+  const result = await invoke<string | string[] | null>("plugin:dialog|save", {
+    options: {
+      title,
+      defaultPath,
+      filters: [{ name: "图片", extensions: ["png"] }],
+    },
+  });
+  return Array.isArray(result) ? (result[0] ?? null) : result;
+}
+
+/**
+ * 把前端生成的图片（base64，不含 `data:` 前缀）按用户选好的路径写盘。
+ *
+ * 走自建命令而不是 fs 插件：项目只装了 dialog 插件，而路径已经由系统对话框
+ * 让用户当面选过，没必要为写一次文件再给前端开文件系统能力。
+ */
+export async function saveBinaryFile(path: string, data: string): Promise<void> {
+  return invoke("save_binary_file", { path, data });
+}
+
 /** 头像上传一条龙，返回新头像 URL（URL 即版本，天然破缓存） */
 export async function astralUploadAvatar(
   filePath: string,
@@ -842,6 +917,14 @@ export async function playQueue(
   startIndex: number,
 ): Promise<void> {
   return invoke("play_queue", { tracks, startIndex });
+}
+
+/**
+ * 单曲播放：不替换播放列表 —— 队里已有这首就播它原来那条，否则追加到队尾再播。
+ * 「播放全部」等整列表入队走 `playQueue`。
+ */
+export async function playTrack(track: Track, quality: string): Promise<void> {
+  return invoke("play_track", { track, quality });
 }
 
 export async function playAt(index: number): Promise<void> {
@@ -1102,6 +1185,165 @@ export async function resetDesktopLyric(): Promise<DesktopLyricState> {
 /** 歌词工具条「打开歌词设置」：唤起主窗口并跳到桌面歌词设置页 */
 export async function openLyricSettings(): Promise<void> {
   return invoke("open_lyric_settings");
+}
+
+// ---------- 歌词偏移与歌词落库 ----------
+//
+// 键口径：`trackId` = `${platform}:${id}`，与 Rust `db::store::db_track_id()` 一致。
+// 偏移方向：offsetMs > 0 = 歌词延后出现，判定用 `position - offsetMs`。
+//
+// ## 偏移改动要广播（2026-10-06）
+// 播放页与桌面歌词窗口是两个独立 WebView，各自持一份 hook 状态。以前只有「切歌」
+// 才会去库里重读，于是在播放页改完偏移、桌面歌词还停在旧值上（用户看到的就是
+// 「偏移不跟随」）。写入方落库后广播 `lyric-offset-changed`，另一边订阅后即时同步。
+
+export const LYRIC_OFFSET_CHANGED_EVENT = "lyric-offset-changed";
+
+export interface LyricOffsetChangedPayload {
+  trackId: string;
+  offsetMs: number;
+}
+
+/** 读逐曲目歌词偏移（毫秒）；没设过返回 0 */
+export async function getLyricOffset(trackId: string): Promise<number> {
+  return invoke("get_lyric_offset", { trackId });
+}
+
+/**
+ * 写逐曲目歌词偏移（毫秒）；Rust 侧夹紧到 ±10s。
+ * 写完广播一次变更事件，让桌面歌词 / 播放页两边立刻对齐。
+ */
+export async function setLyricOffset(trackId: string, offsetMs: number): Promise<void> {
+  await invoke("set_lyric_offset", { trackId, offsetMs });
+  // 广播失败不影响本次写入（库里已经是新值）
+  void emit(LYRIC_OFFSET_CHANGED_EVENT, { trackId, offsetMs }).catch(() => undefined);
+}
+
+/**
+ * 订阅歌词偏移变更（本窗口自己写的也会收到一份，调用方按需去重）。
+ * @returns 取消订阅函数
+ */
+export function onLyricOffsetChanged(
+  handler: (payload: LyricOffsetChangedPayload) => void,
+): Promise<() => void> {
+  return listen<LyricOffsetChangedPayload>(LYRIC_OFFSET_CHANGED_EVENT, (event) => {
+    handler(event.payload);
+  });
+}
+
+/**
+ * 手动挑词后的广播（2026-10-08）：播放页与桌面歌词窗口是两个独立 WebView，
+ * 各自持一份进程内歌词缓存。用户在播放页选定一份歌词后，播放页自己 set state 就
+ * 变了，桌面歌词窗口那条旧 Promise 还躺在它自己的缓存里 —— 表现就是「主页面换了、
+ * 桌面歌词还是旧词」。前面偏移事件（`lyric-offset-changed`）就是为了同一类问题加的，
+ * 这里照抄一条：事件只带 `trackId`（不搬歌词正文），订阅方自己去库里回读新词。
+ */
+export const LYRIC_MANUALLY_PICKED_EVENT = "lyric-manually-picked";
+
+export interface LyricManuallyPickedPayload {
+  trackId: string;
+  /** 这份词来自哪个音源（候选手里带的 `candidate.source`），订阅方可按需展示 */
+  source: string;
+}
+
+/** 广播「这首歌词被手动换过」。广播失败不影响本次选择（库里已经是新词）。 */
+export function notifyLyricManuallyPicked(trackId: string, source: string): void {
+  void emit(LYRIC_MANUALLY_PICKED_EVENT, { trackId, source }).catch(() => undefined);
+}
+
+/** 订阅手动换词（本窗口自己挑的也会收到一份，调用方按需去重） */
+export function onLyricManuallyPicked(
+  handler: (payload: LyricManuallyPickedPayload) => void,
+): Promise<() => void> {
+  return listen<LyricManuallyPickedPayload>(LYRIC_MANUALLY_PICKED_EVENT, (event) => {
+    handler(event.payload);
+  });
+}
+
+/**
+ * 取词成功后落库（火后不管，失败不影响播放）。
+ *
+ * 逐字 / 罗马音是 2026-10-06 补上的面：音源包（wyy/qq/kg）能给就一起存，拿不到就传空串。
+ * 传参名与音源包契约 `ContractLyric` 一致，Rust 侧再映射到 `lyrics` 表的
+ * `word_lrc` / `romaji` 两列（列名是 V11 迁移定下的，前端不必知道）。
+ *
+ * `manual` = 这份词是不是用户在播放页「搜索歌词」手动挑的：true 时取词链路直接回读它、
+ * 不打源站。自动取词一律传 false，把手动标记交回去（否则手动选择会永久粘在这首歌上）。
+ */
+export async function saveLyric(
+  trackId: string,
+  lrc: string,
+  wordByWord: string,
+  translation: string,
+  romanization: string,
+  source: string,
+  manual = false,
+): Promise<void> {
+  return invoke("save_lyric", {
+    trackId,
+    lrc,
+    wordByWord,
+    translation,
+    romanization,
+    source,
+    manual,
+  });
+}
+
+/** 回读已落库的歌词（网络取词失败的兜底）；没落过返回 null */
+export async function getLyric(trackId: string): Promise<LyricRecord | null> {
+  return invoke("get_lyric", { trackId });
+}
+
+// ---------- 不喜欢列表（屏蔽规则） ----------
+//
+// 规则按「歌名 + 歌手」匹配，不按曲目 id —— id 是平台私有的，换源兜底后同一首歌的
+// id 与 platform 都会变。Rust 侧做归一化匹配（全角折叠 / 去标点 / 剥版本后缀），
+// 前端不需要也不能自己猜匹配规则，只负责搬运与展示。
+
+/** 全部屏蔽规则（最近屏蔽的排前面） */
+export async function listDislikes(): Promise<DislikeRule[]> {
+  return invoke("list_dislikes");
+}
+
+/** 屏蔽一首歌。返回规则 id（设置页逐条删除要用），0 = 没成功 */
+export async function addDislikeSong(track: Track): Promise<number> {
+  return invoke("add_dislike_song", { track });
+}
+
+/**
+ * 屏蔽某位歌手（整串歌手按分隔符拆开，逐词各建一条规则）。
+ * 返回本次涉及的**全部**规则 id —— 歌手串可能拆出多条，前端要能一次撤销整串。
+ */
+export async function addDislikeSinger(singer: string): Promise<number[]> {
+  return invoke("add_dislike_singer", { singer });
+}
+
+/**
+ * 取消屏蔽某位歌手（按整串拆词逐条删），返回删掉几条。
+ * 与 `addDislikeSinger` 严格互逆 —— 不依赖前端记住 id，重启后也能干净撤销。
+ */
+export async function removeDislikeSinger(singer: string): Promise<number> {
+  return invoke("remove_dislike_singer", { singer });
+}
+
+/** 取消屏蔽（按规则 id 逐条删除） */
+export async function removeDislikeRule(id: number): Promise<boolean> {
+  return invoke("remove_dislike_rule", { id });
+}
+
+/** 清空全部屏蔽规则 */
+export async function clearDislikes(): Promise<void> {
+  return invoke("clear_dislikes");
+}
+
+/**
+ * 批量判定：返回与 `tracks` 等长的布尔向量，true = 这首已被屏蔽。
+ *
+ * 一次传整屏回来 —— 列表一屏就是上百首，逐行查会把 IPC 通道打满。
+ */
+export async function checkDisliked(tracks: Track[]): Promise<boolean[]> {
+  return invoke("check_disliked", { tracks });
 }
 
 // ---------- 事件 ----------

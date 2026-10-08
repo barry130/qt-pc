@@ -77,7 +77,12 @@ interface PlayerStore {
   setDragging: (d: boolean) => void;
   /** rAF 每帧调用：读插值位置 */
   interpolatedPositionMs: () => number;
-  /** 交互动作，全部转为 invoke（单向数据流） */
+  /**
+   * 单曲播放：**不替换播放列表** —— 队里已有这首（同 id + 同 platform）就播它
+   * 原来那条，否则追加到队尾再播（Rust 侧 `play_track` 原子完成，避免前端镜像
+   * 队列的竞态）。所有「点某一首」的入口都走它；整列表入队只在「播放全部」时用
+   * `playQueue`（DESIGN §11.2 的列表播放语义收敛到那个按钮上）。
+   */
   play: (track: Track) => Promise<void>;
   playQueue: (tracks: Track[], startIndex: number) => Promise<void>;
   playAt: (index: number) => Promise<void>;
@@ -254,9 +259,12 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
 
   play: async (track) => {
     const gen = ++playActionSeq;
-    await preResolvePlayUrl(track, get().state);
+    const st = get().state;
+    await preResolvePlayUrl(track, st);
     if (gen !== playActionSeq) return;
-    await ipc.playQueue([track], 0);
+    // 队列增删全在 Rust 引擎线程原子完成：前端只镜像 queue-changed，自己拼数组
+    // 会产生「追加后下标算错」的竞态。
+    await ipc.playTrack(track, st?.quality ?? "320");
   },
 
   playQueue: async (tracks, startIndex) => {

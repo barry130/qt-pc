@@ -38,6 +38,8 @@ import type {
 } from "@/source-scripts/qt-contract/contract";
 import { engineInvoke, engineResolve, engineSnapshot, INVOKE_TIMEOUT_MS } from "@/source-engine/client";
 import { rememberPlayUrlLine, rememberPlayUrlMiss } from "./playurl-line";
+// 包内 parseSheet 入口不可用（老包 / 引擎未就绪）时的本地回退实现
+import { parsePlaylistInput as localParsePlaylistInput } from "@/lib/playlist-link";
 import { PER_SOURCE_TIMEOUT_MS, withTimeoutMs } from "@/source-scripts/qt-contract/timeout";
 
 // ---------- 引擎调用 ----------
@@ -318,7 +320,9 @@ export function clampSearchPageSize(source: SourceId, size: number): number {
 /**
  * 歌手歌曲（分页，每页由调用方给 size）。
  *
- * 音源侧没有「按歌手 id 取歌」的免费接口，包里是**按歌手名搜索**；
+ * 2026-10-06：`artistId` 是歌手真实 id，给了包里就走**按 id 取作品**（wyy/kw/kg/qq 各有
+ * 端点，见各平台 artistWorks），不再把同名歌手的歌混进来；不给/取不到才退回歌手名搜索
+ * —— 退回判断在包内做，宿主只要把 id 透传就行。
  * 第一页顺带返回歌手头像 picUrl（包内只查第一页）。
  * 调用方必须翻页 —— 只取第一页会永远只有一页的量（曾写死 50 首）；
  * 且必须用 `searchPageMaxOf` 给出的每页上限，传超限值会静默截断甚至返回空。
@@ -328,18 +332,48 @@ export async function getArtistSongs(
   name: string,
   page: number,
   size: number,
-): Promise<{ songs: Track[]; picUrl: string }> {
+  artistId = "",
+): Promise<{ songs: Track[]; picUrl: string; hasMore: boolean }> {
   ensureScript(source);
-  const payload = await sourceCall<{ songs?: MusicInfo[]; picUrl?: string }>(
-    "artistSongs",
-    { source, name, page, size: clampSearchPageSize(source, size) },
-    (p) => p as { songs?: MusicInfo[]; picUrl?: string },
-  );
+  const payload = await callArtistSongsPayload(source, name, page, size, artistId);
   const songs = Array.isArray(payload.songs) ? payload.songs : [];
   return {
     songs: songs.map((m) => toAppTrack(m, source)),
     picUrl: typeof payload.picUrl === "string" ? payload.picUrl : "",
+    hasMore: hasMoreOf(payload, songs.length),
   };
+}
+
+/** artistSongs 的原始应答（PC 侧只有 getArtistSongs 一处消费者，抽出来只为可读） */
+async function callArtistSongsPayload(
+  source: SourceId,
+  name: string,
+  page: number,
+  size: number,
+  artistId: string,
+): Promise<{ songs?: MusicInfo[]; picUrl?: string; hasMore?: boolean }> {
+  type Payload = { songs?: MusicInfo[]; picUrl?: string; hasMore?: boolean };
+  return sourceCall<Payload>(
+    "artistSongs",
+    { source, name, page, size: clampSearchPageSize(source, size), id: artistId },
+    (p) => p as Payload,
+  );
+}
+
+/**
+ * 本页之后是否还有。
+ *
+ * 2026-10-07：数据包开始给权威 `hasMore`（走真 id 时就是平台模块算出的 isEnd）——
+ * 歌手作品是「按名搜一批、再按 singer.mid 过滤出本人」的**过滤型**列表，逐页条数
+ * 天然不齐（实测 QQ 周杰伦 100/90/96/93/77/70/61/52/37/23），按「本页条数 < pageSize」
+ * 推断会在真正到底之前收尾（正是「pc 768 首 / 移动 998 首」的成因）。
+ *
+ * 包没给（旧包 / 旧宿主契约）时退回「本页非空 = 还有」：多翻一页问到空页为止，
+ * 比按页大小猜更安全 —— 空页判据在六个音源上都验过，翻过尾页只会回空数组、不抛错。
+ */
+function hasMoreOf(payload: { hasMore?: boolean }, songCount: number): boolean {
+  if (typeof payload.hasMore === "boolean") return payload.hasMore;
+  return songCount > 0;
 }
 
 // ---------- 取链（脚本预解析 + 回填引擎缓存） ----------
@@ -379,17 +413,26 @@ export async function resolvePlayUrl(
  * 而非「这个音源确实给不出这首歌的地址」。引擎侧据此不把曲目拉黑、
  * 不计入连续失败熔断——弱网下 5 首超时就关掉自动切歌，正是用户反馈的
  * 「网络质量差一点就疯狂不可用」。
+ *
+ * `referer` 随地址一并回填：宿主（播放 range_reader / 下载 download.rs）拿
+ * 这个地址去 CDN 取字节时要带的头，由音源包按源声明下发（B 站部分 CDN 节点
+ * 无 Referer 直接 403）。空串 = 不发。
+ *
+ * `size` / `actualQuality` 是 2026-10-06 加的「取链诚实性」字段：包侧在 Range
+ * 预检里顺手量了文件总长，并把请求档按实测码率重标（只降不升）。宿主此前只
+ * 知道「请求的是 flac」，于是下载把 320k 的文件命名成 `.flac` —— 虚标。
+ * `size = null` / `actualQuality = ""` 表示这次没测出来，调用方按未知处理。
  */
 export async function resolvePlayUrlDetailed(
   track: Track,
   quality: Quality,
-): Promise<{ url: string; stalled: boolean }> {
+): Promise<{ url: string; stalled: boolean; referer: string; size: number | null; actualQuality: string }> {
   let stalled = true;
   try {
     ensureScript(track.platform);
   } catch {
     // local 源不走脚本取链：是明确的用法错误（内容问题），不算环境问题
-    return { url: "", stalled: false };
+    return { url: "", stalled: false, referer: "", size: null, actualQuality: "" };
   }
   const source = track.platform as Source;
   try {
@@ -398,8 +441,23 @@ export async function resolvePlayUrlDetailed(
       // 命中线路与地址一起记（管理端「当前播放地址」要显示走的是哪条源）：
       // 地址被引擎缓存复用，线路必须跟着地址走，不能只看最后一次取链
       rememberPlayUrlLine(track, quality, resolved.line);
-      await ipc.setResolvedPlayUrl(track, quality, resolved.url);
-      return { url: resolved.url, stalled: false };
+      // 回填时连 Referer 一起写进引擎缓存：缓存里的地址后续由播放/下载直接
+      // 取字节，没有头就等于把能播的地址变成 403（见 EngineResolved.referer）
+      await ipc.setResolvedPlayUrl(
+        track,
+        quality,
+        resolved.url,
+        resolved.referer,
+        resolved.size,
+        resolved.actualQuality,
+      );
+      return {
+        url: resolved.url,
+        stalled: false,
+        referer: resolved.referer,
+        size: resolved.size,
+        actualQuality: resolved.actualQuality,
+      };
     }
     // 失败死因（逐线路 trace）也记下来：面板显示「上次取链死因」，
     // 否则「取不到地址」在 PC 上完全不可诊断（2026-09-24 kg 不换源即此类）
@@ -413,19 +471,31 @@ export async function resolvePlayUrlDetailed(
     maybeEmitPlayPackMissing(msg);
     stalled = true;
   }
-  return { url: "", stalled };
+  return { url: "", stalled, referer: "", size: null, actualQuality: "" };
 }
 
 // ---------- 歌词 / 封面 ----------
 
 export async function getLyric(track: Track): Promise<Lyric> {
   ensureScript(track.platform);
-  const result = await sourceCall<{ lyric: string; translation: string }>(
+  // 2026-10-06：逐字与罗马音是可选面——老包只回 lyric/translation 时两个新字段
+  // 是 undefined，落下来就是空串，播放页照旧按整行高亮渲染。
+  const result = await sourceCall<{
+    lyric: string;
+    translation: string;
+    wordByWord?: string;
+    romanization?: string;
+  }>(
     "lyric",
     { source: track.platform, song: fromAppTrack(track) },
-    (p) => p as { lyric: string; translation: string },
+    (p) => p as { lyric: string; translation: string; wordByWord?: string; romanization?: string },
   );
-  return { lrc: result.lyric, translation: result.translation };
+  return {
+    lrc: result.lyric,
+    translation: result.translation,
+    wordByWord: result.wordByWord ?? "",
+    romanization: result.romanization ?? "",
+  };
 }
 
 export async function getTrackCover(track: Track): Promise<string> {
@@ -438,6 +508,48 @@ export async function getTrackCover(track: Track): Promise<string> {
 }
 
 // ---------- 歌单 ----------
+
+/**
+ * 歌单分享链接 / 裸 ID 解析（2026-10-06，报告 §4 第 11 项）。
+ *
+ * 解析的权威实现已下沉到音源包（`qt-sources/src/actions/sheet-import.ts`，
+ * 入口 `parseSheet`）——此前 PC 的 lib/playlist-link.ts 与安卓
+ * services/music-api.ts 各写一份且已漂移（安卓缺 kg 原生 ID、缺显式 id 提取、
+ * 缺 .html 还原）。本函数优先调包内入口，拿不到（老包 26 入口、引擎未就绪、
+ * 调用失败）就地回退到 PC 本地那份，保证老包环境下行为完全不变。
+ *
+ * **只解析、不发请求**：拿到 {platform,id} 后由调用方复用 getPlaylistDetail。
+ */
+export async function parseSheetInput(
+  text: string,
+  fallback?: SourceId,
+): Promise<{ platform: SourceId; id: string } | null> {
+  const local = localParsePlaylistInput(text, fallback);
+  try {
+    const parsed = await sourceCall<{ platform?: string; id?: string } | null>(
+      "parseSheet",
+      { text, source: fallback ?? "" },
+      (p) => (p === null ? null : (p as { platform?: string; id?: string })),
+      // 纯解析不该占满默认 20s 引擎超时；包没就绪时尽早回本地实现
+      3_000,
+    );
+    if (
+      parsed &&
+      typeof parsed.platform === "string" &&
+      typeof parsed.id === "string" &&
+      parsed.platform.length > 0 &&
+      parsed.id.length > 0
+    ) {
+      return { platform: parsed.platform as SourceId, id: parsed.id };
+    }
+    // 包侧明确说「无法识别」：尊重包的判断（它是权威），不再用本地兜底覆盖，
+    // 否则包侧修好的边界（如 ?chain= 短链）会被旧逻辑重新判成错的平台。
+    if (parsed === null) return null;
+  } catch {
+    // 引擎不可用 / 入口不存在（老包）→ 走本地实现
+  }
+  return local;
+}
 
 export async function getPlaylistCategories(
   source: SourceId,
@@ -472,11 +584,14 @@ export async function getRecommendations(
   source: SourceId,
   category: string | null,
   page: number,
+  sort: string = "",
 ): Promise<Playlist[]> {
   ensureScript(source);
   const list = await sourceCall<Parameters<typeof toAppPlaylist>[0][]>(
     "recommendations",
-    { source, category, page },
+    // sort（v5 契约）：包侧 playlistSorts 声明的 id 原样透传（wyy → order=、
+    // kg → t=）；空串/不支持排序的源 = 各平台默认
+    { source, category, page, sort },
     (p) => p.list as Parameters<typeof toAppPlaylist>[0][] | undefined,
   );
   return list.map(toAppPlaylist);
@@ -494,6 +609,11 @@ export async function getCharts(source: SourceId): Promise<Chart[]> {
   return list.map(toAppChart);
 }
 
+/**
+ * 全源聚合榜单。**宿主 PC 端已不再使用**（排行榜页与发现页都改为按音源取，
+ * 见 ChartsPage / DiscoverPage），保留是因为它是数据包对外契约的一部分
+ * （allCharts 入口，其它宿主/安卓端仍在用）。
+ */
 export async function getAllCharts(): Promise<Chart[]> {
   const list = await sourceCall<ContractChart[]>(
     "allCharts",

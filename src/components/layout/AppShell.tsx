@@ -6,6 +6,7 @@ import { useAuthStore } from "@/stores/auth";
 import { TitleBar } from "@/components/TitleBar";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { KeepAliveOutlet, isKeepAlivePath } from "@/components/layout/KeepAliveOutlet";
+import { ScrollTopLayer } from "@/components/layout/ScrollTopLayer";
 import { PlayerBar } from "@/components/PlayerBar";
 import { QueuePanel } from "@/components/player/QueuePanel";
 import { useFramelessWindow } from "@/hooks/useFramelessWindow";
@@ -24,6 +25,7 @@ import { useAppearanceStore } from "@/stores/appearance";
 import { usePlayerStore } from "@/stores/player";
 import { useSourceRegistryStore } from "@/stores/sourceRegistry";
 import { useDownloadsStore } from "@/stores/downloads";
+import { useDislikesStore } from "@/stores/dislikes";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { initStat, trackStatPage } from "@/lib/stat";
 import { UpdateDialog } from "@/components/update/UpdateDialog";
@@ -125,6 +127,13 @@ export function AppShell(): React.JSX.Element {
     };
   }, [refreshDownloads]);
 
+  // 屏蔽规则：启动拉一次。它不像下载那样有 Rust 事件驱动 —— 规则只可能由本窗口
+  // 的写命令改动，而写命令所在的 store 动作自己会 refresh，这里补上冷启动那一次。
+  const refreshDislikes = useDislikesStore((s) => s.refresh);
+  useEffect(() => {
+    void refreshDislikes();
+  }, [refreshDislikes]);
+
   return (
     <div className="relative flex h-screen w-screen flex-col overflow-hidden bg-background text-foreground">
       {bgImage && (
@@ -202,6 +211,12 @@ export function AppShell(): React.JSX.Element {
               </Suspense>
             </ErrorBoundary>
           </div>
+          {/* 「回到顶部」浮层（用户 m05249）：统一挂在这里，十几处长列表不必逐个挂 ref。
+              位置固定在内容区右下角；播放队列是 main 的兄弟节点，面板展开时按钮
+              自动停在面板左侧，不会钻到面板底下。 */}
+          <ErrorBoundary label="回到顶部">
+            <ScrollTopLayer resetKey={pathname} />
+          </ErrorBoundary>
         </main>
         {!isPlayingPage && (
           <ErrorBoundary label="播放队列">

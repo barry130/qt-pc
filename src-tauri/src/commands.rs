@@ -135,12 +135,21 @@ pub async fn cmd_builtin_request(
 /// 引擎侧取链的缓存键为 `{platform}:{trackId}:{quality}`，
 /// 回填后播放/预取直接命中缓存；未回填（解析失败）时引擎经
 /// playurl_bridge 现问前端，仍失败则本次取链按失败处理。
+///
+/// `referer` / `size` / `actualQuality` 是随地址一起下发的伴随字段
+/// （2026-10-06 取链诚实性）：Referer 取字节要带（B 站部分 CDN 节点无它 403）、
+/// size 是 Range 预检实测的文件总长、actualQuality 是按实测码率重标后的档位
+/// （**只降不升**，空串 = 未重标）。下载命名与进度靠后两者，缺了就把
+/// 320k 的文件命名成 `.flac`（虚标）。
 #[tauri::command(rename = "set_resolved_play_url")]
 pub async fn cmd_set_resolved_play_url(
     state: State<'_, AppState>,
     track: Track,
     quality: Quality,
     url: String,
+    referer: String,
+    size: Option<u64>,
+    actual_quality: Option<String>,
 ) -> Result<(), ProviderError> {
     if url.is_empty() {
         return Ok(());
@@ -150,7 +159,16 @@ pub async fn cmd_set_resolved_play_url(
         &track.id,
         crate::quality_str(&quality),
     );
-    state.url_cache.set(key, url);
+    state.url_cache.set(
+        key,
+        crate::provider::url_cache::ResolvedPlayUrl {
+            url,
+            referer,
+            size,
+            actual_quality: actual_quality.unwrap_or_default(),
+            fetched_at: 0,
+        },
+    );
     Ok(())
 }
 
@@ -164,12 +182,33 @@ pub async fn cmd_script_bridge_ready() {
 /// 引擎 → 前端取链桥（playurl_bridge）：前端脚本包按 requestId 应答播放地址；
 /// 空串 = 前端解析失败，引擎把本次取链按失败处理。
 ///
+/// `referer` / `size` / `actualQuality` 由前端一并回填：宿主之后自己向 CDN
+/// 取字节（播放 range_reader / 下载 download.rs）拿不到"声明它的那一侧"，
+/// 只能随地址一起存进缓存。referer 空串 = 该源没声明、取字节时不发这个头；
+/// size = None / actualQuality 空串 = 这次没测出来，按未知处理。
+///
 /// `stalled` 由前端回传：本次失败是**环境问题**（弱网 / 引擎页未就绪 /
 /// 应答超时）而非「音源确实没这首」。引擎据此不把曲目拉黑、不计入连续
 /// 失败熔断（2026-10-03 弱网修复）—— 否则弱网 5 首就把自动切歌关死。
 #[tauri::command(rename = "resolve_play_url_reply")]
-pub async fn cmd_resolve_play_url_reply(request_id: u64, url: String, stalled: bool) {
-    crate::playurl_bridge::reply(request_id, url, stalled);
+pub async fn cmd_resolve_play_url_reply(
+    request_id: u64,
+    url: String,
+    referer: String,
+    stalled: bool,
+    size: Option<u64>,
+    actual_quality: Option<String>,
+) {
+    crate::playurl_bridge::reply(
+        request_id,
+        crate::playurl_bridge::BridgeReply {
+            url,
+            referer,
+            size,
+            actual_quality: actual_quality.unwrap_or_default(),
+            stalled,
+        },
+    );
 }
 
 #[tauri::command(rename = "invalidate_play_url")]
@@ -189,18 +228,17 @@ pub async fn cmd_invalidate_play_url(
 
 // ---------- 播放控制 ----------
 
-/// 单曲播放（队列替换为 [track]）；列表播放请用 play_queue。
+/// 单曲播放（DESIGN §11.2）：**不替换播放列表** —— 队列里已有同一首
+/// （同 id + 同 platform）就播它原来那条，否则追加到队尾再播。
+/// 列表整体入队请用 `play_queue`。
 #[tauri::command(rename = "play_track")]
 pub async fn cmd_play_track(
     state: State<'_, AppState>,
     track: Track,
     quality: Quality,
 ) -> Result<(), ProviderError> {
-    state.engine.send(AudioCmd::SetQueue {
-        tracks: vec![track.clone()],
-        index: 0,
-    });
-    // SetQueue 已含取址链路（play_queue_track），quality 这里仅作缓存键一致性
+    state.engine.send(AudioCmd::PlayTrack(Box::new(track.clone())));
+    // 取址链路在 PlayTrack 内（play_queue_track）；quality 仅作缓存键一致性
     let _ = quality;
     Ok(())
 }
@@ -227,6 +265,10 @@ pub async fn cmd_set_track_quality(
 }
 
 /// 列表入队并播放 startIndex（DESIGN §11.2 play_queue）
+///
+/// 入队前先剔除「不喜欢列表」里的曲目 —— 用户屏蔽它们的意图就是别让它自己出现。
+/// 被点的那首永远保留（语义是「别自动出现」，不是「禁止聆听」），
+/// 起播下标会按过滤后的数组重算。详见 `db::store::filter_disliked_tracks`。
 #[tauri::command(rename = "play_queue")]
 pub async fn cmd_play_queue(
     state: State<'_, AppState>,
@@ -236,10 +278,24 @@ pub async fn cmd_play_queue(
     if tracks.is_empty() {
         return Err("队列为空".into());
     }
-    state.engine.send(AudioCmd::SetQueue {
-        tracks,
-        index: start_index as usize,
-    });
+    let (tracks, index) = match state.db.clone() {
+        Some(db) => {
+            let start = start_index as usize;
+            tauri::async_runtime::spawn_blocking(move || {
+                db.with(|conn| crate::db::store::filter_disliked_tracks(conn, tracks, start))
+            })
+            .await
+            // 屏蔽判定失败不该让用户播不了歌：退化成原样入队
+            .map_err(|e| format!("过滤屏蔽列表失败: {e}"))
+            .unwrap_or_else(|_| Ok((Vec::new(), 0)))
+            .unwrap_or_else(|_| (Vec::new(), 0))
+        }
+        None => (tracks, start_index as usize),
+    };
+    if tracks.is_empty() {
+        return Err("队列为空".into());
+    }
+    state.engine.send(AudioCmd::SetQueue { tracks, index });
     Ok(())
 }
 
@@ -1163,6 +1219,241 @@ pub async fn cmd_open_lyric_settings(app: tauri::AppHandle) -> Result<(), String
     Ok(())
 }
 
+// ---------- 歌词偏移与歌词落库（lyric_settings / lyrics 表） ----------
+//
+// 背景：两张表在 V11 就建好了，但此前全库零读写——歌词正文只活在前端进程内 LRU，
+// 退出即丢；歌词快慢不同步也没有任何可调入口（lx-music-desktop 有 `offset`，
+// LX 还在 `lyric` 表里落库）。这里补齐读写两端。
+//
+// 键口径：`trackId` = `platform:原始id`，与 `db::store::db_track_id()` 一致；
+// 前端自己拼这个串（已有同样的拼法在播放页与桌面歌词窗口的 trackKey 里）。
+
+/// 读逐曲目歌词偏移（毫秒）。没设过 / 曲目未入库都返回 0（= 不偏移）。
+#[tauri::command(rename = "get_lyric_offset")]
+pub async fn cmd_get_lyric_offset(
+    state: State<'_, AppState>,
+    track_id: String,
+) -> Result<i64, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(0);
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| crate::db::store::get_lyric_offset(conn, &track_id))
+    })
+    .await
+    .map_err(|e| format!("读取歌词偏移失败: {e}"))?
+}
+
+/// 写逐曲目歌词偏移（毫秒）。Rust 侧夹紧到 ±10s（`MAX_OFFSET_MS`）。
+#[tauri::command(rename = "set_lyric_offset")]
+pub async fn cmd_set_lyric_offset(
+    state: State<'_, AppState>,
+    track_id: String,
+    offset_ms: i64,
+) -> Result<(), String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(());
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| crate::db::store::set_lyric_offset(conn, &track_id, offset_ms))
+    })
+    .await
+    .map_err(|e| format!("保存歌词偏移失败: {e}"))?
+}
+
+/// 取词成功后把歌词正文落库（火后不管，失败不影响播放）。
+///
+/// `source` 记实际取词的音源：换源兜底时是目标源，回读才知道这份词属于哪个版本。
+/// `word_by_word` / `romanization` 是 2026-10-06 补上的逐字与罗马音面：wyy/qq/kg 的包
+/// 有，bili/kw/migu 的包恒空串，取不到就照写空串（语义见 `db/store/lyrics.rs`）。
+/// 参数名用前端口径（`wordByWord` / `romanization`，与音源包契约 `ContractLyric` 一致），
+/// 落库时才映射到 V11 迁移定下的列名 `word_lrc` / `romaji`。
+///
+/// `manual` = 这份词是不是用户在播放页「搜索歌词」手动挑的。自动取词一律传 `false`
+/// —— 见 `db/store/lyrics.rs`：手动标记写了 1 之后，取词链路就不再打源站而是直接
+/// 回读它，所以自动链路重新取到词时必须把标记交回 0，否则用户的选择会永久粘住。
+#[tauri::command(rename = "save_lyric")]
+pub async fn cmd_save_lyric(
+    state: State<'_, AppState>,
+    track_id: String,
+    lrc: String,
+    word_by_word: String,
+    translation: String,
+    romanization: String,
+    source: String,
+    manual: bool,
+) -> Result<(), String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(());
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| {
+            crate::db::store::upsert_lyric(
+                conn,
+                &track_id,
+                &lrc,
+                &word_by_word,
+                &translation,
+                &romanization,
+                &source,
+                manual,
+            )
+        })
+    })
+    .await
+    .map_err(|e| format!("保存歌词失败: {e}"))?
+}
+
+/// 回读已落库的歌词（网络取词失败的兜底）。没落过返回 null。
+#[tauri::command(rename = "get_lyric")]
+pub async fn cmd_get_lyric(
+    state: State<'_, AppState>,
+    track_id: String,
+) -> Result<Option<crate::db::store::LyricRecord>, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(None);
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| crate::db::store::get_lyric(conn, &track_id))
+    })
+    .await
+    .map_err(|e| format!("读取歌词失败: {e}"))?
+}
+
+// ---------- 不喜欢列表（屏蔽规则，dislike_rules 表） ----------
+//
+// 规则按「歌名 + 歌手」匹配，不按曲目 id —— id 是平台私有的，换源兜底后同一首歌
+// 的 id 与 platform 都会变。代价是匹配必须是容许吵闹的那类：详见
+// `db/store/dislikes.rs` 的 `normalize_key`（全角折叠 + 去标点 + 剥版本后缀）。
+//
+// **被用户点播的那首永不被过滤**：规则的语义是「别让它自动出现」，不是「禁止聆听」。
+
+/// 全部屏蔽规则（按最近屏蔽倒序）。
+#[tauri::command(rename = "list_dislikes")]
+pub async fn cmd_list_dislikes(
+    state: State<'_, AppState>,
+) -> Result<Vec<crate::db::store::DislikeRule>, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(Vec::new());
+    };
+    tauri::async_runtime::spawn_blocking(move || db.with(crate::db::store::list_dislikes))
+        .await
+        .map_err(|e| format!("读取屏蔽列表失败: {e}"))?
+}
+
+/// 屏蔽一首歌。返回规则 id（设置页逐条删除要用）。
+///
+/// 写完后推一条 `ReloadDislikes` 给引擎：它在「下一首」里要绕开这首。
+#[tauri::command(rename = "add_dislike_song")]
+pub async fn cmd_add_dislike_song(
+    state: State<'_, AppState>,
+    track: Track,
+) -> Result<i64, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(0);
+    };
+    let id = tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| crate::db::store::add_dislike_song(conn, &track))
+    })
+    .await
+    .map_err(|e| format!("屏蔽歌曲失败: {e}"))??;
+    state.engine.send(AudioCmd::ReloadDislikes);
+    Ok(id)
+}
+
+/// 屏蔽某位歌手（传进来的整串会按分隔符拆开，逐词各建一条规则）。
+/// 返回新建/命中的**全部**规则 id —— 前端要能一次撤销这一整串歌手。
+#[tauri::command(rename = "add_dislike_singer")]
+pub async fn cmd_add_dislike_singer(
+    state: State<'_, AppState>,
+    singer: String,
+) -> Result<Vec<i64>, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(Vec::new());
+    };
+    let ids = tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| crate::db::store::add_dislike_singer(conn, &singer))
+    })
+    .await
+    .map_err(|e| format!("屏蔽歌手失败: {e}"))??;
+    state.engine.send(AudioCmd::ReloadDislikes);
+    Ok(ids)
+}
+
+/// 取消屏蔽某位歌手（按整串拆词逐条删）。返回删掉了几条。
+///
+/// 与 `add_dislike_singer` 严格互逆：两边都用同一套 split_singers，
+/// 所以「屏蔽 A/B/C」之后一次撤销能干净地撤掉三条，不留孤儿规则。
+#[tauri::command(rename = "remove_dislike_singer")]
+pub async fn cmd_remove_dislike_singer(
+    state: State<'_, AppState>,
+    singer: String,
+) -> Result<usize, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(0);
+    };
+    let removed = tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| crate::db::store::remove_dislike_singer(conn, &singer))
+    })
+    .await
+    .map_err(|e| format!("取消屏蔽歌手失败: {e}"))??;
+    if removed > 0 {
+        state.engine.send(AudioCmd::ReloadDislikes);
+    }
+    Ok(removed)
+}
+
+/// 取消屏蔽（按规则 id 逐条删除 —— LX 的 dislike_list 做不到这件事）。
+#[tauri::command(rename = "remove_dislike_rule")]
+pub async fn cmd_remove_dislike_rule(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<bool, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(false);
+    };
+    let removed = tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| crate::db::store::remove_dislike_rule(conn, id))
+    })
+    .await
+    .map_err(|e| format!("取消屏蔽失败: {e}"))??;
+    state.engine.send(AudioCmd::ReloadDislikes);
+    Ok(removed)
+}
+
+/// 清空全部屏蔽规则。
+#[tauri::command(rename = "clear_dislikes")]
+pub async fn cmd_clear_dislikes(state: State<'_, AppState>) -> Result<(), String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(());
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| crate::db::store::clear_dislikes(conn).map(|_| ()))
+    })
+    .await
+    .map_err(|e| format!("清空屏蔽列表失败: {e}"))??;
+    state.engine.send(AudioCmd::ReloadDislikes);
+    Ok(())
+}
+
+/// 批量判定：返回与入参等长的布尔向量，true = 这首被屏蔽了。
+///
+/// 列表一屏就是上百首，逐行查会把 IPC 通道打满，所以一次传整列表回来。
+#[tauri::command(rename = "check_disliked")]
+pub async fn cmd_check_disliked(
+    state: State<'_, AppState>,
+    tracks: Vec<Track>,
+) -> Result<Vec<bool>, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(vec![false; tracks.len()]);
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| crate::db::store::filter_disliked_flags(conn, &tracks))
+    })
+    .await
+    .map_err(|e| format!("判定屏蔽状态失败: {e}"))?
+}
+
 // ---------- 本地音乐库（DESIGN §13） ----------
 //
 // 约定：本地曲目 `Track.id` = 音频文件绝对路径，`platform = SourceId::Local`。
@@ -1228,9 +1519,7 @@ pub async fn cmd_scan_library(
         let mut upsert_failed = false;
         let mut first_err: Option<String> = None;
         for chunk in rows.chunks(UPSERT_CHUNK) {
-            if let Err(e) =
-                db.with(|conn| crate::db::store::upsert_local_tracks(conn, chunk))
-            {
+            if let Err(e) = db.with(|conn| crate::db::store::upsert_local_tracks(conn, chunk)) {
                 log::error!("[local] 分段入库失败（段含 {} 条）: {e}", chunk.len());
                 upsert_failed = true;
                 first_err = Some(e);
@@ -2161,6 +2450,11 @@ pub async fn cmd_remove_tracks_from_playlist(
 /// 下载目录的 settings 键
 const SETTING_DOWNLOAD_DIR: &str = "download.dir";
 
+/// 同时下载数的 settings 键。用点号风格与 `download.dir` 对齐（settings 表里
+/// 既有 `download.dir` 这种点号键，也有 `downloadNameFormat` 这种驼峰键，
+/// 新键统一按点号走，别再增加一种风格）。
+const SETTING_DOWNLOAD_CONCURRENCY: &str = "download.maxConcurrent";
+
 /// 下载状态变化事件名（与 download 模块保持一致）
 const EVENT_DOWNLOADS_CHANGED: &str = download::EVENT_DOWNLOADS_CHANGED;
 
@@ -2224,6 +2518,21 @@ fn audio_ext_from_url(url: &str, quality: &str) -> String {
         "flac".to_string()
     } else {
         "mp3".to_string()
+    }
+}
+
+/// 下载落盘/显示用的档位：实测档位非空时用它，否则退回请求档。
+///
+/// 取链时请求 flac 但线路只给 320k mp3 的情况真实存在（酷我 `format=flac`
+/// 无无损源时会回退 mp3），落盘名若照请求档写就是虚标。包侧的
+/// `snapQualityToMeasured` 按「实测字节 ÷ 时长」重标且**只降不升**，
+/// 这里只负责在它没给结果（空串）时保持旧行为。
+fn effective_download_quality(requested: &str, measured: &str) -> String {
+    let measured = measured.trim();
+    if measured.is_empty() {
+        requested.to_string()
+    } else {
+        measured.to_string()
     }
 }
 
@@ -2339,6 +2648,60 @@ pub async fn cmd_reset_download_dir(state: State<'_, AppState>) -> Result<String
     }
     let dir = download_dir(&state)?;
     Ok(dir.to_string_lossy().to_string())
+}
+
+/// 读取「同时下载数」。
+///
+/// 内存里的闸门是**权威值**：命令会立刻改它，所以用户刚点完设置就再打开设置页，
+/// 不该被库里那条还没写完（或写失败）的记录盖回去。数据库只是持久化副本。
+/// 启动时由 `lib.rs` 从库里读一次喂给闸门（`load_download_concurrency`）。
+#[tauri::command(rename = "get_download_concurrency")]
+pub async fn cmd_get_download_concurrency(state: State<'_, AppState>) -> Result<usize, String> {
+    Ok(state.downloads.concurrency())
+}
+
+/// 设置「同时下载数」（1–6，越界夹紧）。
+///
+/// 三件事必须一起做，少一件都会出现「设置了不生效」：
+/// 1. 改内存闸门 —— 立刻影响正在排队的任务（提高上限会当场叫醒排队者）；
+/// 2. 写 settings 表 —— 下次启动还在（写失败只记日志，不打断用户）；
+/// 3. 广播 `downloads-changed` —— 下载页要按新并发数刷新「排队中」的展示。
+#[tauri::command(rename = "set_download_concurrency")]
+pub async fn cmd_set_download_concurrency(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    n: usize,
+) -> Result<usize, String> {
+    let n = download::clamp_concurrency(n);
+    state.downloads.set_concurrency(n);
+
+    if let Some(db) = state.db.clone() {
+        let value = n.to_string();
+        // 写库失败不影响本次设置生效（内存已改），只记日志提示
+        let saved = tauri::async_runtime::spawn_blocking(move || {
+            db.with(|conn| {
+                crate::db::store::set_setting(conn, SETTING_DOWNLOAD_CONCURRENCY, &value)
+            })
+        })
+        .await
+        .map_err(|e| format!("保存同时下载数失败: {e}"))?;
+        if let Err(e) = saved {
+            log::warn!("[download] 同时下载数写入设置失败: {e}");
+        }
+    }
+
+    let _ = app.emit(EVENT_DOWNLOADS_CHANGED, ());
+    Ok(n)
+}
+
+/// 启动时把库里存的同时下载数读出来喂给闸门。
+///
+/// 返回 `None` = 库里没存过（沿用默认值 3）或存的不是合法数字。
+pub fn load_download_concurrency(db: &crate::db::Database) -> Result<Option<usize>, String> {
+    let raw = db
+        .with(|conn| crate::db::store::get_setting(conn, SETTING_DOWNLOAD_CONCURRENCY))
+        .map_err(|e| e.to_string())?;
+    Ok(raw.and_then(|s| s.trim().parse::<usize>().ok()))
 }
 
 #[tauri::command(rename = "list_downloads")]
@@ -2490,13 +2853,19 @@ pub async fn cmd_start_download(
     }
 
     // 取址放在建任务之前：失败就干净报错，不留悬挂任务
-    let (url, _fetched) = resolve_play_url_script(&app, &state.url_cache, &track, quality)
+    let resolved = resolve_play_url_script(&app, &state.url_cache, &track, quality)
         .await
         .map_err(|e| format!("取播放地址失败: {e}"))?;
+    let url = resolved.url;
+    let referer = resolved.referer;
+    // 命名用「实测档位」而非请求档位：请求无损却只拿到 320k 时，
+    // 落盘名不该带 `.flac`（虚标）。实测档位由包侧按字节÷时长重标，只降不升；
+    // 没测出来（空串）时退回请求档，与旧行为一致。
+    let named_quality = effective_download_quality(&q_str, &resolved.actual_quality);
 
     let dir = download_dir(&state)?;
     let name_fmt = download_name_format(&state);
-    let final_path = unique_download_path(&dir, &track, &q_str, &url, &name_fmt);
+    let final_path = unique_download_path(&dir, &track, &named_quality, &url, &name_fmt);
     let part_path = download::part_path_for(&final_path);
     let part_str = part_path.to_string_lossy().to_string();
 
@@ -2513,6 +2882,10 @@ pub async fn cmd_start_download(
     let db_for_job = Arc::clone(&db);
     let manager = Arc::clone(&state.downloads);
     let task_for_job = task_id.clone();
+    let declared_size = resolved.size;
+    // 进闸门之前先占住登记表：`run_job` 里的 `begin` 会复用这个旗标，
+    // 所以从「任务已建」这一刻起，暂停 / 取消就能打断它（含还在排队的时候）。
+    manager.reserve(&task_for_job);
     tauri::async_runtime::spawn(async move {
         let outcome = download::run_job(
             app_for_job,
@@ -2521,6 +2894,8 @@ pub async fn cmd_start_download(
             DownloadJob {
                 task_id: task_for_job,
                 url,
+                referer,
+                declared_size,
                 final_path,
                 part_path,
             },
@@ -2660,6 +3035,28 @@ pub async fn cmd_write_log(level: String, message: String) -> Result<(), String>
     Ok(())
 }
 
+/// 把前端生成的图片（base64）写到指定路径（分享卡片「保存为 PNG」）。
+///
+/// 为什么不走 fs 插件：项目只装了 dialog 插件，没有 fs 插件；而保存路径已经由
+/// `plugin:dialog|save` 让用户当面选过，写盘这一步交给 Rust 更直接，也不必为它
+/// 再给前端开一条文件系统能力。
+///
+/// 只写 base64 解码后的原始字节，不解析扩展名/不做目录穿越处理 —— 路径来自系统
+/// 保存对话框，用户自己看得见选了哪。
+#[tauri::command(rename = "save_binary_file")]
+pub async fn cmd_save_binary_file(path: String, data: String) -> Result<(), String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.trim())
+        .map_err(|e| format!("图片数据解码失败: {e}"))?;
+    let out = tauri::async_runtime::spawn_blocking(move || {
+        std::fs::write(&path, &bytes).map_err(|e| format!("写入文件失败: {e}"))
+    })
+    .await
+    .map_err(|e| format!("写入文件失败: {e}"))?;
+    out
+}
+
 /// 删除本地音频文件（幂等：文件本就不在视为已删除）。返回本次是否真的删掉了文件。
 fn remove_local_file(path: &str) -> Result<bool, String> {
     match std::fs::remove_file(path) {
@@ -2748,6 +3145,8 @@ async fn relaunch_download(
     let track = task.track.clone();
     let existing_part = task.part_path.clone();
     let task_id = id.clone();
+    // 同 cmd_start_download：spawn 前先占登记表，排队期间也能被暂停 / 取消打断
+    manager.reserve(&task_id);
 
     tauri::async_runtime::spawn(async move {
         let result = launch_download(
@@ -2783,9 +3182,25 @@ async fn launch_download(
     dir: PathBuf,
     existing_part: Option<String>,
 ) -> Result<(), String> {
-    let (url, _) = resolve_play_url_script(&app, &url_cache, &track, quality.clone())
-        .await
-        .map_err(|e| format!("取播放地址失败: {e}"))?;
+    // 先占并发位再取址：取址也是对音源的一次请求，批量「继续」二十个任务时
+    // 不能把二十个取址请求一起打出去 —— 那正是并发闸门要防的事。
+    // 排队期间被暂停 / 取消（begin 返回 None）时直接收工：终态已由命令层写好。
+    let Some(slot) = manager.begin(&task_id).await else {
+        return Ok(());
+    };
+
+    let resolved = match resolve_play_url_script(&app, &url_cache, &track, quality.clone()).await {
+        Ok(r) => r,
+        Err(e) => {
+            // 取址失败必须摘掉登记表：否则 `is_active` 永远为真，用户点「继续」
+            // 会被当成重复点击直接忽略，任务卡死在失败态再也起不来。
+            manager.release(&task_id);
+            return Err(format!("取播放地址失败: {e}"));
+        }
+    };
+    let url = resolved.url;
+    let referer = resolved.referer;
+    let declared_size = resolved.size;
 
     // 有历史 `.part` 就沿用（路径里含原扩展名，成品名也据此还原，保持一致）
     let (final_path, part_path) = match existing_part.filter(|p| !p.trim().is_empty()) {
@@ -2799,8 +3214,11 @@ async fn launch_download(
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "artist".to_string());
+            // 同 cmd_start_download：命名用实测档位，避免请求 flac 实际 mp3 时虚标
+            let named_quality =
+                effective_download_quality(quality_str(&quality), &resolved.actual_quality);
             let final_path =
-                unique_download_path(&dir, &track, quality_str(&quality), &url, &name_fmt);
+                unique_download_path(&dir, &track, &named_quality, &url, &name_fmt);
             let part = download::part_path_for(&final_path);
             (final_path, part)
         }
@@ -2813,16 +3231,21 @@ async fn launch_download(
     })
     .await;
 
-    download::run_job(
+    // 已经持有并发位，走 `run_job_with_slot` 而不是 `run_job`：
+    // 再 `begin` 一次会把自己锁死（自己占着位子等自己让位）。
+    download::run_job_with_slot(
         app,
         db,
         manager,
         DownloadJob {
             task_id,
             url,
+            referer,
+            declared_size,
             final_path,
             part_path,
         },
+        slot,
     )
     .await;
 

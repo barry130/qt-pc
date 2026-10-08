@@ -1,5 +1,10 @@
 /**
- * 歌单分享链接 / ID 解析（导入歌单用，对齐 qt-uniappx `parsePlaylistInput`）。
+ * 歌单分享链接 / ID 解析 —— **仅作老包回退用**。
+ *
+ * 2026-10-06（报告 §4 第 11 项）：解析的权威实现已下沉到音源包
+ * （`qt-sources/src/actions/sheet-import.ts`，入口 `parseSheet`），两端宿主统一
+ * 调包内入口；本文件只在「音源包太旧（26 入口）/ 引擎未就绪」时被
+ * `source-scripts/index.ts:parseSheetInput` 兜底调用。
  *
  * 分享文案常是整段话（如「分享XX的歌单《名称》https://t1.kugou.com/xxx（@酷狗音乐）」），
  * 所以先抠出第一个 URL，再按 URL 判断平台；纯数字 ID 则交给调用方指定的平台。

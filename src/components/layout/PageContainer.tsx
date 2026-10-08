@@ -11,7 +11,8 @@ export function PageContainer(props: {
       {props.stickyHeader != null && (
         <div className="shrink-0 px-6">{props.stickyHeader}</div>
       )}
-      <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5 [scrollbar-gutter:stable]">{props.children}</div>
+      {/* scrollbar-gutter 由 index.css 统一给所有纵向滚动容器加，这里不再单独写 */}
+      <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">{props.children}</div>
     </div>
   );
 }

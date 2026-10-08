@@ -1,24 +1,24 @@
-//! 引擎 → 前端取链桥。
+//! 引擎 ←→ 前端取链桥。
 //!
-//! 背景：取链方案（scheme）只在前端生效——脚本包解析出的地址靠
+//! 背景：取链方案（scheme）只在前端生效——脚本包解析出的地址经
 //! `set_resolved_play_url` 预先写进 `PlayUrlCache`，引擎只在缓存命中时用。
 //! 引擎主导的换歌（自然播完自动切歌、随机模式下一首、打开流失败后的重取）
 //! 前端无法预判，缓存必然未命中。
 //!
 //! 本模块补上这条通道：引擎取链前发 `play_url_request` 事件问前端，
-//! 前端脚本包解析后经 `resolve_play_url_reply` 应答；前端未就绪、应答
-//! 超时或回空串时，本次取链失败（原生 Rust Provider 已删除，
+//! 前端脚本包解析后以 `resolve_play_url_reply` 应答；前端未就绪、应答
+//! 超时或回空串时，本次取链失败（原因：Rust Provider 已删除，
 //! 前端脚本线路是唯一的第三方取链路径）。
 //!
 //! 就绪语义：前端主窗口挂载后调 `script_bridge_ready` 置位。启动恢复
 //! 播放等早于前端挂载的取链不等待、直接按失败处理。
 //!
-//! P2-5：在途请求表原来是"每个调用方一条 + 只靠超时清理"，
+//! P2-5：在途请求表原来是「每个调用方一条」+ 只靠超时清理，
 //! 前端长时间不响应期间会一直堆。现在：
 //! - **同键单飞合并**：同一 `platform:trackId:quality` 的并发取链只发一次
-//!   前端事件，多个调用方共享同一次应答（前端本来就是按 requestId 配对的
-//!   一问一答，我们这边一个 id 挂 N 个等待方，谁也踩不掉谁）；
-//! - **容量上限 32 条**：满了淘汰最旧的一条（它的等待方立刻按失败处理），
+//!   前端事件，多个调用方共享同一次应答（前端本来就是按 requestId 配对
+//!   一问一答，我们这边一个 id 对 N 个等待方，谁也踩不掉谁）；
+//! - **容量上限 32**：满了淘汰最旧的一条（它的等待方立刻按失败处理），
 //!   保证表不会无限增长；
 //! - **清理时机明确**：应答到达、事件发送失败、调用方超时、容量淘汰，
 //!   四条路径都会把 `by_key` / `by_id` 两条记录一起摘掉。
@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 use crate::provider::types::{Quality, Track};
 use tauri::{AppHandle, Emitter};
 
-/// 前端脚本桥是否已就绪（主窗口挂载后由 `script_bridge_ready` 置位）
+/// 前端脚本桥是否已就绪（主窗口挂载后由 `script_bridge_ready` 置位）。
 static BRIDGE_READY: AtomicBool = AtomicBool::new(false);
 /// 在途请求自增 id
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -47,11 +47,30 @@ struct Pending {
     by_id: HashMap<u64, String>,
 }
 
-/// 一次在途的前端取链请求（一个 request_id = 一次 `play_url_request` 事件）
+/// 前端对一次取链问题的完整应答。
+///
+/// 单飞合并是按这个整包做的：同键的 N 个等待方共享同一次解析，结论必然一致，
+/// 所以 url / referer / 体积 / 实测档位 / stalled 一起转发。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BridgeReply {
+    /// 可播地址；空串 = 前端解析失败或脚本链整体无地址
+    pub url: String,
+    /// 宿主取这个地址的字节时要带的 Referer（包按源声明；空串 = 不发）
+    pub referer: String,
+    /// Range 预检实测的文件总字节数（None = 上游没回 Content-Range，未知）
+    pub size: Option<u64>,
+    /// 按实测码率重标后的档位（**只降不升**；空串 = 未重标 = 请求档即实测档）
+    pub actual_quality: String,
+    /// 本次失败是**环境问题**（弱网 / 引擎页未就绪 / 应答超时）而非
+    /// 「音源确实没这首」——引擎据此不拉黑曲目、不计入熔断（2026-10-03 弱网修复）
+    pub stalled: bool,
+}
+
+/// 一次在途的前端取链请求（一个 request_id = 一次 `play_url_request` 事件）。
 struct Flight {
     request_id: u64,
-    /// 共享同一次应答的等待方；整批唤醒，被丢弃即"本次取链失败"
-    waiters: Vec<tokio::sync::oneshot::Sender<(String, bool)>>,
+    /// 共享同一次应答的等待方；整批唤醒，被丢弃即"本次取链失败"。
+    waiters: Vec<tokio::sync::oneshot::Sender<BridgeReply>>,
     /// 建立时刻：超过 `ASK_TIMEOUT` 的在途请求已经注定失败，不再接受搭车
     started_at: Instant,
 }
@@ -94,8 +113,16 @@ const ASK_TIMEOUT: Duration = Duration::from_secs(14);
 /// 「这首歌没有播放地址」并计入熔断，连挂 5 首把自动切歌关掉。
 #[derive(Debug, PartialEq)]
 pub enum AskOutcome {
-    /// 前端给出了可播地址
-    Url(String),
+    /// 前端给出了可播地址，外加宿主取字节/命名要用的三个伴随字段
+    Url {
+        url: String,
+        /// 取字节时要带的 Referer（空串 = 不发）
+        referer: String,
+        /// Range 预检实测的文件总字节数（None = 未知）
+        size: Option<u64>,
+        /// 按实测码率重标后的档位（空串 = 未重标）
+        actual_quality: String,
+    },
     /// 前端应答了，但脚本链整体没给出地址（音源确实没有 / 线路全灭）
     NoUrl,
     /// 等待超时 / 事件发不出去 / 前端未就绪 —— **环境问题，可能重试就好**
@@ -122,7 +149,7 @@ fn is_ready() -> bool {
 }
 
 /// 单飞键：与播放地址缓存同口径（platform:trackId:quality）。
-/// 复用 `PlayUrlCache::cache_key` 是为了让"缓存未命中 → 问前端"和"同键合并"
+/// 复用 `PlayUrlCache::cache_key` 是为了让"缓存未命中 → 问前端 → 同键合并"
 /// 永远是同一个键，改一处不会漏另一处。
 fn flight_key(track: &Track, quality: &Quality) -> String {
     crate::provider::url_cache::PlayUrlCache::cache_key(
@@ -134,7 +161,7 @@ fn flight_key(track: &Track, quality: &Quality) -> String {
 
 /// 摘掉一次在途请求（应答到达 / 超时 / 事件发送失败共用）。
 ///
-/// 只认 `by_id` 里记着的那次 request_id：如果这条已经被淘汰、同键又新建了
+/// 只认 `by_id` 里记着的那个 request_id：如果这条已经被淘汰、同键又新建了
 /// 一次请求，旧调用方晚到的清理**不能**把新请求删掉（否则那个键会白等到 ASK_TIMEOUT）。
 fn take_flight(table: &mut Pending, request_id: u64) -> Option<Flight> {
     let key = table.by_id.remove(&request_id)?;
@@ -145,7 +172,7 @@ fn take_flight(table: &mut Pending, request_id: u64) -> Option<Flight> {
 }
 
 /// 容量满时淘汰最旧的一条在途请求（丢弃它的等待方 → 调用方立刻按失败处理）。
-/// 用 `(started_at, request_id)` 排序而不是只看 `started_at`：
+/// 按 `(started_at, request_id)` 排序而不是只看 `started_at`：
 /// 同一微秒内建立的请求靠自增 id 兜底，淘汰结果确定（也可测）。
 fn evict_oldest(table: &mut Pending) {
     let Some(oldest) = table
@@ -168,7 +195,7 @@ fn evict_oldest(table: &mut Pending) {
 /// 登记一次取链请求。返回 `(request_id, 是否需要自己发事件)`：
 /// 同键已有在途请求时挂到它下面搭车（返回 `false`，不再发第二个事件）。
 /// `None` = 全局表锁不可用（持锁线程 panic 过），本次取链按失败处理。
-fn register(key: String, tx: tokio::sync::oneshot::Sender<(String, bool)>) -> Option<(u64, bool)> {
+fn register(key: String, tx: tokio::sync::oneshot::Sender<BridgeReply>) -> Option<(u64, bool)> {
     let mut guard = PENDING.lock().ok()?;
     let table = guard.get_or_insert_with(|| Pending {
         by_key: HashMap::new(),
@@ -225,10 +252,13 @@ fn drop_flight(request_id: u64) {
 
 /// 前端应答入口（`resolve_play_url_reply` 命令）。
 ///
-/// 空串 = 前端解析失败或脚本链整体无地址；`stalled` = 该失败是环境问题
+/// 空串 url = 前端解析失败或脚本链整体无地址；`stalled` = 该失败是环境问题
 /// （弱网/引擎未就绪），不是「这首歌没有地址」。同键搭车的所有等待方拿到
-/// 同一个应答 —— 包括 stalled 标记：它们等的是同一次解析，结论必然一致。
-pub fn reply(request_id: u64, url: String, stalled: bool) {
+/// 同一个应答 —— 整包转发：它们等的是同一次解析，结论必然一致。
+///
+/// `referer` / `size` / `actual_quality` = 宿主取字节与下载命名要用的伴随字段，
+/// 由音源包随地址一起下发（见 `BridgeReply`）。
+pub fn reply(request_id: u64, reply: BridgeReply) {
     let flight = {
         let mut guard = match PENDING.lock() {
             Ok(g) => g,
@@ -242,7 +272,7 @@ pub fn reply(request_id: u64, url: String, stalled: bool) {
     if let Some(flight) = flight {
         // 一个 id 对应 N 个调用方：整批发出，单飞合并在这里收口
         for sender in flight.waiters {
-            let _ = sender.send((url.clone(), stalled));
+            let _ = sender.send(reply.clone());
         }
     }
 }
@@ -256,7 +286,7 @@ pub async fn ask_frontend(app: &AppHandle, track: &Track, quality: Quality) -> A
         return AskOutcome::Stalled;
     }
     let key = flight_key(track, &quality);
-    let (tx, rx) = tokio::sync::oneshot::channel::<(String, bool)>();
+    let (tx, rx) = tokio::sync::oneshot::channel::<BridgeReply>();
     let (request_id, need_emit) = match register(key, tx) {
         Some(v) => v,
         // 全局表锁不可用（持锁线程 panic 过）：同样按环境问题处理，不算内容失败
@@ -277,9 +307,19 @@ pub async fn ask_frontend(app: &AppHandle, track: &Track, quality: Quality) -> A
     }
     match tokio::time::timeout(ASK_TIMEOUT, rx).await {
         // 前端带了 stalled 标记上来：它已判定这是环境问题，优先采信
-        Ok(Ok((url, true))) if !url.is_empty() => AskOutcome::Url(url),
-        Ok(Ok((_, true))) => AskOutcome::Stalled,
-        Ok(Ok((url, false))) if !url.is_empty() => AskOutcome::Url(url),
+        Ok(Ok(r)) if r.stalled && !r.url.is_empty() => AskOutcome::Url {
+            url: r.url,
+            referer: r.referer,
+            size: r.size,
+            actual_quality: r.actual_quality,
+        },
+        Ok(Ok(r)) if r.stalled => AskOutcome::Stalled,
+        Ok(Ok(r)) if !r.url.is_empty() => AskOutcome::Url {
+            url: r.url,
+            referer: r.referer,
+            size: r.size,
+            actual_quality: r.actual_quality,
+        },
         // 前端明确回空且没标 stalled：脚本链跑完了但没给出地址 —— 这才是「歌没地址」
         Ok(Ok(_)) => AskOutcome::NoUrl,
         // 应答通道被丢弃（超时清理 / 容量淘汰 / 同键已作废）：环境问题
@@ -311,6 +351,17 @@ mod tests {
         TABLE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// 只测 url/referer 的用例用这个构造，其余伴随字段按"没测出来"填
+    fn reply_of(url: &str, referer: &str, stalled: bool) -> BridgeReply {
+        BridgeReply {
+            url: url.into(),
+            referer: referer.into(),
+            size: None,
+            actual_quality: String::new(),
+            stalled,
+        }
+    }
+
     /// 未就绪时 ask 不发事件（无 AppHandle 可造，这里只验证标志语义与
     /// reply 对未知 id 的容忍）
     #[test]
@@ -323,45 +374,61 @@ mod tests {
     #[test]
     fn reply_unknown_id_is_ignored() {
         let _table = lock_table();
-        reply(987654321, "http://x".into(), false);
+        reply(987654321, reply_of("http://x", "", false));
     }
 
-    /// 同键并发取链合并成一次前端请求，应答整批发给所有等待方
+    /// 同键并发取链合并成一次前端请求，应答整批发给所有等待方；
+    /// 地址、Referer（B 站链没有它会被 CDN 拒 403）与实测字段一起到
     #[test]
     fn same_key_merges_into_one_flight() {
         let _table = lock_table();
-        let (tx1, mut rx1) = tokio::sync::oneshot::channel::<(String, bool)>();
-        let (tx2, mut rx2) = tokio::sync::oneshot::channel::<(String, bool)>();
+        let (tx1, mut rx1) = tokio::sync::oneshot::channel::<BridgeReply>();
+        let (tx2, mut rx2) = tokio::sync::oneshot::channel::<BridgeReply>();
         let (id1, emit1) = register("t-merge:a".into(), tx1).expect("register");
         let (id2, emit2) = register("t-merge:a".into(), tx2).expect("register");
         assert!(emit1, "第一个调用方负责发事件");
         assert!(!emit2, "同键第二个调用方搭车，不能再发一个事件");
         assert_eq!(id1, id2, "两个调用方共享同一个 request_id（前端按它配对）");
-        reply(id1, "http://u".into(), false);
-        assert_eq!(rx1.try_recv().expect("第一个等待方").0, "http://u");
-        assert_eq!(rx2.try_recv().expect("搭车的等待方").0, "http://u");
+        reply(
+            id1,
+            BridgeReply {
+                url: "http://u".into(),
+                referer: "https://www.bilibili.com/".into(),
+                size: Some(9_812_345),
+                actual_quality: "320".into(),
+                stalled: false,
+            },
+        );
+        let r1 = rx1.try_recv().expect("第一个等待方");
+        let r2 = rx2.try_recv().expect("搭车的等待方");
+        assert_eq!(r1.url, "http://u");
+        assert_eq!(r2.url, "http://u");
+        assert_eq!(r1.referer, "https://www.bilibili.com/");
+        assert_eq!(r2.referer, "https://www.bilibili.com/");
+        assert_eq!(r1.size, Some(9_812_345), "实测体积跟着地址走");
+        assert_eq!(r2.actual_quality, "320", "实测档位跟着地址走");
     }
 
     /// 清理（超时 / 发送失败）会整条作废，之后同键可以重新建一条新请求
     #[test]
     fn drop_flight_clears_table_and_allows_new_request() {
         let _table = lock_table();
-        let (tx1, mut rx1) = tokio::sync::oneshot::channel::<(String, bool)>();
-        let (tx2, mut rx2) = tokio::sync::oneshot::channel::<(String, bool)>();
+        let (tx1, mut rx1) = tokio::sync::oneshot::channel::<BridgeReply>();
+        let (tx2, mut rx2) = tokio::sync::oneshot::channel::<BridgeReply>();
         let (id1, _) = register("t-drop:a".into(), tx1).expect("register");
         register("t-drop:a".into(), tx2).expect("register");
         drop_flight(id1);
         assert!(rx1.try_recv().is_err(), "发起方等待被唤醒为失败");
         assert!(rx2.try_recv().is_err(), "搭车方同样立刻失败");
         // 作废后同键可重建，且是新的 request_id
-        let (tx3, mut rx3) = tokio::sync::oneshot::channel::<(String, bool)>();
+        let (tx3, mut rx3) = tokio::sync::oneshot::channel::<BridgeReply>();
         let (id3, emit3) = register("t-drop:a".into(), tx3).expect("register");
         assert!(emit3, "旧条目已清理，新请求必须重新发事件");
         assert_ne!(id3, id1);
-        reply(id3, "http://new".into(), false);
-        assert_eq!(rx3.try_recv().expect("新请求应答").0, "http://new");
+        reply(id3, reply_of("http://new", "", false));
+        assert_eq!(rx3.try_recv().expect("新请求应答").url, "http://new");
         // 迟到的旧 id 应答：条目已不在，静默丢弃（不得影响新请求）
-        reply(id1, "http://late".into(), false);
+        reply(id1, reply_of("http://late", "", false));
         assert!(rx3.try_recv().is_err(), "新请求不会收到旧 id 的应答");
     }
 
@@ -372,7 +439,7 @@ mod tests {
         let mut waiting = Vec::new();
         let mut first_id = 0u64;
         for i in 0..MAX_INFLIGHT {
-            let (tx, rx) = tokio::sync::oneshot::channel::<(String, bool)>();
+            let (tx, rx) = tokio::sync::oneshot::channel::<BridgeReply>();
             let (id, _) = register(format!("t-cap:{i}"), tx).expect("register");
             if i == 0 {
                 first_id = id;
@@ -383,7 +450,7 @@ mod tests {
             PENDING.lock().unwrap().as_ref().unwrap().by_key.len(),
             MAX_INFLIGHT
         );
-        let (tx, mut rx) = tokio::sync::oneshot::channel::<(String, bool)>();
+        let (tx, mut rx) = tokio::sync::oneshot::channel::<BridgeReply>();
         let (last_id, emit) = register("t-cap:new".into(), tx).expect("register");
         assert!(emit);
         assert!(
@@ -399,15 +466,15 @@ mod tests {
                 "淘汰项的 id 索引也清掉"
             );
         }
-        reply(last_id, "http://ok".into(), false);
-        assert_eq!(rx.try_recv().expect("新请求应答").0, "http://ok");
+        reply(last_id, reply_of("http://ok", "", false));
+        assert_eq!(rx.try_recv().expect("新请求应答").url, "http://ok");
     }
 
     /// 发起方任务被取消留下的死条目不会被无限复用：超过等待上限后同键重建
     #[test]
     fn stale_flight_is_rebuilt() {
         let _table = lock_table();
-        let (tx1, mut rx1) = tokio::sync::oneshot::channel::<(String, bool)>();
+        let (tx1, mut rx1) = tokio::sync::oneshot::channel::<BridgeReply>();
         let (id1, _) = register("t-stale:a".into(), tx1).expect("register");
         {
             let mut guard = PENDING.lock().unwrap();
@@ -419,12 +486,12 @@ mod tests {
                 .expect("flight exists");
             flight.started_at = Instant::now() - ASK_TIMEOUT - Duration::from_secs(1);
         }
-        let (tx2, mut rx2) = tokio::sync::oneshot::channel::<(String, bool)>();
+        let (tx2, mut rx2) = tokio::sync::oneshot::channel::<BridgeReply>();
         let (id2, emit2) = register("t-stale:a".into(), tx2).expect("register");
         assert!(emit2, "死条目要被重建，新请求必须自己发事件");
         assert_ne!(id1, id2);
         assert!(rx1.try_recv().is_err(), "旧等待方被唤醒为失败");
-        reply(id2, "http://fresh".into(), false);
-        assert_eq!(rx2.try_recv().expect("新请求应答").0, "http://fresh");
+        reply(id2, reply_of("http://fresh", "", false));
+        assert_eq!(rx2.try_recv().expect("新请求应答").url, "http://fresh");
     }
 }

@@ -46,9 +46,42 @@ struct CacheInner {
 
 struct CachedUrl {
     url: String,
+    /// 宿主取这个地址时要带的 Referer（音源包按源声明；空串 = 不发）。
+    ///
+    /// 为什么头也要进缓存：地址进了缓存之后，播放（range_reader）与下载
+    /// （download.rs）是**自己**向 CDN 取字节的，不再经过取链链路，拿不到
+    /// 声明它的那一侧。B 站实测部分 CDN 节点无 Referer 直接 403 text/html，
+    /// 于是会出现"取链成功、播放失败"。
+    referer: String,
+    /// Range 预检实测的文件总字节数（None = 上游没回 Content-Range，未知）。
+    ///
+    /// 为什么它也要进缓存：下载要按真实体积报进度，且 actual_quality 是
+    /// 由「体积 ÷ 时长」算出来的，缓存命中时不能重新测一次（那要多发一次
+    /// Range 请求，还是打在 CDN 上）。
+    size: Option<u64>,
+    /// 按实测码率重标后的档位（包侧 snapQualityToMeasured，**只降不升**；
+    /// 空串 = 未重标 = 请求档就是实测档）。
+    ///
+    /// 为什么它要进缓存：下载命名用的是「这一条缓存里的档位」。以前用请求档，
+    /// 于是请求 flac 拿到 320k 时文件名写成 `.flac` —— 虚标。
+    actual_quality: String,
     fetched_at: u64,
     /// 插入序号（越小越旧，仅用于同刻打平时的稳定排序）
     seq: u64,
+}
+
+/// 一次取链的结果：地址 + 取字节要带的头 + 实测体积 + 实测档位。
+///
+/// `size = None` / `actual_quality` 空串 = 这次没测出来（引擎页比宿主旧、
+/// 或上游没回 Content-Range），调用方一律按"未知"处理，不得据此判失败。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPlayUrl {
+    pub url: String,
+    pub referer: String,
+    pub size: Option<u64>,
+    pub actual_quality: String,
+    /// 写入缓存的时刻；缓存命中时是**原写入时刻**，不得刷新为当前时间
+    pub fetched_at: u64,
 }
 
 impl PlayUrlCache {
@@ -75,18 +108,25 @@ impl PlayUrlCache {
         format!("{platform}:{track_id}:{quality}")
     }
 
-    /// 命中返回 `(url, fetched_at)`；缓存条目自身的时间戳原样返回，不得刷新为当前时间。
+    /// 命中返回整条结果（含 referer / 实测体积 / 实测档位）；缓存条目自身的
+    /// 时间戳原样返回，不得刷新为当前时间。
     ///
     /// 用 `saturating_sub` 而不是裸减法：`now_ms` 来自 `SystemTime`（不是单调钟），
     /// 系统时间被 NTP 或用户往回调时 `now < fetched_at`，裸减法在 debug 构建里
     /// 会 panic（panic 会毒化 Mutex，之后整个缓存静默失效）、release 构建里会回绕成
     /// 巨大值把条目误判过期。饱和后语义是"未来的时间戳 = 新鲜"，与 sweep 里的
     /// 过期判定（`now.saturating_sub(..) <= ttl`）完全一致，正常时间走向下逐字不变。
-    pub fn get(&self, key: &str) -> Option<(String, u64)> {
+    pub fn get(&self, key: &str) -> Option<ResolvedPlayUrl> {
         let mut inner = self.inner.lock().ok()?;
         match inner.map.get(key) {
             Some(c) if Self::now_ms().saturating_sub(c.fetched_at) <= self.ttl_ms => {
-                Some((c.url.clone(), c.fetched_at))
+                Some(ResolvedPlayUrl {
+                    url: c.url.clone(),
+                    referer: c.referer.clone(),
+                    size: c.size,
+                    actual_quality: c.actual_quality.clone(),
+                    fetched_at: c.fetched_at,
+                })
             }
             Some(_) => {
                 inner.map.remove(key); // 过期即清除
@@ -96,7 +136,8 @@ impl PlayUrlCache {
         }
     }
 
-    pub fn set(&self, key: String, url: String) {
+    /// 写入一条取链结果。`size = None` / `actual_quality` 空串表示这次没测出来。
+    pub fn set(&self, key: String, resolved: ResolvedPlayUrl) {
         let Ok(mut inner) = self.inner.lock() else {
             return;
         };
@@ -106,7 +147,10 @@ impl PlayUrlCache {
         inner.map.insert(
             key,
             CachedUrl {
-                url,
+                url: resolved.url,
+                referer: resolved.referer,
+                size: resolved.size,
+                actual_quality: resolved.actual_quality,
                 fetched_at: now,
                 seq,
             },
@@ -160,23 +204,66 @@ impl Default for PlayUrlCache {
 mod tests {
     use super::*;
 
+    /// 只关心 url/referer 的用例用这个构造，其余字段按"没测出来"填。
+    fn hit(url: &str, referer: &str) -> ResolvedPlayUrl {
+        ResolvedPlayUrl {
+            url: url.into(),
+            referer: referer.into(),
+            size: None,
+            actual_quality: String::new(),
+            fetched_at: 0,
+        }
+    }
+
     #[test]
     fn play_url_cache_roundtrip() {
         let cache = PlayUrlCache::new();
         let key = PlayUrlCache::cache_key("wyy", "123", "320");
         assert!(cache.get(&key).is_none());
-        cache.set(key.clone(), "https://example.com/a.mp3".into());
-        let (url, _at) = cache.get(&key).expect("should hit");
-        assert_eq!(url, "https://example.com/a.mp3");
+        cache.set(
+            key.clone(),
+            hit("https://example.com/a.mp3", "https://www.bilibili.com/"),
+        );
+        let got = cache.get(&key).expect("should hit");
+        assert_eq!(got.url, "https://example.com/a.mp3");
+        assert_eq!(got.referer, "https://www.bilibili.com/");
         cache.invalidate(&key);
         assert!(cache.get(&key).is_none());
+    }
+
+    /// 实测体积与实测档位必须跟着地址一起进缓存：下载靠它们决定命名与进度
+    #[test]
+    fn measured_size_and_actual_quality_roundtrip() {
+        let cache = PlayUrlCache::new();
+        cache.set(
+            "k".into(),
+            ResolvedPlayUrl {
+                url: "https://example.com/a.mp3".into(),
+                referer: String::new(),
+                size: Some(9_812_345),
+                actual_quality: "320".into(),
+                fetched_at: 0,
+            },
+        );
+        let got = cache.get("k").expect("should hit");
+        assert_eq!(got.size, Some(9_812_345));
+        assert_eq!(got.actual_quality, "320");
+    }
+
+    /// 未声明 Referer 的源：缓存里就是空串，宿主据此不发这个头
+    #[test]
+    fn referer_defaults_to_empty_and_roundtrips() {
+        let cache = PlayUrlCache::new();
+        cache.set("k".into(), hit("https://example.com/a.mp3", ""));
+        let got = cache.get("k").expect("should hit");
+        assert!(got.referer.is_empty(), "未声明的源读出来必须是空串");
     }
 
     /// 过期项要真的从表里被清掉（不只是 get 时惰性删），否则挂机久了表只涨不落
     #[test]
     fn expired_entries_are_swept_in_batch() {
         let cache = PlayUrlCache::new();
-        cache.set("stale".into(), "https://example.com/old.mp3".into());
+        cache.set("stale".into(), hit("https://example.com/old.mp3", ""));
         // 直接把这条的时间戳改成 1970（同模块可访问私有字段），避免 sleep 拖慢测试
         {
             let mut inner = cache.inner.lock().unwrap();
@@ -184,7 +271,7 @@ mod tests {
         }
         // 攒满一批插入 → 触发全量清扫
         for i in 0..SWEEP_EVERY_INSERTS {
-            cache.set(format!("fresh-{i}"), "https://example.com/new.mp3".into());
+            cache.set(format!("fresh-{i}"), hit("https://example.com/new.mp3", ""));
         }
         let inner = cache.inner.lock().unwrap();
         assert!(
@@ -206,7 +293,10 @@ mod tests {
         let cache = PlayUrlCache::new();
         let total = PLAY_URL_MAX_ENTRIES + 8;
         for i in 0..total {
-            cache.set(format!("k{i:04}"), format!("https://example.com/{i}.mp3"));
+            cache.set(
+                format!("k{i:04}"),
+                hit(&format!("https://example.com/{i}.mp3"), ""),
+            );
         }
         let inner = cache.inner.lock().unwrap();
         assert!(
@@ -225,10 +315,10 @@ mod tests {
     #[test]
     fn get_returns_original_fetched_at() {
         let cache = PlayUrlCache::new();
-        cache.set("k".into(), "https://example.com/a.mp3".into());
-        let (_, at) = cache.get("k").expect("should hit");
+        cache.set("k".into(), hit("https://example.com/a.mp3", ""));
+        let at = cache.get("k").expect("should hit").fetched_at;
         assert!(at > 0 && at <= PlayUrlCache::now_ms());
-        let (_, again) = cache.get("k").expect("should hit");
+        let again = cache.get("k").expect("should hit").fetched_at;
         assert_eq!(at, again, "读到的时间戳必须原样返回，不得刷新");
     }
 }
