@@ -45,8 +45,8 @@
 
 ```powershell
 # 发版动作（版本号已在 app.config.json 改好并与 tag 一致，工作流会校验）
-git tag v1.1.0
-git push origin v1.1.0
+git tag v1.1.1
+git push origin v1.1.1
 ```
 
 **一次性前置**（做一次就够）：把签名私钥的 base64 配进仓库 secret：

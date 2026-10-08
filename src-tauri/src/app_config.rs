@@ -14,9 +14,9 @@ pub const PRODUCT_DISPLAY_NAME: &str = "轻听";
 pub const IDENTIFIER: &str = "com.qt.quietmusic";
 
 /// 对外版本名（安装包 / 关于页 / 升级接口）
-pub const VERSION_NAME: &str = "1.1.0";
+pub const VERSION_NAME: &str = "1.1.1";
 /// 升级接口比对用的版本号（后端 type=1103 的 version 参数）
-pub const VERSION_CODE: i64 = 110;
+pub const VERSION_CODE: i64 = 111;
 
 /// 宿主契约版本（音源包与本机的接口版本，两端同步抬高）
 pub const HOST_API_VERSION: i64 = 1;

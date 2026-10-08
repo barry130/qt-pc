@@ -3375,7 +3375,7 @@ dependencies = [
 
 [[package]]
 name = "quietmusic"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
