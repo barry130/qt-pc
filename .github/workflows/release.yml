@@ -99,4 +99,11 @@ jobs:
           - fileSize：$size
           "@
           Set-Content -Path release-notes.md -Value $notes
+          # 同一个 tag 重新发布（例如重指 tag 后重跑）时，旧 Release 已存在会让 create 以
+          # already_exists 失败；先删掉同名 Release 再重建（--cleanup-tag=false 保留 tag 本身）。
+          $existing = gh release view $env:TAG --json id --jq ".id" 2>$null
+          if ($LASTEXITCODE -eq 0 -and $existing) {
+            Write-Host "Release $env:TAG 已存在（id=$existing），先删除再重建"
+            gh release delete $env:TAG --yes --cleanup-tag=false
+          }
           gh release create $env:TAG "$env:INSTALLER" "$env:INSTALLER.sig" --notes-file release-notes.md --generate-notes --title "轻听 $($env:TAG.TrimStart('v'))"
