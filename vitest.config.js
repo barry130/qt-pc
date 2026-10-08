@@ -14,5 +14,8 @@ export default defineConfig({
     pool: "threads",
     environment: "node",
     include: ["tests/**/*.test.ts", "tests/**/*.test.tsx"],
+    // 每个用例结束后卸载 React 树并排空更新队列，避免 jsdom 拆除后
+    // 残留的 React 调度任务抛 "window is not defined"（unhandled error → exit 1）
+    setupFiles: ["./tests/setup.cleanup.ts"],
   },
 });
