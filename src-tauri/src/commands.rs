@@ -1061,8 +1061,11 @@ pub async fn cmd_run_update_browser(url: String) -> Result<(), String> {
         let program = "xdg-open";
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         let open_fail = "xdg-open 命令失败（桌面环境可能未安装 xdg-utils）";
+        // 必须显式转成 &str：`Url` 只实现了 `AsRef<str>`，不实现 `AsRef<OsStr>`，
+        // 直接 `.arg(&target)` 在 Linux/macOS 上是 E0277 编译错误（Windows 分支
+        // 因为整块被 cfg 掉，本地编译发现不了）。
         std::process::Command::new(program)
-            .arg(&target)
+            .arg(target.as_str())
             .spawn()
             .map(|_| ())
             .map_err(|e| format!("打开浏览器失败（{open_fail}）：{e}"))
