@@ -1,8 +1,9 @@
 # 轻听（qt-pc）CNB 流水线
 #
-# 两条流水线：
+# 三条流水线：
 #   1) master 分支 push  → 前端静态检查（typecheck / 单测 / 前端产物）
-#   2) v* tag push       → 双产物发布：
+#   2) feat/* 分支 push  → 同一套前端静态检查（功能分支在合入前先拿到 CNB 结果）
+#   3) v* tag push       → 双产物发布：
 #                          a. 在 Linux 构建节点上交叉编译出 x64 / x86 / ARM64 三个
 #                             Windows NSIS 安装包，签名后发布到 CNB Release
 #                          b. 同一个 Linux 节点原生编译 Linux deb / AppImage，
@@ -104,44 +105,55 @@
     cp "$OUT"/*-setup.exe artifacts/
     ls -l artifacts
 
+# 前端静态检查的流水线体，master 与 feat/* 共用（YAML 锚点，避免两处漂移）。
+.frontend-check: &frontend-check
+  name: 前端检查
+  runner:
+    tags: cnb:arch:amd64
+    cpus: 4
+  git:
+    lfs: false
+    submodules: false
+  docker:
+    image: node:22
+  ifNewBranch: true
+  ifModify:
+    - "src/**"
+    - "src-tauri/**"
+    - "index.html"
+    - "package.json"
+    - "pnpm-lock.yaml"
+    - "vite.config.ts"
+    - "tsconfig.json"
+    - "app.config.json"
+    - ".cnb.yml"
+  stages:
+    - name: 安装依赖
+      script: |
+        set -e
+        npm install -g pnpm@11.7.0
+        pnpm install --frozen-lockfile
+    - name: 类型检查与单测
+      script: |
+        set -e
+        pnpm typecheck
+        pnpm test
+    - name: 前端产物
+      script: |
+        set -e
+        pnpm build
+        ls -l dist
+
 master:
   push:
-    - name: 前端检查
-      runner:
-        tags: cnb:arch:amd64
-        cpus: 4
-      git:
-        lfs: false
-        submodules: false
-      docker:
-        image: node:22
-      ifNewBranch: true
-      ifModify:
-        - "src/**"
-        - "src-tauri/**"
-        - "index.html"
-        - "package.json"
-        - "pnpm-lock.yaml"
-        - "vite.config.ts"
-        - "tsconfig.json"
-        - "app.config.json"
-        - ".cnb.yml"
-      stages:
-        - name: 安装依赖
-          script: |
-            set -e
-            npm install -g pnpm@11.7.0
-            pnpm install --frozen-lockfile
-        - name: 类型检查与单测
-          script: |
-            set -e
-            pnpm typecheck
-            pnpm test
-        - name: 前端产物
-          script: |
-            set -e
-            pnpm build
-            ls -l dist
+    - *frontend-check
+
+# 功能分支：push 时同样跑前端静态检查。
+# 注意 CNB 托管节点只有 Linux，Windows / macOS 的 Rust 编译验证在
+# .github/workflows/ci.yml 的三平台矩阵里（Windows / ubuntu-22.04 / macos-14）。
+"feat/*":
+  push:
+    - *frontend-check
 
 v*:
   tag_push:

@@ -1,8 +1,12 @@
 name: CI
 
 on:
+  # 所有分支的 push 都跑（不限 main/master）：三平台矩阵是移植新增的
+  # 验证面，cfg 分支多，必须在合入 master 之前就在真实 Linux / macOS
+  # 上编译过。仓库是公开仓库，Actions 分钟数不计费。
+  # branches: ["**"] 而不是不写：不写会连 tag push 也一起跑。
   push:
-    branches: [main, master]
+    branches: ["**"]
   pull_request:
 
 jobs:
