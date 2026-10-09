@@ -1,6 +1,8 @@
 //! 文件日志（运维）：release 构建没有控制台（windows_subsystem），env_logger
 //! 写的 stderr 一条都到不了用户机器上，报障时无现场可查。本模块把 log 记录与
-//! panic 钩子统一落盘到 `%APPDATA%/QuietMusic/logs/`：
+//! panic 钩子统一落盘到 [`crate::app_paths::logs_root_from_env`] 给出的目录：
+//! Windows `%APPDATA%/QuietMusic/logs`、macOS `~/Library/Logs/QuietMusic`、
+//! Linux `$XDG_STATE_HOME/QuietMusic/logs`（缺省 `~/.local/state/QuietMusic/logs`）：
 //! - 当前文件 `quietmusic.log`，写满 5 MiB 轮转出 `.1`~`.4`（总量上界
 //!   5 文件 × 5 MiB；按大小轮转不按日期，重启不清空）；
 //! - debug 构建同时保留 stderr 输出（dev 终端照常可见）；
@@ -197,8 +199,8 @@ fn level_from_env() -> log::LevelFilter {
     }
 }
 
-/// 本地时间戳 "YYYY-MM-DD HH:MM:SS.mmm"。Windows 用 GetLocalTime（应用只发
-/// Windows 包）；其他平台退化成 UTC，仅影响日志可读性。
+/// 本地时间戳 "YYYY-MM-DD HH:MM:SS.mmm"。Windows 用 GetLocalTime 拿本地时区；
+/// 其他平台退化成 UTC（只影响日志可读性，不影响排查所需的事件顺序）。
 #[cfg(target_os = "windows")]
 fn local_ts() -> String {
     use windows::Win32::Foundation::SYSTEMTIME;

@@ -229,18 +229,25 @@ pnpm exec tauri build --runner cargo --bundles app,dmg
 `Cargo.toml` 里 `tauri` 的 `macos-private-api` feature —— 桌面歌词是无边框透明窗口，
 macOS 需要 NSWindowPrivateApi，缺了直接起不来（Windows/Linux 忽略该特性）。
 
-**不公签（决策）**：不做 Developer ID 签名与 Apple 公证；tauri 对 macOSPrivateApi 构建
-会自动做 ad-hoc 签名（`codesign -`）。
+**不公签（决策）**：不做 Developer ID 签名与 Apple 公证，**产物是未签名的** ——
+tauri 在既无 `APPLE_CERTIFICATE` / `APPLE_CERTIFICATE_PASSWORD` 又无 `signingIdentity`
+时会整段跳过签名（`tauri-bundler` 的 `bundle/macos/sign.rs` 里 `keychain()` 返回
+`Ok(None)`），**不会自动 ad-hoc 签名**。所以下面的手动重签不是"补签"，而是首次签名。
 
 - 首次打开：右键 App →「打开」→ 再点「打开」；或
   `xattr -dr com.apple.quarantine /Applications/QuietMusic.app`。
-- 手动替换或重新编译二进制会让 ad-hoc 签名失效，需重签：
+- 想让它有签名（减少 Gatekeeper 反复拦截）：自己签一次
   `codesign --force --deep --sign - /Applications/QuietMusic.app`。
+- 手动替换或重新编译二进制会破坏已有签名，需重签同一条命令。
 
 数据与日志：数据 `~/Library/Application Support/QuietMusic`，日志 `~/Library/Logs/QuietMusic`。
 
 其余能力与 Windows 对齐：系统媒体控制走 macOS 的「正在播放」（souvlaki 原生后端，无需额外
 feature）、托盘、开机自启（LaunchAgent）、全局快捷键均可用；同样**没有应用内自装**。
+
+**架构覆盖**：`release.yml` 的 `macos` job 跑在 `macos-14`（Apple Silicon）上，
+**CI 只产 `_aarch64.dmg`**；Intel 机器需要的 `_x64.dmg` 要在 Intel Mac 上本地执行
+上面的构建命令自行产出。
 
 ## 常见失败
 
@@ -258,6 +265,7 @@ feature）、托盘、开机自启（LaunchAgent）、全局快捷键均可用�
 | Linux：托盘图标不显示 | GNOME 未启用 AppIndicator 扩展；应用此时按「关窗即退出」运行，装扩展或换桌面环境即可恢复托盘 |
 | Linux：Wayland 下置顶/快捷键失效 | 已知限制（tao 无 layer-shell、Wayland 不提供全局快捷键），切 X11 会话可用 |
 | Linux：AppImage 报 `dlopen(): error loading libfuse.so.2` | 未装 FUSE；`sudo apt install libfuse2` 或改用 `--appimage-extract-and-run` |
+| Linux：deb 装不上（依赖版本不满足） | CNB 流水线的 deb 在 Debian trixie 镜像里构建，glibc 下限比 GitHub 的 ubuntu-22.04 产物高。发行版较旧时优先用 GitHub 产物或 AppImage |
 | macOS：提示「已损坏，无法打开」/「无法验证开发者」 | 未公证导致的 Gatekeeper 拦截（预期）：右键 →「打开」，或 `xattr -dr com.apple.quarantine /Applications/QuietMusic.app` |
-| macOS：替换二进制后「应用已损坏」 | ad-hoc 签名失效，重签：`codesign --force --deep --sign - /Applications/QuietMusic.app` |
+| macOS：替换二进制后「应用已损坏」 | 原本就没有签名（tauri 不自动 ad-hoc），替换后自行签一次：`codesign --force --deep --sign - /Applications/QuietMusic.app` |
 | macOS：`pnpm install` 报 `Unsupported Platform: @esbuild/win32-x64` | `package.json` 里 esbuild 平台包被硬钉成 win32 了（历史坑，已移除硬钉），确认没有重新加回 |

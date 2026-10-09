@@ -41,7 +41,7 @@ pnpm config:check    # 只校验，不一致退出码 1（已挂进 pnpm build /
 | `sourcePack.hostApiVersion` | `1` | `source-update.ts`、`app_config.rs` | 宿主契约版本（与 Rust `HOST_API_VERSION` 同源） |
 | `backend.dev` / `.prod` | 见文件 | `app_config.rs`（`DEV_BASE_URL` / `PROD_BASE_URL`） | Astral 后端地址 |
 | `backend.active` | `prod` | `app_config.rs`（`DEFAULT_BASE_URL`） | **当前生效**的后端；联调改 `dev` 后同步重编 |
-| `platform.windows` / `.linux` / `.macos` | `1103` / `1104` / `1105` | `app_config.rs`（`UPDATE_TYPE`，按 `target_os` 三选一） | 更新/消息/统计的平台号 |
+| `platform.windows` / `.linux` / `.macos` | `1103` / `1104` / `1105` | `app_config.rs`（`UPDATE_TYPE` 字符串、`PLATFORM_CODE` 数值，均按 `target_os` 三选一） | 更新/消息/统计的平台号，以及音源包 manifest 请求与装载上报的 `platform` 字段 |
 | `devServer.port` / `.hmrPort` | `1420` / `1421` | `tauri.conf.json` `build.devUrl`；vite 直接读 JSON | 开发服务器端口 |
 
 派生文件总表（同步器负责的全部落点，共 6 个）：
@@ -60,7 +60,7 @@ src-tauri/src/app_config.rs                    Rust 侧常量 + 一致性单测�
 | 位置 | 守什么 |
 |---|---|
 | `tests/config.test.ts` | 6 个派生文件全部与 `app.config.json` 一致；版本名↔版本号自洽 |
-| `src-tauri/src/app_config.rs` 的 `#[cfg(test)]` | 逐项比对 JSON；`DEFAULT_BASE_URL` 跟随 `backend.active`；`version.name ↔ version.code`；`env!("CARGO_PKG_VERSION")`（Cargo.toml）↔ JSON |
+| `src-tauri/src/app_config.rs` 的 `#[cfg(test)]` | 逐项比对 JSON；`DEFAULT_BASE_URL` 跟随 `backend.active`；`version.name ↔ version.code`；`env!("CARGO_PKG_VERSION")`（Cargo.toml）↔ JSON；`UPDATE_TYPE` / `PLATFORM_CODE` 与 `platform.<当前目标>` 一致且两者同源 |
 | `pnpm test` / `pnpm build` | 前者跑 `--check` 直接失败；后者先同步再构建 |
 | `scripts/sync-config.mjs` | 正则未命中会报错（说明文件被改得不像样了），不会静默跳过 |
 

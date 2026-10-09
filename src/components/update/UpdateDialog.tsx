@@ -49,6 +49,14 @@ export function UpdateDialog(): React.JSX.Element | null {
     if (!isForce(info)) dismiss();
   };
 
+  // 浏览器下载的落点：优先后端下发的官方下载页 browserUrl，没有才退回 downloadUrl
+  // （downloadUrl 由后端按本机 type 1103/1104/1105 分别下发，本身就是本平台的包，
+  // 所以退回它不会把 Linux 用户送到 Windows 安装包）。两者都为空时不显示按钮，
+  // 避免出现点了没反应的死按钮。
+  const browserTarget =
+    info.browserUrl && info.browserUrl.length > 0 ? info.browserUrl : info.downloadUrl;
+  const canBrowserDownload = browserTarget.length > 0;
+
   const startDownload = async (): Promise<void> => {
     setPhase("downloading");
     setPercent(0);
@@ -73,10 +81,8 @@ export function UpdateDialog(): React.JSX.Element | null {
   };
 
   const openBrowser = async (): Promise<void> => {
-    const url =
-      info.browserUrl && info.browserUrl.length > 0 ? info.browserUrl : info.downloadUrl;
-    if (!url) return;
-    await ipc.runUpdateBrowser(url).catch(() => {});
+    if (!canBrowserDownload) return;
+    await ipc.runUpdateBrowser(browserTarget).catch(() => {});
   };
 
   return (
@@ -118,6 +124,11 @@ export function UpdateDialog(): React.JSX.Element | null {
           </p>
         )}
         {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+        {phase === "idle" && !canBrowserDownload && !supportsInAppUpdate() && (
+          <p className="mt-3 text-xs text-muted-foreground">
+            后端未提供本平台的下载地址，请到官网下载页手动更新。
+          </p>
+        )}
 
         <div className="mt-5 flex justify-end gap-2">
           {phase === "idle" && (
@@ -131,7 +142,7 @@ export function UpdateDialog(): React.JSX.Element | null {
                   暂不更新
                 </button>
               )}
-              {(info.browserUrl?.length > 0 || !supportsInAppUpdate()) && (
+              {canBrowserDownload && (
                 <button
                   type="button"
                   onClick={() => void openBrowser()}

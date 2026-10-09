@@ -189,10 +189,10 @@ PC 端第一版必须对接以下现有接口：
 | 通知 | `GET /app/message/center?channel=pc` |
 | 通知 | `GET /app/message/unread-count?channel=pc` |
 | 通知 | `POST /app/message/read-ack` |
-| 更新 | `GET /app/update?type=1103&version=&channel=` |
+| 更新 | `GET /app/update?type=1103/1104/1105&version=&channel=`（按编译目标） |
 | 更新 | `GET /app/version/check?type=&version=&versionName=` |
 | 加速 | `GET /app/github/accels` |
-| 统计 | `POST /app/stat/report`，事件 `ut=app-windows` |
+| 统计 | `POST /app/stat/report`，事件 `ut=app-windows/app-linux/app-macos`（按编译目标） |
 
 收藏同步必须采用现有增量方案：
 
@@ -222,9 +222,9 @@ PC 端**需要后端配合的只有一项**：反馈平台标识走统一客户�
 | 音乐内容接口在移动端前端实现 | `qt-uniappx/services/music-api.ts` 直接请求四大音源 | PC 必须移植到 Rust Provider，避免 WebView CORS、请求头和签名能力受限 |
 | Astral 不承载音乐内容 | 后端只有账号、收藏、反馈、通知、更新、统计 | PC 不要求 Astral 新增音乐内容代理 |
 | 通知渠道 | 后端已支持 `channel=app/pc/web/all` | PC 消息接口固定传 `channel=pc` |
-| 更新接口已支持 Windows | `type=1101/1102/1103` | PC 固定使用 `type=1103` |
-| 反馈平台标识 | 移动端走 `X-App-Ut: app-android / app-ios` | PC 走 `X-App-Ut: app-windows`（与统计 `ut` 同值，后端已支持该值；`X-Platform` 仅后端兼容兜底，客户端不再发送） |
-| 统计平台 | 后端已支持 `ut=app-windows` | PC 统计事件固定传 `ut=app-windows` |
+| 更新接口已支持多平台 | `type=1101/1102/1103/1104/1105` | PC 按编译目标使用 `type=1103`（Windows）/ `1104`（Linux）/ `1105`（macOS） |
+| 反馈平台标识 | 移动端走 `X-App-Ut: app-android / app-ios` | PC 按编译目标走 `X-App-Ut: app-windows / app-linux / app-macos`（与统计 `ut` 同值，后端已支持这三个值；`X-Platform` 仅后端兼容兜底，客户端不再发送） |
+| 统计平台 | 后端已支持 `ut=app-windows / app-linux / app-macos` | PC 统计事件按编译目标传对应 `ut` |
 | 音源显示名 | 代码中默认“音源一/二/三/四” | PC 支持中性名与真实名切换，默认与移动端一致 |
 
 ---
@@ -1051,7 +1051,7 @@ PC 版复用 Astral 轻听账号体系，不新建账号系统。账号用于收
 
 ### 需求描述
 
-复用 Astral 更新接口。更新平台已支持 Windows，PC 固定使用 `type=1103`。
+复用 Astral 更新接口。更新平台已支持 Windows / Linux / macOS，PC 按编译目标使用 `type=1103` / `1104` / `1105`。
 
 ### 功能点
 
@@ -1077,12 +1077,14 @@ PC 版复用 Astral 轻听账号体系，不新建账号系统。账号用于收
 type = 1101 Android
 type = 1102 iOS
 type = 1103 Windows
+type = 1104 Linux
+type = 1105 macOS
 ```
 
 ### 验收标准
 
-1. PC 检查更新时固定传 `type=1103`，且 `version` 传的是 versionCode 数字串。
-2. Windows 类型能获取更新信息；未发布版本能通过 `/app/version/check` 官方校验。
+1. PC 检查更新时按编译目标传 `type=1103` / `1104` / `1105`，且 `version` 传的是 versionCode 数字串。
+2. 本平台类型能获取更新信息；未发布版本能通过 `/app/version/check` 官方校验。
 3. 下载进度和安装流程可用；安装前已落盘播放现场与数据库。
 4. MD5 或文件大小不匹配时禁止安装并删除临时文件。
 5. 更新失败不影响当前版本运行，可重试或改用浏览器下载。

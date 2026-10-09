@@ -830,7 +830,8 @@ fn default_appearance() -> serde_json::Value {
 }
 
 // ---------- Astral：更新 / 消息 / 统计 / 反馈（DESIGN §15） ----------
-// 平台参数固定：type=1103、channel=pc、ut=app-windows；
+// 平台参数按编译目标取值：type = app_config::UPDATE_TYPE（1103/1104/1105）、
+// channel 固定 pc、ut = astral::CLIENT_UT（app-windows / app-linux / app-macos）；
 // 每个请求的 X-App-Ut / X-App-Version / X-Device / X-OS 由 astral.rs::client_headers() 统一注入
 
 #[tauri::command(rename = "astral_app_update")]
@@ -1685,7 +1686,7 @@ pub async fn cmd_remove_scan_dir(state: State<'_, AppState>, path: String) -> Re
 /// 在资源管理器中定位本地曲目文件（本地 Track.id 即文件绝对路径）。
 #[tauri::command(rename = "reveal_local_track")]
 pub async fn cmd_reveal_local_track(path: String) -> Result<(), String> {
-    reveal_in_file_manager(&path)
+    reveal_in_file_manager(&path).await
 }
 
 /// 删除本地曲目。`delete_file = true` 时先删磁盘文件，再删库内记录
@@ -3012,7 +3013,11 @@ fn explorer_select_arg(path: &str) -> String {
 ///   Dolphin 等都实现了该接口，效果与 explorer /select 等价）；接口不在时
 ///   回落 `xdg-open` 打开父目录（不选中，但至少能到地方）。路径按 RFC 3986
 ///   做最小转义（空格、`#`、`?`、`%` 会破坏 file:// URI 解析）。
-fn reveal_in_file_manager(path: &str) -> Result<(), String> {
+///
+/// **这是阻塞实现**：Linux 分支的 `dbus-send … .output()` 要等对端回包（最长到
+/// D-Bus 超时）。命令层必须走下面的 [`reveal_in_file_manager`]（内部
+/// `spawn_blocking`），不要在 async 函数里直接调这个 —— 会把 tokio worker 占住。
+fn reveal_in_file_manager_blocking(path: &str) -> Result<(), String> {
     if !std::path::Path::new(path).exists() {
         return Err("文件已不存在（可能被移动或删除）".to_string());
     }
@@ -3064,6 +3069,15 @@ fn reveal_in_file_manager(path: &str) -> Result<(), String> {
     }
     #[allow(unused_variables)]
     Ok(())
+}
+
+/// [`reveal_in_file_manager_blocking`] 的 async 包装：把整段（含存在性检查与
+/// 进程启动 / D-Bus 等待）挪到 blocking 线程池，命令层只 await。
+async fn reveal_in_file_manager(path: &str) -> Result<(), String> {
+    let path = path.to_string();
+    tauri::async_runtime::spawn_blocking(move || reveal_in_file_manager_blocking(&path))
+        .await
+        .map_err(|e| format!("打开文件管理器失败: {e}"))?
 }
 
 /// Linux file:// URI 的最小百分号转义：只转义会破坏 URI 结构的字符，
@@ -3176,7 +3190,7 @@ pub async fn cmd_reveal_download(state: State<'_, AppState>, id: String) -> Resu
     let path = task
         .and_then(|t| t.file_path)
         .ok_or_else(|| "文件尚未下载完成".to_string())?;
-    reveal_in_file_manager(&path)
+    reveal_in_file_manager(&path).await
 }
 
 /// 把任务状态写库（暂停 / 取消这类由命令层决定的状态）。
@@ -4281,8 +4295,8 @@ pub async fn cmd_get_top_singers(
 #[cfg(test)]
 mod tests {
     use super::{
-        audio_ext_from_url, explorer_select_arg, remove_local_file, reveal_in_file_manager,
-        unique_download_path,
+        audio_ext_from_url, explorer_select_arg, remove_local_file,
+        reveal_in_file_manager_blocking, unique_download_path,
     };
     use crate::provider::types::{SourceId, Track};
 
@@ -4332,7 +4346,7 @@ mod tests {
     fn reveal_rejects_missing_file_without_spawning() {
         // 文件不存在时直接报错（这条路径不会拉起资源管理器，测试无副作用）
         let missing = std::env::temp_dir().join("ll-no-such-file-99.flac");
-        let err = reveal_in_file_manager(&missing.to_string_lossy()).unwrap_err();
+        let err = reveal_in_file_manager_blocking(&missing.to_string_lossy()).unwrap_err();
         assert!(err.contains("不存在"), "错误提示应说明文件不存在: {err}");
     }
 

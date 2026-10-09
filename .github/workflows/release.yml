@@ -160,8 +160,10 @@ jobs:
             src-tauri/target/release/bundle/appimage/*.AppImage --clobber
 
   # ---------- macOS：dmg（无签名 / 无公证） ----------
+  # 产物是 arm64（macos-14 是 Apple Silicon 运行器）。Intel x64 的 dmg 需在
+  # Intel 机器上本地打包，CI 不产。
   macos:
-    name: macOS dmg（无公证）
+    name: macOS dmg（无公证，arm64）
     runs-on: macos-14
     needs: windows
     steps:
@@ -184,8 +186,10 @@ jobs:
         run: pnpm exec tauri build --runner cargo --bundles app,dmg
 
       # 不做 Developer ID 签名 / 公证（决策：不公签）。
-      # tauri build 对 macOSPrivateApi 构建会自动做 ad-hoc 签名
-      # （codesign -）；本地运行前如遇 Gatekeeper 拦截，见 Release 说明。
+      # 注意：tauri 在既无 APPLE_CERTIFICATE / APPLE_CERTIFICATE_PASSWORD
+      # 又无 signingIdentity 时会**整段跳过**签名（bundle/macos/sign.rs 的
+      # keychain() 返回 Ok(None)），不会自动 ad-hoc 签名 —— 产物是未签名的。
+      # 用户首次打开按 Release 说明右键「打开」或清 quarantine 属性。
       - name: 上传到 Release
         env:
           GH_TOKEN: ${{ github.token }}

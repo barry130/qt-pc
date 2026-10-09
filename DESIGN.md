@@ -18,9 +18,9 @@
 | App 接口前缀 `/api/v1/app/**` | ✅ 成立 | `QtAppController`、`QtAppUserController` 的 `@RequestMapping` |
 | 认证使用 `satoken` 请求头 | ✅ 成立（**不是** `Authorization: Bearer`） | 所有 App 控制器 `@RequestHeader("satoken")`；`QtAuthInterceptor` 亦读该头 |
 | 响应包装器 | ✅ 三种并存，字段一致 `{code,msg,data}` | `QtRestResp`（qt）、`FeedbackRestResp`（反馈/消息）、`Result`（统计/宿主） |
-| `type=1101/1102/1103` | ✅ 成立 | `QtAppUpdate.TYPE_WINDOWS = 1103L`、`isSupportedType()` |
+| `type=1101/1102/1103/1104/1105` | ✅ 成立 | `QtAppUpdate.TYPE_WINDOWS = 1103L`（`TYPE_LINUX = 1104L`、`TYPE_MACOS = 1105L`）、`isSupportedType()` |
 | `channel=app/pc/web/all` | ✅ 成立 | `SysNotice.CHANNEL_PC = "pc"`、`FeedbackNoticeService.listForPc()` |
-| `ut=app-windows` | ✅ 成立 | `StatEventDTO.ut` 注释 + `dict-init.sql` 字典 `stat_platform` |
+| `ut=app-windows/app-linux/app-macos` | ✅ 成立 | `StatEventDTO.ut` 注释 + `dict-init.sql` 字典 `stat_platform` |
 | 单批统计 ≤ 200 | ✅ 成立 | `StatReportRequest` `@Size(max = 200)` |
 | `like/changes?since=` + `like/list?page=&size=` | ✅ 成立（`size` 默认 500） | `QtAppUserController` |
 | 反馈客户端头 `X-App-Ut` / `X-App-Version` / `X-Device` / `X-OS` | ✅ 成立，与接口统计共用一套（`ClientHeaders`），`X-Device`/`X-OS` 落 `sys_feedback` | `AppFeedbackController.submit()` |
@@ -281,9 +281,9 @@ AstralClient
 | 项目 | 当前状态 | PC 设计 |
 |---|---|---|
 | 通知渠道 | 后端已支持 `channel=app/pc/web/all` | 消息接口固定传 `channel=pc` |
-| 统计平台 | 后端已支持 `ut=app-android/app-ios/app-windows/web` | 统计事件固定传 `ut=app-windows` |
-| 更新平台 | 后端已支持 `type=1101/1102/1103` | 更新和官方版本校验固定传 `type=1103` |
-| 反馈平台 | 统一客户端系统头 `X-App-Ut`（值 `app-windows`，同 `ut`） | PC 每个 astral 请求都在 Rust 收口处带 `X-App-Ut: app-windows` |
+| 统计平台 | 后端已支持 `ut=app-android/app-ios/app-windows/app-linux/app-macos/web` | 统计事件按编译目标传 `ut=app-windows` / `app-linux` / `app-macos`（见 `astral.rs` 的 `CLIENT_UT`） |
+| 更新平台 | 后端已支持 `type=1101/1102/1103/1104/1105` | 更新和官方版本校验按编译目标传 `type=1103/1104/1105`（见 `app_config.rs` 的 `UPDATE_TYPE`） |
+| 反馈平台 | 统一客户端系统头 `X-App-Ut`（三平台取值，同 `ut`） | PC 每个 astral 请求都在 Rust 收口处带 `X-App-Ut`（按 `target_os` 三选一） |
 | Astral 不代理音乐内容 | 音乐内容仍在客户端适配层请求 | PC Rust Provider 直连现有音源接口 |
 | 当前音源接口为公开接口 | 与现有移动端保持一致 | 第一版仅限个人学习交流，商业发行需替换为官方或授权接口 |
 ---
@@ -2531,10 +2531,10 @@ Rust `AstralClient` 统一封装以下接口，前端不直接使用 `fetch` 请
 
 | Command | 对应接口 |
 |---|---|
-| `astral_app_update` | `GET /app/update?type=1103&version=&channel=` |
-| `astral_check_official_version` | `GET /app/version/check?type=1103&version=&versionName=` |
+| `astral_app_update` | `GET /app/update?type={1103\|1104\|1105}&version=&channel=` |
+| `astral_check_official_version` | `GET /app/version/check?type={1103\|1104\|1105}&version=&versionName=` |
 | `astral_github_accels` | `GET /app/github/accels` |
-| `astral_report_stats` | `POST /app/stat/report`，事件 `ut=app-windows` |
+| `astral_report_stats` | `POST /app/stat/report`，事件 `ut=app-windows / app-linux / app-macos`（按编译目标） |
 
 ## 11.8 事件设计
 
@@ -2907,8 +2907,8 @@ Astral 已提供：
 
 | 接口 | 说明 |
 |---|---|
-| `GET /api/v1/app/update?type=1103&version=&channel=` | 获取 Windows 版本更新信息 |
-| `GET /api/v1/app/version/check?type=1103&version=&versionName=` | 校验 Windows 官方版本 |
+| `GET /api/v1/app/update?type={1103\|1104\|1105}&version=&channel=` | 获取本平台版本更新信息（type 按编译目标） |
+| `GET /api/v1/app/version/check?type={1103\|1104\|1105}&version=&versionName=` | 校验本平台官方版本 |
 | `GET /api/v1/app/github/accels` | 获取 GitHub 加速节点 |
 | `GET /api/v1/app/message/active?versionCode=&channel=pc` | 获取 PC 当前生效通知 |
 | `GET /api/v1/app/message/center?channel=pc` | 获取 PC 消息中心 |
@@ -2939,12 +2939,16 @@ channel=pc
 | `app-android` | Android App |
 | `app-ios` | iOS App |
 | `app-windows` | Windows 桌面端 |
+| `app-linux` | Linux 桌面端 |
+| `app-macos` | macOS 桌面端 |
 | `web` | Web 端 |
 
-PC 端统计事件固定传：
+PC 端统计事件按编译目标三选一（`astral.rs` 的 `CLIENT_UT`）：
 
 ```text
-ut=app-windows
+Windows: ut=app-windows
+Linux:   ut=app-linux
+macOS:   ut=app-macos
 ```
 
 ### 更新平台 `type`
@@ -2954,11 +2958,15 @@ ut=app-windows
 | `1101` | Android |
 | `1102` | iOS |
 | `1103` | Windows |
+| `1104` | Linux |
+| `1105` | macOS |
 
-PC 端更新和官方版本校验固定传：
+PC 端更新和官方版本校验按编译目标三选一（`app_config::UPDATE_TYPE`）：
 
 ```text
-type=1103
+Windows: type=1103
+Linux:   type=1104
+macOS:   type=1105
 ```
 
 ## 15.3 PC 更新流程
@@ -2967,7 +2975,7 @@ type=1103
 启动或用户手动检查
    │
    ▼
-调用 Astral /app/update，携带 type=1103
+调用 Astral /app/update，携带 type=1103/1104/1105（按编译目标）
    │
    ▼
 比较 versionCode
@@ -2979,13 +2987,13 @@ type=1103
 并发探测加速节点
    │
    ▼
-下载 Windows 更新包
+下载本平台更新包
    │
    ▼
 校验 MD5 / 签名
    │
    ▼
-启动安装器
+Windows 启动安装器；Linux/macOS 走浏览器下载手动安装
    │
    ▼
 退出当前应用
@@ -2996,7 +3004,7 @@ Tauri Updater 可作为备选实现：
 1. 更新清单由 Astral 或静态文件服务提供。
 2. 更新包签名遵循 Tauri Updater 规范。
 3. 前端仍通过 Rust Command 获取更新状态。
-4. 即使使用 Tauri Updater，Astral 中的 Windows 版本记录仍应使用 `type=1103`。
+4. 即使使用 Tauri Updater，Astral 中的版本记录仍应按平台使用 `type=1103/1104/1105`。
 
 ## 15.4 通知与统计上报设计
 
@@ -3018,7 +3026,7 @@ export interface StatEvent {
   evt: 'launcher' | 'show' | 'hide' | 'page' | 'error' | 'custom'
   ts: number
   deviceId: string
-  ut: 'app-windows'
+  ut: 'app-windows' | 'app-linux' | 'app-macos'
   appVersion: string
   model?: string
   os?: string
@@ -3035,7 +3043,7 @@ export interface StatEvent {
 
 PC 端规则：
 
-1. 所有事件 `ut` 固定为 `app-windows`。
+1. 所有事件 `ut` 按编译目标取值：`app-windows` / `app-linux` / `app-macos`（与 `X-App-Ut` 同值）。
 2. 单批事件数量不超过 200。
 3. 上报失败进入本地队列重试。
 4. 统计失败不影响播放。
@@ -3048,9 +3056,9 @@ PC 端规则：
 | 自动检查更新 | 开启 |
 | 自动下载 | 关闭 |
 | 更新通道 | stable |
-| 更新平台类型 | 1103 |
+| 更新平台类型 | 1103（Windows）/ 1104（Linux）/ 1105（macOS），按编译目标 |
 | 通知渠道 | pc |
-| 统计平台 | app-windows |
+| 统计平台 | app-windows / app-linux / app-macos，按编译目标 |
 | 跳过当前版本 | 不跳过 |
 | GitHub 加速 | 开启 |
 
@@ -3073,8 +3081,8 @@ PC 端规则：
 | `versionName` | 语义化版本 `major.minor.patch`，如 `1.0.7` |
 | `versionCode` | `major*100 + minor*10 + patch`，如 `1.0.0` → `100`、`1.0.7` → `107`、`1.2.3` → `123` |
 | 起始值 | PC 首个版本 `1.0.0` / `100`，与移动端 `3.0.0 / 300` 天然不冲突（同 `type` 内单调即可） |
-| 请求参数 | `GET /app/update?type=1103&version=107&channel=stable`，注意 **`version` 传的是 versionCode 的字符串**，不是 `versionName` |
-| 官方校验 | `GET /app/version/check?type=1103&version=107&versionName=1.0.7`，三者必须与后台记录完全一致 |
+| 请求参数 | `GET /app/update?type=1103&version=107&channel=stable`（Linux/macOS 换 1104/1105），注意 **`version` 传的是 versionCode 的字符串**，不是 `versionName` |
+| 官方校验 | `GET /app/version/check?type=1103&version=107&versionName=1.0.7`（type 同左），三者必须与后台记录完全一致 |
 | 单一真值 | 二者只在仓库根的 `app.config.json`（`version.name` / `version.code`）写一次，由 `scripts/sync-config.mjs` 写进 `package.json`、`tauri.conf.json`、`Cargo.toml`、`Cargo.lock`、`src-tauri/src/app_config.rs`（§24.2）；**禁止手改派生文件** |
 
 > 历史注：本文档早期写的是 `major*10000 + minor*100 + patch`（`1.0.0` → `10000`），
@@ -3091,7 +3099,7 @@ PC 端规则：
 3. 全绿：pnpm config:check、pnpm test、cargo test --lib
 4. 打包（见 docs/PACKAGING.md）→ 计算安装包 MD5 与字节大小
 5. 上传安装包（GitHub Release 或对象存储）
-6. 后台「版本更新」新增记录：type=1103、versionCode、versionName、
+6. 后台「版本更新」新增记录：**每个平台一条，type 分别填 1103/1104/1105**、versionCode、versionName、
    downloadUrl（GitHub 原始链接）、browserUrl、isGithub=1、md5、fileSize、
    channel、isForce、isPublished=0
 7. 用当前版本自测 /app/version/check 通过（未发布也能校验通过）
@@ -3542,5 +3550,5 @@ CI（GitHub Actions，`windows-latest`）：`checkout → setup node/pnpm → se
 2. 音质枚举仍为 `128 / 320 / flac`。
 3. 播放地址有效期仍为 10 分钟。
 4. 收藏同步仍以 `updatedSeq` 为游标，last-write-wins。
-5. 更新 `type=1103`、消息 `channel=pc`、统一客户端系统头 `X-App-Ut=app-windows`（统计 `ut` 与反馈平台同值）。
+5. 更新 `type=1103/1104/1105`（按编译目标）、消息 `channel=pc`、统一客户端系统头 `X-App-Ut=app-windows/app-linux/app-macos`（统计 `ut` 与反馈平台同值）。
 6. 默认皮肤主色与移动端品牌色一致（`#e5484d` / `#ff5c63`）。

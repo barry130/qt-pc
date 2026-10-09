@@ -62,7 +62,9 @@ if (names.length === 0) {
 }
 
 const lines = [
-  `# 轻听 Windows 安装包 ${tag}`,
+  linuxNames.length > 0
+    ? `# 轻听安装包（Windows / Linux）${tag}`
+    : `# 轻听 Windows 安装包 ${tag}`,
   "",
   "## 安装包信息（建后端更新记录用）",
   "",
@@ -123,4 +125,7 @@ if (linuxNames.length > 0) {
 }
 
 writeFileSync(outFile, lines.join("\n"), "utf8");
-console.log(`已写出 ${outFile}（${names.length} 个安装包）`);
+console.log(
+  `已写出 ${outFile}（Windows ${names.length} 个安装包` +
+    (linuxNames.length > 0 ? ` + Linux ${linuxNames.length} 个包）` : "）"),
+);

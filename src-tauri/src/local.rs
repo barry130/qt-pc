@@ -599,10 +599,17 @@ mod tests {
         touch(&root, "System Volume Information/c.mp3");
         touch(&root, ".git/d.mp3");
         touch(&root, ".cargo-home/e.mp3");
+        // 三平台化新增项（目录名匹配与宿主平台无关，Windows 上同样生效）
+        touch(&root, "proc/f.mp3");
+        touch(&root, "Library/g.mp3");
+        touch(&root, ".Trash/h.mp3");
+        // 反向：音乐目录不能被跳过
+        touch(&root, "Music/i.mp3");
 
         let found = collect_audio_files(&root);
-        assert_eq!(found.len(), 1, "系统/噪声目录应被跳过: {found:?}");
-        assert!(found[0].ends_with("keep.mp3"));
+        assert_eq!(found.len(), 2, "系统/噪声目录应被跳过: {found:?}");
+        assert!(found.iter().any(|p| p.ends_with("keep.mp3")));
+        assert!(found.iter().any(|p| p.ends_with("i.mp3")));
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -712,6 +719,70 @@ mod tests {
             drives.iter().any(|d| d.eq_ignore_ascii_case("c:\\")),
             "系统盘 C: 应被枚举到: {drives:?}"
         );
+    }
+
+    /// macOS：`/` 必在；`/Volumes/*` 每个都是目录（CI 上通常为空，但若存在必须合法）
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn list_drives_returns_macos_roots() {
+        let drives = list_drives();
+        assert!(drives.iter().any(|d| d == "/"), "根目录应被枚举到: {drives:?}");
+        for d in &drives {
+            assert!(
+                std::path::Path::new(d).is_dir(),
+                "枚举出的挂载点必须真实存在: {d}"
+            );
+        }
+        assert!(
+            drives.iter().all(|d| d == "/" || d.starts_with("/Volumes/")),
+            "只应产出 / 与 /Volumes/*: {drives:?}"
+        );
+    }
+
+    /// Linux：`/` 必在；`$HOME` 非空且存在时也在（两者不重复）
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn list_drives_returns_linux_roots() {
+        let drives = list_drives();
+        assert!(drives.iter().any(|d| d == "/"), "根目录应被枚举到: {drives:?}");
+        assert!(std::path::Path::new("/").is_dir());
+        if let Some(home) = std::env::var_os("HOME") {
+            let home = home.to_string_lossy().to_string();
+            if !home.is_empty() && std::path::Path::new(&home).is_dir() {
+                assert!(drives.contains(&home), "家目录应被枚举到: {drives:?}");
+            }
+        }
+        let mut uniq = drives.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), drives.len(), "不应有重复项: {drives:?}");
+    }
+
+    /// 三平台共用：新增的 Linux/macOS 跳过项必须生效，且不误伤通用音乐目录名
+    #[test]
+    fn skip_dir_names_cover_linux_and_macos() {
+        // Linux 伪文件系统 / 系统目录
+        for name in ["proc", "sys", "dev", "run", "boot", "lost+found", "snap", "flatpak"] {
+            assert!(should_skip_dir(name), "Linux 系统目录应跳过: {name}");
+        }
+        // macOS 系统目录与卷元数据
+        for name in [
+            "System",
+            "Library",
+            "private",
+            "Applications",
+            "cores",
+            ".Trash",
+            ".Spotlight-V100",
+            ".fseventsd",
+            ".TemporaryItems",
+        ] {
+            assert!(should_skip_dir(name), "macOS 系统目录应跳过: {name}");
+        }
+        // 反向：常见的音乐目录名一个都不能进跳过清单
+        for name in ["Music", "音乐", "Songs", "Downloads", "下载", "Audio", "Media"] {
+            assert!(!should_skip_dir(name), "音乐目录不应被跳过: {name}");
+        }
     }
 
     // ---------- 文件名降级解析 ----------

@@ -37,6 +37,15 @@ pub const UPDATE_TYPE: &str = "1104";
 #[cfg(target_os = "macos")]
 pub const UPDATE_TYPE: &str = "1105";
 
+/// 平台号（数值形态），与 UPDATE_TYPE 同源，供 JSON 请求体 / URL 查询参数使用。
+/// 音源包 manifest 与装载上报走这个值：绝不能另写字面量，否则三平台会漂移。
+#[cfg(target_os = "windows")]
+pub const PLATFORM_CODE: i64 = 1103;
+#[cfg(target_os = "linux")]
+pub const PLATFORM_CODE: i64 = 1104;
+#[cfg(target_os = "macos")]
+pub const PLATFORM_CODE: i64 = 1105;
+
 #[cfg(test)]
 mod tests {
     //! 一致性护栏：本文件必须与 app.config.json 逐项相等。
@@ -81,6 +90,16 @@ mod tests {
             c["platform"][platform_key].as_i64().unwrap().to_string(),
             super::UPDATE_TYPE,
             "UPDATE_TYPE 必须等于 platform.{platform_key}（JSON 里是数字，Rust 侧是字符串）"
+        );
+        assert_eq!(
+            c["platform"][platform_key].as_i64().unwrap(),
+            super::PLATFORM_CODE,
+            "PLATFORM_CODE 必须等于 platform.{platform_key}"
+        );
+        assert_eq!(
+            super::UPDATE_TYPE.parse::<i64>().unwrap(),
+            super::PLATFORM_CODE,
+            "UPDATE_TYPE 与 PLATFORM_CODE 必须同源（一个字符串一个数值）"
         );
     }
 

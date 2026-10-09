@@ -1063,8 +1063,9 @@ impl PackUpdateOffer {
 /// 由服务端做准入预筛）。无发布 / 业务失败 → None。
 async fn fetch_manifest(astral: &astral::AstralClient) -> Result<Option<SourceRelease>, String> {
     let url = format!(
-        "{}/app/source/manifest?platform=1103&appVersionCode={}&hostApiVersion={}",
+        "{}/app/source/manifest?platform={}&appVersionCode={}&hostApiVersion={}",
         astral.base_url().trim_end_matches('/'),
+        crate::app_config::PLATFORM_CODE,
         astral::version_code(),
         HOST_API_VERSION,
     );
@@ -1100,11 +1101,16 @@ async fn fetch_manifest(astral: &astral::AstralClient) -> Result<Option<SourceRe
 
 /// manifest 发布门槛：已发布 && 未撤回 && 未被服务端回滚 && 面向本平台 &&
 /// 宿主契约不超本机（与 uniappx 同口径；hostApiVersion 超限的版本交给应用升级通道）
+///
+/// 平台判定用 `PLATFORM_CODE`：服务端 `platformMatches` 是按 `platforms` CSV 逐段
+/// 字符串比对，所以这里必须与 manifest 请求带的是同一个平台号，否则会出现
+/// 「按 A 平台取包、按 B 平台准入」的错配。
 fn release_available(release: &SourceRelease) -> bool {
     release.published
         && !release.bad
         && release.rollback_to <= 0
-        && (release.platforms.is_empty() || release.platforms.contains(&1103))
+        && (release.platforms.is_empty()
+            || release.platforms.contains(&crate::app_config::PLATFORM_CODE))
         && release.host_api_version <= HOST_API_VERSION
 }
 
@@ -1943,7 +1949,7 @@ fn app_version_code() -> i64 {
 async fn report_to_backend(app: &AppHandle, code: i64, result: String, detail: String) {
     let client = app.state::<crate::AppState>().astral.clone();
     let payload = json!({
-        "platform": 1103,
+        "platform": crate::app_config::PLATFORM_CODE,
         "appVersionCode": app_version_code(),
         "sourceVersionCode": code,
         "result": result,
