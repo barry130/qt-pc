@@ -653,10 +653,27 @@ mod tests {
 
     #[test]
     fn part_path_is_suffixed_next_to_target() {
-        let p = part_path_for(Path::new("D:\\Music\\周杰伦 - 晴天.flac"));
+        // 用正斜杠拼路径：Windows 与 Unix 都认它作分隔符。
+        // 不能写成 "D:\Music\x.flac" —— 在 Unix 上反斜杠不是分隔符，
+        // 整个串会被当成一个文件名，断言只在 Windows 成立。
+        let p = part_path_for(Path::new("Music/周杰伦 - 晴天.flac"));
         assert_eq!(
             p.file_name().unwrap().to_str().unwrap(),
             "周杰伦 - 晴天.flac.part"
+        );
+        // 临时文件与目标文件同目录，否则 rename 会跨设备失败
+        assert_eq!(p.parent().unwrap(), Path::new("Music"));
+    }
+
+    #[test]
+    fn part_path_falls_back_when_target_has_no_file_name() {
+        assert_eq!(
+            part_path_for(Path::new(""))
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            "download.part"
         );
     }
 
