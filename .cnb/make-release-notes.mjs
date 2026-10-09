@@ -41,8 +41,12 @@ const ARCH_LABEL = {
 
 const dir = resolve(artifactsDir);
 let names = [];
+let linuxNames = [];
 try {
   names = readdirSync(dir).filter((f) => f.endsWith("-setup.exe"));
+  linuxNames = readdirSync(dir).filter(
+    (f) => f.endsWith(".deb") || f.endsWith(".AppImage"),
+  );
 } catch (err) {
   console.error(`读取产物目录失败：${dir}\n${err.message}`);
   process.exit(1);
@@ -90,6 +94,33 @@ lines.push(
   "  `versionCode` / `versionName` 与本次 tag 一致，其余三项照抄上面。",
   "",
 );
+
+// Linux 原生包（无 .sig：不做应用内自装，浏览器下载手动安装）
+if (linuxNames.length > 0) {
+  lines.push(
+    "## Linux 包（amd64）",
+    "",
+    "- 不参与应用内自装更新（Linux 端从浏览器下载手动安装），没有 `.sig`；",
+    "- `deb` 适配 Debian / Ubuntu / 深度等；`AppImage` 免安装，下载后 `chmod +x` 直接运行；",
+    "- 后台「版本更新」新增记录时：`type` 填 `1104`（Linux），downloadUrl / MD5 /",
+    "  fileSize 照抄下面对应条目（若后端暂未开通 Linux 更新记录可先不建）。",
+    "",
+  );
+  for (const name of linuxNames) {
+    const path = join(dir, name);
+    const buf = readFileSync(path);
+    const md5 = createHash("md5").update(buf).digest("hex");
+    const size = statSync(path).size;
+    lines.push(
+      `### ${name}`,
+      "",
+      `- 下载地址：https://cnb.cool/${slug}/-/releases/download/${tag}/${name}`,
+      `- MD5：${md5}`,
+      `- fileSize：${size}`,
+      "",
+    );
+  }
+}
 
 writeFileSync(outFile, lines.join("\n"), "utf8");
 console.log(`已写出 ${outFile}（${names.length} 个安装包）`);

@@ -2,10 +2,13 @@
 #
 # 两条流水线：
 #   1) master 分支 push  → 前端静态检查（typecheck / 单测 / 前端产物）
-#   2) v* tag push       → 在 Linux 构建节点上交叉编译出 x64 / x86 / ARM64 三个
-#                          Windows NSIS 安装包，签名后发布到 CNB Release
+#   2) v* tag push       → 双产物发布：
+#                          a. 在 Linux 构建节点上交叉编译出 x64 / x86 / ARM64 三个
+#                             Windows NSIS 安装包，签名后发布到 CNB Release
+#                          b. 同一个 Linux 节点原生编译 Linux deb / AppImage，
+#                             无需交叉编译，与 Windows 架构串行避免争抢资源
 #
-# 为什么走 Linux 交叉编译
+# 为什么 Windows 走 Linux 交叉编译
 # ----------------------
 # CNB 的 SaaS 托管节点只有 Linux（cnb:arch:amd64 / arm64），没有 Windows 托管节点，
 # 自托管 Windows Runner 需要组织侧开通。Tauri 官方支持在 Linux 上用 cargo-xwin 打
@@ -14,6 +17,14 @@
 #   FROM messense/cargo-xwin:0.23.1  +  Node 22  +  pnpm  +  nsis  +  三个 rust target
 # MSI/WiX 在 Linux 上无法构建（bundler 里那段是 #[cfg(target_os = "windows")]），
 # 因此这里只出 NSIS —— 与仓库原本 bundle.targets: ["nsis"] 一致。
+#
+# Linux 原生包（deb / AppImage）为什么也在这条流水线
+# ----------------------
+# 节点本来就是 Linux，直接原生编译即可；镜像里补装 webkit2gtk-4.1 / gtk3 /
+# libayatana-appindicator3 / libasound2 开发库后 tauri build --bundles deb,appimage
+# 直接出包。Linux 产物不做应用内自装更新（浏览器下载手动安装），无需 ed25519 签名。
+# macOS 无法在 Linux 节点出包（dmg 需要真实 macOS），走 GitHub Actions 的
+# .github/workflows/release.yml（macos-14 runner）。
 #
 # 一次性准备（在 CNB 网页上做）
 # ----------------------------
@@ -37,6 +48,8 @@
 #   QuietMusic_<version>_x64-setup.exe
 #   QuietMusic_<version>_x86-setup.exe
 #   QuietMusic_<version>_arm64-setup.exe
+#   QuietMusic_<version>_amd64.deb            （Linux，无 .sig）
+#   QuietMusic_<version>_amd64.AppImage       （Linux，无 .sig）
 
 # 复用片段：三个架构 job 只有 target/arch/xwin 三个环境变量不同。
 # 注意 YAML 的 `<<:` 合并键是浅合并，job 自己写了的键会整体覆盖锚点里的同名键，
@@ -234,6 +247,29 @@ v*:
             XWIN_ARCH: aarch64
             CARGO_TARGET_DIR: /tmp/cargo-target/arm64
 
+        # Linux 原生包（deb + AppImage）：同一镜像里直接原生编译，没有交叉。
+        # 仍放在 Windows 三架构之后串行——节点内存有限（8 核 16GiB），
+        # 并行会重复 /tmp/cargo-target 的争抢问题。dist 复用上一 stage 的。
+        # Linux 包不做应用内自装更新，所以不签名、不产 .sig。
+        - name: 构建 Linux deb + AppImage
+          env:
+            CARGO_TERM_COLOR: always
+            RUST_BACKTRACE: "1"
+            CARGO_TARGET_DIR: /tmp/cargo-target/linux
+          script: |
+            set -e
+            pnpm exec tauri build \
+              --runner cargo \
+              --bundles deb,appimage \
+              --config '{"build":{"beforeBuildCommand":"echo dist-already-built"}}'
+            OUT_DEB="$CARGO_TARGET_DIR/release/bundle/deb"
+            OUT_APP="$CARGO_TARGET_DIR/release/bundle/appimage"
+            ls -l "$OUT_DEB" "$OUT_APP"
+            mkdir -p artifacts
+            cp "$OUT_DEB"/*.deb artifacts/
+            cp "$OUT_APP"/*.AppImage artifacts/
+            ls -l artifacts
+
         - name: 签名安装包
           script: |
             set -e
@@ -275,3 +311,5 @@ v*:
             attachments:
               - "./artifacts/*-setup.exe"
               - "./artifacts/*-setup.exe.sig"
+              - "./artifacts/*.deb"
+              - "./artifacts/*.AppImage"

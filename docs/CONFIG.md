@@ -41,7 +41,7 @@ pnpm config:check    # 只校验，不一致退出码 1（已挂进 pnpm build /
 | `sourcePack.hostApiVersion` | `1` | `source-update.ts`、`app_config.rs` | 宿主契约版本（与 Rust `HOST_API_VERSION` 同源） |
 | `backend.dev` / `.prod` | 见文件 | `app_config.rs`（`DEV_BASE_URL` / `PROD_BASE_URL`） | Astral 后端地址 |
 | `backend.active` | `prod` | `app_config.rs`（`DEFAULT_BASE_URL`） | **当前生效**的后端；联调改 `dev` 后同步重编 |
-| `platform.windows` | `1103` | `app_config.rs`（`UPDATE_TYPE`） | 更新/消息/统计的平台号 |
+| `platform.windows` / `.linux` / `.macos` | `1103` / `1104` / `1105` | `app_config.rs`（`UPDATE_TYPE`，按 `target_os` 三选一） | 更新/消息/统计的平台号 |
 | `devServer.port` / `.hmrPort` | `1420` / `1421` | `tauri.conf.json` `build.devUrl`；vite 直接读 JSON | 开发服务器端口 |
 
 派生文件总表（同步器负责的全部落点，共 6 个）：
@@ -72,13 +72,19 @@ src-tauri/src/app_config.rs                    Rust 侧常量 + 一致性单测�
 2. pnpm config:sync              # 或直接 pnpm build，它会先同步
 3. pnpm config:check && pnpm test && (cd src-tauri && cargo test --lib)
 4. 打包（见 docs/PACKAGING.md），产物：
-   src-tauri/target/release/bundle/nsis/QuietMusic_<版本>_x64-setup.exe
+   Windows  src-tauri/target/release/bundle/nsis/QuietMusic_<版本>_x64-setup.exe
+   Linux    src-tauri/target/release/bundle/deb|appimage/QuietMusic_<版本>_amd64.*
+   macOS    src-tauri/target/release/bundle/dmg/QuietMusic_<版本>_<arch>.dmg
 5. 算安装包 MD5 与字节大小
 6. 上传安装包（GitHub Release / 对象存储）
-7. 后台「版本更新」新增记录：type=1103、versionCode、versionName、downloadUrl、
+7. 后台「版本更新」新增记录（**每个平台一条，type 分别填** 1103 Windows /
+   1104 Linux / 1105 macOS）：versionCode、versionName、downloadUrl、
    browserUrl、isGithub=1、md5、fileSize、channel、isForce、isPublished=0
 8. 用当前版本自测 /app/version/check 通过（未发布也能校验通过）
 9. 确认无误后 isPublished 置 1，客户端开始收到更新
+
+> Linux / macOS 记录同样要建；这两端没有应用内自装，`browserUrl` 是用户真正下载的入口
+> （Windows 的 `browserUrl` 只是备用）。
 ```
 
 > **`version.code` 是发版版本号**（`major*100 + minor*10 + patch`：1.0.0 → 100、1.0.8 → 108），
@@ -107,7 +113,9 @@ src-tauri/src/app_config.rs                    Rust 侧常量 + 一致性单测�
 > 真实取链冒烟（`app_restart` 前置）。冒烟失败过的版本进 `bad` 黑名单，
 > 不再自动下载。
 
-## 6. 安装包行为（NSIS 自定义模板）
+## 6. 安装包行为（Windows，NSIS 自定义模板）
+
+> Linux 的 deb/AppImage 与 macOS 的 app/dmg 没有安装器脚本，行为见 `docs/PACKAGING.md`。
 
 `tauri.conf.json` 的 `bundle.windows.nsis.template` 指向 `src-tauri/nsis/installer.nsi`
 （Tauri 2.5.0 官方模板 + 18 行补丁）：

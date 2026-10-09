@@ -1,6 +1,6 @@
 # 轻听 PC 版（QuietMusic）
 
-Windows 桌面端轻量级**本地音乐播放器**。基于 **Tauri 2 + React 19 + Rust**：本地音乐库开箱即用，无损音质、桌面歌词、下载与云同步收藏；另提供可选的「音源包」机制，安装音源包后可扩展在线试听（本项目**不内置、不分发任何音源实现**）。
+Windows / Linux / macOS 桌面端轻量级**本地音乐播放器**。基于 **Tauri 2 + React 19 + Rust**（同一份代码按平台编译打包）：本地音乐库开箱即用，无损音质、桌面歌词、下载与云同步收藏；另提供可选的「音源包」机制，安装音源包后可扩展在线试听（本项目**不内置、不分发任何音源实现**）。
 
 > 仅供学习与技术交流使用。本项目不存储、不分发任何音乐内容；音源包由使用者自行获取并自担风险，请勿用于商业用途，并请尊重音乐版权。
 
@@ -13,7 +13,7 @@ Windows 桌面端轻量级**本地音乐播放器**。基于 **Tauri 2 + React 1
 - **在线播放**：HTTP Range 流式读取 + 边下边播，拖动进度条即时定位
 - **播放体验**：播放队列、四种播放模式（顺序 / 列表循环 / 单曲循环 / 随机）、音量与静音、播放条工具按钮自定义
 - **桌面歌词**：独立置顶歌词窗口，支持锁定 / 穿透、快捷键呼出（Ctrl+Alt+K）与自定义样式，逐行 / 逐字同步
-- **系统集成**：Windows 系统媒体控制（SMTC，媒体键 / 蓝牙耳机按键）、任务栏缩略图播放控制按钮、托盘菜单、开机自启
+- **系统集成**：系统媒体控制（Windows SMTC / Linux MPRIS / macOS 正在播放，媒体键与蓝牙耳机按键可用）、任务栏缩略图播放控制按钮（Windows）、托盘菜单、开机自启
 - **屏蔽规则**：按歌手 / 关键词屏蔽不喜欢的歌曲（歌名 / 歌手拆词匹配，与移动端同口径）
 - **下载管理**：无损 / 高音质下载，进度写库、任务列表、去重命名
 - **收藏与歌单**：与后端账号云同步，本地 / 在线歌单统一组织，收藏「同名不同源」查重提示，歌单分享链接导入
@@ -34,10 +34,16 @@ Windows 桌面端轻量级**本地音乐播放器**。基于 **Tauri 2 + React 1
 
 ## 环境要求
 
-- Windows 10 / 11（需要 WebView2，Win11 自带）
-- [Node.js](https://nodejs.org/) ≥ 20 + [pnpm](https://pnpm.io/)
-- Rust ≥ 1.87（rodio 0.22.2 的 MSRV）
-- Tauri 的 Windows 构建依赖（MSVC 工具链、WebView2）
+同一份代码三平台编译，按 `target_os` 分平台打包：
+
+- 通用：[Node.js](https://nodejs.org/) ≥ 20 + [pnpm](https://pnpm.io/)、Rust ≥ 1.87（rodio 0.22.2 的 MSRV）
+- Windows 10 / 11：WebView2（Win11 自带）+ MSVC 工具链
+- Linux（Ubuntu 22.04+，`webkit2gtk-4.1` 自 22.04 起提供）：
+  `libwebkit2gtk-4.1-dev`、`libgtk-3-dev`、`libayatana-appindicator3-dev`、`librsvg2-dev`、`libasound2-dev`
+- macOS 10.15+：Xcode Command Line Tools（`xcode-select --install`）
+
+各平台的构建命令、产物、运行期依赖与已知限制见
+[`docs/PACKAGING.md`](docs/PACKAGING.md)。
 
 ## 快速开始
 
@@ -108,8 +114,9 @@ pnpm build          # 仅前端产物（会先跑 config:sync）
 ```
 
 > **本机不能直接跑 `pnpm tauri build` / `pnpm tauri dev`**：Tauri CLI 会把 `process.argv[0]`
-> 解析成 `DSH Desktop.exe`，报 `unrecognized subcommand`。完整安装包（NSIS）走
-> [`docs/PACKAGING.md`](docs/PACKAGING.md) 里的手动分步流程，效果与 `tauri build` 一致。
+> 解析成 `DSH Desktop.exe`，报 `unrecognized subcommand`。三平台安装包（Windows NSIS /
+> Linux deb+AppImage / macOS app+dmg）都走 [`docs/PACKAGING.md`](docs/PACKAGING.md)
+> 里的手动分步流程（`pnpm exec tauri build --runner cargo --bundles <目标>`），与 `tauri build` 等价。
 
 版本号等发布前必须同步修改的配置见 [`docs/CONFIG.md`](docs/CONFIG.md)。
 
@@ -136,8 +143,9 @@ qt-pc/
 │   ├── src/app_config.rs    # 配置生成物（唯一读取入口，勿手改）
 │   ├── src/ipc_guard.rs     # 命令调用来源校验（危险命令只允许主窗口调用）
 │   ├── src/net_guard.rs     # 出网请求校验（scheme / 私网地址 / host 白名单）
-│   ├── src/smtc.rs          # Windows 系统媒体控制（SMTC）与硬件媒体键
-│   ├── src/taskbar.rs       # 任务栏缩略图工具栏（播放控制三按钮）
+│   ├── src/app_paths.rs     # 数据 / 日志根目录（Windows / Linux / macOS 三平台口径）
+│   ├── src/smtc.rs          # 系统媒体控制（Windows SMTC / Linux MPRIS / macOS 正在播放）与硬件媒体键
+│   ├── src/taskbar.rs       # 任务栏缩略图工具栏（播放控制三按钮，Windows）
 │   ├── src/lyric_window.rs  # 桌面歌词窗口（动态创建 / 锁定穿透 / 位置校验）
 │   ├── src/commands.rs      # Tauri 命令层
 │   ├── src/source_engine_page.html  # 引擎页（装载 bundle、注入 request 与 chain overlay）
@@ -162,7 +170,7 @@ qt-pc/
 | [`DESIGN.md`](DESIGN.md) | 架构设计、模块边界、接口契约 |
 | [`REQUIREMENTS.md`](REQUIREMENTS.md) | 功能需求与验收标准 |
 | [`docs/CONFIG.md`](docs/CONFIG.md) | **唯一配置源 `app.config.json`**：字段表、同步器用法、发布流程、音源包机制、安装包行为与护栏 |
-| [`docs/PACKAGING.md`](docs/PACKAGING.md) | Windows 安装包打包流程 |
+| [`docs/PACKAGING.md`](docs/PACKAGING.md) | 三平台打包流程（Windows NSIS / Linux deb+AppImage / macOS app+dmg）、自动发版与常见失败 |
 | [`docs/plan-playlist-merge.md`](docs/plan-playlist-merge.md) | 收藏 / 歌单模型重构方案 |
 
 ## 已知限制
@@ -171,6 +179,16 @@ qt-pc/
 - 在线能力依赖音源包：未安装时搜索/榜单/在线歌单不可用（本地音乐不受影响）
 - 部分音源的无损取址在无无损源时会回退到有损（下载扩展名按实际返回的 URL 决定）
 - 逐字歌词、音译歌词仅在音源包支持时可用（qrc / krc 加密歌词暂未实现）
+
+平台相关：
+
+- **应用内更新只在 Windows 可用**：Linux / macOS 没有安装器，`supportsInAppUpdate()` 返回 false，
+  新版本走浏览器下载手动安装；后端更新清单按平台（1103 / 1104 / 1105）分别下发。
+- **Linux 托盘**依赖桌面的 AppIndicator/StatusNotifier 宿主：GNOME 未装扩展时不显示，
+  此时按「关窗即退出」运行（托盘不可用时不留后台进程）。
+- **Linux Wayland** 下桌面歌词的置顶/穿透受限（tao 无 layer-shell）、全局快捷键不可用；切 X11 会话正常。
+- **macOS 未签名未公证**：首次打开需右键 →「打开」，或 `xattr -dr com.apple.quarantine`；
+  手动替换二进制后 ad-hoc 签名失效需重签（见 `docs/PACKAGING.md`）。
 
 ## 排障
 

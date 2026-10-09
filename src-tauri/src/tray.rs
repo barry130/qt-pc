@@ -101,13 +101,17 @@ fn show_main_window(app: &AppHandle) {
     }
 }
 
-/// 注册托盘。失败只记日志（个别环境无托栏），不影响主流程。
-pub fn create_tray(app: &AppHandle) {
+/// 注册托盘。
+/// 返回值 = 托盘是否可用：失败（Linux GNOME 无托盘扩展、无 StatusNotifier
+/// 宿主、菜单/图标构建失败等）时返回 false，调用方（lib.rs）需把主窗口的
+/// 关闭语义从「收进托盘」改成「直接退出」——没有托盘时藏窗口等于杀不掉。
+/// Windows/macOS 下托盘始终可用，实际走不到 false 分支。
+pub fn create_tray(app: &AppHandle) -> bool {
     let (menu, desktop_lyric, lock_lyric) = match build_menu(app) {
         Ok(v) => v,
         Err(e) => {
             log::error!("[tray] 菜单构建失败: {e}");
-            return;
+            return false;
         }
     };
     // 存进 state：菜单闭包拿不到这个变量，且歌词也能从主窗口/快捷键开关
@@ -158,7 +162,11 @@ pub fn create_tray(app: &AppHandle) {
         Some(icon) => builder.icon(icon.clone()).build(app),
         None => builder.build(app),
     };
-    if let Err(e) = result {
-        log::error!("[tray] 托盘创建失败: {e}");
+    match result {
+        Ok(_) => true,
+        Err(e) => {
+            log::error!("[tray] 托盘创建失败: {e}");
+            false
+        }
     }
 }

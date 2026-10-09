@@ -103,12 +103,17 @@ pub(crate) fn quality_str(q: &Quality) -> &str {
 
 // ---------- 组装 ----------
 
+/// 托盘是否注册成功。默认 true（Windows/macOS 托盘始终可用）；
+/// setup 里 create_tray 失败（Linux 无托盘宿主）时置 false，
+/// 主窗口的关闭语义随之从「收进托盘」切换为「直接退出」。
+static TRAY_READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
 pub fn run() {
     // 文件日志与 panic 钩子最先装：release 无控制台，之后所有 log:: 输出和
-    // panic 现场都要有落盘处（%APPDATA%/QuietMusic/logs，见 file_logger 模块注释）
-    file_logger::init(
-        std::env::var_os("APPDATA").map(|base| PathBuf::from(base).join("QuietMusic").join("logs")),
-    );
+    // panic 现场都要有落盘处（Windows: %APPDATA%/QuietMusic/logs；
+    // macOS: ~/Library/Logs/QuietMusic；Linux: $XDG_STATE_HOME/QuietMusic/logs，
+    // 见 app_paths::logs_root_from_env 与 file_logger 模块注释）
+    file_logger::init(crate::app_paths::logs_root_from_env());
     file_logger::install_panic_hook();
 
     tauri::Builder::default()
@@ -133,9 +138,13 @@ pub fn run() {
         // 系统通知（音频引擎自动切歌熔断时后台告知，audio::engine::notify_failure）
         .plugin(tauri_plugin_notification::init())
         .on_window_event(|window, event| {
-            // §4 关闭行为：点关闭 = 最小化到托盘，退出走托盘菜单
+            // §4 关闭行为：点关闭 = 最小化到托盘，退出走托盘菜单。
+            // 托盘不可用的环境（Linux GNOME 无托盘扩展等，setup 里
+            // create_tray 返回 false 时置 TRAY_READY=false）没有「藏起来」
+            // 这一说——收进托盘等于再也找不到，所以放行真关闭退出。
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if window.label() == "main" {
+                if window.label() == "main" && TRAY_READY.load(std::sync::atomic::Ordering::Acquire)
+                {
                     // 统计（STATS_DESIGN §4.1）：收进托盘 = 一轮 show→hide 结束，
                     // 让前端结算停留时长并冲队列
                     let _ = window.emit("stat_window_hidden", ());
@@ -171,14 +180,19 @@ pub fn run() {
                 db.clone(),
             );
 
-            // 系统媒体控制（Windows SMTC）：系统媒体面板 + 硬件媒体键 / 蓝牙耳机按键。
-            // 需要主窗口 HWND；取不到（异常环境）就静默降级，不影响播放。
-            #[cfg(target_os = "windows")]
+            // 系统媒体控制（Windows SMTC / Linux MPRIS / macOS 正在播放）：
+            // 系统媒体面板 + 硬件媒体键 / 蓝牙耳机按键。需要主窗口 HWND 的只有
+            // Windows（SMTC 绑定窗口），其他平台忽略；取不到或初始化失败就
+            // 静默降级，不影响播放。
+            #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
             {
+                #[cfg(target_os = "windows")]
                 let hwnd = handle
                     .get_webview_window("main")
                     .and_then(|w| w.hwnd().ok())
                     .map(|h| h.0 as isize);
+                #[cfg(not(target_os = "windows"))]
+                let hwnd = Some(0isize);
                 match hwnd {
                     Some(raw) => {
                         if let Some(h) = smtc::init(raw, handle.clone(), engine.clone()) {
@@ -248,7 +262,15 @@ pub fn run() {
                 }
             }
 
-            tray::create_tray(&handle);
+            // 托盘注册：失败（Linux GNOME 无托盘扩展、无 StatusNotifier 宿主等）
+            // 不能只记日志——「点关闭 = 收进托盘」的关闭语义在没有托盘时等于
+            // 用户没有任何退出入口（主窗口藏起来后只能 kill）。因此托盘没建成
+            // 时改主窗口关闭语义为直接退出（见 on_window_event 的 tray_ready）。
+            let tray_ok = tray::create_tray(&handle);
+            if !tray_ok {
+                log::warn!("[tray] 托盘不可用，主窗口关闭将直接退出应用");
+                TRAY_READY.store(false, std::sync::atomic::Ordering::Release);
+            }
             shortcuts::register_shortcuts(&handle, &keymap);
 
             // 恢复上次开启的桌面歌词窗口（§4.2 位置记忆；失败不影响主流程）

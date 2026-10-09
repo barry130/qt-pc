@@ -27,7 +27,9 @@
   "platform": {
     "android": 1101,
     "ios": 1102,
-    "windows": 1103
+    "windows": 1103,
+    "linux": 1104,
+    "macos": 1105
   },
   "devServer": {
     "port": 1420,

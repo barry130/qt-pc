@@ -51,9 +51,12 @@ export function useFramelessWindow(): void {
         const e = ev as MouseEvent;
         if (e.button !== 0) return;
         e.preventDefault();
+        // macOS/WKWebView 的 tao 后端不支持 startResizeDragging（返回
+        // NotSupported），失败静默——macOS 装饰窗由系统管理 resize，
+        // 不会走到这里；这里兜的是 Linux 桌面边缘命中区。
         void getCurrentWindow()
           .startResizeDragging(dir)
-          .catch((err) => console.error("startResizeDragging failed", err));
+          .catch(() => {});
       };
       el.addEventListener("mousedown", onMousedown);
       handlers.push(() => el.removeEventListener("mousedown", onMousedown));

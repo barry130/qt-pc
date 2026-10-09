@@ -32,7 +32,7 @@ export interface FeedbackItem {
   os: string;
   /** App 版本 */
   appVersion: string;
-  /** 平台：windows | android | ios */
+  /** 平台：windows | linux | macos | android | ios */
   platform: string;
   createTime: string;
   updateTime: string;

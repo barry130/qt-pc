@@ -1,7 +1,12 @@
 name: Release
 
-# 打 tag（v*）才发版：构建 NSIS 安装包 → ed25519 签名 → 创建 GitHub Release。
-# 普通 push 只跑 ci.yml 的测试门，不出包。
+# 打 tag（v*）才发版：三平台构建 → ed25519 签名（仅 Windows 自装更新用）→
+# 上传 GitHub Release。普通 push 只跑 ci.yml 的测试门，不出包。
+# 产物分工：
+#   - Windows：NSIS 安装包（应用内自装更新链路，ed25519 签名 + .sig）
+#   - Linux：deb + AppImage（无应用内自装，浏览器下载手动安装）
+#   - macOS：dmg（无签名无公证：首次打开右键 → 打开，或
+#     xattr -dr com.apple.quarantine QuietMusic.app）
 # 前置一次性配置（见 docs/PACKAGING.md「自动发版」）：
 #   仓库 secret QT_UPDATE_SIGNING_KEY = .signing/ed25519.key 的 base64
 on:
@@ -12,8 +17,9 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    name: 构建 + 签名 + 发布
+  # ---------- Windows：NSIS 安装包 + ed25519 签名（不变的主链路） ----------
+  windows:
+    name: Windows NSIS 构建 + 签名 + 发布
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -94,16 +100,96 @@ jobs:
           $notes = @"
           ## 安装包信息（建后端更新记录用）
 
-          - 下载地址：$url
+          - Windows NSIS 下载地址：$url
           - MD5：$hash
           - fileSize：$size
+          - Linux/macOS 产物见附件（无应用内自装，浏览器下载手动安装）
+
+          ### macOS 未公证说明
+
+          首次打开：右键 App → 「打开」→ 再点「打开」（仅首次）；或终端执行
+          `xattr -dr com.apple.quarantine /Applications/QuietMusic.app`
           "@
           Set-Content -Path release-notes.md -Value $notes
           # 同一个 tag 重新发布（例如重指 tag 后重跑）时，旧 Release 已存在会让 create 以
           # already_exists 失败；先删掉同名 Release 再重建（--cleanup-tag=false 保留 tag 本身）。
+          # Windows 是三平台里唯一「建 Release」的 job，其余平台只 upload。
           $existing = gh release view $env:TAG --json id --jq ".id" 2>$null
           if ($LASTEXITCODE -eq 0 -and $existing) {
             Write-Host "Release $env:TAG 已存在（id=$existing），先删除再重建"
             gh release delete $env:TAG --yes --cleanup-tag=false
           }
           gh release create $env:TAG "$env:INSTALLER" "$env:INSTALLER.sig" --notes-file release-notes.md --generate-notes --title "轻听 $($env:TAG.TrimStart('v'))"
+
+  # ---------- Linux：deb + AppImage ----------
+  linux:
+    name: Linux deb + AppImage
+    runs-on: ubuntu-22.04
+    needs: windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev libasound2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Build (deb + appimage)
+        run: pnpm exec tauri build --runner cargo --bundles deb,appimage
+
+      - name: 上传到 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls src-tauri/target/release/bundle/
+          gh release upload "$TAG" src-tauri/target/release/bundle/deb/*.deb \
+            src-tauri/target/release/bundle/appimage/*.AppImage --clobber
+
+  # ---------- macOS：dmg（无签名 / 无公证） ----------
+  macos:
+    name: macOS dmg（无公证）
+    runs-on: macos-14
+    needs: windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Build (app + dmg)
+        run: pnpm exec tauri build --runner cargo --bundles app,dmg
+
+      # 不做 Developer ID 签名 / 公证（决策：不公签）。
+      # tauri build 对 macOSPrivateApi 构建会自动做 ad-hoc 签名
+      # （codesign -）；本地运行前如遇 Gatekeeper 拦截，见 Release 说明。
+      - name: 上传到 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls src-tauri/target/release/bundle/
+          gh release upload "$TAG" src-tauri/target/release/bundle/dmg/*.dmg --clobber

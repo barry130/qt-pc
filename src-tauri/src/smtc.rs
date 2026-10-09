@@ -1,13 +1,18 @@
-//! Windows 系统媒体控制（SMTC）与硬件媒体键。
+//! 系统媒体控制与硬件媒体键（Windows SMTC / Linux MPRIS / macOS 正在播放）。
 //!
-//! 把当前曲目 / 播放状态投到系统媒体面板（Win+G、锁屏、音量浮层），
-//! 并接收键盘媒体键、蓝牙耳机按键、系统面板的播放 / 暂停 / 上下曲。
+//! 把当前曲目 / 播放状态投到系统媒体面板（Win+G、锁屏、音量浮层 / KDE GNOME
+//! 媒体小部件 / 菜单栏正在播放），并接收键盘媒体键、蓝牙耳机按键、系统面板的
+//! 播放 / 暂停 / 上下曲。三平台后端统一由 souvlaki 抽象：
+//! - Windows：SMTC（需要窗口 HWND）；
+//! - Linux：MPRIS D-Bus（zbus，dbus_name 即总线路径 com.qt.quietmusic）；
+//! - macOS：MPNowPlayingInfoCenter（无需 HWND）。
 //!
-//! 线程模型：`MediaControls` 持有 COM 对象、非 Send，只能在创建它的线程使用，
-//! 因此这里开一条专属线程持有它，主链路通过无界 channel 投递状态更新；
-//! 事件回调只做一件事 —— 往音频引擎发命令。
+//! 线程模型：`MediaControls` 非 Send，只能在创建它的线程使用，因此这里开一条
+//! 专属线程持有它，主链路通过无界 channel 投递状态更新；事件回调只做一件事 ——
+//! 往音频引擎发命令。
 //!
-//! 非 Windows 平台整体降级为空实现（`init` 返回 None，调用方无分支）。
+//! 初始化失败（无 D-Bus 会话 / 非 App bundle 环境等）整体降级为空实现
+//! （`init` 返回 None，调用方无分支）。
 
 use std::time::Duration;
 
@@ -73,9 +78,10 @@ pub fn sync(handle: &Option<SmtcHandle>, st: &crate::audio::state::PlaybackState
     });
 }
 
-/// 初始化系统媒体控制。返回 None 表示不可用（非 Windows / 初始化失败），
+/// 初始化系统媒体控制。返回 None 表示不可用（初始化失败 / 线程起不来），
 /// 调用方无需处理，功能整体静默降级。
-#[cfg(target_os = "windows")]
+/// hwnd 仅 Windows 使用（SMTC 绑定窗口）；其他平台忽略。
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 pub fn init(
     hwnd: isize,
     app: tauri::AppHandle,
@@ -85,15 +91,24 @@ pub fn init(
     let spawned = std::thread::Builder::new()
         .name("smtc".into())
         .spawn(move || {
-            // WinRT 激活工厂要求线程先初始化 COM（MTA 即可）
+            // WinRT 激活工厂要求线程先初始化 COM（MTA 即可）——仅 Windows 需要
+            #[cfg(target_os = "windows")]
             unsafe {
                 co_initialize_mta();
             }
 
+            // 非 Windows：hwnd 参数只为统一签名，MPRIS / macOS 后端不用它
+            #[cfg(not(target_os = "windows"))]
+            let _ = hwnd;
+
             let mut controls = match souvlaki::MediaControls::new(souvlaki::PlatformConfig {
                 display_name: "轻听",
                 dbus_name: "com.qt.quietmusic",
+                // SMTC 需要窗口句柄；MPRIS / macOS 后端忽略该字段
+                #[cfg(target_os = "windows")]
                 hwnd: Some(hwnd as *mut std::ffi::c_void),
+                #[cfg(not(target_os = "windows"))]
+                hwnd: None,
             }) {
                 Ok(c) => c,
                 Err(e) => {
@@ -127,7 +142,8 @@ pub fn init(
     }
 }
 
-#[cfg(not(target_os = "windows"))]
+/// 非 Windows / Linux / macOS 的其他目标（当前不存在，防御性兜底）
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 pub fn init(
     _hwnd: isize,
     _app: tauri::AppHandle,
@@ -136,7 +152,7 @@ pub fn init(
     None
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 fn apply(
     controls: &mut souvlaki::MediaControls,
     cmd: SmtcCommand,
@@ -187,7 +203,7 @@ fn apply(
     }
 }
 
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 fn handle_event(
     engine: &crate::audio::engine::AudioEngine,
     app: &tauri::AppHandle,
@@ -231,7 +247,7 @@ fn handle_event(
 }
 
 /// 相对当前位置快进 / 快退，结果夹在 0..时长之间。
-#[cfg(target_os = "windows")]
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 fn seek_by(
     engine: &crate::audio::engine::AudioEngine,
     dir: souvlaki::SeekDirection,

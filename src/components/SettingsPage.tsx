@@ -195,7 +195,7 @@ function DesktopLyricSection(): React.JSX.Element {
       </SettingRow>
       <SettingRow
         title="锁定歌词位置"
-        description="锁定后不能拖动窗口、鼠标点击穿透到下层窗口（歌词只读展示），并隐藏歌词工具条防止误触；解锁走托盘菜单勾选、这里或快捷键 Ctrl+Alt+K"
+        description="锁定后不能拖动窗口、鼠标点击穿透到下层窗口（歌词只读展示），并隐藏歌词工具条防止误触；解锁走托盘菜单勾选、这里或快捷键 Ctrl+Alt+K（无托盘的环境走这里或快捷键）"
       >
         <Switch
           checked={state.locked}
@@ -510,7 +510,7 @@ function AppearanceSection(): React.JSX.Element {
           </button>
         </div>
       )}
-      <SettingRow title="亮暗模式" description="深色 / 浅色，或跟随 Windows 系统设置">
+      <SettingRow title="亮暗模式" description="深色 / 浅色，或跟随系统设置">
         <div className="flex overflow-hidden rounded-md border border-border">
           {MODE_OPTIONS.map((opt) => (
             <button
@@ -1200,7 +1200,7 @@ function GeneralSection(): React.JSX.Element {
 
   return (
     <div className="max-w-xl divide-y divide-border">
-      <SettingRow title="开机自启" description="登录 Windows 后自动启动轻听（收起在托盘）">
+      <SettingRow title="开机自启" description="登录系统后自动启动轻听（收起在托盘）">
         {autostart === null ? (
           <span className="text-xs text-muted-foreground">…</span>
         ) : (

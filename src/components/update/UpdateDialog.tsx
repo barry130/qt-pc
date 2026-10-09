@@ -9,7 +9,13 @@ import { useUpdateStore } from "@/stores/update";
  * - 发现新版本 → 版本号 + 更新说明 + 文件大小；
  * - 「立即更新」：解析加速直链 → 下载（进度条）→ 校验 → 启动安装器；
  * - 强制更新没有「暂不」；浏览器下载（browserUrl）始终可选。
+ * - 应用内自装目前仅 Windows（NSIS 安装器 + /UPDATE 就地覆盖）；Linux/macOS
+ *   没有「下载完直接装」的机制，隐藏「立即更新」、只留浏览器下载。
  */
+function supportsInAppUpdate(): boolean {
+  // 与 Rust 侧 cmd_run_update_installer 的 cfg 门控保持一致
+  return typeof navigator !== "undefined" && /Windows/i.test(navigator.userAgent);
+}
 export function UpdateDialog(): React.JSX.Element | null {
   const info = useUpdateStore((s) => s.info);
   const dismissed = useUpdateStore((s) => s.dismissed);
@@ -125,7 +131,7 @@ export function UpdateDialog(): React.JSX.Element | null {
                   暂不更新
                 </button>
               )}
-              {info.browserUrl && info.browserUrl.length > 0 && (
+              {(info.browserUrl?.length > 0 || !supportsInAppUpdate()) && (
                 <button
                   type="button"
                   onClick={() => void openBrowser()}
@@ -134,13 +140,15 @@ export function UpdateDialog(): React.JSX.Element | null {
                   浏览器下载
                 </button>
               )}
-              <button
-                type="button"
-                onClick={() => void startDownload()}
-                className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90"
-              >
-                立即更新
-              </button>
+              {supportsInAppUpdate() && (
+                <button
+                  type="button"
+                  onClick={() => void startDownload()}
+                  className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90"
+                >
+                  立即更新
+                </button>
+              )}
             </>
           )}
           {phase === "done" && (

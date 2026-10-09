@@ -104,3 +104,23 @@ RUN mkdir -p /root/.cache/tauri/NSIS/Plugins/x86-unicode/additional \
         https://github.com/tauri-apps/nsis-tauri-utils/releases/download/nsis_tauri_utils-v0.5.3/nsis_tauri_utils.dll \
       && echo "nsis_tauri_utils.dll 预热完成") \
      || echo "警告：nsis_tauri_utils.dll 预热失败，构建阶段会自行下载"
+
+# --- Linux 原生构建依赖（deb / AppImage） ---
+# 同一镜像也承担 Linux 原生包构建（见 .cnb.yml 的 v* 流水线）：
+#   libwebkit2gtk-4.1-dev : Tauri 的 WebKitGTK 4.1 绑定（gtk3 + soup3）
+#   libgtk-3-dev          : 窗口/菜单运行时开发头
+#   libayatana-appindicator3-dev : 托盘（tray-icon 的 libappindicator 后端，已装）
+#   librsvg2-dev          : 图标渲染（AppImage / deb 的 hicolor 图标）
+#   libasound2-dev        : ALSA（cpal 的 Linux 音频后端）
+#   file / patchelf       : AppImage 打包工具链要用的检查/改 ELF 解释器
+# 基线 messense/cargo-xwin 是 debian trixie，包名按 trixie 校验。
+# AppImage 的 linuxdeploy / appimagetool 由 tauri-bundler 自动下载到
+# ~/.cache/tauri，容器里不用预装。
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      libwebkit2gtk-4.1-dev libgtk-3-dev \
+      libayatana-appindicator3-dev librsvg2-dev libasound2-dev \
+      file patchelf \
+ && rm -rf /var/lib/apt/lists/* \
+ && pkg-config --modversion webkit2gtk-4.1 gtk+-3.0 \
+ && rustup target add x86_64-unknown-linux-gnu

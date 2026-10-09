@@ -962,6 +962,7 @@ pub async fn cmd_download_update_file(
 /// - 启动后延时退出：安装器会检测 `quietmusic.exe` 是否在运行，运行中就弹
 ///   「Click OK to kill it」；同时运行中的 exe 会锁住自己要覆盖的文件。
 ///   延时是为了让前端先把「正在退出」渲染出来，再走正常退出流程（含托盘/清理）。
+#[cfg(target_os = "windows")]
 #[tauri::command(rename = "run_update_installer")]
 pub async fn cmd_run_update_installer(app: tauri::AppHandle, path: String) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
@@ -999,11 +1000,24 @@ pub async fn cmd_run_update_installer(app: tauri::AppHandle, path: String) -> Re
     Ok(())
 }
 
+/// 非 Windows（Linux/macOS）：应用内自装安装器是 NSIS `.exe` 专用的
+/// （`/UPDATE` 静默覆盖 + CREATE_NO_WINDOW）。Linux/macOS 的更新策略是
+/// 浏览器下载（AppImage/deb/dmg 手动覆盖），不走本命令。
+#[cfg(not(target_os = "windows"))]
+#[tauri::command(rename = "run_update_installer")]
+pub async fn cmd_run_update_installer(
+    _app: tauri::AppHandle,
+    _path: String,
+) -> Result<(), String> {
+    Err("当前平台不支持应用内自动安装，请从下载页手动更新".to_string())
+}
+
 /// 用系统默认浏览器打开链接（更新页 browserUrl 兜底）。
 ///
 /// 原来走 `cmd /C start "" <url>`：URL 是被**拼进命令行**的，`&`、`^`、引号都能
 /// 变成第二条命令（命令注入）。改用 `ShellExecuteW` 直接调 ShellExecute，
 /// 不经过任何 shell；同时把协议收敛到 http/https（挡掉 `file:` / 自定义协议）。
+/// 非 Windows 走 `xdg-open` / `open`，argv 传参同样不经过 shell，无注入面。
 #[tauri::command(rename = "run_update_browser")]
 pub async fn cmd_run_update_browser(url: String) -> Result<(), String> {
     let target = crate::net_guard::ensure_http_url(&url)?;
@@ -1038,8 +1052,19 @@ pub async fn cmd_run_update_browser(url: String) -> Result<(), String> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = target;
-        Err("当前平台未实现「用默认浏览器打开链接」".to_string())
+        #[cfg(target_os = "macos")]
+        let program = "open";
+        #[cfg(target_os = "macos")]
+        let open_fail = "open 命令失败";
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let program = "xdg-open";
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let open_fail = "xdg-open 命令失败（桌面环境可能未安装 xdg-utils）";
+        std::process::Command::new(program)
+            .arg(&target)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("打开浏览器失败（{open_fail}）：{e}"))
     }
 }
 
@@ -2982,6 +3007,11 @@ fn explorer_select_arg(path: &str) -> String {
 
 /// 在系统文件管理器中定位文件（Windows 用 `explorer /select,`）。
 /// 文件不存在直接返回 Err，由调用方给出可读提示；下载管理与本地曲库共用。
+/// - macOS：`open -R`（Finder 打开父目录并选中该文件）。
+/// - Linux：优先走 D-Bus `org.freedesktop.FileManager1.ShowItems`（GNOME Files /
+///   Dolphin 等都实现了该接口，效果与 explorer /select 等价）；接口不在时
+///   回落 `xdg-open` 打开父目录（不选中，但至少能到地方）。路径按 RFC 3986
+///   做最小转义（空格、`#`、`?`、`%` 会破坏 file:// URI 解析）。
 fn reveal_in_file_manager(path: &str) -> Result<(), String> {
     if !std::path::Path::new(path).exists() {
         return Err("文件已不存在（可能被移动或删除）".to_string());
@@ -2994,7 +3024,62 @@ fn reveal_in_file_manager(path: &str) -> Result<(), String> {
             .spawn()
             .map_err(|e| format!("打开资源管理器失败: {e}"))?;
     }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg("-R")
+            .arg(path)
+            .spawn()
+            .map_err(|e| format!("打开 Finder 失败: {e}"))?;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let uri = format!("file://{}", percent_encode_path(path));
+        let shown = std::process::Command::new("dbus-send")
+            .args([
+                "--session",
+                "--print-reply",
+                "--dest=org.freedesktop.FileManager1",
+                "--type=method_call",
+                "/org/freedesktop/FileManager1",
+                "org.freedesktop.FileManager1.ShowItems",
+            ])
+            .arg(format!("array:string:{uri}"))
+            .arg("string:")
+            .output();
+        match shown {
+            Ok(out) if out.status.success() => {}
+            _ => {
+                // FileManager1 不在（无桌面文件管理器接该接口）：打开父目录兜底
+                let parent = std::path::Path::new(path)
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+                std::process::Command::new("xdg-open")
+                    .arg(&parent)
+                    .spawn()
+                    .map_err(|e| format!("打开文件管理器失败: {e}"))?;
+            }
+        }
+    }
+    #[allow(unused_variables)]
     Ok(())
+}
+
+/// Linux file:// URI 的最小百分号转义：只转义会破坏 URI 结构的字符，
+/// 保留 UTF-8 原文（D-Bus 与文件管理器都按 UTF-8 解析）。
+#[cfg(target_os = "linux")]
+fn percent_encode_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for ch in path.chars() {
+        match ch {
+            ' ' | '#' | '?' | '%' | '"' | '\\' | '<' | '>' | '{' | '}' | '|' | '^' | '`' => {
+                out.push_str(&format!("%{:02X}", ch as u32));
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// 打开日志文件夹（设置页「通用 → 诊断」用；运维排查的入口）。
@@ -3016,8 +3101,19 @@ pub async fn cmd_reveal_logs() -> Result<(), String> {
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = &dir;
-        Err("仅支持 Windows".to_string())
+        #[cfg(target_os = "macos")]
+        let program = "open";
+        #[cfg(target_os = "macos")]
+        let open_fail = "open 命令失败";
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let program = "xdg-open";
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        let open_fail = "xdg-open 命令失败（桌面环境可能未安装 xdg-utils）";
+        std::process::Command::new(program)
+            .arg(&dir)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("打开日志文件夹失败（{open_fail}）：{e}"))
     }
 }
 

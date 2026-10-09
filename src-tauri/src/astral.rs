@@ -203,14 +203,20 @@ pub const DEV_BASE_URL: &str = crate::app_config::DEV_BASE_URL;
 pub const DEFAULT_BASE_URL: &str = crate::app_config::DEFAULT_BASE_URL;
 
 /// 更新 / 消息 / 统计的平台固定参数（§15.2）
-/// UPDATE_TYPE 取 app.config.json 的 platform.windows（1103 = Windows）
+/// UPDATE_TYPE 按编译目标从 app.config.json 的 platform 段取值
+/// （1103 = Windows / 1104 = Linux / 1105 = macOS，见 app_config.rs 生成注释）
 pub const UPDATE_TYPE: &str = crate::app_config::UPDATE_TYPE;
 pub const MESSAGE_CHANNEL: &str = "pc";
-/// 统一客户端平台标识 = 请求头 `X-App-Ut` 的值。
+/// 统一客户端平台标识 = 请求头 `X-App-Ut` 的值，按编译目标三选一。
 /// 与后端 `stat_platform` 字典、App 端的 `app-android` / `app-ios`、Web 端的 `web` 同源
 /// （契约见后端 `com.astral.common.util.ClientHeaders`）：
 /// 统计上报事件的 `ut` 字段与每个请求的 `X-App-Ut` 头都用它，两处不会漂移。
+#[cfg(target_os = "windows")]
 pub const CLIENT_UT: &str = "app-windows";
+#[cfg(target_os = "linux")]
+pub const CLIENT_UT: &str = "app-linux";
+#[cfg(target_os = "macos")]
+pub const CLIENT_UT: &str = "app-macos";
 
 // ---------- 统一客户端系统头 ----------
 // 凡请求 astral 后端都必须携带这 4 个头，服务端两条链路共用：
@@ -224,7 +230,7 @@ pub const HDR_CLIENT_UT: &str = "X-App-Ut";
 pub const HDR_CLIENT_VERSION: &str = "X-App-Version";
 /// 设备头名（值 = 本机主机名）
 pub const HDR_CLIENT_DEVICE: &str = "X-Device";
-/// 系统头名（值 = Windows 版本描述）
+/// 系统头名（值 = 当前系统描述：Windows 完整版本 / Linux 发行版 / macOS 版本）
 pub const HDR_CLIENT_OS: &str = "X-OS";
 
 /// 设备名长度上限（与 sys_feedback.device 列宽一致）
@@ -1508,7 +1514,7 @@ impl AstralClient {
         .await
     }
 
-    // ---------- 统计（§15.4）：ut 固定 app-windows，单批 ≤200 ----------
+    // ---------- 统计（§15.4）：ut 固定为本编译目标的 CLIENT_UT，单批 ≤200 ----------
 
     pub async fn report_stats(&self, mut events: Vec<Value>) -> Result<(), String> {
         if events.len() > 200 {
@@ -1693,10 +1699,59 @@ fn os_description() -> String {
     clip(&out, MAX_OS_LEN)
 }
 
-/// 非 Windows 平台（本项目只发布 Windows 版，这里保证可编译、不返回空）
+/// 非 Windows 平台的系统描述（Linux 读 /etc/os-release 的 PRETTY_NAME，
+/// 如 "Ubuntu 24.04.1 LTS"；macOS 读 sw_vers 的产品名 + 版本，如 "macOS 15.1"）。
+/// 都拿不到时退化为 std::env::consts::OS（"linux" / "macos"）。
 #[cfg(not(target_os = "windows"))]
 fn os_description() -> String {
-    clip(std::env::consts::OS, MAX_OS_LEN)
+    let raw = os_description_raw();
+    clip(&raw, MAX_OS_LEN)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn os_description_raw() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        // PRETTY_NAME 行形如：PRETTY_NAME="Ubuntu 24.04.1 LTS"
+        if let Ok(text) = std::fs::read_to_string("/etc/os-release") {
+            for line in text.lines() {
+                if let Some(value) = line.strip_prefix("PRETTY_NAME=") {
+                    let value = value.trim().trim_matches('"');
+                    if !value.is_empty() {
+                        return value.to_string();
+                    }
+                }
+            }
+        }
+        std::env::consts::OS.to_string()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // sw_vers 输出两行：ProductName: macOS\nProductVersion: 15.1
+        let product = std::process::Command::new("sw_vers")
+            .arg("-productName")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let version = std::process::Command::new("sw_vers")
+            .arg("-productVersion")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        match (product.is_empty(), version.is_empty()) {
+            (false, false) => format!("{product} {version}"),
+            (false, true) => product,
+            _ => std::env::consts::OS.to_string(),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        std::env::consts::OS.to_string()
+    }
 }
 
 /// 统一客户端系统头，进程内只算一次（设备名与系统版本在运行期不变）。
@@ -1818,10 +1873,24 @@ mod tests {
     }
 
     #[test]
-    fn stat_events_are_forced_to_windows_ut() {
-        // 不起真实请求：只验证常量与构造路径
-        assert_eq!(CLIENT_UT, "app-windows");
-        assert_eq!(UPDATE_TYPE, "1103");
+    fn stat_events_are_forced_to_platform_ut() {
+        // 不起真实请求：只验证常量与构造路径。
+        // 常量按编译目标三选一，断言与定义同源（cfg 一致就不会错）。
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(CLIENT_UT, "app-windows");
+            assert_eq!(UPDATE_TYPE, "1103");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(CLIENT_UT, "app-linux");
+            assert_eq!(UPDATE_TYPE, "1104");
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(CLIENT_UT, "app-macos");
+            assert_eq!(UPDATE_TYPE, "1105");
+        }
         assert_eq!(MESSAGE_CHANNEL, "pc");
         let events =
             vec![serde_json::json!({ "evt": "launcher", "ts": 1, "deviceId": "d", "ut": "x" })];
@@ -1829,7 +1898,7 @@ mod tests {
         for evt in events.iter_mut() {
             evt["ut"] = Value::String(CLIENT_UT.to_string());
         }
-        assert_eq!(events[0]["ut"], "app-windows");
+        assert_eq!(events[0]["ut"], CLIENT_UT);
     }
 
     #[test]
@@ -1843,14 +1912,16 @@ mod tests {
                 .find(|(k, _)| *k == name)
                 .map(|(_, v)| v.as_str())
         };
-        assert_eq!(get(HDR_CLIENT_UT), Some("app-windows"));
+        // 常量与编译目标绑定，断言与定义同源（cfg 一致就不会错）
+        assert_eq!(get(HDR_CLIENT_UT), Some(CLIENT_UT));
         assert_eq!(get(HDR_CLIENT_VERSION), Some(version_name()));
         // 主机名按机器而异：只要求在能取到时非空且不超列宽
         if let Some(device) = get(HDR_CLIENT_DEVICE) {
             assert!(!device.is_empty());
             assert!(device.chars().count() <= MAX_DEVICE_LEN);
         }
-        // 系统描述：必须能取到（最差也是 "Windows"），且不超列宽
+        // 系统描述：必须能取到（Windows 最差也是 "Windows"；非 Windows 最差是
+        // consts::OS），且不超列宽
         let os = get(HDR_CLIENT_OS).expect("X-OS 不应缺失");
         assert!(!os.is_empty());
         assert!(os.chars().count() <= MAX_OS_LEN, "X-OS 超长: {os}");

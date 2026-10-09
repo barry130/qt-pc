@@ -64,7 +64,7 @@ pub const IDENTIFIER: &str = "${c.product.identifier}";
 
 /// 对外版本名（安装包 / 关于页 / 升级接口）
 pub const VERSION_NAME: &str = "${c.version.name}";
-/// 升级接口比对用的版本号（后端 type=1103 的 version 参数）
+/// 升级接口比对用的版本号（后端按平台 type 下发的 version 参数）
 pub const VERSION_CODE: i64 = ${c.version.code};
 
 /// 宿主契约版本（音源包与本机的接口版本，两端同步抬高）
@@ -77,8 +77,14 @@ pub const PROD_BASE_URL: &str = "${c.backend.prod}";
 /// 当前生效的后端地址：由 app.config.json 的 \`backend.active\` 决定（${c.backend.active}）
 pub const DEFAULT_BASE_URL: &str = ${active};
 
-/// 更新接口的平台号（1103 = Windows）
+/// 更新接口的平台号，按编译目标三选一
+/// （${c.platform.windows} = Windows / ${c.platform.linux} = Linux / ${c.platform.macos} = macOS）
+#[cfg(target_os = "windows")]
 pub const UPDATE_TYPE: &str = "${c.platform.windows}";
+#[cfg(target_os = "linux")]
+pub const UPDATE_TYPE: &str = "${c.platform.linux}";
+#[cfg(target_os = "macos")]
+pub const UPDATE_TYPE: &str = "${c.platform.macos}";
 
 #[cfg(test)]
 mod tests {
@@ -110,10 +116,20 @@ mod tests {
         );
         assert_eq!(s(&c["backend"]["dev"]), super::DEV_BASE_URL);
         assert_eq!(s(&c["backend"]["prod"]), super::PROD_BASE_URL);
+        // UPDATE_TYPE 按编译目标三选一：断言当前目标对应的 JSON 值与常量相等
+        let platform_key = if cfg!(target_os = "windows") {
+            "windows"
+        } else if cfg!(target_os = "linux") {
+            "linux"
+        } else if cfg!(target_os = "macos") {
+            "macos"
+        } else {
+            panic!("不支持的目标平台：UPDATE_TYPE 未定义");
+        };
         assert_eq!(
-            c["platform"]["windows"].as_i64().unwrap().to_string(),
+            c["platform"][platform_key].as_i64().unwrap().to_string(),
             super::UPDATE_TYPE,
-            "UPDATE_TYPE 必须等于 platform.windows（JSON 里是数字，Rust 侧是字符串）"
+            "UPDATE_TYPE 必须等于 platform.{platform_key}（JSON 里是数字，Rust 侧是字符串）"
         );
     }
 

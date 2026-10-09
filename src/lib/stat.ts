@@ -6,7 +6,8 @@ import * as ipc from "@/services/ipc";
  *
  * 后端契约：POST /api/v1/app/stat/report（匿名免登录），事件字段见后端 StatEventDTO：
  * evt/ts/deviceId/appVersion/model/os/page/duration/ch/errorType/message/stack/release/extra。
- * ut 不用客户端管——Rust 侧 report_stats 统一强制 app-windows。
+ * ut 不用客户端管——Rust 侧 report_stats 按编译目标强制
+ * app-windows / app-linux / app-macos（见 astral.rs CLIENT_UT）。
  *
  * 行为对齐移动端 qt-stat 插件（§7.1）：
  * - deviceId：localStorage 持久化的随机 UUID，禁止采集硬件标识；
@@ -51,7 +52,7 @@ let started = false;
 let ready: Promise<void> = Promise.resolve();
 let deviceId = "";
 let appVersion = "";
-let os = "Windows";
+let os = "Unknown";
 let queue: StatEvent[] = [];
 let attempts = 0;
 let inFlight = false;
@@ -82,12 +83,19 @@ function newDeviceId(): string {
   return `pc-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-/** Windows 版本从 UA 里粗解析；解析不出就给个宽泛值，仅作维度用 */
+/** OS 版本从 UA 里粗解析；解析不出就给个宽泛值，仅作维度用 */
 function osOf(ua: string): string {
-  const m = /Windows NT ([\d.]+)/.exec(ua);
-  if (!m) return "Windows";
-  // NT 10.0 同时覆盖 Win10/Win11（UA 不区分），够用作统计维度
-  return m[1].startsWith("10.") ? "Windows 10/11" : `Windows NT ${m[1]}`;
+  // 三平台 webview UA 都带平台关键字；Windows 顺带解析 NT 版本
+  // （NT 10.0 同时覆盖 Win10/Win11，UA 不区分，够用作统计维度）
+  const win = /Windows NT ([\d.]+)/.exec(ua);
+  if (win) return win[1].startsWith("10.") ? "Windows 10/11" : `Windows NT ${win[1]}`;
+  // macOS：WebKit UA 是 "Macintosh; Intel Mac OS X 10_15_7" 这种
+  const mac = /Mac OS X ([\d_.]+)/.exec(ua);
+  if (mac) return `macOS ${mac[1].replace(/_/g, ".")}`;
+  // Linux：WebKitGTK UA 就是裸 "X11; Linux x86_64"，没有发行版信息
+  if (/Linux/i.test(ua)) return "Linux";
+  // 兜底：老 webview / 隐私模式下的怪 UA
+  return "Unknown";
 }
 
 function baseEvent(evt: StatEvent["evt"]): StatEvent {
@@ -283,7 +291,7 @@ export function __resetStatForTest(): void {
   ready = Promise.resolve();
   deviceId = "";
   appVersion = "";
-  os = "Windows";
+  os = "Unknown";
   queue = [];
   attempts = 0;
   inFlight = false;

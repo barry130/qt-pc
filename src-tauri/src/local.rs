@@ -65,8 +65,11 @@ pub const EVENT_LIBRARY_SCAN_PROGRESS: &str = "library-scan-progress";
 ///
 /// 刻意**不**跳过 `target` / `build` / `dist` 这类通用词——它们有可能被用户
 /// 用来存放音乐（下载目录也常在 `target` 下），宁可多走几层也不误伤。
+///
+/// 跨平台补充（Linux/macOS）：按目录名匹配，无法区分「/proc」与用户自建的
+/// 「~/Music/proc」——用宽泛词名换实现简单，音乐目录极少与系统目录同名，可接受。
 const SKIP_DIR_NAMES: &[&str] = &[
-    // 系统 / 权限受限目录
+    // 系统 / 权限受限目录（Windows）
     "$recycle.bin",
     "system volume information",
     "$winreagent",
@@ -98,6 +101,28 @@ const SKIP_DIR_NAMES: &[&str] = &[
     "__pycache__",
     ".tox",
     ".next",
+    // Linux：/proc /sys /dev /run /boot /snap /flatpak —— 伪文件系统递归
+    // 无意义且可能极慢（/proc 尤甚），设备与运行态目录没有音乐。
+    "proc",
+    "procfs",
+    "sys",
+    "dev",
+    "run",
+    "boot",
+    "lost+found",
+    "snap",
+    "flatpak",
+    // macOS：/System /Library /private /Applications /cores 与卷元数据目录。
+    // "library" 也会跳过用户目录下的同名文件夹，同上可接受。
+    "system",
+    "library",
+    "private",
+    "applications",
+    "cores",
+    ".trash",
+    ".spotlight-v100",
+    ".fseventsd",
+    ".temporaryitems",
 ];
 
 /// 递归深度上限：防御 junction / symlink 造成的异常层级或环。
@@ -254,7 +279,8 @@ pub fn scan_dirs_with_progress(
     rows
 }
 
-/// 可扫描的盘符根目录（Windows 枚举 A:–Z: 中真实存在的盘；其他平台给出根目录）。
+/// 可扫描的盘符根目录（Windows 枚举 A:–Z: 中真实存在的盘；macOS 枚举
+/// `/Volumes` 下的挂载卷 + 根；Linux 给出根目录 + 用户家目录）。
 /// 用于本地曲库的「扫描整个磁盘」入口。
 #[cfg(target_os = "windows")]
 pub fn list_drives() -> Vec<String> {
@@ -264,9 +290,34 @@ pub fn list_drives() -> Vec<String> {
         .collect()
 }
 
-#[cfg(not(target_os = "windows"))]
+/// macOS：`/` + `/Volumes/*`（外接盘 / U 盘 / DMG 都挂在这里）。
+#[cfg(target_os = "macos")]
 pub fn list_drives() -> Vec<String> {
-    vec!["/".to_string()]
+    let mut roots = vec!["/".to_string()];
+    if let Ok(entries) = std::fs::read_dir("/Volumes") {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                let vol = format!("/Volumes/{name}");
+                if Path::new(&vol).is_dir() {
+                    roots.push(vol);
+                }
+            }
+        }
+    }
+    roots
+}
+
+/// Linux：根目录 + `$HOME`（音乐几乎总在家目录；/proc/mounts 解析留待后续按需）。
+#[cfg(target_os = "linux")]
+pub fn list_drives() -> Vec<String> {
+    let mut roots = vec!["/".to_string()];
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy().to_string();
+        if !home.is_empty() && !roots.contains(&home) {
+            roots.push(home);
+        }
+    }
+    roots
 }
 
 /// 组装入库行：优先 symphonia 元数据，缺失字段回落到文件名解析。

@@ -26,9 +26,12 @@ tauri-build = { version = "2", features = [] }
 indexmap = { version = "1.9", features = ["std"] }
 
 [dependencies]
-# 钉 2.12.0：tao 0.37 / windows 0.62 链条。taskbar.rs / lyric_window.rs 的
+# 钉 2.12.1：tao 0.37 / windows 0.62 链条。taskbar.rs / lyric_window.rs 的
 # Win32 调用已按 windows 0.62 适配；再升 tauri 时同样要连带评估 windows 依赖。
-tauri = { version = "=2.12.1", features = ["tray-icon"] }
+# macos-private-api：桌面歌词窗口 transparent(true) 在 macOS 需要
+# NSWindowPrivateApi（与 tauri.conf.json 的 app.macOSPrivateApi 配对，
+# 只影响 macOS 构建，Windows/Linux 忽略该特性）。
+tauri = { version = "=2.12.1", features = ["tray-icon", "macos-private-api"] }
 # 系统通知（Windows toast 等）：自动切歌熔断发生在后台，应用内错误条看不到
 tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
@@ -60,9 +63,15 @@ tauri-plugin-dialog = "2.7"
 tauri-plugin-single-instance = "2"
 # 开机自启（Windows 注册表 Run 键）
 tauri-plugin-autostart = "2"
-# Windows 系统媒体控制（SMTC）：系统媒体面板 + 硬件媒体键 / 蓝牙耳机按键。
-# 只有 Windows 会编译到 windows crate；Linux 的 dbus 后端用不到，关掉默认特性。
+# 系统媒体控制（Windows SMTC / Linux MPRIS / macOS 正在播放）：系统媒体面板 +
+# 硬件媒体键 / 蓝牙耳机按键。Windows 后端走 windows crate，无需特性；
+# Linux 的 MPRIS 后端必须显式开 dbus 或 zbus 之一（souvlaki 源码
+# platform/mpris/mod.rs 对两者皆缺时 compile_error!），这里选 use_zbus：
+# 纯 Rust，不引入 libdbus-1 系统库依赖，容器/发行版适配面最广。
 souvlaki = { version = "0.8.3", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+souvlaki = { version = "0.8.3", default-features = false, features = ["use_zbus"] }
 
 # Windows 任务栏缩略图工具栏（taskbar.rs）：ITaskbarList3::ThumbBarAddButtons +
 # GDI 现场生成图标 + 窗口过程替换接收按钮点击。

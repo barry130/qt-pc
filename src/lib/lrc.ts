@@ -243,7 +243,7 @@ export function formatTime(ms: number): string {
  * picUrl → 封面代理 URL（Rust 代取，CSP 不放开外部域名）。
  * 遵循 Tauri v2 自定义协议地址约定（与 convertFileSrc 一致）：
  * - Windows/WebView2 不认识自定义 scheme，必须用 http://qtres.localhost/<path>
- * - 其余平台为 qtres://localhost/<path>
+ * - Linux/WebKitGTK 与 macOS/WKWebView 均走自定义 scheme：qtres://localhost/<path>
  * Rust 侧 handle_qtres 对两种形式都用 uri().path() 解析，路径统一为 /cover/<base64url>。
  *
  * `px` 可选：目标边长（Rust 侧会按它向上游要缩略图，缺省 300 = 列表卡片 2×）。

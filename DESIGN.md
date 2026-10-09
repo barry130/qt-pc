@@ -1409,8 +1409,19 @@ CHAIN_BUDGET_MS 9s + CHAIN_GRACE_MS 250ms = 9250ms（链内预算，四端共用
 
 ## 8.1 数据目录
 
+根目录按平台取自系统数据目录，再固定拼一层 `QuietMusic/`（`src-tauri/src/app_paths.rs`）：
+
+| 平台 | 数据根 | 日志根 |
+|---|---|---|
+| Windows | `%APPDATA%/QuietMusic/` | 同左 `logs/` |
+| Linux | `$XDG_DATA_HOME/QuietMusic/`（缺省 `~/.local/share/QuietMusic/`） | `$XDG_STATE_HOME/QuietMusic/logs/`（缺省 `~/.local/state/QuietMusic/logs/`） |
+| macOS | `~/Library/Application Support/QuietMusic/` | `~/Library/Logs/QuietMusic/` |
+
+非 Windows 不使用 Tauri 的 `app_data_dir()`（那是 `<identifier>` 口径）也不用 `app_cache_dir()`
+（缓存目录会被系统清理，不能放数据库）；Windows 保留 3.0.3 之前 `LightListen` 旧目录的整目录改名迁移。
+
 ```text
-%APPDATA%/QuietMusic/
+<数据根>/
  ├─ data/
  │   └─ music.db
  ├─ cache/
