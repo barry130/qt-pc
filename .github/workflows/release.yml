@@ -117,13 +117,23 @@ jobs:
           node scripts/update-sign.mjs sign $exe
           node scripts/update-sign.mjs verify $exe
 
+      - name: 汇总产物到扁平目录
+        shell: pwsh
+        run: |
+          $dir = "src-tauri/target/${{ matrix.target }}/release/bundle/nsis"
+          New-Item -ItemType Directory -Force -Path dist-release | Out-Null
+          Copy-Item "$dir/*-setup.exe" dist-release/
+          Copy-Item "$dir/*-setup.exe.sig" dist-release/
+          Get-ChildItem dist-release | Format-Table Name, Length
+
       - name: 上传到 Release 暂存区（upload-artifact）
         uses: actions/upload-artifact@v4
         with:
           name: windows-${{ matrix.arch }}
-          path: |
-            src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe
-            src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe.sig
+          # 必须先汇到**扁平目录**再上传：upload-artifact 会按 path 各条目的公共
+          # 祖先目录保存结构，直接传 src-tauri/target/<target>/.../nsis/* 会带出
+          # 多余层级，publish 那边用 artifacts/*-setup.exe 就一个也匹配不到。
+          path: dist-release/*
           if-no-files-found: error
           retention-days: 7
 
@@ -157,13 +167,18 @@ jobs:
       - name: Build (deb + appimage)
         run: pnpm exec tauri build --runner cargo --bundles deb,appimage
 
+      - name: 汇总产物到扁平目录
+        run: |
+          mkdir -p dist-release
+          cp src-tauri/target/release/bundle/deb/*.deb dist-release/
+          cp src-tauri/target/release/bundle/appimage/*.AppImage dist-release/
+          ls -l dist-release/
+
       - name: 上传到 Release 暂存区（upload-artifact）
         uses: actions/upload-artifact@v4
         with:
           name: linux-amd64
-          path: |
-            src-tauri/target/release/bundle/deb/*.deb
-            src-tauri/target/release/bundle/appimage/*.AppImage
+          path: dist-release/*
           if-no-files-found: error
           retention-days: 7
 
@@ -199,11 +214,17 @@ jobs:
       # 又无 signingIdentity 时会**整段跳过**签名（bundle/macos/sign.rs 的
       # keychain() 返回 Ok(None)），不会自动 ad-hoc 签名 —— 产物是未签名的。
       # 用户首次打开按 Release 说明右键「打开」或清 quarantine 属性。
+      - name: 汇总产物到扁平目录
+        run: |
+          mkdir -p dist-release
+          cp src-tauri/target/release/bundle/dmg/*.dmg dist-release/
+          ls -l dist-release/
+
       - name: 上传到 Release 暂存区（upload-artifact）
         uses: actions/upload-artifact@v4
         with:
           name: macos-arm64
-          path: src-tauri/target/release/bundle/dmg/*.dmg
+          path: dist-release/*
           if-no-files-found: error
           retention-days: 7
 
@@ -229,6 +250,15 @@ jobs:
         run: |
           set -euo pipefail
           ls -l artifacts/
+          # 产物必须全部平铺在 artifacts/ 下。upload-artifact 会保留 path 的目录
+          # 结构，一旦某个构建 job 直接传 bundle 路径而不是扁平目录，这里就会出现
+          # artifacts/deb/xxx.deb 这种层级，下面的 artifacts/*.deb 全部匹配不到。
+          # 显式拦一道，别等发布完才发现少文件。
+          if [ -n "$(find artifacts -mindepth 1 -type d -print -quit)" ]; then
+            echo "::error::artifacts/ 下出现了子目录（产物没有扁平化）："
+            find artifacts -mindepth 1 -type d
+            exit 1
+          fi
           n_exe=$(ls artifacts/*-setup.exe 2>/dev/null | wc -l)
           n_sig=$(ls artifacts/*-setup.exe.sig 2>/dev/null | wc -l)
           n_deb=$(ls artifacts/*.deb 2>/dev/null | wc -l)
