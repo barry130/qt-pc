@@ -27,6 +27,14 @@
 # 齐了就逐个 GET https://github.com/<repo>/releases/download/<tag>/<name> 下载。
 # 超时默认 45 分钟（GitHub 上三平台矩阵构建 + 发布，实测 30~40 分钟）。
 #
+# 下载必须能扛住国内到 GitHub 的抖动
+# -----------------------------------
+# CNB 节点到 github.com 的 TCP 连接经常超时（undici 默认只有 10s 连接超时，
+# 失败时报 ConnectTimeoutError / fetch failed），中途断流也不会自己报错。所以
+# .cnb/fetch-github-release.mjs 里：每个产物最多重试 20 次（退避封顶 30s，且所有
+# 文件共享一个墙钟预算）、边下边报进度（CNB 有 10 分钟无输出超时）、90s 没进数据
+# 就主动 abort 重试、先写 .part 校验字节数再改名。
+#
 # 一次性准备（在 CNB 网页上做）
 # ----------------------------
 #   1. 仓库「设置」里确认已勾选「允许自动触发（云原生构建）」，否则 tag push 不触发流水线。

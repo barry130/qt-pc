@@ -64,4 +64,9 @@ src-tauri/icons/ios/
 *.corrupt
 gitee_search.json
 
+# CNB 镜像流水线的下载目录与资产清单（.cnb/fetch-github-release.mjs 在 CI 里生成；
+# 本地调试跑同一个脚本时也会落在仓库根目录）
+artifacts/
+asset-list.json
+
 tsconfig.tsbuildinfo

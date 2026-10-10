@@ -87,13 +87,17 @@ CNB 侧 `.cnb.yml` 的 `v*` 流水线**不再构建任何东西**，退化成镜
 ```powershell
 # 发版动作（版本号已在 app.config.json 改好并与 tag 一致，两侧工作流都会校验）
 git tag v1.1.3
-git push origin v1.1.3      # origin = GitHub，先起构建
-git push cnb   v1.1.3       # CNB 这边只是「等 GitHub → 镜像」，可以同时推
+git push origin v1.1.3      # origin 配了 GitHub + CNB 两个 pushurl，一条命令推两边
 ```
 
-两边流水线是独立触发的：GitHub 负责出包并发 Release，CNB 轮询到产物齐了才建
+两侧流水线是独立触发的：GitHub 负责出包并发 Release，CNB 轮询到产物齐了才建
 CNB Release。CNB 侧的等待窗口默认 45 分钟（`.cnb.yml` 里 `WAIT_SECONDS`），
 GitHub 构建超时的话把它调大。
+
+> `git remote -v` 里只有一个 `origin`，但它有两个 pushurl：
+> `https://github.com/barry130/qt-pc.git` 和 `https://cnb.cool/canace/qt-pc.git`，
+> 所以 `git push origin <tag>` 会同时推两个远端；没有名为 `cnb` 的 remote。
+> 推不动的时候先确认 `git config --get-all remote.origin.pushurl`。
 
 **一次性前置**（做一次就够）：把签名私钥的 base64 配进 **GitHub 仓库** secret：
 
