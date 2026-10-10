@@ -107,6 +107,15 @@ GitHub 构建超时的话把它调大。
 > 只想重跑某一侧（比如只想让 CNB 镜像重试、又不想让 GitHub 重构建一遍）时：
 > `git push https://cnb.cool/canace/qt-pc.git refs/tags/v1.1.3`。
 
+> **同一个 tag 想重跑，得先把它关联的 Release 删掉。** CNB 不允许删除已关联
+> Release 的 tag，推 tag 会被服务端挡回来：
+> `remote: Not allowed to delete tag v1.1.2 cause it associated with a Release.`
+> 所以重跑顺序是：网页上删掉该 tag 的 CNB Release → `git push <cnb> :refs/tags/<tag>`
+> → **等两分钟** → `git push <cnb> refs/tags/<tag>`（覆盖同一个 tag 不会重新触发
+> `tag_push`，必须先删后推；删完立刻重推同一秒也可能不触发）。
+> 另外，本地 `git credential fill` 拿到的 CNB 凭据没有 `repo-release:rw` 权限，
+> 删不了 Release，只能在网页上操作。
+
 ### CNB 镜像流水线失败时怎么看日志
 
 CNB **没有可读的阶段日志接口**：`build/logs` 系列匿名 401，带 token 也只回
