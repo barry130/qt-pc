@@ -1122,11 +1122,17 @@ impl AstralClient {
 
     // ---------- 更新（§15.3 / §15.7）：version 传 versionCode 数字字符串 ----------
 
+    /// 升级查询：除 type / version 外必须上送本机架构 arch，否则服务端不知道该在
+    /// 同一版本的三个 Windows 安装包里挑哪一个（默认只会给兜底的那一份）。
     pub async fn app_update(&self, version_code: i64) -> Result<Value, String> {
         let code_str = version_code.to_string();
         self.get(
             "app/update",
-            &[("type", UPDATE_TYPE), ("version", &code_str)],
+            &[
+                ("type", UPDATE_TYPE),
+                ("version", &code_str),
+                ("arch", crate::app_config::ARCH),
+            ],
             true,
         )
         .await
@@ -1144,6 +1150,7 @@ impl AstralClient {
                 ("type", UPDATE_TYPE),
                 ("version", &code_str),
                 ("versionName", version_name),
+                ("arch", crate::app_config::ARCH),
             ],
             false,
         )

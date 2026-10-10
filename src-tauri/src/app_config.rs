@@ -46,6 +46,18 @@ pub const PLATFORM_CODE: i64 = 1104;
 #[cfg(target_os = "macos")]
 pub const PLATFORM_CODE: i64 = 1105;
 
+/// 本机 CPU 架构（升级接口 arch 参数，服务端按它挑同版本下的对应安装包）。
+/// 取值必须与后端 qt_app_update_artifact.arch 一致（小写）：
+/// Windows 出 x64 / x86 / arm64 三份包，macOS 出 x64 / arm64 两份，
+/// 拿错架构的安装包会在 MD5 / 大小校验阶段直接失败。
+/// 与 UPDATE_TYPE 一样按编译目标取值，不在别处另写字面量。
+#[cfg(target_arch = "x86_64")]
+pub const ARCH: &str = "x64";
+#[cfg(target_arch = "x86")]
+pub const ARCH: &str = "x86";
+#[cfg(target_arch = "aarch64")]
+pub const ARCH: &str = "arm64";
+
 #[cfg(test)]
 mod tests {
     //! 一致性护栏：本文件必须与 app.config.json 逐项相等。
