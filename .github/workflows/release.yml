@@ -1,12 +1,19 @@
 name: Release
 
-# 打 tag（v*）才发版：三平台构建 → ed25519 签名（仅 Windows 自装更新用）→
-# 上传 GitHub Release。普通 push 只跑 ci.yml 的测试门，不出包。
+# 打 tag（v*）才发版。全部安装包**只在 GitHub 上构建**（Windows / Linux / macOS
+# 三平台都是 GitHub 原生 runner，不需要交叉编译），CNB 只做镜像发布：
+# .cnb.yml 的 v* 流水线改成「等 GitHub Release 出完 → 下载产物 → 建 CNB Release
+#   → 上传附件」。理由：CNB 托管节点只有 Linux，dmg 在那边根本出不来。
+#
 # 产物分工：
-#   - Windows：NSIS 安装包（应用内自装更新链路，ed25519 签名 + .sig）
+#   - Windows：x64 / x86 / ARM64 三个 NSIS 安装包（应用内自装更新链路，ed25519 签名 + .sig）
 #   - Linux：deb + AppImage（无应用内自装，浏览器下载手动安装）
 #   - macOS：dmg（无签名无公证：首次打开右键 → 打开，或
 #     xattr -dr com.apple.quarantine QuietMusic.app）
+#
+# 单一发布点：只有 publish job 建 Release，三个构建 job 各自 upload。
+# 这样任何一个平台构建失败都不会留下「半个 Release」。
+#
 # 前置一次性配置（见 docs/PACKAGING.md「自动发版」）：
 #   仓库 secret QT_UPDATE_SIGNING_KEY = .signing/ed25519.key 的 base64
 on:
@@ -17,24 +24,28 @@ permissions:
   contents: write
 
 jobs:
-  # ---------- Windows：NSIS 安装包 + ed25519 签名（不变的主链路） ----------
-  windows:
-    name: Windows NSIS 构建 + 签名 + 发布
-    runs-on: windows-latest
+  # ---------- 测试门：不过不发版 ----------
+  # 独立成 job 是为了让三个构建平台并行跑，不用等某一方排队；
+  # 任一平台的 cargo test 挂了，publish 就不会执行。
+  gate:
+    name: 测试门（前端 + 三平台 Rust）
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: 校验 tag 与 app.config.json 的版本一致
-        shell: pwsh
+        shell: bash
         env:
           TAG: ${{ github.ref_name }}
         run: |
-          $tag = $env:TAG.TrimStart('v')
-          $cfg = Get-Content app.config.json -Raw | ConvertFrom-Json
-          if ($tag -ne $cfg.version.name) {
-            Write-Error "tag($env:TAG) 与 app.config.json version.name($($cfg.version.name)) 不一致，先改版本号再打 tag"
+          set -euo pipefail
+          tag="${TAG#v}"
+          ver=$(node -e 'process.stdout.write(require("./app.config.json").version.name)')
+          echo "tag=$TAG  app.config.json version=$ver"
+          if [ "$tag" != "$ver" ]; then
+            echo "::error::tag($TAG) 与 app.config.json version.name($ver) 不一致，先改版本号再打 tag"
             exit 1
-          }
+          fi
 
       - uses: pnpm/action-setup@v4
         with:
@@ -44,24 +55,47 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-
-      # 测试不过不发版
       - run: pnpm test
 
+  # ---------- Windows：三架构 NSIS 安装包 ----------
+  # 三个架构并行（各自 runner 独立 target 目录，不共享缓存，无争抢）。
+  # windows-latest 自带 MSVC SDK + NSIS，无需 cargo-xwin / nasm / mt.exe 垫片。
+  windows:
+    name: Windows NSIS ${{ matrix.arch }}
+    runs-on: windows-latest
+    needs: gate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            target: x86_64-pc-windows-msvc
+          - arch: x86
+            target: i686-pc-windows-msvc
+          - arch: arm64
+            target: aarch64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          key: ${{ matrix.target }}
 
-      # Rust 测试不过不发版（ci.yml 常跑，但 tag 可能从没进过 CI 的提交打出——
-      # 2026-10-08 审计补充：发版门此前只挡了前端测试）
-      - name: Run cargo tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml
-
-      # 本机 pnpm tauri build 有 argv0 解析 bug；`pnpm exec + --runner cargo`
-      # 是 docs/PACKAGING.md 步骤 2 验证过的路径（CI 上同样成立）
       - name: 构建 NSIS 安装包
-        run: pnpm exec tauri build --runner cargo
+        run: |
+          pnpm exec tauri build --runner cargo --target ${{ matrix.target }} --bundles nsis
 
       - name: 恢复签名私钥
         shell: pwsh
@@ -78,54 +112,26 @@ jobs:
       - name: ed25519 签名并自验
         shell: pwsh
         run: |
-          $exe = (Get-ChildItem "src-tauri/target/release/bundle/nsis/*-setup.exe" | Select-Object -First 1).FullName
+          $exe = (Get-ChildItem "src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe" | Select-Object -First 1).FullName
           if (-not $exe) { Write-Error "没找到 NSIS 安装包产物"; exit 1 }
           node scripts/update-sign.mjs sign $exe
           node scripts/update-sign.mjs verify $exe
-          "INSTALLER=$exe" >> $env:GITHUB_ENV
 
-      - name: 发布 GitHub Release
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-          GITHUB_REPOSITORY: ${{ github.repository }}
-        run: |
-          $hash = (Get-FileHash $env:INSTALLER -Algorithm MD5).Hash.ToLower()
-          $size = (Get-Item $env:INSTALLER).Length
-          $file = Split-Path $env:INSTALLER -Leaf
-          $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/$env:TAG/$file"
-          # 注意：here-string 结束符 "@ 必须顶格（YAML 剥离缩进后正好处在行首），
-          # 且不能写成 `"@ | Set-Content ... -Value`——悬空的 -Value 会因缺参数直接绑定失败。
-          $notes = @"
-          ## 安装包信息（建后端更新记录用）
-
-          - Windows NSIS 下载地址：$url
-          - MD5：$hash
-          - fileSize：$size
-          - Linux/macOS 产物见附件（无应用内自装，浏览器下载手动安装）
-
-          ### macOS 未公证说明
-
-          首次打开：右键 App → 「打开」→ 再点「打开」（仅首次）；或终端执行
-          `xattr -dr com.apple.quarantine /Applications/QuietMusic.app`
-          "@
-          Set-Content -Path release-notes.md -Value $notes
-          # 同一个 tag 重新发布（例如重指 tag 后重跑）时，旧 Release 已存在会让 create 以
-          # already_exists 失败；先删掉同名 Release 再重建（--cleanup-tag=false 保留 tag 本身）。
-          # Windows 是三平台里唯一「建 Release」的 job，其余平台只 upload。
-          $existing = gh release view $env:TAG --json id --jq ".id" 2>$null
-          if ($LASTEXITCODE -eq 0 -and $existing) {
-            Write-Host "Release $env:TAG 已存在（id=$existing），先删除再重建"
-            gh release delete $env:TAG --yes --cleanup-tag=false
-          }
-          gh release create $env:TAG "$env:INSTALLER" "$env:INSTALLER.sig" --notes-file release-notes.md --generate-notes --title "轻听 $($env:TAG.TrimStart('v'))"
+      - name: 上传到 Release 暂存区（upload-artifact）
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}
+          path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe
+            src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe.sig
+          if-no-files-found: error
+          retention-days: 7
 
   # ---------- Linux：deb + AppImage ----------
   linux:
     name: Linux deb + AppImage
     runs-on: ubuntu-22.04
-    needs: windows
+    needs: gate
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -146,18 +152,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          key: x86_64-unknown-linux-gnu
 
       - name: Build (deb + appimage)
         run: pnpm exec tauri build --runner cargo --bundles deb,appimage
 
-      - name: 上传到 Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-        run: |
-          ls src-tauri/target/release/bundle/
-          gh release upload "$TAG" src-tauri/target/release/bundle/deb/*.deb \
-            src-tauri/target/release/bundle/appimage/*.AppImage --clobber
+      - name: 上传到 Release 暂存区（upload-artifact）
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-amd64
+          path: |
+            src-tauri/target/release/bundle/deb/*.deb
+            src-tauri/target/release/bundle/appimage/*.AppImage
+          if-no-files-found: error
+          retention-days: 7
 
   # ---------- macOS：dmg（无签名 / 无公证） ----------
   # 产物是 arm64（macos-14 是 Apple Silicon 运行器）。Intel x64 的 dmg 需在
@@ -165,7 +173,7 @@ jobs:
   macos:
     name: macOS dmg（无公证，arm64）
     runs-on: macos-14
-    needs: windows
+    needs: gate
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -181,6 +189,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+          key: aarch64-apple-darwin
 
       - name: Build (app + dmg)
         run: pnpm exec tauri build --runner cargo --bundles app,dmg
@@ -190,10 +199,99 @@ jobs:
       # 又无 signingIdentity 时会**整段跳过**签名（bundle/macos/sign.rs 的
       # keychain() 返回 Ok(None)），不会自动 ad-hoc 签名 —— 产物是未签名的。
       # 用户首次打开按 Release 说明右键「打开」或清 quarantine 属性。
-      - name: 上传到 Release
+      - name: 上传到 Release 暂存区（upload-artifact）
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------- 唯一发布点 ----------
+  publish:
+    name: 发布 GitHub Release
+    runs-on: ubuntu-latest
+    # 三个平台全绿才发；任何一个失败都不留半个 Release。
+    needs: [windows, linux, macos]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载全部产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: 校验产物齐全并生成 Release 说明
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          ls -l artifacts/
+          n_exe=$(ls artifacts/*-setup.exe 2>/dev/null | wc -l)
+          n_sig=$(ls artifacts/*-setup.exe.sig 2>/dev/null | wc -l)
+          n_deb=$(ls artifacts/*.deb 2>/dev/null | wc -l)
+          n_app=$(ls artifacts/*.AppImage 2>/dev/null | wc -l)
+          n_dmg=$(ls artifacts/*.dmg 2>/dev/null | wc -l)
+          echo "Windows $n_exe 个安装包 + $n_sig 个签名 / deb $n_deb / AppImage $n_app / dmg $n_dmg"
+          # 每个 .exe 必须有同名 .sig：应用内更新装之前会强制验签
+          for f in artifacts/*-setup.exe; do
+            [ -f "$f.sig" ] || { echo "::error::缺少签名文件 $f.sig"; exit 1; }
+          done
+          [ "$n_exe" -eq 3 ] || { echo "::error::Windows 安装包应为 3 个（x64/x86/arm64），实际 $n_exe"; exit 1; }
+          [ "$n_deb" -ge 1 ] || { echo "::error::缺少 .deb"; exit 1; }
+          [ "$n_app" -ge 1 ] || { echo "::error::缺少 .AppImage"; exit 1; }
+          [ "$n_dmg" -ge 1 ] || { echo "::error::缺少 .dmg"; exit 1; }
+
+          # 说明里逐个列出下载地址 / MD5 / fileSize：后台「版本更新」记录要照抄这三项
+          {
+            echo "# 轻听安装包 ${TAG}"
+            echo
+            echo "## 安装包信息（建后端更新记录用）"
+            echo
+            for f in artifacts/*-setup.exe; do
+              hash=$(md5sum "$f" | cut -d' ' -f1)
+              size=$(stat -c%s "$f")
+              echo "### ${f##*/}"
+              echo
+              echo "- 文件：\`${f##*/}\`"
+              echo "- 下载地址：https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${f##*/}"
+              echo "- MD5：${hash}"
+              echo "- fileSize：${size}"
+              echo
+            done
+            cat <<'EOF'
+          ## 说明
+
+          - 每个安装包都有一个同名的 `.sig` 签名文件，**必须一起下载**；
+            应用内更新会在安装前强制验签（ed25519），缺 `.sig` 或签名不符会直接拒绝。
+          - 后台「版本更新」新增记录时：`type` 填 `1103`（Windows），
+            `versionCode` / `versionName` 与本次 tag 一致，其余三项照抄上面。
+          - Linux（`type` 填 `1104`）：deb / AppImage 无 `.sig`，
+            走浏览器下载手动安装（Linux 端 `supportsInAppUpdate()` 返回 false）。
+          - macOS：dmg **无签名无公证**（决策：不公签）。首次打开右键 App →「打开」→ 再点「打开」；
+            或终端执行 `xattr -dr com.apple.quarantine /Applications/QuietMusic.app`。
+          - 全部产物同时镜像到 CNB Release：<https://cnb.cool/canace/qt-pc/-/releases>
+          EOF
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: 发布 GitHub Release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          ls src-tauri/target/release/bundle/
-          gh release upload "$TAG" src-tauri/target/release/bundle/dmg/*.dmg --clobber
+          set -euo pipefail
+          # 同一个 tag 重新发布（例如重指 tag 后重跑）时，旧 Release 已存在会让 create
+          # 以 already_exists 失败；先删掉同名 Release 再重建（--cleanup-tag=false 保留 tag 本身）。
+          if gh release view "$TAG" --json id --jq '.id' 2>/dev/null; then
+            echo "Release $TAG 已存在，先删除再重建"
+            gh release delete "$TAG" --yes --cleanup-tag=false
+          fi
+          gh release create "$TAG" artifacts/* \
+            --notes-file release-notes.md \
+            --generate-notes \
+            --title "轻听 ${TAG#v}"
+          gh release view "$TAG" --json assets --jq '.assets[].name'

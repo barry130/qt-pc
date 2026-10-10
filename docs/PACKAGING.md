@@ -54,28 +54,48 @@
 
 ## 自动发版（打 tag 即发布，推荐）
 
-`.github/workflows/release.yml` 已配置：**只有 push 了 `v*` 形态的 tag 才触发**，
-普通 push 只跑 ci.yml 的测试门，不出包。流水线分三个 job：
+**打包全部在 GitHub Actions 完成，CNB 只做镜像。** 只有 push 了 `v*` 形态的 tag
+才触发，普通 push 只跑 ci.yml 的测试门，不出包。
+
+`.github/workflows/release.yml` 分四个 job：
 
 | job | runner | 动作 |
 |---|---|---|
-| `windows` | `windows-latest` | 构建 NSIS → ed25519 签名并自验 → **创建** GitHub Release（exe + `.sig` + 安装包 MD5/大小信息） |
-| `linux` | `ubuntu-22.04` | 装系统依赖 → `--bundles deb,appimage` → 上传 `.deb` / `.AppImage` 到同一个 Release（`needs: windows`，只上传不建 Release） |
+| `gate` | `ubuntu-latest` | 校验 tag 与 `app.config.json` 版本一致 → `pnpm install` → `pnpm test`。不过门不构建 |
+| `windows` | `windows-latest` **矩阵 x64/x86/arm64** | 原生 MSVC `--target <triple>` 构建 NSIS → ed25519 签名并自验 → 各自上传产物 |
+| `linux` | `ubuntu-22.04` | 装系统依赖 → `--bundles deb,appimage` → 上传 `.deb` / `.AppImage` |
 | `macos` | `macos-14` | `--bundles app,dmg`（不签名不公证）→ 上传 `.dmg` |
+| `publish` | `ubuntu-latest` | **唯一发布点**：汇总三个 job 的产物 → 校验齐全（3 exe / 3 sig / deb / AppImage / dmg）→ 生成说明 → 建 GitHub Release |
 
-Release 说明会自动生成，并带一段「Linux/macOS 产物无应用内自装，浏览器下载手动安装」
-与「macOS 未公证首次打开方式」的说明。
+三个 Windows 架构用**原生 MSVC 目标**并行构建（`x86_64-pc-windows-msvc` /
+`i686-pc-windows-msvc` / `aarch64-pc-windows-msvc`），不是交叉编译，因此不再需要
+cargo-xwin、`mt.exe` 垫片和自定义构建镜像。
 
-CNB 侧 `.cnb.yml` 的 `v*` 流水线另有「构建 Linux deb + AppImage」stage（原生
-`.cnb/windows-build.Dockerfile` 已补 Linux 构建依赖层），产物走 attachments 上传。
+**单一发布点**：只有 `publish` job 会创建 Release，三个构建 job 只上传中间产物。
+任何一个平台构建失败都不会留下「半个 Release」，`.sig` 缺一个也会在发版前被拦下。
+
+CNB 侧 `.cnb.yml` 的 `v*` 流水线**不再构建任何东西**，退化成镜像发布：
+轮询 GitHub Release 的资产列表（仓库公开，匿名可读，不需要任何 token）→ 齐了下载
+产物（`.cnb/fetch-github-release.mjs`）→ 逐个比对字节数与结构校验签名 →
+`make-release-notes.mjs` 生成说明 → `git:release` 建 CNB Release →
+`cnbcool/attachments` 上传与 GitHub **完全一致**的附件（含 `.dmg`）。
+
+> CNB 侧拿不到签名私钥（私钥只存在于 GitHub 的 `QT_UPDATE_SIGNING_KEY`），
+> 因此 CNB 只做**结构校验**（ed25519 签名恒为 64 字节 → base64 单行恒 88 字符），
+> 密码学验签在 GitHub 构建阶段就已由 `update-sign.mjs sign` + `verify` 完成。
 
 ```powershell
-# 发版动作（版本号已在 app.config.json 改好并与 tag 一致，工作流会校验）
-git tag v1.1.1
-git push origin v1.1.1
+# 发版动作（版本号已在 app.config.json 改好并与 tag 一致，两侧工作流都会校验）
+git tag v1.1.3
+git push origin v1.1.3      # origin = GitHub，先起构建
+git push cnb   v1.1.3       # CNB 这边只是「等 GitHub → 镜像」，可以同时推
 ```
 
-**一次性前置**（做一次就够）：把签名私钥的 base64 配进仓库 secret：
+两边流水线是独立触发的：GitHub 负责出包并发 Release，CNB 轮询到产物齐了才建
+CNB Release。CNB 侧的等待窗口默认 45 分钟（`.cnb.yml` 里 `WAIT_SECONDS`），
+GitHub 构建超时的话把它调大。
+
+**一次性前置**（做一次就够）：把签名私钥的 base64 配进 **GitHub 仓库** secret：
 
 ```powershell
 [Convert]::ToBase64String([IO.File]::ReadAllBytes("F:\qtMusic\qt-pc\.signing\ed25519.key")) | Set-Clipboard
@@ -83,8 +103,18 @@ git push origin v1.1.1
 # New repository secret，名字填 QT_UPDATE_SIGNING_KEY
 ```
 
+> CNB 侧**不再需要**任何签名密钥配置：私钥只在 GitHub 的构建阶段使用，
+> CNB 拿到的已经是签好名的 `.exe` + `.sig`。
+
 发完 Release 后，把说明页里的「下载地址 / MD5 / fileSize」填进后端管理后台的
-更新记录（应用内更新检查走的是后端 `app_update`，GitHub Release 只是托管安装包）。
+更新记录（应用内更新检查走的是后端 `app_update`，Release 只是托管安装包）。
+面向国内用户时下载地址建议填 **CNB** 的
+`https://cnb.cool/canace/qt-pc/-/releases/download/<tag>/<文件名>`，
+GitHub 的地址在 Release 说明里同时给出。
+
+> macOS 说明：CI 只出 **arm64** 的 dmg（`macos-14` 是 Apple Silicon 运行器）。
+> Intel 的 `_x64.dmg` 需要在 Intel Mac 上本地 `pnpm tauri build --target x86_64-apple-darwin --bundles dmg`
+> 打出后手动上传。deb 是 glibc 构建，装在较老的发行版上可能报缺 `GLIBC_2.32` 一类的错。
 
 ## 步骤 1：构建前端
 
@@ -265,7 +295,7 @@ feature）、托盘、开机自启（LaunchAgent）、全局快捷键均可用�
 | Linux：托盘图标不显示 | GNOME 未启用 AppIndicator 扩展；应用此时按「关窗即退出」运行，装扩展或换桌面环境即可恢复托盘 |
 | Linux：Wayland 下置顶/快捷键失效 | 已知限制（tao 无 layer-shell、Wayland 不提供全局快捷键），切 X11 会话可用 |
 | Linux：AppImage 报 `dlopen(): error loading libfuse.so.2` | 未装 FUSE；`sudo apt install libfuse2` 或改用 `--appimage-extract-and-run` |
-| Linux：deb 装不上（依赖版本不满足） | CNB 流水线的 deb 在 Debian trixie 镜像里构建，glibc 下限比 GitHub 的 ubuntu-22.04 产物高。发行版较旧时优先用 GitHub 产物或 AppImage |
+| Linux：deb 装不上（依赖版本不满足） | deb 在 GitHub 的 `ubuntu-22.04` 上构建（glibc 2.35），很老的发行版装不上。发行版较旧时改用 AppImage |
 | macOS：提示「已损坏，无法打开」/「无法验证开发者」 | 未公证导致的 Gatekeeper 拦截（预期）：右键 →「打开」，或 `xattr -dr com.apple.quarantine /Applications/QuietMusic.app` |
 | macOS：替换二进制后「应用已损坏」 | 原本就没有签名（tauri 不自动 ad-hoc），替换后自行签一次：`codesign --force --deep --sign - /Applications/QuietMusic.app` |
 | macOS：`pnpm install` 报 `Unsupported Platform: @esbuild/win32-x64` | `package.json` 里 esbuild 平台包被硬钉成 win32 了（历史坑，已移除硬钉），确认没有重新加回 |
