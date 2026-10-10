@@ -75,10 +75,16 @@ cargo-xwin、`mt.exe` 垫片和自定义构建镜像。
 任何一个平台构建失败都不会留下「半个 Release」，`.sig` 缺一个也会在发版前被拦下。
 
 CNB 侧 `.cnb.yml` 的 `v*` 流水线**不再构建任何东西**，退化成镜像发布：
-轮询 GitHub Release 的资产列表（仓库公开，匿名可读，不需要任何 token）→ 齐了下载
-产物（`.cnb/fetch-github-release.mjs`）→ 逐个比对字节数与结构校验签名 →
-`make-release-notes.mjs` 生成说明 → `git:release` 建 CNB Release →
-`cnbcool/attachments` 上传与 GitHub **完全一致**的附件（含 `.dmg`）。
+查 GitHub Release 的资产清单 → 齐了下载产物（`.cnb/fetch-github-release.mjs`）→
+逐个校验 sha256 与结构校验签名 → `make-release-notes.mjs` 生成说明 →
+`git:release` 建 CNB Release → `cnbcool/attachments` 上传与 GitHub **完全一致**的
+附件（含 `.dmg`）。
+
+资产清单抓的是 `https://github.com/<repo>/releases/expanded_assets/<tag>` —— github.com
+网页端的一段 HTML，**不占** `api.github.com` 那个 60 次/小时/IP 的匿名配额（CNB 托管
+节点是共享出口 IP，REST 配额很容易被别人的构建耗光，撞上就白等）。REST API 留作兜底。
+这段 HTML 里带每个资产的 sha256，下载时边写边算，对不上就重下；拿不到 sha256 时才
+退回比对字节数。
 
 > CNB 侧拿不到签名私钥（私钥只存在于 GitHub 的 `QT_UPDATE_SIGNING_KEY`），
 > 因此 CNB 只做**结构校验**（ed25519 签名恒为 64 字节 → base64 单行恒 88 字符），
@@ -303,3 +309,7 @@ feature）、托盘、开机自启（LaunchAgent）、全局快捷键均可用�
 | macOS：提示「已损坏，无法打开」/「无法验证开发者」 | 未公证导致的 Gatekeeper 拦截（预期）：右键 →「打开」，或 `xattr -dr com.apple.quarantine /Applications/QuietMusic.app` |
 | macOS：替换二进制后「应用已损坏」 | 原本就没有签名（tauri 不自动 ad-hoc），替换后自行签一次：`codesign --force --deep --sign - /Applications/QuietMusic.app` |
 | macOS：`pnpm install` 报 `Unsupported Platform: @esbuild/win32-x64` | `package.json` 里 esbuild 平台包被硬钉成 win32 了（历史坑，已移除硬钉），确认没有重新加回 |
+| CNB 侧没有触发 `v*` tag 流水线 | ① 仓库「设置 → 云原生构建」勾了「允许自动触发」；② 覆盖同一个 tag 时，**先删 tag、等两分钟再推** —— 删完立刻重推同一秒，CNB 可能不产生 `tag_push` 事件；③ 用 `GET https://api.cnb.cool/{repo}/-/git/commit-statuses/{sha}` 看有没有 `cnb/tag_push/...` 的状态 |
+| CNB 镜像报「等待 GitHub Release 超时」 | GitHub 侧构建失败了，去 https://github.com/barry130/qt-pc/actions 看日志；确实只是慢就把 `.cnb.yml` 的 `WAIT_SECONDS`（默认 2700 = 45 分钟）调大 |
+| CNB 镜像报 `下载 xxx 失败（n/20 次）` | CNB 节点直连 github.com 会 TCP 超时（脚本已重试 20 次、退避封顶 30s、共享 45 分钟墙钟预算）。持续失败就是节点侧故障，等一会儿重推同一个 tag 重跑即可 |
+| 想知道 CNB 流水线到底卡在哪一步 | 公开 API 只能看结果：`GET https://api.cnb.cool/{repo}/-/git/commit-statuses/{sha}` 返回 `cnb/tag_push/pipeline-1(镜像 GitHub Release 产物) | error | error [10m 39s]`，其中的时长能倒推大概卡在哪一步（秒级 = 早期阶段，分钟级 = 轮询或下载）。阶段日志要在网页上看 |

@@ -36,7 +36,6 @@ import { createWriteStream, mkdirSync, renameSync, rmSync, statSync, writeFileSy
 import { join } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
-import { pathToFileURL } from "node:url";
 
 const repo = process.env.GITHUB_REPO || "barry130/qt-pc";
 const tag = process.env.GITHUB_TAG || process.env.CNB_BRANCH || process.env.CNB_TAG || "";
@@ -348,8 +347,12 @@ async function main() {
   log(`下载完成：${wanted.length} 个产物，共 ${(total / 1024 / 1024).toFixed(1)} MiB`);
 }
 
-// 直接执行才跑轮询；被 import 时（例如本地单测选择逻辑）只导出纯函数。
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// 直接 `node .cnb/fetch-github-release.mjs` 执行时跑主流程；设了 FETCH_LIB_ONLY=1
+// 就只导出纯函数，供本地对 parseExpandedAssets / selectAssets / isReady 做单测。
+// 这里刻意**不**用 `import.meta.url === pathToFileURL(process.argv[1]).href` 那套
+// 惯用写法：CNB 容器里工作目录与模块真实路径一旦对不上（比如经过软链挂载），
+// 比较会静默失败，主流程根本不跑，流水线会在后面「产物为 0」这种莫名其妙的地方挂。
+if (process.env.FETCH_LIB_ONLY !== "1") {
   main().catch((err) => {
     console.error(`::error::${err.message}`);
     process.exit(1);
