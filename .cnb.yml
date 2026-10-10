@@ -147,14 +147,29 @@ v*:
             WAIT_SECONDS: "2700"
             POLL_SECONDS: "60"
           script: |
-            set -e
             mkdir -p artifacts
-            node .cnb/fetch-github-release.mjs
-            ls -l artifacts/
+            # 这里**故意不让这一步直接失败**：CNB 不提供可读的阶段日志接口，一旦
+            # 哪步挂了只能看到一个 error [xx 秒]。所以下载与校验都只记录退出码，
+            # 把日志 tee 到 .cnb-debug.log，最后由「按前面的结果判定成败」统一
+            # 判红 —— 中间留出机会把日志推到 ci-debug 分支去查。
+            # tee 是必须的：CNB 有 10 分钟无输出超时，重定向到文件会让平台以为
+            # 卡死而腰斩。
+            set +e
+            set -o pipefail
+            node .cnb/fetch-github-release.mjs 2>&1 | tee .cnb-debug.log
+            dl_rc=$?
+            set +o pipefail
+            set -e
+            echo "== 下载阶段退出码=$dl_rc ==" | tee -a .cnb-debug.log
+            ls -l artifacts/ 2>&1 | tee -a .cnb-debug.log
+            echo "$dl_rc" > .cnb-download-rc
+            exit 0
 
         - name: 校验下载下来的产物
           script: |
-            set -e
+            set +e
+            set -o pipefail
+            (
             fail=0
             n_exe=$(ls artifacts/*-setup.exe 2>/dev/null | wc -l)
             n_sig=$(ls artifacts/*-setup.exe.sig 2>/dev/null | wc -l)
@@ -216,6 +231,55 @@ v*:
               }
               if (bad) { console.error(`${bad} 个产物校验不符`); process.exit(1); }
             '
+            ) 2>&1 | tee -a .cnb-debug.log
+            vrc=${PIPESTATUS[0]}
+            set +o pipefail
+            set -e
+            echo "== 校验阶段退出码=$vrc ==" | tee -a .cnb-debug.log
+            dl_rc=$(cat .cnb-download-rc 2>/dev/null || echo 1)
+            if [ "$dl_rc" != "0" ] || [ "$vrc" != "0" ]; then
+              echo 1 > .cnb-failed
+            else
+              echo 0 > .cnb-failed
+            fi
+            exit 0
+
+        # CNB 没有可读的阶段日志接口（build/logs 系列的接口匿名 401、带 token 也
+        # 只回 {"code":204,"message":"We couldn't find information on that stage."}），
+        # 失败时只能看到一个 error [xx 秒]。所以把日志推到一个专用于排查的
+        # ci-debug 分支：本地 git fetch origin ci-debug 就能读到全文。推失败只是
+        # 少一条线索，不影响判定。
+        - name: 失败诊断快照
+          script: |
+            set -e
+            if [ "$(cat .cnb-failed)" = "0" ]; then
+              echo "下载与校验都通过，不需要诊断快照"
+              exit 0
+            fi
+            {
+              echo "# CNB 镜像流水线失败日志"
+              echo
+              echo '```'
+              cat .cnb-debug.log
+              echo '```'
+            } > .cnb-debug.md
+            git config user.name "cnb-debug"
+            git config user.email "debug@cnb.cool"
+            git add .cnb-debug.md
+            git commit -m "ci-debug: 镜像 GitHub Release 产物失败日志" .cnb-debug.md \
+              || echo "::warning::提交 .cnb-debug.md 失败"
+            git push --force origin HEAD:refs/heads/ci-debug \
+              || echo "::warning::推 ci-debug 分支失败（可能没有写权限）"
+            exit 0
+
+        # 日志已经留痕，到这一步才让流水线真正判红，避免「一失败就没线索」。
+        - name: 按前面的结果判定成败
+          script: |
+            if [ "$(cat .cnb-failed)" != "0" ]; then
+              echo "::error::下载或校验阶段失败，完整日志见 ci-debug 分支上的 .cnb-debug.md"
+              exit 1
+            fi
+            echo "下载与校验都通过"
 
         - name: 生成 Release 描述
           script: |

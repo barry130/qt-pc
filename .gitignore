@@ -68,5 +68,11 @@ gitee_search.json
 # 本地调试跑同一个脚本时也会落在仓库根目录）
 artifacts/
 asset-list.json
+# CNB 镜像流水线的诊断中间产物：日志 tee 到 .cnb-debug.log（已被 *.log 覆盖），
+# 失败时把内容包进 .cnb-debug.md 推到只用于排查的 ci-debug 分支
+.cnb-debug.md
+.cnb-failed
+.cnb-download-rc
+release-notes.md
 
 tsconfig.tsbuildinfo
