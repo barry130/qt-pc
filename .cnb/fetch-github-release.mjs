@@ -4,7 +4,7 @@
  *
  * 用法（由 .cnb.yml 的 v* tag_push 流水线调用，环境变量注入）：
  *   GITHUB_REPO=barry130/qt-pc      必填，owner/repo
- *   GITHUB_TAG=v1.1.2               必填，tag（默认取 CNB_BRANCH）
+ *   GITHUB_TAG=v1.1.2               选填，tag（默认见 resolveTag()）
  *   WAIT_SECONDS=2700               选填，最长等待秒数，默认 2700（45 分钟）
  *   POLL_SECONDS=60                 选填，轮询间隔，默认 60
  *   ARTIFACT_DIR=artifacts          选填，下载目录，默认 artifacts
@@ -32,13 +32,41 @@
  * 资产列表就是完整清单，不会漏掉最后一个平台。
  */
 import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { createWriteStream, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 const repo = process.env.GITHUB_REPO || "barry130/qt-pc";
-const tag = process.env.GITHUB_TAG || process.env.CNB_BRANCH || process.env.CNB_TAG || "";
+
+/**
+ * 这次流水线是在检哪个 tag。
+ *
+ * 不要只信 CNB_BRANCH：实测「删掉 tag 再重推」触发的 tag_push 里，那个变量是空的
+ * （第一次新建 tag 的那次有值），于是 tag 解析成空串，版本校验和下载地址双双失效，
+ * 流水线几十秒就挂掉，而这个信息只有拿到日志才看得见。
+ *
+ * 所以最后退回从 git 读：CNB 是按 tag 检出的，HEAD 上就挂着那个 tag，
+ * `git describe --tags --exact-match` 一定读得回来。
+ */
+function resolveTag() {
+  const fromEnv =
+    process.env.GITHUB_TAG || process.env.CNB_BRANCH || process.env.CNB_TAG || "";
+  if (fromEnv) return fromEnv.trim();
+  for (const args of [["describe", "--tags", "--exact-match"], ["tag", "--points-at", "HEAD"]]) {
+    try {
+      const out = execFileSync("git", args, { encoding: "utf8" });
+      const first = out.split("\n").map((s) => s.trim()).find(Boolean);
+      if (first) return first;
+    } catch {
+      // 这条命令不可用就试下一个
+    }
+  }
+  return "";
+}
+
+const tag = resolveTag();
 const waitSeconds = Number(process.env.WAIT_SECONDS || 2700);
 const pollSeconds = Number(process.env.POLL_SECONDS || 60);
 const dir = process.env.ARTIFACT_DIR || "artifacts";
@@ -284,8 +312,29 @@ async function download(name, expectedSize, expectedSha, deadline) {
 }
 
 async function main() {
+  // 先把「这次到底在检哪个 tag、各个开关是什么值」全部打进日志：CNB 看不到阶段
+  // 日志，排查时只能靠这一段判断是不是环境变量没按预期注入。
+  log(`repo=${repo} tag=${tag || "<空>"}`);
+  log(
+    `环境：GITHUB_TAG=${process.env.GITHUB_TAG || "<空>"} ` +
+      `CNB_BRANCH=${process.env.CNB_BRANCH || "<空>"} ` +
+      `CNB_TAG=${process.env.CNB_TAG || "<空>"} ` +
+      `GITHUB_REPO=${process.env.GITHUB_REPO || "<空>"}`,
+  );
+  log(
+    `参数：WAIT_SECONDS=${waitSeconds} POLL_SECONDS=${pollSeconds} ` +
+      `ARTIFACT_DIR=${dir} STALL_SECONDS=${stallSeconds} MAX_ATTEMPTS=${maxAttempts}`,
+  );
+  try {
+    log(`git describe：${execFileSync("git", ["describe", "--tags", "--exact-match"], { encoding: "utf8" }).trim() || "<无>"}`);
+  } catch {
+    log("git describe：（HEAD 上没有精确匹配的 tag）");
+  }
   if (!repo || !tag) {
-    console.error("需要 GITHUB_REPO（owner/repo）与 GITHUB_TAG 两个环境变量");
+    console.error(
+      "::error::没能确定要镜像的 tag（GITHUB_TAG / CNB_BRANCH / CNB_TAG 都是空，" +
+        "git describe 也没读到 tag）",
+    );
     process.exit(1);
   }
   log(`等待 ${repo} 的 Release ${tag}（最多 ${waitSeconds}s，每 ${pollSeconds}s 查一次）`);
@@ -353,8 +402,14 @@ async function main() {
 // 惯用写法：CNB 容器里工作目录与模块真实路径一旦对不上（比如经过软链挂载），
 // 比较会静默失败，主流程根本不跑，流水线会在后面「产物为 0」这种莫名其妙的地方挂。
 if (process.env.FETCH_LIB_ONLY !== "1") {
-  main().catch((err) => {
-    console.error(`::error::${err.message}`);
-    process.exit(1);
-  });
+  // --print-tag：只吐出「这次流水线在检哪个 tag」就退出。.cnb.yml 的版本校验阶段
+  // 用它，保证那边和下载这边用的是同一套 tag 解析逻辑（见 resolveTag 的说明）。
+  if (process.argv.includes("--print-tag")) {
+    process.stdout.write(tag);
+  } else {
+    main().catch((err) => {
+      console.error(`::error::${err.message}`);
+      process.exit(1);
+    });
+  }
 }

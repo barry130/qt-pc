@@ -127,14 +127,42 @@ v*:
       stages:
         - name: 校验 tag 与版本号一致
           script: |
+            # 和后面几个阶段一样：这里只记录结果不让流水线当场变红，判定统一
+            # 放到最后的「按前面的结果判定成败」。日志从这一阶段就开始攒，
+            # 万一后面失败，ci-debug 分支上是完整的一份。
+            set +e
+            set -o pipefail
+            (
+              echo "== 流水线环境 =="
+              echo "CNB_BRANCH=${CNB_BRANCH:-<空>}"
+              echo "CNB_TAG=${CNB_TAG:-<空>}"
+              echo "CNB_REPO_SLUG=${CNB_REPO_SLUG:-<空>}"
+              echo "GITHUB_REPO=${GITHUB_REPO:-<空>}"
+              echo "GITHUB_TAG=${GITHUB_TAG:-<空>}"
+              echo "HEAD=$(git rev-parse HEAD 2>&1)"
+              echo
+              # tag 的解析逻辑跟下载阶段共用同一份代码（脚本里的 resolveTag）：
+              # CNB_BRANCH 在「删 tag 再重推」触发的 tag_push 里实测是空的，
+              # 只认它会让整条流水线几十秒就挂掉。
+              TAG_RAW=$(node .cnb/fetch-github-release.mjs --print-tag)
+              TAG="${TAG_RAW#v}"
+              VER=$(node -e 'process.stdout.write(require("./app.config.json").version.name)')
+              echo "解析到的 tag=$TAG_RAW  app.config.json version=$VER"
+              if [ -z "$TAG_RAW" ]; then
+                echo "::error::没能从环境变量或 git 里解析出 tag"
+                exit 1
+              fi
+              if [ "$TAG" != "$VER" ]; then
+                echo "::error::tag($TAG) 与 app.config.json version.name($VER) 不一致，先改版本号再打 tag"
+                exit 1
+              fi
+            ) 2>&1 | tee .cnb-debug.log
+            vrc=${PIPESTATUS[0]}
+            set +o pipefail
             set -e
-            TAG="${CNB_BRANCH#v}"
-            VER=$(node -e 'process.stdout.write(require("./app.config.json").version.name)')
-            echo "tag=$CNB_BRANCH  app.config.json version=$VER"
-            if [ "$TAG" != "$VER" ]; then
-              echo "::error::tag($TAG) 与 app.config.json version.name($VER) 不一致，先改版本号再打 tag"
-              exit 1
-            fi
+            echo "== 版本校验退出码=$vrc ==" | tee -a .cnb-debug.log
+            echo "$vrc" > .cnb-failed
+            exit 0
 
         - name: 等 GitHub Release 出包并下载
           env:
@@ -149,20 +177,22 @@ v*:
           script: |
             mkdir -p artifacts
             # 这里**故意不让这一步直接失败**：CNB 不提供可读的阶段日志接口，一旦
-            # 哪步挂了只能看到一个 error [xx 秒]。所以下载与校验都只记录退出码，
-            # 把日志 tee 到 .cnb-debug.log，最后由「按前面的结果判定成败」统一
-            # 判红 —— 中间留出机会把日志推到 ci-debug 分支去查。
-            # tee 是必须的：CNB 有 10 分钟无输出超时，重定向到文件会让平台以为
-            # 卡死而腰斩。
+            # 哪步挂了只能看到一个 error [xx 秒]。所以每个阶段都只把退出码并进
+            # .cnb-failed 并以 0 退出，最后由「按前面的结果判定成败」统一判红 ——
+            # 中间留出机会把完整日志推到 ci-debug 分支去查。
+            # tee 是必须的：CNB 有 10 分钟无输出超时，纯重定向到文件会让平台
+            # 以为卡死而腰斩。
             set +e
             set -o pipefail
-            node .cnb/fetch-github-release.mjs 2>&1 | tee .cnb-debug.log
+            node .cnb/fetch-github-release.mjs 2>&1 | tee -a .cnb-debug.log
             dl_rc=$?
             set +o pipefail
             set -e
             echo "== 下载阶段退出码=$dl_rc ==" | tee -a .cnb-debug.log
             ls -l artifacts/ 2>&1 | tee -a .cnb-debug.log
-            echo "$dl_rc" > .cnb-download-rc
+            if [ "$(cat .cnb-failed)" != "0" ] || [ "$dl_rc" != "0" ]; then
+              echo 1 > .cnb-failed
+            fi
             exit 0
 
         - name: 校验下载下来的产物
@@ -236,11 +266,8 @@ v*:
             set +o pipefail
             set -e
             echo "== 校验阶段退出码=$vrc ==" | tee -a .cnb-debug.log
-            dl_rc=$(cat .cnb-download-rc 2>/dev/null || echo 1)
-            if [ "$dl_rc" != "0" ] || [ "$vrc" != "0" ]; then
+            if [ "$(cat .cnb-failed)" != "0" ] || [ "$vrc" != "0" ]; then
               echo 1 > .cnb-failed
-            else
-              echo 0 > .cnb-failed
             fi
             exit 0
 
@@ -265,7 +292,9 @@ v*:
             } > .cnb-debug.md
             git config user.name "cnb-debug"
             git config user.email "debug@cnb.cool"
-            git add .cnb-debug.md
+            # -f 是必须的：.cnb-debug.md 本来就在 .gitignore 里（避免误提交到
+            # master），普通 git add 会直接报「被忽略」并让这一步红掉。
+            git add -f .cnb-debug.md
             git commit -m "ci-debug: 镜像 GitHub Release 产物失败日志" .cnb-debug.md \
               || echo "::warning::提交 .cnb-debug.md 失败"
             git push --force origin HEAD:refs/heads/ci-debug \

@@ -104,6 +104,30 @@ GitHub 构建超时的话把它调大。
 > `https://github.com/barry130/qt-pc.git` 和 `https://cnb.cool/canace/qt-pc.git`，
 > 所以 `git push origin <tag>` 会同时推两个远端；没有名为 `cnb` 的 remote。
 > 推不动的时候先确认 `git config --get-all remote.origin.pushurl`。
+> 只想重跑某一侧（比如只想让 CNB 镜像重试、又不想让 GitHub 重构建一遍）时：
+> `git push https://cnb.cool/canace/qt-pc.git refs/tags/v1.1.3`。
+
+### CNB 镜像流水线失败时怎么看日志
+
+CNB **没有可读的阶段日志接口**：`build/logs` 系列匿名 401，带 token 也只回
+`{"code":204,"message":"We couldn't find information on that stage."}`，日志网页
+是前端 SPA。所以公开能看到的只有 commit-status 里的
+`cnb/tag_push/pipeline-1(镜像 GitHub Release 产物) | error | error [27.5s]`，
+连卡在哪一步都看不出来。
+
+为此镜像流水线把下载与校验两个阶段改成**只记录退出码、不直接失败**（日志 `tee` 到
+`.cnb-debug.log`），紧接着的「失败诊断快照」阶段会在失败时把日志包成 `.cnb-debug.md`
+推到一条只用于排查的 `ci-debug` 分支，然后才由「按前面的结果判定成败」把流水线判红：
+
+```powershell
+# 拿到 CNB 镜像流水线的完整日志
+git fetch https://cnb.cool/canace/qt-pc.git ci-debug
+git show FETCH_HEAD:.cnb-debug.md > cnbfail.md
+```
+
+> 只读 commit-status（不登录网页）也可以确认跑到哪了：
+> `GET https://api.cnb.cool/canace/qt-pc/-/git/commit-statuses/<完整 sha>`，
+> 返回里的 `description` 形如 `error [10m 39s]`，时长能大致倒推卡在哪一步。
 
 **一次性前置**（做一次就够）：把签名私钥的 base64 配进 **GitHub 仓库** secret：
 
@@ -312,4 +336,4 @@ feature）、托盘、开机自启（LaunchAgent）、全局快捷键均可用�
 | CNB 侧没有触发 `v*` tag 流水线 | ① 仓库「设置 → 云原生构建」勾了「允许自动触发」；② 覆盖同一个 tag 时，**先删 tag、等两分钟再推** —— 删完立刻重推同一秒，CNB 可能不产生 `tag_push` 事件；③ 用 `GET https://api.cnb.cool/{repo}/-/git/commit-statuses/{sha}` 看有没有 `cnb/tag_push/...` 的状态 |
 | CNB 镜像报「等待 GitHub Release 超时」 | GitHub 侧构建失败了，去 https://github.com/barry130/qt-pc/actions 看日志；确实只是慢就把 `.cnb.yml` 的 `WAIT_SECONDS`（默认 2700 = 45 分钟）调大 |
 | CNB 镜像报 `下载 xxx 失败（n/20 次）` | CNB 节点直连 github.com 会 TCP 超时（脚本已重试 20 次、退避封顶 30s、共享 45 分钟墙钟预算）。持续失败就是节点侧故障，等一会儿重推同一个 tag 重跑即可 |
-| 想知道 CNB 流水线到底卡在哪一步 | 公开 API 只能看结果：`GET https://api.cnb.cool/{repo}/-/git/commit-statuses/{sha}` 返回 `cnb/tag_push/pipeline-1(镜像 GitHub Release 产物) | error | error [10m 39s]`，其中的时长能倒推大概卡在哪一步（秒级 = 早期阶段，分钟级 = 轮询或下载）。阶段日志要在网页上看 |
+| 想知道 CNB 流水线到底卡在哪一步 | `GET https://api.cnb.cool/{repo}/-/git/commit-statuses/<完整 sha>` 返回 `cnb/tag_push/pipeline-1(镜像 GitHub Release 产物) | error | error [10m 39s]`，其中的时长能倒推大概卡在哪一步（秒级 = 早期阶段，分钟级 = 轮询或下载）。完整日志在 `ci-debug` 分支，见上面「CNB 镜像流水线失败时怎么看日志」 |

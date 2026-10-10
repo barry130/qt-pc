@@ -72,7 +72,6 @@ asset-list.json
 # 失败时把内容包进 .cnb-debug.md 推到只用于排查的 ci-debug 分支
 .cnb-debug.md
 .cnb-failed
-.cnb-download-rc
 release-notes.md
 
 tsconfig.tsbuildinfo
