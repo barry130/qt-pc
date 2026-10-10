@@ -274,37 +274,9 @@ jobs:
           [ "$n_app" -ge 1 ] || { echo "::error::缺少 .AppImage"; exit 1; }
           [ "$n_dmg" -ge 1 ] || { echo "::error::缺少 .dmg"; exit 1; }
 
-          # 说明里逐个列出下载地址 / MD5 / fileSize：后台「版本更新」记录要照抄这三项
-          {
-            echo "# 轻听安装包 ${TAG}"
-            echo
-            echo "## 安装包信息（建后端更新记录用）"
-            echo
-            for f in artifacts/*-setup.exe; do
-              hash=$(md5sum "$f" | cut -d' ' -f1)
-              size=$(stat -c%s "$f")
-              echo "### ${f##*/}"
-              echo
-              echo "- 文件：\`${f##*/}\`"
-              echo "- 下载地址：https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/${f##*/}"
-              echo "- MD5：${hash}"
-              echo "- fileSize：${size}"
-              echo
-            done
-            cat <<'EOF'
-          ## 说明
-
-          - 每个安装包都有一个同名的 `.sig` 签名文件，**必须一起下载**；
-            应用内更新会在安装前强制验签（ed25519），缺 `.sig` 或签名不符会直接拒绝。
-          - 后台「版本更新」新增记录时：`type` 填 `1103`（Windows），
-            `versionCode` / `versionName` 与本次 tag 一致，其余三项照抄上面。
-          - Linux（`type` 填 `1104`）：deb / AppImage 无 `.sig`，
-            走浏览器下载手动安装（Linux 端 `supportsInAppUpdate()` 返回 false）。
-          - macOS：dmg **无签名无公证**（决策：不公签）。首次打开右键 App →「打开」→ 再点「打开」；
-            或终端执行 `xattr -dr com.apple.quarantine /Applications/QuietMusic.app`。
-          - 全部产物同时镜像到 CNB Release：<https://cnb.cool/canace/qt-pc/-/releases>
-          EOF
-          } > release-notes.md
+          # Release 说明由 .cnb/make-release-notes.mjs 生成 —— 和 CNB 镜像侧共用同一份
+          # 脚本，两边描述才不会走样。这里只是把产物平铺目录喂给它。
+          node .cnb/make-release-notes.mjs artifacts release-notes.md
           cat release-notes.md
 
       - name: 发布 GitHub Release

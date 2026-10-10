@@ -1,171 +1,145 @@
 #!/usr/bin/env node
 /**
- * 生成 CNB Release 的描述文件（镜像 GitHub Release 时用）。
+ * 生成 Release 描述文件（GitHub 发版和 CNB 镜像共用这一份，保证两边描述一致）。
  *
  * 用法：
  *   node .cnb/make-release-notes.mjs <安装包目录> <输出文件>
  *   例：node .cnb/make-release-notes.mjs artifacts release-notes.md
  *
- * 为什么要有这个脚本
- * ------------------
- * 应用内更新走的是后端 `astral` 的 `app_update`，后台「版本更新」记录需要手填
- * downloadUrl / MD5 / fileSize 三个字段。GitHub 侧的 release.yml 是把这三项写进
- * Release 描述里，发布时对照着填；CNB 侧沿用同一约定。
+ * 描述是写给普通用户看的，只回答一个问题：**我该下载哪个文件**。
+ * 所以刻意不写这些东西：
+ *   - 后台「版本更新」记录要填的 type / versionCode / downloadUrl / MD5 / fileSize
+ *     （那是运营自己的活，不该出现在用户面前；需要时从 GitHub API 拉资产列表即可）
+ *   - 每个文件的完整下载直链（页面上点一下就是，写一遍只是噪音）
+ *   - 每个 .sig 的单独说明（只在最后提一句它是干嘛的）
  *
- * 输入目录里应当是从 GitHub Release 原样下载下来的全部产物（镜像流水线
- * .cnb.yml 的 v* tag_push 会这么做），所以 MD5 / fileSize 与 GitHub 侧一致。
+ * 输入目录里应当是本次构建的全部产物（GitHub 侧是 publish job 下载的 artifacts/，
+ * CNB 侧是镜像流水线下载的 artifacts/），所以文件名两边完全一致。
  *
- * 下载地址用 CNB 的公开直链模板：
- *   https://cnb.cool/<仓库 slug>/-/releases/download/<tag>/<文件名>
- * （该路径由 CNB Release 附件提供，安装包与同名的 .sig 必须在同一地址，
- *   宿主 `commands.rs` 里是直接 `format!("{}.sig", final_url)` 拼出来的。）
+ * 环境变量：
+ *   CNB_REPO_SLUG  有值 = 在 CNB 侧生成（默认 slug）
+ *   GITHUB_REPOSITORY  在 GitHub Actions 里生成
+ *   CNB_BRANCH / GITHUB_REF_NAME  tag
  */
-import { createHash } from "node:crypto";
-import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { readdirSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
 
 const [, , artifactsDir = "artifacts", outFile = "release-notes.md"] = process.argv;
 
-const slug = process.env.CNB_REPO_SLUG || "canace/qt-pc";
-const tag = process.env.CNB_BRANCH || process.env.CNB_TAG || process.env.TAG || "";
-
-/** 从产物名 `QuietMusic_1.1.0_x64-setup.exe` 里取架构后缀 */
-function archOf(name) {
-  const m = /_(x64|x86|arm64)-setup\.exe$/.exec(name);
-  if (!m) return "";
-  return m[1];
-}
-
-/** 从产物名 `QuietMusic_1.1.0_aarch64.dmg` 里取 macOS 架构后缀（无后缀即 x64） */
-function macArchOf(name) {
-  if (!name.endsWith(".dmg")) return "";
-  const m = /_(aarch64|x64)\.dmg$/.exec(name);
-  return m ? m[1] : "";
-}
-
-const ARCH_LABEL = {
-  x64: "x64（64 位 Intel／AMD，绝大多数电脑）",
-  x86: "x86（32 位，老机器）",
-  arm64: "ARM64（骁龙 X 等 ARM 笔记本）",
-};
+const tag = (process.env.CNB_BRANCH || process.env.GITHUB_REF_NAME || process.env.GITHUB_TAG || "").trim();
+const version = tag.replace(/^v/, "");
+const cnbSlug = process.env.CNB_REPO_SLUG || "canace/qt-pc";
+const ghRepo = process.env.GITHUB_REPOSITORY || "barry130/qt-pc";
+const onCnb = Boolean(process.env.CNB_REPO_SLUG);
 
 const dir = resolve(artifactsDir);
-let names = [];
-let linuxNames = [];
-let macNames = [];
+let all = [];
 try {
-  const all = readdirSync(dir);
-  names = all.filter((f) => f.endsWith("-setup.exe"));
-  linuxNames = all.filter((f) => f.endsWith(".deb") || f.endsWith(".AppImage"));
-  macNames = all.filter((f) => f.endsWith(".dmg"));
+  all = readdirSync(dir).filter((f) => !f.startsWith(".") && !f.endsWith(".part"));
 } catch (err) {
   console.error(`读取产物目录失败：${dir}\n${err.message}`);
   process.exit(1);
 }
 
-// 固定 x64 → x86 → arm64 的顺序，别让文件系统顺序影响阅读
-const ORDER = ["x64", "x86", "arm64"];
-names.sort((a, b) => ORDER.indexOf(archOf(a)) - ORDER.indexOf(archOf(b)));
-macNames.sort();
+/** 在本次产物里按后缀挑文件，取第一个；没有就返回空串 */
+function pick(suffix) {
+  return all.find((f) => f.endsWith(suffix)) || "";
+}
 
-if (names.length === 0) {
+const winExes = all.filter((f) => f.endsWith("-setup.exe"));
+if (winExes.length === 0) {
   console.error(`产物目录里没有 *-setup.exe：${dir}`);
   process.exit(1);
 }
 
-/** 列出「下载地址 / MD5 / fileSize」三件套 */
-function assetBlock(name) {
-  const path = join(dir, name);
-  const buf = readFileSync(path);
-  const md5 = createHash("md5").update(buf).digest("hex");
-  const size = statSync(path).size;
+/** `QuietMusic_1.1.2_x64-setup.exe` → `x64` */
+function archOf(name) {
+  return /_(x64|x86|arm64)-setup\.exe$/.exec(name)?.[1] || "";
+}
+const exe = (arch) => winExes.find((f) => archOf(f) === arch) || "";
+const deb = pick(".deb");
+const appImage = pick(".AppImage");
+const dmg = pick(".dmg");
+
+const WINDOWS_ROWS = [
+  ["64 位 Intel／AMD（绝大多数电脑）", exe("x64")],
+  ["32 位老机器", exe("x86")],
+  ["ARM 笔记本（骁龙 X 等）", exe("arm64")],
+].filter(([, f]) => f);
+
+const LINUX_ROWS = [
+  ["Debian / Ubuntu / 深度等", deb],
+  ["任何 x86_64 Linux（免安装）", appImage],
+].filter(([, f]) => f);
+
+function table(rows) {
   return [
-    `- 文件：\`${name}\``,
-    `- 下载地址：https://cnb.cool/${slug}/-/releases/download/${tag}/${name}`,
-    `- MD5：${md5}`,
-    `- fileSize：${size}`,
+    "| 你的系统 | 下载这个 |",
+    "|---|---|",
+    ...rows.map(([k, f]) => `| ${k} | \`${f}\` |`),
+    "",
   ];
 }
 
-const hasExtra = linuxNames.length > 0 || macNames.length > 0;
-const lines = [
-  hasExtra
-    ? `# 轻听安装包（Windows / Linux / macOS）${tag}`
-    : `# 轻听 Windows 安装包 ${tag}`,
-  "",
-  "> 本 Release 的安装包由 GitHub Actions 构建（`.github/workflows/release.yml`），",
-  "> CNB 只做镜像，两侧文件逐字节相同：",
-  `> <https://github.com/${process.env.GITHUB_REPO || "barry130/qt-pc"}/releases/tag/${tag}>`,
-  "",
-  "## 安装包信息（建后端更新记录用）",
-  "",
-];
+const lines = [`# 轻听 ${version}`, ""];
 
-for (const name of names) {
-  const arch = archOf(name);
+// 镜像提示：GitHub 那边提醒换 CNB，CNB 这边就别自我指涉了。
+if (!onCnb) {
   lines.push(
-    `### ${ARCH_LABEL[arch] || arch || name}`,
-    "",
-    ...assetBlock(name),
+    `> 下载慢的话换 [CNB 镜像](https://cnb.cool/${cnbSlug}/-/releases/tag/${tag})，` +
+      `两边文件完全相同（安装包由 GitHub Actions 构建，CNB 只做镜像）。`,
     "",
   );
 }
 
 lines.push(
-  "## 说明",
+  "## 该下载哪个",
   "",
-  "- 每个安装包都有一个同名的 `.sig` 签名文件，**必须一起下载／上传**；",
-  "  应用内更新会在安装前强制验签（ed25519），缺 `.sig` 或签名不符会直接拒绝。",
-  "- 后台「版本更新」新增记录时：`type` 填 `1103`（Windows），",
-  "  `versionCode` / `versionName` 与本次 tag 一致，其余三项照抄上面。",
+  "在下面的「附件（Assets）」里点文件名即可。",
   "",
 );
 
-// Linux 原生包（无 .sig：不做应用内自装，浏览器下载手动安装）
-if (linuxNames.length > 0) {
+if (WINDOWS_ROWS.length) {
   lines.push(
-    "## Linux 包（amd64）",
+    "### Windows",
     "",
-    "- 不参与应用内自装更新（Linux 端从浏览器下载手动安装），没有 `.sig`；",
-    "- `deb` 适配 Debian / Ubuntu / 深度等；`AppImage` 免安装，下载后 `chmod +x` 直接运行；",
-    "- deb 在 ubuntu-22.04 上构建，glibc 下限比 Debian 系发行版友好；",
-    "- 后台「版本更新」新增记录时：`type` 填 `1104`（Linux），downloadUrl / MD5 /",
-    "  fileSize 照抄下面对应条目（若后端暂未开通 Linux 更新记录可先不建）。",
+    ...table(WINDOWS_ROWS),
+    "不知道架构？按 `Win + Pause` 打开「系统」页，看「系统类型」。",
     "",
   );
-  for (const name of linuxNames) {
-    lines.push(`### ${name}`, "", ...assetBlock(name), "");
-  }
 }
 
-// macOS dmg（无签名无公证：不做应用内自装，首次打开需手动放行）
-if (macNames.length > 0) {
+if (dmg) {
   lines.push(
-    "## macOS 包",
+    "### macOS",
     "",
-    "- **无签名、无公证**（决策：不公签），且不参与应用内自装更新；",
-    "- 首次打开会报「已损坏，无法打开」/「无法验证开发者」，这是预期的：",
-    "  下载后右键 App →「打开」→ 再点「打开」；",
-    "  或终端执行 `xattr -dr com.apple.quarantine /Applications/QuietMusic.app`；",
-    "- CI 产出的 dmg 是 Apple Silicon（aarch64）。Intel（x64）机器需要 `_<x64>.dmg`，",
-    "  请在 Intel Mac 上本地执行 `pnpm exec tauri build --runner cargo --bundles app,dmg` 打包。",
+    ...table([["Apple Silicon（M 系列）", dmg]]),
+    "Intel Mac 暂时没有现成的包，需要在 Intel Mac 上本地打包。",
     "",
   );
-  for (const name of macNames) {
-    const a = macArchOf(name);
-    lines.push(
-      `### ${a ? (a === "aarch64" ? "aarch64（Apple Silicon）" : "x64（Intel）") : name}`,
-      "",
-      ...assetBlock(name),
-      "",
-    );
-  }
 }
+
+if (LINUX_ROWS.length) {
+  lines.push("### Linux", "", ...table(LINUX_ROWS));
+}
+
+lines.push(
+  "## 其它",
+  "",
+  "- 每个 Windows 安装包旁边还有一个同名的 `.sig` 文件，那是给**应用内自动更新**验签用的。" +
+    "你手动下载安装的话不用管它。",
+  "- macOS 的 dmg **没有签名也没有公证**，所以第一次打开会提示「已损坏，无法打开」，这是正常的：" +
+    "在访达里右键点 App →「打开」，再点一次「打开」；" +
+    "或者终端执行 `xattr -dr com.apple.quarantine /Applications/QuietMusic.app`。",
+  "- Linux 的包不支持应用内自动更新，下载后手动安装。deb 需要 glibc 2.32 及以上" +
+    "（Ubuntu 22.04 / Debian 12 都没问题），发行版太老就用 AppImage。",
+  "",
+);
 
 writeFileSync(outFile, lines.join("\n"), "utf8");
 console.log(
-  `已写出 ${outFile}（Windows ${names.length} 个安装包` +
-    (linuxNames.length > 0 ? ` + Linux ${linuxNames.length} 个包` : "") +
-    (macNames.length > 0 ? ` + macOS ${macNames.length} 个 dmg` : "") +
+  `已写出 ${outFile}（Windows ${winExes.length} 个安装包` +
+    (LINUX_ROWS.length ? ` + Linux ${LINUX_ROWS.length} 个包` : "") +
+    (dmg ? " + macOS 1 个 dmg" : "") +
     "）",
 );

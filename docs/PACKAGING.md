@@ -171,11 +171,21 @@ git show FETCH_HEAD:.cnb-debug.md > cnbfail.md
 > CNB 侧**不再需要**任何签名密钥配置：私钥只在 GitHub 的构建阶段使用，
 > CNB 拿到的已经是签好名的 `.exe` + `.sig`。
 
-发完 Release 后，把说明页里的「下载地址 / MD5 / fileSize」填进后端管理后台的
-更新记录（应用内更新检查走的是后端 `app_update`，Release 只是托管安装包）。
-面向国内用户时下载地址建议填 **CNB** 的
-`https://cnb.cool/canace/qt-pc/-/releases/download/<tag>/<文件名>`，
-GitHub 的地址在 Release 说明里同时给出。
+> Release 描述由 `.cnb/make-release-notes.mjs` 生成，**GitHub 和 CNB 两边共用同一份**，
+> 内容只回答「我该下载哪个」：按系统/架构列一张表指向附件里的文件名，不写后台
+> 「版本更新」记录要填的 type / MD5 / fileSize，也不逐个列下载直链。
+
+发完 Release 后，需要填后台更新记录时从 GitHub 资产列表取信息即可
+（应用内更新检查走的是后端 `app_update`，Release 只是托管安装包）：
+
+```powershell
+$r = Invoke-RestMethod "https://api.github.com/repos/barry130/qt-pc/releases/tags/v1.1.3" `
+  -Headers @{ "User-Agent" = "ps"; "Accept" = "application/vnd.github+json" }
+$r.assets | ForEach-Object { "$($_.name)`t$($_.size)`t$($_.browser_download_url)" }
+```
+
+面向国内用户时，后台填的 downloadUrl 建议用 **CNB** 的
+`https://cnb.cool/canace/qt-pc/-/releases/download/<tag>/<文件名>`。
 
 > macOS 说明：CI 只出 **arm64** 的 dmg（`macos-14` 是 Apple Silicon 运行器）。
 > Intel 的 `_x64.dmg` 需要在 Intel Mac 上本地 `pnpm tauri build --target x86_64-apple-darwin --bundles dmg`
