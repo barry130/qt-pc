@@ -126,25 +126,36 @@ v*:
       timeout: 2h
       stages:
 
-        - name: 探针
+        - name: 探针2
           script: |
             set +e
             {
-              echo "== 探针 =="
-              echo "CNB_BRANCH=${CNB_BRANCH:-<空>}"
-              echo "CNB_TAG=${CNB_TAG:-<空>}"
-              echo "CNB_REPO_SLUG=${CNB_REPO_SLUG:-<空>}"
-              echo "HEAD=$(git rev-parse HEAD 2>&1)"
-              echo "node=$(node -v 2>&1)"
-              echo "branch=$(git rev-parse --abbrev-ref HEAD 2>&1)"
-              echo "TAG_RAW=$(node .cnb/fetch-github-release.mjs --print-tag 2>&1)"
-              echo "== env 全量 =="
-              env | sort
+              echo "== shell 身份 =="
+              echo "shell 0 实际路径: $(readlink -f /proc/$$/exe 2>&1)"
+              echo "ps -p $$: $(ps -p $$ -o comm= 2>&1)"
+              echo "/bin/sh -> $(readlink -f /bin/sh 2>&1)"
+              echo "ls /bin/*sh: $(ls /bin/ /usr/bin/ 2>&1 | grep -E '^(ba|da|z|)sh$' | tr '\n' ' ')"
+              echo "bash -c 'echo BASH_OK': $(bash -c 'echo BASH_OK' 2>&1)"
+              echo
+              echo "== bash 专有语法测试 =="
+              echo 'false | true' | { set -o pipefail; echo "set -o pipefail 的退出码=$?"; } 2>&1
+              echo "--- 直接试 pipefail ---"
+              ( set -o pipefail ) 2>&1
+              echo "pipefail rc=$?"
+              echo "--- 试 PIPESTATUS ---"
+              sh -c 'false | true; echo "PIPESTATUS0=[${PIPESTATUS[0]}]"' 2>&1
+              echo "sh rc=$?"
+              echo
+              echo "== 真实 stage1 里会用到的写法 =="
+              ( echo hello ) 2>&1 | tee .cnb-t.log
+              vrc=${PIPESTATUS[0]}
+              echo "vrc=$vrc"
+              echo "== 结束 =="
             } > .cnb-debug.md 2>&1
             cat .cnb-debug.md
             git config user.name "cnb-debug"
             git config user.email "debug@cnb.cool"
             git add -f .cnb-debug.md
-            git commit -m "ci-debug: 探针" .cnb-debug.md || echo "commit 失败"
+            git commit -m "ci-debug: 探针2 shell 语法" .cnb-debug.md || echo "commit 失败"
             git push --force origin HEAD:refs/heads/ci-debug || echo "push 失败"
             exit 0
