@@ -42,6 +42,20 @@
 # 文件共享一个墙钟预算）、边下边报进度（CNB 有 10 分钟无输出超时）、90s 没进数据
 # 就主动 abort 重试、先写 .part 校验 sha256 再改名。
 #
+# stage 脚本必须写成 POSIX sh（踩过的坑）
+# ---------------------------------------
+# CNB 执行 script 用的是 **sh（Debian 上是 dash），不是 bash**。dash 里
+#   - `set -o pipefail`      → "set: Illegal option -o pipefail"，并直接终止脚本
+#   - `${PIPESTATUS[0]}`    → Bad substitution
+# 两者都会让整个 stage 一行都跑不完，流水线表现是「容器刚起来就 error [4~5 秒]」，
+# 和 job 级别的问题（runner 起不来、镜像拉不动）长得一模一样，很有迷惑性。
+# 判断方法很直接：先用「什么都不做的探针 stage」跑一次确认基础设施没问题
+# （那个 stage 必须是 success），再把怀疑的语法加回去，看是不是立刻变红。
+#
+# 结论是整份 .cnb.yml 一律按 POSIX 写：要拿管道左边命令的退出码，就让它自己
+# 把退出码写进文件（`{ cmd; echo $? > .cnb-rc; } | tee log`），主脚本再读文件；
+# 需要子作用域（里面的 exit 只结束子作用域）就用 `( ... )` 而不是 `{ ... }`。
+#
 # 一次性准备（在 CNB 网页上做）
 # ----------------------------
 #   1. 仓库「设置」里确认已勾选「允许自动触发（云原生构建）」，否则 tag push 不触发流水线。
@@ -125,37 +139,241 @@ v*:
       # 默认的 10 分钟无输出超时；下载阶段静默也远不到 10 分钟。
       timeout: 2h
       stages:
+        - name: 校验 tag 与版本号一致
+          script: |
+            # 【重要】CNB 是用 sh（Debian 上是 dash）执行 script 的，**不是 bash**。
+            # dash 不认识 `set -o pipefail` 和 `${PIPESTATUS[0]}`：前者直接
+            # "set: Illegal option -o pipefail" 并终止脚本，后者是 Bad substitution。
+            # 症状是容器刚起来就 error [4~5 秒]，一个 stage 都没跑完，看起来像
+            # job 级别的问题，实际上是这几行 shell 语法把脚本干掉了。
+            # 所以下面一律用 POSIX 写法：要拿子命令的退出码，就让子命令自己把
+            # 退出码写进文件，主脚本再读文件，而不是去问管道。
+            # 和后面几个阶段一样：这里只记录结果不让流水线当场变红，判定统一
+            # 放到最后的「按前面的结果判定成败」。日志从这一阶段就开始攒，
+            # 万一后面失败，ci-debug 分支上是完整的一份。
+            set +e
+            (
+              echo "== 流水线环境 =="
+              echo "CNB_BRANCH=${CNB_BRANCH:-<空>}"
+              echo "CNB_TAG=${CNB_TAG:-<空>}"
+              echo "CNB_REPO_SLUG=${CNB_REPO_SLUG:-<空>}"
+              echo "GITHUB_REPO=${GITHUB_REPO:-<空>}"
+              echo "GITHUB_TAG=${GITHUB_TAG:-<空>}"
+              echo "HEAD=$(git rev-parse HEAD 2>&1)"
+              echo
+              # tag 的解析逻辑跟下载阶段共用同一份代码（脚本里的 resolveTag）：
+              # CNB_BRANCH 在「删 tag 再重推」触发的 tag_push 里实测是空的，
+              # 只认它会让整条流水线几十秒就挂掉。
+              TAG_RAW=$(node .cnb/fetch-github-release.mjs --print-tag)
+              TAG="${TAG_RAW#v}"
+              VER=$(node -e 'process.stdout.write(require("./app.config.json").version.name)')
+              echo "解析到的 tag=$TAG_RAW  app.config.json version=$VER"
+              if [ -z "$TAG_RAW" ]; then
+                echo "::error::没能从环境变量或 git 里解析出 tag"
+                exit 1
+              fi
+              if [ "$TAG" != "$VER" ]; then
+                echo "::error::tag($TAG) 与 app.config.json version.name($VER) 不一致，先改版本号再打 tag"
+                exit 1
+              fi
+            ) > .cnb-debug.log 2>&1
+            vrc=$?
+            cat .cnb-debug.log
+            echo "== 版本校验退出码=$vrc ==" | tee -a .cnb-debug.log
+            echo "$vrc" > .cnb-failed
+            exit 0
 
-        - name: 探针2
+        - name: 等 GitHub Release 出包并下载
+          env:
+            GITHUB_REPO: barry130/qt-pc
+            # 45 分钟：GitHub 上 gate + 三平台矩阵 + 发布，实测 25~40 分钟。
+            # 轮询间隔 60s：查资产列表走 github.com 网页端（不占 REST 配额），
+            # 但也别把人家当 API 压，60s 一次足够（Release 是原子发布的，
+            # 最多也就多等一分钟）。
+            # node:22 镜像自带 node，用它做 HTML 解析、流式下载与 sha256 校验。
+            WAIT_SECONDS: "2700"
+            POLL_SECONDS: "60"
+          script: |
+            mkdir -p artifacts
+            # 这里**故意不让这一步直接失败**：CNB 不提供可读的阶段日志接口，一旦
+            # 哪步挂了只能看到一个 error [xx 秒]。所以每个阶段都只把退出码并进
+            # .cnb-failed 并以 0 退出，最后由「按前面的结果判定成败」统一判红 ——
+            # 中间留出机会把完整日志推到 ci-debug 分支去查。
+            # tee 是必须的：CNB 有 10 分钟无输出超时，纯重定向到文件会让平台
+            # 以为卡死而腰斩。退出码用 .cnb-rc 文件传递（dash 没有 PIPESTATUS）。
+            set +e
+            mkdir -p artifacts
+            rm -f .cnb-rc
+            { node .cnb/fetch-github-release.mjs 2>&1; echo $? > .cnb-rc; } | tee -a .cnb-debug.log
+            dl_rc=$(cat .cnb-rc 2>/dev/null || echo 1)
+            echo "== 下载阶段退出码=$dl_rc ==" | tee -a .cnb-debug.log
+            ls -l artifacts/ 2>&1 | tee -a .cnb-debug.log
+            if [ "$(cat .cnb-failed)" != "0" ] || [ "$dl_rc" != "0" ]; then
+              echo 1 > .cnb-failed
+            fi
+            exit 0
+
+        - name: 校验下载下来的产物
           script: |
             set +e
+            (
+            fail=0
+            n_exe=$(ls artifacts/*-setup.exe 2>/dev/null | wc -l)
+            n_sig=$(ls artifacts/*-setup.exe.sig 2>/dev/null | wc -l)
+            n_deb=$(ls artifacts/*.deb 2>/dev/null | wc -l)
+            n_app=$(ls artifacts/*.AppImage 2>/dev/null | wc -l)
+            n_dmg=$(ls artifacts/*.dmg 2>/dev/null | wc -l)
+            echo "exe=$n_exe sig=$n_sig deb=$n_deb AppImage=$n_app dmg=$n_dmg"
+            [ "$n_exe" -eq 3 ] || { echo "::error::Windows 安装包应为 3 个，实际 $n_exe"; fail=1; }
+            [ "$n_sig" -eq 3 ] || { echo "::error::签名文件应为 3 个，实际 $n_sig"; fail=1; }
+            [ "$n_deb" -ge 1 ] || { echo "::error::缺少 .deb"; fail=1; }
+            [ "$n_app" -ge 1 ] || { echo "::error::缺少 .AppImage"; fail=1; }
+            [ "$n_dmg" -ge 1 ] || { echo "::error::缺少 .dmg"; fail=1; }
+            [ "$fail" -eq 0 ] || exit 1
+            # 每个 .exe 必须有同名 .sig：应用内更新装之前会强制验签（ed25519）。
+            for f in artifacts/*-setup.exe; do
+              [ -s "$f.sig" ] || { echo "::error::缺少或为空的签名文件 $f.sig"; exit 1; }
+            done
+            # 不做密码学验签：私钥只存在于 GitHub 侧（签名与验签都在 build 阶段
+            # 跑过 update-sign.mjs sign/verify，这里拿不到私钥）。这里只能做结构
+            # 校验 —— ed25519 签名恒为 64 字节，base64 单行恒为 88 个字符。
+            for f in artifacts/*-setup.exe.sig; do
+              len=$(tr -d '\r\n' < "$f" | wc -c)
+              if [ "$len" -ne 88 ]; then
+                echo "::error::$f 长度 $len 字节，不是合法的 base64 ed25519 签名（应为 88）"
+                exit 1
+              fi
+              if ! grep -Eq '^[A-Za-z0-9+/]{88}=$' "$f"; then
+                echo "::error::$f 不是合法的 base64 单行签名"
+                exit 1
+              fi
+            done
+            # 任何产物都不得为 0 字节：下载中断最典型的表现是 GitHub 的 HTML
+            # 错误页 / 302 中间页被落到了目标文件名上。
+            for f in artifacts/*; do
+              [ -s "$f" ] || { echo "::error::空文件 $f"; exit 1; }
+            done
+            # 每个产物的内容都要和 GitHub 上公布的摘要/字节数对得上
+            #（截断的下载、被劫持塞进来的 HTML 错误页都会在这里暴露；
+            #  fetch 脚本里已经边下边算过一遍，这里是换个进程再复核一次）。
+            node -e '
+              const { createHash } = require("node:crypto");
+              const { readFileSync, statSync } = require("node:fs");
+              const { join } = require("node:path");
+              const list = JSON.parse(readFileSync("asset-list.json", "utf8"));
+              let bad = 0;
+              for (const a of list) {
+                const p = join("artifacts", a.name);
+                let ok, got;
+                if (a.sha256) {
+                  got = createHash("sha256").update(readFileSync(p)).digest("hex");
+                  ok = got === a.sha256;
+                  console.log(`${ok ? "OK " : "!! "} ${a.name}  sha256 ${got.slice(0,16)}… / ${a.sha256.slice(0,16)}…`);
+                } else {
+                  got = statSync(p).size;
+                  ok = !a.size || got === a.size;
+                  console.log(`${ok ? "OK " : "!! "} ${a.name}  ${got} / ${a.size || "?"} 字节`);
+                }
+                if (!ok) bad++;
+              }
+              if (bad) { console.error(`${bad} 个产物校验不符`); process.exit(1); }
+            '
+            ) >> .cnb-debug.log 2>&1
+            vrc=$?
+            tail -n 60 .cnb-debug.log
+            echo "== 校验阶段退出码=$vrc ==" | tee -a .cnb-debug.log
+            if [ "$(cat .cnb-failed)" != "0" ] || [ "$vrc" != "0" ]; then
+              echo 1 > .cnb-failed
+            fi
+            exit 0
+
+        - name: 生成 Release 描述
+          script: |
+            set +e
+            rm -f .cnb-rc
+            { node .cnb/make-release-notes.mjs artifacts release-notes.md 2>&1; echo $? > .cnb-rc; } | tee -a .cnb-debug.log
+            notes_rc=$(cat .cnb-rc 2>/dev/null || echo 1)
+            if [ "$notes_rc" != "0" ]; then
+              echo "::error::生成 Release 描述失败"
+              echo 1 > .cnb-failed
+            else
+              echo "== Release 描述 =="
+              cat release-notes.md
+            fi
+            exit 0
+
+        # git:release 不支持上传附件，附件交给下一步的 cnbcool/attachments
+        - name: 创建 CNB Release
+          type: git:release
+          options:
+            title: 轻听 $CNB_BRANCH
+            descriptionFromFile: release-notes.md
+            overlying: false
+            latest: "true"
+
+        - name: 上传安装包与签名文件
+          image: cnbcool/attachments:latest
+          settings:
+            type: UPLOAD
+            tag: $CNB_BRANCH
+            token: $CNB_TOKEN
+            attachments:
+              - "./artifacts/*-setup.exe"
+              - "./artifacts/*-setup.exe.sig"
+              - "./artifacts/*.deb"
+              - "./artifacts/*.AppImage"
+              - "./artifacts/*.dmg"
+
+        # 上面两个 stage（git:release、attachments）既不给可读的阶段日志，也没法
+        # 在脚本里接退出码。唯一能自证「镜像真的成了」的办法是反过来问 CNB 自己：
+        # 用 $CNB_TOKEN 查这个 tag 的 Release 在不在、附件是不是和 artifacts 一一对应。
+        - name: 核对 CNB Release 与附件
+          script: |
+            set +e
+            rm -f .cnb-rc
+            { node .cnb/verify-cnb-release.mjs 2>&1; echo $? > .cnb-rc; } | tee -a .cnb-debug.log
+            verify_rc=$(cat .cnb-rc 2>/dev/null || echo 1)
+            echo "== 核对阶段退出码=$verify_rc ==" | tee -a .cnb-debug.log
+            if [ "$verify_rc" != "0" ]; then
+              echo 1 > .cnb-failed
+            fi
+            exit 0
+
+        # CNB 没有可读的阶段日志接口（build/logs 系列的接口匿名 401、带 token 也
+        # 只回 {"code":204,"message":"We couldn't find information on that stage."}），
+        # 失败时只能看到一个 error [xx 秒]。所以把日志推到一个专用于排查的
+        # ci-debug 分支：本地 git fetch origin ci-debug 就能读到全文。推失败只是
+        # 少一条线索，不影响判定。
+        - name: 失败诊断快照
+          script: |
+            set -e
+            if [ "$(cat .cnb-failed)" = "0" ]; then
+              echo "前面各阶段都通过，不需要诊断快照"
+              exit 0
+            fi
             {
-              echo "== shell 身份 =="
-              echo "shell 0 实际路径: $(readlink -f /proc/$$/exe 2>&1)"
-              echo "ps -p $$: $(ps -p $$ -o comm= 2>&1)"
-              echo "/bin/sh -> $(readlink -f /bin/sh 2>&1)"
-              echo "ls /bin/*sh: $(ls /bin/ /usr/bin/ 2>&1 | grep -E '^(ba|da|z|)sh$' | tr '\n' ' ')"
-              echo "bash -c 'echo BASH_OK': $(bash -c 'echo BASH_OK' 2>&1)"
+              echo "# CNB 镜像流水线失败日志"
               echo
-              echo "== bash 专有语法测试 =="
-              echo 'false | true' | { set -o pipefail; echo "set -o pipefail 的退出码=$?"; } 2>&1
-              echo "--- 直接试 pipefail ---"
-              ( set -o pipefail ) 2>&1
-              echo "pipefail rc=$?"
-              echo "--- 试 PIPESTATUS ---"
-              sh -c 'false | true; echo "PIPESTATUS0=[${PIPESTATUS[0]}]"' 2>&1
-              echo "sh rc=$?"
-              echo
-              echo "== 真实 stage1 里会用到的写法 =="
-              ( echo hello ) 2>&1 | tee .cnb-t.log
-              vrc=${PIPESTATUS[0]}
-              echo "vrc=$vrc"
-              echo "== 结束 =="
-            } > .cnb-debug.md 2>&1
-            cat .cnb-debug.md
+              echo '```'
+              cat .cnb-debug.log
+              echo '```'
+            } > .cnb-debug.md
             git config user.name "cnb-debug"
             git config user.email "debug@cnb.cool"
+            # -f 是必须的：.cnb-debug.md 本来就在 .gitignore 里（避免误提交到
+            # master），普通 git add 会直接报「被忽略」并让这一步红掉。
             git add -f .cnb-debug.md
-            git commit -m "ci-debug: 探针2 shell 语法" .cnb-debug.md || echo "commit 失败"
-            git push --force origin HEAD:refs/heads/ci-debug || echo "push 失败"
+            git commit -m "ci-debug: 镜像 GitHub Release 产物失败日志" .cnb-debug.md \
+              || echo "::warning::提交 .cnb-debug.md 失败"
+            git push --force origin HEAD:refs/heads/ci-debug \
+              || echo "::warning::推 ci-debug 分支失败（可能没有写权限）"
             exit 0
+
+        # 日志已经留痕，到这一步才让流水线真正判红，避免「一失败就没线索」。
+        - name: 按前面的结果判定成败
+          script: |
+            if [ "$(cat .cnb-failed)" != "0" ]; then
+              echo "::error::镜像流水线失败，完整日志见 ci-debug 分支上的 .cnb-debug.md"
+              exit 1
+            fi
+            echo "GitHub Release 已镜像到 CNB"
