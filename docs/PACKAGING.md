@@ -111,13 +111,15 @@ GitHub 构建超时的话把它调大。
 
 CNB **没有可读的阶段日志接口**：`build/logs` 系列匿名 401，带 token 也只回
 `{"code":204,"message":"We couldn't find information on that stage."}`，日志网页
-是前端 SPA。所以公开能看到的只有 commit-status 里的
+是前端 SPA，`cnb build get-build-logs` 需要 `repo-cnb-history:r` 权限（本地
+拿到的 git 凭据没有这个 scope）。所以公开能看到的只有 commit-status 里的
 `cnb/tag_push/pipeline-1(镜像 GitHub Release 产物) | error | error [27.5s]`，
 连卡在哪一步都看不出来。
 
-为此镜像流水线把下载与校验两个阶段改成**只记录退出码、不直接失败**（日志 `tee` 到
-`.cnb-debug.log`），紧接着的「失败诊断快照」阶段会在失败时把日志包成 `.cnb-debug.md`
-推到一条只用于排查的 `ci-debug` 分支，然后才由「按前面的结果判定成败」把流水线判红：
+为此镜像流水线把下载、校验、生成说明这几个阶段改成**只记录退出码、不直接失败**
+（日志 `tee` 到 `.cnb-debug.log`），排在最后的「失败诊断快照」阶段会在失败时把
+日志包成 `.cnb-debug.md` 推到一条只用于排查的 `ci-debug` 分支，然后才由
+「按前面的结果判定成败」把流水线判红：
 
 ```powershell
 # 拿到 CNB 镜像流水线的完整日志
@@ -126,8 +128,28 @@ git show FETCH_HEAD:.cnb-debug.md > cnbfail.md
 ```
 
 > 只读 commit-status（不登录网页）也可以确认跑到哪了：
-> `GET https://api.cnb.cool/canace/qt-pc/-/git/commit-statuses/<完整 sha>`，
-> 返回里的 `description` 形如 `error [10m 39s]`，时长能大致倒推卡在哪一步。
+> `GET https://api.cnb.cool/canace/qt-pc/-/git/commit-statuses/<完整 sha>`（需带
+> `Authorization: Bearer <CNB token>`，匿名 401），返回里的 `description` 形如
+> `error [10m 39s]`，时长能大致倒推卡在哪一步。
+
+阶段顺序是：`校验 tag → 下载 → 校验产物 → 生成说明 → git:release → 上传附件
+→ 核对 CNB Release → 失败诊断快照 → 按结果判定成败`。最后那个「核对」是唯一
+能自证镜像真的成功的手段 —— `git:release` 和 `cnbcool/attachments` 既不给日志
+也接不到退出码，所以 `.cnb/verify-cnb-release.mjs` 拿着 `$CNB_TOKEN` 回查
+`GET /canace/qt-pc/-/releases/tags/<tag>`，要求附件和 `artifacts/` 一一对应。
+
+> **CNB 的 stage 脚本是用 `sh`（Debian 上是 dash）跑的，不是 bash。**
+> dash 不认识 `set -o pipefail`（直接 "set: Illegal option -o pipefail" 并终止
+> 脚本）和 `${PIPESTATUS[0]}`（Bad substitution）。症状是容器刚起来就
+> `error [4~5 秒]`，一个 stage 都跑不完，看着像 runner/镜像问题其实是自己写的
+> shell 干掉了自己。要拿管道左边命令的退出码，用 POSIX 写法
+> `{ cmd; echo $? > .cnb-rc; } | tee log` 再读文件；需要子作用域（里面的 `exit`
+> 只结束子作用域）用 `( ... )` 而不是 `{ ... }`。改动 `.cnb.yml` 的 stage 脚本
+> 前先看一眼这段。
+
+> 还有一个副作用：`overlying: false` 的 `git:release` 是「先删再建」，所以一旦
+> 这一步之后失败，CNB 上会留下一个没有附件的 Release。下一次重推同一个 tag 会
+> 重新建一遍。
 
 **一次性前置**（做一次就够）：把签名私钥的 base64 配进 **GitHub 仓库** secret：
 
@@ -337,3 +359,5 @@ feature）、托盘、开机自启（LaunchAgent）、全局快捷键均可用�
 | CNB 镜像报「等待 GitHub Release 超时」 | GitHub 侧构建失败了，去 https://github.com/barry130/qt-pc/actions 看日志；确实只是慢就把 `.cnb.yml` 的 `WAIT_SECONDS`（默认 2700 = 45 分钟）调大 |
 | CNB 镜像报 `下载 xxx 失败（n/20 次）` | CNB 节点直连 github.com 会 TCP 超时（脚本已重试 20 次、退避封顶 30s、共享 45 分钟墙钟预算）。持续失败就是节点侧故障，等一会儿重推同一个 tag 重跑即可 |
 | 想知道 CNB 流水线到底卡在哪一步 | `GET https://api.cnb.cool/{repo}/-/git/commit-statuses/<完整 sha>` 返回 `cnb/tag_push/pipeline-1(镜像 GitHub Release 产物) | error | error [10m 39s]`，其中的时长能倒推大概卡在哪一步（秒级 = 早期阶段，分钟级 = 轮询或下载）。完整日志在 `ci-debug` 分支，见上面「CNB 镜像流水线失败时怎么看日志」 |
+| CNB 镜像报 `…不是合法的 base64 单行签名` | ed25519 签名恒为 64 字节，base64 之后恒为 **88 个字符、结尾是两个 `=`**（64 = 3×21 + 1，多出 1 个字节要补两个 `=`）。按 `{88}=` 去匹配会误判成非法，正确写法是 `{86}==` |
+| tag 流水线几秒就红（`error [4~5s]`） | 多半是 stage 脚本里用了 bash 专有语法（`set -o pipefail`、`${PIPESTATUS[0]}`），CNB 是用 dash 跑的，见上面 CNB 一节的提醒 |

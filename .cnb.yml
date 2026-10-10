@@ -235,16 +235,17 @@ v*:
               [ -s "$f.sig" ] || { echo "::error::缺少或为空的签名文件 $f.sig"; exit 1; }
             done
             # 不做密码学验签：私钥只存在于 GitHub 侧（签名与验签都在 build 阶段
-            # 跑过 update-sign.mjs sign/verify，这里拿不到私钥）。这里只能做结构
-            # 校验 —— ed25519 签名恒为 64 字节，base64 单行恒为 88 个字符。
+              # 跑过 update-sign.mjs sign/verify，这里拿不到私钥）。这里只能做结构
+              # 校验 —— ed25519 签名恒为 64 字节，而 64 = 3×21 + 1，所以 base64 之后
+              # 恒为 88 个字符、且结尾一定是两个 '='（不是一个！写成 {88}= 会误判）。
             for f in artifacts/*-setup.exe.sig; do
               len=$(tr -d '\r\n' < "$f" | wc -c)
               if [ "$len" -ne 88 ]; then
                 echo "::error::$f 长度 $len 字节，不是合法的 base64 ed25519 签名（应为 88）"
                 exit 1
               fi
-              if ! grep -Eq '^[A-Za-z0-9+/]{88}=$' "$f"; then
-                echo "::error::$f 不是合法的 base64 单行签名"
+              if ! tr -d '\r\n' < "$f" | grep -Eq '^[A-Za-z0-9+/]{86}==$'; then
+                echo "::error::$f 不是合法的 base64 单行 ed25519 签名（应为 86 个 base64 字符 + 两个 '='）"
                 exit 1
               fi
             done
