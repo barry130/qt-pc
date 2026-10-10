@@ -21,8 +21,15 @@
 #
 # 等待 GitHub 的方式
 # ----------------------
-# 轮询 GitHub Release 资产列表（仓库是公开的，匿名可读，不需要任何 token）：
-#   GET https://api.github.com/repos/barry130/qt-pc/releases/tags/<tag>
+# 仓库是公开的，下载与查询都不需要任何 token。查资产列表走的是 **HTML 片段**而不是
+# REST API：
+#   GET https://github.com/barry130/qt-pc/releases/expanded_assets/<tag>
+# 原因：GitHub 对未认证的 api.github.com 限 60 次/小时/IP，而 CNB 托管节点是共享出口
+# IP，别人的构建也在消耗同一个配额 —— 45 分钟轮询看着不多，实际很容易撞到 403 然后
+# 白等一个重置窗口。网页端的这段 HTML 不占 REST 配额，还顺带给出每个资产的 sha256。
+# REST API（GET /repos/barry130/qt-pc/releases/tags/<tag>）留作兜底，万一 GitHub 改了
+# HTML 结构，至少还能拿到资产名和精确字节数。
+#
 # 期望同时看到 3 个 *-setup.exe、3 个 .sig、1 个 .deb、1 个 .AppImage、1 个 .dmg；
 # 齐了就逐个 GET https://github.com/<repo>/releases/download/<tag>/<name> 下载。
 # 超时默认 45 分钟（GitHub 上三平台矩阵构建 + 发布，实测 30~40 分钟）。
@@ -33,7 +40,7 @@
 # 失败时报 ConnectTimeoutError / fetch failed），中途断流也不会自己报错。所以
 # .cnb/fetch-github-release.mjs 里：每个产物最多重试 20 次（退避封顶 30s，且所有
 # 文件共享一个墙钟预算）、边下边报进度（CNB 有 10 分钟无输出超时）、90s 没进数据
-# 就主动 abort 重试、先写 .part 校验字节数再改名。
+# 就主动 abort 重试、先写 .part 校验 sha256 再改名。
 #
 # 一次性准备（在 CNB 网页上做）
 # ----------------------------
@@ -133,10 +140,10 @@ v*:
           env:
             GITHUB_REPO: barry130/qt-pc
             # 45 分钟：GitHub 上 gate + 三平台矩阵 + 发布，实测 25~40 分钟。
-            # 轮询间隔 60s 是**匿名** API 配额算出来的：GitHub 匿名 REST 限
-            # 60 次/小时/IP，节点是共享出口 IP，30s 一次会在长等里被限流。
-            # node:22 镜像自带 node，用它做 JSON 解析与下载（正则切 JSON 太脆，
-            # 且 fetch 跟随重定向比 curl 更省心）。
+            # 轮询间隔 60s：查资产列表走 github.com 网页端（不占 REST 配额），
+            # 但也别把人家当 API 压，60s 一次足够（Release 是原子发布的，
+            # 最多也就多等一分钟）。
+            # node:22 镜像自带 node，用它做 HTML 解析、流式下载与 sha256 校验。
             WAIT_SECONDS: "2700"
             POLL_SECONDS: "60"
           script: |
@@ -184,20 +191,30 @@ v*:
             for f in artifacts/*; do
               [ -s "$f" ] || { echo "::error::空文件 $f"; exit 1; }
             done
-            # 字节数与 GitHub Release 声明的 size 逐个比对（截断的下载在这里暴露，
-            # fetch 脚本里已按「非空 + 5 次重试」兜底，这里是最后一道闸）。
+            # 每个产物的内容都要和 GitHub 上公布的摘要/字节数对得上
+            #（截断的下载、被劫持塞进来的 HTML 错误页都会在这里暴露；
+            #  fetch 脚本里已经边下边算过一遍，这里是换个进程再复核一次）。
             node -e '
+              const { createHash } = require("node:crypto");
               const { readFileSync, statSync } = require("node:fs");
               const { join } = require("node:path");
               const list = JSON.parse(readFileSync("asset-list.json", "utf8"));
               let bad = 0;
               for (const a of list) {
-                const got = statSync(join("artifacts", a.name)).size;
-                const ok = got === a.size;
+                const p = join("artifacts", a.name);
+                let ok, got;
+                if (a.sha256) {
+                  got = createHash("sha256").update(readFileSync(p)).digest("hex");
+                  ok = got === a.sha256;
+                  console.log(`${ok ? "OK " : "!! "} ${a.name}  sha256 ${got.slice(0,16)}… / ${a.sha256.slice(0,16)}…`);
+                } else {
+                  got = statSync(p).size;
+                  ok = !a.size || got === a.size;
+                  console.log(`${ok ? "OK " : "!! "} ${a.name}  ${got} / ${a.size || "?"} 字节`);
+                }
                 if (!ok) bad++;
-                console.log(`${ok ? "OK " : "!! "} ${a.name}  ${got} / ${a.size} 字节`);
               }
-              if (bad) { console.error(`${bad} 个产物字节数不符`); process.exit(1); }
+              if (bad) { console.error(`${bad} 个产物校验不符`); process.exit(1); }
             '
 
         - name: 生成 Release 描述

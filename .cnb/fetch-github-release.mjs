@@ -10,30 +10,33 @@
  *   ARTIFACT_DIR=artifacts          选填，下载目录，默认 artifacts
  *   STALL_SECONDS=90                选填，下载时多久没进数据就判卡死重试，默认 90
  *   MAX_ATTEMPTS=20                 选填，每个产物的下载重试次数，默认 20
+ *   GITHUB_TOKEN=                   选填，配了就能顺带提升 API 配额，默认匿名
  *
- * 为什么不用 shell + curl 解析
- * ---------------------------
- * 1. 匿名 REST 配额：GitHub 对未认证请求限 60 次/小时/IP，CNB 托管节点是共享
- *    出口 IP。轮询间隔必须给到 60s，45 分钟最多 46 次，留足余量。
- * 2. JSON 不能用正则切：资产名里一旦出现特殊字符（GitHub 在 display_name /
- *    标签上会返回转义），grep '"name":"[^"]*"' 就会切错。用 JSON.parse 才稳。
- * 3. 下载要跟随重定向：asset 直链是 302 到 S3，node fetch 默认跟随，
- *    curl 需要 -L 还得额外处理 --retry；这里统一在代码里做。
+ * 为什么轮询走 HTML 片段而不是 REST API
+ * -----------------------------------
+ * GitHub 对未认证的 `api.github.com` 限 60 次/小时/IP，而 CNB 托管节点是共享出口
+ * IP —— 一台节点上别人的构建也在消耗同一个配额，45 分钟轮询一次看着不多，实际很
+ * 容易被撞到 403。真撞上了就只能在 45 分钟里干等一个不会到来的重置窗口。
  *
- * 下载完会把每个文件的字节数与 Release 声明的 size 逐个比对，并写出
- * artifacts/asset-list.json 供流水线的校验阶段复核。截断的下载在这里就被
- * 重试掉，不会流到「生成 MD5 / fileSize」那一步 —— 用截断文件算出的
- * MD5 与 fileSize 会让后台「版本更新」记录静默失效。
+ * 所以主路径改抓 `https://github.com/<repo>/releases/expanded_assets/<tag>`：
+ * 这是 github.com 网页端的一段 HTML，列出了每个资产的下载链接和 **sha256 摘要**，
+ * 不占 REST 配额。REST API 留作兜底（万一 GitHub 改了这段 HTML 结构，至少还能
+ * 拿到资产名和精确字节数，不会彻底卡死）。
+ *
+ * 顺带白捡一个更硬的校验：sha256。下载时边写边算，对不上就重下 —— 比只比对字节数
+ * 强得多（截断、代理塞 HTML 错误页、内容损坏都能挡）。
  *
  * 判定「出齐」的条件（与 GitHub 侧 release.yml 的 publish 校验保持一致）：
  *   3 个 *-setup.exe + 3 个 .sig + ≥1 .deb + ≥1 .AppImage + ≥1 .dmg
- * GitHub 侧先跑完三平台矩阵才建 Release 并一次性传完所有资产，所以这里读到
- * 的资产列表就是完整清单，不会漏掉最后一个平台。
+ * GitHub 侧先跑完三平台矩阵才建 Release 并一次性传完所有资产，所以这里读到的
+ * 资产列表就是完整清单，不会漏掉最后一个平台。
  */
+import { createHash } from "node:crypto";
 import { createWriteStream, mkdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { pathToFileURL } from "node:url";
 
 const repo = process.env.GITHUB_REPO || "barry130/qt-pc";
 const tag = process.env.GITHUB_TAG || process.env.CNB_BRANCH || process.env.CNB_TAG || "";
@@ -47,11 +50,10 @@ const stallSeconds = Number(process.env.STALL_SECONDS || 90);
 // ConnectTimeoutError / fetch failed）。单次超时很便宜，所以宁可多试几轮也别
 // 早早就放弃：20 次 × 10s 连接，退避封顶 30s，再由共享 deadline 兜住总时长。
 const maxAttempts = Number(process.env.MAX_ATTEMPTS || 20);
+const ghToken = (process.env.GITHUB_TOKEN || "").trim();
 
-if (!repo || !tag) {
-  console.error("需要 GITHUB_REPO（owner/repo）与 GITHUB_TAG 两个环境变量");
-  process.exit(1);
-}
+// 注意：GITHUB_REPO / GITHUB_TAG 的必填校验放在 main() 里，被 import 做单测时
+// 不要因为缺环境变量就把进程干掉。
 
 /** 关心的资产类型：exe / sig 是应用内更新链路，deb/AppImage/dmg 是手动安装 */
 const PATTERNS = [
@@ -62,6 +64,7 @@ const PATTERNS = [
   { re: /\.dmg$/, min: 1, label: "dmg" },
 ];
 
+const htmlUrl = `https://github.com/${repo}/releases/expanded_assets/${tag}`;
 const apiUrl = `https://api.github.com/repos/${repo}/releases/tags/${tag}`;
 
 function log(msg) {
@@ -72,16 +75,68 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/** 拉 Release JSON；Release 还不存在时返回 null（tag 刚推，流水线还没跑完） */
-async function fetchRelease() {
-  const res = await fetch(apiUrl, {
-    headers: {
-      Accept: "application/vnd.github+json",
-      "User-Agent": "qt-pc-cnb-mirror",
-      "X-GitHub-Api-Version": "2022-11-28",
-    },
+function headers(extra = {}) {
+  return {
+    "User-Agent": "qt-pc-cnb-mirror",
+    ...(ghToken ? { Authorization: `Bearer ${ghToken}` } : {}),
+    ...extra,
+  };
+}
+
+/**
+ * 从 expanded_assets 的 HTML 片段里抠出资产清单。
+ *
+ * 结构长这样（空白很多，用正则按「下一个 href 之前」切块最稳）：
+ *   <a href="/<repo>/releases/download/<tag>/NAME" ...><span class="text-bold">NAME</span></a>
+ *   ... 隔一大段 ... <span class="Truncate-text">sha256:<64 位十六进制></span>
+ * sha256 不保证都有（GitHub 只给近期上传的资产生成），缺失时就留空字符串，
+ * 由调用方退回到「只比字节数」。
+ */
+function parseExpandedAssets(html) {
+  const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const re = new RegExp(
+    `href="/${esc(repo)}/releases/download/${esc(tag)}/([^"]+)"`,
+    "g",
+  );
+  const hits = [];
+  for (const m of html.matchAll(re)) {
+    hits.push({ name: decodeURIComponent(m[1]), index: m.index });
+  }
+  return hits.map((hit, i) => {
+    const end = i + 1 < hits.length ? hits[i + 1].index : html.length;
+    const block = html.slice(hit.index, end);
+    const sha = block.match(/sha256:([0-9a-f]{64})/);
+    return { name: hit.name, size: 0, sha256: sha ? sha[1] : "" };
   });
-  if (res.status === 404) return null;
+}
+
+/** 读一次资产清单：先 HTML（不占 REST 配额，带 sha256），失败再退到 REST API。 */
+async function fetchAssets() {
+  try {
+    const res = await fetch(htmlUrl, {
+      headers: headers({ Accept: "text/html" }),
+      redirect: "follow",
+    });
+    if (res.status === 404) return { source: "html", assets: [] };
+    if (res.ok) {
+      const list = parseExpandedAssets(await res.text());
+      if (list.length) return { source: "html", assets: list };
+      log("expanded_assets 里没解析出资产，改走 REST API");
+    } else {
+      log(`expanded_assets 返回 HTTP ${res.status}，改走 REST API`);
+    }
+  } catch (err) {
+    log(`抓 expanded_assets 失败（${err.message}），改走 REST API`);
+  }
+
+  const res = await fetch(apiUrl, {
+    headers: headers({
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+    }),
+    redirect: "follow",
+  });
+  if (res.status === 404) return { source: "api", assets: [] };
   if (res.status === 403 || res.status === 429) {
     const reset = res.headers.get("x-ratelimit-reset");
     throw new Error(
@@ -90,15 +145,18 @@ async function fetchRelease() {
     );
   }
   if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
-  return res.json();
+  const body = await res.json();
+  const assets = Array.isArray(body?.assets) ? body.assets : [];
+  return {
+    source: "api",
+    assets: assets.map((a) => ({ name: a.name, size: Number(a.size) || 0, sha256: "" })),
+  };
 }
 
-/** 匹配关心的资产，返回 {counts, wanted}（wanted 含 name + GitHub 声明的 size） */
-function selectAssets(release) {
-  const assets = Array.isArray(release?.assets) ? release.assets : [];
+/** 匹配关心的资产，返回 {counts, wanted}（wanted 含 name / size / sha256） */
+function selectAssets(assets) {
   const wanted = assets
     .filter((a) => PATTERNS.some((p) => p.re.test(a.name)))
-    .map((a) => ({ name: a.name, size: Number(a.size) || 0 }))
     .sort((a, b) => (a.name < b.name ? -1 : 1));
   const names = wanted.map((a) => a.name);
   const counts = PATTERNS.map((p) => ({
@@ -113,9 +171,12 @@ function formatCounts(counts) {
   return counts.map((c) => `${c.label}=${c.n}`).join(" ");
 }
 
-function isReady(counts) {
+/** 每一类都达到下限才算「出齐」 */
+export function isReady(counts) {
   return counts.every((c) => c.n >= c.min);
 }
+
+export { selectAssets, parseExpandedAssets };
 
 /**
  * 流式下载到磁盘，不进内存。
@@ -125,8 +186,8 @@ function isReady(counts) {
  * 的超时，节点带宽再慢一点就会被判定失败。改成 pipe + 边下边报进度后，峰值内存是
  * 一个 64 KiB 的块，输出也连续不断。
  *
- * 仍然逐个校验字节数：先写 `.part`，字节数对上才 rename 到位，失败重试时把半截
- * 文件删掉 —— 绝不能把截断的文件留给后面的 MD5 / fileSize 计算。
+ * 仍然逐个校验内容：先写 `.part`，sha256（拿得到时）或字节数对上了才 rename 到位，
+ * 失败重试时把半截文件删掉 —— 绝不能把截断的文件留给后面的 MD5 / fileSize 计算。
  *
  * 还有一层「卡死」看门狗：undici 只管连接超时（10s）和响应头超时（300s），**读到一半
  * 断流不会自己报错**，fetch 会一直挂着。从 CNB 节点拉 GitHub 大文件经常卡在几十 KB/s，
@@ -135,8 +196,8 @@ function isReady(counts) {
  * 重试次数很多，但所有文件共享一个 deadline（downloadDeadline）：单个文件失败
  * 不该无限重试，整条流水线的墙钟预算也只有 2h（.cnb.yml 的 timeout: 2h）。
  */
-async function download(name, expectedSize, deadline) {
-  const url = `https://github.com/${repo}/releases/download/${tag}/${name}`;
+async function download(name, expectedSize, expectedSha, deadline) {
+  const url = `https://github.com/${repo}/releases/download/${tag}/${encodeURIComponent(name)}`;
   const finalPath = join(dir, name);
   const partPath = `${finalPath}.part`;
   const mib = (n) => `${(n / 1024 / 1024).toFixed(1)} MiB`;
@@ -156,7 +217,7 @@ async function download(name, expectedSize, deadline) {
     try {
       armStall();
       const res = await fetch(url, {
-        headers: { "User-Agent": "qt-pc-cnb-mirror" },
+        headers: headers(),
         redirect: "follow",
         signal: ctl.signal,
       });
@@ -165,8 +226,10 @@ async function download(name, expectedSize, deadline) {
       let seen = 0;
       let lastBytes = 0;
       let lastAt = Date.now();
+      const sha = createHash("sha256");
       const counter = new Transform({
         transform(chunk, _enc, cb) {
+          sha.update(chunk);
           seen += chunk.length;
           armStall();
           // 每 25 MiB 或每 30s 报一次：既能看到在动，也不会刷屏。
@@ -186,9 +249,14 @@ async function download(name, expectedSize, deadline) {
 
       const size = statSync(partPath).size;
       if (size === 0) throw new Error("下载到 0 字节");
-      // 与 Release 声明的字节数比对：截断 / 落到 HTML 错误页都能挡住。
+      // 有 sha256 就用它（最硬）；拿不到才退回字节数比对。
       // （不去重算 MD5 —— 校验和留给 make-release-notes 一次算完。）
-      if (expectedSize > 0 && size !== expectedSize) {
+      if (expectedSha) {
+        const got = sha.digest("hex");
+        if (got !== expectedSha) {
+          throw new Error(`sha256 不符：拿到 ${got.slice(0, 12)}…，应为 ${expectedSha.slice(0, 12)}…`);
+        }
+      } else if (expectedSize > 0 && size !== expectedSize) {
         throw new Error(`字节数不符：拿到 ${size}，应为 ${expectedSize}`);
       }
       rmSync(finalPath, { force: true });
@@ -217,39 +285,41 @@ async function download(name, expectedSize, deadline) {
 }
 
 async function main() {
+  if (!repo || !tag) {
+    console.error("需要 GITHUB_REPO（owner/repo）与 GITHUB_TAG 两个环境变量");
+    process.exit(1);
+  }
   log(`等待 ${repo} 的 Release ${tag}（最多 ${waitSeconds}s，每 ${pollSeconds}s 查一次）`);
+  log(`资产清单来源：${ghToken ? "HTML + REST（带 token）" : "HTML + REST（匿名）"}`);
   const deadline = Date.now() + waitSeconds * 1000;
+  let wanted = [];
 
-  let wanted = null;
   for (;;) {
-    let release;
+    let assets = [];
     try {
-      release = await fetchRelease();
+      // 轮询期间的任何一次失败（网络抖动、限流、5xx、HTML 结构变了）都不该让
+      // 整条流水线挂掉：这一轮跳过，sleep(pollSeconds) 后继续，直到预算用完。
+      const got = await fetchAssets();
+      assets = got.assets;
+      if (!assets.length) {
+        log(`Release ${tag} 还不存在（tag 刚推，GitHub 流水线可能还在跑）`);
+      } else {
+        const { counts, wanted: names } = selectAssets(assets);
+        log(`${got.source}：${formatCounts(counts)}`);
+        if (isReady(counts)) {
+          wanted = names;
+          log(`资产已齐（${wanted.length} 个）：`);
+          for (const a of wanted) {
+            console.log(`  ${a.name}  ${a.size || "?"} 字节  sha256=${(a.sha256 || "无").slice(0, 12)}`);
+          }
+          break;
+        }
+        // Release 存在但资产不齐 —— 可能是上一次同 tag 的旧 Release，或 GitHub 侧
+        // 正在往里传（delete-then-recreate）。都继续等，不误判。
+        log("资产还没齐，继续等");
+      }
     } catch (err) {
-      // 限流/网络抖动不该直接判死：还有余量就退避后继续等。
-      if (Date.now() >= deadline) {
-        console.error(`::error::查询 GitHub Release 失败：${err.message}`);
-        process.exit(1);
-      }
       log(`查询失败：${err.message}`);
-      await sleep(Math.min(pollSeconds * 1000, 30_000));
-      continue;
-    }
-
-    if (!release) {
-      log(`Release ${tag} 还不存在（tag 刚推，GitHub 流水线可能还在跑）`);
-    } else {
-      const { counts, wanted: names } = selectAssets(release);
-      log(formatCounts(counts));
-      if (isReady(counts)) {
-        wanted = names;
-        log(`资产已齐（${wanted.length} 个）：`);
-        for (const a of wanted) console.log(`  ${a.name}  ${a.size} 字节`);
-        break;
-      }
-      // Release 存在但资产不齐 —— 可能是上一次同 tag 的旧 Release，或 GitHub 侧
-      // 正在往里传（delete-then-recreate）。都继续等，不误判。
-      log("资产还没齐，继续等");
     }
 
     if (Date.now() >= deadline) {
@@ -271,14 +341,17 @@ async function main() {
   const downloadDeadline = Date.now() + waitSeconds * 1000;
   log(`开始下载 ${wanted.length} 个产物到 ${dir}/`);
   let total = 0;
-  for (const [i, { name, size }] of wanted.entries()) {
-    log(`[${i + 1}/${wanted.length}] ${name}`);
-    total += await download(name, size, downloadDeadline);
+  for (const [i, a] of wanted.entries()) {
+    log(`[${i + 1}/${wanted.length}] ${a.name}`);
+    total += await download(a.name, a.size, a.sha256, downloadDeadline);
   }
   log(`下载完成：${wanted.length} 个产物，共 ${(total / 1024 / 1024).toFixed(1)} MiB`);
 }
 
-main().catch((err) => {
-  console.error(`::error::${err.message}`);
-  process.exit(1);
-});
+// 直接执行才跑轮询；被 import 时（例如本地单测选择逻辑）只导出纯函数。
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((err) => {
+    console.error(`::error::${err.message}`);
+    process.exit(1);
+  });
+}
