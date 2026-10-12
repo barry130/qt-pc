@@ -12,7 +12,13 @@ import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 export default function App(): React.JSX.Element {
   if (getCurrentWindow().label === "lyrics") {
     return (
-      <ErrorBoundary label="桌面歌词">
+      // autoReset：歌词窗是无边框透明窗、也没有「重试」按钮可点，一旦被错误边界
+      // 接管就是永久停在错误卡片上（用户 2026-10-12 实测：整块变成「这块内容出错了
+      // （桌面歌词）」且不自愈）。它没有 resetKey 可依赖 —— 这个窗口不换路由、
+      // 不切页签，没有任何「状态变了」的时机能触发恢复，只能靠自动重试。
+      // 重试之所以有效：边界接住异常时 React 会卸载整棵子树，重试＝重新挂载、
+      // 重新走初始化与取词，偶发错误（越界、竞态）因此能自愈。
+      <ErrorBoundary label="桌面歌词" autoReset>
         <LyricWindow />
       </ErrorBoundary>
     );

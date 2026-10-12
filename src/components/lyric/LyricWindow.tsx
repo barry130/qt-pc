@@ -160,6 +160,28 @@ export function LyricWindow(): React.JSX.Element {
   const currentTrackRef = useRef<Track | null>(null);
   const lyricSeq = useRef(0);
 
+  /**
+   * 整篇歌词的唯一写入口（换歌 / 换词 / 取词失败）。
+   *
+   * `lines` 与 `activeIdx` 是两个独立 state，而后者只在 rAF 里被重算：整篇歌词一换
+   * （尤其是换成更短的一份、或直接变空），上一首留下的 `activeIdx` 就越界，这一刻
+   * `lines[activeIdx]` 是 `undefined`，要等下一帧才归位。所以在这里就按新歌词把当前行
+   * 定准，中间不留「越界的那一帧」。
+   *
+   * 为什么非管不可（2026-10-12 用户实测）：越界时窗口整块变成「这块内容出错了
+   * （桌面歌词）」——`app.lastError` 里抓到的是
+   * `[桌面歌词] Cannot read properties of undefined (reading 'words')`。
+   */
+  const applyLines = useCallback((next: LyricLine[]): void => {
+    const idx = findActiveIndex(next, baseRef.current.positionMs - offsetRef.current);
+    linesRef.current = next;
+    activeIdxRef.current = idx;
+    fillRatioRef.current = 1;
+    setLines(next);
+    setActiveIdx(idx);
+    setFillRatio(1);
+  }, []);
+
   // 曲目变化 → 一次性拉整篇歌词（含换源兜底：按目标源取词）
   const loadLyricFor = useCallback(async (track: Track | null): Promise<void> => {
     currentTrackRef.current = track;
@@ -167,8 +189,7 @@ export function LyricWindow(): React.JSX.Element {
     const key = trackKey(track);
     if (!track || key.length === 0) {
       setHasTrack(false);
-      linesRef.current = [];
-      setLines([]);
+      applyLines([]);
       return;
     }
     setHasTrack(true);
@@ -184,14 +205,12 @@ export function LyricWindow(): React.JSX.Element {
       const wbw = lyric.wordByWord ?? "";
       const base = wbw.length > 0 ? parseWordByWordLrc(wbw) : parseLrc(lyric.lrc);
       const merged = mergeRomanization(mergeTranslation(base, lyric.translation), lyric.romanization ?? "");
-      linesRef.current = merged;
-      setLines(merged);
+      applyLines(merged);
     } catch {
       if (seq !== lyricSeq.current) return;
-      linesRef.current = [];
-      setLines([]);
+      applyLines([]);
     }
-  }, []);
+  }, [applyLines]);
 
   // —— 订阅与初始化（一次） ——
   useEffect(() => {
@@ -460,9 +479,14 @@ export function LyricWindow(): React.JSX.Element {
     [patchStyle, ui.fontSize],
   );
 
-  const current = activeIdx >= 0 ? lines[activeIdx] : null;
-  const prev = activeIdx > 0 ? lines[activeIdx - 1] : null;
-  const nextLine = activeIdx >= 0 ? lines[activeIdx + 1] : null;
+  // 越界一律当「没有当前行」：`lines` 刚换成更短的一份时，`activeIdx` 可能还是上一首
+  // 的行号（`applyLines` 已经尽量不留这一帧，这里再兜一层，别再让判空漏掉 undefined ——
+  // 原先写的是 `current !== null`，`undefined` 能过，紧接着的 `current.words` 就抛
+  // TypeError，整个窗口被错误边界接管）。
+  const safeIdx = activeIdx >= 0 && activeIdx < lines.length ? activeIdx : -1;
+  const current = safeIdx >= 0 ? lines[safeIdx] : null;
+  const prev = safeIdx > 0 ? lines[safeIdx - 1] : null;
+  const nextLine = safeIdx >= 0 && safeIdx + 1 < lines.length ? lines[safeIdx + 1] : null;
   const showSecond = ui.lineMode === "two-lines";
   const showThird = ui.lineMode === "three-lines";
   const mainText = hasTrack ? (current?.text || "… 间奏 …") : "轻听 · 桌面歌词";
