@@ -269,7 +269,7 @@ struct FileLogger;
 
 impl log::Log for FileLogger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= log::max_level()
+        metadata.level() <= log::max_level() && !suppressed(metadata.target(), metadata.level())
     }
 
     fn log(&self, record: &log::Record) {
@@ -290,6 +290,37 @@ impl log::Log for FileLogger {
     }
 
     fn flush(&self) {}
+}
+
+/// 第三方依赖的刷屏静音名单。
+///
+/// 为什么需要：`RUST_LOG` 只能设一个全局级别，而这里要压的是**某个依赖**的
+/// WARN —— 它不影响功能、却按千行/秒地写。2026-10-10 实测 symphonia 的 MP3
+/// demuxer 在 43 秒里写了 56,378 行 WARN（"invalid mpeg audio header" /
+/// "skipping junk at ..."），一晚上轮转掉 4 个 5 MiB 文件，把真正的故障现场
+/// 全冲走了（诊断日志里翻不到任何有用信息）。
+///
+/// 只按 target 前缀静音，且 Error 一律放行（真解码失败还是要看得见）。
+/// 想连这些一起看时用 `RUST_LOG=debug` 或 `trace`（此时不过滤，见下）。
+fn suppressed(target: &str, level: log::Level) -> bool {
+    suppressed_at(target, level, log::max_level())
+}
+
+/// 判定本体，把全局级别当参数传进来 —— 便于单测（不依赖进程级 log 状态）。
+fn suppressed_at(target: &str, level: log::Level, max: log::LevelFilter) -> bool {
+    /// 静音名单：这些 target 只放 Error 过去
+    const NOISY_TARGETS: [&str; 2] = ["symphonia_bundle_mp3", "symphonia_format_isomp4"];
+    // 显式调高到 debug/trace 时是「我要看细节」，过滤让位
+    if max >= log::LevelFilter::Debug {
+        return false;
+    }
+    // log::Level 的序是 Error < Warn < Info < Debug < Trace（越严重越小）
+    if level <= log::Level::Error {
+        return false;
+    }
+    NOISY_TARGETS
+        .iter()
+        .any(|prefix| target.starts_with(prefix))
 }
 
 /// 追加一行到当前日志（写满自动轮转；文件不可用时静默丢弃）。
@@ -433,6 +464,85 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 默认档（Info，用户把级别调到 info 时的档位）下，symphonia 的 WARN/INFO
+    /// 刷屏必须被静音 —— 2026-10-10 就是它们以约 1300 行/秒把诊断日志冲成 4 个
+    /// 轮转文件。
+    #[test]
+    fn symphonia_noise_is_suppressed_at_info_level() {
+        let info = log::LevelFilter::Info;
+        assert!(suppressed_at(
+            "symphonia_bundle_mp3::demuxer",
+            log::Level::Warn,
+            info
+        ));
+        assert!(suppressed_at(
+            "symphonia_bundle_mp3::demuxer",
+            log::Level::Info,
+            info
+        ));
+        assert!(suppressed_at(
+            "symphonia_format_isomp4::demuxer",
+            log::Level::Warn,
+            info
+        ));
+    }
+
+    /// 但真解码失败（Error）不能被吞掉，否则「放不出声」又没现场可查。
+    #[test]
+    fn symphonia_errors_still_pass() {
+        assert!(!suppressed_at(
+            "symphonia_bundle_mp3::demuxer",
+            log::Level::Error,
+            log::LevelFilter::Info
+        ));
+    }
+
+    /// 本项目自己的日志一条都不能被误伤。
+    #[test]
+    fn own_targets_are_never_suppressed() {
+        let info = log::LevelFilter::Info;
+        for target in [
+            "quietmusic_lib::qtres",
+            "quietmusic_lib::audio::engine",
+            "quietmusic_lib",
+            "quietmusic_lib::commands",
+        ] {
+            assert!(
+                !suppressed_at(target, log::Level::Info, info),
+                "{target} 被误静音了"
+            );
+            assert!(!suppressed_at(target, log::Level::Warn, info));
+        }
+    }
+
+    /// 显式要细节（RUST_LOG=debug/trace）时过滤让位：静音只是默认档的降噪，
+    /// 不能变成「永远看不到」。
+    #[test]
+    fn debug_level_disables_the_filter() {
+        for max in [log::LevelFilter::Debug, log::LevelFilter::Trace] {
+            assert!(!suppressed_at(
+                "symphonia_bundle_mp3::demuxer",
+                log::Level::Warn,
+                max
+            ));
+        }
+    }
+
+    /// 前缀匹配不能误伤同前缀以外的 target。
+    #[test]
+    fn prefix_match_is_not_overbroad() {
+        assert!(!suppressed_at(
+            "symphonia_core",
+            log::Level::Warn,
+            log::LevelFilter::Info
+        ));
+        assert!(suppressed_at(
+            "symphonia_bundle_mp3::demuxer",
+            log::Level::Warn,
+            log::LevelFilter::Info
+        ));
+    }
 
     /// 级别词 → 过滤器：大小写与空白都容忍，认不出的词返回 None（调用方回落
     /// 默认档），绝不 panic。
