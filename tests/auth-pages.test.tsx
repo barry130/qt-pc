@@ -40,6 +40,8 @@ const mocks = vi.hoisted(() => {
     likePull: vi.fn(async () => ({ changes: [], maxSeq: 0 })),
     likePullAll: vi.fn(async () => ({ changes: [], maxSeq: 0 })),
     likeApply: vi.fn(async () => undefined),
+    // auth store 的收藏同步失败路径会经 @/lib/logger 落一份进文件日志
+    writeLog: vi.fn(async () => undefined),
   };
 });
 

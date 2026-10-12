@@ -1,5 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import * as ipc from "@/services/ipc";
+import { log } from "@/lib/logger";
 
 /**
  * 桌面端使用统计上报（STATS_DESIGN.md §4.1 事件模型 / §7 采集行为）。
@@ -154,7 +155,7 @@ export async function flushStat(): Promise<void> {
       queue = queue.slice(batch.length);
       attempts = 0;
     }
-    console.warn("[stat] 上报失败，稍后重试", err);
+    log.warn("[stat] 上报失败，稍后重试", err);
     persistQueue();
   } finally {
     inFlight = false;
@@ -280,7 +281,7 @@ async function doInit(): Promise<void> {
     installErrorHooks();
   } catch (err) {
     // 统计初始化失败不影响主流程，但置回未启动便于排查
-    console.warn("[stat] 初始化失败", err);
+    log.warn("[stat] 初始化失败", err);
     started = false;
   }
 }

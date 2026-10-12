@@ -581,6 +581,23 @@ fn dir_stats(dir: &std::path::Path) -> (u64, u64) {
     crate::cache::dir_stats(dir)
 }
 
+/// 当前缓存**根目录**（设置页「缓存位置」回显、换目录的基准）。
+///
+/// 读的是运行期状态而不是 settings 表：用户刚点完「换目录」，库里那条可能还没
+/// 写完，界面必须立刻反映内存里的权威值。
+pub(crate) fn cache_root(state: &AppState) -> PathBuf {
+    state
+        .cache_root
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+/// 缓存根目录下的音频缓存目录（引擎实际写文件的地方）。
+fn cache_audio_dir(state: &AppState) -> PathBuf {
+    cache_root(state).join("audio")
+}
+
 /// WebView2 用户数据目录（EBWebView，app_local_data_dir 下）。
 fn webview_profile_dir(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
     use tauri::Manager;
@@ -595,7 +612,7 @@ pub async fn cmd_audio_cache_stats(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<AudioCacheStats, String> {
-    let dir = state.audio_cache_dir.clone();
+    let dir = cache_audio_dir(&state);
     tauri::async_runtime::spawn_blocking(move || {
         let (total_bytes, file_count) = dir_stats(&dir);
         // 网页缓存只统计「纯缓存」子目录（与 clear_web_cache 的清理范围一致），
@@ -626,7 +643,7 @@ pub async fn cmd_audio_cache_stats(
 pub async fn cmd_clear_audio_cache(
     state: State<'_, AppState>,
 ) -> Result<AudioCacheClearResult, String> {
-    let dir = state.audio_cache_dir.clone();
+    let dir = cache_audio_dir(&state);
     // 引擎侧拿「正在使用」的缓存文件（正在播放的在线流）
     let engine = state.engine.clone();
     let busy = tauri::async_runtime::spawn_blocking(move || engine.current_cache_file())
@@ -2338,7 +2355,7 @@ pub async fn cmd_list_my_playlists(
             .await
             .map_err(|e| format!("读取我的歌单失败: {e}"))?;
     match &result {
-        Ok(v) => log::info!(
+        Ok(v) => log::debug!(
             "[db] 我的歌单 {} 条（本地 {} / 在线 {}）",
             v.len(),
             v.iter().filter(|p| p.platform == "local").count(),
@@ -3134,8 +3151,11 @@ pub async fn cmd_reveal_logs() -> Result<(), String> {
     }
 }
 
-/// 前端日志落盘：全局错误浮层（main.tsx）把 JS 侧错误转写进文件日志，
+/// 前端日志落盘：`@/lib/logger` 把 JS 侧四级日志转写进文件日志，
 /// release 下前端崩溃才不只有 settings 表里一条 lastError。
+///
+/// 级别认不出来时按 **debug** 记：前端加了新档而这里没跟上，日志只会更安静，
+/// 不会把 warn/error 的文件给刷满。
 #[tauri::command(rename = "write_log")]
 pub async fn cmd_write_log(level: String, message: String) -> Result<(), String> {
     // 截断防线：异常时的循环报错或超大 stack 不能把日志文件刷爆
@@ -3143,7 +3163,8 @@ pub async fn cmd_write_log(level: String, message: String) -> Result<(), String>
     match level.as_str() {
         "error" => log::error!("[frontend] {message}"),
         "warn" => log::warn!("[frontend] {message}"),
-        _ => log::info!("[frontend] {message}"),
+        "info" => log::info!("[frontend] {message}"),
+        _ => log::debug!("[frontend] {message}"),
     }
     Ok(())
 }
@@ -3694,7 +3715,7 @@ pub async fn cmd_like_apply(
                 // 会带 platform="local" 推到云端，这里放过才落得进 PC 的收藏表。
                 // 认不出来的平台才是真脏数据，跳过。
                 let Some(platform) = crate::provider::types::SourceId::parse(&c.platform) else {
-                    log::info!("[like] 云端歌曲 {} 平台 {} 未知，跳过", c.id, c.platform);
+                    log::debug!("[like] 云端歌曲 {} 平台 {} 未知，跳过", c.id, c.platform);
                     continue;
                 };
                 let db_id = format!("{platform}:{}", c.id);
@@ -3745,13 +3766,13 @@ pub async fn cmd_like_apply(
                     applied += 1;
                 } else if c.pid.is_empty() {
                     // 云端没带 pid（无归属）：不加载（v5 起无默认歌单）
-                    log::info!("[like] 云端歌曲 {} 未归属歌单，跳过", c.id);
+                    log::debug!("[like] 云端歌曲 {} 未归属歌单，跳过", c.id);
                 } else {
                     // 必须有对应歌单（云端卡片或本地自建）才加载；
                     // pid 找不到歌单 → 不加载，等歌单同步过来后的全量重导再进
                     let known = crate::db::store::playlist_pid_exists(conn, &c.pid)?;
                     if !known {
-                        log::info!("[like] 云端歌曲 {} 的歌单 {} 不存在，跳过", c.id, c.pid);
+                        log::debug!("[like] 云端歌曲 {} 的歌单 {} 不存在，跳过", c.id, c.pid);
                     } else {
                         crate::db::store::add_liked_song(conn, &track, &c.pid)?;
                         applied += 1;
@@ -4293,6 +4314,264 @@ pub async fn cmd_get_top_singers(
     })
     .await
     .map_err(|e| format!("读取热门歌手失败: {e}"))?
+}
+
+// ---------- 日志与缓存目录（设置页「通用 → 诊断」，DESIGN §…） ----------
+//
+// 三条原则，跟 download.dir 那套保持一致：
+// 1. **内存是权威值**：命令先改运行期状态，再写 settings 表；表只是持久化副本。
+//    用户刚点完设置再打开设置页，不该被库里还没写完的记录盖回去。
+// 2. **落库失败要分轻重**：只影响「下次启动还在不在」的，记 warn 不打断用户
+//    （级别 / 大小 / 份数）；会让「改了不生效」的（目录），必须报错。
+// 3. **不碰权限**：qt_admin 只管前端显不显示，Rust 侧一律照做 —— 与
+//    download.dir 相同口径，后端没有管理员概念。
+
+/// 日志配置快照：设置页一次拿全（回显 + 控件区间）。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogConfig {
+    /// 当前日志目录（拿不到运行期目录时给默认目录，界面不留空）
+    pub dir: String,
+    /// 文件日志本次运行是否真的启用了（目录建不出来时是 false，
+    /// 此时 `dir` 仍有值，界面要按 `enabled` 决定「打开文件夹」能不能点）
+    pub enabled: bool,
+    /// 当前生效级别（debug / info / warn / error / trace）
+    pub level: String,
+    /// 单个文件上限（MB）
+    pub file_mb: u64,
+    /// 轮转保留份数
+    pub backups: u32,
+    /// 没配过时按构建走的默认级别（debug 构建 debug，发行包 warn）——
+    /// 让用户看见「我什么都没配，现在是什么档」
+    pub default_level: String,
+    pub min_file_mb: u64,
+    pub max_file_mb: u64,
+    pub min_backups: u32,
+    pub max_backups: u32,
+}
+
+/// 把运行期日志参数打包成设置页要的快照。
+fn log_config() -> LogConfig {
+    LogConfig {
+        dir: crate::file_logger::effective_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        enabled: crate::file_logger::logs_dir().is_some(),
+        level: crate::file_logger::level_name(crate::file_logger::current_level()).to_string(),
+        file_mb: crate::file_logger::current_file_mb(),
+        backups: crate::file_logger::current_backups(),
+        default_level: crate::file_logger::level_name(crate::file_logger::default_level())
+            .to_string(),
+        min_file_mb: crate::file_logger::MIN_FILE_MB,
+        max_file_mb: crate::file_logger::MAX_FILE_MB,
+        min_backups: crate::file_logger::MIN_BACKUPS,
+        max_backups: crate::file_logger::MAX_BACKUPS,
+    }
+}
+
+#[tauri::command(rename = "get_log_config")]
+pub async fn cmd_get_log_config() -> Result<LogConfig, String> {
+    Ok(log_config())
+}
+
+/// 改日志参数（级别 / 单文件上限 / 保留份数）。
+///
+/// 三个参数都是 `Option`，`None` = **这一项不动**：设置页只提交用户真改过的项，
+/// 免得「只调了大小」把级别顺手打回默认。
+///
+/// 先夹紧再落库：库里存的就是合法值，下次启动 `apply_settings` 不必再救一次脏
+/// 数据，设置页也能拿同一套区间画控件。级别认不出来直接报错 —— 静默回落默认档
+/// 会让用户以为「选了 error 却还在刷 debug」。
+#[tauri::command(rename = "set_log_config")]
+pub async fn cmd_set_log_config(
+    state: State<'_, AppState>,
+    level: Option<String>,
+    file_mb: Option<u64>,
+    backups: Option<u32>,
+) -> Result<LogConfig, String> {
+    let level = match level.as_deref() {
+        Some(raw) => Some(
+            crate::file_logger::parse_level(raw)
+                .ok_or_else(|| format!("无法识别的日志级别: {raw}"))?,
+        ),
+        None => None,
+    };
+    let level_raw = level.map(crate::file_logger::level_name);
+    let file_mb_raw = file_mb.map(crate::file_logger::clamp_file_mb).map(|v| v.to_string());
+    let backups_raw = backups.map(crate::file_logger::clamp_backups).map(|v| v.to_string());
+
+    // 目录传 None：换目录要重开句柄，走 choose_log_dir / reset_log_dir
+    crate::file_logger::apply_settings(
+        None,
+        level_raw,
+        file_mb_raw.as_deref(),
+        backups_raw.as_deref(),
+    );
+
+    let mut writes: Vec<(&'static str, String)> = Vec::new();
+    if let Some(v) = level_raw {
+        writes.push((crate::file_logger::SETTING_LOG_LEVEL, v.to_string()));
+    }
+    if let Some(v) = &file_mb_raw {
+        writes.push((crate::file_logger::SETTING_LOG_FILE_MB, v.clone()));
+    }
+    if let Some(v) = &backups_raw {
+        writes.push((crate::file_logger::SETTING_LOG_BACKUPS, v.clone()));
+    }
+    if !writes.is_empty() {
+        if let Some(db) = state.db.clone() {
+            // 本次已经生效，落库只决定「下次启动还在不在」，失败不打断用户
+            let saved = tauri::async_runtime::spawn_blocking(move || {
+                db.with(|conn| {
+                    for (key, value) in &writes {
+                        crate::db::store::set_setting(conn, key, value)?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(|e| format!("保存日志设置失败: {e}"))?;
+            if let Err(e) = saved {
+                log::warn!("[log] 日志设置写入设置表失败: {e}");
+            }
+        }
+    }
+    Ok(log_config())
+}
+
+/// 弹出系统文件夹选择框，选中后保存为日志目录并**立刻**把日志写过去。
+///
+/// 目录不可写就直接报错、不动任何状态：否则配置存下了、文件却没写进去，重启后
+/// `apply_settings` 建不出目录会把文件日志整个关掉，用户拿到的是一个「设置显示
+/// 已改、实际一条日志都没有」的假象。
+#[tauri::command(rename = "choose_log_dir")]
+pub async fn cmd_choose_log_dir(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_title("选择日志目录")
+            .blocking_pick_folder()
+    })
+    .await
+    .map_err(|e| format!("打开文件夹选择框失败: {e}"))?;
+
+    let Some(picked) = picked else {
+        return Ok(None); // 用户取消
+    };
+    let path = match picked.into_path() {
+        Ok(p) => p,
+        Err(e) => return Err(format!("无效的文件夹路径: {e:?}")),
+    };
+    let path_str = path.to_string_lossy().to_string();
+
+    let probe = path_str.clone();
+    tauri::async_runtime::spawn_blocking(move || std::fs::create_dir_all(&probe))
+        .await
+        .map_err(|e| format!("检查日志目录失败: {e}"))?
+        .map_err(|e| format!("日志目录不可写（{path_str}）：{e}"))?;
+
+    if let Some(db) = &state.db {
+        db.with(|conn| {
+            crate::db::store::set_setting(conn, crate::file_logger::SETTING_LOG_DIR, &path_str)
+        })
+        .map_err(|e| format!("保存日志目录失败: {e}"))?;
+    }
+    crate::file_logger::apply_settings(Some(&path_str), None, None, None);
+    Ok(Some(path_str))
+}
+
+/// 重置日志目录为默认（安装目录/logs，不可写时回落 APPDATA），返回重置后的路径。
+#[tauri::command(rename = "reset_log_dir")]
+pub async fn cmd_reset_log_dir(state: State<'_, AppState>) -> Result<String, String> {
+    if let Some(db) = &state.db {
+        db.with(|conn| crate::db::store::set_setting(conn, crate::file_logger::SETTING_LOG_DIR, ""))
+            .map_err(|e| format!("重置日志目录失败: {e}"))?;
+    }
+    // 空串 = 回到默认目录（见 file_logger::resolve_dir）
+    crate::file_logger::apply_settings(Some(""), None, None, None);
+    Ok(crate::file_logger::effective_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default())
+}
+
+#[tauri::command(rename = "get_cache_dir")]
+pub async fn cmd_get_cache_dir(state: State<'_, AppState>) -> Result<String, String> {
+    Ok(cache_root(&state).to_string_lossy().to_string())
+}
+
+/// 换缓存根目录：落库 → 改内存权威值 → 通知引擎。
+///
+/// 三件事必须一起做，少一件就是「设置了不生效」：引擎不换，播放缓存还写老地方；
+/// 内存不换，缓存统计/清理还指着老地方算体积。
+///
+/// 落库存的是**根目录**（不是 `<根>/audio`）：引擎只认音频子目录，由它落库会把
+/// 子目录存成根，下次启动再 join 一次 `audio`，缓存跑到 `<根>/audio/audio`。
+#[tauri::command(rename = "choose_cache_dir")]
+pub async fn cmd_choose_cache_dir(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_title("选择缓存目录")
+            .blocking_pick_folder()
+    })
+    .await
+    .map_err(|e| format!("打开文件夹选择框失败: {e}"))?;
+
+    let Some(picked) = picked else {
+        return Ok(None); // 用户取消
+    };
+    let root = match picked.into_path() {
+        Ok(p) => p,
+        Err(e) => return Err(format!("无效的文件夹路径: {e:?}")),
+    };
+    let audio = root.join("audio");
+    let root_str = root.to_string_lossy().to_string();
+
+    // 与日志目录同理：先证明写得进去，再动状态
+    let probe = audio.clone();
+    tauri::async_runtime::spawn_blocking(move || std::fs::create_dir_all(&probe))
+        .await
+        .map_err(|e| format!("检查缓存目录失败: {e}"))?
+        .map_err(|e| format!("缓存目录不可写（{root_str}）：{e}"))?;
+
+    if let Some(db) = &state.db {
+        db.with(|conn| {
+            crate::db::store::set_setting(conn, crate::cache::SETTING_CACHE_DIR, &root_str)
+        })
+        .map_err(|e| format!("保存缓存目录失败: {e}"))?;
+    }
+
+    *state.cache_root.lock().unwrap_or_else(|p| p.into_inner()) = root;
+    state.engine.send(AudioCmd::SetCacheDir(audio));
+    Ok(Some(root_str))
+}
+
+/// 重置缓存目录为默认（安装目录/cache，不可写时回落 app_cache_dir），
+/// 返回重置后的**根目录**。
+#[tauri::command(rename = "reset_cache_dir")]
+pub async fn cmd_reset_cache_dir(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    if let Some(db) = &state.db {
+        db.with(|conn| crate::db::store::set_setting(conn, crate::cache::SETTING_CACHE_DIR, ""))
+            .map_err(|e| format!("重置缓存目录失败: {e}"))?;
+    }
+    let root = crate::app_paths::cache_root(&app);
+    let audio = root.join("audio");
+    *state.cache_root.lock().unwrap_or_else(|p| p.into_inner()) = root.clone();
+    state.engine.send(AudioCmd::SetCacheDir(audio));
+    Ok(root.to_string_lossy().to_string())
 }
 
 #[cfg(test)]

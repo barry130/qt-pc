@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { usePlayerStore } from "@/stores/player";
 import * as ipc from "@/services/ipc";
+import { log } from "@/lib/logger";
 
 /**
  * 订阅 Rust 侧播放事件：
@@ -29,7 +30,12 @@ export function usePlaybackEvents(): void {
         applyQueue(q);
       });
       const u4 = await ipc.onAudioError((e) => {
-        console.error("[audio-error]", e.message);
+        // 与后端 `[queue] 曲目 N 播放失败` 同一口径：环境问题（弱网/引擎卡）
+        // 是降级可自愈，记 warn；确实放不出来才记 error。后端 `stalled` 字段
+        // 缺失（老版本）时按 error 记，宁可吵一点也别把真失败埋了。
+        const detail = `[audio-error] ${e.kind} ${e.trackId ?? "-"}：${e.message}`;
+        if (e.stalled) log.warn(detail);
+        else log.error(detail);
       });
       if (disposed) {
         u1();
@@ -49,7 +55,8 @@ export function usePlaybackEvents(): void {
         applySnapshot(snap);
         if (!queueEventApplied) applyQueue(await ipc.getQueue());
       } catch (err) {
-        console.error("restore_last_session failed", err);
+        // 恢复上次现场失败是降级：引擎随后会推默认状态，界面照常能用
+        log.warn("restore_last_session failed", err);
       }
     };
     void track();

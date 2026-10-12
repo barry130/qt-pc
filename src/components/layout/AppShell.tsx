@@ -28,6 +28,7 @@ import { useDownloadsStore } from "@/stores/downloads";
 import { useDislikesStore } from "@/stores/dislikes";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { initStat, trackStatPage } from "@/lib/stat";
+import { syncLogLevel } from "@/lib/logger";
 import { UpdateDialog } from "@/components/update/UpdateDialog";
 import { QtNoticeDialog } from "@/components/notice/qt-NoticeDialog";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
@@ -84,6 +85,10 @@ export function AppShell(): React.JSX.Element {
   // 使用统计（STATS_DESIGN §4.1/§7）：冷启动 launcher+show，路由变化记 page
   useEffect(() => {
     void initStat();
+  }, []);
+  // 前端日志级别跟后端的生效级别对齐（qt_admin 改过就按改过的来）
+  useEffect(() => {
+    void syncLogLevel();
   }, []);
   useEffect(() => {
     trackStatPage(pathname);

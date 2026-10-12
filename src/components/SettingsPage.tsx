@@ -48,6 +48,7 @@ import {
   type SourcePackVo,
 } from "@/source-scripts/source-update";
 import { SKINS, getSkin } from "@/lib/skins";
+import { setLogLevel } from "@/lib/logger";
 import { isQuality, qualityOptionsFromRegistry } from "@/lib/quality";
 import { useSourceQualities, useSourceRegistryStore } from "@/stores/sourceRegistry";
 import { useMusicSourceStore } from "@/stores/musicSource";
@@ -1081,6 +1082,96 @@ const CACHE_LIMIT_DEFAULT = "512";
 /** 手工输入档的取值范围：非负整数 MB（0 = 不限），上界 1TB 够任何磁盘用 */
 const CACHE_LIMIT_CUSTOM_MAX_MB = 1048576;
 
+/** 日志级别选项（顺序由宽到严，与 file_logger 的四级一致；trace 不对外暴露） */
+const LOG_LEVEL_OPTIONS: { value: ipc.LogLevel; label: string }[] = [
+  { value: "debug", label: "调试" },
+  { value: "info", label: "信息" },
+  { value: "warn", label: "警告" },
+  { value: "error", label: "错误" },
+];
+
+/** 目录选择行（日志 / 缓存共用）：只读路径 + 更改位置 + 恢复默认 */
+function DirPicker(props: {
+  path: string;
+  busy: boolean;
+  /** 置灰（如日志目录当前不可用时不允许再换） */
+  disabled?: boolean;
+  onChoose: () => void;
+  onReset: () => void;
+}): React.JSX.Element {
+  return (
+    <div className="flex items-center gap-2">
+      <span
+        className="max-w-52 truncate rounded border border-input bg-background px-2 py-1.5 text-xs text-muted-foreground"
+        title={props.path}
+      >
+        {props.path || "…"}
+      </span>
+      <button
+        type="button"
+        onClick={props.onChoose}
+        disabled={props.busy || props.disabled}
+        className="rounded-md border border-border px-3 py-1.5 text-xs transition-colors hover:bg-accent disabled:opacity-50"
+      >
+        更改位置
+      </button>
+      <button
+        type="button"
+        onClick={props.onReset}
+        disabled={props.busy || props.disabled}
+        className="rounded-md border border-border px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
+      >
+        恢复默认
+      </button>
+    </div>
+  );
+}
+
+/** 数字输入（失焦 / 回车提交）。越界值不在这里拦：后端夹紧后回传真实值，
+ *  useEffect 跟着把草稿改回来 —— 用户填 999 份会立刻看到变成 50，而不是
+ *  留一个「我填了 999」的假象。非法（空 / 负 / 非数字）直接还原不报错。 */
+function NumberField(props: {
+  value: number;
+  min: number;
+  max: number;
+  suffix: string;
+  onCommit: (n: number) => void;
+}): React.JSX.Element {
+  const [draft, setDraft] = useState(String(props.value));
+  useEffect(() => {
+    setDraft(String(props.value));
+  }, [props.value]);
+
+  const commit = (): void => {
+    const raw = draft.trim();
+    if (!/^\d+$/.test(raw)) {
+      setDraft(String(props.value));
+      return;
+    }
+    const n = Number(raw);
+    if (n !== props.value) props.onCommit(n);
+  };
+
+  return (
+    <span className="flex items-center gap-1">
+      <input
+        type="number"
+        inputMode="numeric"
+        min={props.min}
+        max={props.max}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") commit();
+        }}
+        onBlur={commit}
+        className="w-20 rounded-md border border-border bg-transparent px-2 py-1 text-xs outline-none focus:border-primary"
+      />
+      <span className="text-xs text-muted-foreground">{props.suffix}</span>
+    </span>
+  );
+}
+
 function GeneralSection(): React.JSX.Element {
   const [autostart, setAutostartState] = useState<boolean | null>(null);
   const [cache, setCache] = useState<AudioCacheStats | null>(null);
@@ -1094,6 +1185,14 @@ function GeneralSection(): React.JSX.Element {
   const [clearing, setClearing] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // 日志配置（级别 / 单文件上限 / 保留份数 / 目录）。null = 还没读到
+  const [logCfg, setLogCfg] = useState<ipc.LogConfig | null>(null);
+  // 缓存根目录（音频缓存是它下面的 audio）
+  const [cacheDir, setCacheDir] = useState("");
+  const [dirBusy, setDirBusy] = useState(false);
+  // 日志级别只对 qt_admin 开放（与「播放链接」同一口径：前端显隐，后端不设权限）
+  const profile = useAuthStore((s) => s.profile);
+  const admin = isAdmin(profile);
 
   useEffect(() => {
     void ipc
@@ -1101,6 +1200,14 @@ function GeneralSection(): React.JSX.Element {
       .then(setAutostartState)
       .catch(() => setAutostartState(false));
     void refreshCache();
+    void ipc
+      .getLogConfig()
+      .then(setLogCfg)
+      .catch((err) => setError(errMsg(err)));
+    void ipc
+      .getCacheDir()
+      .then(setCacheDir)
+      .catch((err) => setError(errMsg(err)));
     // 上限档回显：脏数据/缺项都回落默认档（与引擎侧 parse 口径一致）。
     // 当前值不在档位里（含脏数据）→ 进手工输入态并回显原值
     void ipc
@@ -1198,6 +1305,83 @@ function GeneralSection(): React.JSX.Element {
     }
   };
 
+  /**
+   * 下发日志配置补丁。后端返回夹紧后的完整配置，直接拿来回显 —— 用户填 999
+   * 份，界面立刻显示真正生效的 50，而不是留一个「看起来生效了」的假值。
+   */
+  const patchLog = async (patch: {
+    level?: ipc.LogLevel;
+    fileMb?: number;
+    backups?: number;
+  }): Promise<void> => {
+    setError(null);
+    try {
+      const next = await ipc.setLogConfig(patch);
+      setLogCfg(next);
+      // 前端这份过滤也得跟着改：不然管理员调了级别，前端日志还被旧档卡着
+      setLogLevel(next.level === "trace" ? "debug" : next.level);
+    } catch (err) {
+      setError(errMsg(err));
+    }
+  };
+
+  const chooseLogDir = async (): Promise<void> => {
+    setDirBusy(true);
+    setError(null);
+    try {
+      const picked = await ipc.chooseLogDir();
+      // 选中后重读：目录换了，enabled 也可能跟着变（新目录不可写就写不进去）
+      if (picked) setLogCfg(await ipc.getLogConfig());
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setDirBusy(false);
+    }
+  };
+
+  const resetLogDir = async (): Promise<void> => {
+    setDirBusy(true);
+    setError(null);
+    try {
+      await ipc.resetLogDir();
+      setLogCfg(await ipc.getLogConfig());
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setDirBusy(false);
+    }
+  };
+
+  const chooseCacheDir = async (): Promise<void> => {
+    setDirBusy(true);
+    setError(null);
+    try {
+      const picked = await ipc.chooseCacheDir();
+      if (picked) {
+        setCacheDir(picked);
+        // 换目录后旧位置的体积统计失效，重新算
+        await refreshCache();
+      }
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setDirBusy(false);
+    }
+  };
+
+  const resetCacheDir = async (): Promise<void> => {
+    setDirBusy(true);
+    setError(null);
+    try {
+      setCacheDir(await ipc.resetCacheDir());
+      await refreshCache();
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setDirBusy(false);
+    }
+  };
+
   return (
     <div className="max-w-xl divide-y divide-border">
       <SettingRow title="开机自启" description="登录系统后自动启动轻听（收起在托盘）">
@@ -1258,6 +1442,17 @@ function GeneralSection(): React.JSX.Element {
         )}
       </SettingRow>
       <SettingRow
+        title="缓存位置"
+        description="播放缓存与图片缓存的存放目录，默认在安装目录下的 cache 文件夹（不占用系统盘）。换到别的盘后已缓存的文件不会自动搬过去，需要时先在上面「清理缓存」再换。"
+      >
+        <DirPicker
+          path={cacheDir}
+          busy={dirBusy}
+          onChoose={() => void chooseCacheDir()}
+          onReset={() => void resetCacheDir()}
+        />
+      </SettingRow>
+      <SettingRow
         title="清理缓存"
         description={
           cache
@@ -1296,16 +1491,72 @@ function GeneralSection(): React.JSX.Element {
       </SettingRow>
       <SettingRow
         title="诊断日志"
-        description="应用与播放的运行日志保存在本机（%APPDATA%/QuietMusic/logs），反馈问题时可一并附上"
+        description={
+          logCfg
+            ? `应用与播放的运行日志保存在本机（${logCfg.dir || "默认目录"}），反馈问题时可一并附上${
+                logCfg.enabled ? "" : "。当前未能写入文件（目录不可用），日志只输出到控制台"
+              }`
+            : "应用与播放的运行日志保存在本机，反馈问题时可一并附上"
+        }
       >
-        <button
-          type="button"
-          onClick={() => void openLogs()}
-          className="rounded-md border border-border px-3 py-1.5 text-xs transition-colors hover:bg-accent"
-        >
-          打开日志文件夹
-        </button>
+        <div className="flex items-center gap-2">
+          <DirPicker
+            path={logCfg?.dir ?? ""}
+            busy={dirBusy}
+            onChoose={() => void chooseLogDir()}
+            onReset={() => void resetLogDir()}
+          />
+          <button
+            type="button"
+            onClick={() => void openLogs()}
+            disabled={!logCfg?.enabled}
+            className="rounded-md border border-border px-3 py-1.5 text-xs transition-colors hover:bg-accent disabled:opacity-50"
+          >
+            打开文件夹
+          </button>
+        </div>
       </SettingRow>
+      {admin && logCfg && (
+        <>
+          <SettingRow
+            title="日志级别"
+            description={`记录到哪个级别：调试最详细、错误最少。默认为${
+              LOG_LEVEL_OPTIONS.find((o) => o.value === logCfg.defaultLevel)?.label ??
+              logCfg.defaultLevel
+            }（未设置时按版本自动选择）。级别改动立即生效，无需重启。`}
+          >
+            <Segmented
+              value={logCfg.level === "trace" ? "debug" : logCfg.level}
+              options={LOG_LEVEL_OPTIONS}
+              onChange={(v) => void patchLog({ level: v })}
+            />
+          </SettingRow>
+          <SettingRow
+            title="日志文件大小"
+            description={`单个日志文件的上限（${logCfg.minFileMb}–${logCfg.maxFileMb} MB），写满后自动开始新文件`}
+          >
+            <NumberField
+              value={logCfg.fileMb}
+              min={logCfg.minFileMb}
+              max={logCfg.maxFileMb}
+              suffix="MB"
+              onCommit={(n) => void patchLog({ fileMb: n })}
+            />
+          </SettingRow>
+          <SettingRow
+            title="日志保留份数"
+            description={`最多保留几个历史日志文件（${logCfg.minBackups}–${logCfg.maxBackups} 个），超出后自动删除最旧的`}
+          >
+            <NumberField
+              value={logCfg.backups}
+              min={logCfg.minBackups}
+              max={logCfg.maxBackups}
+              suffix="个"
+              onCommit={(n) => void patchLog({ backups: n })}
+            />
+          </SettingRow>
+        </>
+      )}
       {message && <p className="py-2 text-xs text-muted-foreground">{message}</p>}
       {error && <p className="py-2 text-xs text-destructive">{error}</p>}
     </div>

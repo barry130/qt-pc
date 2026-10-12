@@ -4,6 +4,7 @@ import * as ipc from "@/services/ipc";
 import { usePlayerStore } from "@/stores/player";
 import { qtresCoverUrl, formatTime } from "@/lib/lrc";
 import { cn } from "@/lib/utils";
+import { log } from "@/lib/logger";
 import { LocalCover } from "@/components/library/LocalCover";
 
 /**
@@ -107,7 +108,7 @@ export function QueuePanel(): React.JSX.Element | null {
     if (from !== null && to >= 0 && to < queue.length && from !== to) {
       void ipc.queueMove(from, to).catch((err) => {
         // 拖拽排序失败不上浮全局错误浮层，留排查日志即可
-        console.error("[queue] 拖拽排序失败", err);
+        log.warn("[queue] 拖拽排序失败", err);
       });
       justDraggedRef.current = true;
     }
@@ -198,7 +199,7 @@ export function QueuePanel(): React.JSX.Element | null {
       setSelecting(false);
     } catch (err) {
       // 批量删除失败不上浮全局错误浮层：与列表页就地报错对齐，留日志可排查
-      console.error("[queue] 批量删除失败", err);
+      log.warn("[queue] 批量删除失败", err);
     } finally {
       setDeleting(false);
     }
@@ -269,7 +270,7 @@ export function QueuePanel(): React.JSX.Element | null {
                   title="清空后续"
                   onClick={() =>
                     void ipc.queueClearAfter().catch((err) => {
-                      console.error("[queue] 清空后续失败", err);
+                      log.warn("[queue] 清空后续失败", err);
                     })
                   }
                   className="rounded px-1.5 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
@@ -284,7 +285,7 @@ export function QueuePanel(): React.JSX.Element | null {
                   title="清空队列"
                   onClick={() =>
                     void ipc.clearQueue().catch((err) => {
-                      console.error("[queue] 清空队列失败", err);
+                      log.warn("[queue] 清空队列失败", err);
                     })
                   }
                   className="rounded p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"

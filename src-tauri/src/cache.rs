@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 /// settings 键：播放缓存上限（MB；"0" = 不限）。引擎侧写入（SetCacheLimit），
 /// 设置页读它做回显。
 pub const SETTING_AUDIO_CACHE_LIMIT_MB: &str = "cache.audioLimitMb";
+/// settings 键：缓存根目录（空串 = 用默认，即安装目录下的 `cache`）。
+/// 与 `download.dir` 一样走点号风格；值落在根目录上，音频缓存是它下面的 `audio`。
+pub const SETTING_CACHE_DIR: &str = "cache.dir";
 /// settings 里没有这条时的默认上限：512MB
 pub const DEFAULT_AUDIO_CACHE_LIMIT_MB: u64 = 512;
 
@@ -43,7 +46,7 @@ pub fn prune_audio_cache(dir: &Path, limit_mb: u64, keep: Option<&Path>) -> (u64
     let mut files = match collect_files(dir) {
         Ok(f) => f,
         Err(e) => {
-            log::info!("[cache] 扫描缓存目录失败 {}: {e}", dir.display());
+            log::warn!("[cache] 扫描缓存目录失败 {}: {e}", dir.display());
             return (0, 0);
         }
     };
@@ -70,7 +73,7 @@ pub fn prune_audio_cache(dir: &Path, limit_mb: u64, keep: Option<&Path>) -> (u64
                 removed += 1;
             }
             Err(e) => {
-                log::info!("[cache] 跳过删除失败文件 {}: {e}", f.path.display());
+                log::warn!("[cache] 跳过删除失败文件 {}: {e}", f.path.display());
             }
         }
     }
@@ -150,7 +153,7 @@ pub fn clear_dir_files(dir: &Path, skip: Option<&Path>) -> (u64, u64) {
                 Ok(()) => freed += size,
                 Err(e) => {
                     // 文件可能刚好被并发使用：计入失败，不算错误
-                    log::info!("[cache] 跳过删除失败文件 {}: {e}", path.display());
+                    log::warn!("[cache] 跳过删除失败文件 {}: {e}", path.display());
                     failed += 1;
                 }
             }

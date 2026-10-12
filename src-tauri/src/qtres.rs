@@ -419,7 +419,10 @@ fn handle_script_file<R: tauri::Runtime>(
     } else {
         "application/octet-stream"
     };
-    log::info!(
+    // debug 而不是 info：这是纯粹的调用流水（每次开窗/切歌都来一遍），
+    // 留在 info 会把诊断日志淹掉（2026-10-12 实测占全文件 63.5%）。
+    // 要查音源包加载时用 RUST_LOG=debug。
+    log::debug!(
         "[qtres] /script 分发: {code}/{file} ({} bytes)",
         bytes.len()
     );
@@ -595,7 +598,9 @@ fn handle_qtres_sync<R: tauri::Runtime>(
     // 前端可用 ?w=900 指定播放页大图；缺省是列表缩略图尺寸
     let target_px = cover_target_px(request.uri().query());
     let resp = handle_cover(original_url, target_px);
-    log::info!(
+    // 同上：封面代取是最高频的调用流水（列表滚动一次就是几十条，且同一 URL 常
+    // 重复命中）。降为 debug，只保留失败路径的 WARN。
+    log::debug!(
         "[qtres] cover kind={kind} status={} px={target_px} url={logged}",
         resp.status().as_u16()
     );

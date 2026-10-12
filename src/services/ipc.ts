@@ -554,6 +554,78 @@ export async function setAudioCacheLimit(mb: number): Promise<void> {
   return invoke("set_audio_cache_limit", { mb });
 }
 
+// ---------- 日志与缓存目录（设置页「通用 → 诊断」） ----------
+
+/**
+ * 日志配置快照：级别 / 单文件上限 / 保留份数 / 目录，外加默认档与控件区间。
+ *
+ * `enabled = false` 表示本次运行文件日志没起来（目录建不出来），此时 `dir`
+ * 仍有值但「打开文件夹」不该给用户「里面应该有日志」的错觉。
+ */
+export interface LogConfig {
+  dir: string;
+  enabled: boolean;
+  /** 当前生效级别。可能比界面的四档更细：RUST_LOG=trace 时后端如实回传 */
+  level: LogLevel | "trace";
+  fileMb: number;
+  backups: number;
+  /** 没配置过时按构建走的默认级别（debug 构建 debug，发行包 warn） */
+  defaultLevel: LogLevel;
+  minFileMb: number;
+  maxFileMb: number;
+  minBackups: number;
+  maxBackups: number;
+}
+
+/** 界面可选的日志级别（trace 是 log crate 的能力，不在设置页暴露） */
+export type LogLevel = "error" | "warn" | "info" | "debug";
+
+/** 读日志配置（设置页回显） */
+export async function getLogConfig(): Promise<LogConfig> {
+  return invoke("get_log_config");
+}
+
+/**
+ * 改日志参数。传 `undefined` 的项**不动**——只调大小的时候别把级别打回默认。
+ * 返回改完之后的完整配置（含夹紧后的值），界面直接拿它回显。
+ */
+export async function setLogConfig(patch: {
+  level?: LogLevel;
+  fileMb?: number;
+  backups?: number;
+}): Promise<LogConfig> {
+  return invoke("set_log_config", {
+    level: patch.level ?? null,
+    fileMb: patch.fileMb ?? null,
+    backups: patch.backups ?? null,
+  });
+}
+
+/** 选日志目录并立刻把日志写过去；用户取消返回 null */
+export async function chooseLogDir(): Promise<string | null> {
+  return invoke("choose_log_dir");
+}
+
+/** 重置日志目录为默认（安装目录/logs），返回重置后的路径 */
+export async function resetLogDir(): Promise<string> {
+  return invoke("reset_log_dir");
+}
+
+/** 当前缓存根目录（音频缓存是它下面的 audio） */
+export async function getCacheDir(): Promise<string> {
+  return invoke("get_cache_dir");
+}
+
+/** 选缓存根目录并立即切换（引擎与统计同时跟随）；用户取消返回 null */
+export async function chooseCacheDir(): Promise<string | null> {
+  return invoke("choose_cache_dir");
+}
+
+/** 重置缓存目录为默认（安装目录/cache），返回重置后的根目录 */
+export async function resetCacheDir(): Promise<string> {
+  return invoke("reset_cache_dir");
+}
+
 /** 开机自启是否已开启 */
 export async function autostartState(): Promise<boolean> {
   return invoke("autostart_state");
@@ -897,9 +969,14 @@ export async function setSetting(key: string, value: string): Promise<void> {
   return invoke("set_setting", { key, value });
 }
 
-/** 前端日志落盘（全局错误浮层用；release 下 JS 崩溃也要有现场可查） */
+/**
+ * 前端日志落盘（`@/lib/logger` 的出口；release 下 JS 崩溃也要有现场可查）。
+ *
+ * `level` 是界面那四档：后端只认 error/warn/info，其余一律按 debug 记
+ * （见 `cmd_write_log`），这样前端加一档不必先动后端。
+ */
 export async function writeLog(
-  level: "error" | "warn" | "info",
+  level: LogLevel,
   message: string,
 ): Promise<void> {
   return invoke("write_log", { level, message });

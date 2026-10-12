@@ -16,6 +16,8 @@ vi.mock("@tauri-apps/api/event", () => ({
 vi.mock("@/services/ipc", () => ({
   getAppVersion: vi.fn(async () => ({ versionName: "1.0.0", versionCode: 100 })),
   astralReportStats: vi.fn(async () => {}),
+  // stat.ts 的失败路径会经 @/lib/logger 落一份进文件日志
+  writeLog: vi.fn(async () => {}),
 }));
 
 import * as ipc from "@/services/ipc";

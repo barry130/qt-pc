@@ -283,6 +283,12 @@ export interface AudioError {
   trackId: string | null;
   kind: string;
   message: string;
+  /**
+   * 本次失败只是环境问题（弱网 / 引擎卡），不是「这首歌坏了」。
+   * 引擎据此不把曲目拉黑、不计入连续失败熔断（见 audio/engine.rs 的
+   * `dispatch_load_failed`）。老版本后端不带这个字段，故可选。
+   */
+  stalled?: boolean;
 }
 
 /** queue-changed 事件负载 */

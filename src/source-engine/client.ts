@@ -21,6 +21,7 @@
  */
 import { emitTo, listen } from "@tauri-apps/api/event";
 import { stripErrorUrls } from "@/lib/utils";
+import { log } from "@/lib/logger";
 import type { Quality } from "@/types";
 import type { MusicInfo, Source } from "@/source-scripts/qt-contract/contract";
 
@@ -450,15 +451,19 @@ export async function engineResolve(
   const referer = typeof answer.referer === "string" ? answer.referer : "";
   const size = typeof answer.size === "number" && Number.isFinite(answer.size) ? answer.size : null;
   const actualQuality = typeof answer.actualQuality === "string" ? answer.actualQuality : "";
-  // 死因落控制台：面板只在 qt_admin 打开时才看得到，日志是排障的第一现场
-  if (url.length === 0 && error.length > 0) {
-    console.warn(`[playurl] 取链失败 ${source}:${song.id}@${quality} — ${error}`);
-  }
   // 音源包在 trace 前缀打 `[网络]` 表示「整链没有一条线路拿到过响应」，
   // 即本次全灭是弱网/引擎卡造成的环境问题，而不是这个音源没这首歌
   // （见 qt-sources/src/actions/play-url.ts 的 noteSourceMissFiltered）。
   // 据此让 stalled=true，引擎不把曲目拉黑、不计入熔断。
   const stalled = url.length === 0 && /\[网络\]/.test(error);
+  // 死因落日志：面板只在 qt_admin 打开时才看得到，日志是排障的第一现场。
+  // 级别跟着 stalled 走：环境问题（弱网/引擎卡）是降级可自愈，记 warn；
+  // 音源确实没这首才是需要有人看的错误，记 error。
+  if (url.length === 0 && error.length > 0) {
+    const detail = `[playurl] 取链失败 ${source}:${song.id}@${quality} — ${error}`;
+    if (stalled) log.warn(detail);
+    else log.error(detail);
+  }
   return { url, line: normalizeLine(answer.line), error, stalled, referer, size, actualQuality };
 }
 

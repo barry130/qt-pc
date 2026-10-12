@@ -1167,7 +1167,7 @@ async fn discover_updates(
             }
             Ok(_) => {}
             Err(e) => {
-                log::info!("[source-bundle] {} 探测失败: {e}", pack.id);
+                log::warn!("[source-bundle] {} 探测失败: {e}", pack.id);
             }
         }
     }
@@ -1236,7 +1236,7 @@ async fn discover_updates(
             }
         }
         Ok(_) => {}
-        Err(e) => log::info!("[source-bundle] manifest 通道不可用: {e}"),
+        Err(e) => log::warn!("[source-bundle] manifest 通道不可用: {e}"),
     }
 
     // 去重（同 target 取 newCode 最高）+ meta 优先

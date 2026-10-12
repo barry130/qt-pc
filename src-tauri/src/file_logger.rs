@@ -1,32 +1,62 @@
 //! 文件日志（运维）：release 构建没有控制台（windows_subsystem），env_logger
 //! 写的 stderr 一条都到不了用户机器上，报障时无现场可查。本模块把 log 记录与
-//! panic 钩子统一落盘到 [`crate::app_paths::logs_root_from_env`] 给出的目录：
-//! Windows `%APPDATA%/QuietMusic/logs`、macOS `~/Library/Logs/QuietMusic`、
-//! Linux `$XDG_STATE_HOME/QuietMusic/logs`（缺省 `~/.local/state/QuietMusic/logs`）：
-//! - 当前文件 `quietmusic.log`，写满 5 MiB 轮转出 `.1`~`.4`（总量上界
-//!   5 文件 × 5 MiB；按大小轮转不按日期，重启不清空）；
+//! panic 钩子统一落盘到 [`crate::app_paths::logs_root_from_env`] 给出的目录
+//! （默认是**安装目录下的 `logs`**，安装目录不可写时回落
+//! `%APPDATA%/QuietMusic/logs` / `~/Library/Logs/QuietMusic` /
+//! `$XDG_STATE_HOME/QuietMusic/logs`；用户可在设置页改到任意目录）：
+//! - 当前文件 `quietmusic.log`，写满一个文件就轮转出 `.1`~`.N`
+//!   （默认 5 个备份 × 每份 10 MiB，按大小轮转不按日期，重启不清空）；
+//! - 级别默认按构建区分：debug 构建（含 `tauri dev`）留 `Debug`，
+//!   发行包只留 `Warn`（Info 里绝大多数是启动流程，真要看的是 Warn/Error）；
+//!   `RUST_LOG` 与设置页里的 `log.level` 都能覆盖；
 //! - debug 构建同时保留 stderr 输出（dev 终端照常可见）；
 //! - 不引入新依赖：时间戳 Windows 用 GetLocalTime，其他平台退化 UTC。
 //!
 //! 用法：`run()` 最开头 `init()` + `install_panic_hook()`，其余代码照常用
-//! `log::` 宏，无感知。
+//! `log::` 宏，无感知；数据库打开后再 `apply_settings()` 把用户配置（级别 /
+//! 单文件大小 / 保留份数 / 目录）盖上去。
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-/// 单文件上限 5 MiB
-const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
-/// 轮转保留的历史文件数（quietmusic.log.1 ~ .4）
-const MAX_BACKUPS: u32 = 4;
+/// settings 键：日志目录（空串 = 用默认，见 [`crate::app_paths::logs_root_from_env`]）。
+/// 与 `download.dir` / `cache.audioLimitMb` 一样走点号风格。
+pub const SETTING_LOG_DIR: &str = "log.dir";
+/// settings 键：日志级别（debug / info / warn / error）
+pub const SETTING_LOG_LEVEL: &str = "log.level";
+/// settings 键：单个日志文件上限（MB）
+pub const SETTING_LOG_FILE_MB: &str = "log.fileMb";
+/// settings 键：日志轮转保留份数
+pub const SETTING_LOG_BACKUPS: &str = "log.backups";
+
+/// 默认单文件上限 10 MiB
+pub const DEFAULT_FILE_MB: u64 = 10;
+/// 默认轮转保留份数（quietmusic.log.1 ~ .5）
+pub const DEFAULT_BACKUPS: u32 = 5;
+/// 单文件上限允许区间（MB）：太小会一启动就轮转，太大一份文件不好往外发
+pub const MIN_FILE_MB: u64 = 1;
+pub const MAX_FILE_MB: u64 = 512;
+/// 保留份数允许区间（份）
+pub const MIN_BACKUPS: u32 = 1;
+pub const MAX_BACKUPS: u32 = 50;
+
 const CURRENT_NAME: &str = "quietmusic.log";
 
+/// 运行期可变的日志参数。
+///
+/// 单文件上限与保留份数由设置页决定（默认 10 MiB × 5），所以不能是常量 ——
+/// 但也不需要单独再造一个结构体，直接挂在已有的 [`Inner`] 上。
 struct Inner {
     dir: Option<PathBuf>,
     file: Option<File>,
     /// 当前文件已写字节数（轮转判据）
     written: u64,
+    /// 单个文件的上限（字节）
+    max_file_bytes: u64,
+    /// 轮转保留的历史文件数（quietmusic.log.1 ~ .N）
+    max_backups: u32,
 }
 
 static LOGGER: OnceLock<Mutex<Inner>> = OnceLock::new();
@@ -38,16 +68,18 @@ pub fn init(dir: Option<PathBuf>) {
         dir: dir.clone(),
         file: None,
         written: 0,
+        max_file_bytes: DEFAULT_FILE_MB * 1024 * 1024,
+        max_backups: DEFAULT_BACKUPS,
     };
     if let Some(dir) = dir {
         if fs::create_dir_all(&dir).is_ok() {
             let current = dir.join(CURRENT_NAME);
             let oversize = fs::metadata(&current)
-                .map(|m| m.len() >= MAX_FILE_BYTES)
+                .map(|m| m.len() >= inner.max_file_bytes)
                 .unwrap_or(false);
             if oversize {
                 inner.file = None;
-                rotate(&dir);
+                rotate(&dir, inner.max_backups);
             }
             inner.file = open_current(&dir);
             inner.written = fs::metadata(&current).map(|m| m.len()).unwrap_or(0);
@@ -65,6 +97,140 @@ pub fn logs_dir() -> Option<PathBuf> {
     let mutex = LOGGER.get()?;
     let inner = mutex.lock().unwrap_or_else(|p| p.into_inner());
     inner.dir.clone()
+}
+
+/// 当前日志目录，拿不到运行期目录时回落默认目录。
+///
+/// 与 [`logs_dir`] 的区别：后者是「本次运行真的在写哪」，拿不到就是 None；
+/// 这个多一步兜底，专门给设置页回显用 —— 用户改目录前也得看见「现在的目录
+/// 是哪个」，而不是一个空白。
+pub fn effective_dir() -> Option<PathBuf> {
+    logs_dir().or_else(crate::app_paths::logs_root_from_env)
+}
+
+/// 当前生效的级别（设置页回显用）。
+pub fn current_level() -> log::LevelFilter {
+    log::max_level()
+}
+
+/// 当前生效的单文件上限（MB，设置页回显用）。
+pub fn current_file_mb() -> u64 {
+    LOGGER
+        .get()
+        .map(|m| {
+            let inner = m.lock().unwrap_or_else(|p| p.into_inner());
+            (inner.max_file_bytes / (1024 * 1024)).max(MIN_FILE_MB)
+        })
+        .unwrap_or(DEFAULT_FILE_MB)
+}
+
+/// 当前生效的保留份数（设置页回显用）。
+pub fn current_backups() -> u32 {
+    LOGGER
+        .get()
+        .map(|m| m.lock().unwrap_or_else(|p| p.into_inner()).max_backups)
+        .unwrap_or(DEFAULT_BACKUPS)
+}
+
+/// `log.level` 的词 → 级别。无法识别的词返回 None（调用方回落默认）。
+pub fn parse_level(raw: &str) -> Option<log::LevelFilter> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "trace" => Some(log::LevelFilter::Trace),
+        "debug" => Some(log::LevelFilter::Debug),
+        "info" => Some(log::LevelFilter::Info),
+        "warn" | "warning" => Some(log::LevelFilter::Warn),
+        "error" => Some(log::LevelFilter::Error),
+        _ => None,
+    }
+}
+
+/// 级别的稳定字符串（写回 settings / 回显用）。
+pub fn level_name(level: log::LevelFilter) -> &'static str {
+    match level {
+        log::LevelFilter::Off => "error",
+        log::LevelFilter::Error => "error",
+        log::LevelFilter::Warn => "warn",
+        log::LevelFilter::Info => "info",
+        log::LevelFilter::Debug => "debug",
+        log::LevelFilter::Trace => "trace",
+    }
+}
+
+/// 把设置页里的数值夹进允许区间（脏数据不能让日志系统瘫痪）。
+pub fn clamp_file_mb(mb: u64) -> u64 {
+    mb.clamp(MIN_FILE_MB, MAX_FILE_MB)
+}
+
+/// 同上，保留份数。
+pub fn clamp_backups(n: u32) -> u32 {
+    n.clamp(MIN_BACKUPS, MAX_BACKUPS)
+}
+
+/// `log.dir` 的原始值 → 目录：空串（含全空白）表示「用默认目录」
+/// （[`crate::app_paths::logs_root_from_env`]），否则按原样取路径。
+fn resolve_dir(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        crate::app_paths::logs_root_from_env()
+    } else {
+        Some(PathBuf::from(trimmed))
+    }
+}
+
+/// 数据库打开后调用：把用户配置盖到运行期参数上。
+///
+/// 四个参数都是「原始字符串」，解析与夹紧都收在本模块里 —— 调用方
+/// （`lib.rs` setup 与设置命令）只需要把 settings 表里的值递进来。
+///
+/// **`None` 一律表示「这一项不动」**，不是「回落默认值」：启动时库里没配过
+/// 这几条键，`init()` 已经装好默认档（`DEFAULT_FILE_MB` × `DEFAULT_BACKUPS` ×
+/// `level_from_env()`），不动的结果与显式回落默认完全一致；而设置页只改其中
+/// 一项时（比如只换目录），另外两项也不会被顺手打回默认。目录的「回到默认」
+/// 走空串（[`resolve_dir`]），和「不动」区分开。
+///
+/// 换目录会先关旧句柄（Windows 上不关就没法改名/删除）再在新目录重开。
+pub fn apply_settings(
+    dir: Option<&str>,
+    level: Option<&str>,
+    file_mb: Option<&str>,
+    backups: Option<&str>,
+) {
+    if let Some(level) = level.and_then(parse_level) {
+        log::set_max_level(level);
+    }
+
+    let Some(mutex) = LOGGER.get() else { return };
+    let mut inner = mutex.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(mb) = file_mb.and_then(|s| s.trim().parse::<u64>().ok()) {
+        inner.max_file_bytes = clamp_file_mb(mb) * 1024 * 1024;
+    }
+    if let Some(n) = backups.and_then(|s| s.trim().parse::<u32>().ok()) {
+        inner.max_backups = clamp_backups(n);
+    }
+
+    let Some(raw_dir) = dir else { return };
+    let Some(new_dir) = resolve_dir(raw_dir) else {
+        return;
+    };
+    if inner.dir.as_deref() == Some(new_dir.as_path()) {
+        return;
+    }
+    // 换目录：先关句柄，再在新目录重开
+    inner.file = None;
+    inner.written = 0;
+    inner.dir = None;
+    if fs::create_dir_all(&new_dir).is_ok() {
+        let current = new_dir.join(CURRENT_NAME);
+        let oversize = fs::metadata(&current)
+            .map(|m| m.len() >= inner.max_file_bytes)
+            .unwrap_or(false);
+        if oversize {
+            rotate(&new_dir, inner.max_backups);
+        }
+        inner.file = open_current(&new_dir);
+        inner.written = fs::metadata(&current).map(|m| m.len()).unwrap_or(0);
+        inner.dir = Some(new_dir);
+    }
 }
 
 /// 安装 panic 钩子：panic 信息落日志文件（release 无 stderr 可看，否则
@@ -134,11 +300,11 @@ fn append_line(line: &str) {
     let mut inner = mutex.lock().unwrap_or_else(|p| p.into_inner());
     let Some(dir) = inner.dir.clone() else { return };
     let need = line.len() as u64 + 1;
-    if inner.file.is_none() || inner.written + need > MAX_FILE_BYTES {
+    if inner.file.is_none() || inner.written + need > inner.max_file_bytes {
         // Windows 上先关句柄才能改名轮转
         inner.file = None;
         if inner.written > 0 {
-            rotate(&dir);
+            rotate(&dir, inner.max_backups);
         }
         inner.file = open_current(&dir);
         inner.written = fs::metadata(dir.join(CURRENT_NAME))
@@ -168,10 +334,16 @@ fn open_current(dir: &PathBuf) -> Option<File> {
         .ok()
 }
 
-/// log.4 删掉、log.N → log.N+1、当前文件 → log.1（调用前须已关闭当前句柄）
-fn rotate(dir: &PathBuf) {
-    let _ = fs::remove_file(dir.join(format!("{CURRENT_NAME}.{}", MAX_BACKUPS)));
-    for i in (1..MAX_BACKUPS).rev() {
+/// log.N 删掉、log.i → log.i+1、当前文件 → log.1（调用前须已关闭当前句柄）。
+/// `backups` 是保留份数：调小后多出来的旧文件也要一并清掉，否则用户把份数
+/// 从 50 改到 5 之后，磁盘上仍留着 45 份历史文件。
+fn rotate(dir: &PathBuf, backups: u32) {
+    let _ = fs::remove_file(dir.join(format!("{CURRENT_NAME}.{backups}")));
+    // 调小份数后遗留的更高编号（最多 MAX_BACKUPS 次探测，代价可忽略）
+    for i in (backups + 1)..=MAX_BACKUPS {
+        let _ = fs::remove_file(dir.join(format!("{CURRENT_NAME}.{i}")));
+    }
+    for i in (1..backups).rev() {
         let _ = fs::rename(
             dir.join(format!("{CURRENT_NAME}.{i}")),
             dir.join(format!("{CURRENT_NAME}.{}", i + 1)),
@@ -183,19 +355,33 @@ fn rotate(dir: &PathBuf) {
     );
 }
 
-/// RUST_LOG 兼容（只认单词，`RUST_LOG=debug` 之类），默认 info——与原先
-/// env_logger 的 default_filter_or("info") 口径一致。
+/// RUST_LOG 兼容（只认单词，`RUST_LOG=debug` 之类）。
+///
+/// 默认级别**按构建区分**：debug 构建（含 `tauri dev`）留 `Debug`，发行包只留
+/// `Warn` —— 发行包里 Info 绝大多数是启动流程，真要看的是 Warn/Error，而
+/// 2026-10-10 的教训是一晚上能写出 20 MiB 噪音把现场冲走。
 /// 只取首个逗号段做**精确**匹配：子串匹配会把 `RUST_LOG=info,wgpu=warn`
-/// 里的目标识别降成 Warn（丢了全局 info），`off` 等无法识别的词回落 info。
+/// 里的目标识别降成 Warn（丢了全局 info），`off` 等无法识别的词回落默认值。
 fn level_from_env() -> log::LevelFilter {
     let raw = std::env::var("RUST_LOG").unwrap_or_default();
     let first = raw.split(',').next().unwrap_or("").trim().to_ascii_lowercase();
     match first.as_str() {
         "trace" => log::LevelFilter::Trace,
         "debug" => log::LevelFilter::Debug,
+        "info" => log::LevelFilter::Info,
         "warn" => log::LevelFilter::Warn,
         "error" => log::LevelFilter::Error,
-        _ => log::LevelFilter::Info,
+        _ => default_level(),
+    }
+}
+
+/// 未显式配置时的默认级别：debug 构建 Debug，release 构建 Warn。
+/// （`pub` 是给设置页回显用：让用户看见「没配置时默认是多少」。）
+pub fn default_level() -> log::LevelFilter {
+    if cfg!(debug_assertions) {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Warn
     }
 }
 
@@ -242,4 +428,131 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 级别词 → 过滤器：大小写与空白都容忍，认不出的词返回 None（调用方回落
+    /// 默认档），绝不 panic。
+    #[test]
+    fn parse_level_accepts_known_words_only() {
+        assert_eq!(parse_level("DEBUG"), Some(log::LevelFilter::Debug));
+        assert_eq!(parse_level("  Warn "), Some(log::LevelFilter::Warn));
+        assert_eq!(parse_level("warning"), Some(log::LevelFilter::Warn));
+        assert_eq!(parse_level("info"), Some(log::LevelFilter::Info));
+        assert_eq!(parse_level("error"), Some(log::LevelFilter::Error));
+        assert_eq!(parse_level("off"), None);
+        assert_eq!(parse_level(""), None);
+    }
+
+    /// level_name 与 parse_level 必须互逆 —— 设置页回显的就是写回去的值，
+    /// 一旦不互逆，用户「点开设置什么都没改」也会把级别改掉。
+    #[test]
+    fn level_name_round_trips_through_parse_level() {
+        for lv in [
+            log::LevelFilter::Error,
+            log::LevelFilter::Warn,
+            log::LevelFilter::Info,
+            log::LevelFilter::Debug,
+            log::LevelFilter::Trace,
+        ] {
+            assert_eq!(parse_level(level_name(lv)), Some(lv), "{lv:?} 不能往返");
+        }
+    }
+
+    /// 未设 RUST_LOG 时默认档按构建区分：debug 构建 Debug，发行包 Warn。
+    #[test]
+    fn default_level_follows_build_kind() {
+        let expected = if cfg!(debug_assertions) {
+            log::LevelFilter::Debug
+        } else {
+            log::LevelFilter::Warn
+        };
+        assert_eq!(default_level(), expected);
+    }
+
+    /// 大小与份数的夹紧：脏数据（0 / 超大）不能把日志系统弄瘫。
+    #[test]
+    fn clamps_keep_values_in_range() {
+        assert_eq!(clamp_file_mb(0), MIN_FILE_MB);
+        assert_eq!(clamp_file_mb(u64::MAX), MAX_FILE_MB);
+        assert_eq!(clamp_file_mb(20), 20);
+        assert_eq!(clamp_backups(0), MIN_BACKUPS);
+        assert_eq!(clamp_backups(999), MAX_BACKUPS);
+        assert_eq!(clamp_backups(5), 5);
+    }
+
+    /// 空串是「回到默认目录」，不是「不动」—— 设置页的「恢复默认」就是写空串。
+    /// 空白串同理（库里存了空格也得当默认，否则会建出一个名字是空格的目录）。
+    #[test]
+    fn blank_dir_means_default() {
+        let expected = crate::app_paths::logs_root_from_env();
+        assert_eq!(resolve_dir(""), expected);
+        assert_eq!(resolve_dir("   "), expected);
+        assert_eq!(resolve_dir("\t\n"), expected);
+    }
+
+    /// 非空串原样取路径（含相对路径：用户自己填的，不做「必须绝对路径」的额外
+    /// 门槛 —— 与 download.dir 一致）。两端的空白要去掉，否则 Windows 上
+    /// `PathBuf::from(" D:\\logs ")` 会带空格建目录。
+    #[test]
+    fn non_blank_dir_is_used_verbatim() {
+        assert_eq!(
+            resolve_dir("D:\\logs\\qm"),
+            Some(PathBuf::from("D:\\logs\\qm"))
+        );
+        assert_eq!(resolve_dir("  D:\\logs\\qm  "), Some(PathBuf::from("D:\\logs\\qm")));
+    }
+
+    /// `apply_settings` 的 `None` = 「这一项不动」：设置页只改大小的时候，级别
+    /// 与份数都不能被顺手打回默认。
+    #[test]
+    fn none_arguments_leave_other_items_untouched() {
+        // 级别是进程级全局量，测试之间会互相串；先存后还，别把这个测试的
+        // 副作用留给同进程的其他测试。
+        let level_before = log::max_level();
+        let mutex = LOGGER.get_or_init(|| {
+            Mutex::new(Inner {
+                dir: None,
+                file: None,
+                written: 0,
+                max_file_bytes: DEFAULT_FILE_MB * 1024 * 1024,
+                max_backups: DEFAULT_BACKUPS,
+            })
+        });
+        // 先摆一个非默认状态
+        apply_settings(None, Some("error"), Some("77"), Some("9"));
+        assert_eq!(log::max_level(), log::LevelFilter::Error);
+        {
+            let inner = mutex.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(inner.max_file_bytes, 77 * 1024 * 1024);
+            assert_eq!(inner.max_backups, 9);
+        }
+        // 只改份数：级别与大小保持刚才的值
+        apply_settings(None, None, None, Some("3"));
+        assert_eq!(log::max_level(), log::LevelFilter::Error);
+        {
+            let inner = mutex.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(inner.max_file_bytes, 77 * 1024 * 1024);
+            assert_eq!(inner.max_backups, 3);
+        }
+        // 认不出的级别词不动任何东西（不 panic、不回落默认）
+        apply_settings(None, Some("nonsense"), None, None);
+        assert_eq!(log::max_level(), log::LevelFilter::Error);
+        // 脏数据同样只是「不动」
+        apply_settings(None, None, Some("abc"), None);
+        {
+            let inner = mutex.lock().unwrap_or_else(|p| p.into_inner());
+            assert_eq!(inner.max_file_bytes, 77 * 1024 * 1024);
+        }
+        // 还原：份数回默认，级别回测试前的档
+        {
+            let mut inner = mutex.lock().unwrap_or_else(|p| p.into_inner());
+            inner.max_file_bytes = DEFAULT_FILE_MB * 1024 * 1024;
+            inner.max_backups = DEFAULT_BACKUPS;
+        }
+        log::set_max_level(level_before);
+    }
 }

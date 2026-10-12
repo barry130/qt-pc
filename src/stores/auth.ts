@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { errMsg } from "@/lib/utils";
+import { log } from "@/lib/logger";
 import type { AuthSession } from "@/types";
 import * as ipc from "@/services/ipc";
 
@@ -384,7 +385,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
       // 不会被对账误复活。同步失败不影响使用，只记错误不抛。
       void syncLikesWithReconcile().catch((err) => {
         const msg = errMsg(err);
-        console.warn("[like] 收藏同步失败", err);
+        log.warn("[like] 收藏同步失败", err);
         // 同步失败不该打断登录流程，但得留下线索：错误写进 settings 表，
         // 桌面端没有顺手的 devtools，从库里能直接读到。
         // 用字面量而不是模块常量：同步是启动早期跑的，万一模块还没初始化完，
@@ -392,9 +393,11 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
         void ipc.setSetting("like.lastError", msg).catch(() => {});
       });
     } catch (err) {
-      // 后端没起 / 网络不可达：保留本地登录态（离线容忍），只是暂时拿不到用户信息
+      // 后端没起 / 网络不可达：保留本地登录态（离线容忍），只是暂时拿不到用户信息。
+      // 这是正常离线场景，不该刷成 warn 吓人；但留一条 debug 决策轨迹 ——
+      // 排查「为什么没登录上」时，得能看出是走到了这条路，而不是压根没调。
+      log.debug("[auth] 拉取用户信息失败，保持离线登录态", err);
       set({ profile: null, error: null });
-      void err;
     }
   },
 
@@ -408,7 +411,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
       await handleLikeOwnerSwitch(profile);
       // 与 init 路径同口径：失败写 like.lastError 留排查线索（见 init 内注释）
       void syncLikesWithReconcile().catch((err) => {
-        console.warn("[like] 登录后收藏同步失败", err);
+        log.warn("[like] 登录后收藏同步失败", err);
         void ipc.setSetting("like.lastError", errMsg(err)).catch(() => {});
       });
     } catch (err) {
@@ -435,7 +438,7 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
       await handleLikeOwnerSwitch(profile);
       // 与 init/login 路径同口径：失败写 like.lastError 留排查线索
       void syncLikesWithReconcile().catch((err) => {
-        console.warn("[like] 注册后收藏同步失败", err);
+        log.warn("[like] 注册后收藏同步失败", err);
         void ipc.setSetting("like.lastError", errMsg(err)).catch(() => {});
       });
     } catch (err) {

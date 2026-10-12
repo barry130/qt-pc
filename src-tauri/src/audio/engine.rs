@@ -149,6 +149,9 @@ pub enum AudioCmd {
     SetSpectrum(bool),
     /// 播放缓存体积上限（MB，0 = 不限）。引擎落 settings 并立即后台修剪一遍。
     SetCacheLimit(u64),
+    /// 切换播放缓存目录（设置页「通用 → 缓存位置」）。之后的取流按新目录落盘；
+    /// 已在播的那条流保持原文件不变（文件句柄正被读）。
+    SetCacheDir(PathBuf),
     /// 取址 / 打开流失败的回执：统一置错误态，并决定是否自动跳过（§7.3 恢复策略）。
     LoadFailed {
         track_id: String,
@@ -973,7 +976,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
         } => {
             // 过期结果丢弃：等待取址/构建期间用户又切了歌，这条是旧歌的
             if gen != inner.load_gen {
-                log::info!(
+                log::debug!(
                     "[queue] 丢弃过期的加载结果 track={} (gen={gen} != {})",
                     track.id,
                     inner.load_gen
@@ -1416,6 +1419,18 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             // 调低上限立即生效：后台修剪到新上限以内
             spawn_cache_prune(inner);
         }
+        AudioCmd::SetCacheDir(dir) => {
+            // 只换目录本身：正在读的那条流仍指着旧文件（句柄已打开），
+            // 后续取流 / 修剪走新目录。
+            //
+            // 这里**不**写 settings：`cache.dir` 存的是缓存**根目录**（音频缓存
+            // 是它下面的 `audio`，见 lib.rs setup），而引擎只知道传进来的
+            // `audio` 子目录 —— 由引擎落库就会把 `<根>/audio` 存进去，下次启动
+            // 再 join 一次 `audio`，缓存跑到 `<根>/audio/audio`。落库归调用方
+            // （commands::cmd_choose_cache_dir）。
+            log::info!("[cache] 缓存目录已切换到 {}", dir.display());
+            inner.cache_dir = dir;
+        }
         AudioCmd::LoadFailed {
             track_id,
             message,
@@ -1425,7 +1440,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
         } => {
             if gen != inner.load_gen {
                 // 过期的失败回执：用户已切到别的歌，不能把当前状态置错
-                log::info!("[queue] 丢弃过期的失败回执 track={track_id}");
+                log::debug!("[queue] 丢弃过期的失败回执 track={track_id}");
             } else {
                 log::error!("[queue] 曲目 {track_id} 播放失败: {message}");
                 inner.mutate(|st| {
@@ -1464,7 +1479,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
         }
         AudioCmd::StalledRetry { track_id, gen } => {
             if gen != inner.load_gen {
-                log::info!("[queue] 丢弃过期的弱网重试 track={track_id}");
+                log::debug!("[queue] 丢弃过期的弱网重试 track={track_id}");
             } else {
                 // 只在仍是当前曲时才重试（用户在延迟期间手动切了别的歌就不动）
                 let is_current = inner
@@ -1475,12 +1490,12 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                     .map(|t| t.id == track_id)
                     .unwrap_or(false);
                 if !is_current {
-                    log::info!("[queue] 弱网重试时当前曲已变，丢弃 track={track_id}");
+                    log::debug!("[queue] 弱网重试时当前曲已变，丢弃 track={track_id}");
                 } else {
                     // 先出借用再play_queue_track（它要&mut inner）
                     let track = inner.queue.lock().unwrap().current().cloned();
                     if let Some(track) = track {
-                        log::info!("[queue] 弱网重试：{track_id}");
+                        log::debug!("[queue] 弱网重试：{track_id}");
                         play_queue_track(inner, track);
                     }
                 }
@@ -1488,7 +1503,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
         }
         AudioCmd::Recovered { gen } => {
             if gen != 0 && gen != inner.load_gen {
-                log::info!("[queue] 丢弃过期的恢复探测回执");
+                log::debug!("[queue] 丢弃过期的恢复探测回执");
             } else {
                 // 网络/音源已恢复：重开自动切歌并把当前曲重新拉起来。
                 // 过去熔断是单向门，只能靠用户手动操作，这里让它自愈。
@@ -1502,10 +1517,10 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                 });
                 let track = inner.queue.lock().unwrap().current().cloned();
                 if let Some(track) = track {
-                    log::info!("[queue] 网络已恢复，重新播放当前曲 {}", track.id);
+                    log::debug!("[queue] 网络已恢复，重新播放当前曲 {}", track.id);
                     play_queue_track(inner, track);
                 } else {
-                    log::info!("[queue] 网络已恢复，队列为空不重放");
+                    log::debug!("[queue] 网络已恢复，队列为空不重放");
                 }
             }
         }
@@ -1590,7 +1605,7 @@ fn advance(inner: &mut EngineInner, auto: bool) {
         let q = inner.queue.lock().unwrap();
         q.next_index_skipping(mode, auto, |t| inner.dislikes.matches(t))
     };
-    log::info!("[queue] advance(auto={auto}, mode={mode:?}) -> {next:?}");
+    log::debug!("[queue] advance(auto={auto}, mode={mode:?}) -> {next:?}");
     match next {
         Some(i) => {
             let track = {
@@ -1740,7 +1755,7 @@ fn schedule_stalled_retry(inner: &mut EngineInner, track_id: &str) {
     }
     let delay = STALLED_RETRY_BASE_MS.saturating_mul(1u64 << attempt).min(STALLED_RETRY_MAX_MS);
     inner.stall_retry = attempt + 1;
-    log::info!("[queue] 网络较慢，{delay}ms 后重试同一首（{}/{STALLED_RETRY_LIMIT}）", attempt + 1);
+    log::debug!("[queue] 网络较慢，{delay}ms 后重试同一首（{}/{STALLED_RETRY_LIMIT}）", attempt + 1);
 
     // 重试要走引擎命令通道（load_queue_track 需要 &mut EngineInner），
     // 且必须带代次：延迟期间用户可能已切歌/暂停，到时由 gen 不匹配丢弃。
@@ -1789,7 +1804,7 @@ fn schedule_recovery_probe(inner: &EngineInner) {
                 crate::resolve_play_url_script(&app, &cache, &track, quality.clone()).await;
             if probe.is_ok() {
                 let _ = tx.send(AudioCmd::Recovered { gen: 0 });
-                log::info!("[queue] 第{attempt}次恢复探测成功，重开自动切歌");
+                log::debug!("[queue] 第{attempt}次恢复探测成功，重开自动切歌");
                 return;
             }
             delay = (delay * 2).min(RECOVERY_PROBE_MAX_MS);
@@ -1852,7 +1867,7 @@ fn skip_if_recoverable(inner: &mut EngineInner, track_id: &str, autoplay: bool) 
         });
         return;
     };
-    log::info!("[queue] 曲目 {track_id} 失败，跳过到队列第 {} 首", i + 1);
+    log::debug!("[queue] 曲目 {track_id} 失败，跳过到队列第 {} 首", i + 1);
 
     let track = {
         let mut q = inner.queue.lock().unwrap();
@@ -2019,7 +2034,7 @@ impl LoadJob {
     async fn run(self) {
         // 本地曲目：Track.id 即文件绝对路径，无需 Provider 取址（DESIGN §13）
         if self.track.platform.is_local() {
-            log::info!("[queue] local track path={}", self.track.id);
+            log::debug!("[queue] local track path={}", self.track.id);
             let path = self.track.id.clone();
             self.build_and_dispatch(PlaySource::Local { path }, true, None)
                 .await;
@@ -2036,7 +2051,7 @@ impl LoadJob {
             .await;
             if let Ok(Ok(Some(path))) = found {
                 if std::path::Path::new(&path).exists() {
-                    log::info!("[queue] 命中已下载文件，离线播放: {path}");
+                    log::debug!("[queue] 命中已下载文件，离线播放: {path}");
                     self.build_and_dispatch(PlaySource::Local { path }, true, None)
                         .await;
                     return;
@@ -2060,7 +2075,7 @@ impl LoadJob {
                 let url = hit.url;
                 let referer = hit.referer;
                 let fetched_at = hit.fetched_at;
-                log::info!(
+                log::debug!(
                     "[queue] resolve ok track={} url_host={}",
                     self.track.id,
                     url.split("//")

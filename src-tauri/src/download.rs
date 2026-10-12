@@ -509,7 +509,7 @@ async fn attempt_once(
         // 服务端支持续传：总长 = 已下载 + 本次剩余
     } else if offset > 0 && resp.status().is_success() {
         // 服务端忽略 Range，整包重来
-        log::info!("[download] {} 服务端不支持续传，从头下载", job.task_id);
+        log::warn!("[download] {} 服务端不支持续传，从头下载", job.task_id);
         offset = 0;
     } else if !resp.status().is_success() {
         let msg = format!("服务器返回 HTTP {code}");

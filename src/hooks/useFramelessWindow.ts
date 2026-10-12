@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { log } from "@/lib/logger";
 
 /** 8 个方向命中区，与 index.css 的 .resize-hit-* 类一一对应 */
 type ResizeDir =
@@ -95,7 +96,7 @@ export function useTitleBarDrag(): {
       }
       void getCurrentWindow()
         .startDragging()
-        .catch((err) => console.error("startDragging failed", err));
+        .catch((err) => log.warn("startDragging failed", err));
     };
     el.addEventListener("mousedown", onMousedown);
     return () => el.removeEventListener("mousedown", onMousedown);

@@ -43,7 +43,13 @@ use tauri::{Emitter, Manager};
 pub struct AppState {
     pub url_cache: Arc<PlayUrlCache>,
     pub engine: AudioEngine,
-    pub audio_cache_dir: PathBuf,
+    /// 播放缓存的**根目录**（默认安装目录下的 `cache`，设置页可改，settings
+    /// key = `cache.dir`）。音频缓存是它下面的 `audio`。
+    ///
+    /// 用 `Mutex` 而不是普通字段：设置页换目录后，`audio_cache_stats` /
+    /// `clear_audio_cache` 必须跟着看新目录，否则用户换完目录再点「清理缓存」
+    /// 清的还是旧位置。锁中毒按仓库惯例 `unwrap_or_else(|p| p.into_inner())`。
+    pub cache_root: std::sync::Mutex<PathBuf>,
     /// None = 打开/迁移失败（已记日志），播放等功能不受影响
     pub db: Option<Arc<Database>>,
     /// Astral 后端 HTTP 客户端（更新 / 消息 / 统计 / 反馈，§2.3.4）
@@ -155,13 +161,6 @@ pub fn run() {
         })
         .setup(|app| {
             let handle = app.handle().clone();
-            let cache_base = handle
-                .path()
-                .app_cache_dir()
-                .unwrap_or_else(|_| PathBuf::from("."));
-            let audio_cache_dir = cache_base.join("audio");
-            let url_cache = Arc::new(PlayUrlCache::new());
-
             // 数据库：DESIGN §8.1 %APPDATA%/QuietMusic/data/music.db
             // 口径集中在 app_paths::data_root（含 LightListen 旧目录迁移）
             let db_root = crate::app_paths::data_root(&handle);
@@ -173,9 +172,44 @@ pub fn run() {
                 }
             };
 
+            // 日志参数（级别 / 单文件大小 / 保留份数 / 目录）：必须等数据库打开后
+            // 才能读到用户配置。这里只做一次「盖上去」——运行期改配置走设置命令。
+            {
+                let read = |key: &str| -> Option<String> {
+                    db.as_ref()
+                        .and_then(|db| db.with(|c| crate::db::store::get_setting(c, key)).ok())
+                        .flatten()
+                };
+                let dir = read(crate::file_logger::SETTING_LOG_DIR);
+                let level = read(crate::file_logger::SETTING_LOG_LEVEL);
+                let file_mb = read(crate::file_logger::SETTING_LOG_FILE_MB);
+                let backups = read(crate::file_logger::SETTING_LOG_BACKUPS);
+                crate::file_logger::apply_settings(
+                    dir.as_deref(),
+                    level.as_deref(),
+                    file_mb.as_deref(),
+                    backups.as_deref(),
+                );
+            }
+
+            // 缓存根目录：默认**安装目录下的 `cache`**（见 app_paths::cache_root），
+            // 安装目录不可写时回落 app_cache_dir()。设置页可改成任意目录
+            // （settings key = cache.dir，见 commands::cmd_choose_cache_dir）。
+            let cache_root = match db.as_ref().and_then(|db| {
+                db.with(|c| crate::db::store::get_setting(c, crate::cache::SETTING_CACHE_DIR))
+                    .ok()
+                    .flatten()
+            }) {
+                Some(dir) if !dir.trim().is_empty() => PathBuf::from(dir.trim()),
+                _ => crate::app_paths::cache_root(&handle),
+            };
+            let audio_cache_dir = cache_root.join("audio");
+
+            let url_cache = Arc::new(PlayUrlCache::new());
+
             let engine = AudioEngine::spawn(
                 handle.clone(),
-                audio_cache_dir.clone(),
+                audio_cache_dir,
                 Arc::clone(&url_cache),
                 db.clone(),
             );
@@ -235,7 +269,7 @@ pub fn run() {
             app.manage(AppState {
                 url_cache,
                 engine,
-                audio_cache_dir,
+                cache_root: std::sync::Mutex::new(cache_root),
                 db,
                 astral,
                 downloads: Arc::new(download::DownloadManager::new()),
@@ -486,6 +520,14 @@ pub fn run() {
             cmd_reset_download_dir,
             cmd_get_download_concurrency,
             cmd_set_download_concurrency,
+            // 日志与缓存目录（设置页「通用 → 诊断」；日志级别仅 qt_admin 可见）
+            cmd_get_log_config,
+            cmd_set_log_config,
+            cmd_choose_log_dir,
+            cmd_reset_log_dir,
+            cmd_get_cache_dir,
+            cmd_choose_cache_dir,
+            cmd_reset_cache_dir,
         ]))
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
