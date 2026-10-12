@@ -3,7 +3,7 @@
 //! 关闭主窗口默认最小化到托盘（§4 关闭行为），退出只能走托盘菜单。
 
 use tauri::menu::{CheckMenuItem, IsMenuItem, Menu, MenuItem};
-use tauri::tray::{TrayIconBuilder, TrayIconEvent};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::AppHandle;
 use tauri::{Emitter, Manager, Wry};
 
@@ -90,14 +90,19 @@ fn sync_lock_checked(app: &AppHandle) {
     }
 }
 
-/// 显示并聚焦主窗口（托盘「显示主窗口」）
+/// 显示并聚焦主窗口（托盘左键单击 / 菜单「显示主窗口」）
 fn show_main_window(app: &AppHandle) {
     if let Some(win) = app.get_webview_window("main") {
+        // 只有「本来不可见」才算一轮新的 show：左键可以连点，若每次都发事件，
+        // 前端停留计时会被反复重置，统计出的时长永远接近 0。
+        let was_visible = win.is_visible().unwrap_or(true);
         let _ = win.unminimize();
         let _ = win.show();
         let _ = win.set_focus();
-        // 统计：窗口重新可见 → 前端记一轮新的 show（开始停留计时）
-        let _ = app.emit("stat_window_shown", ());
+        if !was_visible {
+            // 统计：窗口重新可见 → 前端记一轮新的 show（开始停留计时）
+            let _ = app.emit("stat_window_shown", ());
+        }
     }
 }
 
@@ -122,11 +127,25 @@ pub fn create_tray(app: &AppHandle) -> bool {
         .tooltip("轻听")
         .menu(&menu)
         .show_menu_on_left_click(false)
-        // 菜单弹出前刷新勾选：两个状态都可能已经被别处改过
+        // 菜单弹出前刷新勾选：两个状态都可能已经被别处改过。
+        // 左键单击 = 显示主窗口（Windows 用户直觉：点托盘图标就把窗口叫回来），
+        // 菜单只在右键弹（show_menu_on_left_click(false)）；双击是两次单击的
+        // 自然叠加，不额外处理。只在按键抬起时响应，避免按下/抬起各触发一次。
         .on_tray_icon_event(|tray, event| {
-            if matches!(event, TrayIconEvent::Click { .. }) {
-                sync_lyric_checked(tray.app_handle());
-                sync_lock_checked(tray.app_handle());
+            match event {
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                } => {
+                    log::debug!("[tray] 左键单击 → 显示主窗口");
+                    show_main_window(tray.app_handle());
+                }
+                TrayIconEvent::Click { .. } => {
+                    sync_lyric_checked(tray.app_handle());
+                    sync_lock_checked(tray.app_handle());
+                }
+                _ => {}
             }
         })
         .on_menu_event(|app, event| match event.id.as_ref() {
