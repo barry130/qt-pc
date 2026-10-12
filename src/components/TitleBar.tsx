@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { ArrowLeft, Settings } from "lucide-react";
-import { Link, useRouter, useNavigate } from "@tanstack/react-router";
+import { Link, useRouter, useNavigate, useSearch } from "@tanstack/react-router";
 import { useTitleBarDrag } from "@/hooks/useFramelessWindow";
 import { WindowControls } from "@/components/WindowControls";
 import { MusicSourceSwitcher } from "@/components/music-source/MusicSourceSwitcher";
@@ -8,6 +8,7 @@ import { MessagesPopover } from "@/components/mine/MessagesPopover";
 import { avatarUrl, displayName, useAuthStore } from "@/stores/auth";
 import { useAppearanceStore } from "@/stores/appearance";
 import { qtresCoverUrl } from "@/lib/lrc";
+import { parseSearchType } from "@/lib/search-params";
 import { cn } from "@/lib/utils";
 
 /**
@@ -21,6 +22,9 @@ export function TitleBar(): React.JSX.Element {
   const [keyword, setKeyword] = useState("");
   const navigate = useNavigate();
   const router = useRouter();
+  // 已经在搜索页时保持当前页签：标题栏的搜索框是全局入口，不该把正停在
+  // 「歌单」页签的用户踢回歌曲列表（type 在 URL 里，见 lib/search-params.ts）
+  const currentType = useSearch({ strict: false }) as { type?: string };
   const session = useAuthStore((s) => s.session);
   const profile = useAuthStore((s) => s.profile);
   // 有背景图时标题栏底色半透明（见 --sidebar-surface），此时去掉 backdrop-blur-sm：
@@ -33,7 +37,10 @@ export function TitleBar(): React.JSX.Element {
   const goSearch = (): void => {
     const kw = keyword.trim();
     if (!kw) return;
-    void navigate({ to: "/search", search: { q: kw } });
+    void navigate({
+      to: "/search",
+      search: { q: kw, type: parseSearchType(currentType.type) },
+    });
   };
 
   return (

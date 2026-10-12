@@ -8,6 +8,7 @@ import {
 import { AppShell } from "@/components/layout/AppShell";
 import { PlaceholderPage } from "@/components/layout/PlaceholderPage";
 import { lazyPage } from "@/lib/lazyPage";
+import { parseSearchType, type SearchType } from "@/lib/search-params";
 
 /**
  * 路由表（DESIGN §5.2）。壳内使用 memory history：Tauri 无地址栏，
@@ -86,8 +87,12 @@ const dailyRoute = createRoute({
 const searchRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/search",
-  validateSearch: (search: Record<string, unknown>): { q: string } => ({
+  // 页签进 URL 是必须的：搜索页不常驻（见 KeepAliveOutlet 头注），从详情页
+  // 返回时组件是重新挂载的，页签留在 state 里会被打回「歌曲」
+  // —— 用户从「歌单」点进去的歌单，返回却看到歌曲列表（见 lib/search-params.ts）
+  validateSearch: (search: Record<string, unknown>): { q: string; type: SearchType } => ({
     q: typeof search.q === "string" ? search.q : "",
+    type: parseSearchType(search.type),
   }),
   component: SearchPage,
 });
