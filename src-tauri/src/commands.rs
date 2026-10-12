@@ -756,6 +756,7 @@ pub async fn cmd_list_shortcuts(
                 .into_iter()
                 .map(
                     |(action, accelerator, enabled)| crate::shortcuts::ShortcutEntry {
+                        conflict: crate::shortcuts::is_conflicted(&accelerator),
                         id: action.id().to_string(),
                         accelerator,
                         enabled,
@@ -799,6 +800,7 @@ pub async fn cmd_save_shortcuts(
         .into_iter()
         .map(
             |(action, accelerator, enabled)| crate::shortcuts::ShortcutEntry {
+                conflict: crate::shortcuts::is_conflicted(&accelerator),
                 id: action.id().to_string(),
                 accelerator,
                 enabled,

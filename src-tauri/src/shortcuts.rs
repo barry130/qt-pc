@@ -60,6 +60,10 @@ pub struct ShortcutEntry {
     pub accelerator: String,
     /// 是否启用
     pub enabled: bool,
+    /// 上一次注册是否失败（被别的程序占用）。
+    /// 只记日志的话用户永远不知道「这个键在我这儿根本没用」——
+    /// 表现是"按了没反应"，会被当成播放器的 bug。设置页据此提示改键。
+    pub conflict: bool,
 }
 
 /// 从 settings 表读自定义快捷键，与默认表合并。
@@ -103,10 +107,25 @@ pub fn save_shortcuts(db: &Database, map: &serde_json::Value) -> Result<Keymap, 
     Ok(load_shortcuts(Some(db)))
 }
 
+/// 注册失败的加速键（被其它程序占用）。`register_shortcuts` 每次全量重注册前
+/// 清空、逐个登记，`list_shortcuts` 读它把「这个键其实没生效」告诉设置页。
+static CONFLICTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// 某加速键当前是否处于「注册失败」状态
+pub fn is_conflicted(accelerator: &str) -> bool {
+    CONFLICTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .any(|a| a == accelerator)
+}
+
 /// 注册全部全局快捷键（只注册 enabled 的项）。
 /// 单个注册失败只记日志（常见于与其它应用冲突），不阻断。
 pub fn register_shortcuts(app: &AppHandle, shortcuts: &Keymap) {
     let gs = app.global_shortcut();
+    // 全量重注册：先清空上一轮的冲突记录，否则改键成功后旧键仍被标红
+    CONFLICTS.lock().unwrap_or_else(|p| p.into_inner()).clear();
     for (action, accelerator, enabled) in shortcuts {
         if !enabled {
             log::info!(
@@ -122,7 +141,14 @@ pub fn register_shortcuts(app: &AppHandle, shortcuts: &Keymap) {
             }
         });
         if let Err(e) = ok {
+            // Windows 上这就是 RegisterHotKey 的 1409（ERROR_HOTKEY_ALREADY_REGISTERED）：
+            // 键被别的程序（输入法、截图工具、QQ 等）抢走了。除了记日志，
+            // 还要登记下来让设置页能提示「该键无效，请改键」。
             log::warn!("[shortcuts] 注册 {accelerator} 失败（可能与其它应用冲突）: {e}");
+            CONFLICTS
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(accelerator.clone());
         }
     }
 }

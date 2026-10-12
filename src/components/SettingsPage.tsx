@@ -2430,6 +2430,13 @@ function ShortcutSection(): React.JSX.Element {
                   按下新的快捷键组合（Esc 取消）…
                 </p>
               )}
+              {/* 注册失败 = 这个键被别的程序占着（Windows 上是 RegisterHotKey 1409）。
+                  不提示的话表现就是"按了没反应"，会被当成播放器的 bug。 */}
+              {e.conflict && listening !== e.id && (
+                <p className="mt-0.5 text-xs text-destructive">
+                  该快捷键已被其它程序占用，当前无效；请点右侧输入框改绑一个组合。
+                </p>
+              )}
             </div>
             <div className="flex shrink-0 items-center gap-2">
               <input

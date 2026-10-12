@@ -277,6 +277,8 @@ export interface ShortcutEntry {
   accelerator: string;
   /** 是否启用 */
   enabled: boolean;
+  /** 上次注册是否被其它程序占用（true = 该键按了不会有反应，需要改键） */
+  conflict: boolean;
 }
 
 /** 当前生效的快捷键表 */
