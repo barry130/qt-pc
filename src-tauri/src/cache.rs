@@ -45,6 +45,10 @@ pub fn prune_audio_cache(dir: &Path, limit_mb: u64, keep: Option<&Path>) -> (u64
     }
     let mut files = match collect_files(dir) {
         Ok(f) => f,
+        // 目录不存在 = 还没缓存过任何音频（`audio` 由 range_reader::open 首次落盘
+        // 时才创建），这是**正常状态**而不是故障：新装 / 清过缓存后每次启动都会
+        // 走到这里，打 WARN 只会稀释真故障。只有权限、IO 这类真错误才告警。
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return (0, 0),
         Err(e) => {
             log::warn!("[cache] 扫描缓存目录失败 {}: {e}", dir.display());
             return (0, 0);

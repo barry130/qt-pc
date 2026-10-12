@@ -253,15 +253,20 @@ pub fn run() {
             // 回填上次的登录会话（token 存 settings 表），没过期才装进客户端
             if let Some(db) = &db {
                 match db.with(|conn| crate::db::store::get_setting(conn, "astral.session")) {
-                    Ok(Some(json)) => match serde_json::from_str::<astral::AuthSession>(&json) {
-                        Ok(session) if session.is_valid() => {
-                            astral.set_session(&session);
-                            log::info!("[astral] 已恢复上次登录会话");
+                    // 登出写的是空串（astral::clear_persisted_session），空值 = 未登录。
+                    // 空串喂给 serde_json 只会得到 "EOF while parsing a value"，
+                    // 每次启动白打一条像故障的 WARN —— 先判空再解析。
+                    Ok(Some(json)) if !json.trim().is_empty() => {
+                        match serde_json::from_str::<astral::AuthSession>(&json) {
+                            Ok(session) if session.is_valid() => {
+                                astral.set_session(&session);
+                                log::info!("[astral] 已恢复上次登录会话");
+                            }
+                            Ok(_) => log::info!("[astral] 上次会话已过期，需要重新登录"),
+                            Err(e) => log::warn!("[astral] 会话解析失败: {e}"),
                         }
-                        Ok(_) => log::info!("[astral] 上次会话已过期，需要重新登录"),
-                        Err(e) => log::warn!("[astral] 会话解析失败: {e}"),
-                    },
-                    Ok(None) => {}
+                    }
+                    Ok(_) => {}
                     Err(e) => log::warn!("[astral] 读取会话失败: {e}"),
                 }
             }

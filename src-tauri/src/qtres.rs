@@ -570,6 +570,18 @@ pub fn handle_qtres<R: tauri::Runtime>(
     });
 }
 
+/// WebView2 按浏览器惯例探测的站点资源路径。它们与封面代理无关
+/// （qtres 只对外提供 `cover/`、`engine/`、`script/`），但会掉进「无法解码
+/// 封面路径」兜底分支，于是每次启动都白打一条 WARN，把真故障淹掉。
+/// 这些路径本来就该 404：直接短路，连日志都不记。
+const ASSET_PROBE_PATHS: &[&str] = &[
+    "/favicon.ico",
+    "/apple-touch-icon.png",
+    "/apple-touch-icon-precomposed.png",
+    "/manifest.json",
+    "/robots.txt",
+];
+
 fn handle_qtres_sync<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     request: Request<Vec<u8>>,
@@ -586,7 +598,13 @@ fn handle_qtres_sync<R: tauri::Runtime>(
         return handle_script_file(app, rest);
     }
     let Some((kind, original_url)) = decode_res_path(&path) else {
-        log::warn!("[qtres] 无法解码封面路径: {path}");
+        // 非 cover/ 前缀：既可能是浏览器惯例探测（见 ASSET_PROBE_PATHS，
+        // 属预期内的 404，静默即可），也可能是前端拼错的地址。
+        // 后者才是要查的现场，所以留 debug 一条，别再让探测噪声占 WARN。
+        if ASSET_PROBE_PATHS.contains(&path.as_str()) {
+            return not_found();
+        }
+        log::debug!("[qtres] 非封面路径，返回 404: {path}");
         return placeholder();
     };
     if !host_allowed(&original_url) {
