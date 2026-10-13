@@ -273,8 +273,21 @@ export function useAnySourceSupports(feature: SourceFeature): boolean {
 
 /** ---------- 音质/排序门控（v5 契约） ---------- */
 
-/** 音质档位的高低序（数组序 = 高到低；与包侧 QUALITIES 的声明序一致） */
-const QUALITY_RANKS: string[] = ["flac", "320", "128"];
+/**
+ * 音质档位的高低序（**高→低**），从注册表的 `qualities` 派生。
+ *
+ * 包侧 `QUALITIES` 按「低→高」声明（qt-sources/src/registry.ts 明确写了数组序
+ * = 从低到高，因为 play-guard 的 qualityLadder() 直接反转它），所以这里取反。
+ *
+ * 为什么不再硬编码：原实现写死 `["flac","320","128"]`，包一加新档位就与真实
+ * 高低序脱节。2026-10 加 `flac24bit` 后实测后果：`clampQualityForPlatform` 里
+ * `QUALITY_RANKS.indexOf("flac24bit") = -1` ⇒ 走 `return declared[0]`，
+ * **任何**平台的下载都从「母带 24bit」掉到「标准 128k」（下载按钮调用它，
+ * 播放路径不经过，故只有下载坏）。
+ */
+function qualityRanksOf(qualities: RegistryQuality[]): string[] {
+  return qualities.map((q) => q.id).reverse();
+}
 
 /**
  * 某源可用的音质档位（v5 契约：包侧 qualities 子集过滤全局档位）。
@@ -330,13 +343,17 @@ export function clampQualityForPlatform(
     platform == null ? undefined : state.sources.find((item) => item.id === platform)?.qualities;
   if (declared === undefined || declared.length === 0) return wanted;
   if (declared.includes(wanted)) return wanted;
-  const wantedRank = QUALITY_RANKS.indexOf(wanted);
+  const ranks = qualityRanksOf(state.qualities);
+  // 档位序为空（注册表还没装好/旧包没给）＝对高低一无所知，此时不动请求值：
+  // 与「未声明就不动」同一保守口径，宁可原样发出去让包侧按线路能力兜底。
+  if (ranks.length === 0) return wanted;
+  const wantedRank = ranks.indexOf(wanted);
   if (wantedRank < 0) return declared[0]!;
   // 向下降：可用档里取 ≤ 想要排名的最高一档
   let best: string | null = null;
   let bestRank = -1;
   for (const q of declared) {
-    const rank = QUALITY_RANKS.indexOf(q);
+    const rank = ranks.indexOf(q);
     if (rank < 0) continue;
     if (rank <= wantedRank && rank > bestRank) {
       best = q;
@@ -346,9 +363,9 @@ export function clampQualityForPlatform(
   if (best !== null) return best;
   // 想要的档位以下没有可用档 → 取最接近的更高一档
   let up: string | null = null;
-  let upRank = QUALITY_RANKS.length;
+  let upRank = ranks.length;
   for (const q of declared) {
-    const rank = QUALITY_RANKS.indexOf(q);
+    const rank = ranks.indexOf(q);
     if (rank < 0) continue;
     if (rank < upRank) {
       up = q;
