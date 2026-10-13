@@ -178,7 +178,7 @@ function DesktopLyricSection(): React.JSX.Element {
   }
 
   return (
-    <div className="max-w-xl divide-y divide-border pb-8">
+    <div className="max-w-4xl divide-y divide-border pb-8">
       <SettingRow title="显示桌面歌词" description="在桌面置顶显示逐行歌词，鼠标悬停歌词上方会出现工具条">
         <Switch
           checked={visible}
@@ -494,7 +494,7 @@ function AppearanceSection(): React.JSX.Element {
   };
 
   return (
-    <div className="max-w-[576px]">
+    <div className="max-w-4xl">
       {/* 写库失败必须看得见：以前是「界面已生效、重启却回滚」而用户无从察觉（P2-8）。
           role="alert" 让读屏器也念出来（P2-10）。 */}
       {saveError !== null && (
@@ -769,7 +769,7 @@ function PlaybackSection(): React.JSX.Element {
   };
 
   return (
-    <div className="max-w-xl divide-y divide-border">
+    <div className="max-w-4xl divide-y divide-border">
       <SettingRow
         title="音频输出设备"
         description="连蓝牙耳机后自动无声？选「跟随系统默认」即可插拔自动切换；固定设备适合挂多套输出。切换时当前曲目从原进度无缝续播。"
@@ -850,7 +850,7 @@ function PlayerBarSection(): React.JSX.Element {
   const full = countedVisible >= PLAYER_BAR_MAX_VISIBLE;
 
   return (
-    <div className="max-w-xl">
+    <div className="max-w-4xl">
       <p className="pb-2 pt-1 text-xs text-muted-foreground">
         播放条上除「上一首 / 播放 / 下一首」以外的按钮都能自行开关；关掉后剩下的按钮按数量自动
         分到播放键两侧，中间的播放键保持居中。默认只开收藏 / 播放模式 / 桌面歌词 / 下载 / 音质 /
@@ -905,7 +905,7 @@ function SoundSection(): React.JSX.Element {
 
   if (!fx) {
     return (
-      <div className="max-w-xl">
+      <div className="max-w-4xl">
         {error ? (
           <p className="py-4 text-xs text-destructive">{error}</p>
         ) : (
@@ -921,7 +921,7 @@ function SoundSection(): React.JSX.Element {
   );
 
   return (
-    <div className="max-w-xl divide-y divide-border">
+    <div className="max-w-4xl divide-y divide-border">
       <SettingRow
         title="响度归一化"
         description="不同音源的响度标准不一致，切歌忽大忽小？开启后按曲目实际响度自动调节增益（±12dB 内），音量更平稳。"
@@ -1384,7 +1384,7 @@ function GeneralSection(): React.JSX.Element {
   };
 
   return (
-    <div className="max-w-xl divide-y divide-border">
+    <div className="max-w-4xl divide-y divide-border">
       <SettingRow title="开机自启" description="登录系统后自动启动轻听（收起在托盘）">
         {autostart === null ? (
           <span className="text-xs text-muted-foreground">…</span>
@@ -1867,7 +1867,7 @@ function SourcePackageSection(): React.JSX.Element {
     : "未安装（在线播放不可用）";
 
   return (
-    <div className="max-w-xl divide-y divide-border">
+    <div className="max-w-4xl divide-y divide-border">
       <SettingRow
         title="数据包"
         description="搜索/歌单/歌词/封面等数据源。不随应用分发，可从链接或本地文件安装。"
@@ -2262,7 +2262,7 @@ function AboutSection(): React.JSX.Element {
   };
 
   return (
-    <div className="max-w-xl divide-y divide-border">
+    <div className="max-w-4xl divide-y divide-border">
       <SettingRow title="当前版本" description="轻听 PC 版">
         <span className="font-mono text-xs text-muted-foreground">
           {version ? `${version.versionName} (versionCode ${version.versionCode})` : "…"}
@@ -2438,7 +2438,7 @@ function ShortcutSection(): React.JSX.Element {
   };
 
   return (
-    <div className="max-w-xl divide-y divide-border">
+    <div className="max-w-4xl divide-y divide-border">
       {entries.length === 0 && !error && (
         <p className="py-4 text-sm text-muted-foreground">加载中…</p>
       )}
@@ -2655,7 +2655,7 @@ function DownloadSection(): React.JSX.Element {
   };
 
   return (
-    <div className="max-w-xl divide-y divide-border">
+    <div className="max-w-4xl divide-y divide-border">
       <SettingRow
         title="下载保存位置"
         description="默认为安装目录下的 Download 文件夹；重名歌曲自动加序号，不会互相覆盖。"
@@ -2803,7 +2803,7 @@ function DislikeSection(): React.JSX.Element {
   };
 
   return (
-    <div className="max-w-xl divide-y divide-border">
+    <div className="max-w-4xl divide-y divide-border">
       <SettingRow
         title="屏蔽规则"
         description="屏蔽后，这些歌 / 这个人的歌不会再出现在列表与自动播放里（手动点播仍可播放）。"

@@ -93,7 +93,7 @@ export function TitleBar(): React.JSX.Element {
         <MessagesPopover />
         <Link
           to="/settings/$section"
-          params={{ section: "appearance" }}
+          params={{ section: "general" }}
           title="设置"
           aria-label="设置"
           onMouseDown={(e) => e.stopPropagation()}

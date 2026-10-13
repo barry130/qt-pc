@@ -562,7 +562,7 @@ Windows 平台注意事项（原文未覆盖，均为实测坑点）：
 | `/feedback` | 意见反馈 | 提交、我的、公开反馈 |
 | `/profile` | 个人中心 | 资料、签到、退出登录 |
 | `/login` | 登录 / 注册 | 含邮箱验证码、忘记密码（`changePass`） |
-| `/settings/:section` | 设置 | `appearance \| audio \| lyric \| library \| download \| shortcut \| network \| storage \| update \| about` |
+| `/settings/:section` | 设置 | `general \| appearance \| desktop-lyric \| playback \| player-bar \| sound \| download \| dislike \| source-package \| shortcut \| about`（标签顺序即 `SECTION_TITLES` 的键顺序，`general` 在最前） |
 | `/onboarding` | 首次启动引导 | 对齐 REQUIREMENTS §5.1，原文缺失 |
 | `/lyrics` | 桌面歌词 | **仅供歌词窗口加载**，不在主窗口导航中出现 |
 
@@ -571,6 +571,7 @@ Windows 平台注意事项（原文未覆盖，均为实测坑点）：
 1. 所有涉及音源内容的详情页路由都携带 `platform`，与 §6.6 数据模型的 `platform` 字段一一对应。
 2. 搜索关键字走 URL query，保证前进 / 后退可复现结果。
 3. `/playing` 与 `/lyrics` 共用歌词渲染组件，但状态来源不同（见 §10.2）。
+4. 设置页的标签顺序由 `SettingsPage.tsx` 的 `SECTION_TITLES` 键顺序决定，`general` 在首位；标题栏设置入口固定跳 `general`。各分节内容用 `max-w-4xl`（896px）而非旧的 `max-w-xl`（576px）：1200px 默认窗口下内容区可用约 930px，576px 会只占左半屏、右侧大片留白。
 
 ## 5.3 标题栏
 
@@ -581,7 +582,7 @@ Windows 平台注意事项（原文未覆盖，均为实测坑点）：
 3. 全局搜索框
 4. 返回 / 前进按钮（可选）
 5. 主页按钮
-6. 设置入口
+6. 设置入口（跳 `/settings/general`，即「通用」；不是「外观」）
 7. 最小化按钮
 8. 最大化 / 还原按钮
 9. 关闭按钮
