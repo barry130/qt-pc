@@ -267,6 +267,11 @@ export interface PlaybackState {
   track: Track | null;
   /** 当前音频输出设备名（设置页显示用） */
   outputDevice: string;
+  /** 本次实际播放码率（kbps，按流的真实字节数 ÷ 时长算）；null = 没测出来（流式 /
+   *  无 Content-Length / 本地文件取不到），此时不显示码率而不是显示 0 */
+  bitrateKbps: number | null;
+  /** 取链侧按实测码率重贴的档位（只降不升）；空串 = 没测出来，请求档位即实际档位 */
+  actualQuality: string;
 }
 
 /** position-changed 事件负载 */

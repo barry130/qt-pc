@@ -62,6 +62,8 @@ function snapshot(playUrl: string | null): PlaybackState {
     sleepTimerMs: null,
     track,
     outputDevice: "",
+    bitrateKbps: null,
+    actualQuality: "",
     sleepAfterTrack: false,
     speed: 1,
   };

@@ -68,6 +68,12 @@ pub enum AudioCmd {
         /// 当前实际播放地址（在线源才有）。换源兜底后它指向目标源，
         /// 歌词按它查换源记录换源取词（DESIGN 换源一致性）
         play_url: Option<String>,
+        /// 取链侧按实测码率重贴的档位（只降不升）；空串 = 没测出来，请求即实际
+        actual_quality: String,
+        /// 取链侧 Range 探测出的文件总字节数（None = 没测出来）。挂载时优先用它，
+        /// 缺了才回落到已挂载流自己的 Content-Length —— 分块传输（无长度）的流
+        /// 只有取链侧这份探测结果，丢了就等于播放条永远不显示码率。
+        size_bytes: Option<u64>,
         /// 加载代次：与引擎当前代次不一致说明等待期间用户又切了歌，结果丢弃
         gen: u64,
     },
@@ -972,6 +978,8 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             is_local,
             url_fetched_at,
             play_url,
+            actual_quality,
+            size_bytes,
             gen,
         } => {
             // 过期结果丢弃：等待取址/构建期间用户又切了歌，这条是旧歌的
@@ -993,6 +1001,8 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                     is_local,
                     url_fetched_at,
                     play_url,
+                    actual_quality,
+                    size_bytes,
                 );
             }
         }
@@ -1059,6 +1069,8 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                 st.buffered_ms = 0;
                 st.track_id = None;
                 st.track = None;
+                st.bitrate_kbps = None;
+                st.actual_quality = String::new();
             });
             inner.persist_state();
         }
@@ -1577,6 +1589,10 @@ fn load_queue_track(inner: &mut EngineInner, track: Track, autoplay: bool, start
         st.duration_ms = 0;
         st.buffered_ms = 0;
         st.is_local = false;
+        // 上一首的实测码率/档位不能挂在新歌头上：Loading 期显示旧值等于撒谎。
+        // 新值要等流真正挂上（mount_decoder）才算得出来。
+        st.bitrate_kbps = None;
+        st.actual_quality = String::new();
     });
     spawn_resolve_and_load(inner, track, autoplay, start_ms, gen);
 }
@@ -2081,6 +2097,10 @@ impl LoadJob {
                 let url = hit.url;
                 let referer = hit.referer;
                 let fetched_at = hit.fetched_at;
+                // 取链侧已经用 Range 探到了文件真实长度，并按实测码率重贴过档位；
+                // 这两条是播放条显示"实际码率/实际音质"的唯一来源，别在这里丢掉。
+                let real_quality = hit.actual_quality;
+                let size_bytes = hit.size;
                 log::debug!(
                     "[queue] resolve ok track={} url_host={}",
                     self.track.id,
@@ -2098,9 +2118,14 @@ impl LoadJob {
                     referer,
                 };
                 match self.try_build(&source).await {
-                    Ok(built) => {
-                        self.dispatch_ready(built, false, Some(fetched_at), Some(play_url))
-                    }
+                    Ok(built) => self.dispatch_ready(
+                        built,
+                        false,
+                        Some(fetched_at),
+                        Some(play_url),
+                        real_quality,
+                        size_bytes,
+                    ),
                     Err(first_err) => {
                         // 文件本身就超出单曲缓冲上限：这不是地址问题 —— 重取地址、
                         // 换线路都改变不了文件长度，白跑一轮还会把这首的地址缓存
@@ -2138,6 +2163,8 @@ impl LoadJob {
                                 let url2 = hit2.url;
                                 let referer2 = hit2.referer;
                                 let fetched_at2 = hit2.fetched_at;
+                                let real_quality2 = hit2.actual_quality;
+                                let size_bytes2 = hit2.size;
                                 let source2 = PlaySource::Online {
                                     url: url2.clone(),
                                     fetchedAt: fetched_at2,
@@ -2149,6 +2176,8 @@ impl LoadJob {
                                         false,
                                         Some(fetched_at2),
                                         Some(url2),
+                                        real_quality2,
+                                        size_bytes2,
                                     ),
                                     Err(e2) => self.dispatch_load_failed(
                                         "load",
@@ -2199,8 +2228,21 @@ impl LoadJob {
 
     /// 构建并回发（本地/离线文件路径，不重试）。
     async fn build_and_dispatch(self, source: PlaySource, is_local: bool, fetched_at: Option<u64>) {
+        // 本地文件 / 已下载文件的体积直接取文件长度（在线流由取链侧的探测结果带回来），
+        // 播放条据此算实际码率 —— 本地无损和在线 128k 的差别是靠这个数看出来的。
+        let size_bytes = match &source {
+            PlaySource::Local { path } => std::fs::metadata(path).ok().map(|m| m.len()),
+            PlaySource::Online { .. } => None,
+        };
         match self.try_build(&source).await {
-            Ok(built) => self.dispatch_ready(built, is_local, fetched_at, None),
+            Ok(built) => self.dispatch_ready(
+                built,
+                is_local,
+                fetched_at,
+                None,
+                String::new(),
+                size_bytes,
+            ),
             // 本地文件读不出来是内容问题，不算环境问题
             Err(e) => self.dispatch_load_failed("load", &e, false),
         }
@@ -2213,6 +2255,8 @@ impl LoadJob {
         is_local: bool,
         fetched_at: Option<u64>,
         play_url: Option<String>,
+        actual_quality: String,
+        size_bytes: Option<u64>,
     ) {
         let (decoder, shared, duration_ms) = built;
         let _ = self.tx.send(AudioCmd::LoadReady {
@@ -2229,6 +2273,8 @@ impl LoadJob {
             is_local,
             url_fetched_at: fetched_at,
             play_url,
+            actual_quality,
+            size_bytes,
             gen: self.gen,
         });
         record_play_start(self.history_db.clone(), self.track.clone());
@@ -2330,6 +2376,8 @@ fn mount_decoder(
     is_local: bool,
     url_fetched_at: Option<u64>,
     play_url: Option<String>,
+    actual_quality: String,
+    probed_size: Option<u64>,
 ) {
     inner.failed_tracks.remove(&track.id);
     // 成功挂载 = 这首能播：重开自动切歌熔断（连续失败计数一并清零）
@@ -2373,6 +2421,12 @@ fn mount_decoder(
     } else {
         inner.sink.pause();
     }
+    // 码率必须在 shared 被移进 inner 之前算：优先用取链侧 Range 探测到的长度
+    // （分块传输的流没有 Content-Length，只有探测结果这一份），缺了才回落到
+    // 已挂载流自己读到的长度。duration_ms 用解码器报的时长 —— 它才是真正在
+    // 播的那条流的时长，元数据时长在某些平台上不可靠。
+    let size_bytes = probed_size.or_else(|| shared.as_ref().and_then(|s| s.total_len()));
+    let bitrate_kbps = measured_bitrate_kbps(size_bytes, duration_ms);
     inner.current_shared = shared;
 
     inner.mutate(|st| {
@@ -2389,6 +2443,8 @@ fn mount_decoder(
         st.is_local = is_local;
         st.url_fetched_at = url_fetched_at;
         st.play_url = play_url;
+        st.bitrate_kbps = bitrate_kbps;
+        st.actual_quality = actual_quality;
     });
     inner.tick_anchor = None;
     emit_position_tick(inner);
@@ -2426,6 +2482,26 @@ fn meta_duration_ms(track: &Track) -> u64 {
         0
     } else {
         meta
+    }
+}
+
+/// 实测码率（kbps）= 总字节数 × 8 ÷ 时长。任一输入缺失/为 0 一律返回 None：
+/// 显示 "0 kbps" 会被读成"码率极低"，那是假消息；不显示才是诚实的。
+///
+/// 这里的口径与取链侧 `measured_kbps`（qt-sources 的 play-guard）一致 ——
+/// 同一份数据在两处算出的档位必须一样，否则播放条和取链日志会互相矛盾。
+fn measured_bitrate_kbps(size_bytes: Option<u64>, duration_ms: u64) -> Option<u32> {
+    let size = size_bytes?;
+    if size == 0 || duration_ms == 0 {
+        return None;
+    }
+    let kbps = ((size as f64 * 8.0) / (duration_ms as f64 / 1000.0) / 1000.0).round() as u32;
+    // 四舍五入到 0 的只可能是垃圾数据（几个字节配上极长时长）；显示 "0 kbps"
+    // 会被读成"码率极低"，与"测不出来"是两个完全不同的结论，一律按测不出处理。
+    if kbps == 0 {
+        None
+    } else {
+        Some(kbps)
     }
 }
 
@@ -2554,6 +2630,32 @@ mod duration_tests {
     fn metadata_duration_keeps_long_tracks() {
         // 3 小时的现场集：仍在合理范围内，保留
         assert_eq!(meta_duration_ms(&track_with_duration(10_800.0)), 10_800_000);
+    }
+}
+
+#[cfg(test)]
+mod bitrate_tests {
+    use super::measured_bitrate_kbps;
+
+    /// 320k 的曲子：4 分钟 ≈ 9.6MB → 320kbps
+    #[test]
+    fn bitrate_from_size_and_duration() {
+        assert_eq!(measured_bitrate_kbps(Some(9_600_000), 240_000), Some(320));
+    }
+
+    #[test]
+    fn bitrate_flac_is_higher_than_lossy() {
+        let flac = measured_bitrate_kbps(Some(30_000_000), 240_000).unwrap();
+        let k320 = measured_bitrate_kbps(Some(9_600_000), 240_000).unwrap();
+        assert!(flac > k320, "无损实测码率应高于 320k: {flac} vs {k320}");
+    }
+
+    /// 测不出来就返回 None —— 前端整行不渲染，绝不让 0 冒充"码率极低"
+    #[test]
+    fn bitrate_is_none_when_unknown() {
+        assert_eq!(measured_bitrate_kbps(None, 240_000), None);
+        assert_eq!(measured_bitrate_kbps(Some(0), 240_000), None);
+        assert_eq!(measured_bitrate_kbps(Some(9_600_000), 0), None);
     }
 }
 

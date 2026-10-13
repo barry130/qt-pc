@@ -65,6 +65,16 @@ pub struct PlaybackStateSnapshot {
     pub track: Option<Track>,
     /// 当前音频输出设备名（设置页显示用）
     pub output_device: String,
+    /// 实际播放码率（kbps）：按**真正挂载的那条流**的总字节数 ÷ 时长换算。
+    ///
+    /// None = 测不出来（本地文件 / 服务端没给长度 / 时长未知），前端此时不显示
+    /// 码率 —— 显示 0 会被读成"码率极低"，那是假消息。
+    pub bitrate_kbps: Option<u32>,
+    /// 实测后重贴的档位（取链侧按实测码率**只降不升**地重新贴档）。
+    ///
+    /// 空串 = 这次没测出来、没重贴，请求的 `quality` 就是实际档位。非空时它就是
+    /// 实际在播的档位，播放条直接显示这个档而不是请求档。
+    pub actual_quality: String,
 }
 
 impl Default for PlaybackStateSnapshot {
@@ -91,6 +101,8 @@ impl Default for PlaybackStateSnapshot {
             speed: 1.0,
             track: None,
             output_device: String::new(),
+            bitrate_kbps: None,
+            actual_quality: String::new(),
         }
     }
 }

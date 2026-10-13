@@ -1156,14 +1156,10 @@ pub enum PlaybackStatus { Stopped, Loading, Buffering, Playing, Paused, Error }
 #[serde(rename_all = "camelCase")]
 pub enum PlayMode { Sequence, ListLoop, OneLoop, Random }
 
-/// 序列化值直接对齐前端与移动端使用的 "128" / "320" / "flac"，
-/// 避免出现两套音质命名（原文 Standard/High/Lossless 与 §6.7 的 '128'|'320'|'flac' 不一致）
-#[derive(serde::Serialize, serde::Deserialize, Clone, Copy)]
-pub enum Quality {
-    #[serde(rename = "128")]  Standard,
-    #[serde(rename = "320")]  High,
-    #[serde(rename = "flac")] Lossless,
-}
+/// 音质档位直接复用 provider 的类型：档位清单由音源包声明
+/// （`128` / `320` / `flac` / `flac24bit` …），宿主只透传字符串，
+/// 不再有第二份枚举与 `From` 转换。
+pub use crate::provider::types::Quality;
 
 #[derive(serde::Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -1185,10 +1181,27 @@ pub struct PlaybackState {
     /// 是否本地文件（决定是否走 10 分钟失效与缓冲逻辑）
     pub is_local: bool,
     pub url_fetched_at: Option<u64>,
+    /// 当前实际播放地址（在线曲目才有；播放条调试面板展示用）
+    pub play_url: Option<String>,
     /// 最近一次错误，供前端展示「该歌曲暂时无法播放」
     pub error: Option<String>,
     /// 睡眠定时剩余毫秒，None 表示未启用
     pub sleep_timer_ms: Option<u64>,
+    /// true = 播完当前曲目后停止（无倒计时语义）
+    pub sleep_after_track: bool,
+    /// 播放倍速（0.5 ~ 2.0，1.0 = 原速）
+    pub speed: f32,
+    /// 当前曲目，播放条直接渲染，避免前端二次查询
+    pub track: Option<Track>,
+    /// 当前音频输出设备名（设置页显示用）
+    pub output_device: String,
+    /// 实际播放码率（kbps）：按**真正挂载的那条流**的总字节数 ÷ 时长换算。
+    /// None = 测不出来（本地文件 / 服务端没给长度 / 时长未知），前端此时不显示
+    /// 码率——显示 0 会被读成"码率极低"，那是假消息。
+    pub bitrate_kbps: Option<u32>,
+    /// 实测后重贴的档位（取链侧按实测码率**只降不升**地重新贴档）。
+    /// 空串 = 这次没测出来、没重贴，请求的 `quality` 就是实际档位。
+    pub actual_quality: String,
 }
 ```
 

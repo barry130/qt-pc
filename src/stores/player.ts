@@ -130,6 +130,8 @@ const initialSnapshot: PlaybackState = {
   speed: 1,
   track: null,
   outputDevice: "",
+  bitrateKbps: null,
+  actualQuality: "",
 };
 
 export const usePlayerStore = create<PlayerStore>((set, get) => ({

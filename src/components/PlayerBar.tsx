@@ -66,6 +66,19 @@ import {
 } from "@/services/ipc";
 
 /**
+ * 按实测码率给本地/离线文件贴一个**粗档**标签。
+ *
+ * 本地文件没有「请求档位」这回事（文件是什么码率就是什么码率），所以不能拿
+ * 默认音质冒充；这里只按实测码率分三档。阈值口径跟数据包侧
+ * `snapQualityToMeasured` 的档位下限一致：无损 700k、320 档 240k（0.75×）。
+ */
+function localQualityShort(kbps: number): string {
+  if (kbps >= 700) return "无损";
+  if (kbps >= 240) return "高品";
+  return "标准";
+}
+
+/**
  * 播放条（DESIGN §5.5）：
  * 封面 / 歌名歌手 / 上一首 / 播放 / 下一首 / 模式 / 队列 / 进度条 / 音量
  * 进度拖动期间暂停插值（isDraggingProgress），松手即 seek */
@@ -102,6 +115,27 @@ export function PlayerBar(): React.JSX.Element {
   // qt_admin 专属：播放地址调试入口只向内部账号展示
   const profile = useAuthStore((s) => s.profile);
   const showPlayUrl = isAdmin(profile);
+
+  // 歌手下面那行的「实际码率 / 实际音质」（REQUIREMENTS：显示真正在播的东西）。
+  // 档位短标与音质菜单共用同一份注册表清单，菜单里叫什么这里就叫什么。
+  const qualities = qualityOptionsFromRegistry(
+    useSourceQualities(track?.platform ?? null),
+  );
+  const bitrateKbps = state?.bitrateKbps ?? null;
+  const qualityShort = useMemo(() => {
+    if (!track || bitrateKbps === null) return "";
+    // 取链侧已按实测码率重标过档位（只降不升）→ 那就是实际档位，直接采信
+    const measured = state?.actualQuality ?? "";
+    if (measured.length > 0) {
+      return qualities.find((o) => o.value === measured)?.short ?? measured;
+    }
+    // 本地/离线文件：压根没有「请求档」这回事（文件是什么码率就是什么档），
+    // 只能按实测码率贴粗档 —— 拿默认音质冒充本地文件档位是虚标。
+    if (state?.isLocal) return localQualityShort(bitrateKbps);
+    // 在线且包侧没重标：空串 = 这次没测出来 ⇒ 请求档就是实际档
+    const requested = state?.quality ?? "";
+    return qualities.find((o) => o.value === requested)?.short ?? requested;
+  }, [track, bitrateKbps, state?.actualQuality, state?.isLocal, state?.quality, qualities]);
 
   // 播放条按钮开关（设置 → 播放条）：只存「展示中的按钮 id」（见 lib/player-bar.ts），
   // 名额上限（非音量 ≤10）在 store.toggle 里把守；按钮行为一律不变
@@ -384,6 +418,13 @@ export function PlayerBar(): React.JSX.Element {
           <div className="truncate text-xs text-muted-foreground">
             {track ? track.singer : "未知"}
           </div>
+          {/* 实际播的码率 + 实际音质（不是"请求了什么"，是"真在播什么"）。
+              任一测不出来就整行不渲染：宁可空着，也不写个 0 kbps 或请求档冒充。 */}
+          {track && bitrateKbps !== null ? (
+            <div className="truncate text-[11px] tabular-nums text-muted-foreground/80">
+              {bitrateKbps} kbps{qualityShort ? ` · ${qualityShort}` : ""}
+            </div>
+          ) : null}
         </div>
       </button>
 
