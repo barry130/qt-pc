@@ -96,13 +96,17 @@ fn is_public_ip(ip: IpAddr) -> bool {
     }
 }
 
-/// 是否属于本项目自有域名（`canace.cn` 及其子域）。
+/// 是否属于本项目自有域名。
 ///
-/// 用 `== 域` 或 `ends_with(".域")`，**不能**只写 `ends_with(域)`：
-/// 那样 `canace.cn.evil.com` 也会被判为自家域名。
+/// 域名后缀**不在代码里**：自有域名属于私有信息，仓库是公开的，取值来自
+/// [`crate::runtime_config`]（运行时文件 > `QT_OWN_DOMAINS` 环境变量 > 编译期
+/// 私有常量）。匹配规则是 `== 后缀` 或 `ends_with(".后缀")`，**不能**只写
+/// `ends_with(后缀)`：那样 `example.com.evil.com` 也会被判为自家域名。
+///
+/// 后缀列表为空（缺私有配置）⇒ **谁都匹配不上**：明文 http 下载一律被拒。
+/// 这是"收紧"方向，缺配置时正是想要的行为。
 pub fn is_own_host(host: &str) -> bool {
-    let h = host.trim_end_matches('.').to_ascii_lowercase();
-    h == "canace.cn" || h.ends_with(".canace.cn")
+    crate::runtime_config::host_is_own(host)
 }
 
 /// 音源脚本网络出口的准入：必须是公网 http(s) 地址。
@@ -138,10 +142,9 @@ pub fn ensure_trusted_download_url(raw: &str) -> Result<Url, String> {
 ///
 /// 明文 http 只在两种情况下放行：
 /// - 后端**提供了 MD5**（下载后会校验，替换内容会被发现）；
-/// - 目标是我们自己的更新 CDN（`*.canace.cn`）。
+/// - 目标是我们自己的更新 CDN（[`is_own_host`]，后缀见私有配置）。
 ///
-/// 之所以不一律要求 https：当前发布包的下载地址就是
-/// `http://qt.music.canace.cn/...`（该 CDN 尚未启用 TLS，实测 https 握手失败），
+/// 之所以不一律要求 https：自有更新 CDN 可能尚未启用 TLS（实测 https 握手失败），
 /// 一律强制会直接打断更新。等后端为每个 release 填上 md5/fileSize 后，
 /// 就可以把这里的规则收紧成"必须 https 且有哈希"。
 pub fn ensure_installer_url(raw: &str, has_hash: bool) -> Result<Url, String> {
@@ -155,6 +158,21 @@ pub fn ensure_installer_url(raw: &str, has_hash: bool) -> Result<Url, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试用自有域名（**合成名，不是真实域名**）。
+    ///
+    /// 真实自有域名绝不写进仓库（公开仓库规则，见 `runtime_config` 模块文档），
+    /// 所以这里用 `.example` 保留域，并通过
+    /// [`crate::runtime_config::set_own_domains_for_test`] 显式钉住列表 ——
+    /// **不能**依赖开发机上恰好有 `app.config.local.json`，那会让测试时灵时不灵。
+    const OWN: &[&str] = &["example.com", "cdn.example.com"];
+    /// 合成名里"既不是自有域名、也长得像"的那些，用来验后缀陷阱
+    const SUFFIX_TRAP: &str = "example.com.evil.com";
+
+    /// 把自有域名列表钉到测试固定值
+    fn setup() {
+        crate::runtime_config::set_own_domains_for_test(OWN);
+    }
 
     #[test]
     fn rejects_non_http_schemes() {
@@ -201,8 +219,7 @@ mod tests {
         }
         for host in [
             "example.com",
-            "astral.canace.cn",
-            "qt.music.canace.cn",
+            "cdn.example.com",
             "112.45.27.155",
             "2001:4860:4860::8888",
         ] {
@@ -212,17 +229,35 @@ mod tests {
 
     #[test]
     fn own_host_check_is_not_a_suffix_trap() {
-        assert!(is_own_host("canace.cn"));
-        assert!(is_own_host("qt.music.canace.cn"));
-        assert!(!is_own_host("canace.cn.evil.com"));
-        assert!(!is_own_host("evilcanace.cn"));
+        setup();
+        assert!(is_own_host("example.com"));
+        assert!(is_own_host("a.b.example.com"));
+        // 后缀陷阱：把自有后缀当"字符串结尾"来比，这两个都会被误判为自家域名
+        assert!(!is_own_host(SUFFIX_TRAP));
+        assert!(!is_own_host("evilexample.com"));
+    }
+
+    /// 没有配置自有域名时（列表为空）谁都匹配不上 —— 收紧，不是放松
+    ///
+    /// 这是 `is_own_host` 里**真正决定放行与否**的那条分支，所以要在这里断言，
+    /// 不能只在 `runtime_config` 里测一个同义的 helper。
+    #[test]
+    fn empty_own_domains_accepts_nothing() {
+        crate::runtime_config::set_own_domains_for_test(&[]);
+        assert!(!is_own_host("example.com"));
+        assert!(!is_own_host("cdn.example.com"));
+        // 空列表下，明文 + 无哈希的下载必须被拒（这正是此前靠自有 CDN 放行的场景）
+        assert!(ensure_installer_url("http://cdn.example.com/setup.exe", false).is_err());
+        // 但后端给了哈希就仍放行（与自有域名无关）
+        assert!(ensure_installer_url("http://cdn.example.com/setup.exe", true).is_ok());
     }
 
     #[test]
     fn installer_url_policy() {
-        // 自有 CDN 的明文地址（当前真实发布形态）必须放行，否则更新直接坏掉
+        setup();
+        // 自有 CDN 的明文地址必须放行，否则更新直接坏掉
         assert!(ensure_installer_url(
-            "http://qt.music.canace.cn/astral/x/v1/QuietMusic_1.0.8_x64-setup.exe",
+            "http://cdn.example.com/astral/x/v1/QuietMusic_1.0.8_x64-setup.exe",
             false
         )
         .is_ok());
@@ -233,9 +268,9 @@ mod tests {
         // 明文 + 非自有域名 + 无哈希 → 拒绝
         assert!(ensure_installer_url("http://evil.com/setup.exe", false).is_err());
         // 明文 + 非自有域名，但后端给了哈希 → 放行（下载后会校验）
-        assert!(ensure_installer_url("http://cdn.example.com/setup.exe", true).is_ok());
-        // 后缀陷阱：canace.cn.evil.com 不是自有域名
-        assert!(ensure_installer_url("http://canace.cn.evil.com/setup.exe", false).is_err());
+        assert!(ensure_installer_url("http://mirror.qtcdn-test.example/setup.exe", true).is_ok());
+        // 后缀陷阱：example.com.evil.com 不是自有域名
+        assert!(ensure_installer_url(&format!("http://{SUFFIX_TRAP}/setup.exe"), false).is_err());
         // 内网一律拒绝，无论有没有哈希
         assert!(ensure_installer_url("http://127.0.0.1/setup.exe", true).is_err());
         assert!(ensure_installer_url("http://192.168.1.9/setup.exe", true).is_err());

@@ -17,8 +17,12 @@ pub mod net_guard;
 pub mod pack_safety;
 pub mod pack_signature;
 pub mod playurl_bridge;
+/// 私有配置的编译期常量（由 scripts/sync-config.mjs 生成；缺失时 build.rs 补空壳）
+pub mod private_config;
 pub mod provider;
 pub mod qtres;
+/// 运行期私有配置（自有域名 / 生产后端 / 官网地址，启动时按顺序找本地文件）
+pub mod runtime_config;
 pub mod shortcuts;
 pub mod smtc;
 pub mod source_bundle;
@@ -246,7 +250,18 @@ pub fn run() {
             // 托盘 + 全局快捷键（§14.1 / §14.2；自定义快捷键从 settings 表读）
             let keymap = shortcuts::load_shortcuts(db.as_deref());
 
-            let astral = Arc::new(astral::AstralClient::new(astral::DEFAULT_BASE_URL));
+            // 私有配置（自有域名 / 生产后端 / 官网）的来源：运维排查"改了地址怎么没生效"
+            // 时，第一件要知道的就是这次运行到底读没读到文件、读到的是哪一个。
+            // 没读到不算故障（公开仓库形态本来就该没有），所以是 info 不是 warn。
+            match runtime_config::source_path() {
+                Some(p) => log::info!("[config] 私有配置来源 {}", p.display()),
+                None => log::info!(
+                    "[config] 未找到 {}，编译期私有常量生效（自有域名列表为空则明文下载一律被拒）",
+                    runtime_config::FILE_NAME
+                ),
+            }
+
+            let astral = Arc::new(astral::AstralClient::new(runtime_config::base_url()));
             // 401 自动刷新换到的新会话要能落库（否则重启又回到过期会话）
             astral.set_session_db(db.clone());
 
@@ -405,6 +420,7 @@ pub fn run() {
             cmd_get_appearance,
             cmd_set_appearance,
             cmd_get_app_version,
+            cmd_official_site_url,
             cmd_show_desktop_lyric,
             cmd_hide_desktop_lyric,
             cmd_get_desktop_lyric_state,

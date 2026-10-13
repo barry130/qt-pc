@@ -4576,6 +4576,16 @@ pub async fn cmd_reset_cache_dir(
     Ok(root.to_string_lossy().to_string())
 }
 
+/// 官网地址（设置页的「项目介绍 / 用户协议 / 隐私政策 / 意见反馈 / 音源教程」入口）。
+///
+/// 为什么走 IPC 而不是前端常量：官网域名属于自有地址，**不能进公开仓库**。
+/// 真值来自 `runtime_config`（运行时 `app.config.local.json` > 编译期私有常量），
+/// 只有 Rust 侧能拿到。返回空串 = 未配置，前端据此不渲染这几个入口。
+#[tauri::command(rename = "official_site_url")]
+pub async fn cmd_official_site_url() -> String {
+    crate::runtime_config::official_site_url().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

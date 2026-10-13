@@ -1,0 +1,15 @@
+{
+  "$comment": [
+    "私有配置模板 —— 公开仓库不含任何自有域名，真实地址只写在这里。",
+    "用法：复制本文件为 app.config.local.json（同目录，仓库根），填上真实值。",
+    "app.config.local.json 已被 .gitignore 忽略：**不要提交**，也不要把真实值写进本模板。",
+    "字段全部可选，缺省时回落到 app.config.json 里的公开默认值。",
+    "发布构建不需要手动填：GitHub Action 在打包前用仓库 Secret 生成这个文件",
+    "（见 .github/workflows/release.yml 的「注入私有配置」步骤）。",
+    "也可以只放运行时用：把同名文件放到 exe 旁边、或 %APPDATA%/QuietMusic/ 下，",
+    "不必重新编译就能改后端地址（查找顺序见 src-tauri/src/runtime_config.rs）。"
+  ],
+  "backendBaseUrl": "https://<自有后端域名>/api/v1/",
+  "officialSiteUrl": "https://<官网域名>",
+  "ownDomains": ["<自有域名后缀，例如 example.com>"]
+}

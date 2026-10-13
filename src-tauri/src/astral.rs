@@ -1805,7 +1805,7 @@ mod tests {
         let direct = "https://github.com/barry130/x/releases/download/v1/L.exe";
         assert_eq!(AstralClient::strip_accel_prefix(direct), direct);
         // 非 GitHub 链接（后端自托管等）原样返回
-        let other = "https://astral.canace.cn/files/L.exe";
+        let other = "https://cdn.example.com/files/L.exe";
         assert_eq!(AstralClient::strip_accel_prefix(other), other);
     }
 
@@ -2126,9 +2126,9 @@ mod tests {
     #[test]
     fn sanitize_err_strips_urls_keeps_reason() {
         // reqwest 网络错误的典型形态（带请求地址）
-        let e = "error sending request for url (http://astral.canace.cn/api/v1/app/source/manifest?platform=1103)";
+        let e = "error sending request for url (https://api.example.com/api/v1/app/source/manifest?platform=1103)";
         assert_eq!(sanitize_err(e), "error sending request for url (…)");
-        let e2 = "Astral 请求失败: https://storage.canace.icu/p/xyz/1 超时";
+        let e2 = "Astral 请求失败: https://cdn.example.com/p/xyz/1 超时";
         assert_eq!(sanitize_err(e2), "Astral 请求失败: … 超时");
         // 无 URL 原样通过；中文/尾部 URL 也能处理
         assert_eq!(

@@ -25,6 +25,18 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
       - run: pnpm test
+      # 泄漏护栏：自有域名 / 生产后端地址 / 官网地址**只能**待在被忽略的
+      # app.config.local.json 与 private_config.rs 里。这两个文件不提交，
+      # 所以这里扫的是真的进了仓库的那份内容。任何人手滑把生产地址写回
+      # app.config.json、注释或测试夹具，这一步直接红。
+      # 刻意不把域名写进本文件（否则这个 workflow 自己就成了泄漏点）。
+      - name: 公开仓库不得出现自有地址
+        run: |
+          if git grep -n -I -E 'canace\.(cn|icu)' -- . ':(exclude)pnpm-lock.yaml'; then
+            echo "::error::仓库里出现了自有域名，请改写到 app.config.local.json（见 docs/CONFIG.md）"
+            exit 1
+          fi
+          echo "OK：没有自有域名"
 
   # 三平台编译 + 测试：Windows（主发布目标）之外，Linux/macOS
   # 是移植新增的验证面——cfg 分支多，必须每个平台都真编译过。
@@ -48,5 +60,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
+      # 私有值不提交，`src/private_config.rs` 缺失时由 `src-tauri/build.rs` 补空壳，
+      # 所以这里**不需要**任何注入就能编译 —— 这样 CI 才是在验证"公开仓库形态"，
+      # 而不是被开发机上残留的私有文件蒙混过去。
       - name: Run cargo tests
         run: cargo test --manifest-path src-tauri/Cargo.toml

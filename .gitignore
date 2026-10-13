@@ -75,3 +75,10 @@ asset-list.json
 release-notes.md
 
 tsconfig.tsbuildinfo
+
+# 私有配置：自有域名、生产后端地址、官网地址。公开仓库不含这些值 ——
+# 发布构建由 GitHub Action 用仓库 Secret 生成（见 docs/CONFIG.md §2.1），
+# 本地开发复制 app.config.local.json.example 改名即可。
+app.config.local.json
+# 上面那个文件生成的编译期常量（scripts/sync-config.mjs 写入；build.rs 在缺失时补空壳）
+src-tauri/src/private_config.rs

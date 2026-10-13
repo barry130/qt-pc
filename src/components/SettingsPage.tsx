@@ -2,11 +2,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Ban, ExternalLink, X } from "lucide-react";
 import { errMsg, stripErrorUrls } from "@/lib/utils";
 import {
-  OFFICIAL_AGREEMENT_URL,
-  OFFICIAL_FEEDBACK_URL,
-  OFFICIAL_PRIVACY_URL,
-  OFFICIAL_SITE_URL,
-  OFFICIAL_SOURCE_SETUP_URL,
+  OFFICIAL_AGREEMENT_PATH,
+  OFFICIAL_FEEDBACK_PATH,
+  OFFICIAL_PRIVACY_PATH,
+  OFFICIAL_SOURCE_SETUP_PATH,
+  officialSitePath,
 } from "@/lib/official-site";
 import { useNavigate } from "@tanstack/react-router";
 import { getAllWindows } from "@tauri-apps/api/window";
@@ -27,6 +27,7 @@ import { useAppearanceStore } from "@/stores/appearance";
 import { useUpdateStore } from "@/stores/update";
 import { useSourceUpdateStore } from "@/stores/source-update";
 import { runCheck } from "@/hooks/useUpdateCheck";
+import { useOfficialSiteUrl } from "@/hooks/useOfficialSiteUrl";
 import {
   activateSourcePack,
   applySourceUpdate,
@@ -1654,6 +1655,8 @@ function SourcePackageSection(): React.JSX.Element {
   const [confirming, setConfirming] = useState(false);
   /** 剪贴板检测到的音源包链接（非 null = 询问弹窗开着） */
   const [clipTip, setClipTip] = useState<string | null>(null);
+  /** 官网根地址（未配置时为空串 → 教程入口整行不渲染） */
+  const siteUrl = useOfficialSiteUrl();
 
   const refresh = useCallback(async () => {
     try {
@@ -2028,13 +2031,20 @@ function SourcePackageSection(): React.JSX.Element {
           </button>
         </div>
       </SettingRow>
-      {/* 装包/换源/音质/排错的完整说明只在官网维护一份，客户端给个入口即可 */}
-      <SettingRow
-        title="如何设置音源"
-        description="三种安装方式、切换默认音源、音质选择与装不上排查"
-      >
-        <ExternalLinkButton label="查看教程" url={OFFICIAL_SOURCE_SETUP_URL} />
-      </SettingRow>
+      {/* 装包/换源/音质/排错的完整说明只在官网维护一份，客户端给个入口即可。
+          官网地址是自有地址（只在 Rust 侧持有），未配置时整行不渲染 —— 宁可没有入口，
+          也不要给一个打不开的链接 */}
+      {siteUrl ? (
+        <SettingRow
+          title="如何设置音源"
+          description="三种安装方式、切换默认音源、音质选择与装不上排查"
+        >
+          <ExternalLinkButton
+            label="查看教程"
+            url={officialSitePath(siteUrl, OFFICIAL_SOURCE_SETUP_PATH)}
+          />
+        </SettingRow>
+      ) : null}
       {clipTip !== null && !preview && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
           <div className="w-full max-w-sm rounded-xl border border-border bg-card p-4 shadow-lg">
@@ -2218,6 +2228,8 @@ function AboutSection(): React.JSX.Element {
   const [checking, setChecking] = useState(false);
   const [result, setResult] = useState<string>("");
   const setUpdate = useUpdateStore((s) => s.setUpdate);
+  /** 官网根地址（未配置时为空串 → 下面四行整块不渲染） */
+  const siteUrl = useOfficialSiteUrl();
 
   useEffect(() => {
     void getAppVersion().then(setVersion).catch(() => {});
@@ -2270,22 +2282,34 @@ function AboutSection(): React.JSX.Element {
         <div className="py-3 text-xs text-muted-foreground">{result}</div>
       )}
       {/* 官网条款与开源信息：协议正文、隐私说明与仓库地址都只在官网维护一份，
-          客户端只保留入口，避免两边各写一份然后慢慢对不上 */}
-      <SettingRow title="项目介绍与开源地址" description="功能说明、截图与三个仓库的地址">
-        <ExternalLinkButton label="打开官网" url={OFFICIAL_SITE_URL} />
-      </SettingRow>
-      <SettingRow title="用户协议" description="使用本软件前请先阅读">
-        <ExternalLinkButton label="查看" url={OFFICIAL_AGREEMENT_URL} />
-      </SettingRow>
-      <SettingRow title="隐私政策" description="收集哪些数据、如何使用与保留">
-        <ExternalLinkButton label="查看" url={OFFICIAL_PRIVACY_URL} />
-      </SettingRow>
-      <SettingRow
-        title="意见反馈"
-        description="GitHub / CNB 双渠道提交 Issue 或 PR"
-      >
-        <ExternalLinkButton label="前往反馈" url={OFFICIAL_FEEDBACK_URL} />
-      </SettingRow>
+          客户端只保留入口，避免两边各写一份然后慢慢对不上。
+          官网地址是自有地址（只在 Rust 侧持有）：未配置时整块不渲染，
+          不给打不开的链接 */}
+      {siteUrl ? (
+        <>
+          <SettingRow title="项目介绍与开源地址" description="功能说明、截图与三个仓库的地址">
+            <ExternalLinkButton label="打开官网" url={siteUrl} />
+          </SettingRow>
+          <SettingRow title="用户协议" description="使用本软件前请先阅读">
+            <ExternalLinkButton
+              label="查看"
+              url={officialSitePath(siteUrl, OFFICIAL_AGREEMENT_PATH)}
+            />
+          </SettingRow>
+          <SettingRow title="隐私政策" description="收集哪些数据、如何使用与保留">
+            <ExternalLinkButton
+              label="查看"
+              url={officialSitePath(siteUrl, OFFICIAL_PRIVACY_PATH)}
+            />
+          </SettingRow>
+          <SettingRow title="意见反馈" description="GitHub / CNB 双渠道提交 Issue 或 PR">
+            <ExternalLinkButton
+              label="前往反馈"
+              url={officialSitePath(siteUrl, OFFICIAL_FEEDBACK_PATH)}
+            />
+          </SettingRow>
+        </>
+      ) : null}
     </div>
   );
 }

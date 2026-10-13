@@ -2,9 +2,13 @@
 
 ## 0. 一句话
 
-**改配置只改仓库根的 [`app.config.json`](../app.config.json)，然后跑 `pnpm config:sync`。**
+**公开配置只改仓库根的 [`app.config.json`](../app.config.json)，然后跑 `pnpm config:sync`。**
 其它配置文件里凡是与它重复的值，都由 [`scripts/sync-config.mjs`](../scripts/sync-config.mjs)
 自动写入，**不要手改**（`pnpm config:check` 与单测会拦截手改）。
+
+**自有域名 / 生产后端地址 / 官网地址不进仓库**，只写在 `app.config.local.json`
+（被 `.gitignore` 忽略，模板见 [`app.config.local.json.example`](../app.config.local.json.example)），
+详见 §2.1。
 
 ```bash
 pnpm config:sync     # 把 app.config.json 的值写进各工具配置文件（值没变则不落盘）
@@ -39,10 +43,12 @@ pnpm config:check    # 只校验，不一致退出码 1（已挂进 pnpm build /
 | `version.name` | `1.0.8` | `package.json` / `tauri.conf.json` / `Cargo.toml` / `Cargo.lock` / `app_config.rs` | 安装包版本、关于页、`/app/version/check` |
 | `version.code` | `108` | `app_config.rs`（`VERSION_CODE`） | `/app/update?version=`、后台 `qt_app_update` 记录 |
 | `sourcePack.hostApiVersion` | `1` | `source-update.ts`、`app_config.rs` | 宿主契约版本（与 Rust `HOST_API_VERSION` 同源） |
-| `backend.dev` / `.prod` | 见文件 | `app_config.rs`（`DEV_BASE_URL` / `PROD_BASE_URL`） | Astral 后端地址 |
+| `backend.dev` | `http://localhost:27000/api/v1/` | `app_config.rs`（`DEV_BASE_URL`） | **本机联调**后端地址（公开仓库只留这一个） |
 | `backend.active` | `prod` | `app_config.rs`（`DEFAULT_BASE_URL`） | **当前生效**的后端；联调改 `dev` 后同步重编 |
 | `platform.windows` / `.linux` / `.macos` | `1103` / `1104` / `1105` | `app_config.rs`（`UPDATE_TYPE` 字符串、`PLATFORM_CODE` 数值，均按 `target_os` 三选一） | 更新/消息/统计的平台号，以及音源包 manifest 请求与装载上报的 `platform` 字段 |
 | `devServer.port` / `.hmrPort` | `1420` / `1421` | `tauri.conf.json` `build.devUrl`；vite 直接读 JSON | 开发服务器端口 |
+
+> `backend.prod` **已从本文件移除**：生产后端地址是自有地址，见 §2.1。
 
 派生文件总表（同步器负责的全部落点，共 6 个）：
 
@@ -55,14 +61,95 @@ src/source-scripts/source-update.ts            HOST_API_VERSION
 src-tauri/src/app_config.rs                    Rust 侧常量 + 一致性单测（整文件生成）
 ```
 
+## 2.1 私有配置（自有域名 / 生产后端 / 官网）
+
+**仓库是公开的，所以任何自有地址都不能出现在提交的文件里。** 这类值走一条独立的路：
+
+```text
+app.config.local.json          （不提交，模板 app.config.local.json.example）
+        │  pnpm config:sync
+        ▼
+src-tauri/src/private_config.rs （不提交，由同步器整文件生成）
+        │
+        ▼
+runtime_config.rs               （运行期还能被同名的 app.config.local.json 覆盖）
+```
+
+| 字段 | 落点 | 谁读 |
+|---|---|---|
+| `backendBaseUrl` | `private_config.rs` `BACKEND_BASE_URL` | `runtime_config::base_url()` → `AstralClient::new`（在线试听 / 登录 / 云同步 / 更新检查） |
+| `officialSiteUrl` | `private_config.rs` `OFFICIAL_SITE_URL` | `runtime_config::official_site_url()` → `official_site_url` 命令 → 设置页「关于」与「如何设置音源」的入口 |
+| `ownDomains` | `private_config.rs` `OWN_DOMAINS` | `net_guard::is_own_host()`（明文 http 下载的白名单） |
+
+### 为什么分「编译期」和「运行期」两层
+
+不是重复：**编译期**那层让发布包里带着真实地址（用户机器上没有配置文件也能用）；
+**运行期**那层让运维改地址不必重新发版，也让测试能把客户端指向本机服务。
+
+运行期查找顺序（先命中先用，见 `src-tauri/src/runtime_config.rs`）：
+
+1. 环境变量 `QT_CONFIG_FILE` 指向的文件（调试用）；
+2. **exe 所在目录**的 `app.config.local.json`（便携部署 / 正常安装）；
+3. `%APPDATA%\QuietMusic\app.config.local.json`（数据目录）；
+4. 当前工作目录的 `app.config.local.json` —— **最后**：工作目录不可靠（开发时是
+   `src-tauri/`，从快捷方式启动时是「起始位置」里填的任意目录）。
+
+自有域名后缀还可以用环境变量 `QT_OWN_DOMAINS`（逗号分隔）临时覆盖。测试**不走**
+环境变量：`own_domain_suffixes()` 是 `OnceLock` 缓存的，改环境变量只在第一次读之前
+有效，多线程并行跑用例时会变成「看谁先跑」。测试改用
+`runtime_config::set_own_domains_for_test()`（线程局部，用例之间天然隔离）。
+
+### 缺配置时会发生什么（刻意不 panic）
+
+| 场景 | 行为 |
+|---|---|
+| 没有 `app.config.local.json`（公开仓库 / CI 裸构建） | 编译照常通过：`build.rs` 补空壳、同步器写同义空壳；`BACKEND_BASE_URL` 是空串 |
+| 运行期也没有任何私有配置 | `runtime_config::base_url()` 打一条 **ERROR**（说明在线能力不可用，而不是"网络有问题"），回落到本机联调地址 |
+| `ownDomains` 为空 | `is_own_host()` 永远返回 false ⇒ 明文 http 下载**一律被拒**。这是收紧方向，正是想要的行为 |
+| `officialSiteUrl` 为空 | 设置页不渲染官网那几行（宁可没有入口，也不给打不开的链接） |
+
+### 本地开发怎么用
+
+```powershell
+Copy-Item app.config.local.json.example app.config.local.json
+# 填上 backendBaseUrl / officialSiteUrl / ownDomains，然后
+node scripts/sync-config.mjs      # 或 pnpm config:sync
+```
+
+不填也能开发：纯前端 / 本地播放功能与后端地址无关；需要联调后端时把
+`app.config.json` 的 `backend.active` 改成 `dev` 即可（那条地址是公开的本机地址）。
+
+**改地址不必重新编译**：把填好的 `app.config.local.json` 放到 exe 旁边
+（或 `%APPDATA%\QuietMusic\` 下），运行期 `runtime_config` 会覆盖编译期常量。
+调试时也可以用 `QT_CONFIG_FILE` 显式指定任意路径。
+
+### 发布构建如何注入私有配置
+
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) 的
+**「注入私有配置」**步骤在打包前用仓库 Secret 生成 `app.config.local.json`，
+`pnpm build`（`beforeBuildCommand`）再跑同步器把它编译进 `private_config.rs`：
+
+| Secret | 必填 | 内容 |
+|---|---|---|
+| `QT_BACKEND_BASE_URL` | ✅ | 生产后端地址（`https://<自有域名>/api/v1/`） |
+| `QT_OFFICIAL_SITE_URL` | ✅ | 官网根地址（不要带尾斜杠） |
+| `QT_OWN_DOMAINS` | ✅ | 自有域名后缀，逗号分隔（如 `example.com,cdn.example.com`） |
+
+缺必填项时该步骤**直接失败**：静默发出一个连不上后端的包，用户侧只表现为
+「登录 / 试听全挂」，比构建失败难查得多。注入完还有一步
+「校验私有配置已进入编译产物」——它检查 `private_config.rs` 里确实出现了
+后端地址与自有域名，挡住"Secret 填了但没编译进去"这种更隐蔽的错。
+
 ## 3. 护栏：手改会在哪里失败
 
 | 位置 | 守什么 |
 |---|---|
-| `tests/config.test.ts` | 6 个派生文件全部与 `app.config.json` 一致；版本名↔版本号自洽 |
+| `tests/config.test.ts` | 6 个派生文件全部与 `app.config.json` 一致；版本名↔版本号自洽；**公开配置里的每个 http(s) 地址都必须指向本机**（断言不写具体域名，否则测试自己就成了泄露点），且 `backend.prod` 字段不存在 |
 | `src-tauri/src/app_config.rs` 的 `#[cfg(test)]` | 逐项比对 JSON；`DEFAULT_BASE_URL` 跟随 `backend.active`；`version.name ↔ version.code`；`env!("CARGO_PKG_VERSION")`（Cargo.toml）↔ JSON；`UPDATE_TYPE` / `PLATFORM_CODE` 与 `platform.<当前目标>` 一致且两者同源 |
+| `src-tauri/src/runtime_config.rs` 的 `#[cfg(test)]` | 域名后缀归一化；`host_is_own` 的后缀陷阱（`example.com.evil.com` 不算自家域名）；后缀列表为空时谁都匹配不上 |
+| `.github/workflows/ci.yml` 的「公开仓库不得出现自有地址」 | `git grep` 扫全仓：出现自有域名直接红。它拦的是测试夹具与注释里手滑写回真实域名 |
 | `pnpm test` / `pnpm build` | 前者跑 `--check` 直接失败；后者先同步再构建 |
-| `scripts/sync-config.mjs` | 正则未命中会报错（说明文件被改得不像样了），不会静默跳过 |
+| `scripts/sync-config.mjs` | 正则未命中会报错（说明文件被改得不像样了），不会静默跳过；`private_config.rs` **不参与 `--check`**（有私有文件时它本来就该与仓库版本不同） |
 
 ## 4. 发布一个新版本（PC 应用）
 
@@ -159,7 +246,8 @@ src-tauri/src/app_config.rs                    Rust 侧常量 + 一致性单测�
 `.gitignore` 覆盖：`node_modules/`、`dist/`、`dist-sources/`、`src-tauri/target/`、
 `.cargo-home/`、`.pnpm-store/`、`.npm-cache/`、`.vite-cache/`、`tmp/`、`.tmp/`、
 `src-tauri/gen/schemas/`、`src-tauri/.cargo/`、`release-pending/`、`diag-*.mjs`、
-`diag-live-rank-*.json`、`*.log`、`nul` 等。
+`diag-live-rank-*.json`、`*.log`、`nul`，以及两个**私有配置**文件
+`app.config.local.json` 与 `src-tauri/src/private_config.rs`（见 §2.1）。
 
 **可以随时删（会自动重建）**：`dist/`、`.vite-cache/`、`.npm-cache/`、
 `src-tauri/gen/schemas/`、`src-tauri/target/debug/`（debug 产物，删后 `tauri dev` 首次重编较慢）、

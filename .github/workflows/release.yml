@@ -93,6 +93,62 @@ jobs:
           workspaces: src-tauri
           key: ${{ matrix.target }}
 
+      # 私有配置注入：自有域名 / 生产后端地址 / 官网地址**不进仓库**，
+      # 发布包里的真值只能在打包前由 Secret 写成本地配置文件，
+      # 再由 `pnpm build`（beforeBuildCommand → scripts/sync-config.mjs）编译进
+      # src-tauri/src/private_config.rs。缺任何一个都直接失败 —— 静默发一个
+      # "连不上后端"的包，比构建失败难查得多（用户侧只表现为登录/试听全挂）。
+      #
+      # 这一步放在 `pnpm install` 之后、打包之前：`pnpm exec tauri build` 会跑
+      # beforeBuildCommand=pnpm build，而 build 的第一件事就是 sync-config.mjs，
+      # 所以文件必须在那之前就位。
+      - name: 注入私有配置
+        shell: pwsh
+        env:
+          QT_BACKEND_BASE_URL: ${{ secrets.QT_BACKEND_BASE_URL }}
+          QT_OFFICIAL_SITE_URL: ${{ secrets.QT_OFFICIAL_SITE_URL }}
+          QT_OWN_DOMAINS: ${{ secrets.QT_OWN_DOMAINS }}
+        run: |
+          $missing = @()
+          if ([string]::IsNullOrEmpty($env:QT_BACKEND_BASE_URL)) { $missing += "QT_BACKEND_BASE_URL" }
+          if ([string]::IsNullOrEmpty($env:QT_OFFICIAL_SITE_URL)) { $missing += "QT_OFFICIAL_SITE_URL" }
+          if ([string]::IsNullOrEmpty($env:QT_OWN_DOMAINS)) { $missing += "QT_OWN_DOMAINS" }
+          if ($missing.Count -gt 0) {
+            Write-Error "缺少 secret：$($missing -join ', ')。配置方法见 docs/CONFIG.md「发布构建如何注入私有配置」"
+            exit 1
+          }
+          $domains = $env:QT_OWN_DOMAINS.Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
+          if ($domains.Count -eq 0) {
+            Write-Error "secret QT_OWN_DOMAINS 里没有有效域名（逗号分隔）。自有 CDN 的明文 http 下载会因此被拒，安装包可能装不上"
+            exit 1
+          }
+          $cfg = [ordered]@{
+            backendBaseUrl  = $env:QT_BACKEND_BASE_URL.Trim()
+            officialSiteUrl = $env:QT_OFFICIAL_SITE_URL.Trim()
+            ownDomains      = @($domains)
+          }
+          $json = $cfg | ConvertTo-Json -Depth 5
+          # 不写 BOM：sync-config.mjs 用 JSON.parse 读，BOM 会让它当成非法 JSON
+          [IO.File]::WriteAllText("$PWD/app.config.local.json", $json, (New-Object Text.UTF8Encoding $false))
+          Write-Host "已写入 app.config.local.json（后端 / 官网 / 自有域名 $($domains.Count) 条）"
+
+      # 注入完立刻验一次：`pnpm build` 会把私有值编译进 private_config.rs，
+      # 而后端地址为空串的包是"看起来装好了但登录/试听全挂"，必须在发版前拦住。
+      - name: 校验私有配置已进入编译产物
+        shell: pwsh
+        run: |
+          pnpm config:sync
+          $rs = Get-Content "src-tauri/src/private_config.rs" -Raw
+          if ($rs -notmatch 'BACKEND_BASE_URL: &str = "https?://') {
+            Write-Error "private_config.rs 里没有生产后端地址，说明私有配置没进来（检查 secret 与 app.config.local.json）"
+            exit 1
+          }
+          if ($rs -notmatch 'OWN_DOMAINS: &\[&str\] = &\[\s*"') {
+            Write-Error "private_config.rs 里没有自有域名，明文 http 下载会被拒"
+            exit 1
+          }
+          Write-Host "私有配置已编译进 private_config.rs"
+
       - name: 构建 NSIS 安装包
         run: |
           pnpm exec tauri build --runner cargo --target ${{ matrix.target }} --bundles nsis

@@ -64,37 +64,48 @@ Vite 开发服务器固定监听 `http://localhost:1420` —— 端口单源于 
 
 收藏同步、歌单、自动更新、反馈、统计等能力依赖后端服务 `astral`。播放与本地音乐库不依赖它。
 
-后端地址由单一配置源生成，落点在 `src-tauri/src/app_config.rs`（`astral.rs` 转指到它）：
+**后端地址不写死在代码里，也不进仓库**（仓库公开，自有域名属于私有信息）。真值来自
+[`app.config.local.json`](app.config.local.json.example)（被 `.gitignore` 忽略，模板见
+`app.config.local.json.example`），由 `scripts/sync-config.mjs` 编译进
+`src-tauri/src/private_config.rs`，运行期再由 `src-tauri/src/runtime_config.rs` 按同名文件覆盖：
 
-- 开发：`http://localhost:27000/api/v1/`
-- 生产：自有域名，**不在文档里写明文**；取值见 `app.config.json` 的 `backend.prod`。
-  当前生效哪一条由同文件的 `backend.active` 决定（现为 `prod`，即默认走生产后端）
+- 开发：`http://localhost:27000/api/v1/`（唯一写进公开配置的地址，见 `app.config.json` 的 `backend.dev`）
+- 生产：自有域名，**不在仓库里出现**；取值见你本机的 `app.config.local.json` 的 `backendBaseUrl`
+- 当前生效哪一条由 `app.config.json` 的 `backend.active` 决定（`dev` / `prod`）
 
-> 切换环境只改 `app.config.json` 的 `backend.active`（`dev` / `prod`）再跑 `pnpm config:sync` 重新编译，
-> 不要手改 `app_config.rs` / `astral.rs` 里的地址字面量。详见 [`docs/CONFIG.md`](docs/CONFIG.md)。
+> 本地开发复制一份私有配置即可：`Copy-Item app.config.local.json.example app.config.local.json`
+> 再填值，然后跑 `pnpm config:sync`。不填也能开发 —— 本地播放与后端无关，只有在线能力不可用
+> （启动日志会打一条说明原因的 ERROR）。
+>
+> 发布构建由 [`.github/workflows/release.yml`](.github/workflows/release.yml) 的
+> 「注入私有配置」步骤用仓库 Secret 生成这个文件，缺 Secret 直接构建失败。
 >
 > 生产链路必须是 HTTPS：更新包下载与安装器启动都依赖它，明文 HTTP 会让 MD5 校验形同虚设。
 
 ## 配置
 
-**所有配置只在仓库根的 [`app.config.json`](app.config.json) 里改一处**，其余文件由
+**公开配置只在仓库根的 [`app.config.json`](app.config.json) 里改一处**，其余文件由
 [`scripts/sync-config.mjs`](scripts/sync-config.mjs) 自动写入 —— 版本号、产品名、应用 ID、
-后端地址、平台号、开发端口、宿主契约版本都在那里：
+平台号、开发端口、宿主契约版本都在那里：
 
 ```bash
 pnpm config:sync     # 同步到 package.json / tauri.conf.json / Cargo.toml / Cargo.lock /
                      # src/source-scripts/source-update.ts / src-tauri/src/app_config.rs
+                     # 有 app.config.local.json 时还会生成 src-tauri/src/private_config.rs
 pnpm config:check    # 只校验（已挂进 pnpm build / pnpm test：手改派生文件会直接失败）
 ```
 
 - 发版只改 `version.name` 与 `version.code` 两行（如 `1.0.8` / `108`），二者自洽性由单测校验。
+- 自有域名、生产后端地址、官网地址走**另一条独立的私有链路**（`app.config.local.json`
+  → `private_config.rs` → `runtime_config.rs`），既不进仓库，也不参与一致性校验。
 - 工具独占的配置（tsconfig 选项、vite 构建目标、Cargo 依赖与 profile、NSIS 模板）留在各自文件，
-  不重复记录；完整字段表、护栏位置、音源包机制、安装包行为见 [`docs/CONFIG.md`](docs/CONFIG.md)。
+  不重复记录；完整字段表、护栏位置、私有配置查找顺序、音源包机制、安装包行为见
+  [`docs/CONFIG.md`](docs/CONFIG.md)。
 
 ## 测试
 
 ```bash
-# 前端（Vitest，40 个测试文件）
+# 前端（Vitest，47 个测试文件）
 pnpm test
 pnpm typecheck
 

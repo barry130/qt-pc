@@ -843,8 +843,8 @@ mod tests {
             "http://qpic.y.qq.com/music_cover/8eiaDBJ/300?n=1",
             "https://i1.hdslb.com/bfs/a.jpg",
             "https://d.musicapp.migu.cn/data/oss/resource/00/2z/m2/7e.webp",
-            "http://astral.canace.cn/files/avatar/1.png",
-            "https://storage.canace.icu/p/xyz/avatar.png",
+            "http://api.example.com/files/avatar/1.png",
+            "https://cdn.example.com/p/xyz/avatar.png",
             // 没在白名单里出现过的陌生域名，也一样放行（这正是放开的目的）
             "https://evil.example.com/a.jpg",
         ] {
@@ -974,12 +974,12 @@ mod tests {
             sized_cover_url("https://i1.hdslb.com/bfs/a.jpg@672w_378h_1c.webp", 300),
             "https://i1.hdslb.com/bfs/a.jpg@672w_378h_1c.webp"
         );
-        // 其它图床（酷我/QQ/酷狗/Astral）完全不动：实测都不吃尺寸参数
+        // 其它图床（酷我/QQ/酷狗/自建 CDN）完全不动：实测都不吃尺寸参数
         for url in [
             "https://zimg.kuwo.cn/bang/9/2/x.png",
             "http://y.gtimg.cn/music/photo_new/T003R300x300M000x.jpg",
             "https://imge.kugou.com/stdmusic/300/x.jpg",
-            "https://storage.canace.icu/p/x/1.png",
+            "https://cdn.example.com/p/x/1.png",
         ] {
             assert_eq!(sized_cover_url(url, 300), url, "不应改写 {url}");
         }

@@ -23,9 +23,17 @@ pub const HOST_API_VERSION: i64 = 1;
 
 /// 本地联调后端
 pub const DEV_BASE_URL: &str = "http://localhost:27000/api/v1/";
-/// 线上后端
-pub const PROD_BASE_URL: &str = "https://astral.canace.cn/api/v1/";
-/// 当前生效的后端地址：由 app.config.json 的 `backend.active` 决定（prod）
+/// 生产后端地址：**编译期**取私有配置（`app.config.local.json` → `private_config.rs`）。
+/// 公开仓库里没有真值，`BACKEND_BASE_URL` 是空串；运行期还能被同名文件覆盖，
+/// 见 `runtime_config::base_url()`（那才是真正决定连哪台后端的函数）。
+pub const PROD_BASE_URL: &str = crate::private_config::BACKEND_BASE_URL;
+/// 当前生效的后端（编译期口径）：由 app.config.json 的 `backend.active` 决定（prod）。
+///
+/// `runtime_config::base_url()` 会读这个常量：`dev` 时**完全不看**私有配置
+/// （联调就该只连本机，本机上那份 `app.config.local.json` 是给生产形态用的，
+/// 不该在开发时被偷偷读走），`prod` 时才走"运行时文件 > 编译期私有常量"。
+pub const ACTIVE_BACKEND: &str = "prod";
+/// 当前生效的后端地址（编译期口径）
 pub const DEFAULT_BASE_URL: &str = PROD_BASE_URL;
 
 /// 更新接口的平台号，按编译目标三选一
@@ -87,7 +95,9 @@ mod tests {
             super::HOST_API_VERSION
         );
         assert_eq!(s(&c["backend"]["dev"]), super::DEV_BASE_URL);
-        assert_eq!(s(&c["backend"]["prod"]), super::PROD_BASE_URL);
+        // 生产地址不在 app.config.json 里（公开仓库不含自有域名）：只断言编译期
+        // 取值确实转指到私有配置，真值由 private_config.rs 持有。
+        assert_eq!(super::PROD_BASE_URL, crate::private_config::BACKEND_BASE_URL);
         // UPDATE_TYPE 按编译目标三选一：断言当前目标对应的 JSON 值与常量相等
         let platform_key = if cfg!(target_os = "windows") {
             "windows"
@@ -119,6 +129,7 @@ mod tests {
     #[test]
     fn default_base_url_follows_active() {
         let c = cfg();
+        assert_eq!(s(&c["backend"]["active"]), super::ACTIVE_BACKEND);
         let want = match s(&c["backend"]["active"]) {
             "dev" => super::DEV_BASE_URL,
             "prod" => super::PROD_BASE_URL,

@@ -3477,7 +3477,8 @@ M0 通过后再按下表推进；M0 不通过就要在架构层面调整（例�
 
 ```text
 qt-pc/
- ├─ app.config.json          # ★ 唯一配置源（§24.2）：版本号 / 产品名 / ID / 后端地址 / 端口 / 音源包版本
+ ├─ app.config.json          # ★ 公开配置源（§24.2）：版本号 / 产品名 / ID / 本机联调地址 / 端口 / 音源包版本
+ ├─ app.config.local.json    # 私有配置（不提交）：自有域名 / 生产后端 / 官网；模板见 .example
  ├─ REQUIREMENTS.md
  ├─ DESIGN.md
  ├─ README.md
@@ -3495,24 +3496,33 @@ qt-pc/
  └─ src-tauri/               # §19.2
 ```
 
-### 24.2 配置单一真值（`app.config.json`）
+### 24.2 配置单一真值（`app.config.json` + 私有层）
 
 > 早期草案设想的 `config.dev.toml` / `config.local.toml` **没有落地**，按下面的方案实现。
 > 草案的问题：同一份信息（版本号）散落在 5 个文件里手改，发版时必然漏改一处。
 
 | 位置 | 提交 | 内容 |
 |---|---|---|
-| `app.config.json`（仓库根） | 提交 | **唯一配置源**：产品名 / 展示名 / ID、`version.{name,code}`、`sourcePack.{code,name,hostApiVersion}`、`backend.{dev,prod,active}`、`platform.*`、`devServer.{port,hmrPort}` |
-| `scripts/sync-config.mjs` | 提交 | 同步器：把上面的值写进 7 个派生文件；`--check` 只校验不写盘 |
-| `src-tauri/src/app_config.rs` | 提交（**生成物**） | Rust 侧唯一读取入口（`astral.rs` 的对外常量转指到它，调用方不变）+ 一致性单测 |
+| `app.config.json`（仓库根） | 提交 | **唯一公开配置源**：产品名 / 展示名 / ID、`version.{name,code}`、`sourcePack.hostApiVersion`、`backend.{dev,active}`、`platform.*`、`devServer.{port,hmrPort}` |
+| `app.config.local.json`（仓库根） | **不提交** | **私有值**：`backendBaseUrl` / `officialSiteUrl` / `ownDomains`（模板见 `app.config.local.json.example`） |
+| `scripts/sync-config.mjs` | 提交 | 同步器：把公开值写进 6 个派生文件、把私有值写进 `private_config.rs`；`--check` 只校验不写盘（且**不校验**私有产物） |
+| `src-tauri/src/app_config.rs` | 提交（**生成物**） | Rust 侧公开常量的唯一读取入口（`astral.rs` 的对外常量转指到它）+ 一致性单测 |
+| `src-tauri/src/private_config.rs` | **不提交**（生成物） | 私有值编译成的常量；缺失时由 `build.rs` 补空壳，保证裸 `cargo test` 可编译 |
+| `src-tauri/src/runtime_config.rs` | 提交 | 运行期读同名 `app.config.local.json` 覆盖编译期常量 + 自有域名匹配 |
 | `src-tauri/.cargo/config.toml` | **不提交** | 本机 cargo 走 127.0.0.1 镜像的绕行配置（已在 `.gitignore`） |
 
 规则：
 
-- 改配置**只改 `app.config.json`**，然后 `pnpm config:sync`；`pnpm build` / `pnpm dev` 会自动先同步，
+- 改公开配置**只改 `app.config.json`**，然后 `pnpm config:sync`；`pnpm build` / `pnpm dev` 会自动先同步，
   `pnpm test` 会先校验（不一致直接失败）。
-- 后端地址由 Rust 持有（`app_config.rs` → `astral.rs`），前端不感知也不硬编码；
-  切换环境改 `backend.active`（`dev` / `prod`）后同步重编，不再手改 `DEFAULT_BASE_URL` 的字面量。
+- **自有域名 / 生产后端地址 / 官网地址一律不进仓库**（仓库公开）。它们只活在
+  `app.config.local.json` 里，编译期落进 `private_config.rs`，运行期还能被同名文件覆盖 ——
+  后者让运维改地址不必重新发版，也让测试能把客户端指向本机服务。
+- 后端地址由 Rust 持有（`app_config.rs` → `runtime_config.rs` → `astral.rs`），
+  前端不感知也不硬编码；官网地址同样如此，经 `official_site_url` 命令下发。
+  切换环境改 `backend.active`（`dev` / `prod`）后同步重编，不手改任何地址字面量。
+- 私有配置缺失**不 panic**：公开仓库与 CI 裸构建本来就没有它。代价是自有域名列表为空 ⇒
+  `net_guard::is_own_host()` 永远为假 ⇒ 明文 http 下载一律被拒（**收紧**而非放松）。
 - 只有「在多个文件里重复出现」的值才进配置源；工具独占的配置（tsconfig 选项、vite 构建目标、
   Cargo 依赖与 profile、NSIS 模板…）留在原文件 —— 理由与完整字段表见 `docs/CONFIG.md`。
 

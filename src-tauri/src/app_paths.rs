@@ -21,8 +21,8 @@ use tauri::Manager;
 
 /// 旧版（LightListen 时期）目录名
 const LEGACY_DIR_NAME: &str = "LightListen";
-/// 当前目录名
-const DIR_NAME: &str = "QuietMusic";
+/// 当前目录名（`runtime_config` 找 `app.config.local.json` 时也用这个口径）
+pub(crate) const DIR_NAME: &str = "QuietMusic";
 
 /// 安装目录（exe 所在目录）且**确认可写**；日志与缓存默认都挂在它下面。
 ///

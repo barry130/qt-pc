@@ -2,8 +2,13 @@
 //!
 //! `#[ignore]`：依赖外网与后端可达，常规 `cargo test` 不跑。手动执行：
 //! `cargo test --test live_astral -- --ignored --nocapture`
+//!
+//! 后端地址取自 `runtime_config::base_url()`（运行时 `app.config.local.json` >
+//! 编译期 `private_config.rs`），所以跑之前先确保本机有私有配置，否则这里会连到
+//! 本机联调地址、全部请求失败 —— 打印出的地址就是判断依据。
 
-use quietmusic_lib::astral::{version_code, version_name, AstralClient, DEFAULT_BASE_URL};
+use quietmusic_lib::astral::{version_code, version_name, AstralClient};
+use quietmusic_lib::runtime_config;
 
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
@@ -16,7 +21,14 @@ fn runtime() -> tokio::runtime::Runtime {
 fn live_update_check_version_and_messages() {
     let rt = runtime();
     rt.block_on(async {
-        let client = AstralClient::new(DEFAULT_BASE_URL);
+        let base = runtime_config::base_url();
+        println!(
+            "[live] 后端地址 = {base}（私有配置来源：{}）",
+            runtime_config::source_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "无，用的是编译期常量".to_string())
+        );
+        let client = AstralClient::new(base);
         println!(
             "[live] versionName={} versionCode={}",
             version_name(),

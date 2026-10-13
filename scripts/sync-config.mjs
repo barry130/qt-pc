@@ -15,6 +15,12 @@
  *    哈希写进发布说明），值没变时绝不能碰文件，否则包哈希会无意义地变化。
  * 3. **--check 是护栏**：`pnpm build` / `pnpm test` / Rust 单测都会校验，
  *    绕过脚本手改派生文件会直接失败，而不是等到发版才发现版本号对不上。
+ * 4. **公开 / 私有两层**：`app.config.json`（**提交**）只放公开值 —— 版本号、产品名、
+ *    ID、端口、宿主契约版本，以及**本机联调地址**。自有域名、生产后端地址、官网地址
+ *    一律不进仓库，只活在 `app.config.local.json`（**被 .gitignore 忽略**，模板见
+ *    `app.config.local.json.example`）。本脚本把它编译成 `src-tauri/src/private_config.rs`
+ *    （同样被忽略），运行期还能用同名文件覆盖 —— 见 `src-tauri/src/runtime_config.rs`。
+ *    该目标**不参与 --check**：有私有文件时它本来就该和仓库版本不同。
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -22,19 +28,75 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
-/** 单一配置源路径 */
+/** 单一配置源路径（公开，提交进仓库） */
 export const CONFIG_FILE = path.join(ROOT, "app.config.json");
 
-/** 读取并做最基本的形状校验 */
+/** 私有配置路径（自有域名 / 生产后端地址 / 官网地址；被 .gitignore 忽略，可不存在） */
+export const PRIVATE_FILE = path.join(ROOT, "app.config.local.json");
+
+/** 读取并做最基本的形状校验（按 mtime 记忆：同一次进程里反复读不会读到半写状态） */
 export function loadConfig() {
-  const cfg = JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8"));
+  const cfg = readJsonCached(CONFIG_FILE, "app.config.json");
   for (const key of ["product", "version", "sourcePack", "backend", "platform", "devServer"]) {
     if (!cfg[key]) throw new Error(`app.config.json 缺字段: ${key}`);
   }
   if (!["dev", "prod"].includes(cfg.backend.active)) {
     throw new Error(`app.config.json: backend.active 只能是 dev 或 prod，当前 ${cfg.backend.active}`);
   }
+  if (!cfg.backend.dev) throw new Error("app.config.json 缺字段: backend.dev");
   return cfg;
+}
+
+/**
+ * 读 JSON 并按 (mtimeMs, size) 记忆。
+ *
+ * 为什么需要：`--check` / 测试可能在前一个进程刚写完文件时立刻读，而编辑器的
+ * 保存是「先截断再写」——不记忆就会偶发读到空文件报 "Unexpected end of JSON input"。
+ */
+const jsonCache = new Map();
+function readJsonCached(abs, label) {
+  const st = fs.statSync(abs);
+  const key = `${st.mtimeMs}:${st.size}`;
+  const hit = jsonCache.get(abs);
+  if (hit && hit.key === key) return hit.value;
+  const value = JSON.parse(fs.readFileSync(abs, "utf8"));
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`${label} 顶层必须是对象`);
+  }
+  jsonCache.set(abs, { key, value });
+  return value;
+}
+
+/**
+ * 读取私有配置；文件不存在时返回空对象（公开仓库 / CI 裸编译的正常状态）。
+ *
+ * 字段全部可选，缺省即"仓库里没有这个值"。刻意不在这里做"生产构建必须有值"的
+ * 校验：那会让 `pnpm build` 在开发机上直接失败，而开发机本来就不需要生产地址。
+ * 真正的护栏在发版流程（`.github/workflows/release.yml` 的「注入私有配置」步骤，
+ * 缺 Secret 直接 fail），以及运行期（`runtime_config` 打 ERROR 日志）。
+ */
+export function loadLocalConfig() {
+  if (!fs.existsSync(PRIVATE_FILE)) return {};
+  let raw;
+  try {
+    raw = JSON.parse(fs.readFileSync(PRIVATE_FILE, "utf8"));
+  } catch (e) {
+    throw new Error(`app.config.local.json 不是合法 JSON：${e.message}`);
+  }
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("app.config.local.json 顶层必须是对象");
+  }
+  for (const key of ["backendBaseUrl", "officialSiteUrl"]) {
+    if (raw[key] !== undefined && typeof raw[key] !== "string") {
+      throw new Error(`app.config.local.json: ${key} 必须是字符串`);
+    }
+  }
+  if (raw.ownDomains !== undefined) {
+    if (!Array.isArray(raw.ownDomains) || raw.ownDomains.some((d) => typeof d !== "string")) {
+      throw new Error("app.config.local.json: ownDomains 必须是字符串数组");
+    }
+  }
+  return raw;
 }
 
 /** 版本名 → 版本号（1.0.7 → 107），与 DESIGN §15.7 的规则一致 */
@@ -72,9 +134,17 @@ pub const HOST_API_VERSION: i64 = ${c.sourcePack.hostApiVersion};
 
 /// 本地联调后端
 pub const DEV_BASE_URL: &str = "${c.backend.dev}";
-/// 线上后端
-pub const PROD_BASE_URL: &str = "${c.backend.prod}";
-/// 当前生效的后端地址：由 app.config.json 的 \`backend.active\` 决定（${c.backend.active}）
+/// 生产后端地址：**编译期**取私有配置（\`app.config.local.json\` → \`private_config.rs\`）。
+/// 公开仓库里没有真值，\`BACKEND_BASE_URL\` 是空串；运行期还能被同名文件覆盖，
+/// 见 \`runtime_config::base_url()\`（那才是真正决定连哪台后端的函数）。
+pub const PROD_BASE_URL: &str = crate::private_config::BACKEND_BASE_URL;
+/// 当前生效的后端（编译期口径）：由 app.config.json 的 \`backend.active\` 决定（${c.backend.active}）。
+///
+/// \`runtime_config::base_url()\` 会读这个常量：\`dev\` 时**完全不看**私有配置
+/// （联调就该只连本机，本机上那份 \`app.config.local.json\` 是给生产形态用的，
+/// 不该在开发时被偷偷读走），\`prod\` 时才走"运行时文件 > 编译期私有常量"。
+pub const ACTIVE_BACKEND: &str = "${c.backend.active}";
+/// 当前生效的后端地址（编译期口径）
 pub const DEFAULT_BASE_URL: &str = ${active};
 
 /// 更新接口的平台号，按编译目标三选一
@@ -136,7 +206,9 @@ mod tests {
             super::HOST_API_VERSION
         );
         assert_eq!(s(&c["backend"]["dev"]), super::DEV_BASE_URL);
-        assert_eq!(s(&c["backend"]["prod"]), super::PROD_BASE_URL);
+        // 生产地址不在 app.config.json 里（公开仓库不含自有域名）：只断言编译期
+        // 取值确实转指到私有配置，真值由 private_config.rs 持有。
+        assert_eq!(super::PROD_BASE_URL, crate::private_config::BACKEND_BASE_URL);
         // UPDATE_TYPE 按编译目标三选一：断言当前目标对应的 JSON 值与常量相等
         let platform_key = if cfg!(target_os = "windows") {
             "windows"
@@ -168,6 +240,7 @@ mod tests {
     #[test]
     fn default_base_url_follows_active() {
         let c = cfg();
+        assert_eq!(s(&c["backend"]["active"]), super::ACTIVE_BACKEND);
         let want = match s(&c["backend"]["active"]) {
             "dev" => super::DEV_BASE_URL,
             "prod" => super::PROD_BASE_URL,
@@ -200,6 +273,92 @@ mod tests {
     }
 }
 `;
+}
+
+/** 把任意值写成 Rust 字符串字面量（私有值是外部输入，必须转义，否则能拼出坏代码） */
+function rustStr(v) {
+  return JSON.stringify(String(v ?? ""));
+}
+
+/** 私有域名后缀规范化：去掉前导点与大小写差异，空项丢弃 */
+function normalizeSuffix(raw) {
+  return String(raw).trim().replace(/^\.+/, "").toLowerCase();
+}
+
+/**
+ * `src-tauri/src/private_config.rs` 的完整内容（**不提交**）。
+ *
+ * 与 `app_config.rs` 分开的理由：那是公开的、提交进仓库、参与 --check；
+ * 这个是私有值编译出来的产物，有私有文件时本来就该和仓库版本不同，
+ * 所以既不能混在一起（每次同步都会脏工作区），也不该被 --check 拦。
+ */
+function privateRustSource(local) {
+  const base = typeof local.backendBaseUrl === "string" ? local.backendBaseUrl.trim() : "";
+  const site = typeof local.officialSiteUrl === "string" ? local.officialSiteUrl.trim() : "";
+  const domains = (local.ownDomains ?? []).map(normalizeSuffix).filter(Boolean);
+  const list = domains.map((d) => `    ${rustStr(d)},`).join("\n");
+  return `//! 由 \`scripts/sync-config.mjs\` 从 \`app.config.local.json\` 生成 —— **不要手改，也不要提交**。
+//!
+//! 这个文件承载的是**自有域名、生产后端地址、官网地址**。公开仓库里没有真值：
+//! 没有 \`app.config.local.json\` 时这里全是空串，编译照常通过，只是线上能力不可用
+//! （运行期 \`runtime_config\` 会打出可诊断的 ERROR）。
+//!
+//! 发布构建由 \`.github/workflows/release.yml\` 用仓库 Secret 生成
+//! \`app.config.local.json\` 后再跑 \`pnpm config:sync\`；本地开发复制
+//! \`app.config.local.json.example\` 填值即可。
+
+/// 生产后端地址（形如 \`https://<自有域名>/api/v1/\`；空 = 未配置）
+pub const BACKEND_BASE_URL: &str = ${rustStr(base)};
+
+/// 官网地址（关于页的教程 / 协议 / 隐私 / 反馈入口；空 = 设置页不显示这几项）
+pub const OFFICIAL_SITE_URL: &str = ${rustStr(site)};
+
+/// 自有域名后缀（明文 http 放行的唯一依据；空数组 = 没有任何自有域名，
+/// 于是所有明文下载都会被拒 —— 收紧而非放松，正是缺配置时想要的行为）
+pub const OWN_DOMAINS: &[&str] = &[
+${list}
+];
+
+/// 内存中直接覆盖自有域名后缀（调试 / 测试用，逗号分隔；留空则用 OWN_DOMAINS）
+pub const OWN_DOMAINS_ENV: &str = "QT_OWN_DOMAINS";
+`;
+}
+
+/**
+ * 私有配置的**运行期护栏**：返回 `{ errors }`。
+ *
+ * 为什么不在这里 `process.exit(1)`：开发机本来就不需要生产地址，硬拦会让
+ * `pnpm build` / `pnpm test` 直接不可用。所以这里只把问题报出来，
+ * 由 `main()` 决定在写入模式下打 ERROR 日志、在 `--check` 下保持沉默
+ * （`--check` 的语义是「派生文件是否与配置源一致」，与私有值无关）。
+ */
+export function privateReport(c, local) {
+  const base = typeof local.backendBaseUrl === "string" ? local.backendBaseUrl.trim() : "";
+  const site = typeof local.officialSiteUrl === "string" ? local.officialSiteUrl.trim() : "";
+  const domains = (local.ownDomains ?? []).map(normalizeSuffix).filter(Boolean);
+  const errors = [];
+  if (String(c?.backend?.active ?? "prod") === "prod") {
+    if (!base) {
+      errors.push(
+        "app.config.local.json 缺少 backendBaseUrl：本次构建没有生产后端地址" +
+          "（应用能启动，但在线试听 / 登录 / 云同步全部不可用）。" +
+          "补值后重跑 `pnpm config:sync` 并重新编译。",
+      );
+    }
+    if (!site) {
+      errors.push("app.config.local.json 缺少 officialSiteUrl：设置页的官网入口不会显示。");
+    }
+    if (domains.length === 0) {
+      errors.push(
+        "app.config.local.json 缺少 ownDomains：自有 CDN 的明文 http 下载地址会被拒" +
+          "（更新安装包可能装不上）。",
+      );
+    }
+  }
+  return {
+    errors,
+    configured: { backend: !!base, site: !!site, domains: domains.length > 0 },
+  };
 }
 
 /** 全部派生目标：每个规则 = 正则 + 替换（替换用函数，避免 $ 转义问题） */
@@ -265,6 +424,15 @@ function buildTargets(c) {
       desc: "Rust 侧生成文件（常量 + 一致性单测）",
       whole: () => rustSource(c),
     },
+    {
+      // 私有值（自有域名 / 生产后端地址 / 官网地址）。**不参与 --check**：
+      // 有 app.config.local.json 时它本来就与仓库里的版本不同，参与校验
+      // 会让每台开发机 / 每次发版都报"不一致"。写入时照样只改真正变化的文件。
+      file: "src-tauri/src/private_config.rs",
+      desc: "私有配置生成物（自有域名 / 生产后端 / 官网；不校验）",
+      skipCheck: true,
+      whole: () => privateRustSource(loadLocalConfig()),
+    },
   ];
 }
 
@@ -307,9 +475,17 @@ export function sync(config = loadConfig()) {
   return changed;
 }
 
-/** 校验模式：返回不一致列表（空数组 = 全部一致） */
+/** 校验模式：返回不一致列表（空数组 = 全部一致；跳过 skipCheck 的私有产物） */
 export function check(config = loadConfig()) {
-  return plan(config).filter((i) => i.changed);
+  return plan(config).filter((i) => i.changed && !i.skipCheck);
+}
+
+/** `--check` 输出用的解释文案：私有配置缺值时把后果说清楚，而不是只报一个 exit 1 */
+function printPrivateHints(config) {
+  const { errors } = privateReport(config, loadLocalConfig());
+  if (errors.length === 0) return;
+  console.warn(`[config] 注意：本次构建没有完整的私有配置（${PRIVATE_FILE} 不存在或缺字段）：`);
+  for (const e of errors) console.warn(`  - ${e}`);
 }
 
 function main() {
@@ -325,6 +501,9 @@ function main() {
   }
 
   if (isCheck) {
+    // 私有配置缺失**不算不一致**：公开仓库 / CI 裸构建本来就该是空的。
+    // 只提示后果；真正的强制在发版流程（release.yml 缺 Secret 直接 fail）。
+    printPrivateHints(config);
     const bad = check(config);
     if (bad.length === 0) {
       console.log(`[config] 全部一致（版本 ${config.version.name} / ${config.version.code}）`);
@@ -335,12 +514,22 @@ function main() {
     process.exit(1);
   }
 
+  // 写盘顺序要紧：私有配置先生成，后面的 Rust 校验（cargo）才有 private_config.rs 可读。
   const changed = sync(config);
+  const { configured } = privateReport(config, loadLocalConfig());
+  console.log(
+    `[config] 私有配置：后端 ${configured.backend ? "已注入" : "缺失"}` +
+      ` / 官网 ${configured.site ? "已注入" : "缺失"}` +
+      ` / 自有域名 ${configured.domains ? "已注入" : "缺失"}（源：${
+        fs.existsSync(PRIVATE_FILE) ? "app.config.local.json" : "无（公开仓库形态）"
+      }）`,
+  );
+  printPrivateHints(config);
   if (changed.length === 0) {
     console.log(`[config] 已是最新，无需改动（版本 ${config.version.name} / ${config.version.code}）`);
     return;
   }
-  console.log(`[config] 已从 app.config.json 同步 ${changed.length} 个文件：`);
+  console.log(`[config] 已同步 ${changed.length} 个文件：`);
   for (const i of changed) console.log(`  - ${i.file}  (${i.desc})`);
 }
 
