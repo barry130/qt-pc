@@ -12,10 +12,22 @@
 //! - 图标不引入资源文件，用 GDI 现场光栅化（32bpp DIB + 全零掩码 → CreateIconIndirect）；
 //!   颜色跟随系统主题（浅色主题画深色图标，深色主题画白色图标）。
 //! - 非 Windows 平台整体降级为空实现，调用方无需分支。
+//!
+//! **挂载时机由 `TaskbarButtonCreated` 驱动**（2026-10-13 修复「三个按钮经常不显示」）。
+//! 官方文档（Taskbar Extensions / ThumbBarAddButtons）规定：任务栏按钮由 shell 创建，
+//! 建好之后它会向窗口发一条 `RegisterWindowMessageW(L"TaskbarButtonCreated")` 注册消息，
+//! **必须先收到这条消息，才能调用任何 ITaskbarList3 方法**。而且 shell 每次**重建**任务栏
+//! 按钮都会重发它 —— 主窗口 hide→show（点关闭收进托盘、再从托盘打开）就会走一遍重建，
+//! 旧按钮上的缩略图工具栏随旧按钮一起消失。早先的实现只挂一次、也不认这条消息，
+//! 所以「关掉主窗口再打开，三个按钮就没了」；启动时那次「等窗口可见再睡 300ms」的盲等
+//! 撞不上 shell 就绪窗口时同样会静默失败（shell 返回成功但按钮不渲染）。
+//!
+//! 「hide→show 会重发」已在本机实测确认（独立探针窗口，ShowWindow(SW_HIDE) 后再
+//! SW_SHOW，累计收到 3 条 TaskbarButtonCreated）—— 不是照文档推断的。
 
 #[cfg(target_os = "windows")]
 mod imp {
-    use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
     use std::sync::{Mutex, OnceLock};
     use std::time::Duration;
 
@@ -36,8 +48,8 @@ mod imp {
         THB_TOOLTIP, THUMBBUTTON, THUMBBUTTONMASK,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallWindowProcW, CreateIconIndirect, IsWindowVisible, SetWindowLongPtrW, GWLP_WNDPROC,
-        HICON, ICONINFO, WM_COMMAND,
+        CallWindowProcW, CreateIconIndirect, DefWindowProcW, IsWindowVisible,
+        RegisterWindowMessageW, SetWindowLongPtrW, GWLP_WNDPROC, HICON, ICONINFO, WM_COMMAND,
     };
 
     use crate::media::{dispatch_media_action, MediaAction};
@@ -54,6 +66,9 @@ mod imp {
         play: isize,
         pause: isize,
         next: isize,
+        /// 光栅化时的像素边长与系统主题，仅用于日志
+        size: i32,
+        light: bool,
     }
 
     struct Inner {
@@ -71,12 +86,26 @@ mod imp {
     /// 上次同步的「是否正在播放」：publish 会被进度更新高频调用，
     /// 只有播放↔暂停翻转才需要动任务栏按钮
     static LAST_PLAYING: AtomicBool = AtomicBool::new(false);
+    /// shell 的 `TaskbarButtonCreated` 注册消息 ID（0 = 还没注册成功）
+    static TASKBAR_CREATED_MSG: AtomicU32 = AtomicU32::new(0);
+    /// 收到 `TaskbarButtonCreated` 的次数。窗口过程可能比窗口首次显示晚一拍装好，
+    /// 那样 shell 那条消息就永远错过了；兜底补挂前先用它判断要不要补。
+    static CREATED_COUNT: AtomicU32 = AtomicU32::new(0);
+    /// 防重入：on_button_created 是在窗口过程里跑的，ThumbBarAddButtons 期间 shell
+    /// 若再往窗口投消息就会递归进来。只允许一层。
+    static IN_CREATE: AtomicBool = AtomicBool::new(false);
 
     /// 安装任务栏缩略图工具栏。失败只返回 Err 由调用方记日志，绝不影响主流程。
     ///
-    /// 关键时序：init 在 setup 里跑，此刻窗口还没显示、任务栏按钮尚未创建 ——
-    /// 太早 ThumbBarAddButtons 会被 shell 静默丢掉（返回成功但按钮不渲染）。
-    /// 所以这里等窗口真正可见后再挂（最多等 10s），挂载动作扔回主线程。
+    /// 关键时序（2026-10-13 修复「三个按钮经常不显示」）：
+    /// 1. `init` 在 `setup` 里跑，**早于** `lib.rs` 末尾那次 `win.show()`。正好赶在窗口
+    ///    首次显示前把窗口过程换好，这样 shell 建好任务栏按钮后发出的 `TaskbarButtonCreated`
+    ///    不会漏收。
+    /// 2. 真正调 `ThumbBarAddButtons` 的时机交给那条消息（见 `wnd_proc` / `on_button_created`）。
+    ///    官方要求「必须先收到这条消息，才能调用任何 ITaskbarList3 方法」，早调会被 shell
+    ///    静默丢弃（返回 S_OK 但按钮不渲染）。shell 每次重建任务栏按钮都会重发它，
+    ///    所以主窗口 hide→show 后也能自动补挂。
+    /// 3. 窗口过程万一装晚了就收不到首次那条消息，这里留一条兜底：等窗口可见后主动挂一次。
     pub fn init(app: &AppHandle) -> Result<(), String> {
         let raw = app
             .get_webview_window("main")
@@ -87,12 +116,26 @@ mod imp {
         // 按钮点击回调需要 AppHandle（窗口过程是自由函数，拿不到闭包捕获）
         let _ = APP.set(app.clone());
 
+        // 消息 ID 必须先注册好：窗口过程要靠它认人
+        let msg = unsafe { RegisterWindowMessageW(w!("TaskbarButtonCreated")) };
+        if msg == 0 {
+            log::warn!("[taskbar] 注册 TaskbarButtonCreated 失败，改用兜底挂载");
+        }
+        TASKBAR_CREATED_MSG.store(msg, Ordering::Release);
+
+        // 关键：这里是 setup，主线程，且**早于** lib.rs 末尾那次 win.show()。
+        // 同步装好窗口过程（而不是 run_on_main_thread 排队 —— 排队要等 setup 返回，
+        // 那时窗口已经显示、shell 的消息已经发过了），首次显示的那条
+        // TaskbarButtonCreated 才不会漏。
+        unsafe { install_hook(raw) };
+
         let app2 = app.clone();
         let spawned = std::thread::Builder::new()
             .name("taskbar".into())
             .spawn(move || {
+                // 兜底：窗口过程万一没赶上首次显示（或注册消息拿不到），
+                // 等窗口可见后主动挂一次，避免「就是没有按钮」。
                 let hwnd = HWND(raw as *mut core::ffi::c_void);
-                // 等窗口首次显示（任务栏按钮随之创建）再挂，太早会被 shell 静默丢掉
                 let mut visible = false;
                 for _ in 0..100 {
                     if unsafe { IsWindowVisible(hwnd).as_bool() } {
@@ -105,9 +148,17 @@ mod imp {
                     log::warn!("[taskbar] 窗口 10s 内未显示，缩略图工具栏未挂载");
                     return;
                 }
-                // 再留一小段缓冲：窗口标记可见与任务栏按钮注册之间可能差一拍
+                // shell 已经发过 TaskbarButtonCreated 就别重复挂（会多一次无用调用）
+                if CREATED_COUNT.load(Ordering::Acquire) > 0 {
+                    return;
+                }
+                // 窗口可见 ≠ 任务栏按钮已注册，留一拍给 shell
                 std::thread::sleep(Duration::from_millis(300));
-                let _ = app2.run_on_main_thread(move || unsafe { add_buttons(raw) });
+                if CREATED_COUNT.load(Ordering::Acquire) > 0 {
+                    return;
+                }
+                log::info!("[taskbar] 未收到 TaskbarButtonCreated，改用兜底挂载");
+                let _ = app2.run_on_main_thread(|| unsafe { on_button_created() });
             });
         if spawned.is_err() {
             return Err(format!("等待线程创建失败: {:?}", spawned.err()));
@@ -115,8 +166,12 @@ mod imp {
         Ok(())
     }
 
-    /// 在主线程上挂载缩略图工具栏（须等窗口可见后调用）
-    unsafe fn add_buttons(hwnd_raw: isize) {
+    /// 换掉窗口过程、备好图标（须在主线程、且尽量在窗口首次显示前调用）。
+    /// 幂等：重复调用直接返回。
+    unsafe fn install_hook(hwnd_raw: isize) {
+        if STATE.lock().map(|g| g.is_some()).unwrap_or(false) {
+            return;
+        }
         let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
 
         // tao 通常已为主线程初始化过 COM，重复初始化返回 RPC_E_CHANGED_MODE 属正常
@@ -145,7 +200,54 @@ mod imp {
             play: make_icon(Glyph::Play, size, r, g, b).0 as isize,
             pause: make_icon(Glyph::Pause, size, r, g, b).0 as isize,
             next: make_icon(Glyph::Next, size, r, g, b).0 as isize,
+            size,
+            light,
         };
+
+        // 换窗口过程：按钮点击（WM_COMMAND）和 shell 的 TaskbarButtonCreated 都靠它。
+        // 原过程要透传（鼠标移动、重绘…），所以必须先存下来。
+        let proc_ptr: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT = wnd_proc;
+        // 同 lyric_window.rs：32 位下该函数是 SetWindowLongW 的 re-export，入参 i32、
+        // 返回 i32。入参用 `as _` 自适应宽度；返回值显式 `as isize` 归一化回
+        // OLD_PROC: AtomicIsize 与后面 transmute::<isize, _> 需要的类型。
+        let old = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, proc_ptr as usize as _) as isize;
+        if old == 0 {
+            // 不敢 return：STATE 仍要置位，兜底路径靠它拿 hwnd / icons 挂按钮
+            log::warn!("[taskbar] 窗口过程替换失败，缩略图按钮点击不会生效");
+        }
+        OLD_PROC.store(old, Ordering::Release);
+
+        if let Ok(mut guard) = STATE.lock() {
+            *guard = Some(Inner {
+                hwnd: hwnd_raw,
+                icons,
+            });
+        }
+
+        log::info!(
+            "[taskbar] 窗口过程已接管（图标 {size}px、{}主题），等待 shell 的 TaskbarButtonCreated",
+            if light { "浅色" } else { "深色" }
+        );
+    }
+
+    /// 把三个按钮挂到当前任务栏按钮上（须在收到 `TaskbarButtonCreated` 之后调用）。
+    /// shell 每次重建任务栏按钮都会重发该消息，这里也就跟着重新挂一遍。
+    unsafe fn on_button_created() {
+        // 只允许一层：本函数在窗口过程里被调用，COM 调用期间 shell 可能再投消息进来
+        if IN_CREATE.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // 下面有多条提前 return 的分支，靠 RAII 复位，免得漏掉某条把标志永久卡住
+        let _guard = CreateGuard;
+
+        let Some((hwnd_raw, icons)) = STATE
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|i| (i.hwnd, i.icons)))
+        else {
+            return;
+        };
+        let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
 
         // 初始播放/暂停图标按真实状态画（启动即恢复播放时 publish 已把 LAST_PLAYING 置真）
         let playing = LAST_PLAYING.load(Ordering::Relaxed);
@@ -175,34 +277,32 @@ mod imp {
             return;
         }
 
-        // 换窗口过程以接收按钮点击；失败也不回滚按钮（点了没反应而已）
-        let proc_ptr: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT = wnd_proc;
-        // 同 lyric_window.rs：32 位下该函数是 SetWindowLongW 的 re-export，入参 i32、
-        // 返回 i32。入参用 `as _` 自适应宽度；返回值显式 `as isize` 归一化回
-        // OLD_PROC: AtomicIsize 与后面 transmute::<isize, _> 需要的类型。
-        let old = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, proc_ptr as usize as _) as isize;
-        if old == 0 {
-            log::warn!("[taskbar] 窗口过程替换失败，缩略图按钮点击不会生效");
-        }
-        OLD_PROC.store(old, Ordering::Release);
-
-        if let Ok(mut guard) = STATE.lock() {
-            *guard = Some(Inner {
-                hwnd: hwnd_raw,
-                icons,
-            });
-        }
-
         log::info!(
-            "[taskbar] 任务栏缩略图工具栏已启用（上一首 / 播放暂停 / 下一首），图标 {size}px、{}主题",
-            if light { "浅色" } else { "深色" }
+            "[taskbar] 任务栏缩略图工具栏已启用（上一首 / 播放暂停 / 下一首），图标 {}px、{}主题",
+            icons.size,
+            if icons.light { "浅色" } else { "深色" }
         );
+    }
+
+    /// 防重入标志的 RAII 守卫：on_button_created 提前返回也不漏复位
+    struct CreateGuard;
+
+    impl Drop for CreateGuard {
+        fn drop(&mut self) {
+            IN_CREATE.store(false, Ordering::Release);
+        }
     }
 
     /// 播放状态同步：只在「播放 ↔ 暂停」翻转时更新按钮图标。
     /// 从音频引擎线程调用，实际动 COM 的活儿扔回主线程做。
     pub fn sync(playing: bool) {
         if LAST_PLAYING.swap(playing, Ordering::Relaxed) == playing {
+            return;
+        }
+        // 还没收到过 TaskbarButtonCreated，按钮尚不存在：此刻调 ThumbBarUpdateButtons
+        // 会被 shell 丢掉。不要紧 —— LAST_PLAYING 已经更新，首次挂载时 on_button_created
+        // 会按它画出正确的初始图标。
+        if CREATED_COUNT.load(Ordering::Acquire) == 0 {
             return;
         }
         let Some(app) = APP.get().cloned() else {
@@ -261,14 +361,21 @@ mod imp {
         btn
     }
 
-    /// 替换后的窗口过程：只吃掉自己的按钮点击，其余原样透传
+    /// 替换后的窗口过程：认 shell 的 `TaskbarButtonCreated` 和自家按钮点击，其余原样透传
     unsafe extern "system" fn wnd_proc(
         hwnd: HWND,
         msg: u32,
         wparam: WPARAM,
         lparam: LPARAM,
     ) -> LRESULT {
-        if msg == WM_COMMAND {
+        // shell 建好（或重建）任务栏按钮后发这条注册消息，这才是挂按钮的唯一正确时机。
+        // 主窗口 hide→show（关闭收进托盘再打开）会走一遍重建，于是自动补挂。
+        let created = TASKBAR_CREATED_MSG.load(Ordering::Acquire);
+        if created != 0 && msg == created {
+            CREATED_COUNT.fetch_add(1, Ordering::AcqRel);
+            on_button_created();
+            // 不 return：继续透传给原过程，tao / tray-icon 也要收这条消息
+        } else if msg == WM_COMMAND {
             let id = (wparam.0 & 0xFFFF) as u32;
             let code = ((wparam.0 >> 16) & 0xFFFF) as u32;
             if code == THBN_CLICKED && matches!(id, BTN_PREV | BTN_PLAY | BTN_NEXT) {
@@ -287,7 +394,9 @@ mod imp {
 
         let old = OLD_PROC.load(Ordering::Acquire);
         if old == 0 {
-            return LRESULT(0);
+            // 没能拿到原过程（理论上只在替换失败时发生）：交给系统默认处理，
+            // 比返回 0 安全 —— 无边框窗口的命中测试靠 WM_NCCALCSIZE / WM_NCHITTEST。
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
         }
         let prev: Option<unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT> =
             Some(core::mem::transmute::<
