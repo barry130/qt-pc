@@ -112,7 +112,17 @@ pub(crate) async fn source_builtin_request(
     // 上游 content-type 不可靠（网易歌单接口回 text/plain、QQ 回 x-javascript、
     // 酷狗回 text/html），对齐蓝本 http.ts 的行为：不看 content-type 直接尝试
     // JSON 解析，失败则原样字符串。
-    let text = res.text().await.map_err(crate::astral::sanitize_err)?;
+    //
+    // 这里不能直接调用 `res.text()`：Range 预检的 FLAC STREAMINFO 位深字段位于
+    // 二进制字节中，先按 UTF-8 解码会把高位字节替换/展开，包侧再也无法按字节偏移
+    // 读取。先保留原始响应字节做一次可靠嗅探，再按原有文本契约交给脚本。
+    let raw = res.bytes().await.map_err(crate::astral::sanitize_err)?;
+    if let Some(bits) = flac_bits_of(&raw) {
+        // 这是宿主附加的只读元信息，不是上游响应头；键名带 qt 前缀避免与 CDN
+        // 同名头混淆。包侧通过既有 headers 契约读取，未知/解析失败则按未知处理。
+        headers.insert("x-qt-flac-bits".to_string(), bits.to_string());
+    }
+    let text = String::from_utf8_lossy(&raw).into_owned();
     let body =
         serde_json::from_str::<serde_json::Value>(&text).unwrap_or(serde_json::Value::String(text));
     Ok(SourceResponse {
@@ -4586,10 +4596,46 @@ pub async fn cmd_official_site_url() -> String {
     crate::runtime_config::official_site_url().to_string()
 }
 
+/// 从规范 FLAC 文件头解析每采样位数（bps）。
+///
+/// 只认 `fLaC` + 首个元数据块为 STREAMINFO、长度为 34 字节的布局；
+/// 解析失败时返回 None，调用方不注入附加头，让包侧按“未知”处理。
+/// STREAMINFO 的采样率/声道/bps 共用 8 字节定点区，bps-1 位于文件字节
+/// 20 的最低位与字节 21 的高四位：`((b[20] & 1) << 4) | (b[21] >> 4)`。
+fn flac_bits_of(bytes: &[u8]) -> Option<u8> {
+    if bytes.len() < 42 || &bytes[0..4] != b"fLaC" {
+        return None;
+    }
+    // 元数据块头：最高位是 last-block 标志，低 7 位必须是 STREAMINFO 类型 0。
+    if bytes[4] & 0x7f != 0 {
+        return None;
+    }
+    let block_len = (u32::from(bytes[5]) << 16)
+        | (u32::from(bytes[6]) << 8)
+        | u32::from(bytes[7]);
+    if block_len != 34 {
+        return None;
+    }
+    // 顺手验证固定区里的采样率非零，避免把伪造的 fLaC 前缀当成音频元数据。
+    let sample_rate = (u32::from(bytes[18]) << 12)
+        | (u32::from(bytes[19]) << 4)
+        | u32::from(bytes[20] >> 4);
+    if sample_rate == 0 {
+        return None;
+    }
+    let bits_minus_one = (u16::from(bytes[20] & 1) << 4) | u16::from(bytes[21] >> 4);
+    let bits = bits_minus_one + 1;
+    if (4..=32).contains(&bits) {
+        Some(bits as u8)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        audio_ext_from_url, explorer_select_arg, remove_local_file,
+        audio_ext_from_url, explorer_select_arg, flac_bits_of, remove_local_file,
         reveal_in_file_manager_blocking, unique_download_path,
     };
     use crate::provider::types::{SourceId, Track};
@@ -4738,5 +4784,41 @@ mod tests {
         assert!(!playlists.is_empty(), "歌单列表不应为空");
         let first = &playlists[0];
         assert!(first.get("id").is_some(), "歌单应有 id 字段");
+    }
+
+    fn flac_header(sample_rate: u32, bits: u8) -> Vec<u8> {
+        let mut bytes = b"fLaC".to_vec();
+        // 非末尾 STREAMINFO 元数据块：类型 0，长度固定 34 字节。
+        bytes.extend_from_slice(&[0, 0, 0, 34]);
+        bytes.extend_from_slice(&[0u8; 34]);
+        bytes[18] = (sample_rate >> 12) as u8;
+        bytes[19] = (sample_rate >> 4) as u8;
+        bytes[20] = ((sample_rate & 0x0f) as u8) << 4;
+        // 立体声：channels - 1 = 1，占 file[20] 的 bit 1..3。
+        bytes[20] |= 1 << 1;
+        let bits_minus_one = bits - 1;
+        bytes[20] |= (bits_minus_one >> 4) & 1;
+        bytes[21] = (bits_minus_one & 0x0f) << 4;
+        bytes
+    }
+
+    #[test]
+    fn flac_bits_of_reads_streaminfo_bit_depth_before_utf8_decode() {
+        assert_eq!(flac_bits_of(&flac_header(44_100, 16)), Some(16));
+        assert_eq!(flac_bits_of(&flac_header(88_200, 24)), Some(24));
+    }
+
+    #[test]
+    fn flac_bits_of_rejects_incomplete_or_invalid_headers() {
+        assert_eq!(flac_bits_of(b"fLaC"), None);
+        assert_eq!(flac_bits_of(b"ID3xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"), None);
+
+        let mut wrong_block = flac_header(44_100, 16);
+        wrong_block[4] = 1;
+        assert_eq!(flac_bits_of(&wrong_block), None);
+
+        let mut wrong_length = flac_header(44_100, 16);
+        wrong_length[7] = 33;
+        assert_eq!(flac_bits_of(&wrong_length), None);
     }
 }
