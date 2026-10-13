@@ -6,7 +6,7 @@
 //! - read 落在未就绪区间 → 阻塞等待；seek 到未就绪区间 → 通知下载线程
 //!   发起新 Range 请求重定位下载点（含前向 seek；由此产生的空洞由读取触发时回填）
 //! - 服务端不支持 Range（200 而非 206）→ 退化为「先下完再播」（spool 模式）
-//! - 单曲缓冲上限 100MB
+//! - 单曲缓冲上限 512MB（超限即拒播，见 `MAX_BUFFER_BYTES`）
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -19,8 +19,24 @@ use sha1::{Digest, Sha1};
 
 /// 首包超时（DESIGN §6.12：默认 8s，判定为不可播放）
 pub const FIRST_PACKET_TIMEOUT: Duration = Duration::from_secs(8);
-/// 单曲缓冲上限（覆盖 FLAC）
-const MAX_BUFFER_BYTES: u64 = 100 * 1024 * 1024;
+/// 单曲缓冲上限（覆盖 FLAC / flac24bit：单曲最长约 135MB）。
+///
+/// 独立于缓存总量设置（`cache.audioLimitMb`）——那是整个缓存目录的 LRU 总预算，
+/// 单首大文件的界限是另一回事。512MB 远超任何正常 flac24bit 曲目（实测最高约
+/// 5500kbps，6 分钟即 ~135MB），又足以挡住异常超长文件在写盘前预分配。
+pub const MAX_BUFFER_BYTES: u64 = 512 * 1024 * 1024;
+/// 「超出单曲缓冲上限」错误的文案前缀（错误判据的唯一来源）。
+///
+/// 这条失败**不是环境问题**：重取播放地址改变不了文件长度，换源也一样。
+/// 上层（`engine::LoadJob`）据此跳过「作废缓存 URL 重取一次」的弯路，直接
+/// 给用户一句看得懂的提示。判据必须只认这一条 —— 把 HTTP 5xx / 起点异常
+/// 之类**可重取**的失败误判成「文件过大」会让引擎白白放弃可救的地址。
+pub const BUFFER_LIMIT_PREFIX: &str = "音频文件超出缓冲上限";
+
+/// 判断一条「打开音频流」的错误文案是否是超单曲缓冲上限（见 `BUFFER_LIMIT_PREFIX`）。
+pub fn is_buffer_limit_error(message: &str) -> bool {
+    message.contains(BUFFER_LIMIT_PREFIX)
+}
 /// 流中断重试次数（连续失败 → failed，上层广播 audio-error）
 const MAX_RETRIES: u32 = 3;
 /// 空洞待回填时空闲轮询间隔
@@ -300,8 +316,10 @@ pub fn open(
 
     if let Some(len) = total_from_header {
         if len > MAX_BUFFER_BYTES {
+            // 文案前缀是判据（见 BUFFER_LIMIT_PREFIX），别随手改
             return Err(io::Error::other(format!(
-                "音频文件超出缓冲上限（{len} 字节）"
+                "{BUFFER_LIMIT_PREFIX}（{len} 字节，上限 {} 字节）",
+                MAX_BUFFER_BYTES
             )));
         }
         file.set_len(len)?;
@@ -837,6 +855,45 @@ mod tests {
         match body.read_with_timeout(&mut out, Duration::from_secs(5)) {
             BodyRead::Data(n) => assert_eq!(n, 3),
             _ => panic!("期望继续读到数据"),
+        }
+    }
+
+    /// 单曲缓冲上限必须盖得住 flac24bit（实测单曲最大约 135MB）。
+    /// 100MB 时代真机复现过：`音频文件超出缓冲上限（141238577 字节）`。
+    #[test]
+    fn buffer_limit_covers_flac24bit_tracks() {
+        const REAL_FLAC24BIT_BYTES: u64 = 141_238_577;
+        assert!(
+            MAX_BUFFER_BYTES > REAL_FLAC24BIT_BYTES,
+            "上限 {MAX_BUFFER_BYTES} 字节盖不住实测的 {REAL_FLAC24BIT_BYTES} 字节 flac24bit"
+        );
+    }
+
+    /// 上限判据只认自己这条文案：可重取的失败（HTTP 5xx、起点异常、连接中断）
+    /// 绝不能被误判成「文件过大」，否则引擎会白白放弃本可救回的地址。
+    #[test]
+    fn buffer_limit_predicate_matches_only_the_cap_message() {
+        // 真·超限文案（含字节数与上限）
+        let real = format!(
+            "{BUFFER_LIMIT_PREFIX}（{} 字节，上限 {MAX_BUFFER_BYTES} 字节）",
+            141_238_577u64
+        );
+        assert!(is_buffer_limit_error(&real));
+
+        // 可重取的失败：一个都不许命中
+        for other in [
+            "HTTP 状态 503",
+            "HTTP 状态 502 Bad Gateway",
+            "Content-Range 起点异常：期望 0，实际 1048576",
+            "连接中断: connection reset by peer",
+            "请求超时",
+            "播放地址解析失败",
+            "",
+        ] {
+            assert!(
+                !is_buffer_limit_error(other),
+                "「{other}」不该被判成文件过大"
+            );
         }
     }
 }

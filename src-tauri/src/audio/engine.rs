@@ -1640,6 +1640,12 @@ fn advance(inner: &mut EngineInner, auto: bool) {
 /// 就关闭 auto_next 并发系统通知，防止死歌队列一首接一首白等取链无限空转。
 const FAIL_STREAK_LIMIT: u32 = 5;
 
+/// 文件超出单曲缓冲上限（`range_reader::MAX_BUFFER_BYTES`）时给用户的整条文案。
+///
+/// 不套「该歌曲暂时无法播放（…）」的壳：那不是暂时故障，重取地址/换源/等一会儿
+/// 都不会改变文件长度。见 `LoadJob::run` 里的 `is_buffer_limit_error` 短路。
+const MSG_FILE_TOO_LARGE: &str = "该歌曲文件过大，暂不支持在线播放";
+
 /// 弱网原地重试：首次失败后等这么久再试**同一首**（指数退避，封顶见下）。
 const STALLED_RETRY_BASE_MS: u64 = 3_000;
 /// 弱网连续重试上限：超过就不再自动重试（避免网络长时间不可用时空转）。
@@ -2096,6 +2102,21 @@ impl LoadJob {
                         self.dispatch_ready(built, false, Some(fetched_at), Some(play_url))
                     }
                     Err(first_err) => {
+                        // 文件本身就超出单曲缓冲上限：这不是地址问题 —— 重取地址、
+                        // 换线路都改变不了文件长度，白跑一轮还会把这首的地址缓存
+                        // 白白作废。直接按内容问题报错，给一句看得懂的提示。
+                        if range_reader::is_buffer_limit_error(&first_err) {
+                            log::warn!(
+                                "[queue] 曲目 {} 文件超出单曲缓冲上限，跳过重取: {first_err}",
+                                self.track.id
+                            );
+                            self.dispatch_failed_message(
+                                "load",
+                                MSG_FILE_TOO_LARGE.to_string(),
+                                false,
+                            );
+                            return;
+                        }
                         // 打开流失败最常见两种：休眠唤醒后的半死连接、缓存的
                         // 签名 URL 已过期 —— 作废缓存重取一次再打开，仍失败才算真失败
                         log::warn!("[queue] 打开音频流失败（{first_err}），作废缓存 URL 重取一次");
@@ -2223,6 +2244,17 @@ impl LoadJob {
         } else {
             format!("该歌曲暂时无法播放（{detail}）")
         };
+        self.dispatch_failed_message(kind, message, stalled);
+    }
+
+    /// 回发失败（整条文案由调用方给定）。
+    ///
+    /// 与 `dispatch_load_failed` 的差别只在文案：后者会把 `detail` 套进
+    /// 「暂时无法播放」的壳，而这个壳暗示「过会儿再试可能就好了」。文件超出
+    /// 单曲缓冲上限属于确定的放不了 —— 重取地址、换源、等一会儿都不会改变
+    /// 文件长度，套那个壳只会让用户反复重试。`stalled` 仍然照传，引擎侧
+    /// 据此决定是否拉黑、是否计入连续失败熔断。
+    fn dispatch_failed_message(self, kind: &'static str, message: String, stalled: bool) {
         let _ = self.app.emit(
             "audio-error",
             serde_json::json!({
@@ -2612,5 +2644,49 @@ mod stall_watch_tests {
         w.mark_dead(false);
         assert_eq!(w.window(), STALL_DEAD_TIMEOUT);
         assert_eq!(w.poll(0, t0 + STALL_DEAD_TIMEOUT), Some(1));
+    }
+}
+
+/// 超单曲缓冲上限的失败分类（2026-10-13 真机：flac24bit 141238577 字节被拒播）。
+///
+/// 这组断言守的是「别把这类失败当弱网」：一旦被当成环境问题，`LoadJob` 会白跑
+/// 一轮「作废地址 + 重取」，而结果注定一样。
+#[cfg(test)]
+mod buffer_limit_tests {
+    use super::*;
+    use crate::audio::range_reader;
+
+    /// 真机原样文案必须被认出来（判据来自 `range_reader::BUFFER_LIMIT_PREFIX`）。
+    #[test]
+    fn real_device_message_is_classified_as_too_large() {
+        let real = format!(
+            "{}（141238577 字节，上限 {} 字节）",
+            range_reader::BUFFER_LIMIT_PREFIX,
+            range_reader::MAX_BUFFER_BYTES
+        );
+        assert!(range_reader::is_buffer_limit_error(&real));
+    }
+
+    /// 给用户的文案不套「暂时无法播放」的壳 —— 那暗示等一会儿就好。
+    #[test]
+    fn file_too_large_message_promises_no_retry() {
+        assert!(!MSG_FILE_TOO_LARGE.contains("暂时"));
+        assert!(MSG_FILE_TOO_LARGE.contains("过大"));
+    }
+
+    /// 上限判据不能把可重取的失败一起吃进去（否则白白放弃可救的地址）。
+    #[test]
+    fn retryable_failures_are_not_classified_as_too_large() {
+        for other in [
+            "HTTP 状态 503",
+            "Content-Range 起点异常",
+            "连接中断: connection reset by peer",
+            "首包超时",
+        ] {
+            assert!(
+                !range_reader::is_buffer_limit_error(other),
+                "「{other}」不该被判成文件过大"
+            );
+        }
     }
 }
