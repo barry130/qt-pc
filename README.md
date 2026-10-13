@@ -67,7 +67,8 @@ Vite 开发服务器固定监听 `http://localhost:1420` —— 端口单源于 
 后端地址由单一配置源生成，落点在 `src-tauri/src/app_config.rs`（`astral.rs` 转指到它）：
 
 - 开发：`http://localhost:27000/api/v1/`
-- 生产：`https://astral.canace.cn/api/v1/`（**当前生效**，`backend.active = "prod"`）
+- 生产：自有域名，**不在文档里写明文**；取值见 `app.config.json` 的 `backend.prod`。
+  当前生效哪一条由同文件的 `backend.active` 决定（现为 `prod`，即默认走生产后端）
 
 > 切换环境只改 `app.config.json` 的 `backend.active`（`dev` / `prod`）再跑 `pnpm config:sync` 重新编译，
 > 不要手改 `app_config.rs` / `astral.rs` 里的地址字面量。详见 [`docs/CONFIG.md`](docs/CONFIG.md)。
