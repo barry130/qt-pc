@@ -110,6 +110,30 @@ describe("parseWordByWordLrc 词时间轴口径归一", () => {
     expect(lines[0].words?.map((w) => w.startMs)).toEqual([0, 224, 448]);
   });
 
+  it("绝对时间但末词远早于行尾（QRC 行尾留白）：仍按绝对折算", () => {
+    // 真实线上行（qq 曲尽陈情 [152417,6401]）：首词贴行起点，末词终点 158001
+    // 距 timeMs+durationMs=158818 差 817ms —— 旧口径的 400ms 上限把它判成相对，
+    // 词起点留成绝对毫秒，整行恒 0% 染色（这就是「同一首歌有的行能逐字有的不行」）。
+    const lines = parseWordByWordLrc(
+      "[152417,6401]无(152417,456)端(152873,368)瞬(156977,1024)",
+    );
+    expect(lines[0].words?.map((w) => w.startMs)).toEqual([0, 456, 4560]);
+    // 折算后逐字染色才推得动：行内 500ms 处 → 首词唱完
+    expect(karaokeFillRatio(lines[0], 500)).toBeGreaterThan(0);
+  });
+
+  it("相对时间但末词远超时长：不误判成绝对（只认首词锚点）", () => {
+    // kg 形态：首词 0，末词终点超出 durationMs 也仍保持相对
+    const lines = parseWordByWordLrc("[3485,500]你(0,224)好(224,9000)");
+    expect(lines[0].words?.map((w) => w.startMs)).toEqual([0, 224]);
+  });
+
+  it("行时长为 0：照样能折算（时长已不参与判定）", () => {
+    // 真实线上行（qq [57681,0]…）：旧实现把 durationMs 当判据，为 0 就整行跳过归一
+    const lines = parseWordByWordLrc("[57681,0]无(57681,456)端(58137,368)");
+    expect(lines[0].words?.map((w) => w.startMs)).toEqual([0, 456]);
+  });
+
   it("行文本由词拼接而来，归一不影响文本", () => {
     const lines = parseWordByWordLrc("[9330,672]你(9330,224)好(9554,224)");
     expect(lines[0].text).toBe("你好");

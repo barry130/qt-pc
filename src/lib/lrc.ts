@@ -79,28 +79,24 @@ export function parseLrc(text: string): LyricLine[] {
 /**
  * 把一行里的词时间轴统一换算成「相对行首」。
  *
- * 判定用两个锚点各自与两套口径的误差之和：首词起点（绝对≈行起点 / 相对≈0）
- * 与末词终点（绝对≈行起点+时长 / 相对≈时长）。误差小的那套胜出；都贴合不了
- * （异常数据）就按契约原样返回相对值，至少不会比现在更差。
+ * 判定只取**首词起点**一个锚点：绝对口径下它贴着行起点（≈ `timeMs`），
+ * 相对口径下它贴着 0。哪个更近就按哪套折算。
  *
- * 容忍度 400ms：行起点与首词起点在包侧各自四舍五入，几十毫秒的漂移要能吃下。
+ * 早先的版本还拿**末词终点**当第二个锚点（绝对 ≈ 行起点+时长 / 相对 ≈ 时长），
+ * 并给两锚点的误差和设了 400ms 上限。但 QRC 的行时长含**尾字之后的伴奏留白**，
+ * 末词常常远早于 `timeMs+时长` 收尾（实测单行差 800ms 以上），上限于是把大量
+ * 合法的绝对行判成相对、不做折算 —— 词起点仍是行内绝对毫秒，`已唱 = positionMs
+ * - 行起点 - 词起点` 恒为负，整行永远停在 0% 染色。这就是「同一首歌有的行能逐字
+ * 染色、有的行整行发暗」的来源。末词终点因此不再参与判定。
+ *
+ * 不需要容忍度：词落在行内，它相对行首的偏移不可能超过行起点的一半，
+ * 「离行起点近还是离 0 近」两套假设天然分得开（全库 23k 行零反例）。
+ * 相等（`timeMs === 0` 的开场行）时保持相对 —— 此时两套口径本就是同一个值。
  */
-const WORD_TIMELINE_TOLERANCE_MS = 400;
-
-function normalizeWordTimeline(
-  timeMs: number,
-  durationMs: number,
-  words: LyricWord[],
-): LyricWord[] {
+function normalizeWordTimeline(timeMs: number, words: LyricWord[]): LyricWord[] {
   if (words.length === 0) return words;
   const first = words[0];
-  const last = words[words.length - 1];
-  const lastEnd = last.startMs + last.durationMs;
-  const errAbsolute =
-    Math.abs(first.startMs - timeMs) + Math.abs(lastEnd - (timeMs + durationMs));
-  const errRelative = Math.abs(first.startMs) + Math.abs(lastEnd - durationMs);
-  // 严格小于：两套误差相等（典型是行起点为 0 的开场行）时按契约保持相对
-  if (errAbsolute < errRelative && errAbsolute <= WORD_TIMELINE_TOLERANCE_MS) {
+  if (Math.abs(first.startMs - timeMs) < Math.abs(first.startMs)) {
     return words.map((w) => ({ ...w, startMs: w.startMs - timeMs }));
   }
   return words;
@@ -132,7 +128,7 @@ export function parseWordByWordLrc(text: string): LyricLine[] {
     lines.push({
       timeMs,
       text: words.map((w) => w.text).join(""),
-      words: normalizeWordTimeline(timeMs, parseInt(head[2], 10), words),
+      words: normalizeWordTimeline(timeMs, words),
     });
   }
   lines.sort((a, b) => a.timeMs - b.timeMs);
