@@ -2556,10 +2556,23 @@ fn sanitize_file_name(s: &str) -> String {
     }
 }
 
+/// 该档位是否按无损落盘（URL 没给可用后缀时的兜底判据）。
+///
+/// 只认明确以 FLAC 容器交付的档位。注意 **不能写成 `quality != "128" && … != "320"`
+/// 之外的「非数字即无损」**：dolby / atmos 一类的空间音频档交付的是 mp4/m4a 容器，
+/// 兜底成 `.flac` 同样是虚标。档位是数据包声明的开放字符串，新增档位时改这里。
+fn is_lossless_quality(quality: &str) -> bool {
+    matches!(quality, "flac" | "flac24bit" | "hires" | "master")
+}
+
 /// 从取址 URL 推断音频扩展名；URL 没有可用后缀时按音质兜底。
 ///
 /// 无损地址各源都会带明确的 `.flac`，但 kw 的 `format=flac|mp3|aac` 在无无损源时
 /// 会真的回退成 mp3，所以优先信 URL，信不过再退回音质映射。
+///
+/// 兜底必须用 `is_lossless_quality` 而不是 `quality == "flac"`：2026-10 加了
+/// `flac24bit` 档后，QQ / kw 部分直链是带 query 的裸路径（URL 侧取不到后缀），
+/// 旧写法会把一个真 24bit FLAC 落盘成 `.mp3`（比 mp3 存成 flac 更离谱）。
 fn audio_ext_from_url(url: &str, quality: &str) -> String {
     let path = url.split(['?', '#']).next().unwrap_or(url);
     let segment = path.rsplit('/').next().unwrap_or("");
@@ -2572,7 +2585,7 @@ fn audio_ext_from_url(url: &str, quality: &str) -> String {
             return ext;
         }
     }
-    if quality == "flac" {
+    if is_lossless_quality(quality) {
         "flac".to_string()
     } else {
         "mp3".to_string()
@@ -4671,6 +4684,23 @@ mod tests {
         // 非音频后缀（如已失效的重定向地址）也走音质兜底
         assert_eq!(audio_ext_from_url("https://cdn/x.html", "flac"), "flac");
         assert_eq!(audio_ext_from_url("https://cdn/x.html", "128"), "mp3");
+    }
+
+    #[test]
+    fn ext_falls_back_to_flac_for_24bit_quality() {
+        // flac24bit / hires 与 flac 一样是 FLAC 容器：裸路径直链（QQ、kw 部分
+        // 节点的 URL 不带后缀）必须兜底成 .flac，旧实现在这里落 .mp3
+        assert_eq!(audio_ext_from_url("https://cdn/track/file", "flac24bit"), "flac");
+        assert_eq!(audio_ext_from_url("https://cdn/x.html", "flac24bit"), "flac");
+        assert_eq!(audio_ext_from_url("https://cdn/track/file", "hires"), "flac");
+        assert_eq!(audio_ext_from_url("https://cdn/track/file", "master"), "flac");
+        // 空间音频档不是 FLAC 容器，不能跟着一起兜底成 .flac
+        assert_eq!(audio_ext_from_url("https://cdn/track/file", "dolby"), "mp3");
+        // URL 后缀仍然优先（实测档位比请求档可信，但 URL 比两者都直接）
+        assert_eq!(
+            audio_ext_from_url("https://cdn/a.mp3?k=v", "flac24bit"),
+            "mp3"
+        );
     }
 
     #[test]
