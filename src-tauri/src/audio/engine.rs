@@ -68,8 +68,6 @@ pub enum AudioCmd {
         /// 当前实际播放地址（在线源才有）。换源兜底后它指向目标源，
         /// 歌词按它查换源记录换源取词（DESIGN 换源一致性）
         play_url: Option<String>,
-        /// 取链侧按实测码率重贴的档位（只降不升）；空串 = 没测出来，请求即实际
-        actual_quality: String,
         /// 取链侧 Range 探测出的文件总字节数（None = 没测出来）。挂载时优先用它，
         /// 缺了才回落到已挂载流自己的 Content-Length —— 分块传输（无长度）的流
         /// 只有取链侧这份探测结果，丢了就等于播放条永远不显示码率。
@@ -978,7 +976,6 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             is_local,
             url_fetched_at,
             play_url,
-            actual_quality,
             size_bytes,
             gen,
         } => {
@@ -1001,7 +998,6 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                     is_local,
                     url_fetched_at,
                     play_url,
-                    actual_quality,
                     size_bytes,
                 );
             }
@@ -1070,7 +1066,6 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                 st.track_id = None;
                 st.track = None;
                 st.bitrate_kbps = None;
-                st.actual_quality = String::new();
             });
             inner.persist_state();
         }
@@ -1589,10 +1584,9 @@ fn load_queue_track(inner: &mut EngineInner, track: Track, autoplay: bool, start
         st.duration_ms = 0;
         st.buffered_ms = 0;
         st.is_local = false;
-        // 上一首的实测码率/档位不能挂在新歌头上：Loading 期显示旧值等于撒谎。
+        // 上一首的实测码率不能挂在新歌头上：Loading 期显示旧值等于撒谎。
         // 新值要等流真正挂上（mount_decoder）才算得出来。
         st.bitrate_kbps = None;
-        st.actual_quality = String::new();
     });
     spawn_resolve_and_load(inner, track, autoplay, start_ms, gen);
 }
@@ -2097,9 +2091,8 @@ impl LoadJob {
                 let url = hit.url;
                 let referer = hit.referer;
                 let fetched_at = hit.fetched_at;
-                // 取链侧已经用 Range 探到了文件真实长度，并按实测码率重贴过档位；
-                // 这两条是播放条显示"实际码率/实际音质"的唯一来源，别在这里丢掉。
-                let real_quality = hit.actual_quality;
+                // 取链侧已经用 Range 探到了文件真实长度，这是播放条显示"实际码率"
+                // 的一条来源（分块传输的流自己读不到 Content-Length），别在这里丢掉。
                 let size_bytes = hit.size;
                 log::debug!(
                     "[queue] resolve ok track={} url_host={}",
@@ -2123,7 +2116,6 @@ impl LoadJob {
                         false,
                         Some(fetched_at),
                         Some(play_url),
-                        real_quality,
                         size_bytes,
                     ),
                     Err(first_err) => {
@@ -2163,7 +2155,6 @@ impl LoadJob {
                                 let url2 = hit2.url;
                                 let referer2 = hit2.referer;
                                 let fetched_at2 = hit2.fetched_at;
-                                let real_quality2 = hit2.actual_quality;
                                 let size_bytes2 = hit2.size;
                                 let source2 = PlaySource::Online {
                                     url: url2.clone(),
@@ -2176,7 +2167,6 @@ impl LoadJob {
                                         false,
                                         Some(fetched_at2),
                                         Some(url2),
-                                        real_quality2,
                                         size_bytes2,
                                     ),
                                     Err(e2) => self.dispatch_load_failed(
@@ -2235,14 +2225,7 @@ impl LoadJob {
             PlaySource::Online { .. } => None,
         };
         match self.try_build(&source).await {
-            Ok(built) => self.dispatch_ready(
-                built,
-                is_local,
-                fetched_at,
-                None,
-                String::new(),
-                size_bytes,
-            ),
+            Ok(built) => self.dispatch_ready(built, is_local, fetched_at, None, size_bytes),
             // 本地文件读不出来是内容问题，不算环境问题
             Err(e) => self.dispatch_load_failed("load", &e, false),
         }
@@ -2255,7 +2238,6 @@ impl LoadJob {
         is_local: bool,
         fetched_at: Option<u64>,
         play_url: Option<String>,
-        actual_quality: String,
         size_bytes: Option<u64>,
     ) {
         let (decoder, shared, duration_ms) = built;
@@ -2273,7 +2255,6 @@ impl LoadJob {
             is_local,
             url_fetched_at: fetched_at,
             play_url,
-            actual_quality,
             size_bytes,
             gen: self.gen,
         });
@@ -2376,7 +2357,6 @@ fn mount_decoder(
     is_local: bool,
     url_fetched_at: Option<u64>,
     play_url: Option<String>,
-    actual_quality: String,
     probed_size: Option<u64>,
 ) {
     inner.failed_tracks.remove(&track.id);
@@ -2444,7 +2424,6 @@ fn mount_decoder(
         st.url_fetched_at = url_fetched_at;
         st.play_url = play_url;
         st.bitrate_kbps = bitrate_kbps;
-        st.actual_quality = actual_quality;
     });
     inner.tick_anchor = None;
     emit_position_tick(inner);

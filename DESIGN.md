@@ -1199,9 +1199,6 @@ pub struct PlaybackState {
     /// None = 测不出来（本地文件 / 服务端没给长度 / 时长未知），前端此时不显示
     /// 码率——显示 0 会被读成"码率极低"，那是假消息。
     pub bitrate_kbps: Option<u32>,
-    /// 实测后重贴的档位（取链侧按实测码率**只降不升**地重新贴档）。
-    /// 空串 = 这次没测出来、没重贴，请求的 `quality` 就是实际档位。
-    pub actual_quality: String,
 }
 ```
 

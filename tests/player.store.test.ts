@@ -44,7 +44,6 @@ function playingSnapshot(positionMs: number): PlaybackState {
     track,
     outputDevice: "",
     bitrateKbps: null,
-    actualQuality: "",
     sleepAfterTrack: false,
     speed: 1,
   };
