@@ -2145,6 +2145,25 @@ pub async fn cmd_is_favorite(state: State<'_, AppState>, track: Track) -> Result
     .map_err(|e| format!("读取收藏状态失败: {e}"))?
 }
 
+/// 批量判定：返回与入参等长的布尔向量，true = 这首已收藏。
+///
+/// 与 `check_disliked` 同形：列表行的红心要一次点亮整屏，逐行调 `is_favorite`
+/// 会把 IPC 通道打满。判定口径与 `is_liked_song` 一致（见 store::likes）。
+#[tauri::command(rename = "check_favorite_flags")]
+pub async fn cmd_check_favorite_flags(
+    state: State<'_, AppState>,
+    tracks: Vec<Track>,
+) -> Result<Vec<bool>, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(vec![false; tracks.len()]);
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| crate::db::store::is_liked_songs_flags(conn, &tracks))
+    })
+    .await
+    .map_err(|e| format!("判定收藏状态失败: {e}"))?
+}
+
 /// 最近播放（去重、按时间倒序）。`limit = 0` 时取默认 100 条。
 #[tauri::command(rename = "list_history")]
 pub async fn cmd_list_history(

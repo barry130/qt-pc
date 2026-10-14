@@ -4,6 +4,7 @@ import { RefreshCw, Trash2 } from "lucide-react";
 import * as ipc from "@/services/ipc";
 import { BackButton } from "@/components/layout/BackButton";
 import { AddDirButtons } from "./AddDirButtons";
+import { IconButton } from "@/components/common/IconButton";
 
 /**
  * 本地音乐文件夹管理（路由 /library/folders，DESIGN §13）。
@@ -97,15 +98,16 @@ export function LibraryFoldersPage(): React.JSX.Element {
 
       <div className="mt-4 flex flex-wrap items-center gap-2">
         <AddDirButtons onPick={(p) => void add(p)} disabled={busy} />
-        <button
-          type="button"
-          onClick={() => void rescan()}
+        <IconButton
+          label={busy ? "处理中…" : "立即扫描"}
+          variant="outline"
+          size="lg"
+          hover="secondary"
           disabled={busy || dirs.length === 0}
-          className="flex h-9 items-center gap-1.5 rounded-md border border-border px-3 text-xs transition-colors hover:bg-secondary disabled:opacity-50"
+          onClick={() => void rescan()}
         >
-          <RefreshCw className="h-3.5 w-3.5" />
-          {busy ? "处理中…" : "立即扫描"}
-        </button>
+          <RefreshCw />
+        </IconButton>
       </div>
 
       {tip && (
@@ -130,15 +132,16 @@ export function LibraryFoldersPage(): React.JSX.Element {
               className="flex items-center gap-3 border-b border-border/50 py-2.5"
             >
               <span className="min-w-0 flex-1 truncate text-sm">{dir}</span>
-              <button
-                type="button"
-                onClick={() => void remove(dir)}
+              <IconButton
+                label="移除"
+                size="lg"
+                hover="secondary"
+                danger
                 disabled={busy}
-                className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:text-destructive disabled:opacity-50"
-                title="移除"
+                onClick={() => void remove(dir)}
               >
-                <Trash2 className="h-4 w-4" />
-              </button>
+                <Trash2 />
+              </IconButton>
             </li>
           ))}
         </ul>

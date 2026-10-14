@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Play, Search, SearchX, X } from "lucide-react";
+import { Play, Search, SearchX, Trash2, X } from "lucide-react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import type { Album, Artist, Playlist, Track } from "@/types";
 import {
@@ -23,6 +23,7 @@ import { qtresCoverUrl, formatTime } from "@/lib/lrc";
 import { CoverCard, CoverGrid } from "./discovery/CoverCard";
 import { TrackRowsSkeleton } from "./discovery/Skeletons";
 import { BackButton } from "@/components/layout/BackButton";
+import { IconButton } from "@/components/common/IconButton";
 
 /**
  * 搜索页（路由 /search?q=，DESIGN §5.2：关键字走 URL query，前进 / 后退可复现）。
@@ -619,13 +620,13 @@ function SearchLanding(props: {
         <section>
           <div className="flex items-center justify-between">
             <h3 className="text-xs font-medium text-muted-foreground">搜索历史</h3>
-            <button
-              type="button"
+            <IconButton
+              label="清空搜索历史"
+              danger
               onClick={props.onClearHistory}
-              className="text-[11px] text-muted-foreground transition-colors hover:text-foreground"
             >
-              清空
-            </button>
+              <Trash2 />
+            </IconButton>
           </div>
           <div className="mt-2 flex flex-wrap gap-2">
             {props.history.map((kw) => (

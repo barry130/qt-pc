@@ -184,6 +184,32 @@ pub(crate) fn is_liked_song(conn: &Connection, track: &Track) -> Result<bool, ru
     Ok(hit.is_some())
 }
 
+/// 批量判定，返回与入参等长的布尔向量（顺序一致）。
+///
+/// 与 `dislikes::filter_disliked_flags` 同形：列表一屏上百行，逐行走 IPC 会把
+/// 事件通道打满，所以一次传整张列表回来。判定口径与 `is_liked_song` 一字不差
+/// （`(sid, platform)` + `deleted_at IS NULL`）—— 两处若漂移，就会出现
+/// 「列表说收藏了、播放条说没收藏」。
+///
+/// 语句只 prepare 一次，循环里换参数绑定：SQLite 的 prepare 开销远大于执行。
+pub(crate) fn is_liked_songs_flags(
+    conn: &Connection,
+    tracks: &[Track],
+) -> Result<Vec<bool>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT 1 FROM liked_songs
+          WHERE sid = ?1 AND platform = ?2 AND deleted_at IS NULL",
+    )?;
+    let mut out = Vec::with_capacity(tracks.len());
+    for t in tracks {
+        let hit: Option<i64> =
+            stmt.query_row(params![t.id, t.platform.to_string()], |row| row.get(0))
+                .optional()?;
+        out.push(hit.is_some());
+    }
+    Ok(out)
+}
+
 /// 收藏列表（按收藏时间倒序）。Join tracks 补齐时长等信息；
 /// tracks 缺行时（本地曲目尚未扫描入库）用 liked_songs 自带字段兜底。
 ///

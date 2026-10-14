@@ -11,6 +11,7 @@ import { qtresCoverUrl } from "@/lib/lrc";
 import { TrackList } from "./TrackList";
 import { ErrorRetry, TrackRowsSkeleton } from "./Skeletons";
 import { BackButton } from "@/components/layout/BackButton";
+import { IconButton } from "@/components/common/IconButton";
 
 /**
  * 歌手页（路由 /artist/$platform/$id）。
@@ -145,14 +146,15 @@ export function ArtistPage(): React.JSX.Element {
             </p>
           </div>
           {songs.length > 0 && (
-            <button
-              type="button"
+            <IconButton
+              label="播放全部"
+              variant="primary"
+              size="lg"
+              className="h-9 w-9 shrink-0 rounded-lg shadow-lg shadow-primary/25"
               onClick={() => void playQueue(songs, 0)}
-              className="flex h-9 shrink-0 items-center gap-1.5 rounded-lg bg-primary px-5 text-sm font-medium text-primary-foreground shadow-lg shadow-primary/25 transition-opacity hover:opacity-90"
             >
               <Play className="h-4 w-4 fill-current" />
-              播放全部
-            </button>
+            </IconButton>
           )}
         </div>
 
@@ -171,7 +173,7 @@ export function ArtistPage(): React.JSX.Element {
           </div>
         ) : (
           <>
-            <TrackList tracks={songs} showIndex showAddToPlaylist showDownload />
+            <TrackList tracks={songs} showIndex showCollect showDownload />
             {loadingAll ? (
               <div className="py-4 text-center text-xs text-muted-foreground">
                 正在加载其余歌曲… 已加载 {songs.length} 首

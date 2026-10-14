@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Pause, Play, RotateCcw, X } from "lucide-react";
+import { Eraser, Pause, Play, RotateCcw, X } from "lucide-react";
 import { errMsg } from "@/lib/utils";
 import type { DownloadTask } from "@/types";
 import * as ipc from "@/services/ipc";
 import { useDownloadsStore } from "@/stores/downloads";
 import { BatchDeleteButton, RowActions } from "@/components/common/RowActions";
+import { IconButton } from "@/components/common/IconButton";
 import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 
 const STATUS_LABEL: Record<DownloadTask["status"], string> = {
@@ -157,23 +158,27 @@ export function DownloadsPage(): React.JSX.Element {
           <h1 className="text-base font-medium">下载管理</h1>
           <div className="flex items-center gap-1">
             {activeCount > 0 && (
-              <button
-                type="button"
+              <IconButton
+                label="全部暂停"
+                variant="outline"
+                size="md"
+                hover="secondary"
                 onClick={() => void pauseAll()}
-                className="flex h-7 items-center gap-1 rounded-md border border-border px-2 text-xs transition-colors hover:bg-secondary"
               >
-                <Pause className="h-3.5 w-3.5" />
-                全部暂停
-              </button>
+                <Pause />
+              </IconButton>
             )}
             {doneCount > 0 && (
-              <button
-                type="button"
+              <IconButton
+                label={`清理已完成记录（${doneCount}）`}
+                variant="outline"
+                size="md"
+                hover="secondary"
+                danger
                 onClick={() => void clearFinished()}
-                className="flex h-7 items-center gap-1 rounded-md border border-border px-2 text-xs transition-colors hover:bg-secondary"
               >
-                清理已完成记录
-              </button>
+                <Eraser />
+              </IconButton>
             )}
           </div>
         </div>
@@ -184,7 +189,10 @@ export function DownloadsPage(): React.JSX.Element {
         {/* 多选 / 批量删除：与本地曲库同一套交互 */}
         {tasks.length > 0 && (
           <div className="mt-2 flex flex-wrap items-center gap-2">
-            <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+            <label
+              title={allSelected ? "取消全选" : "全选下载任务"}
+              className="flex items-center gap-1.5 text-xs text-muted-foreground"
+            >
               <input
                 ref={allRef}
                 type="checkbox"
@@ -197,7 +205,6 @@ export function DownloadsPage(): React.JSX.Element {
                 aria-label="全选下载任务"
                 className="h-3.5 w-3.5 accent-primary"
               />
-              全选
             </label>
             <BatchDeleteButton
               count={selected.size}
@@ -209,13 +216,14 @@ export function DownloadsPage(): React.JSX.Element {
               onError={(msg) => setError(msg)}
             />
             {selected.size > 0 && (
-              <button
-                type="button"
-                onClick={() => setSelected(new Set())}
-                className="text-xs text-muted-foreground transition-colors hover:text-foreground"
-              >
-                已选 {selected.size} 首 · 取消选择
-              </button>
+              <>
+                <span className="text-xs text-muted-foreground">
+                  已选 {selected.size} 首
+                </span>
+                <IconButton label="取消选择" onClick={() => setSelected(new Set())}>
+                  <X />
+                </IconButton>
+              </>
             )}
           </div>
         )}
@@ -310,36 +318,24 @@ function TaskRow(props: {
 
         <div className="flex shrink-0 items-center gap-0.5">
           {inFlight && (
-            <IconButton
-              icon={<Pause className="h-3.5 w-3.5" />}
-              title="暂停"
-              onClick={props.onPause}
-              disabled={busy}
-            />
+            <IconButton label="暂停" onClick={props.onPause} disabled={busy}>
+              <Pause />
+            </IconButton>
           )}
           {canResume && (
-            <IconButton
-              icon={<Play className="h-3.5 w-3.5" />}
-              title="继续"
-              onClick={props.onResume}
-              disabled={busy}
-            />
+            <IconButton label="继续" onClick={props.onResume} disabled={busy}>
+              <Play />
+            </IconButton>
           )}
           {canRetry && (
-            <IconButton
-              icon={<RotateCcw className="h-3.5 w-3.5" />}
-              title="重试"
-              onClick={props.onRetry}
-              disabled={busy}
-            />
+            <IconButton label="重试" onClick={props.onRetry} disabled={busy}>
+              <RotateCcw />
+            </IconButton>
           )}
           {(inFlight || canResume) && (
-            <IconButton
-              icon={<X className="h-3.5 w-3.5" />}
-              title="取消"
-              onClick={props.onCancel}
-              disabled={busy}
-            />
+            <IconButton label="取消" danger onClick={props.onCancel} disabled={busy}>
+              <X />
+            </IconButton>
           )}
           {/* 定位只在文件已落盘（已完成）时提供；删除菜单对所有状态可用 */}
           <RowActions
@@ -360,26 +356,5 @@ function TaskRow(props: {
         </div>
       )}
     </li>
-  );
-}
-
-/** 图标按钮（悬停显示 title 提示），与本地曲库的行内操作风格一致 */
-function IconButton(props: {
-  icon: React.ReactNode;
-  title: string;
-  onClick: () => void;
-  disabled?: boolean;
-}): React.JSX.Element {
-  return (
-    <button
-      type="button"
-      title={props.title}
-      aria-label={props.title}
-      onClick={props.onClick}
-      disabled={props.disabled}
-      className="rounded p-1 text-muted-foreground transition-colors hover:bg-background hover:text-foreground disabled:opacity-50"
-    >
-      {props.icon}
-    </button>
   );
 }

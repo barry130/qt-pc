@@ -1,18 +1,22 @@
 import { memo, useCallback, useEffect, useRef } from "react";
 import { useNavigate } from "@tanstack/react-router";
-import { Ban, ListEnd, Play } from "lucide-react";
+import { Ban, ListEnd, Play, X } from "lucide-react";
 import type { Track } from "@/types";
 import { qtresCoverUrl, formatTime } from "@/lib/lrc";
 import { usePlayerStore } from "@/stores/player";
 import { trackDbId, useDownloadsStore } from "@/stores/downloads";
 import { useDislikesStore } from "@/stores/dislikes";
 import { useDislikeFlags } from "@/hooks/useDislikeFlags";
+import { useFavoritesStore } from "@/stores/favorites";
+import { useFavoriteFlags } from "@/hooks/useFavoriteFlags";
 import * as ipc from "@/services/ipc";
 import { errMsg } from "@/lib/utils";
-import { AddToPlaylistButton } from "../mine/AddToPlaylistButton";
+import { CollectButton } from "../mine/CollectButton";
 import { DownloadButton } from "../mine/DownloadButton";
 import { LocalCover } from "../library/LocalCover";
 import { RowActions } from "../common/RowActions";
+import { IconButton } from "../common/IconButton";
+import { PlayNextIcon } from "../common/PlayNextIcon";
 
 /**
  * 曲目列表（发现类页面共用：榜单详情 / 歌单详情 / 新歌速递 / 收藏 / 历史 / 本地）。
@@ -20,12 +24,18 @@ import { RowActions } from "../common/RowActions";
  * 否则追加到队尾；**不清空**正在排队的整张列表。整体入队（替换队列）只在页面顶部的
  * 「播放全部」按钮上（`playQueue(tracks, 0)`，DESIGN §11.2 的列表播放语义）。
  *
- * 传了 `onRemove` 时每行右侧出现「移除」按钮（收藏、我的歌单等可编辑列表用）；
+ * 传了 `onRemove` 时每行右侧出现「移除」按钮（可编辑列表用）；
  * 为此行容器用 `div[role=button]` 而非 `button`，避免按钮嵌套。
+ * **目前没有调用方**：本地歌单详情页的曲目必然是收藏态，「从歌单移除」与
+ * 「取消收藏」是同一件事，所以那里只留了收藏红心。这个入口留给规划中的
+ * 列表右键菜单（REQUIREMENTS §右键菜单的「从歌单移除」）。
  *
  * 队列 2.0：悬停行会露出「下一首播放」「加入队列」；已下载的曲目带「已下载」标。
  * 本地曲库页传 `local` 进入本地模式：悬停按钮用「播放」代替「下一首播放」，
  * 行尾出现「在文件夹中显示 / 删除」，需要时可带行首复选框做批量选择。
+ * 这两个动作的图标必须能一眼区分：本地模式是 Play（就是播放），其余列表是
+ * PlayNextIcon（播放三角 + 回车形，插到这首后面）。若两处都用 Play，
+ * 用户会以为那个按钮是「播放」。
  *
  * 性能（长列表）：行拆成 `memo` 的 `TrackRow`，且列表层只把**标量**传下去
  * （active/downloaded/…），因此：
@@ -59,8 +69,8 @@ export function TrackList(props: {
   showIndex?: boolean;
   /** 传入后每行右侧出现「移除」按钮 */
   onRemove?: (track: Track) => void;
-  /** 为 true 时每行右侧出现「＋歌单」（加入我的歌单） */
-  showAddToPlaylist?: boolean;
+  /** 为 true 时每行右侧出现「收藏」（点开是本地歌单清单，与播放条红心同逻辑） */
+  showCollect?: boolean;
   /** 为 true 时每行右侧出现「下载」 */
   showDownload?: boolean;
   /**
@@ -80,7 +90,7 @@ export function TrackList(props: {
     tracks,
     showIndex = false,
     onRemove,
-    showAddToPlaylist = false,
+    showCollect = false,
     showDownload = false,
     selection: selectionProp,
     local,
@@ -95,6 +105,9 @@ export function TrackList(props: {
   const rulesVersion = useDislikesStore((s) => s.version);
   // 哪些行中了屏蔽规则：一次 IPC 查整张列表（判定规则在 Rust 侧，前端猜不出来）
   const dislikeFlags = useDislikeFlags(tracks, rulesVersion);
+  const favoritesVersion = useFavoritesStore((s) => s.version);
+  // 哪些行已被收藏：同样一次 IPC 查整张列表，行尾红心据此点亮
+  const favoriteFlags = useFavoriteFlags(tracks, favoritesVersion);
 
   /**
    * 回调放 ref、只暴露 `useCallback` 包出来的稳定引用：调用方（各页面）几乎都在
@@ -175,6 +188,7 @@ export function TrackList(props: {
             downloaded={isDownloaded}
             downloading={!isDownloaded && active.has(dbId)}
             disliked={dislikeFlags[i] === true}
+            favorited={favoriteFlags[i] === true}
             showIndex={showIndex}
             plainRow={plainRow}
             // 本地行：悬停按钮换成「播放」，行尾带定位 / 删除
@@ -182,7 +196,7 @@ export function TrackList(props: {
             onBanSong={handleBanSong}
             onBanSinger={handleBanSinger}
             onUnban={handleUnban}
-            showAddToPlaylist={showAddToPlaylist}
+            showCollect={showCollect}
             showDownload={showDownload}
             selectionIds={selection?.ids}
             onToggleSelect={handleToggle}
@@ -215,13 +229,15 @@ interface TrackRowProps {
   localRow: boolean;
   /** 这一行是否命中了屏蔽规则（淡化显示 + 行尾按钮变「取消屏蔽」） */
   disliked: boolean;
+  /** 这一行是否已被收藏（行尾红心实心高亮） */
+  favorited: boolean;
   /** 屏蔽这首歌 */
   onBanSong: (track: Track) => void;
   /** 屏蔽这首歌的歌手（整串歌手一起） */
   onBanSinger: (singer: string) => void;
   /** 取消这首的屏蔽 */
   onUnban: (track: Track) => void;
-  showAddToPlaylist: boolean;
+  showCollect: boolean;
   showDownload: boolean;
   /** 批量选择集合；省略则不显示复选框 */
   selectionIds?: Set<string>;
@@ -244,10 +260,11 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
     plainRow,
     localRow,
     disliked,
+    favorited,
     onBanSong,
     onBanSinger,
     onUnban,
-    showAddToPlaylist,
+    showCollect,
     showDownload,
     selectionIds,
     onToggleSelect,
@@ -278,8 +295,15 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
     >
       {/* 左侧固定槽位：批量选择时放复选框，否则放序号 / 播放态均衡条。
           复选框放在槽位里（而不是另起一列），否则槽位空着还要多占一份
-          行间距，复选框到歌名会拉开近 50px。 */}
-      <span className="flex h-5 w-6 shrink-0 items-center justify-center text-xs tabular-nums text-muted-foreground">
+          行间距，复选框到歌名会拉开近 50px。
+          榜单 / 每日新歌是「带名次的列表」，勾选框和名次都要看得见，所以
+          两者同时要的时候把槽位加宽到 w-12 并排摆（只多占 24px），
+          而不是让复选框把名次顶掉。 */}
+      <span
+        className={`flex h-5 shrink-0 items-center justify-center gap-1.5 text-xs tabular-nums text-muted-foreground ${
+          selectionIds && showIndex ? "w-12" : "w-6"
+        }`}
+      >
         {selectionIds ? (
           <input
             type="checkbox"
@@ -289,9 +313,10 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
             onChange={() => onToggleSelect(t.id)}
             className="h-3.5 w-3.5 accent-primary"
           />
-        ) : showIndex ? (
+        ) : null}
+        {showIndex ? (
           i + 1
-        ) : activeRow ? (
+        ) : selectionIds ? null : activeRow ? (
           // 正在播放：三根跳动的均衡条（样式见 index.css .eq-bar）
           <span className="flex h-3 items-end gap-[2px]" aria-label="正在播放">
             <span className="eq-bar" />
@@ -395,7 +420,14 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
           }}
           className="rounded p-1 text-muted-foreground transition-colors hover:bg-background hover:text-foreground"
         >
-          <Play className="h-3.5 w-3.5" />
+          {/* 本地模式这个按钮就是「播放」，用 Play；其余列表是「下一首播放」，
+              用 PlayNextIcon（播放三角 + 回车形 = 插到这首后面）。原先两处都用
+              Play，和「播放」完全同形，看不出是「下一首」。 */}
+          {localRow ? (
+            <Play className="h-3.5 w-3.5" />
+          ) : (
+            <PlayNextIcon className="h-3.5 w-3.5" />
+          )}
         </button>
         <button
           type="button"
@@ -446,18 +478,18 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
         />
       )}
       {showDownload && <DownloadButton track={t} />}
-      {showAddToPlaylist && <AddToPlaylistButton track={t} />}
+      {showCollect && <CollectButton track={t} favorited={favorited} />}
       {showRemove ? (
-        <button
-          type="button"
+        <IconButton
+          label="从歌单移除"
+          danger
           onClick={(e) => {
             e.stopPropagation();
             onRemove(t);
           }}
-          className="ml-2 shrink-0 rounded px-2 py-1 text-xs text-muted-foreground transition-colors hover:text-destructive"
         >
-          移除
-        </button>
+          <X />
+        </IconButton>
       ) : null}
     </div>
   );

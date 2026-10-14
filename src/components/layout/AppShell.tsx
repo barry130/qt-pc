@@ -32,6 +32,7 @@ import { syncLogLevel } from "@/lib/logger";
 import { UpdateDialog } from "@/components/update/UpdateDialog";
 import { QtNoticeDialog } from "@/components/notice/qt-NoticeDialog";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
+import { ToastHost } from "@/components/common/ToastHost";
 import { PageFallback } from "@/lib/lazyPage";
 
 /**
@@ -232,6 +233,12 @@ export function AppShell(): React.JSX.Element {
 
       <ErrorBoundary label="播放条">
         <PlayerBar />
+      </ErrorBoundary>
+
+      {/* 右上角轻提示（3 秒自动消失）：批量收藏这类「做完了」的一次性回执挂这儿，
+          不塞进页头把控件左右挤（用户 m09470）。挂在对话框之前，弹窗盖住它 */}
+      <ErrorBoundary label="轻提示">
+        <ToastHost />
       </ErrorBoundary>
 
       <ErrorBoundary label="对话框">

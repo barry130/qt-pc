@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { Play } from "lucide-react";
 import { useNavigate } from "@tanstack/react-router";
 import type {
   PlayOverview,
@@ -8,6 +9,7 @@ import type {
 } from "@/types";
 import * as ipc from "@/services/ipc";
 import { usePlayerStore } from "@/stores/player";
+import { IconButton } from "@/components/common/IconButton";
 import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 
 /**
@@ -93,18 +95,20 @@ export function StatsPage(): React.JSX.Element {
             <section className="mt-7">
               <div className="mb-2 flex items-center justify-between">
                 <h2 className="text-sm text-muted-foreground">常听歌曲</h2>
-                <button
-                  type="button"
+                <IconButton
+                  label="播放全部"
+                  variant="outline"
+                  size="md"
+                  hover="secondary"
                   onClick={() =>
                     void playQueue(
                       tracks.map((it) => it.track),
                       0,
                     )
                   }
-                  className="text-xs text-muted-foreground transition-colors hover:text-foreground"
                 >
-                  播放全部
-                </button>
+                  <Play />
+                </IconButton>
               </div>
               <ul>
                 {tracks.map((it, i) => (

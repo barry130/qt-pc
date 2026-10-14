@@ -1,5 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Trash2, ChevronDown, ArrowUp, ArrowDown, Play } from "lucide-react";
+import {
+  Trash2,
+  ChevronDown,
+  ChevronRight,
+  ArrowUp,
+  ArrowDown,
+  Play,
+  X,
+  ScanSearch,
+} from "lucide-react";
 import { errMsg } from "@/lib/utils";
 import type { Track } from "@/types";
 import * as ipc from "@/services/ipc";
@@ -7,6 +16,7 @@ import { usePlayerStore } from "@/stores/player";
 import { TrackList } from "../discovery/TrackList";
 import { AddDirButtons } from "./AddDirButtons";
 import { BatchDeleteButton } from "../common/RowActions";
+import { IconButton } from "../common/IconButton";
 import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 
 /**
@@ -362,18 +372,19 @@ export function LibraryPage(): React.JSX.Element {
                 className={`h-3.5 w-3.5 transition-transform ${scanOpen ? "rotate-180" : ""}`}
               />
             </button>
-            <button
-              type="button"
+            <IconButton
+              label={scanning ? "扫描中…" : "扫描"}
+              variant="primary"
+              size="lg"
+              disabled={scanning || dirs.length === 0}
               onClick={() => {
                 // 收起状态下点扫描自动展开，进度提示才看得见
                 setScanOpen(true);
                 void runScan(dirs);
               }}
-              disabled={scanning || dirs.length === 0}
-              className="h-8 rounded-md bg-primary px-4 text-sm font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
             >
-              {scanning ? "扫描中…" : "扫描"}
-            </button>
+              <ScanSearch />
+            </IconButton>
           </div>
         </div>
 
@@ -474,13 +485,13 @@ export function LibraryPage(): React.JSX.Element {
                 className="flex items-center justify-between gap-2 text-xs text-muted-foreground"
               >
                 <span className="truncate">{d}</span>
-                <button
-                  type="button"
+                <IconButton
+                  label="移除扫描目录"
+                  danger
                   onClick={() => void removeDir(d)}
-                  className="shrink-0 text-xs transition-colors hover:text-destructive"
                 >
-                  移除
-                </button>
+                  <X />
+                </IconButton>
               </li>
             ))}
           </ul>
@@ -502,16 +513,15 @@ export function LibraryPage(): React.JSX.Element {
               aria-label="搜索本地歌曲"
               className="h-7 w-48 rounded-md border border-input bg-background px-2 text-xs outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
             />
-            <button
-              type="button"
+            <IconButton
+              label="播放当前列表全部歌曲"
+              variant="primary"
+              size="md"
               disabled={visible.length === 0}
               onClick={() => void usePlayerStore.getState().playQueue(visible, 0)}
-              title="播放当前列表全部歌曲"
-              className="flex h-7 items-center gap-1 rounded-md bg-primary px-2.5 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
             >
-              <Play className="h-3.5 w-3.5" />
-              全部播放
-            </button>
+              <Play />
+            </IconButton>
             <div className="flex overflow-hidden rounded-md border border-border">
               {VIEW_OPTIONS.map((o) => (
                 <button
@@ -540,27 +550,26 @@ export function LibraryPage(): React.JSX.Element {
                 </option>
               ))}
             </select>
-            <button
-              type="button"
+            <IconButton
+              label={sortDesc ? "当前为倒序，点击切换正序" : "当前为正序，点击切换倒序"}
+              variant="outline"
+              size="md"
+              hover="secondary"
               onClick={() => setSortDesc((v) => !v)}
-              title={sortDesc ? "当前为倒序，点击切换正序" : "当前为正序，点击切换倒序"}
-              aria-label="切换排序方向"
-              className="flex h-7 items-center gap-0.5 rounded-md border border-border px-2 text-xs text-muted-foreground transition-colors hover:bg-secondary"
             >
-              {sortDesc ? (
-                <ArrowDown className="h-3.5 w-3.5" />
-              ) : (
-                <ArrowUp className="h-3.5 w-3.5" />
-              )}
-              {sortDesc ? "倒序" : "正序"}
-            </button>
+              {sortDesc ? <ArrowDown /> : <ArrowUp />}
+            </IconButton>
 
             {/* 批量选择：勾选行首复选框后「批量删除」 */}
-            <label className="flex items-center gap-1.5 text-xs text-muted-foreground">
+            <label
+              title={allSelected ? "取消全选" : "全选"}
+              className="flex items-center gap-1.5 text-xs text-muted-foreground"
+            >
               <input
                 ref={allRef}
                 type="checkbox"
                 checked={allSelected}
+                aria-label={allSelected ? "取消全选" : "全选"}
                 onChange={() =>
                   setSelected(
                     allSelected ? new Set() : new Set(visible.map((t) => t.id)),
@@ -568,7 +577,6 @@ export function LibraryPage(): React.JSX.Element {
                 }
                 className="h-3.5 w-3.5 accent-primary"
               />
-              全选
             </label>
             <BatchDeleteButton
               count={selected.size}
@@ -579,13 +587,14 @@ export function LibraryPage(): React.JSX.Element {
               onError={(msg) => setError(msg)}
             />
             {selected.size > 0 && (
-              <button
-                type="button"
-                onClick={() => setSelected(new Set())}
-                className="text-xs text-muted-foreground transition-colors hover:text-foreground"
-              >
-                已选 {selected.size} 首 · 取消选择
-              </button>
+              <>
+                <span className="text-xs text-muted-foreground">
+                  已选 {selected.size} 首
+                </span>
+                <IconButton label="取消选择" onClick={() => setSelected(new Set())}>
+                  <X />
+                </IconButton>
+              </>
             )}
           </div>
         )}
@@ -597,18 +606,23 @@ export function LibraryPage(): React.JSX.Element {
               <button
                 type="button"
                 onClick={() => setMissingOpen((v) => !v)}
-                className="text-xs text-muted-foreground transition-colors hover:text-foreground"
+                title={missingOpen ? "收起" : "展开"}
+                className="flex items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
               >
-                {missingOpen ? "▾" : "▸"} 有 {missing.length} 首文件已不在（可能被移动或删除）
+                {missingOpen ? (
+                  <ChevronDown className="h-3.5 w-3.5" />
+                ) : (
+                  <ChevronRight className="h-3.5 w-3.5" />
+                )}
+                有 {missing.length} 首文件已不在（可能被移动或删除）
               </button>
-              <button
-                type="button"
+              <IconButton
+                label="清理记录"
+                danger
                 onClick={() => void purgeMissing()}
-                className="flex shrink-0 items-center gap-1 rounded px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
               >
-                <Trash2 className="h-3.5 w-3.5" />
-                清理记录
-              </button>
+                <Trash2 />
+              </IconButton>
             </div>
             {missingOpen && (
               <ul className="mt-2 max-h-40 space-y-1 overflow-y-auto">

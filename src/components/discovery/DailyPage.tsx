@@ -1,4 +1,4 @@
-import { useCallback, useEffect } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Play } from "lucide-react";
 import type { Track } from "@/types";
 import * as sourceApi from "@/source-scripts";
@@ -7,7 +7,9 @@ import { usePlayerStore } from "@/stores/player";
 import { useLatestUsesOffset, useSourceRegistryStore } from "@/stores/sourceRegistry";
 import { usePagedList, type PageResult } from "@/hooks/usePagedList";
 import { TrackList } from "./TrackList";
+import { BatchBar } from "./BatchBar";
 import { ErrorRetry, TrackRowsSkeleton } from "./Skeletons";
+import { IconButton } from "@/components/common/IconButton";
 
 /**
  * 每页条数：沿用原实现的 50。
@@ -121,28 +123,75 @@ export function DailyPage(): React.JSX.Element {
     mode: "scroll",
   });
 
+  // 批量管理的已勾选曲目 id 集合（见 BatchBar）
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  /** 批量操作的失败提示：与整页加载失败分开，别把已加载的列表顶掉 */
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const toggleSelect = useCallback((trackId: string): void => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(trackId)) next.delete(trackId);
+      else next.add(trackId);
+      return next;
+    });
+  }, []);
+
+  // 换源 / 重载后列表整体作废，勾选集里若还留着这些 id，「已选 N 首」就虚高；
+  // 往下翻页时列表是**追加**的，已勾选的不会消失，所以这里只做收窄、不清空。
+  useEffect(() => {
+    setSelected((prev) => {
+      if (prev.size === 0) return prev;
+      const ids = new Set(songs.map((t) => t.id));
+      const next = new Set([...prev].filter((x) => ids.has(x)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [songs]);
+
   return (
     <div className="flex h-full min-w-0 flex-col">
-      <div className="flex items-baseline justify-between border-b border-border px-4 py-3">
-        <div>
+      <div className="flex items-center justify-between gap-4 border-b border-border px-4 py-3">
+        <div className="min-w-0">
           <h1 className="text-base font-medium">每日新歌</h1>
-          <p className="mt-1 text-xs text-muted-foreground">
+          <p className="mt-1 truncate text-xs text-muted-foreground">
             共 {songs.length} 首 · 跟随当前音源，切换音源会自动重取
           </p>
         </div>
-        {songs.length > 0 && (
-          <button
-            type="button"
-            onClick={() => void playQueue(songs, 0)}
-            className="flex h-8 shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90"
-          >
-            <Play className="h-3.5 w-3.5 fill-current" />
-            播放全部
-          </button>
-        )}
+        {/* 右侧一组：页头主操作「播放全部」+ 批量条。批量操作属于页头，不在
+            列表上方再占一行；批量条落在最右端，与歌单 / 榜单详情页同位置
+            （那两页的批量条也在页头右端、和「播放全部」同一行）。
+            每日新歌是分页流，全选 / 批量只作用于**当前已加载**的 songs ——
+            继续下拉会追加新页，已勾选的保持不动（见上面收窄勾选的副作用）。
+            收藏 / 取消收藏都在条子的歌单面板里选（与单曲红心同逻辑），
+            这里没有宿主歌单，所以不传 hostPlaylistId。 */}
+        <div className="flex shrink-0 items-center gap-2">
+          {songs.length > 0 && (
+            <IconButton
+              label="播放全部"
+              variant="primary"
+              size="md"
+              className="shrink-0"
+              onClick={() => void playQueue(songs, 0)}
+            >
+              <Play />
+            </IconButton>
+          )}
+          {!loading && !error && songs.length > 0 ? (
+            <BatchBar
+              embedded
+              tracks={songs}
+              selected={selected}
+              onSelectedChange={setSelected}
+              onError={setActionError}
+            />
+          ) : null}
+        </div>
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
+        {actionError && (
+          <div className="px-6 pt-4 text-center text-sm text-destructive">{actionError}</div>
+        )}
         {error ? (
           <ErrorRetry message={`加载失败：${error}`} onRetry={reload} />
         ) : loading ? (
@@ -153,7 +202,13 @@ export function DailyPage(): React.JSX.Element {
           </div>
         ) : (
           <>
-            <TrackList tracks={songs} showIndex showAddToPlaylist showDownload />
+            <TrackList
+              tracks={songs}
+              showIndex
+              showCollect
+              showDownload
+              selection={{ ids: selected, onToggle: toggleSelect }}
+            />
             {/* 哨兵：进入视口就拉下一页。不支持翻页的源没有下一页，不挂哨兵 */}
             {hasMore ? <div ref={sentinelRef} className="h-1" /> : null}
             <div className="py-4 text-center text-xs text-muted-foreground">

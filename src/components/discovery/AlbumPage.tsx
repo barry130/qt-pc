@@ -10,6 +10,7 @@ import { qtresCoverUrl } from "@/lib/lrc";
 import { TrackList } from "./TrackList";
 import { ErrorRetry, TrackRowsSkeleton } from "./Skeletons";
 import { BackButton } from "@/components/layout/BackButton";
+import { IconButton } from "@/components/common/IconButton";
 
 /**
  * 专辑页（路由 /album/$platform/$id）。
@@ -118,14 +119,15 @@ export function AlbumPage(): React.JSX.Element {
             </p>
             {songs.length > 0 && (
               <div className="mt-3">
-                <button
-                  type="button"
+                <IconButton
+                  label="播放全部"
+                  variant="primary"
+                  size="lg"
+                  className="h-9 w-9 rounded-lg shadow-lg shadow-primary/25"
                   onClick={() => void playQueue(songs, 0)}
-                  className="flex h-9 items-center gap-1.5 rounded-lg bg-primary px-5 text-sm font-medium text-primary-foreground shadow-lg shadow-primary/25 transition-opacity hover:opacity-90"
                 >
                   <Play className="h-4 w-4 fill-current" />
-                  播放全部
-                </button>
+                </IconButton>
               </div>
             )}
           </div>
@@ -143,7 +145,7 @@ export function AlbumPage(): React.JSX.Element {
           </div>
         ) : (
           <>
-            <TrackList tracks={songs} showIndex showAddToPlaylist showDownload />
+            <TrackList tracks={songs} showIndex showCollect showDownload />
             {/* 哨兵：进入视口就拉下一页 */}
             <div ref={sentinelRef} className="h-1" />
             <div className="py-4 text-center text-xs text-muted-foreground">

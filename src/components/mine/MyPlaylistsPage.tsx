@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { HeartOff, ImagePlus, Import, Pencil, Plus, Trash2 } from "lucide-react";
 import { errMsg } from "@/lib/utils";
 import { useNavigate } from "@tanstack/react-router";
 import type { MyPlaylistSummary } from "@/types";
@@ -7,6 +8,7 @@ import * as ipc from "@/services/ipc";
 import { pullLikes } from "@/stores/auth";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { ImportPlaylistDialog } from "./ImportPlaylistDialog";
+import { IconButton } from "@/components/common/IconButton";
 import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 
 /**
@@ -177,21 +179,24 @@ export function MyPlaylistsPage(): React.JSX.Element {
             placeholder="新建歌单名称"
             className="h-8 flex-1 rounded-md border border-input bg-background px-3 text-xs outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
           />
-          <button
-            type="button"
-            onClick={() => void create()}
+          <IconButton
+            label="新建歌单"
+            variant="primary"
+            size="lg"
             disabled={!name.trim()}
-            className="h-8 shrink-0 rounded-md bg-primary px-3 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
+            onClick={() => void create()}
           >
-            新建
-          </button>
-          <button
-            type="button"
+            <Plus />
+          </IconButton>
+          <IconButton
+            label="导入"
+            variant="outline"
+            size="lg"
+            hover="secondary"
             onClick={() => setImportOpen(true)}
-            className="h-8 shrink-0 rounded-md border border-border px-3 text-xs hover:bg-accent"
           >
-            导入
-          </button>
+            <Import />
+          </IconButton>
         </div>
       </div>
 
@@ -227,7 +232,8 @@ export function MyPlaylistsPage(): React.JSX.Element {
               onSaveRename={(id) => void saveRename(id)}
               onCancelRename={() => setEditingId(null)}
               onRemove={(p) => void remove(p)}
-              removeLabel="删除"
+              removeLabel="删除歌单"
+              removeIcon={<Trash2 />}
               onChangeCover={(p) => void changeCover(p)}
             />
             <Group
@@ -243,6 +249,7 @@ export function MyPlaylistsPage(): React.JSX.Element {
               onCancelRename={() => setEditingId(null)}
               onRemove={(p) => void remove(p)}
               removeLabel="取消收藏"
+              removeIcon={<HeartOff />}
               hideRename
             />
           </>
@@ -271,7 +278,9 @@ function Group(props: {
   onSaveRename: (id: string) => void;
   onCancelRename: () => void;
   onRemove: (p: MyPlaylistSummary) => void;
+  /** 图标按钮的无障碍名称（本地=删除歌单 / 在线=取消收藏），也是悬浮提示 */
   removeLabel: string;
+  removeIcon: React.ReactNode;
   /** 云端卡片歌单不可改名（名字归云端/音源所有） */
   hideRename?: boolean;
   /** 本地自建歌单换封面；不传则不显示入口（在线歌单封面归音源/云端所有） */
@@ -325,31 +334,32 @@ function Group(props: {
               )}
 
               {!props.hideRename && (
-                <button
-                  type="button"
+                <IconButton
+                  label="重命名"
+                  hover="secondary"
                   onClick={() => props.onStartRename(p)}
-                  className="shrink-0 rounded px-2 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
                 >
-                  重命名
-                </button>
+                  <Pencil />
+                </IconButton>
               )}
               {/* 换封面只给本地自建歌单（云端卡片「我喜欢的歌曲」与在线歌单都不给） */}
               {props.onChangeCover && p.isLocal && (
-                <button
-                  type="button"
+                <IconButton
+                  label="换封面"
+                  hover="secondary"
                   onClick={() => props.onChangeCover?.(p)}
-                  className="shrink-0 rounded px-2 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
                 >
-                  换封面
-                </button>
+                  <ImagePlus />
+                </IconButton>
               )}
-              <button
-                type="button"
+              <IconButton
+                label={props.removeLabel}
+                hover="secondary"
+                danger
                 onClick={() => props.onRemove(p)}
-                className="shrink-0 rounded px-2 py-1 text-xs text-muted-foreground transition-colors hover:text-destructive"
               >
-                {props.removeLabel}
-              </button>
+                {props.removeIcon}
+              </IconButton>
             </li>
           );
         })}

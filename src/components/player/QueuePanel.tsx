@@ -1,11 +1,22 @@
 import { useEffect, useRef, useState } from "react";
-import { GripVertical, ListMusic, Trash2, X } from "lucide-react";
+import {
+  GripVertical,
+  ListChecks,
+  ListMusic,
+  ListX,
+  Square,
+  SquareCheckBig,
+  Trash2,
+  X,
+} from "lucide-react";
 import * as ipc from "@/services/ipc";
 import { usePlayerStore } from "@/stores/player";
 import { qtresCoverUrl, formatTime } from "@/lib/lrc";
 import { cn } from "@/lib/utils";
 import { log } from "@/lib/logger";
 import { LocalCover } from "@/components/library/LocalCover";
+import { IconButton } from "@/components/common/IconButton";
+import { PlayNextIcon } from "@/components/common/PlayNextIcon";
 
 /**
  * 播放队列面板（DESIGN §5.5 QueueButton / §11.5 队列 2.0）。
@@ -214,8 +225,10 @@ export function QueuePanel(): React.JSX.Element | null {
               已选 {selected.size} / {queue.length}
             </div>
             <div className="flex items-center gap-1">
-              <button
-                type="button"
+              <IconButton
+                label={selected.size === queue.length ? "全不选" : "全选"}
+                size="lg"
+                hover="secondary"
                 onClick={() =>
                   setSelected(
                     selected.size === queue.length
@@ -223,26 +236,27 @@ export function QueuePanel(): React.JSX.Element | null {
                       : new Set(queue.map((_, i) => i)),
                   )
                 }
-                className="rounded px-1.5 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
               >
-                {selected.size === queue.length ? "全不选" : "全选"}
-              </button>
-              <button
-                type="button"
-                onClick={() => void deleteSelected()}
+                {selected.size === queue.length ? <Square /> : <SquareCheckBig />}
+              </IconButton>
+              <IconButton
+                label={deleting ? "删除中…" : `删除已选（${selected.size}）`}
+                size="lg"
+                hover="secondary"
+                danger
                 disabled={deleting || selected.size === 0}
-                className="rounded px-1.5 py-1 text-[11px] text-destructive transition-colors hover:bg-secondary disabled:opacity-40"
+                onClick={() => void deleteSelected()}
               >
-                {deleting ? "删除中…" : "删除"}
-              </button>
-              <button
-                type="button"
-                aria-label="退出批量管理"
+                <Trash2 />
+              </IconButton>
+              <IconButton
+                label="退出批量管理"
+                size="lg"
+                hover="secondary"
                 onClick={() => setSelecting(false)}
-                className="rounded p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
               >
-                <X className="h-4 w-4" />
-              </button>
+                <X />
+              </IconButton>
             </div>
           </>
         ) : (
@@ -253,54 +267,52 @@ export function QueuePanel(): React.JSX.Element | null {
             </div>
             <div className="flex items-center gap-1">
               {queue.length > 1 && (
-                <button
-                  type="button"
-                  aria-label="批量管理"
-                  title="批量管理"
+                <IconButton
+                  label="批量管理"
+                  size="lg"
+                  hover="secondary"
                   onClick={() => setSelecting(true)}
-                  className="rounded px-1.5 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
                 >
-                  批量
-                </button>
+                  <ListChecks />
+                </IconButton>
               )}
               {activeIndex !== null && activeIndex < queue.length - 1 && (
-                <button
-                  type="button"
-                  aria-label="清空后续"
-                  title="清空后续"
+                <IconButton
+                  label="清空后续"
+                  size="lg"
+                  hover="secondary"
                   onClick={() =>
                     void ipc.queueClearAfter().catch((err) => {
                       log.warn("[queue] 清空后续失败", err);
                     })
                   }
-                  className="rounded px-1.5 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
                 >
-                  清空后续
-                </button>
+                  <ListX />
+                </IconButton>
               )}
               {queue.length > 0 && (
-                <button
-                  type="button"
-                  aria-label="清空队列"
-                  title="清空队列"
+                <IconButton
+                  label="清空队列"
+                  size="lg"
+                  hover="secondary"
+                  danger
                   onClick={() =>
                     void ipc.clearQueue().catch((err) => {
                       log.warn("[queue] 清空队列失败", err);
                     })
                   }
-                  className="rounded p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
                 >
-                  <Trash2 className="h-4 w-4" />
-                </button>
+                  <Trash2 />
+                </IconButton>
               )}
-              <button
-                type="button"
-                aria-label="关闭队列"
+              <IconButton
+                label="关闭队列"
+                size="lg"
+                hover="secondary"
                 onClick={() => setQueueOpen(false)}
-                className="rounded p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
               >
-                <X className="h-4 w-4" />
-              </button>
+                <X />
+              </IconButton>
             </div>
           </>
         )}
@@ -413,33 +425,28 @@ export function QueuePanel(): React.JSX.Element | null {
               )}
               {/* 行内操作：悬停才出现，避免平时干扰阅读；批量模式下不显示（点击行本身即选择） */}
               {!selecting && (
-                <div className="flex shrink-0 items-center opacity-0 transition-opacity group-hover:opacity-100">
-                  <button
-                    type="button"
-                    title="下一首播放"
-                    aria-label="下一首播放"
+                <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
+                  <IconButton
+                    label="下一首播放"
                     onClick={(e) => {
                       e.stopPropagation();
                       const target =
                         activeIndex === null ? 0 : Math.min(activeIndex + 1, queue.length - 1);
                       void ipc.queueMove(i, target);
                     }}
-                    className="rounded px-1 py-0.5 text-[11px] text-muted-foreground transition-colors hover:bg-background hover:text-foreground"
                   >
-                    下一首
-                  </button>
-                  <button
-                    type="button"
-                    title="从队列移除"
-                    aria-label="从队列移除"
+                    <PlayNextIcon />
+                  </IconButton>
+                  <IconButton
+                    label="从队列移除"
+                    danger
                     onClick={(e) => {
                       e.stopPropagation();
                       void ipc.queueRemoveAt(i);
                     }}
-                    className="rounded p-1 text-muted-foreground transition-colors hover:bg-background hover:text-destructive"
                   >
-                    <X className="h-3.5 w-3.5" />
-                  </button>
+                    <X />
+                  </IconButton>
                 </div>
               )}
             </div>

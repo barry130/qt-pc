@@ -219,7 +219,11 @@ export function onLibraryScanProgress(
 // 歌单只来自云端同步的卡片或本地自建；无归属（pid 找不到歌单）的歌不加载。
 export const LOCAL_PLATFORM = "local";
 
-/** 收藏一首歌。`pid` 不传 = 散装收藏，落到「我喜欢的歌曲」。 */
+/**
+ * 收藏一首歌到某个歌单。`pid` 指定归属歌单，**实际必传**：Rust 侧
+ * `cmd_add_favorite` 没拿到 pid 直接报「收藏必须指定歌单（pid）」，
+ * 无归属的歌不加载（v5 起）。留成可选只是为了调用点不必先断言。
+ */
 export async function addFavorite(track: Track, pid?: string): Promise<void> {
   return invoke("add_favorite", { track, pid: pid ?? null });
 }
@@ -242,6 +246,14 @@ export async function listTrackPlaylists(track: Track): Promise<string[]> {
 
 export async function isFavorite(track: Track): Promise<boolean> {
   return invoke("is_favorite", { track });
+}
+
+/**
+ * 批量判定：返回与入参等长的布尔向量，true = 这首已收藏。
+ * 列表行红心一次点亮整屏用（逐行调 `isFavorite` 会把 IPC 通道打满）。
+ */
+export async function checkFavoriteFlags(tracks: Track[]): Promise<boolean[]> {
+  return invoke("check_favorite_flags", { tracks });
 }
 
 export async function listHistory(limit?: number): Promise<HistoryItem[]> {
@@ -326,6 +338,14 @@ export async function addTracksToPlaylist(
   return invoke("add_tracks_to_playlist", { id, tracks });
 }
 
+/**
+ * 从歌单移除单首曲目。
+ *
+ * 界面上暂时没有调用方：本地歌单详情页的曲目必然是收藏态，所以「从歌单移除」
+ * 与「取消收藏」是同一件事，那一行现在只有收藏红心（走 `removeFavorite`）。
+ * 保留这个原语是因为它是 `remove_tracks_from_playlist` 的单首版本，且
+ * REQUIREMENTS 里规划的列表右键菜单「从歌单移除」还要用它。
+ */
 export async function removeTrackFromPlaylist(
   id: string,
   track: Track,

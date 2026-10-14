@@ -506,6 +506,7 @@ pub fn run() {
             cmd_list_favorites,
             cmd_list_track_playlists,
             cmd_is_favorite,
+            cmd_check_favorite_flags,
             cmd_favorite_playlist,
             cmd_unfavorite_playlist,
             cmd_list_favorite_playlists,

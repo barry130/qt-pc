@@ -1,7 +1,8 @@
 import { useState } from "react";
-import { ChevronDown, FolderPlus, HardDrive } from "lucide-react";
+import { FolderPlus, HardDrive } from "lucide-react";
 import { errMsg } from "@/lib/utils";
 import * as ipc from "@/services/ipc";
+import { IconButton } from "@/components/common/IconButton";
 
 /**
  * 本地曲库的两个添加入口：「添加文件夹」（系统原生目录选择器）与
@@ -45,29 +46,30 @@ export function AddDirButtons(props: {
 
   return (
     <div className="flex flex-wrap items-center gap-2">
-      <button
-        type="button"
-        onClick={() => void chooseFolder()}
+      <IconButton
+        label="添加文件夹"
+        variant="outline"
+        size="lg"
+        hover="secondary"
         disabled={props.disabled}
-        className="flex h-8 items-center gap-1 rounded-md border border-border px-3 text-xs transition-colors hover:bg-secondary disabled:opacity-50"
+        onClick={() => void chooseFolder()}
       >
-        <FolderPlus className="h-3.5 w-3.5" />
-        添加文件夹
-      </button>
+        <FolderPlus />
+      </IconButton>
 
       <div className="relative">
-        <button
-          type="button"
-          onClick={() => void toggleDrives()}
+        <IconButton
+          label="扫描整个磁盘"
+          variant="outline"
+          size="lg"
+          hover="secondary"
           disabled={props.disabled}
-          aria-haspopup="menu"
-          aria-expanded={menuOpen}
-          className="flex h-8 items-center gap-1 rounded-md border border-border px-3 text-xs transition-colors hover:bg-secondary disabled:opacity-50"
+          ariaHasPopup="menu"
+          ariaExpanded={menuOpen}
+          onClick={() => void toggleDrives()}
         >
-          <HardDrive className="h-3.5 w-3.5" />
-          扫描整个磁盘
-          <ChevronDown className="h-3 w-3" />
-        </button>
+          <HardDrive />
+        </IconButton>
         {menuOpen && (
           <ul
             role="menu"

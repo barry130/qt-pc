@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { FolderOpen, Trash2 } from "lucide-react";
 import { errMsg } from "@/lib/utils";
+import { IconButton } from "./IconButton";
 
 /**
  * 列表行内操作（本地曲库 / 下载管理共用）：定位文件 + 删除菜单。
@@ -193,22 +194,22 @@ export function BatchDeleteButton(props: {
 
   return (
     <div ref={ref} className="relative">
-      <button
-        type="button"
-        title="批量删除"
-        aria-label="批量删除"
-        aria-haspopup="menu"
-        aria-expanded={open}
+      <IconButton
+        label={count > 0 ? `批量删除（${count}）` : "批量删除"}
+        variant="outline"
+        size="md"
+        hover="secondary"
+        danger
+        ariaHasPopup="menu"
+        ariaExpanded={open}
         disabled={busy || count === 0}
         onClick={() => {
           setOpen((v) => !v);
           setConfirming(false);
         }}
-        className="flex h-7 items-center gap-1 rounded-md border border-border px-2 text-xs transition-colors hover:bg-secondary disabled:opacity-50"
       >
-        <Trash2 className="h-3.5 w-3.5" />
-        批量删除{count > 0 ? `（${count}）` : ""}
-      </button>
+        <Trash2 />
+      </IconButton>
 
       {open && (
         <div

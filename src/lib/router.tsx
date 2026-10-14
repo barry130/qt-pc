@@ -9,6 +9,7 @@ import { AppShell } from "@/components/layout/AppShell";
 import { PlaceholderPage } from "@/components/layout/PlaceholderPage";
 import { lazyPage } from "@/lib/lazyPage";
 import { parseSearchType, type SearchType } from "@/lib/search-params";
+import { LOCAL_PLATFORM } from "@/services/ipc";
 
 /**
  * 路由表（DESIGN §5.2）。壳内使用 memory history：Tauri 无地址栏，
@@ -25,13 +26,9 @@ const SettingsPage = lazyPage<{ section: string }>(
   () => import("@/components/SettingsPage"),
   "SettingsPage",
 );
-const PlaylistDetailPage = lazyPage<{ platform: string; id: string }>(
+const PlaylistDetailPage = lazyPage<{ platform: string; id: string; kind?: "playlist" | "chart" }>(
   () => import("@/components/discovery/PlaylistDetailPage"),
   "PlaylistDetailPage",
-);
-const ChartDetailPage = lazyPage<{ platform: string; id: string }>(
-  () => import("@/components/discovery/ChartDetailPage"),
-  "ChartDetailPage",
 );
 const FeedbackListPage = lazyPage(
   () => import("@/components/mine/FeedbackListPage"),
@@ -44,10 +41,6 @@ const FeedbackSubmitPage = lazyPage(
 const FeedbackDetailPage = lazyPage(
   () => import("@/components/mine/FeedbackDetailPage"),
   "FeedbackDetailPage",
-);
-const MyPlaylistDetailPage = lazyPage(
-  () => import("@/components/mine/MyPlaylistDetailPage"),
-  "MyPlaylistDetailPage",
 );
 const LoginPage = lazyPage(() => import("@/components/mine/LoginPage"), "LoginPage");
 const ForgotPasswordPage = lazyPage(
@@ -133,7 +126,9 @@ const chartDetailRoute = createRoute({
       platform: string;
       id: string;
     };
-    return <ChartDetailPage platform={platform} id={id} />;
+    // 榜单详情与歌单详情共用同一页面组件（骨架一致：封面 + 标题 + 共 N 首
+    // + 播放全部 + 批量条），靠 kind 分叉取数来源与「取消收藏」的语义
+    return <PlaylistDetailPage platform={platform} id={id} kind="chart" />;
   },
 });
 
@@ -176,7 +171,12 @@ const myPlaylistsRoute = createRoute({
 const myPlaylistDetailRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/my/playlist/$id",
-  component: MyPlaylistDetailPage,
+  // 本地歌单详情与在线歌单详情**共用同一个页面组件**（见 PlaylistDetailPage 模块头）：
+  // 本地歌单只是把 platform 传成 "local"，页面内据此分叉。
+  component: () => {
+    const { id } = useParams({ strict: false }) as { id: string };
+    return <PlaylistDetailPage platform={LOCAL_PLATFORM} id={id} />;
+  },
 });
 
 const historyRoute = createRoute({

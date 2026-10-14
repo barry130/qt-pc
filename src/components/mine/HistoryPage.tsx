@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
+import { Trash2 } from "lucide-react";
 import { errMsg } from "@/lib/utils";
 import type { HistoryItem } from "@/types";
 import * as ipc from "@/services/ipc";
 import { TrackList } from "../discovery/TrackList";
+import { IconButton } from "../common/IconButton";
 import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 
 /**
@@ -57,13 +59,16 @@ export function HistoryPage(): React.JSX.Element {
           </p>
         </div>
         {tracks.length > 0 && (
-          <button
-            type="button"
+          <IconButton
+            label="清空播放记录"
+            variant="outline"
+            size="lg"
+            hover="secondary"
+            danger
             onClick={() => void clear()}
-            className="h-8 rounded-md border border-border px-3 text-xs transition-colors hover:bg-secondary"
           >
-            清空
-          </button>
+            <Trash2 />
+          </IconButton>
         )}
       </div>
 
@@ -82,7 +87,7 @@ export function HistoryPage(): React.JSX.Element {
             还没有播放记录
           </div>
         ) : (
-          <TrackList tracks={tracks} showAddToPlaylist showDownload />
+          <TrackList tracks={tracks} showCollect showDownload />
         )}
       </div>
     </div>

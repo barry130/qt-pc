@@ -257,6 +257,23 @@
   }
 }
 
+/* 右上角轻提示（common/ToastHost，3 秒自动消失的回执）：只做「淡入 + 轻微下落」，
+ * 淡出走 transition（见组件里的 leaving 态，动画结束后才切 opacity，不打架）。
+ * 减弱动效由文件末尾的 .reduce-motion 统一关掉。 */
+@keyframes qt-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.qt-toast {
+  animation: qt-toast-in 0.18s ease-out;
+}
+
 /* 播放页黑胶封面旋转。
  * 用 animation-play-state 而不是增删 animation：暂停时停在当前角度，
  * 恢复播放后从原角度继续，不会「啪」地跳回 0 度。
@@ -303,10 +320,25 @@
  * contain-intrinsic-size 给的是「还没渲染过时按多高占位」的估值：行高固定
  * （py-2 + 36px 封面 ≈ 52px），先按 52px 占位避免滚动条长度跳动；`auto` 关键字
  * 让浏览器记住每行**实际**渲染过的高度，之后用真实值，估值只影响首次。
- * 若将来行模板变化（改成两行文本等），这个估值要跟着调。 */
+ * 若将来行模板变化（改成两行文本等），这个估值要跟着调。
+ *
+ * 注意 `content-visibility` 不是「视口外才生效」的纯优化：它**无条件**给元素加上
+ * `contain: layout style paint`，而 paint containment 会把溢出到元素盒外的后代
+ * **裁掉**。行内的弹出层（收藏面板、删除菜单）用 `absolute top-full` 落在行的
+ * 下边缘之外，正好被裁成一条几像素的白边——面板其实已经渲染好了，只是看不见。
+ * 所以下面给「当前开着弹出层的行」退回 `visible`：弹出层只可能同时存在一个，
+ * 命中的行至多一行，跳绘优化对其它行照旧生效。
+ *
+ * 判据用 `aria-expanded="true"`（行内弹出层的触发按钮都必须带这个属性，
+ * 顺带补 `role="menu"` 兜底），比在 JS 里往行上传一个「我开着面板」的 prop 更省：
+ * 不用改 TrackRow 的 memo 契约，也不会漏掉将来新加的弹出层。 */
 .cv-row {
   content-visibility: auto;
   contain-intrinsic-size: auto 52px;
+}
+.cv-row:has([aria-expanded="true"], [role="menu"]) {
+  /* 恢复绘制溢出：不这么做弹出层会被 paint containment 裁掉 */
+  content-visibility: visible;
 }
 
 /* 减弱动效 */

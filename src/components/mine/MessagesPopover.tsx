@@ -1,8 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowLeft, MessageSquare, RefreshCw, X } from "lucide-react";
+import { ArrowLeft, CheckCheck, MessageSquare, RefreshCw, X } from "lucide-react";
 import { useMessages, summary, type MessageItem } from "./messages-data";
 import { RichText } from "@/lib/richText";
 import * as ipc from "@/services/ipc";
+import { IconButton } from "@/components/common/IconButton";
 
 /**
  * 消息中心弹出面板（标题栏「消息中心」图标点开，参考主流播放器的邮件下拉）。
@@ -86,14 +87,13 @@ function MessagesPanel(props: {
       {current ? (
         <>
           <div className="flex shrink-0 items-center justify-between border-b border-border px-4 py-2.5">
-            <button
-              type="button"
+            <IconButton
+              label="返回列表"
+              hover="secondary"
               onClick={() => setOpenId(null)}
-              className="flex items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
             >
-              <ArrowLeft className="h-3.5 w-3.5" />
-              返回列表
-            </button>
+              <ArrowLeft />
+            </IconButton>
             <button
               type="button"
               onClick={onClose}
@@ -147,14 +147,14 @@ function MessagesPanel(props: {
               >
                 <RefreshCw className="h-3.5 w-3.5" />
               </button>
-              <button
-                type="button"
-                onClick={onMarkAllRead}
+              <IconButton
+                label="全部标为已读"
+                hover="secondary"
                 disabled={unread.length === 0}
-                className="rounded px-1.5 py-1 text-xs text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground disabled:opacity-40"
+                onClick={onMarkAllRead}
               >
-                全部已读
-              </button>
+                <CheckCheck />
+              </IconButton>
             </div>
           </div>
 
