@@ -10,7 +10,7 @@ import {
 } from "@/lib/localOnline";
 import { useMusicSourceStore } from "@/stores/musicSource";
 import { useSourceLabelFn, useSourceRegistryStore } from "@/stores/sourceRegistry";
-import { useDismissOnOutside } from "@/hooks/useDismissOnOutside";
+import { Popover } from "@/components/common/Popover";
 import { cn, errMsg } from "@/lib/utils";
 import type { Lyric, SourceId, Track } from "@/types";
 
@@ -38,47 +38,51 @@ export function LyricSearchButton(props: {
   onPicked: (lyric: Lyric) => void;
 }): React.JSX.Element {
   const { track, cross, open, onOpenChange, onPicked } = props;
-  const boxRef = useRef<HTMLDivElement | null>(null);
-  useDismissOnOutside(boxRef, open, () => onOpenChange(false));
 
   return (
-    <div ref={boxRef} className="relative">
-      <button
-        type="button"
-        data-testid="lyric-search-toggle"
-        aria-label="搜索歌词"
-        aria-expanded={open}
-        title="搜索歌词（自动取词拿错版本/没有词时手动挑一份）"
-        disabled={track === null}
-        onClick={() => onOpenChange(!open)}
-        className={cn(
-          "flex items-center gap-1 rounded-md px-2 py-1 text-xs transition-colors",
-          track === null
-            ? "cursor-not-allowed text-foreground/40"
-            : "text-foreground/80 hover:bg-foreground/10",
-          open && "bg-foreground/10 text-foreground",
-        )}
-      >
-        <Search className="h-3.5 w-3.5" />
-        搜索歌词
-      </button>
-
-      {open && track !== null && (
-        <div
-          data-testid="lyric-search-panel"
-          className="absolute right-0 z-20 mt-1 w-[380px] max-w-[80vw] rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-lg"
+    <Popover
+      open={open}
+      onOpenChange={onOpenChange}
+      trigger={(t) => (
+        <button
+          type="button"
+          data-testid="lyric-search-toggle"
+          aria-label="搜索歌词"
+          aria-expanded={t.open}
+          title="搜索歌词（自动取词拿错版本/没有词时手动挑一份）"
+          disabled={track === null}
+          onClick={t.toggle}
+          className={cn(
+            "flex items-center gap-1 rounded-md px-2 py-1 text-xs transition-colors",
+            track === null
+              ? "cursor-not-allowed text-foreground/40"
+              : "text-foreground/80 hover:bg-foreground/10",
+            t.open && "bg-foreground/10 text-foreground",
+          )}
         >
-          <LyricSearchPanel
-            track={track}
-            cross={cross}
-            onPicked={(lyric) => {
-              onOpenChange(false);
-              onPicked(lyric);
-            }}
-          />
-        </div>
+          <Search className="h-3.5 w-3.5" />
+          搜索歌词
+        </button>
       )}
-    </div>
+    >
+      {() =>
+        track !== null ? (
+          <div
+            data-testid="lyric-search-panel"
+            className="absolute right-0 z-20 mt-1 w-[380px] max-w-[80vw] rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-lg"
+          >
+            <LyricSearchPanel
+              track={track}
+              cross={cross}
+              onPicked={(lyric) => {
+                onOpenChange(false);
+                onPicked(lyric);
+              }}
+            />
+          </div>
+        ) : null
+      }
+    </Popover>
   );
 }
 

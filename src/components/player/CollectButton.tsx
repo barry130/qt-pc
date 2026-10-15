@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { Heart } from "lucide-react";
 import type { Track } from "@/types";
 import * as ipc from "@/services/ipc";
 import { useFavoritesStore } from "@/stores/favorites";
-import { useDismissOnOutside } from "@/hooks/useDismissOnOutside";
 import { CollectMenu } from "@/components/mine/CollectMenu";
+import { Popover } from "@/components/common/Popover";
 
 /**
  * 收藏选择器（播放条上的红心）。
@@ -21,7 +21,6 @@ import { CollectMenu } from "@/components/mine/CollectMenu";
 export function CollectButton(props: { track: Track | null }): React.JSX.Element {
   const { track } = props;
   const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement | null>(null);
   const version = useFavoritesStore((s) => s.version);
 
   // 当前曲目是否已被收藏（面板没开时也要能点亮红心）
@@ -49,35 +48,37 @@ export function CollectButton(props: { track: Track | null }): React.JSX.Element
   // 曲目切了就把面板收起，避免对着上一首歌操作
   useEffect(() => setOpen(false), [track]);
 
-  // 点外面 / Esc 收起：用全仓共用那一份（与其它弹层行为一致）
-  const close = useCallback(() => setOpen(false), []);
-  useDismissOnOutside(ref, open, close);
-
   return (
-    <div ref={ref} className="relative">
-      <button
-        type="button"
-        aria-label="收藏到歌单"
-        title="收藏到歌单"
-        disabled={!track}
-        onClick={() => setOpen((v) => !v)}
-        className={[
-          "flex h-8 w-8 items-center justify-center rounded-full transition-colors hover:bg-secondary/50",
-          liked ? "text-primary" : "text-foreground/80",
-          !track && "cursor-not-allowed opacity-40",
-        ].join(" ")}
-      >
-        <Heart className={liked ? "h-4 w-4 fill-current" : "h-4 w-4"} />
-      </button>
-
-      {open && track && (
-        <CollectMenu
-          track={track}
-          onLikedChange={setLiked}
-          onClose={() => setOpen(false)}
-          className="absolute bottom-full left-1/2 z-30 mb-2 w-56 -translate-x-1/2 rounded-xl border border-border bg-popover/95 p-1 text-popover-foreground shadow-2xl backdrop-blur-xl"
-        />
+    <Popover
+      open={open}
+      onOpenChange={setOpen}
+      trigger={(t) => (
+        <button
+          type="button"
+          aria-label="收藏到歌单"
+          title="收藏到歌单"
+          disabled={!track}
+          onClick={t.toggle}
+          className={[
+            "flex h-8 w-8 items-center justify-center rounded-full transition-colors hover:bg-secondary/50",
+            liked ? "text-primary" : "text-foreground/80",
+            !track && "cursor-not-allowed opacity-40",
+          ].join(" ")}
+        >
+          <Heart className={liked ? "h-4 w-4 fill-current" : "h-4 w-4"} />
+        </button>
       )}
-    </div>
+    >
+      {() =>
+        track ? (
+          <CollectMenu
+            track={track}
+            onLikedChange={setLiked}
+            onClose={() => setOpen(false)}
+            className="absolute bottom-full left-1/2 z-30 mb-2 w-56 -translate-x-1/2 rounded-xl border border-border bg-popover/95 p-1 text-popover-foreground shadow-2xl backdrop-blur-xl"
+          />
+        ) : null
+      }
+    </Popover>
   );
 }

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Check, Download, Heart, Loader2, Plus, X } from "lucide-react";
 import { cn, errMsg } from "@/lib/utils";
 import { findCrossSourceDup } from "@/lib/collect-dup";
@@ -9,7 +9,7 @@ import { useFavoriteFlags } from "@/hooks/useFavoriteFlags";
 import type { MyPlaylistSummary, Track } from "@/types";
 import * as ipc from "@/services/ipc";
 import { IconButton } from "@/components/common/IconButton";
-import { useDismissOnOutside } from "@/hooks/useDismissOnOutside";
+import { Popover } from "@/components/common/Popover";
 
 /**
  * 列表批量管理条（**歌单详情 / 榜单详情 / 每日新歌共用**）。
@@ -111,13 +111,10 @@ export function BatchBar(props: {
   const sourceLabel = useSourceLabelFn();
   const bump = useFavoritesStore((s) => s.bump);
   const favVersion = useFavoritesStore((s) => s.version);
-  const menuRef = useRef<HTMLSpanElement | null>(null);
   const closeMenu = (): void => {
     setMenuOpen(false);
     setPending(null);
   };
-  // 触发按钮与面板一起包在 menuRef 里，否则点面板内部会被当成「点外部」
-  useDismissOnOutside(menuRef, menuOpen, closeMenu);
 
   const targets = useMemo(
     () => tracks.filter((t) => selected.has(t.id)),
@@ -455,26 +452,35 @@ export function BatchBar(props: {
           取消收藏」的开关，与播放条红心打开的 `CollectMenu` 同口径。
           红心和单曲版一样会变实心：整批都已收藏就点亮，只要还有一首没收
           就是空心（判定口径同 `is_liked_song`）。 */}
-      <span ref={menuRef} className="relative flex items-center">
-        <IconButton
-          label={
-            allLiked
-              ? `已收藏${count > 0 ? `（${count}）` : ""}，点击管理收藏`
-              : `批量收藏${count > 0 ? `（${count}）` : ""}`
-          }
-          variant="outline"
-          size="lg"
-          hover="secondary"
-          disabled={menuBusy || count === 0}
-          ariaHasPopup="menu"
-          ariaExpanded={menuOpen}
-          onClick={() => void openMenu()}
-        >
-          {/* 实心高亮写在图标自己身上（与列表行红心同款）：按钮的 hover 会改
-              按钮文字色，改不动 svg 自己的 color，所以悬停时红心不会褪色 */}
-          <Heart className={allLiked ? "fill-current text-primary" : undefined} />
-        </IconButton>
-        {menuOpen ? (
+      <Popover
+        open={menuOpen}
+        onOpenChange={(next) => {
+          if (next) setMenuOpen(true);
+          else closeMenu();
+        }}
+        className="relative flex items-center"
+        trigger={(t) => (
+          <IconButton
+            label={
+              allLiked
+                ? `已收藏${count > 0 ? `（${count}）` : ""}，点击管理收藏`
+                : `批量收藏${count > 0 ? `（${count}）` : ""}`
+            }
+            variant="outline"
+            size="lg"
+            hover="secondary"
+            disabled={menuBusy || count === 0}
+            ariaHasPopup="menu"
+            ariaExpanded={t.open}
+            onClick={() => void openMenu()}
+          >
+            {/* 实心高亮写在图标自己身上（与列表行红心同款）：按钮的 hover 会改
+                按钮文字色，改不动 svg 自己的 color，所以悬停时红心不会褪色 */}
+            <Heart className={allLiked ? "fill-current text-primary" : undefined} />
+          </IconButton>
+        )}
+      >
+        {() => (
           <div className="absolute right-0 top-full z-20 mt-1 w-60 rounded-md border border-border bg-popover p-1 shadow-md">
             <div className="px-2 py-1 text-xs text-muted-foreground">
               {membersLoading ? "读取歌单…" : `收藏 / 取消收藏 ${count} 首`}
@@ -578,8 +584,8 @@ export function BatchBar(props: {
               <div className="px-2 py-1 text-[11px] text-destructive">{menuError}</div>
             )}
           </div>
-        ) : null}
-      </span>
+        )}
+      </Popover>
     </div>
   );
 }

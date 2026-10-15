@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { FolderOpen, Trash2 } from "lucide-react";
 import { errMsg } from "@/lib/utils";
 import { IconButton } from "./IconButton";
+import { Popover } from "./Popover";
 
 /**
  * 列表行内操作（本地曲库 / 下载管理共用）：定位文件 + 删除菜单。
@@ -52,21 +53,7 @@ export function RowActions(props: {
   const [open, setOpen] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
-  const ref = useRef<HTMLDivElement | null>(null);
   const disabled = props.disabled || busy;
-
-  // 点击外部关闭菜单；顺手复位二次确认，避免下次打开还停在「确认删除」上
-  useEffect(() => {
-    if (!open) return;
-    const onDoc = (e: MouseEvent): void => {
-      if (ref.current && !ref.current.contains(e.target as Node)) {
-        setOpen(false);
-        setConfirming(false);
-      }
-    };
-    document.addEventListener("mousedown", onDoc);
-    return () => document.removeEventListener("mousedown", onDoc);
-  }, [open]);
 
   const reveal = async (): Promise<void> => {
     try {
@@ -90,40 +77,51 @@ export function RowActions(props: {
   };
 
   return (
-    <div ref={ref} className="relative flex shrink-0 items-center">
-      {props.onReveal && (
-        <button
-          type="button"
-          title="在文件夹中显示"
-          aria-label="在文件夹中显示"
-          disabled={disabled}
-          onClick={(e) => {
-            e.stopPropagation();
-            void reveal();
-          }}
-          className="rounded p-1 text-muted-foreground transition-colors hover:bg-background hover:text-foreground disabled:opacity-50"
-        >
-          <FolderOpen className="h-3.5 w-3.5" />
-        </button>
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        // 收起（点外面 / Esc）顺手复位二次确认，避免下次打开还停在「确认删除」上
+        if (!next) setConfirming(false);
+      }}
+      className="relative flex shrink-0 items-center"
+      trigger={(t) => (
+        <>
+          {props.onReveal && (
+            <button
+              type="button"
+              title="在文件夹中显示"
+              aria-label="在文件夹中显示"
+              disabled={disabled}
+              onClick={(e) => {
+                e.stopPropagation();
+                void reveal();
+              }}
+              className="rounded p-1 text-muted-foreground transition-colors hover:bg-background hover:text-foreground disabled:opacity-50"
+            >
+              <FolderOpen className="h-3.5 w-3.5" />
+            </button>
+          )}
+          <button
+            type="button"
+            title="删除"
+            aria-label="删除"
+            aria-haspopup="menu"
+            aria-expanded={t.open}
+            disabled={disabled}
+            onClick={(e) => {
+              e.stopPropagation();
+              t.toggle();
+              setConfirming(false);
+            }}
+            className="rounded p-1 text-muted-foreground transition-colors hover:bg-background hover:text-destructive disabled:opacity-50"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </button>
+        </>
       )}
-      <button
-        type="button"
-        title="删除"
-        aria-label="删除"
-        aria-haspopup="menu"
-        aria-expanded={open}
-        disabled={disabled}
-        onClick={(e) => {
-          e.stopPropagation();
-          setOpen((v) => !v);
-          setConfirming(false);
-        }}
-        className="rounded p-1 text-muted-foreground transition-colors hover:bg-background hover:text-destructive disabled:opacity-50"
-      >
-        <Trash2 className="h-3.5 w-3.5" />
-      </button>
-
-      {open && (
+    >
+      {() => (
         <div
           role="menu"
           className="absolute right-0 top-full z-20 mt-1 w-48 rounded-md border border-border bg-popover p-1 shadow-md"
@@ -142,7 +140,7 @@ export function RowActions(props: {
           )}
         </div>
       )}
-    </div>
+    </Popover>
   );
 }
 
@@ -163,20 +161,7 @@ export function BatchDeleteButton(props: {
   const [open, setOpen] = useState(false);
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
-  const ref = useRef<HTMLDivElement | null>(null);
   const count = props.count;
-
-  useEffect(() => {
-    if (!open) return;
-    const onDoc = (e: MouseEvent): void => {
-      if (ref.current && !ref.current.contains(e.target as Node)) {
-        setOpen(false);
-        setConfirming(false);
-      }
-    };
-    document.addEventListener("mousedown", onDoc);
-    return () => document.removeEventListener("mousedown", onDoc);
-  }, [open]);
 
   const remove = async (deleteFile: boolean): Promise<void> => {
     setBusy(true);
@@ -193,25 +178,32 @@ export function BatchDeleteButton(props: {
   };
 
   return (
-    <div ref={ref} className="relative">
-      <IconButton
-        label={count > 0 ? `批量删除（${count}）` : "批量删除"}
-        variant="outline"
-        size="md"
-        hover="secondary"
-        danger
-        ariaHasPopup="menu"
-        ariaExpanded={open}
-        disabled={busy || count === 0}
-        onClick={() => {
-          setOpen((v) => !v);
-          setConfirming(false);
-        }}
-      >
-        <Trash2 />
-      </IconButton>
-
-      {open && (
+    <Popover
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (!next) setConfirming(false);
+      }}
+      trigger={(t) => (
+        <IconButton
+          label={count > 0 ? `批量删除（${count}）` : "批量删除"}
+          variant="outline"
+          size="md"
+          hover="secondary"
+          danger
+          ariaHasPopup="menu"
+          ariaExpanded={t.open}
+          disabled={busy || count === 0}
+          onClick={() => {
+            t.toggle();
+            setConfirming(false);
+          }}
+        >
+          <Trash2 />
+        </IconButton>
+      )}
+    >
+      {() => (
         <div
           role="menu"
           className="absolute left-0 top-full z-20 mt-1 w-52 rounded-md border border-border bg-popover p-1 shadow-md"
@@ -230,6 +222,6 @@ export function BatchDeleteButton(props: {
           )}
         </div>
       )}
-    </div>
+    </Popover>
   );
 }

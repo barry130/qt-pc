@@ -43,8 +43,8 @@ import { qualityOptionsFromRegistry } from "@/lib/quality";
 import { PLAYER_BAR_BUTTONS, splitPlayerBarButtons } from "@/lib/player-bar";
 import { useSourceQualities } from "@/stores/sourceRegistry";
 import { usePlayerBarStore } from "@/stores/playerBar";
-import { useDismissOnOutside } from "@/hooks/useDismissOnOutside";
 import { useTauriEvent } from "@/hooks/useTauriEvent";
+import { Popover } from "@/components/common/Popover";
 import { SPEED_OPTIONS, speedLabel } from "@/lib/fx";
 import type { Quality, Track } from "@/types";
 import { useInterpolatedPosition } from "@/hooks/useInterpolatedPosition";
@@ -678,10 +678,7 @@ function DesktopLyricButton(): React.JSX.Element {
  * 无损就不显示 flac；未声明 = 全部档位）。菜单向上弹（播放条贴在窗口底部）。
  */
 function QualityMenu(props: { current: Quality; platform: string }): React.JSX.Element {
-  const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
-  const boxRef = useRef<HTMLDivElement | null>(null);
-  useDismissOnOutside(boxRef, open, () => setOpen(false));
   // 档位清单来自数据包注册表并按当前歌曲的源过滤（未就绪时 qualityOptionsFromRegistry 兜底三档）
   const options = qualityOptionsFromRegistry(
     useSourceQualities(props.platform),
@@ -689,29 +686,32 @@ function QualityMenu(props: { current: Quality; platform: string }): React.JSX.E
   const shortOf = (q: Quality): string =>
     options.find((o) => o.value === q)?.short ?? q;
 
-  const pick = (q: Quality): void => {
-    setOpen(false);
-    if (q === props.current) return;
-    setBusy(true);
-    // 取址失败不会抛到这里，走 audio-error 事件 → 播放条自己提示
-    void setTrackQuality(q).finally(() => setBusy(false));
-  };
-
   return (
-    <div ref={boxRef} className="relative">
-      <button
-        type="button"
-        aria-label={`音质：${shortOf(props.current)}（只对当前这首歌生效）`}
-        title="音质（只对当前这首歌生效，默认音质在设置里改）"
-        aria-haspopup="menu"
-        aria-expanded={open}
-        disabled={busy}
-        onClick={() => setOpen((v) => !v)}
-        className="flex h-9 min-w-12 items-center justify-center rounded-full px-2.5 text-xs font-medium tabular-nums transition-all disabled:opacity-50 text-foreground/80 hover:bg-secondary/50 hover:text-foreground"
-      >
-        {shortOf(props.current)}
-      </button>
-      {open ? (
+    <Popover
+      trigger={(t) => (
+        <button
+          type="button"
+          aria-label={`音质：${shortOf(props.current)}（只对当前这首歌生效）`}
+          title="音质（只对当前这首歌生效，默认音质在设置里改）"
+          aria-haspopup="menu"
+          aria-expanded={t.open}
+          disabled={busy}
+          onClick={t.toggle}
+          className="flex h-9 min-w-12 items-center justify-center rounded-full px-2.5 text-xs font-medium tabular-nums transition-all disabled:opacity-50 text-foreground/80 hover:bg-secondary/50 hover:text-foreground"
+        >
+          {shortOf(props.current)}
+        </button>
+      )}
+    >
+      {(close) => {
+        const pick = (q: Quality): void => {
+          close();
+          if (q === props.current) return;
+          setBusy(true);
+          // 取址失败不会抛到这里，走 audio-error 事件 → 播放条自己提示
+          void setTrackQuality(q).finally(() => setBusy(false));
+        };
+        return (
         <div
           role="menu"
           className="absolute bottom-full right-0 z-30 mb-2 w-32 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg"
@@ -735,9 +735,10 @@ function QualityMenu(props: { current: Quality; platform: string }): React.JSX.E
               <span className="text-[10px] text-muted-foreground">{o.short}</span>
             </button>
           ))}
-        </div>
-      ) : null}
-    </div>
+          </div>
+        );
+      }}
+    </Popover>
   );
 }
 
@@ -746,29 +747,28 @@ function QualityMenu(props: { current: Quality; platform: string }): React.JSX.E
  * 与「音质」不同——音质菜单只改当前这首，默认音质在设置页。
  */
 function SpeedMenu(props: { current: number }): React.JSX.Element {
-  const [open, setOpen] = useState(false);
-  const boxRef = useRef<HTMLDivElement | null>(null);
-  useDismissOnOutside(boxRef, open, () => setOpen(false));
-
-  const pick = (v: number): void => {
-    setOpen(false);
-    if (v !== props.current) void setSpeed(v).catch(() => {});
-  };
-
   return (
-    <div ref={boxRef} className="relative">
-      <button
-        type="button"
-        aria-label={`倍速：${speedLabel(props.current)}`}
-        title="倍速"
-        aria-haspopup="menu"
-        aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
-        className="flex h-9 min-w-12 items-center justify-center rounded-full px-2.5 text-xs font-medium tabular-nums text-foreground/80 transition-all hover:bg-secondary/50 hover:text-foreground"
-      >
-        {speedLabel(props.current)}
-      </button>
-      {open ? (
+    <Popover
+      trigger={(t) => (
+        <button
+          type="button"
+          aria-label={`倍速：${speedLabel(props.current)}`}
+          title="倍速"
+          aria-haspopup="menu"
+          aria-expanded={t.open}
+          onClick={t.toggle}
+          className="flex h-9 min-w-12 items-center justify-center rounded-full px-2.5 text-xs font-medium tabular-nums text-foreground/80 transition-all hover:bg-secondary/50 hover:text-foreground"
+        >
+          {speedLabel(props.current)}
+        </button>
+      )}
+    >
+      {(close) => {
+        const pick = (v: number): void => {
+          close();
+          if (v !== props.current) void setSpeed(v).catch(() => {});
+        };
+        return (
         <div
           role="menu"
           className="absolute bottom-full right-0 z-30 mb-2 w-28 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg"
@@ -791,9 +791,10 @@ function SpeedMenu(props: { current: number }): React.JSX.Element {
               {v === 1 && <span className="text-[10px] text-muted-foreground">原速</span>}
             </button>
           ))}
-        </div>
-      ) : null}
-    </div>
+          </div>
+        );
+      }}
+    </Popover>
   );
 }
 
@@ -808,9 +809,6 @@ function SleepTimerMenu(props: {
   remainingMs: number | null;
   afterTrack: boolean;
 }): React.JSX.Element {
-  const [open, setOpen] = useState(false);
-  const boxRef = useRef<HTMLDivElement | null>(null);
-  useDismissOnOutside(boxRef, open, () => setOpen(false));
   // 快照只带「武装时刻的剩余量」，这里本地每秒递减展示
   const [remainMs, setRemainMs] = useState<number | null>(null);
   const armedAtRef = useRef(0);
@@ -837,26 +835,29 @@ function SleepTimerMenu(props: {
       ? `睡眠定时：${formatTime(remainMs)} 后暂停`
       : "睡眠定时";
 
-  const pick = (minutes: number | "track" | null): void => {
-    setOpen(false);
-    if (minutes === null) void setSleepTimer(null, false).catch(() => {});
-    else if (minutes === "track") void setSleepTimer(null, true).catch(() => {});
-    else void setSleepTimer(minutes * 60_000, false).catch(() => {});
-  };
-
   return (
-    <div ref={boxRef} className="relative">
-      <ControlButton
-        label={title}
-        active={armed}
-        emphasis
-        aria-haspopup="menu"
-        aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
-      >
-        <Timer className="h-4 w-4" />
-      </ControlButton>
-      {open ? (
+    <Popover
+      trigger={(t) => (
+        <ControlButton
+          label={title}
+          active={armed}
+          emphasis
+          ariaHasPopup="menu"
+          ariaExpanded={t.open}
+          onClick={t.toggle}
+        >
+          <Timer className="h-4 w-4" />
+        </ControlButton>
+      )}
+    >
+      {(close) => {
+        const pick = (minutes: number | "track" | null): void => {
+          close();
+          if (minutes === null) void setSleepTimer(null, false).catch(() => {});
+          else if (minutes === "track") void setSleepTimer(null, true).catch(() => {});
+          else void setSleepTimer(minutes * 60_000, false).catch(() => {});
+        };
+        return (
         <div
           role="menu"
           className="absolute bottom-full right-0 z-30 mb-2 w-36 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg"
@@ -900,9 +901,10 @@ function SleepTimerMenu(props: {
           >
             播完当前歌停止
           </button>
-        </div>
-      ) : null}
-    </div>
+          </div>
+        );
+      }}
+    </Popover>
   );
 }
 
@@ -939,8 +941,6 @@ function PlayModeButton(props: {
 function PlayUrlButton(props: { url: string | null; line: string; miss: string }): React.JSX.Element {
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
-  const boxRef = useRef<HTMLDivElement | null>(null);
-  useDismissOnOutside(boxRef, open, () => setOpen(false));
 
   // 收起时把「已复制」复位，下次打开是干净状态
   useEffect(() => {
@@ -959,15 +959,16 @@ function PlayUrlButton(props: { url: string | null; line: string; miss: string }
   };
 
   return (
-    <div ref={boxRef} className="relative">
-      <ControlButton
-        label="播放地址（仅管理员）"
-        active={open}
-        onClick={() => setOpen((v) => !v)}
-      >
-        <Link2 className="h-4 w-4" />
-      </ControlButton>
-      {open ? (
+    <Popover
+      open={open}
+      onOpenChange={setOpen}
+      trigger={(t) => (
+        <ControlButton label="播放地址（仅管理员）" active={t.open} onClick={t.toggle}>
+          <Link2 className="h-4 w-4" />
+        </ControlButton>
+      )}
+    >
+      {() => (
         <div className="absolute bottom-full left-1/2 z-30 mb-2 w-[420px] max-w-[70vw] -translate-x-1/2 rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-lg">
           <div className="mb-1.5 text-[10px] text-muted-foreground">
             当前实际播放地址（换源后指向真正在播的源）
@@ -1016,8 +1017,8 @@ function PlayUrlButton(props: { url: string | null; line: string; miss: string }
             )}
           </div>
         </div>
-      ) : null}
-    </div>
+      )}
+    </Popover>
   );
 }
 
@@ -1158,21 +1159,20 @@ function EqualizerButton(): React.JSX.Element {
  * 照移动端做成「卡片预览 + 复制图片 / 保存 PNG」的弹层 —— 分享出去的是图，不是一行文字。
  */
 function ShareButton(props: { track: Track }): React.JSX.Element {
-  const [open, setOpen] = useState(false);
-  const boxRef = useRef<HTMLDivElement | null>(null);
-  useDismissOnOutside(boxRef, open, () => setOpen(false));
-
   return (
-    <div ref={boxRef} className="relative">
-      <ControlButton label="分享" active={open} onClick={() => setOpen((v) => !v)}>
-        <Share2 className="h-4 w-4" />
-      </ControlButton>
-      {open ? (
+    <Popover
+      trigger={(t) => (
+        <ControlButton label="分享" active={t.open} onClick={t.toggle}>
+          <Share2 className="h-4 w-4" />
+        </ControlButton>
+      )}
+    >
+      {() => (
         <div className="absolute bottom-full left-1/2 z-30 mb-2 -translate-x-1/2 rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-lg">
           <ShareCardPanel track={props.track} />
         </div>
-      ) : null}
-    </div>
+      )}
+    </Popover>
   );
 }
 
@@ -1181,27 +1181,26 @@ function ShareButton(props: { track: Track }): React.JSX.Element {
  * SourceSwitchPanel），点选后就地替换 —— 队列位置不动；点外面/Esc 收起。
  */
 function SourceSwitchButton(props: { track: Track }): React.JSX.Element {
-  const [open, setOpen] = useState(false);
-  const boxRef = useRef<HTMLDivElement | null>(null);
-  useDismissOnOutside(boxRef, open, () => setOpen(false));
-
   return (
-    <div ref={boxRef} className="relative">
-      <ControlButton label="换源" active={open} onClick={() => setOpen((v) => !v)}>
-        <RefreshCw className="h-4 w-4" />
-      </ControlButton>
-      {open ? (
+    <Popover
+      trigger={(t) => (
+        <ControlButton label="换源" active={t.open} onClick={t.toggle}>
+          <RefreshCw className="h-4 w-4" />
+        </ControlButton>
+      )}
+    >
+      {(close) => (
         <div className="absolute bottom-full left-1/2 z-30 mb-2 -translate-x-1/2 rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-lg">
           <SourceSwitchPanel
             track={props.track}
             onPick={(candidate) => {
-              setOpen(false);
+              close();
               void replaceCurrentWithCandidate(candidate);
             }}
           />
         </div>
-      ) : null}
-    </div>
+      )}
+    </Popover>
   );
 }
 

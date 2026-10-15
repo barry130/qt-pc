@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { RotateCcw } from "lucide-react";
 
 import { MAX_LYRIC_OFFSET_MS, type LyricOffset } from "@/hooks/useLyricOffset";
-import { useDismissOnOutside } from "@/hooks/useDismissOnOutside";
+import { Popover } from "@/components/common/Popover";
 import { cn } from "@/lib/utils";
 
 /**
@@ -25,10 +25,6 @@ export function LyricOffsetControl(props: {
   const [dragging, setDragging] = useState(false);
   const draggingRef = useRef(false);
   draggingRef.current = dragging;
-  // 与旁边「搜索歌词」弹层同款收起（点外面 / Esc）——桌面歌词工具条里两个
-  // 下拉挨着，一个点外面能关、一个不能关最招人烦
-  const boxRef = useRef<HTMLDivElement | null>(null);
-  useDismissOnOutside(boxRef, open, () => setOpen(false));
 
   // 面板开着且用户没在拖时，跟随外部值（比如另一处 UI 改了偏移 / 切歌重读）
   useEffect(() => {
@@ -39,26 +35,31 @@ export function LyricOffsetControl(props: {
     `${ms > 0 ? "+" : ms < 0 ? "−" : ""}${Math.abs(ms)} ms`;
 
   return (
-    <div ref={boxRef} className={cn("relative", className)}>
-      <button
-        type="button"
-        data-testid="lyric-offset-toggle"
-        aria-label="歌词偏移"
-        aria-expanded={open}
-        title="歌词偏移（歌词比声音快/慢时调整）"
-        onClick={() => setOpen((v) => !v)}
-        className={cn(
-          "flex items-center gap-1 rounded-md px-2 py-1 text-xs transition-colors",
-          "text-foreground/80 hover:bg-foreground/10",
-          offset.offsetMs !== 0 && "text-lyric-highlight",
-        )}
-      >
-        <span className="tabular-nums">
-          {offset.offsetMs === 0 ? "偏移" : fmt(offset.offsetMs)}
-        </span>
-      </button>
-
-      {open && (
+    <Popover
+      open={open}
+      onOpenChange={setOpen}
+      className={cn("relative", className)}
+      trigger={(t) => (
+        <button
+          type="button"
+          data-testid="lyric-offset-toggle"
+          aria-label="歌词偏移"
+          aria-expanded={t.open}
+          title="歌词偏移（歌词比声音快/慢时调整）"
+          onClick={t.toggle}
+          className={cn(
+            "flex items-center gap-1 rounded-md px-2 py-1 text-xs transition-colors",
+            "text-foreground/80 hover:bg-foreground/10",
+            offset.offsetMs !== 0 && "text-lyric-highlight",
+          )}
+        >
+          <span className="tabular-nums">
+            {offset.offsetMs === 0 ? "偏移" : fmt(offset.offsetMs)}
+          </span>
+        </button>
+      )}
+    >
+      {() => (
         <div
           data-testid="lyric-offset-panel"
           className={cn(
@@ -137,6 +138,6 @@ export function LyricOffsetControl(props: {
           </p>
         </div>
       )}
-    </div>
+    </Popover>
   );
 }

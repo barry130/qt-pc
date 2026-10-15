@@ -882,73 +882,12 @@ fn run_engine(deps: EngineDeps) {
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
 
-        // 淡出暂停到期：Pause 命令只发起淡出（增益拉到 0），状态仍是 Playing，
-        // 到点这里才真正 pause。期间用户 Play/Seek/换曲都会撤销 deadline。
-        if let Some(deadline) = inner.pause_deadline {
-            if std::time::Instant::now() >= deadline {
-                inner.pause_deadline = None;
-                inner.fx.clear_fade();
-                finish_pause(&mut inner);
-            }
-        }
-        // 睡眠定时到期：暂停播放并清空定时状态（播完当前歌停止的模式
-        // 走 advance(auto) 里的分支，不经过这里）
-        if let Some(deadline) = inner.sleep_deadline {
-            if std::time::Instant::now() >= deadline {
-                inner.sleep_deadline = None;
-                fire_sleep_timer(&mut inner);
-            }
-        }
-
-        // 输出设备变化检测（仅"跟随系统默认"模式）：默认设备变了
-        // （插拔蓝牙耳机 / HDMI 等）就重建输出流并从原进度无缝续播 ——
-        // 否则旧流被系统拆除后 sink 照常推进，声音却写进了死端点。
-        if inner.output_choice.is_none()
-            && last_device_check.elapsed() >= std::time::Duration::from_secs(2)
-        {
-            last_device_check = std::time::Instant::now();
-            if let Some(dev) = cpal::default_host().default_output_device() {
-                if let Ok(desc) = dev.description() {
-                    let name = desc.name().to_string();
-                    if name != inner.current_device && !name.is_empty() {
-                        log::info!(
-                            "[device] 默认输出设备变化：{} → {}，重建输出流",
-                            inner.current_device,
-                            name
-                        );
-                        if let Err(e) = inner.rebuild_output(None) {
-                            log::warn!("[device] 重建输出流失败: {e}");
-                        }
-                    }
-                }
-            }
-        }
+        // 到期检查（淡出暂停 / 睡眠定时）与设备热插拔检测，详见各函数注释
+        apply_expired_deadlines(&mut inner);
+        check_default_device_change(&mut inner, &mut last_device_check);
 
         if playing {
-            // 自然播完检测：只认**实时**的 Playing 状态 + sink 已空。
-            // 设备切换重建后 sink 暂时是空的、状态是 Loading（等待异步取址
-            // 回发 Load 续播原曲）—— 若按循环开头的旧 playing 判定，
-            // 会把这次重建误判成"播完了"而自动切歌。
-            let is_still_playing = inner
-                .state
-                .read()
-                .map(|st| st.status == PlaybackStatus::Playing)
-                .unwrap_or(false);
-            if is_still_playing && inner.sink.empty() {
-                advance(&mut inner, true);
-            } else if is_still_playing {
-                emit_position_tick(&mut inner);
-                // 位置冻结看门狗：回调线程死了 / 解码卡住时 `sink.empty()` 也是
-                // false，只有「位置不再推进」这一个信号能识破（见 watch_pipeline）
-                watch_pipeline(&mut inner);
-            }
-            // 心跳：每 5s 补发一次全量快照。事件是"语义变化才推送"，
-            // 前端一旦漏收（启动竞态 / WebView 重载），播放条会停在
-            // 「未在播放」而音频其实在响 —— 定期补发自愈。
-            if last_publish.elapsed() >= std::time::Duration::from_secs(5) {
-                inner.publish();
-                last_publish = std::time::Instant::now();
-            }
+            playing_cycle(&mut inner, &mut last_publish);
         }
 
         // 只有「此刻确实在播」才该看到位置推进。其余状态（暂停 / 缓冲 / 加载中 /
@@ -963,6 +902,84 @@ fn run_engine(deps: EngineDeps) {
         {
             inner.watch.reset();
         }
+    }
+}
+
+/// 到期检查（run_engine 每圈跑一遍）：淡出暂停与睡眠定时。
+fn apply_expired_deadlines(inner: &mut EngineInner) {
+    // 淡出暂停到期：Pause 命令只发起淡出（增益拉到 0），状态仍是 Playing，
+    // 到点这里才真正 pause。期间用户 Play/Seek/换曲都会撤销 deadline。
+    if let Some(deadline) = inner.pause_deadline {
+        if std::time::Instant::now() >= deadline {
+            inner.pause_deadline = None;
+            inner.fx.clear_fade();
+            finish_pause(inner);
+        }
+    }
+    // 睡眠定时到期：暂停播放并清空定时状态（播完当前歌停止的模式
+    // 走 advance(auto) 里的分支，不经过这里）
+    if let Some(deadline) = inner.sleep_deadline {
+        if std::time::Instant::now() >= deadline {
+            inner.sleep_deadline = None;
+            fire_sleep_timer(inner);
+        }
+    }
+}
+
+/// 输出设备热插拔检测（跟随默认模式下每 2s 对比一次设备名）。
+fn check_default_device_change(inner: &mut EngineInner, last_check: &mut std::time::Instant) {
+    // 输出设备变化检测（仅"跟随系统默认"模式）：默认设备变了
+    // （插拔蓝牙耳机 / HDMI 等）就重建输出流并从原进度无缝续播 ——
+    // 否则旧流被系统拆除后 sink 照常推进，声音却写进了死端点。
+    if inner.output_choice.is_none()
+        && last_check.elapsed() >= std::time::Duration::from_secs(2)
+    {
+        *last_check = std::time::Instant::now();
+        if let Some(dev) = cpal::default_host().default_output_device() {
+            if let Ok(desc) = dev.description() {
+                let name = desc.name().to_string();
+                if name != inner.current_device && !name.is_empty() {
+                    log::info!(
+                        "[device] 默认输出设备变化：{} → {}，重建输出流",
+                        inner.current_device,
+                        name
+                    );
+                    if let Err(e) = inner.rebuild_output(None) {
+                        log::warn!("[device] 重建输出流失败: {e}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// playing 态的每圈工作：自然播完检测 + 位置 tick + 冻结看门狗 + 5s 心跳补发。
+/// 不改变 run_engine 的单线程模型 —— 三段都只借这一处调用，时序语义与
+/// 原地展开完全一致（last_publish 由调用方持有，圈与圈之间延续）。
+fn playing_cycle(inner: &mut EngineInner, last_publish: &mut std::time::Instant) {
+    // 自然播完检测：只认**实时**的 Playing 状态 + sink 已空。
+    // 设备切换重建后 sink 暂时是空的、状态是 Loading（等待异步取址
+    // 回发 Load 续播原曲）—— 若按循环开头的旧 playing 判定，
+    // 会把这次重建误判成"播完了"而自动切歌。
+    let is_still_playing = inner
+        .state
+        .read()
+        .map(|st| st.status == PlaybackStatus::Playing)
+        .unwrap_or(false);
+    if is_still_playing && inner.sink.empty() {
+        advance(inner, true);
+    } else if is_still_playing {
+        emit_position_tick(inner);
+        // 位置冻结看门狗：回调线程死了 / 解码卡住时 `sink.empty()` 也是
+        // false，只有「位置不再推进」这一个信号能识破（见 watch_pipeline）
+        watch_pipeline(inner);
+    }
+    // 心跳：每 5s 补发一次全量快照。事件是"语义变化才推送"，
+    // 前端一旦漏收（启动竞态 / WebView 重载），播放条会停在
+    // 「未在播放」而音频其实在响 —— 定期补发自愈。
+    if last_publish.elapsed() >= std::time::Duration::from_secs(5) {
+        inner.publish();
+        *last_publish = std::time::Instant::now();
     }
 }
 

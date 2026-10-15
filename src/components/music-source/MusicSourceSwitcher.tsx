@@ -1,7 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect } from "react";
 import { Check, ChevronDown } from "lucide-react";
 import { useMusicSourceStore } from "@/stores/musicSource";
 import { useSourceRegistryStore, useSourceLabel } from "@/stores/sourceRegistry";
+import { Popover } from "@/components/common/Popover";
 import { cn } from "@/lib/utils";
 
 /**
@@ -27,23 +28,10 @@ export function MusicSourceSwitcher(): React.JSX.Element {
   const sources = useSourceRegistryStore((s) => s.sources);
   const ensureRegistry = useSourceRegistryStore((s) => s.ensure);
   const activeLabel = useSourceLabel(activeSourceId);
-  const [open, setOpen] = useState(false);
-  const rootRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     void ensureRegistry();
   }, [ensureRegistry]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onDocClick = (e: MouseEvent): void => {
-      if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", onDocClick);
-    return () => document.removeEventListener("mousedown", onDocClick);
-  }, [open]);
 
   /** 切源：只改全局状态，各页按 activeSourceId / generation 依赖自己重取（见文件头注释）。 */
   const applySource = (id: string): void => {
@@ -51,23 +39,25 @@ export function MusicSourceSwitcher(): React.JSX.Element {
   };
 
   return (
-    <div ref={rootRef} className="relative">
-      <button
-        type="button"
-        aria-label="切换音源"
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        onClick={() => setOpen((o) => !o)}
-        className={cn(
-          "flex items-center gap-1 rounded-full border border-border bg-secondary/50 px-3 py-1.5 text-xs font-medium transition-colors hover:bg-accent",
-          open && "bg-accent",
-        )}
-      >
-        {`音源：${activeLabel}`}
-        <ChevronDown className="h-3 w-3 opacity-60" />
-      </button>
-
-      {open && (
+    <Popover
+      trigger={(t) => (
+        <button
+          type="button"
+          aria-label="切换音源"
+          aria-haspopup="listbox"
+          aria-expanded={t.open}
+          onClick={t.toggle}
+          className={cn(
+            "flex items-center gap-1 rounded-full border border-border bg-secondary/50 px-3 py-1.5 text-xs font-medium transition-colors hover:bg-accent",
+            t.open && "bg-accent",
+          )}
+        >
+          {`音源：${activeLabel}`}
+          <ChevronDown className="h-3 w-3 opacity-60" />
+        </button>
+      )}
+    >
+      {(close) => (
         <ul
           role="listbox"
           // 语义令牌：写死 bg-white/70 dark:bg-black/40 会在换肤 / 深浅切换时脱节。
@@ -84,7 +74,7 @@ export function MusicSourceSwitcher(): React.JSX.Element {
                 role="option"
                 aria-selected={s.id === activeSourceId}
                 onClick={() => {
-                  setOpen(false);
+                  close();
                   if (s.id === activeSourceId) return;
                   applySource(s.id);
                 }}
@@ -102,6 +92,6 @@ export function MusicSourceSwitcher(): React.JSX.Element {
           ))}
         </ul>
       )}
-    </div>
+    </Popover>
   );
 }

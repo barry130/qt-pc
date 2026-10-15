@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { ArrowLeft, CheckCheck, MessageSquare, RefreshCw, X } from "lucide-react";
 import { useMessages, summary, type MessageItem } from "./messages-data";
 import { RichText } from "@/lib/richText";
 import * as ipc from "@/services/ipc";
 import { IconButton } from "@/components/common/IconButton";
+import { Popover } from "@/components/common/Popover";
 
 /**
  * 消息中心弹出面板（标题栏「消息中心」图标点开，参考主流播放器的邮件下拉）。
@@ -12,47 +13,36 @@ import { IconButton } from "@/components/common/IconButton";
  * 图标带未读数角标；点面板外或右上角 × 收起。
  */
 export function MessagesPopover(): React.JSX.Element {
-  const [open, setOpen] = useState(false);
-  const rootRef = useRef<HTMLDivElement | null>(null);
   const { items, loading, error, reload, markRead, markAllRead } = useMessages();
   const unread = items.filter((it) => !it.read).length;
 
-  // 点面板外收起（标题栏按钮本体在 rootRef 内，不会误判）
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (e: MouseEvent): void => {
-      if (rootRef.current && !rootRef.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", onDown);
-    return () => document.removeEventListener("mousedown", onDown);
-  }, [open]);
-
   return (
-    <div ref={rootRef} className="relative flex h-full items-center">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        aria-label="消息中心"
-        title="消息中心"
-        aria-expanded={open}
-        // 标题栏是拖动区，按钮按下要拦住，防止误触发拖动
-        onMouseDown={(e) => e.stopPropagation()}
-        onDoubleClick={(e) => e.stopPropagation()}
-        // 圆角小块 hover，与标题栏右侧其它入口同形状（窗口控制仍为贴边全高矩形）
-        className="mx-1 flex h-8 w-9 items-center justify-center rounded-md text-foreground/80 transition-colors hover:bg-secondary hover:text-foreground"
-      >
-        <MessageSquare className="h-4 w-4" />
-        {unread > 0 && (
-          // 角标定位在按钮右上角（外层包裹器 = 按钮 + 左右 4px 边距）
-          <span className="absolute right-0 top-1 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-destructive px-0.5 text-[9px] font-medium leading-none text-white">
-            {unread > 99 ? "99+" : unread}
-          </span>
-        )}
-      </button>
-
-      {open && (
+    <Popover
+      className="relative flex h-full items-center"
+      trigger={(t) => (
+        <button
+          type="button"
+          onClick={t.toggle}
+          aria-label="消息中心"
+          title="消息中心"
+          aria-expanded={t.open}
+          // 标题栏是拖动区，按钮按下要拦住，防止误触发拖动
+          onMouseDown={(e) => e.stopPropagation()}
+          onDoubleClick={(e) => e.stopPropagation()}
+          // 圆角小块 hover，与标题栏右侧其它入口同形状（窗口控制仍为贴边全高矩形）
+          className="mx-1 flex h-8 w-9 items-center justify-center rounded-md text-foreground/80 transition-colors hover:bg-secondary hover:text-foreground"
+        >
+          <MessageSquare className="h-4 w-4" />
+          {unread > 0 && (
+            // 角标定位在按钮右上角（外层包裹器 = 按钮 + 左右 4px 边距）
+            <span className="absolute right-0 top-1 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-destructive px-0.5 text-[9px] font-medium leading-none text-white">
+              {unread > 99 ? "99+" : unread}
+            </span>
+          )}
+        </button>
+      )}
+    >
+      {(close) => (
         <MessagesPanel
           items={items}
           loading={loading}
@@ -60,10 +50,10 @@ export function MessagesPopover(): React.JSX.Element {
           onReload={() => void reload()}
           onMarkRead={markRead}
           onMarkAllRead={markAllRead}
-          onClose={() => setOpen(false)}
+          onClose={close}
         />
       )}
-    </div>
+    </Popover>
   );
 }
 
