@@ -9,6 +9,7 @@ import { usePagedList, type PageResult } from "@/hooks/usePagedList";
 import { resolveArtistId } from "@/lib/artist-id";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { TrackList } from "./TrackList";
+import { BatchBar } from "./BatchBar";
 import { ErrorRetry, TrackRowsSkeleton } from "./Skeletons";
 import { BackButton } from "@/components/layout/BackButton";
 import { IconButton } from "@/components/common/IconButton";
@@ -32,6 +33,21 @@ import { IconButton } from "@/components/common/IconButton";
  * 每页条数走数据包声明的 `searchPageMax`（useSearchPageMax）：上游上限各不相同
  * （qq 要 100 会返回 0 条、酷狗恒给 30），传超限值会让「满页 = 还有下一页」
  * 的推断失效。宿主不再内置这张表。
+ *
+ * ---------------------------------------------------------------------------
+ * 页头：与歌单 / 榜单详情页同一套 hero（用户 m05156，每日新歌页 m02747 同款）
+ * ---------------------------------------------------------------------------
+ * 原页头是圆形头像 + 一行小字，播放键单独摆在行尾。现改为与
+ * `PlaylistDetailPage` 同构的 hero：模糊封面铺底 + 方形封面 + 小标签
+ * + 大标题 + 曲数 + 大号「播放全部」，批量条贴在右端、与「播放全部」
+ * 同一行底线对齐。头像取包内 artistSongs 第一页的 picUrl，回退首曲封面 /
+ * 首字占位不变。
+ *
+ * 注意 hero 外层**不能**加 `overflow-hidden`：批量条的歌单面板是 absolute
+ * 展开的，一裁就只剩一条缝，裁切只加在铺底图那一层（详情页已踩过同一个坑）。
+ *
+ * 歌手页没有歌单级收藏（歌手不是可收藏实体），按钮行只有「播放全部」；
+ * 曲级收藏 / 下载走右端批量条与行内按钮。
  */
 export function ArtistPage(): React.JSX.Element {
   const { platform, id } = useParams({ strict: false }) as {
@@ -92,6 +108,32 @@ export function ArtistPage(): React.JSX.Element {
     if (avatar.length > 0) rememberAvatar(cacheKey, avatar);
   }, [cacheKey, avatar]);
 
+  // 批量管理的已勾选曲目 id 集合（见 BatchBar）
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  /** 批量操作的失败提示：与整页加载失败分开，别把已加载的列表顶掉 */
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const toggleSelect = useCallback((trackId: string): void => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(trackId)) next.delete(trackId);
+      else next.add(trackId);
+      return next;
+    });
+  }, []);
+
+  // 换歌手 / 重载后列表整体作废，勾选集里若还留着这些 id，「已选 N 首」就虚高；
+  // 全量模式下一页页落进列表是**追加**的，已勾选的不会消失，
+  // 所以这里只做收窄、不清空。
+  useEffect(() => {
+    setSelected((prev) => {
+      if (prev.size === 0) return prev;
+      const ids = new Set(songs.map((t) => t.id));
+      const next = new Set([...prev].filter((x) => ids.has(x)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [songs]);
+
   const cover = avatar || songs.find((t) => t.picUrl)?.picUrl || "";
   const coverUrl = cover ? qtresCoverUrl(cover) : null;
   // 收尾前才显示进度（以前只看 progress !== null，拉完也永远停不掉）
@@ -99,9 +141,13 @@ export function ArtistPage(): React.JSX.Element {
 
   return (
     <div className="flex h-full min-w-0 flex-col">
-      <header className="relative shrink-0 overflow-hidden border-b border-border">
+      {/* 页头 hero：与歌单 / 榜单详情页同一套（模糊封面铺底 + 方形封面 + 小标签
+          + 大标题 + 曲数 + 大号「播放全部」+ 右端批量条），详见文件头。
+          **不能加 overflow-hidden**：批量条的歌单面板是 absolute 展开的，
+          裁切只加在铺底图那一层里。 */}
+      <header className="relative shrink-0 border-b border-border">
         {coverUrl ? (
-          <>
+          <div className="absolute inset-0 overflow-hidden">
             <img
               src={coverUrl}
               alt=""
@@ -110,15 +156,15 @@ export function ArtistPage(): React.JSX.Element {
               className="absolute inset-0 h-full w-full scale-125 select-none object-cover opacity-45 blur-3xl saturate-150"
             />
             <div className="absolute inset-0 bg-gradient-to-b from-background/10 to-background" />
-          </>
+          </div>
         ) : null}
 
         <div className="relative flex items-center px-6 pt-5">
           <BackButton />
         </div>
 
-        <div className="relative flex items-center gap-5 px-6 pb-5 pt-4">
-          <div className="h-24 w-24 shrink-0 overflow-hidden rounded-full bg-secondary shadow-xl ring-1 ring-border">
+        <div className="relative flex gap-5 px-6 pb-6 pt-4">
+          <div className="h-36 w-36 shrink-0 overflow-hidden rounded-2xl bg-secondary shadow-xl ring-1 ring-border">
             {coverUrl ? (
               <img
                 src={coverUrl}
@@ -127,35 +173,53 @@ export function ArtistPage(): React.JSX.Element {
                 loading="lazy"
               />
             ) : (
-              <span className="flex h-full w-full items-center justify-center text-3xl font-bold text-muted-foreground/50">
+              <span className="flex h-full w-full items-center justify-center text-4xl font-bold text-muted-foreground/50">
                 {name.slice(0, 1)}
               </span>
             )}
           </div>
-          <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 flex-1 flex-col justify-end pb-1">
             <p className="text-[11px] font-medium uppercase tracking-[0.2em] text-muted-foreground">
               歌手
             </p>
-            <h1 className="mt-0.5 truncate text-2xl font-bold tracking-tight">{name}</h1>
+            <h1 className="mt-1 truncate text-2xl font-bold tracking-tight">{name}</h1>
+            {/* 全量拉取时如实报进度，拉完才说「共 N 首歌」（与详情页同口径） */}
             <p className="mt-1 text-xs text-muted-foreground">
               {loading
                 ? "加载中…"
                 : loadingAll
                   ? `已加载 ${songs.length} 首，正在取完其余…`
-                  : `全部 ${songs.length} 首歌曲`}
+                  : `共 ${songs.length} 首歌`}
             </p>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <IconButton
+                label="播放全部"
+                variant="primary"
+                size="lg"
+                disabled={songs.length === 0}
+                className="h-9 w-9 rounded-lg shadow-lg shadow-primary/25"
+                onClick={() => void playQueue(songs, 0)}
+              >
+                <Play className="h-4 w-4 fill-current" />
+              </IconButton>
+            </div>
           </div>
-          {songs.length > 0 && (
-            <IconButton
-              label="播放全部"
-              variant="primary"
-              size="lg"
-              className="h-9 w-9 shrink-0 rounded-lg shadow-lg shadow-primary/25"
-              onClick={() => void playQueue(songs, 0)}
-            >
-              <Play className="h-4 w-4 fill-current" />
-            </IconButton>
-          )}
+
+          {/* 批量条摆在页头右侧，与左边那颗「播放全部」同一行（与歌单 / 榜单详情页
+              同位置，用户口径：批量操作属于页头）。歌手页没有宿主歌单，
+              不传 hostPlaylistId；收藏 / 下载只作用于当前已加载的 songs。
+              `items-end` + `pb-1` 与信息列底线对齐（同详情页）。 */}
+          {!loading && !error && songs.length > 0 ? (
+            <div className="relative flex shrink-0 items-end pb-1">
+              <BatchBar
+                embedded
+                tracks={songs}
+                selected={selected}
+                onSelectedChange={setSelected}
+                onError={setActionError}
+              />
+            </div>
+          ) : null}
         </div>
 
         {/* 全量拉取进度：歌手页是「进页即全部」，拉完前顶部显示一条进度带 */}
@@ -163,6 +227,9 @@ export function ArtistPage(): React.JSX.Element {
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
+        {actionError && (
+          <div className="px-6 pt-4 text-center text-sm text-destructive">{actionError}</div>
+        )}
         {error ? (
           <ErrorRetry message={`加载失败：${error}`} onRetry={reload} />
         ) : loading ? (
@@ -173,7 +240,13 @@ export function ArtistPage(): React.JSX.Element {
           </div>
         ) : (
           <>
-            <TrackList tracks={songs} showIndex showCollect showDownload />
+            <TrackList
+              tracks={songs}
+              showIndex
+              showCollect
+              showDownload
+              selection={{ ids: selected, onToggle: toggleSelect }}
+            />
             {loadingAll ? (
               <div className="py-4 text-center text-xs text-muted-foreground">
                 正在加载其余歌曲… 已加载 {songs.length} 首

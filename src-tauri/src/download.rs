@@ -373,30 +373,12 @@ enum AttemptError {
     Fatal(String),
 }
 
-/// 执行一个下载任务（自动重试）。返回结果前会把状态写回数据库。
+/// 已持有并发位时的执行入口（唯一入口，自动重试）。返回结果前会把状态写回数据库。
 ///
-/// 并发闸门就在这个函数的入口：拿不到并发位就排队等着。放在这里而不是
-/// 两个调用点各自 acquire，是为了让「启动下载」只有一条路径 ——
-/// 漏改一处就等于闸门失效。
-pub async fn run_job(
-    app: tauri::AppHandle,
-    db: Arc<Database>,
-    manager: Arc<DownloadManager>,
-    job: DownloadJob,
-) -> DownloadOutcome {
-    match manager.begin(&job.task_id).await {
-        // 排队期间任务已登记（`is_active` 为真），所以暂停 / 取消能打断排队中的任务；
-        // 若在排队时被取消，命令层已写好终态（paused / canceled），这里什么都不写。
-        Some(slot) => run_job_with_slot(app, db, manager, job, slot).await,
-        None => DownloadOutcome::Stopped,
-    }
-}
-
-/// 已持有并发位时的执行入口。
-///
-/// 「继续 / 重试」那条路径要**先取址再下载**，取址本身也是对音源的一次请求，
-/// 所以由调用方先 `begin` 拿到位子、连取址一起算进闸门，再调这里；
-/// 这样批量继续 20 个任务不会先把 20 个取址请求同时打出去。
+/// 所有路径（新任务、继续、重试）都由 `launch_download` 先 `begin` 拿到位子、
+/// 连取址一起算进闸门，再调这里 —— 取址本身也是对音源的一次请求，批量入队 /
+/// 批量继续 20 个任务时不能先把 20 个取址请求同时打出去。闸门只在 `begin`
+/// 一个地方进，漏改一处就等于闸门失效。
 pub async fn run_job_with_slot(
     app: tauri::AppHandle,
     db: Arc<Database>,

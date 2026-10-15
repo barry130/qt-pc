@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ClipboardPaste, HeartOff, ImagePlus, Pencil, Plus, Trash2 } from "lucide-react";
+import { ClipboardPaste, Heart, HeartOff, ImagePlus, Pencil, Plus } from "lucide-react";
 import { errMsg } from "@/lib/utils";
 import { useNavigate } from "@tanstack/react-router";
 import type { MyPlaylistSummary } from "@/types";
@@ -32,6 +32,9 @@ import { useDismissOnOutside } from "@/hooks/useDismissOnOutside";
  *   缩小到 16px 后与侧边栏/播放条的「下载」（箭头插进托盘下方）几乎同形，
  *   用户反馈「和下载太像」。导入歌单的动作实质是「粘贴分享链接」，
  *   剪贴板图标既不同形也说得更准。
+ * - 本地歌单行尾的删除入口不用垃圾桶、用**实心红心**（用户指定）：
+ *   歌单详情页里本地歌单就是恒为已收藏态的实心红心（取消收藏即删单），
+ *   两处同观感；在线组的取消收藏是 HeartOff（空心断开），正好与实心相对。
  * - 本地歌单的「删除」不可逆（曲目归属一起摘掉），走二次确认；
  *   在线歌单的「取消收藏」只是摘掉一个引用、不动歌，一次点击完成。
  */
@@ -275,7 +278,7 @@ export function MyPlaylistsPage(): React.JSX.Element {
               onRemove={(p) => onRemoveClick(p)}
               removeLabel="删除歌单"
               confirmRemoveLabel="确认删除歌单"
-              removeIcon={<Trash2 />}
+              removeIcon={<Heart className="fill-current text-primary" />}
               confirmRemoveId={confirmRemoveId}
               confirmRef={confirmRef}
               onChangeCover={(p) => void changeCover(p)}

@@ -41,13 +41,16 @@ pub struct DownloadTask {
 }
 
 /// 建任务，返回任务 id。曲目本体先入库（本地曲目由扫描器负责）。
-/// `part_path` 由调用方按「任务 id 唯一」生成，暂停 / 继续 / 重试都复用它。
+///
+/// 「只入队不取址」后，新建时还没有 `.part` —— 成品名要等取到地址才知道
+/// 扩展名 —— `part_path` 传 `None`（NULL = 还没轮到取址，与空串分开，口径
+/// 同 `actual_quality`），取址后由 `set_download_part_path` 补写。
 /// `actual_quality` 是取址时算出的实测档位，没测出来传 `None`。
 pub(crate) fn create_download_task(
     conn: &Connection,
     track: &Track,
     quality: &str,
-    part_path: &str,
+    part_path: Option<&str>,
     actual_quality: Option<&str>,
 ) -> Result<String, rusqlite::Error> {
     upsert_tracks(conn, &[track])?;

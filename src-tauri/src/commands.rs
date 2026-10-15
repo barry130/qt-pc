@@ -8,7 +8,7 @@ use crate::astral::AuthSession;
 use crate::audio::engine::AudioCmd;
 use crate::audio::fx::{EqParams, FadeParams, FxState};
 use crate::audio::state::PlayMode;
-use crate::download::{self, DownloadJob, DownloadManager, DownloadOutcome};
+use crate::download::{self, DownloadJob, DownloadManager};
 use crate::provider::types::{Quality, Track};
 use crate::provider::url_cache::PlayUrlCache;
 use crate::provider::ProviderError;
@@ -2586,14 +2586,16 @@ fn measured_quality_opt(measured: &str) -> Option<String> {
 
 /// 读取「下载文件名格式」设置：artist=歌手-歌名（默认），song=歌名-歌手。
 /// 仅影响设置变更后新开始的下载；已存在的任务沿用原保存路径。
-fn download_name_format(state: &AppState) -> String {
-    let v = state.db.clone().and_then(|db| {
-        db.with(|c| {
+///
+/// 取 `&Arc<Database>` 而不是 `&AppState`：调用方（`launch_download`）跑在
+/// 后台任务里，手里只有 db 句柄。
+fn download_name_format(db: &Arc<crate::db::Database>) -> String {
+    let v = db
+        .with(|c| {
             crate::db::store::get_setting(c, crate::settings_keys::SETTING_DOWNLOAD_NAME_FORMAT)
         })
         .ok()
-        .flatten()
-    });
+        .flatten();
     match v.as_deref() {
         Some("song") => "song".to_string(),
         _ => "artist".to_string(),
@@ -2863,10 +2865,17 @@ pub async fn cmd_list_downloaded_track_ids(
         .map_err(|e| format!("读取已下载列表失败: {e}"))?
 }
 
-/// 开始下载一首歌，返回任务 id。
+/// 开始下载一首歌，返回任务 id。**只入队，不取址**。
 ///
-/// 顺序刻意是「先取址成功再建任务」：早前版本先建 pending 任务再取址，
-/// 取址失败时任务会永远停在「等待中」。
+/// 播放地址是音源侧限时签发的：入队时就取好，排在队尾等轮到再下，八成
+/// 已过期；批量点下载还会立刻打出 N 个取址请求，把并发闸门甩在身后。
+/// 所以这里只建 pending 任务就返回（part 路径、实测档位都还没有，取址后
+/// 由 `launch_download` 补写）；取址挪到 `launch_download` 里「排队拿到
+/// 并发位之后」才做 —— 与「继续 / 重试」同一条链路，轮到哪首取哪首。
+///
+/// 代价是取址失败发生在后台。早前版本因此刻意「先取址再建任务」（否则
+/// 任务永远停在「等待中」）；现在取址失败会在 `launch_download` 里落成
+/// failed 终态（带原因）并广播，列表里看得到、点「重试」能重来。
 /// 去重：同曲目同音质已有未取消的任务（含已完成）直接复用，不重复下载。
 #[tauri::command(rename = "start_download")]
 pub async fn cmd_start_download(
@@ -2902,35 +2911,17 @@ pub async fn cmd_start_download(
         return Ok(task.id);
     }
 
-    // 取址放在建任务之前：失败就干净报错，不留悬挂任务
-    let resolved = resolve_play_url_script(&app, &state.url_cache, &track, quality)
-        .await
-        .map_err(|e| format!("取播放地址失败: {e}"))?;
-    let url = resolved.url;
-    let referer = resolved.referer;
-    // 命名用「实测档位」而非请求档位：请求无损却只拿到 320k 时，
-    // 落盘名不该带 `.flac`（虚标）。实测档位由包侧按字节÷时长重标，只降不升；
-    // 没测出来（空串）时退回请求档，与旧行为一致。
-    let named_quality = effective_download_quality(&q_str, &resolved.actual_quality);
-    // 实测档位一并落库：下载列表要显示「最终拿到的档位」而不是请求档。
-    // 空串 = 这次没测出来 → 存 NULL，UI 据此退回请求档（与命名同一口径）。
-    let actual_quality = measured_quality_opt(&resolved.actual_quality);
-
+    // 下载目录先于建任务：目录都拿不到就别留一条永远起不来的 pending。
     let dir = download_dir(&state)?;
-    let name_fmt = download_name_format(&state);
-    let final_path = unique_download_path(&dir, &track, &named_quality, &url, &name_fmt);
-    let part_path = download::part_path_for(&final_path);
-    let part_str = part_path.to_string_lossy().to_string();
 
+    // 只入队：part_path / actual_quality 都要等取址之后才知道，先存 NULL
+    // （NULL = 还没轮到取址，与空串「取了但没有」分开，口径同 actual_quality）。
     let task_id = tauri::async_runtime::spawn_blocking({
         let db = Arc::clone(&db);
         let t = track.clone();
         let q = q_str.clone();
-        let actual = actual_quality.clone();
         move || {
-            db.with(|conn| {
-                crate::db::store::create_download_task(conn, &t, &q, &part_str, actual.as_deref())
-            })
+            db.with(|conn| crate::db::store::create_download_task(conn, &t, &q, None, None))
         }
     })
     .await
@@ -2939,28 +2930,26 @@ pub async fn cmd_start_download(
     let app_for_job = app.clone();
     let db_for_job = Arc::clone(&db);
     let manager = Arc::clone(&state.downloads);
+    let url_cache = Arc::clone(&state.url_cache);
     let task_for_job = task_id.clone();
-    let declared_size = resolved.size;
-    // 进闸门之前先占住登记表：`run_job` 里的 `begin` 会复用这个旗标，
+    // 进闸门之前先占住登记表：`launch_download` 里的 `begin` 会复用这个旗标，
     // 所以从「任务已建」这一刻起，暂停 / 取消就能打断它（含还在排队的时候）。
     manager.reserve(&task_for_job);
     tauri::async_runtime::spawn(async move {
-        let outcome = download::run_job(
+        let result = launch_download(
             app_for_job,
-            Arc::clone(&db_for_job),
+            db_for_job,
             manager,
-            DownloadJob {
-                task_id: task_for_job,
-                url,
-                referer,
-                declared_size,
-                final_path,
-                part_path,
-            },
+            url_cache,
+            task_for_job,
+            track,
+            quality,
+            dir,
+            None,
         )
         .await;
-        if let DownloadOutcome::Failed(msg) = outcome {
-            log::warn!("[download] 任务失败: {msg}");
+        if let Err(e) = result {
+            log::warn!("[download] 任务失败: {e}");
         }
     });
 
@@ -3315,7 +3304,10 @@ async fn relaunch_download(
     Ok(())
 }
 
-/// 「继续 / 重试」的实际执行：取址 → 定路径 → 交给下载器。
+/// 排队取址 + 下载的实际执行：等并发位 → 取址 → 定路径 → 交给下载器。
+///
+/// 「继续 / 重试」走这里；「开始下载」自 2026-11 只入队不取址，也走这里
+/// （见 `cmd_start_download`）：地址是限时签名的，必须等真正轮到这首才取。
 #[allow(clippy::too_many_arguments)]
 async fn launch_download(
     app: tauri::AppHandle,
@@ -3328,8 +3320,8 @@ async fn launch_download(
     dir: PathBuf,
     existing_part: Option<String>,
 ) -> Result<(), String> {
-    // 先占并发位再取址：取址也是对音源的一次请求，批量「继续」二十个任务时
-    // 不能把二十个取址请求一起打出去 —— 那正是并发闸门要防的事。
+    // 先占并发位再取址：取址也是对音源的一次请求，批量入队 / 批量「继续」
+    // 二十个任务时不能把二十个取址请求一起打出去 —— 那正是并发闸门要防的事。
     // 排队期间被暂停 / 取消（begin 返回 None）时直接收工：终态已由命令层写好。
     let Some(slot) = manager.begin(&task_id).await else {
         return Ok(());
@@ -3341,6 +3333,16 @@ async fn launch_download(
             // 取址失败必须摘掉登记表：否则 `is_active` 永远为真，用户点「继续」
             // 会被当成重复点击直接忽略，任务卡死在失败态再也起不来。
             manager.release(&task_id);
+            // 「只入队」后取址发生在后台，失败必须亮出来（落 failed + 广播），
+            // 否则任务永远停在「等待中」、列表里也看不到原因 —— 这正是早前
+            // 版本「先取址再建任务」要防的事，现在换成后台落终态来防。
+            // 取址期间用户点了暂停 / 取消的除外：终态以用户操作为准，不覆盖。
+            if !slot.cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                let msg = format!("取播放地址失败: {e}");
+                let _ =
+                    set_download_state(&db, &task_id, download::status::FAILED, Some(&msg)).await;
+                let _ = app.emit(EVENT_DOWNLOADS_CHANGED, ());
+            }
             return Err(format!("取播放地址失败: {e}"));
         }
     };
@@ -3357,17 +3359,9 @@ async fn launch_download(
             (final_path, PathBuf::from(&p))
         }
         None => {
-            let name_fmt = db
-                .with(|c| {
-                    crate::db::store::get_setting(
-                        c,
-                        crate::settings_keys::SETTING_DOWNLOAD_NAME_FORMAT,
-                    )
-                })
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "artist".to_string());
-            // 同 cmd_start_download：命名用实测档位，避免请求 flac 实际 mp3 时虚标
+            let name_fmt = download_name_format(&db);
+            // 命名用实测档位（判据见 effective_download_quality），
+            // 避免请求 flac 实际 mp3 时虚标
             let named_quality =
                 effective_download_quality(quality_str(&quality), &resolved.actual_quality);
             let final_path =
@@ -3389,7 +3383,7 @@ async fn launch_download(
     })
     .await;
 
-    // 已经持有并发位，走 `run_job_with_slot` 而不是 `run_job`：
+    // 并发位已在函数开头 `begin` 过了（取址也算闸门内），这里直接带位执行：
     // 再 `begin` 一次会把自己锁死（自己占着位子等自己让位）。
     download::run_job_with_slot(
         app,

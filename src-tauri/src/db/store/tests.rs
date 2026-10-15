@@ -445,8 +445,14 @@ fn download_task_lifecycle() {
     let t = track("5001", "下载用歌");
 
     // 请求 flac24bit、实测只给 320k —— 库里两档都存，UI 显示实测那档
-    let id = create_download_task(&conn, &t, "flac24bit", "D:\\dl\\a.mp3.part", Some("320"))
-        .expect("create task");
+    let id = create_download_task(
+        &conn,
+        &t,
+        "flac24bit",
+        Some("D:\\dl\\a.mp3.part"),
+        Some("320"),
+    )
+    .expect("create task");
     let tasks = list_download_tasks(&conn).expect("list");
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].status, "pending");
@@ -477,8 +483,9 @@ fn download_task_lifecycle() {
     assert_eq!(tasks[0].actual_quality.as_deref(), Some("flac"));
     assert_eq!(tasks[0].quality, "flac24bit");
 
-    // 失败态单独一条（没测出档位 → actual_quality 为 NULL）
-    let id2 = create_download_task(&conn, &track("5002", "另一首"), "128", "p2.part", None)
+    // 失败态单独一条：part_path 传 None —— 「只入队」后新建任务还没轮到
+    // 取址，没有 .part 可言（NULL = 还没取址，与空串分开，口径同 actual_quality）
+    let id2 = create_download_task(&conn, &track("5002", "另一首"), "128", None, None)
         .expect("create 2");
     fail_download_task(&conn, &id2, "网络错误").expect("fail");
     let tasks = list_download_tasks(&conn).expect("list");
@@ -486,6 +493,7 @@ fn download_task_lifecycle() {
     assert_eq!(failed.status, "failed");
     assert_eq!(failed.error.as_deref(), Some("网络错误"));
     assert!(failed.actual_quality.is_none());
+    assert!(failed.part_path.is_none());
     // 写回 NULL 而不是空串：数据层要把「没测过」和「测出来是空」分开
     set_download_actual_quality(&conn, &id2, Some("320")).expect("set actual 2");
     assert_eq!(
@@ -519,9 +527,12 @@ fn download_task_lifecycle() {
 #[test]
 fn delete_download_tasks_batch_returns_paths_of_selected_only() {
     let conn = test_conn();
-    let a = create_download_task(&conn, &track("7001", "甲"), "320", "a.part", None).expect("a");
-    let b = create_download_task(&conn, &track("7002", "乙"), "320", "b.part", None).expect("b");
-    let c = create_download_task(&conn, &track("7003", "丙"), "320", "c.part", None).expect("c");
+    let a =
+        create_download_task(&conn, &track("7001", "甲"), "320", Some("a.part"), None).expect("a");
+    let b =
+        create_download_task(&conn, &track("7002", "乙"), "320", Some("b.part"), None).expect("b");
+    let c =
+        create_download_task(&conn, &track("7003", "丙"), "320", Some("c.part"), None).expect("c");
     finish_download_task(&conn, &a, "D:\\dl\\a.mp3", 10).expect("finish a");
     finish_download_task(&conn, &b, "D:\\dl\\b.mp3", 20).expect("finish b");
 
@@ -564,7 +575,7 @@ fn download_dedupe_offline_lookup_and_stale_cleanup() {
         .expect("offline")
         .is_none());
 
-    let id = create_download_task(&conn, &t, "320", "p.part", None).expect("create");
+    let id = create_download_task(&conn, &t, "320", Some("p.part"), None).expect("create");
     // 进行中的任务算去重命中
     let hit = find_download_task(&conn, &db_id, "320")
         .expect("find")
