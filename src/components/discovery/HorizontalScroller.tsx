@@ -71,11 +71,20 @@ export function HorizontalScroller(props: {
         {props.children}
       </div>
 
-      <ScrollArrow side="left" hidden={atStart} onClick={() => scrollByPage(-1)} />
-      <ScrollArrow side="right" hidden={atEnd} onClick={() => scrollByPage(1)} />
+      {/* 箭头层：高度 = 封面高度，箭头对齐**封面**中线。
+          不能直接放在 relative 容器上写 top-1/2 —— 那个中线是「封面 + 标题 + 副标题」的
+          整卡中线，会落到封面偏下、压住封面里的字；而副标题有无各排不同
+          （新歌速递的 TrackCard 没有副标题），整卡中线本身也不一致。 */}
+      <div className={cn("pointer-events-none absolute inset-x-0 top-0 z-10", COVER_H)}>
+        <ScrollArrow side="left" hidden={atStart} onClick={() => scrollByPage(-1)} />
+        <ScrollArrow side="right" hidden={atEnd} onClick={() => scrollByPage(1)} />
+      </div>
     </div>
   );
 }
+
+/** 横向卡片行里的卡片固定 `w-32`（128px），封面是 `aspect-square` → 封面方块恒为 128px */
+const COVER_H = "h-32";
 
 function ScrollArrow(props: {
   side: "left" | "right";
@@ -89,7 +98,7 @@ function ScrollArrow(props: {
       aria-label={props.side === "left" ? "向左滚动" : "向右滚动"}
       onClick={props.onClick}
       className={cn(
-        "absolute top-1/2 z-10 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-full border border-border bg-card/90 text-foreground opacity-0 shadow-md transition-opacity hover:bg-accent group-hover/scroller:opacity-100",
+        "pointer-events-auto absolute top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-full border border-border bg-card/90 text-foreground opacity-0 shadow-md transition-opacity hover:bg-accent group-hover/scroller:opacity-100",
         props.side === "left" ? "left-0" : "right-0",
       )}
     >
