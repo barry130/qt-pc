@@ -1615,17 +1615,26 @@ CREATE INDEX idx_play_stats_count ON play_stats(play_count DESC);
 ```
 ### download_tasks
 
+v1 建表，v7 / v14 各补列（下方为**当前**完整形态）：
+
 ```sql
 CREATE TABLE download_tasks (
   id TEXT PRIMARY KEY,
   track_id TEXT NOT NULL,
   platform TEXT NOT NULL,
+  -- 请求档位：用户点下载时选的（128 / 320 / flac / 音源包声明的任意档）
   quality TEXT NOT NULL,
+  -- v14：实测档位 —— 取址时按「实测字节 ÷ 时长」重标（只降不升）；
+  -- NULL = 这次没测出来，UI 退回 quality 显示
+  actual_quality TEXT,
   status TEXT NOT NULL,
   progress REAL NOT NULL DEFAULT 0,
   file_path TEXT,
   file_size INTEGER,
   error TEXT,
+  -- v7：断点续传的 .part 临时路径与写完后校验用的服务端声明长度
+  part_path TEXT,
+  total_bytes INTEGER,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL,
   FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
@@ -1633,6 +1642,11 @@ CREATE TABLE download_tasks (
 
 CREATE INDEX idx_download_tasks_status ON download_tasks(status);
 ```
+
+`quality` 与 `actual_quality` 并存是刻意的：前者是**用户意图**（去重键也用它，
+`find_download_task` 按 `(track_id, quality)` 命中），后者是**实际交付**。
+下载列表展示后者（`actualQuality || quality`）——请求 flac 而线路只回 320k mp3
+时标请求档就是虚标。
 ### scan_dirs
 
 ```sql

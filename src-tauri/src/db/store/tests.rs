@@ -444,13 +444,21 @@ fn download_task_lifecycle() {
     let conn = test_conn();
     let t = track("5001", "下载用歌");
 
-    let id = create_download_task(&conn, &t, "320", "D:\\dl\\a.mp3.part").expect("create task");
+    // 请求 flac24bit、实测只给 320k —— 库里两档都存，UI 显示实测那档
+    let id = create_download_task(&conn, &t, "flac24bit", "D:\\dl\\a.mp3.part", Some("320"))
+        .expect("create task");
     let tasks = list_download_tasks(&conn).expect("list");
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].status, "pending");
     assert_eq!(tasks[0].track.title, "下载用歌");
-    assert_eq!(tasks[0].quality, "320");
+    assert_eq!(tasks[0].quality, "flac24bit");
+    assert_eq!(tasks[0].actual_quality.as_deref(), Some("320"));
     assert_eq!(tasks[0].part_path.as_deref(), Some("D:\\dl\\a.mp3.part"));
+
+    // 实测档位可后补（续传重新取址时会覆盖写）
+    set_download_actual_quality(&conn, &id, Some("flac")).expect("set actual");
+    let tasks = list_download_tasks(&conn).expect("list");
+    assert_eq!(tasks[0].actual_quality.as_deref(), Some("flac"));
 
     update_download_progress(&conn, &id, 0.5).expect("progress");
     let tasks = list_download_tasks(&conn).expect("list");
@@ -464,15 +472,40 @@ fn download_task_lifecycle() {
     assert_eq!(tasks[0].file_size, Some(12345));
     // 完成即清掉临时路径，避免看起来还有半截文件
     assert!(tasks[0].part_path.is_none());
+    // 收尾的 UPDATE 不能顺手把实测档位擦掉 —— 列表里绝大多数行都是 done，
+    // 它们正是要显示实测档位的那批（用户截图里那条就是 done）。
+    assert_eq!(tasks[0].actual_quality.as_deref(), Some("flac"));
+    assert_eq!(tasks[0].quality, "flac24bit");
 
-    // 失败态单独一条
-    let id2 =
-        create_download_task(&conn, &track("5002", "另一首"), "128", "p2.part").expect("create 2");
+    // 失败态单独一条（没测出档位 → actual_quality 为 NULL）
+    let id2 = create_download_task(&conn, &track("5002", "另一首"), "128", "p2.part", None)
+        .expect("create 2");
     fail_download_task(&conn, &id2, "网络错误").expect("fail");
     let tasks = list_download_tasks(&conn).expect("list");
     let failed = tasks.iter().find(|x| x.id == id2).expect("找到失败任务");
     assert_eq!(failed.status, "failed");
     assert_eq!(failed.error.as_deref(), Some("网络错误"));
+    assert!(failed.actual_quality.is_none());
+    // 写回 NULL 而不是空串：数据层要把「没测过」和「测出来是空」分开
+    set_download_actual_quality(&conn, &id2, Some("320")).expect("set actual 2");
+    assert_eq!(
+        list_download_tasks(&conn)
+            .expect("list")
+            .iter()
+            .find(|x| x.id == id2)
+            .expect("找到")
+            .actual_quality
+            .as_deref(),
+        Some("320")
+    );
+    set_download_actual_quality(&conn, &id2, None).expect("clear actual 2");
+    assert!(list_download_tasks(&conn)
+        .expect("list")
+        .iter()
+        .find(|x| x.id == id2)
+        .expect("找到")
+        .actual_quality
+        .is_none());
 
     // 删除任务会返回它曾下载的文件路径（是否删文件由调用方决定）
     assert_eq!(
@@ -486,9 +519,9 @@ fn download_task_lifecycle() {
 #[test]
 fn delete_download_tasks_batch_returns_paths_of_selected_only() {
     let conn = test_conn();
-    let a = create_download_task(&conn, &track("7001", "甲"), "320", "a.part").expect("a");
-    let b = create_download_task(&conn, &track("7002", "乙"), "320", "b.part").expect("b");
-    let c = create_download_task(&conn, &track("7003", "丙"), "320", "c.part").expect("c");
+    let a = create_download_task(&conn, &track("7001", "甲"), "320", "a.part", None).expect("a");
+    let b = create_download_task(&conn, &track("7002", "乙"), "320", "b.part", None).expect("b");
+    let c = create_download_task(&conn, &track("7003", "丙"), "320", "c.part", None).expect("c");
     finish_download_task(&conn, &a, "D:\\dl\\a.mp3", 10).expect("finish a");
     finish_download_task(&conn, &b, "D:\\dl\\b.mp3", 20).expect("finish b");
 
@@ -531,7 +564,7 @@ fn download_dedupe_offline_lookup_and_stale_cleanup() {
         .expect("offline")
         .is_none());
 
-    let id = create_download_task(&conn, &t, "320", "p.part").expect("create");
+    let id = create_download_task(&conn, &t, "320", "p.part", None).expect("create");
     // 进行中的任务算去重命中
     let hit = find_download_task(&conn, &db_id, "320")
         .expect("find")

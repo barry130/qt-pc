@@ -2570,6 +2570,20 @@ fn effective_download_quality(requested: &str, measured: &str) -> String {
     }
 }
 
+/// 落库用的实测档位：空串（这次没测出来）→ `None`，否则 `Some(档位)`。
+///
+/// 与 `effective_download_quality` 是同一判据的两种投影：那个是「显示/命名用什么」，
+/// 这个是「库里存什么」。存 `None` 而不是空串，是为了让「没测过」和
+/// 「测出来叫空字符串」在数据层不可能混淆。
+fn measured_quality_opt(measured: &str) -> Option<String> {
+    let measured = measured.trim();
+    if measured.is_empty() {
+        None
+    } else {
+        Some(measured.to_string())
+    }
+}
+
 /// 读取「下载文件名格式」设置：artist=歌手-歌名（默认），song=歌名-歌手。
 /// 仅影响设置变更后新开始的下载；已存在的任务沿用原保存路径。
 fn download_name_format(state: &AppState) -> String {
@@ -2898,6 +2912,9 @@ pub async fn cmd_start_download(
     // 落盘名不该带 `.flac`（虚标）。实测档位由包侧按字节÷时长重标，只降不升；
     // 没测出来（空串）时退回请求档，与旧行为一致。
     let named_quality = effective_download_quality(&q_str, &resolved.actual_quality);
+    // 实测档位一并落库：下载列表要显示「最终拿到的档位」而不是请求档。
+    // 空串 = 这次没测出来 → 存 NULL，UI 据此退回请求档（与命名同一口径）。
+    let actual_quality = measured_quality_opt(&resolved.actual_quality);
 
     let dir = download_dir(&state)?;
     let name_fmt = download_name_format(&state);
@@ -2909,7 +2926,12 @@ pub async fn cmd_start_download(
         let db = Arc::clone(&db);
         let t = track.clone();
         let q = q_str.clone();
-        move || db.with(|conn| crate::db::store::create_download_task(conn, &t, &q, &part_str))
+        let actual = actual_quality.clone();
+        move || {
+            db.with(|conn| {
+                crate::db::store::create_download_task(conn, &t, &q, &part_str, actual.as_deref())
+            })
+        }
     })
     .await
     .map_err(|e| format!("创建下载任务失败: {e}"))??;
@@ -3325,6 +3347,8 @@ async fn launch_download(
     let url = resolved.url;
     let referer = resolved.referer;
     let declared_size = resolved.size;
+    // 实测档位：命名与落库共用同一判据（空串 → None，退回请求档）
+    let actual_quality = measured_quality_opt(&resolved.actual_quality);
 
     // 有历史 `.part` 就沿用（路径里含原扩展名，成品名也据此还原，保持一致）
     let (final_path, part_path) = match existing_part.filter(|p| !p.trim().is_empty()) {
@@ -3355,8 +3379,13 @@ async fn launch_download(
     let part_str = part_path.to_string_lossy().to_string();
     let id_for_db = task_id.clone();
     let db_part = Arc::clone(&db);
+    let actual_for_db = actual_quality.clone();
     let _ = tauri::async_runtime::spawn_blocking(move || {
-        db_part.with(|c| crate::db::store::set_download_part_path(c, &id_for_db, &part_str))
+        db_part.with(|c| {
+            // 续传会重新取址，实测档位可能和上次不同（换了线路）→ 覆盖写
+            crate::db::store::set_download_actual_quality(c, &id_for_db, actual_for_db.as_deref())?;
+            crate::db::store::set_download_part_path(c, &id_for_db, &part_str)
+        })
     })
     .await;
 

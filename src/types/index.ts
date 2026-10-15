@@ -56,7 +56,13 @@ export interface HistoryItem {
 export interface DownloadTask {
   id: string;
   track: Track;
+  /** **请求**档位：用户点下载时选的 */
   quality: Quality;
+  /**
+   * **实测**档位：取址时按「实测字节 ÷ 时长」重标的结果（只降不升）。
+   * `null` = 这次没测出来，显示时退回 `quality`。
+   */
+  actualQuality?: Quality | null;
   /** pending / downloading / paused / done / failed / canceled */
   status: "pending" | "downloading" | "paused" | "done" | "failed" | "canceled";
   /** 0 ~ 1 */

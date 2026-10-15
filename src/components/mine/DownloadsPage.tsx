@@ -297,7 +297,9 @@ function TaskRow(props: {
         <div className="min-w-0 flex-1">
           <div className="truncate text-sm">{t.track.title}</div>
           <div className="truncate text-xs text-muted-foreground">
-            {t.track.singer} · {t.quality}
+            {/* 显示**实测**档位：请求 flac 而线路只给 320k 时，标请求档就是虚标。
+                没测出来（历史任务 / 取址没给结果）时退回请求档。 */}
+            {t.track.singer} · {t.actualQuality || t.quality}
             {t.status === "done" && t.fileSize
               ? ` · ${formatBytes(t.fileSize)}`
               : ""}

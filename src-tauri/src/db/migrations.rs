@@ -244,6 +244,7 @@ pub(crate) const MIGRATIONS: &[(i64, &str)] = &[
     (11, V11),
     (12, V12),
     (13, V13),
+    (14, V14),
 ];
 
 const V1: &str = r#"
@@ -498,8 +499,23 @@ const V13: &str = r#"
 ALTER TABLE lyrics ADD COLUMN manual INTEGER NOT NULL DEFAULT 0;
 "#;
 
+/// V14：下载任务的「实测档位」。
+///
+/// 背景：`download_tasks.quality` 存的是**请求**档位（用户点下载时选的），
+/// 但取址时请求 flac 而线路只给 320k mp3 是常态（酷我 `format=flac` 无无损源
+/// 时回退 mp3）。包侧的 `snapQualityToMeasured` 已按「实测字节 ÷ 时长」重标
+/// 且只降不升，宿主也一直用它给落盘文件命名 —— 可这结果只活在内存里，
+/// 落库的仍是请求档，下载列表于是把 320k 的 mp3 标成 `flac24bit`（虚标）。
+///
+/// 加一列 `actual_quality` 把实测档位存下来，下载列表直接显示它。
+/// 可空：NULL = 这次取址没测出档位（`ResolvedPlayUrl.actual_quality` 为空串），
+/// UI 据此退回请求档，与旧行为一致。已有的历史行也是 NULL。
+const V14: &str = r#"
+ALTER TABLE download_tasks ADD COLUMN actual_quality TEXT;
+"#;
+
 /// 当前程序支持的最新 schema 版本。
-pub(crate) const CURRENT_VERSION: i64 = 13;
+pub(crate) const CURRENT_VERSION: i64 = 14;
 
 /// 建表 schema_migrations 并把所有未应用版本按序执行。
 pub(crate) fn run(conn: &Connection) -> Result<(), rusqlite::Error> {

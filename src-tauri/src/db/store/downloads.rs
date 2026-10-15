@@ -17,7 +17,12 @@ use super::*;
 pub struct DownloadTask {
     pub id: String,
     pub track: Track,
+    /// **请求**档位：用户点下载时选的（`128` / `320` / `flac` / 包声明的任意档）
     pub quality: String,
+    /// **实测**档位：取址时按「实测字节 ÷ 时长」重标的结果（只降不升）。
+    /// `None` = 这次没测出来，显示方应退回 `quality`。
+    #[serde(default)]
+    pub actual_quality: Option<String>,
     /// pending / downloading / paused / done / failed / canceled
     pub status: String,
     /// 0.0 ~ 1.0
@@ -37,29 +42,47 @@ pub struct DownloadTask {
 
 /// 建任务，返回任务 id。曲目本体先入库（本地曲目由扫描器负责）。
 /// `part_path` 由调用方按「任务 id 唯一」生成，暂停 / 继续 / 重试都复用它。
+/// `actual_quality` 是取址时算出的实测档位，没测出来传 `None`。
 pub(crate) fn create_download_task(
     conn: &Connection,
     track: &Track,
     quality: &str,
     part_path: &str,
+    actual_quality: Option<&str>,
 ) -> Result<String, rusqlite::Error> {
     upsert_tracks(conn, &[track])?;
     let now = now_ms();
     let id = format!("dl_{}_{}", now, fastrand::u64(..));
     conn.execute(
-        "INSERT INTO download_tasks (id, track_id, platform, quality, status, progress,
-                                     part_path, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6, ?6)",
+        "INSERT INTO download_tasks (id, track_id, platform, quality, actual_quality,
+                                     status, progress, part_path, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 0, ?6, ?7, ?7)",
         params![
             id,
             db_track_id(track),
             track.platform.to_string(),
             quality,
+            actual_quality,
             part_path,
             now
         ],
     )?;
     Ok(id)
+}
+
+/// 记录取址时算出的实测档位（`None` = 没测出来，写 NULL）。
+///
+/// 续传 / 重试时会重新取址，实测档位可能和上次不同（换了线路），所以是覆盖写。
+pub(crate) fn set_download_actual_quality(
+    conn: &Connection,
+    id: &str,
+    actual: Option<&str>,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE download_tasks SET actual_quality = ?1, updated_at = ?2 WHERE id = ?3",
+        params![actual, now_ms(), id],
+    )?;
+    Ok(())
 }
 
 pub(crate) fn update_download_progress(
@@ -119,37 +142,38 @@ pub(crate) fn fail_download_task(
 
 /// 下载任务的公共查询列（`list` / `by_id` / `by_track` 共用，保证映射口径一致）。
 const DOWNLOAD_SELECT_COLUMNS: &str =
-    "d.id, d.quality, d.status, d.progress, d.file_path, d.file_size,
+    "d.id, d.quality, d.actual_quality, d.status, d.progress, d.file_path, d.file_size,
             d.error, d.part_path, d.total_bytes, d.created_at, d.updated_at,
             t.id, t.platform, t.title, t.singer, t.album, t.duration_ms, t.music_id";
 
 /// 把一行下载任务映射成 `DownloadTask`。轨道主键解析失败返回 None（脏数据跳过）。
 fn map_download_row(row: &rusqlite::Row<'_>) -> Result<Option<DownloadTask>, rusqlite::Error> {
-    let db_id: String = row.get(11)?;
+    let db_id: String = row.get(12)?;
     let Some((platform, track_id)) = split_db_track_id(&db_id) else {
         return Ok(None);
     };
     Ok(Some(DownloadTask {
         id: row.get(0)?,
         quality: row.get(1)?,
-        status: row.get(2)?,
-        progress: row.get(3)?,
-        file_path: row.get(4)?,
-        file_size: row.get(5)?,
-        error: row.get(6)?,
-        part_path: row.get(7)?,
-        total_bytes: row.get(8)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
+        actual_quality: row.get(2)?,
+        status: row.get(3)?,
+        progress: row.get(4)?,
+        file_path: row.get(5)?,
+        file_size: row.get(6)?,
+        error: row.get(7)?,
+        part_path: row.get(8)?,
+        total_bytes: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
         track: Track {
             id: track_id,
             platform,
-            title: row.get(13)?,
-            singer: row.get(14)?,
-            album: row.get(15)?,
+            title: row.get(14)?,
+            singer: row.get(15)?,
+            album: row.get(16)?,
             pic_url: String::new(),
-            duration: row.get::<_, Option<i64>>(16)?.unwrap_or(0) as f64 / 1000.0,
-            music_id: row.get(17)?,
+            duration: row.get::<_, Option<i64>>(17)?.unwrap_or(0) as f64 / 1000.0,
+            music_id: row.get(18)?,
         },
     }))
 }
