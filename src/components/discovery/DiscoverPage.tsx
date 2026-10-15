@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { BarChart3, ChevronRight, Disc3, FileMusic, Flame, PackageOpen, RefreshCw, Sparkles } from "lucide-react";
 import type { Chart, Playlist, Track } from "@/types";
@@ -17,8 +17,8 @@ import { TrackCard } from "./TrackCard";
 /**
  * 首页 / 发现（路由 /，DESIGN §5.2 / §5.3）。
  *
- * 布局自上而下：Hero（当前音源 + 快捷入口）→ 榜单精选（两列卡片，封面 + 前三首）
- * → 新歌速递（横向歌曲卡）→ 推荐歌单（横向封面卡）。
+ * 布局自上而下：Hero（当前音源 + 快捷入口）→ 榜单精选（卡片列数随内容区实测宽度
+ * 自适应，封面 + 前三首）→ 新歌速递（横向歌曲卡）→ 推荐歌单（横向封面卡）。
  * 后两个区块同为一行横向滚动、条数一致（HOME_ROW_COUNT）：一上一下两个行，
  * 一行满一行空会被读成「数据没加载完」，同口径才像同一套版式。
  * 三个区块统一跟随全局音源（§6.4 要点 5）：榜单此前用四源聚合命令，但点进详情
@@ -29,10 +29,36 @@ import { TrackCard } from "./TrackCard";
  * 而卡片版已经把「榜里有什么歌」摆出来了，封面行只是它的信息子集。
  */
 
-/** 首页「榜单精选」展示的榜单数量（两列 × 两排） */
-const SPOTLIGHT_COUNT = 4;
+/**
+ * 榜单精选取几排。
+ *
+ * 改造前是写死的「两列 × 两排」= 4 张，现在列数随内容区实测宽度浮动，**排数不动**：
+ * 只有列数变、排数不变，宽屏才是「同一块版式铺得更开」，而不是「下面又长出一截」。
+ */
+const SPOTLIGHT_ROWS = 2;
+/** 列数下限 2：改造前的固定列数，窗口收到最窄也不至于退成单列 */
+const SPOTLIGHT_MIN_COLS = 2;
+/**
+ * 列数上限 5 —— 它同时决定了首页最多一次拉几个榜的详情。
+ *
+ * 每多展示一张卡就多一次 chartDetail 请求（有进程内缓存，但首屏是并发打出去的），
+ * 不封顶的话 4K 屏会一次甩出十几个请求。5 列 × 2 排 = 10 张，宽屏早已铺满。
+ */
+const SPOTLIGHT_MAX_COLS = 5;
+/**
+ * 榜单卡的最小宽度（px）与卡片间隙（与 grid 的 gap-4 对齐）。
+ *
+ * 360 的来由：卡片左侧是 80px 封面，右侧一列曲目（名次 + 歌名 - 歌手），
+ * 两侧各 16px 内边距、中间 12px 间距 —— 再窄曲目名就只剩几个字。
+ * 与 CoverGrid 的 128 不是一回事：那是纯封面卡，这里一张卡的信息量顶三张封面。
+ */
+const SPOTLIGHT_CARD_MIN_W = 360;
+const SPOTLIGHT_GAP = 16;
+/** 首页「榜单精选」一次取回的榜单条数：刚好铺满上限列数 × 排数，多取是白拿 */
+const SPOTLIGHT_FETCH = SPOTLIGHT_MAX_COLS * SPOTLIGHT_ROWS;
 /** 每张卡右侧的曲目条数 */
 const SPOTLIGHT_TRACKS = 3;
+
 /**
  * 首页两条横滚行（新歌速递 / 推荐歌单）各自装多少张卡。
  *
@@ -117,6 +143,16 @@ export function DiscoverPage(): React.JSX.Element {
   const [charts, setCharts] = useState<Chart[]>([]);
   /** 榜单精选的曲目：键 = `音源:榜单 id`；未到 = 骨架屏 */
   const [chartTracks, setChartTracks] = useState<Record<string, Track[]>>({});
+  /** 榜单精选的实测列数（见下方 useLayoutEffect）；初始 2 与最小窗口宽度一致 */
+  const [spotlightCols, setSpotlightCols] = useState(SPOTLIGHT_MIN_COLS);
+  const spotlightRef = useRef<HTMLDivElement | null>(null);
+  /**
+   * 首页「榜单精选」实际展示的条数 = 实测列数 × 排数，再被真实拿到的榜单数封顶。
+   *
+   * 它是**派生值**而不是 state：列数一变，条数和「拉哪几个榜的详情」都要跟着变，
+   * 三处（展示、详情 effect、刷新）读同一个数才不会各算各的。
+   */
+  const spotlightCount = Math.min(charts.length, spotlightCols * SPOTLIGHT_ROWS);
   /** 刷新按钮的在飞态（只挡重复点击，不挡卡片渲染） */
   const [refreshing, setRefreshing] = useState(false);
   // 引擎相位 + 播放包装配状态：数据面由已装数据包提供（不内置）；error（引擎
@@ -175,20 +211,53 @@ export function DiscoverPage(): React.JSX.Element {
       const c = await sourceApi
         .getCharts(activeSourceId)
         .catch(() => [] as Chart[]);
-      if (!cancelled) setCharts(Array.isArray(c) ? c.slice(0, 10) : []);
+      if (!cancelled) setCharts(Array.isArray(c) ? c.slice(0, SPOTLIGHT_FETCH) : []);
     })();
     return () => {
       cancelled = true;
     };
   }, [showCharts, activeSourceId, metaGeneration]);
 
-  // 榜单精选：拿前 4 个榜各拉一次详情，取前 3 首。
+  /**
+   * 榜单精选的网格是否已挂载 —— 它是 useLayoutEffect 的重测触发条件。
+   *
+   * 空态时渲染的是 EmptyBlock、没有 grid 可测；等榜单到了 grid 才出现，
+   * 这个布尔量翻转，effect 才拿得到 ref。依赖 ref.current 本身不触发重跑。
+   */
+  const spotlightGridMounted = showCharts && charts.length > 0;
+
+  /**
+   * 榜单精选列数：按**容器实测宽度**算，不用 Tailwind 的视口断点 —— 主内容区会被
+   * 侧边栏和播放队列面板挤压，视口宽度对不上内容区宽度（同 CoverGrid 的口径）。
+   *
+   * 用 useLayoutEffect 而不是 useEffect：测到之前会先按初始列数画一帧，
+   * 等 effect 再改成 3~5 列，宽屏上能看见卡片「重新排版」的那一下。
+   * 布局阶段同步测完，第一帧就是最终列数。
+   */
+  useLayoutEffect(() => {
+    const el = spotlightRef.current;
+    if (el === null || typeof ResizeObserver === "undefined") return;
+    const measure = (): void => {
+      const w = el.clientWidth;
+      // 切走（KeepAliveOutlet 的 display:none）时宽度归零，保留上一次的列数，
+      // 切回来 ResizeObserver 会再报一次真实宽度
+      if (w <= 0) return;
+      const c = Math.floor((w + SPOTLIGHT_GAP) / (SPOTLIGHT_CARD_MIN_W + SPOTLIGHT_GAP));
+      setSpotlightCols(Math.max(SPOTLIGHT_MIN_COLS, Math.min(SPOTLIGHT_MAX_COLS, c)));
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [spotlightGridMounted]);
+
+  // 榜单精选：拿前 N 个榜各拉一次详情，取前 3 首。
   // 每个榜各自 catch —— 一个榜挂了不该让另外三张卡空着；失败记成空数组，
   // 卡片显示「暂无曲目」，和「这个榜真的没歌」是同一副样子（首页不做错误态）。
   useEffect(() => {
     let cancelled = false;
     if (!showCharts || charts.length === 0) return;
-    const picked = charts.slice(0, SPOTLIGHT_COUNT);
+    const picked = charts.slice(0, spotlightCount);
     void (async () => {
       const rows = await Promise.all(
         picked.map(async (c) => {
@@ -207,7 +276,7 @@ export function DiscoverPage(): React.JSX.Element {
     return () => {
       cancelled = true;
     };
-  }, [charts, showCharts]);
+  }, [charts, showCharts, spotlightCount]);
 
   // 刷新：绕过详情缓存重拉榜单列表与每张卡的曲目（源站榜单是按天/按小时更新的，
   // 用户点它就是想看最新名次）。缓存整体丢弃，避免新旧混着显示。
@@ -218,7 +287,7 @@ export function DiscoverPage(): React.JSX.Element {
       const c = await sourceApi
         .getCharts(activeSourceId)
         .catch(() => [] as Chart[]);
-      const picked = (Array.isArray(c) ? c : []).slice(0, SPOTLIGHT_COUNT);
+      const picked = (Array.isArray(c) ? c : []).slice(0, spotlightCount);
       const rows = await Promise.all(
         picked.map(async (chart) => {
           const list = await loadChartDetail(chart, true).catch(() => [] as Track[]);
@@ -229,7 +298,7 @@ export function DiscoverPage(): React.JSX.Element {
       const next: Record<string, Track[]> = {};
       for (const [key, list] of rows) next[key] = list;
       setChartTracks(next);
-      setCharts(Array.isArray(c) ? c.slice(0, 10) : []);
+      setCharts(Array.isArray(c) ? c.slice(0, SPOTLIGHT_FETCH) : []);
     } finally {
       setRefreshing(false);
     }
@@ -307,8 +376,9 @@ export function DiscoverPage(): React.JSX.Element {
       )}
 
       {/* 榜单精选（跟随当前音源；当前源没声明榜单时整块隐藏）。
-          两列卡片：左封面 + 右前三首。比原来的横向封面行多给了一层信息，
-          所以原来那条「热门榜单」行已经删掉，不再重复展示同一批榜单。 */}
+          列数随内容区实测宽度浮动（见 useLayoutEffect）：左封面 + 右前三首。
+          比原来的横向封面行多给了一层信息，所以原来那条「热门榜单」行已经删掉，
+          不再重复展示同一批榜单。 */}
       {showCharts && (
       <section className="mt-6 px-5">
         <SectionTitle
@@ -339,8 +409,14 @@ export function DiscoverPage(): React.JSX.Element {
         {charts.length === 0 ? (
           <EmptyBlock icon={BarChart3} text="暂无榜单" />
         ) : (
-          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-            {charts.slice(0, SPOTLIGHT_COUNT).map((c) => (
+          <div
+            ref={spotlightRef}
+            className="grid gap-4"
+            // 列数由容器实测宽度决定（见上方 useLayoutEffect）；1fr 均分 → 每行铺满，
+            // 卡片在 360px 基础上略微拉伸吃掉余数
+            style={{ gridTemplateColumns: `repeat(${spotlightCols}, minmax(0, 1fr))` }}
+          >
+            {charts.slice(0, spotlightCount).map((c) => (
               <ChartSpotlightCard
                 key={`${c.platform}-${c.id}`}
                 chart={c}
