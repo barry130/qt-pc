@@ -4,7 +4,12 @@ import type { Track } from "@/types";
 import * as sourceApi from "@/source-scripts";
 import { useMusicSourceStore } from "@/stores/musicSource";
 import { usePlayerStore } from "@/stores/player";
-import { useLatestUsesOffset, useSourceRegistryStore } from "@/stores/sourceRegistry";
+import {
+  useLatestUsesOffset,
+  useSourceLabel,
+  useSourceRegistryStore,
+} from "@/stores/sourceRegistry";
+import { qtresCoverUrl } from "@/lib/lrc";
 import { usePagedList, type PageResult } from "@/hooks/usePagedList";
 import { TrackList } from "./TrackList";
 import { BatchBar } from "./BatchBar";
@@ -59,11 +64,30 @@ const LATEST_PAGE_SIZE = 50;
  *    （`limit` + `offset` 查询参数）、bili（`pn = floor(offset / size) + 1`）
  *    的口径一致 —— 页码从 1 起、offset 从 0 起，不再混用；
  * 3. `latestUsesOffset = false` 的平台：**第 2 页起直接返回空数组**
- *    （hasMore = false，列表底部提示“不支持翻页”）。它们不支持翻页，就不该
+ *    （hasMore = false，列表底部不再挂任何提示）。它们不支持翻页，就不该
  *    无限上拉 —— 继续传 offset 只会反复拿回同一批第一页数据，既浪费请求
  *    又让用户以为列表卡住了。这类平台保持“进页即第一页”的原行为；
+ *    底部那句「当前音源的新歌接口不支持翻页」是给开发看的实现细节，对用户
+ *    没有可用信息（用户 m02747 明确去掉），因此整条页脚只在**真会翻页**的源上渲染；
  * 4. 能力自述异步到达（注册表是引擎加载后才有的），所以 `canPage` 进了
  *    resetKey：注册表到位后若结论翻转，整页重拉，不会停在旧的翻页口径上。
+ *
+ * ---------------------------------------------------------------------------
+ * 页头：与歌单 / 榜单详情页同一套 hero（用户 m02747）
+ * ---------------------------------------------------------------------------
+ * 原页头是一行「标题 + 一行小字」，右侧直接摆按钮，和歌单详情页差一截。
+ * 现改为与 `PlaylistDetailPage` 同构的 hero：模糊封面铺底 + 封面方图 + 小标签
+ * + 大标题 + 共 N 首 + 大号「播放全部」，批量条贴在右端、与「播放全部」同一行
+ * 底线对齐。封面没有页面自己的来源（本页是「一个源的新歌流」，不是某个实体），
+ * 就沿用列表里**第一张有图的曲目封面**当门面 —— 与专辑页同款回退：
+ * 一张图都取不到时落回首字占位。
+ *
+ * 注意 hero 外层**不能**加 `overflow-hidden`：批量条的歌单面板是 absolute
+ * 展开的，一裁就只剩一条缝（`PlaylistDetailPage` 已踩过同一个坑，裁切只加在
+ * 铺底图那一层上）。
+ *
+ * **页内没有返回键**：每日新歌是侧栏一级页面（与歌单广场、首页同级），不是
+ * 「被推进来的」详情页，标题栏里已经有全局返回。
  *
  * 注意：包侧 kg 的 latest 把 offset 当 **页号** 用（`page = offset + 1`），
  * 与 wyy/bili 的“记录偏移”口径不一致；kg 因此在本页会“跳页”（第 2 页请求
@@ -78,6 +102,8 @@ export function DailyPage(): React.JSX.Element {
   const canPage = useLatestUsesOffset(activeSourceId);
   /** 注册表世代：装/卸/换数据包后 +1——keep-alive 常驻页靠它清掉旧包残留的列表 */
   const metaGeneration = useSourceRegistryStore((s) => s.generation);
+  /** hero 小标签：本页是「哪个源的新歌流」，标出音源名（与详情页 hero 的层级一致） */
+  const sourceLabel = useSourceLabel(activeSourceId);
 
   // 能力自述来自注册表快照，注册表是异步的：没拿到之前 canPage 是兜底值，
   // 拿不到就等于“永远不支持翻页”。AppShell 挂载时已 ensure 过，这里补一次
@@ -128,6 +154,12 @@ export function DailyPage(): React.JSX.Element {
   /** 批量操作的失败提示：与整页加载失败分开，别把已加载的列表顶掉 */
   const [actionError, setActionError] = useState<string | null>(null);
 
+  // hero 的门面封面：本页不是某个实体（没有歌单封面 / 榜单配图可拿），
+  // 沿用列表里**第一张有图的曲目封面**，与专辑页同款回退 —— 一张都取不到
+  // （还没加载完 / 当前源的新歌不带图）就落回首字占位。
+  const cover = songs.find((t) => t.picUrl)?.picUrl;
+  const coverUrl = cover ? qtresCoverUrl(cover) : null;
+
   const toggleSelect = useCallback((trackId: string): void => {
     setSelected((prev) => {
       const next = new Set(prev);
@@ -150,43 +182,88 @@ export function DailyPage(): React.JSX.Element {
 
   return (
     <div className="flex h-full min-w-0 flex-col">
-      <div className="flex items-center justify-between gap-4 border-b border-border px-4 py-3">
-        <div className="min-w-0">
-          <h1 className="text-base font-medium">每日新歌</h1>
-          <p className="mt-1 truncate text-xs text-muted-foreground">
-            共 {songs.length} 首 · 跟随当前音源，切换音源会自动重取
-          </p>
-        </div>
-        {/* 右侧一组：页头主操作「播放全部」+ 批量条。批量操作属于页头，不在
-            列表上方再占一行；批量条落在最右端，与歌单 / 榜单详情页同位置
-            （那两页的批量条也在页头右端、和「播放全部」同一行）。
-            每日新歌是分页流，全选 / 批量只作用于**当前已加载**的 songs ——
-            继续下拉会追加新页，已勾选的保持不动（见上面收窄勾选的副作用）。
-            收藏 / 取消收藏都在条子的歌单面板里选（与单曲红心同逻辑），
-            这里没有宿主歌单，所以不传 hostPlaylistId。 */}
-        <div className="flex shrink-0 items-center gap-2">
-          {songs.length > 0 && (
-            <IconButton
-              label="播放全部"
-              variant="primary"
-              size="md"
-              className="shrink-0"
-              onClick={() => void playQueue(songs, 0)}
-            >
-              <Play />
-            </IconButton>
-          )}
-          {!loading && !error && songs.length > 0 ? (
-            <BatchBar
-              embedded
-              tracks={songs}
-              selected={selected}
-              onSelectedChange={setSelected}
-              onError={setActionError}
+      {/* 页头 hero：与歌单 / 榜单详情页同一套（模糊封面铺底 + 封面方图 + 小标签
+          + 大标题 + 共 N 首 + 大号「播放全部」+ 右端批量条），详见文件头。
+          **不能加 overflow-hidden**：批量条的歌单面板是 absolute 展开的，
+          裁切只加在铺底图那一层里。 */}
+      <header className="relative shrink-0 border-b border-border">
+        {coverUrl ? (
+          <div className="absolute inset-0 overflow-hidden">
+            <img
+              src={coverUrl}
+              alt=""
+              aria-hidden
+              draggable={false}
+              className="absolute inset-0 h-full w-full scale-125 select-none object-cover opacity-45 blur-3xl saturate-150"
             />
+            <div className="absolute inset-0 bg-gradient-to-b from-background/10 to-background" />
+          </div>
+        ) : null}
+
+        {/* 页内不摆返回键：每日新歌是侧栏一级页面（同级：歌单广场 / 首页），
+            不是被推进来的详情页；标题栏里已经有全局返回。所以这里省掉详情页
+            那条 `BackButton` 行，hero 直接从封面 + 信息开始。 */}
+        <div className="relative flex gap-5 px-6 pb-6 pt-6">
+          <div className="h-36 w-36 shrink-0 overflow-hidden rounded-2xl bg-secondary shadow-xl ring-1 ring-border">
+            {coverUrl ? (
+              <img
+                src={coverUrl}
+                alt=""
+                className="h-full w-full object-cover"
+                loading="lazy"
+              />
+            ) : (
+              <span className="flex h-full w-full items-center justify-center text-4xl font-bold text-muted-foreground/50">
+                新
+              </span>
+            )}
+          </div>
+
+          <div className="flex min-w-0 flex-1 flex-col justify-end pb-1">
+            <p className="text-[11px] font-medium uppercase tracking-[0.2em] text-muted-foreground">
+              {sourceLabel}
+            </p>
+            <h1 className="mt-1 truncate text-2xl font-bold tracking-tight">每日新歌</h1>
+            <p className="mt-1 text-xs text-muted-foreground">
+              {loading ? "加载中…" : `共 ${songs.length} 首`}
+            </p>
+            <p className="mt-2 line-clamp-3 text-xs text-muted-foreground">
+              跟随当前音源，切换音源会自动重取
+            </p>
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <IconButton
+                label="播放全部"
+                variant="primary"
+                size="lg"
+                disabled={songs.length === 0}
+                className="h-9 w-9 rounded-lg shadow-lg shadow-primary/25"
+                onClick={() => void playQueue(songs, 0)}
+              >
+                <Play className="h-4 w-4 fill-current" />
+              </IconButton>
+            </div>
+          </div>
+
+          {/* 批量条摆在页头右侧，与左边那颗「播放全部」同一行（用户口径：批量
+              操作属于页头，不该在列表上方再占一行；与歌单 / 榜单详情页同位置）。
+              每日新歌是分页流，全选 / 批量只作用于**当前已加载**的 songs ——
+              继续下拉会追加新页，已勾选的保持不动（见上面收窄勾选的副作用）。
+              收藏 / 取消收藏都在条子的歌单面板里选（与单曲红心同逻辑），
+              这里没有宿主歌单，所以不传 hostPlaylistId。
+              `items-end` + `pb-1` 与信息列底线对齐（同详情页）。 */}
+          {!loading && !error && songs.length > 0 ? (
+            <div className="relative flex shrink-0 items-end pb-1">
+              <BatchBar
+                embedded
+                tracks={songs}
+                selected={selected}
+                onSelectedChange={setSelected}
+                onError={setActionError}
+              />
+            </div>
           ) : null}
         </div>
-      </div>
+      </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         {actionError && (
@@ -211,15 +288,13 @@ export function DailyPage(): React.JSX.Element {
             />
             {/* 哨兵：进入视口就拉下一页。不支持翻页的源没有下一页，不挂哨兵 */}
             {hasMore ? <div ref={sentinelRef} className="h-1" /> : null}
-            <div className="py-4 text-center text-xs text-muted-foreground">
-              {loadingMore
-                ? "加载中…"
-                : hasMore
-                  ? "继续下拉加载更多"
-                  : canPage
-                    ? "已经到底了"
-                    : "当前音源的新歌接口不支持翻页"}
-            </div>
+            {/* 页脚只在**真会翻页**的源上出现：不支持翻页的源整页就是全部内容，
+                「不支持翻页」是实现细节，对用户没有可用信息（用户 m02747）。 */}
+            {canPage ? (
+              <div className="py-4 text-center text-xs text-muted-foreground">
+                {loadingMore ? "加载中…" : hasMore ? "继续下拉加载更多" : "已经到底了"}
+              </div>
+            ) : null}
           </>
         )}
       </div>
