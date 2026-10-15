@@ -1,15 +1,17 @@
-import { useCallback, useEffect, useState } from "react";
-import { HeartOff, ImagePlus, Import, Pencil, Plus, Trash2 } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ClipboardPaste, HeartOff, ImagePlus, Pencil, Plus, Trash2 } from "lucide-react";
 import { errMsg } from "@/lib/utils";
 import { useNavigate } from "@tanstack/react-router";
 import type { MyPlaylistSummary } from "@/types";
 import { useSourceLabelFn } from "@/stores/sourceRegistry";
 import * as ipc from "@/services/ipc";
 import { pullLikes } from "@/stores/auth";
+import { useFavoritesStore } from "@/stores/favorites";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { ImportPlaylistDialog } from "./ImportPlaylistDialog";
 import { IconButton } from "@/components/common/IconButton";
 import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
+import { useDismissOnOutside } from "@/hooks/useDismissOnOutside";
 
 /**
  * 我的歌单（路由 /my/playlists，DESIGN §5.3）——「我的歌单」与「收藏」已合成一页。
@@ -24,6 +26,14 @@ import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
  *
  * 建单 / 导入 / 重命名 / 本地歌单换封面都在这一页，不再拆成两个页面。
  * 云端收藏在打开本页时自动拉取（pullLikes），不提供手动同步入口。
+ *
+ * 两个操作手感上的取舍：
+ * - 「导入」用 ClipboardPaste 而不是 lucide 的 Import：后者是「箭头插进托盘」，
+ *   缩小到 16px 后与侧边栏/播放条的「下载」（箭头插进托盘下方）几乎同形，
+ *   用户反馈「和下载太像」。导入歌单的动作实质是「粘贴分享链接」，
+ *   剪贴板图标既不同形也说得更准。
+ * - 本地歌单的「删除」不可逆（曲目归属一起摘掉），走二次确认；
+ *   在线歌单的「取消收藏」只是摘掉一个引用、不动歌，一次点击完成。
  */
 export function MyPlaylistsPage(): React.JSX.Element {
   const navigate = useNavigate();
@@ -34,10 +44,15 @@ export function MyPlaylistsPage(): React.JSX.Element {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [importOpen, setImportOpen] = useState(false);
+  /** 正在等第二下确认的本地歌单 pid（删除不可逆，见下方 onRemoveClick） */
+  const [confirmRemoveId, setConfirmRemoveId] = useState<string | null>(null);
+  const bumpFavorites = useFavoritesStore((s) => s.bump);
 
   const load = useCallback(async (): Promise<void> => {
     setLoading(true);
     setError(null);
+    // 列表一换，等确认的那一行可能已经不在了；留着会让下次点删除变成「直接删」
+    setConfirmRemoveId(null);
     try {
       // 打开时先把云端收藏拉回来（未登录 / 后端不可达由 pullLikes 内部吞掉），
       // 别端的建单/删单/改名才能反映到这个列表
@@ -92,12 +107,23 @@ export function MyPlaylistsPage(): React.JSX.Element {
     }
   };
 
-  /** 移除：自建歌单是删除（按 pid），云端卡片歌单是取消收藏（不动歌） */
+  /**
+   * 移除：自建歌单是删除（按 pid），云端卡片歌单是取消收藏（不动歌）。
+   *
+   * 本地歌单的删除不可逆 —— 里面的曲目必然挂在它名下，删单会把归属一起摘掉
+   * （Rust `delete_playlist` 会把失去全部归属的歌下线），所以走二次确认：
+   * 第一下只把这一行切成「确认」态，第二下才真删。在线歌单的「取消收藏」
+   * 只是摘掉一个引用、不动歌，仍然一次点击完成。
+   */
   const remove = async (p: MyPlaylistSummary): Promise<void> => {
     setError(null);
+    setConfirmRemoveId(null);
     try {
       if (p.isLocal) {
         await ipc.deletePlaylist(p.pid);
+        // 删单会摘掉这个歌单下所有曲目的归属，别处列表里的红心必须跟着变空，
+        // 否则同一首歌显示两种收藏态（与详情页删单同款）
+        bumpFavorites();
       } else {
         await ipc.unfavoritePlaylist(p.platform, p.pid, p.name, p.picUrl);
       }
@@ -106,6 +132,21 @@ export function MyPlaylistsPage(): React.JSX.Element {
       setError(errMsg(err));
     }
   };
+
+  /** 删除按钮的两段式点击：本地歌单先亮确认，再点才删 */
+  const onRemoveClick = (p: MyPlaylistSummary): void => {
+    if (p.isLocal && confirmRemoveId !== p.pid) {
+      setConfirmRemoveId(p.pid);
+      return;
+    }
+    void remove(p);
+  };
+
+  // 确认态不能一直挂着：点别处 / Esc 就撤回（沿用详情页与 RowActions 的手法），
+  // 免得随手再点一下就把歌单删了
+  const cancelRemove = useCallback(() => setConfirmRemoveId(null), []);
+  const confirmRef = useRef<HTMLSpanElement | null>(null);
+  useDismissOnOutside(confirmRef, confirmRemoveId !== null, cancelRemove);
 
   const open = (p: MyPlaylistSummary): void => {
     if (p.platform === ipc.LOCAL_PLATFORM) {
@@ -195,7 +236,7 @@ export function MyPlaylistsPage(): React.JSX.Element {
             hover="secondary"
             onClick={() => setImportOpen(true)}
           >
-            <Import />
+            <ClipboardPaste />
           </IconButton>
         </div>
       </div>
@@ -231,9 +272,12 @@ export function MyPlaylistsPage(): React.JSX.Element {
               }}
               onSaveRename={(id) => void saveRename(id)}
               onCancelRename={() => setEditingId(null)}
-              onRemove={(p) => void remove(p)}
+              onRemove={(p) => onRemoveClick(p)}
               removeLabel="删除歌单"
+              confirmRemoveLabel="确认删除歌单"
               removeIcon={<Trash2 />}
+              confirmRemoveId={confirmRemoveId}
+              confirmRef={confirmRef}
               onChangeCover={(p) => void changeCover(p)}
             />
             <Group
@@ -250,6 +294,7 @@ export function MyPlaylistsPage(): React.JSX.Element {
               onRemove={(p) => void remove(p)}
               removeLabel="取消收藏"
               removeIcon={<HeartOff />}
+              confirmRemoveId={null}
               hideRename
             />
           </>
@@ -280,7 +325,13 @@ function Group(props: {
   onRemove: (p: MyPlaylistSummary) => void;
   /** 图标按钮的无障碍名称（本地=删除歌单 / 在线=取消收藏），也是悬浮提示 */
   removeLabel: string;
+  /** 确认态下的无障碍名称（本地=确认删除歌单）；不传就用 removeLabel */
+  confirmRemoveLabel?: string;
   removeIcon: React.ReactNode;
+  /** 正在等第二下确认的那一行 pid；本地分组用，在线分组传 null */
+  confirmRemoveId: string | null;
+  /** 包住确认态按钮的容器（点外面 / Esc 撤回确认） */
+  confirmRef?: React.RefObject<HTMLSpanElement | null>;
   /** 云端卡片歌单不可改名（名字归云端/音源所有） */
   hideRename?: boolean;
   /** 本地自建歌单换封面；不传则不显示入口（在线歌单封面归音源/云端所有） */
@@ -299,6 +350,7 @@ function Group(props: {
       ) : (
         <ul>
         {props.items.map((p) => {
+          const confirming = props.confirmRemoveId === p.pid;
           return (
             <li
               key={`${p.platform}:${p.pid}`}
@@ -352,14 +404,23 @@ function Group(props: {
                   <ImagePlus />
                 </IconButton>
               )}
-              <IconButton
-                label={props.removeLabel}
-                hover="secondary"
-                danger
-                onClick={() => props.onRemove(p)}
-              >
-                {props.removeIcon}
-              </IconButton>
+              {/* 本地歌单删除不可逆，与详情页红心同款：第一下把这一行切成确认态
+                  （按钮的无障碍名改口成「确认删除歌单」，右边冒出「再点一次即删除」），
+                  第二下才真删；点别处 / Esc 撤回。提示挂在按钮右侧、名字列是
+                  flex-1，所以冒出来只挤名字，不会把右侧那几个图标按钮顶走。 */}
+              <span ref={confirming ? props.confirmRef : undefined} className="flex items-center gap-2">
+                <IconButton
+                  label={confirming ? (props.confirmRemoveLabel ?? props.removeLabel) : props.removeLabel}
+                  hover="secondary"
+                  danger
+                  onClick={() => props.onRemove(p)}
+                >
+                  {props.removeIcon}
+                </IconButton>
+                {confirming && (
+                  <span className="text-xs text-destructive">再点一次即删除</span>
+                )}
+              </span>
             </li>
           );
         })}
