@@ -76,7 +76,8 @@ pub fn load_shortcuts(db: Option<&Database>) -> Keymap {
     let Some(db) = db else {
         return result;
     };
-    let saved = db.with(|c| crate::db::store::get_setting(c, "shortcuts"));
+    let saved =
+        db.with(|c| crate::db::store::get_setting(c, crate::settings_keys::SETTING_SHORTCUTS));
     let Ok(Some(json)) = saved else {
         return result;
     };
@@ -102,7 +103,9 @@ pub fn save_shortcuts(db: &Database, map: &serde_json::Value) -> Result<Keymap, 
     // 先校验能反序列化，避免把垃圾写进库
     serde_json::from_value::<HashMap<String, ShortcutConfig>>(map.clone())
         .map_err(|e| format!("快捷键配置格式错误: {e}"))?;
-    db.with(|c| crate::db::store::set_setting(c, "shortcuts", &map.to_string()))
+    db.with(|c| {
+        crate::db::store::set_setting(c, crate::settings_keys::SETTING_SHORTCUTS, &map.to_string())
+    })
         .map_err(|e| e.to_string())?;
     Ok(load_shortcuts(Some(db)))
 }

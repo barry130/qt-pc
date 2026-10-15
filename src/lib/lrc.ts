@@ -39,9 +39,9 @@ export function parseLrc(text: string): LyricLine[] {
   for (const raw of text.split(/\r?\n/)) {
     const line = raw.trimEnd();
     if (!line) continue;
-    const tags = [...line.matchAll(/\[([^\[\]]+)\]/g)];
+    const tags = [...line.matchAll(/\[([^[\]]+)\]/g)];
     if (tags.length === 0) continue;
-    const content = line.replace(/\[([^\[\]]+)\]/g, "").trim();
+    const content = line.replace(/\[([^[\]]+)\]/g, "").trim();
     for (const t of tags) {
       const ms = parseTimeTag(t[1]);
       if (ms === null) continue; // [ti:] 等元数据

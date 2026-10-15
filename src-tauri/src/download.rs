@@ -77,17 +77,22 @@ impl Gate {
         }
     }
 
+    // 本文件所有取锁点统一「毒锁容忍」（与 db/mod.rs::conn 同口径）：Cargo.toml
+    // 已恢复 panic=unwind，任何一次持锁 panic 都会毒化 Mutex，之后所有
+    // lock().unwrap() 连锁失败 —— 一次偶发 panic 会让整个下载调度在本次
+    // 运行里永久瘫痪。into_inner() 拿回的数据最坏是脏计数，saturating_sub
+    // 与 clamp_concurrency 已兜住。
     fn limit(&self) -> usize {
-        self.state.lock().unwrap().limit
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).limit
     }
 
     fn running(&self) -> usize {
-        self.state.lock().unwrap().running
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).running
     }
 
     /// 改并发上限。下调不打断在跑的任务，只是它们结束后不再补位。
     fn set_limit(&self, n: usize) {
-        self.state.lock().unwrap().limit = clamp_concurrency(n);
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).limit = clamp_concurrency(n);
         // 叫醒所有排队者重算：下调后可能已超额（它们得继续睡），
         // 上调后有空位（它们应该立刻开工）。
         self.wake.notify_waiters();
@@ -95,7 +100,7 @@ impl Gate {
 
     /// 尝试占一个并发位；满了返回 false。
     fn try_enter(&self) -> bool {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if st.running < st.limit {
             st.running += 1;
             true
@@ -106,7 +111,7 @@ impl Gate {
 
     fn release(&self) {
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             // saturating_sub 兜底：即使计数被弄脏也不至于下溢成天文数字
             st.running = st.running.saturating_sub(1);
         }
@@ -169,7 +174,7 @@ impl DownloadManager {
     fn register(&self, id: &str) -> Arc<AtomicBool> {
         self.active
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .entry(id.to_string())
             .or_insert_with(|| Arc::new(AtomicBool::new(false)))
             .clone()
@@ -189,13 +194,13 @@ impl DownloadManager {
     }
 
     fn unregister(&self, id: &str) {
-        self.active.lock().unwrap().remove(id);
+        self.active.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
     }
 
     /// 请求停止（暂停 / 取消）。返回该任务当前是否真的在下载（或正在排队）。
     pub fn request_stop(&self, id: &str) -> bool {
         let hit = {
-            let map = self.active.lock().unwrap();
+            let map = self.active.lock().unwrap_or_else(|e| e.into_inner());
             match map.get(id) {
                 Some(flag) => {
                     flag.store(true, Ordering::SeqCst);
@@ -216,7 +221,7 @@ impl DownloadManager {
     /// 任务是否已登记（在下载**或**在排队）。排队中也算 —— 否则连点两次
     /// 「继续」会往闸门里排两个重复任务，白白占一个并发位。
     pub fn is_active(&self, id: &str) -> bool {
-        self.active.lock().unwrap().contains_key(id)
+        self.active.lock().unwrap_or_else(|e| e.into_inner()).contains_key(id)
     }
 
     /// 排队等一个并发位。返回 `None` = 任务在排队期间被暂停 / 取消，

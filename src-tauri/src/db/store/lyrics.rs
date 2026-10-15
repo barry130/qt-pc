@@ -88,6 +88,7 @@ pub(crate) fn set_lyric_offset(
 /// 注意**空值照写**（不做「新值为空就保留旧值」的保护）：`word_lrc` 的时间轴是跟
 /// 主歌词配套的，换源后主词已经换成另一份，再拿旧源的逐字时间轴去叠新主词，
 /// 只会错位到没法看 —— 宁可退化成无染色，也不要错位。
+#[allow(clippy::too_many_arguments)] // 与 cmd_save_lyric 的 IPC 字段 1:1 透传，字段数跟着契约走
 pub(crate) fn upsert_lyric(
     conn: &Connection,
     track_id: &str,

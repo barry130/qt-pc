@@ -23,6 +23,10 @@ jobs:
           node-version: 22
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # lint 门禁（eslint.config.js，只收正确性规则）：rules-of-hooks /
+      # 未用变量 / 死赋值 / 正则转义 / preserve-caught-error 等。先于
+      # typecheck 跑：失败定位最快。
+      - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm test
       # 泄漏护栏：自有域名 / 生产后端地址 / 官网地址**只能**待在被忽略的
@@ -63,5 +67,11 @@ jobs:
       # 私有值不提交，`src/private_config.rs` 缺失时由 `src-tauri/build.rs` 补空壳，
       # 所以这里**不需要**任何注入就能编译 —— 这样 CI 才是在验证"公开仓库形态"，
       # 而不是被开发机上残留的私有文件蒙混过去。
+      # clippy 门禁：存量已清零（评审修复批次落盘），-D warnings 拦截新代码。
+      # 刻意**不**加 rustfmt --check 门禁：存量是统一的手写风格，一次全量
+      # 重排会产生 124 处/约 30 文件的纯格式 diff，与「增量修改不重排旧代码」
+      # 约定冲突（同前端不引 Prettier 的决策）。
+      - name: Run cargo clippy
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - name: Run cargo tests
         run: cargo test --manifest-path src-tauri/Cargo.toml

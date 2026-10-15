@@ -12,7 +12,7 @@
 // 而 curl 未必在 /bin/sh 的 PATH 里（镜像里 PATH 只有 /usr/local/bin:/usr/bin 等）。
 
 import { readdirSync, statSync } from "node:fs";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 
 const API = "https://api.cnb.cool";
 

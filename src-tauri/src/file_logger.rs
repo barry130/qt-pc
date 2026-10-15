@@ -18,7 +18,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 /// settings 键：日志目录（空串 = 用默认，见 [`crate::app_paths::logs_root_from_env`]）。
@@ -357,7 +357,7 @@ fn append_line(line: &str) {
     }
 }
 
-fn open_current(dir: &PathBuf) -> Option<File> {
+fn open_current(dir: &Path) -> Option<File> {
     OpenOptions::new()
         .create(true)
         .append(true)
@@ -368,7 +368,7 @@ fn open_current(dir: &PathBuf) -> Option<File> {
 /// log.N 删掉、log.i → log.i+1、当前文件 → log.1（调用前须已关闭当前句柄）。
 /// `backups` 是保留份数：调小后多出来的旧文件也要一并清掉，否则用户把份数
 /// 从 50 改到 5 之后，磁盘上仍留着 45 份历史文件。
-fn rotate(dir: &PathBuf, backups: u32) {
+fn rotate(dir: &Path, backups: u32) {
     let _ = fs::remove_file(dir.join(format!("{CURRENT_NAME}.{backups}")));
     // 调小份数后遗留的更高编号（最多 MAX_BACKUPS 次探测，代价可忽略）
     for i in (backups + 1)..=MAX_BACKUPS {

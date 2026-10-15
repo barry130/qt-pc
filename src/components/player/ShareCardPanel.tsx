@@ -67,7 +67,7 @@ function wrapText(
   const push = (s: string): void => {
     if (out.length < maxLines) out.push(s);
   };
-  const tokens = text.match(/[A-Za-z0-9''\-]+|\s+|[^\s]/g) ?? [];
+  const tokens = text.match(/[A-Za-z0-9''-]+|\s+|[^\s]/g) ?? [];
   for (const tk of tokens) {
     const next = line + tk;
     if (ctx.measureText(next).width > maxWidth && line.length > 0) {

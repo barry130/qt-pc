@@ -861,6 +861,7 @@ mod tests {
     /// 单曲缓冲上限必须盖得住 flac24bit（实测单曲最大约 135MB）。
     /// 100MB 时代真机复现过：`音频文件超出缓冲上限（141238577 字节）`。
     #[test]
+    #[allow(clippy::assertions_on_constants)] // 刻意的常量回归守卫：调低上限时测试必须红
     fn buffer_limit_covers_flac24bit_tracks() {
         const REAL_FLAC24BIT_BYTES: u64 = 141_238_577;
         assert!(

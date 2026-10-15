@@ -258,7 +258,7 @@ fn load_state(db: Option<&Database>) -> LyricWindowState {
     let Some(db) = db else {
         return LyricWindowState::default();
     };
-    let saved = db.with(|c| get_setting(c, "lyric.window"));
+    let saved = db.with(|c| get_setting(c, crate::settings_keys::SETTING_LYRIC_WINDOW));
     let mut state = match saved {
         Ok(Some(json)) => serde_json::from_str::<LyricWindowState>(&json).unwrap_or_default(),
         _ => LyricWindowState::default(),
@@ -272,7 +272,8 @@ fn load_state(db: Option<&Database>) -> LyricWindowState {
 fn save_state(db: Option<&Database>, state: &LyricWindowState) {
     if let Some(db) = db {
         if let Ok(json) = serde_json::to_string(state) {
-            let _ = db.with(|c| set_setting(c, "lyric.window", &json));
+            let _ =
+                db.with(|c| set_setting(c, crate::settings_keys::SETTING_LYRIC_WINDOW, &json));
         }
     }
 }
@@ -575,12 +576,12 @@ pub fn reset(app: &AppHandle) -> Result<LyricWindowState, String> {
 /// 从歌词窗口工具条打开主窗口的「设置 · 桌面歌词」页：
 /// 唤起主窗口并发事件，由主窗口前端负责导航
 pub fn open_main_settings(app: &AppHandle) {
-    if let Some(win) = app.get_webview_window("main") {
+    if let Some(win) = app.get_webview_window(crate::MAIN_WINDOW_LABEL) {
         let _ = win.show();
         let _ = win.unminimize();
         let _ = win.set_focus();
     }
-    let _ = app.emit_to("main", "lyric-open-settings", ());
+    let _ = app.emit_to(crate::MAIN_WINDOW_LABEL, "lyric-open-settings", ());
 }
 
 pub fn get_state(app: &AppHandle) -> LyricWindowState {

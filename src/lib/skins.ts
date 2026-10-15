@@ -1,6 +1,6 @@
 /**
  * 皮肤系统（DESIGN §9.2 skinId / R7 followCoverColor）。
- * 内置 6 套皮肤，每套定义：
+ * 内置 5 套皮肤（SKINS 表）+ 一套由 getSkin() 按自定义主色合成的 "custom"，每套定义：
  * - 主色（primary）：按钮/链接/激活态
  * - 背景色（bg）：主区域底色，带皮肤色相微调
  * - 侧边栏色（sidebar）：侧边栏底色，比背景深/浅一档
@@ -118,6 +118,30 @@ export function hexToRgb(hex: string): [number, number, number] | null {
   ];
 }
 
+/**
+ * 封面取色缓存容量上限。封面 URL 可能来自任意外链（切歌 / 换源都会带来新
+ * 键），进程生命期内不设限会随播放历史无限增长。Map 保持插入序：超限淘汰
+ * 最旧键、命中时重新插入刷新位置（近似 LRU）。
+ */
+const COVER_CACHE_MAX = 256;
+
+function cacheGet<T>(cache: Map<string, T>, url: string): T | undefined {
+  if (!cache.has(url)) return undefined;
+  const value = cache.get(url)!;
+  cache.delete(url);
+  cache.set(url, value);
+  return value;
+}
+
+function cacheSet<T>(cache: Map<string, T>, url: string, value: T): T {
+  if (!cache.has(url) && cache.size >= COVER_CACHE_MAX) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(url, value);
+  return value;
+}
+
 const coverColorCache = new Map<string, string | null>();
 
 /**
@@ -127,13 +151,13 @@ const coverColorCache = new Map<string, string | null>();
  * 结果缓存，同一 URL 不重复提取。
  */
 export async function extractCoverColor(url: string): Promise<string | null> {
-  if (coverColorCache.has(url)) return coverColorCache.get(url)!;
+  const hit = cacheGet(coverColorCache, url);
+  if (hit !== undefined) return hit;
 
   try {
     const response = await fetch(url);
     if (!response.ok) {
-      coverColorCache.set(url, null);
-      return null;
+      return cacheSet(coverColorCache, url, null);
     }
     const blob = await response.blob();
     const blobUrl = URL.createObjectURL(blob);
@@ -152,8 +176,7 @@ export async function extractCoverColor(url: string): Promise<string | null> {
     const ctx = canvas.getContext("2d");
     if (!ctx) {
       URL.revokeObjectURL(blobUrl);
-      coverColorCache.set(url, null);
-      return null;
+      return cacheSet(coverColorCache, url, null);
     }
 
     ctx.drawImage(img, 0, 0, size, size);
@@ -164,8 +187,7 @@ export async function extractCoverColor(url: string): Promise<string | null> {
       data = ctx.getImageData(0, 0, size, size).data;
     } catch {
       // 画布被跨源图污染时 getImageData 抛错：按取色失败处理，不拖垮调用方
-      coverColorCache.set(url, null);
-      return null;
+      return cacheSet(coverColorCache, url, null);
     }
     let r = 0,
       g = 0,
@@ -181,8 +203,7 @@ export async function extractCoverColor(url: string): Promise<string | null> {
     }
 
     if (count === 0) {
-      coverColorCache.set(url, null);
-      return null;
+      return cacheSet(coverColorCache, url, null);
     }
 
     r = Math.round(r / count);
@@ -193,16 +214,13 @@ export async function extractCoverColor(url: string): Promise<string | null> {
     const max = Math.max(r, g, b);
     const min = Math.min(r, g, b);
     if (max === 0 || (max - min) / max < 0.15) {
-      coverColorCache.set(url, null);
-      return null;
+      return cacheSet(coverColorCache, url, null);
     }
 
     const color = `rgb(${r}, ${g}, ${b})`;
-    coverColorCache.set(url, color);
-    return color;
+    return cacheSet(coverColorCache, url, color);
   } catch {
-    coverColorCache.set(url, null);
-    return null;
+    return cacheSet(coverColorCache, url, null);
   }
 }
 
@@ -236,10 +254,11 @@ function rgbToHsl(r: number, g: number, b: number): [number, number, number] {
  * 返回 null 表示封面基本无彩色（灰阶/黑白封面），此时背景退回皮肤主色。
  */
 export async function extractCoverAccent(url: string): Promise<string | null> {
-  if (coverAccentCache.has(url)) return coverAccentCache.get(url)!;
+  const hit = cacheGet(coverAccentCache, url);
+  if (hit !== undefined) return hit;
 
   const record = (v: string | null): string | null => {
-    coverAccentCache.set(url, v);
+    cacheSet(coverAccentCache, url, v);
     return v;
   };
 

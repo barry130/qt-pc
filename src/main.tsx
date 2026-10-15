@@ -5,6 +5,7 @@ import App from "./App";
 import "./index.css";
 import * as ipc from "./services/ipc";
 import { ErrorBoundary } from "./components/common/ErrorBoundary";
+import { LAST_ERROR_KEY } from "./lib/storageKeys";
 
 /**
  * React 挂载之前/之外的兜底提示。
@@ -84,7 +85,7 @@ function ensureOverlay(): HTMLElement | null {
 function showFatalError(message: string): void {
   console.error("[qt] " + message);
   // 写库失败就算了（ipc 本身可能就是失败原因），浮层上已经能看到
-  void ipc.setSetting("app.lastError", message).catch(() => {});
+  void ipc.setSetting(LAST_ERROR_KEY, message).catch(() => {});
   // 同步落一份进文件日志（release 无 devtools，%APPDATA%/QuietMusic/logs 是唯一现场）
   void ipc.writeLog("error", message).catch(() => {});
 

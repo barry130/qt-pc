@@ -675,13 +675,13 @@ fn install_pack_at(
         state.pack_mut_or_push(pack.clone());
         // 生效门：槽位空着或本来就生效的是它 → 自动上位；否则不打扰用户选择
         if header.kind == PACK_KIND_PLAY {
-            if state.active_id.as_deref().map_or(true, |a| a == header.id) {
+            if state.active_id.as_deref().is_none_or(|a| a == header.id) {
                 state.active_id = Some(header.id.clone());
             }
         } else if state
             .active_meta_id
             .as_deref()
-            .map_or(true, |a| a == header.id)
+            .is_none_or(|a| a == header.id)
         {
             state.active_meta_id = Some(header.id.clone());
         }
@@ -1401,7 +1401,7 @@ pub async fn cmd_source_install_from_url(app: AppHandle, url: String) -> Result<
         outcome.pack.id,
         outcome.pack.version_code
     );
-    Ok(serde_json::to_value(&outcome).map_err(|e| e.to_string())?)
+    serde_json::to_value(&outcome).map_err(|e| e.to_string())
 }
 
 /// 从包文本安装（诊断/导入用；与直链同一条管线，来源记为未知）
@@ -1410,7 +1410,7 @@ pub async fn cmd_source_install_from_text(app: AppHandle, text: String) -> Resul
     let dir = source_bundle::bundle_dir(&app);
     let outcome = install_pack_at(&dir, &text, false, "", "")?;
     broadcast_if_activated(&app, &outcome);
-    Ok(serde_json::to_value(&outcome).map_err(|e| e.to_string())?)
+    serde_json::to_value(&outcome).map_err(|e| e.to_string())
 }
 
 /// 从本地文件安装：系统文件选择框（.js）→ 读文本 → 统一安装管线。
@@ -1476,7 +1476,7 @@ pub async fn cmd_source_stage_from_url(app: AppHandle, url: String) -> Result<Va
         preview.id,
         preview.version_code
     );
-    Ok(serde_json::to_value(&preview).map_err(|e| e.to_string())?)
+    serde_json::to_value(&preview).map_err(|e| e.to_string())
 }
 
 /// 安装预览 ②（本地文件）：文件选择框 → 读全文 → 静态校验 → 暂存。
@@ -1542,7 +1542,7 @@ pub async fn cmd_source_install_staged(app: AppHandle, token: String) -> Result<
         outcome.pack.version_code,
         staged.channel
     );
-    Ok(serde_json::to_value(&outcome).map_err(|e| e.to_string())?)
+    serde_json::to_value(&outcome).map_err(|e| e.to_string())
 }
 
 /// 切换生效包（设置页单选；kind 决定槽位与广播）：

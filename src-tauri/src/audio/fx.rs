@@ -439,7 +439,7 @@ fn fft_inplace(re: &mut [f32], im: &mut [f32]) {
     // 位反转重排
     let bits = n.trailing_zeros();
     for i in 0..n {
-        let rev = (i.reverse_bits() >> (usize::BITS - bits)) as usize;
+        let rev = i.reverse_bits() >> (usize::BITS - bits);
         if i < rev {
             re.swap(i, rev);
             im.swap(i, rev);

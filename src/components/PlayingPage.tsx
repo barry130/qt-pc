@@ -63,7 +63,10 @@ export function PlayingPage(): React.JSX.Element {
   // 歌词必须跟着换到对应源重取，避免「放的是 kw 的音、显示的是 wyy 的词」
   const cross = useMemo(
     () => crossSourceForPlayback(track, quality),
-    // 线路记忆不是响应式数据，靠 playUrl 变化触发重估（跨源兜底必然改地址）
+    // 线路记忆不是响应式数据，靠 playUrl 变化触发重估（跨源兜底必然改地址）。
+    // playUrl 是刻意的缓存失效触发器而非被读取的值，插件会误判为多余依赖，
+    // 必须保留在依赖里。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [track, quality, playUrl],
   );
 

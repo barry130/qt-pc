@@ -11,6 +11,7 @@ pub mod download;
 pub mod file_logger;
 pub mod ipc_guard;
 pub mod local;
+pub mod library_scan;
 pub mod lyric_window;
 pub mod media;
 pub mod net_guard;
@@ -23,6 +24,7 @@ pub mod provider;
 pub mod qtres;
 /// 运行期私有配置（自有域名 / 生产后端 / 官网地址，启动时按顺序找本地文件）
 pub mod runtime_config;
+pub mod settings_keys;
 pub mod shortcuts;
 pub mod smtc;
 pub mod source_bundle;
@@ -42,6 +44,11 @@ use provider::types::{Quality, Track};
 use provider::url_cache::{PlayUrlCache, ResolvedPlayUrl};
 use provider::ProviderError;
 use tauri::{Emitter, Manager};
+
+/// 主窗口 label（= tauri.conf.json `app.windows[0].label`；前端对应
+/// src/lib/window-labels.ts）。托盘 / SMTC / 任务栏 / 单实例 / 歌词窗的跨窗口
+/// 通信都以它定位主窗口，调用点不要散写字面量（契约由 tests/window-labels-contract.test.ts 守护）。
+pub const MAIN_WINDOW_LABEL: &str = "main";
 
 /// 全局应用状态
 pub struct AppState {
@@ -130,7 +137,7 @@ pub fn run() {
         // 单实例必须最先注册（插件内部靠启动竞态判定谁是主实例）：
         // 第二个实例拉起时把已有主窗口带到前台然后立刻退出
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(win) = app.get_webview_window("main") {
+            if let Some(win) = app.get_webview_window(MAIN_WINDOW_LABEL) {
                 let _ = win.unminimize();
                 let _ = win.show();
                 let _ = win.set_focus();
@@ -153,7 +160,8 @@ pub fn run() {
             // create_tray 返回 false 时置 TRAY_READY=false）没有「藏起来」
             // 这一说——收进托盘等于再也找不到，所以放行真关闭退出。
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                if window.label() == "main" && TRAY_READY.load(std::sync::atomic::Ordering::Acquire)
+                if window.label() == MAIN_WINDOW_LABEL
+                    && TRAY_READY.load(std::sync::atomic::Ordering::Acquire)
                 {
                     // 统计（STATS_DESIGN §4.1）：收进托盘 = 一轮 show→hide 结束，
                     // 让前端结算停留时长并冲队列
@@ -226,7 +234,7 @@ pub fn run() {
             {
                 #[cfg(target_os = "windows")]
                 let hwnd = handle
-                    .get_webview_window("main")
+                    .get_webview_window(MAIN_WINDOW_LABEL)
                     .and_then(|w| w.hwnd().ok())
                     .map(|h| h.0 as isize);
                 #[cfg(not(target_os = "windows"))]
@@ -267,7 +275,9 @@ pub fn run() {
 
             // 回填上次的登录会话（token 存 settings 表），没过期才装进客户端
             if let Some(db) = &db {
-                match db.with(|conn| crate::db::store::get_setting(conn, "astral.session")) {
+                match db.with(|conn| {
+                    crate::db::store::get_setting(conn, crate::astral::SETTING_ASTRAL_SESSION)
+                }) {
                     // 登出写的是空串（astral::clear_persisted_session），空值 = 未登录。
                     // 空串喂给 serde_json 只会得到 "EOF while parsing a value"，
                     // 每次启动白打一条像故障的 WARN —— 先判空再解析。
@@ -341,7 +351,7 @@ pub fn run() {
             }
 
             // visible:false → 等前端首帧 show()，避免白屏闪烁（DESIGN §4.1）
-            if let Some(win) = handle.get_webview_window("main") {
+            if let Some(win) = handle.get_webview_window(MAIN_WINDOW_LABEL) {
                 let _ = win.show();
             }
             Ok(())

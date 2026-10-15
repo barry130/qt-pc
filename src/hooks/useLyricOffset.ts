@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { getLyricOffset, onLyricOffsetChanged, setLyricOffset } from "@/services/ipc";
+import { useTauriEvent } from "@/hooks/useTauriEvent";
+import { getLyricOffset, LYRIC_OFFSET_CHANGED_EVENT, setLyricOffset } from "@/services/ipc";
+import type { LyricOffsetChangedPayload } from "@/services/ipc";
 import type { Track } from "@/types";
 
 /**
@@ -83,27 +85,14 @@ export function useLyricOffset(track: Track | null | undefined): LyricOffset {
 
   // 跨窗口同步：任一边改完偏移都会广播，这里收到就即时对齐。
   // 只在值真的不同时才 setState —— 自己刚写出去的那一份会原样广播回来，
-  // 不比较的话会在拖动中途把 draft 打回去。
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    let disposed = false;
-    void onLyricOffsetChanged((payload) => {
-      if (disposed) return;
-      if (payload.trackId.length === 0 || payload.trackId !== keyRef.current) return;
-      const v = clamp(payload.offsetMs);
-      setOffsetMs((cur) => (cur === v ? cur : v));
-      setDraftState((cur) => (cur === v ? cur : v));
-    })
-      .then((u) => {
-        if (disposed) u();
-        else unlisten = u;
-      })
-      .catch(() => undefined);
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, []);
+  // 不比较的话会在拖动中途把 draft 打回去。（订阅竞态由 useTauriEvent 内部处理）
+  useTauriEvent<LyricOffsetChangedPayload>(LYRIC_OFFSET_CHANGED_EVENT, (e) => {
+    const { trackId, offsetMs } = e.payload;
+    if (trackId.length === 0 || trackId !== keyRef.current) return;
+    const v = clamp(offsetMs);
+    setOffsetMs((cur) => (cur === v ? cur : v));
+    setDraftState((cur) => (cur === v ? cur : v));
+  });
 
   const setDraftMs = useCallback((ms: number) => {
     setDraftState(clamp(ms));

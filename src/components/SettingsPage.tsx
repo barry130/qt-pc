@@ -10,7 +10,8 @@ import {
 } from "@/lib/official-site";
 import { useNavigate } from "@tanstack/react-router";
 import { getAllWindows } from "@tauri-apps/api/window";
-import { listen } from "@tauri-apps/api/event";
+import { LYRICS_WINDOW_LABEL } from "@/lib/window-labels";
+import { CACHE_AUDIO_LIMIT_MB_KEY, QUALITY_KEY } from "@/lib/storageKeys";
 import { PageContainer } from "@/components/layout/PageContainer";
 import * as ipc from "@/services/ipc";
 import {
@@ -22,12 +23,15 @@ import {
   setDesktopLyricLocked,
   setDesktopLyricStyle,
   showDesktopLyric,
+  SOURCE_META_CHANGED_EVENT,
+  SOURCE_PACK_CHANGED_EVENT,
 } from "@/services/ipc";
 import { useAppearanceStore } from "@/stores/appearance";
 import { useUpdateStore } from "@/stores/update";
 import { useSourceUpdateStore } from "@/stores/source-update";
 import { runCheck } from "@/hooks/useUpdateCheck";
 import { useOfficialSiteUrl } from "@/hooks/useOfficialSiteUrl";
+import { useTauriEvent } from "@/hooks/useTauriEvent";
 import {
   activateSourcePack,
   applySourceUpdate,
@@ -274,7 +278,7 @@ function DesktopLyricSection(): React.JSX.Element {
             void (async () => {
               try {
                 const windows = await getAllWindows();
-                const win = windows.find((candidate) => candidate.label === "lyrics");
+                const win = windows.find((candidate) => candidate.label === LYRICS_WINDOW_LABEL);
                 if (!win) return;
                 const pos = await win.outerPosition();
                 const size = await win.outerSize();
@@ -711,7 +715,7 @@ function PlaybackSection(): React.JSX.Element {
       const [list, snap, savedQuality] = await Promise.all([
         ipc.listOutputDevices(),
         ipc.getPlaybackState(),
-        ipc.getSetting("quality"),
+        ipc.getSetting(QUALITY_KEY),
       ]);
       setDevices(list);
       setCurrent(snap?.outputDevice ?? "");
@@ -1212,7 +1216,7 @@ function GeneralSection(): React.JSX.Element {
     // 上限档回显：脏数据/缺项都回落默认档（与引擎侧 parse 口径一致）。
     // 当前值不在档位里（含脏数据）→ 进手工输入态并回显原值
     void ipc
-      .getSetting("cache.audioLimitMb")
+      .getSetting(CACHE_AUDIO_LIMIT_MB_KEY)
       .then((raw) => {
         const v = raw && raw.trim() ? raw.trim() : CACHE_LIMIT_DEFAULT;
         setLimit(v);
@@ -1668,16 +1672,11 @@ function SourcePackageSection(): React.JSX.Element {
 
   useEffect(() => {
     void refresh();
-    // Rust 侧包变化（安装/切换/卸载/回滚，含引擎 describe 回填）时同步列表
-    const unlisteners: (() => void)[] = [];
-    void listen("source-pack-changed", () => void refresh()).then((u) =>
-      unlisteners.push(u),
-    );
-    void listen("source-meta-changed", () => void refresh()).then((u) =>
-      unlisteners.push(u),
-    );
-    return () => unlisteners.forEach((u) => u());
   }, [refresh]);
+
+  // Rust 侧包变化（安装/切换/卸载/回滚，含引擎 describe 回填）时同步列表
+  useTauriEvent(SOURCE_PACK_CHANGED_EVENT, () => void refresh());
+  useTauriEvent(SOURCE_META_CHANGED_EVENT, () => void refresh());
 
   // 武装态在组件卸载时清理计时器（3 秒自动解除在事件回调里做）
   useEffect(
@@ -1696,7 +1695,8 @@ function SourcePackageSection(): React.JSX.Element {
     const checkClipboard = (): void => {
       if (disposed || clipboardBusy || preview || clipTip !== null) return;
       void (async () => {
-        let text = "";
+        // try 成功路径赋值、catch 直接 return：两条路径都不需要声明处的初值
+        let text: string;
         try {
           text = await navigator.clipboard.readText();
         } catch {

@@ -103,12 +103,12 @@ pub(crate) fn load_session(conn: &Connection) -> Result<Option<SavedSession>, ru
 
 /// 播放状态写入 settings。
 pub(crate) fn save_play_state(conn: &Connection, s: &PlayState) -> Result<(), rusqlite::Error> {
-    set_setting(conn, "queue_index", &s.index.to_string())?;
-    set_setting(conn, "position_ms", &s.position_ms.to_string())?;
-    set_setting(conn, "quality", &s.quality)?;
-    set_setting(conn, "play_mode", &s.play_mode)?;
-    set_setting(conn, "volume", &format!("{}", s.volume))?;
-    set_setting(conn, "muted", if s.muted { "1" } else { "0" })
+    set_setting(conn, crate::settings_keys::SETTING_QUEUE_INDEX, &s.index.to_string())?;
+    set_setting(conn, crate::settings_keys::SETTING_POSITION_MS, &s.position_ms.to_string())?;
+    set_setting(conn, crate::settings_keys::SETTING_QUALITY, &s.quality)?;
+    set_setting(conn, crate::settings_keys::SETTING_PLAY_MODE, &s.play_mode)?;
+    set_setting(conn, crate::settings_keys::SETTING_VOLUME, &format!("{}", s.volume))?;
+    set_setting(conn, crate::settings_keys::SETTING_MUTED, if s.muted { "1" } else { "0" })
 }
 
 pub(crate) fn load_play_state(conn: &Connection) -> Result<Option<PlayState>, rusqlite::Error> {
@@ -120,17 +120,22 @@ pub(crate) fn load_play_state(conn: &Connection) -> Result<Option<PlayState>, ru
         )
         .optional()
     };
-    let Some(index) = get("queue_index")? else {
+    let Some(index) = get(crate::settings_keys::SETTING_QUEUE_INDEX)? else {
         return Ok(None);
     };
     Ok(Some(PlayState {
         index: index.parse().unwrap_or(0),
-        position_ms: get("position_ms")?
+        position_ms: get(crate::settings_keys::SETTING_POSITION_MS)?
             .and_then(|v| v.parse().ok())
             .unwrap_or(0),
-        quality: get("quality")?.unwrap_or_else(|| "320".into()),
-        play_mode: get("play_mode")?.unwrap_or_else(|| "listLoop".into()),
-        volume: get("volume")?.and_then(|v| v.parse().ok()).unwrap_or(0.8),
-        muted: get("muted")?.map(|v| v == "1").unwrap_or(false),
+        quality: get(crate::settings_keys::SETTING_QUALITY)?.unwrap_or_else(|| "320".into()),
+        play_mode: get(crate::settings_keys::SETTING_PLAY_MODE)?
+            .unwrap_or_else(|| "listLoop".into()),
+        volume: get(crate::settings_keys::SETTING_VOLUME)?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0.8),
+        muted: get(crate::settings_keys::SETTING_MUTED)?
+            .map(|v| v == "1")
+            .unwrap_or(false),
     }))
 }

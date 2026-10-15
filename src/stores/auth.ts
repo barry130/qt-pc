@@ -119,16 +119,10 @@ export function avatarUrl(profile: Record<string, unknown> | null): string {
   return "";
 }
 
-/** 同步失败时把错误写到这里，便于从库中排查 */
-export const LIKE_LAST_ERROR_KEY = "like.lastError";
-
-/** 收藏同步游标（存 settings 表，跟着账号走） */
-export const LIKE_SEQ_KEY = "like.sync.seq";
-
-/** 是否已做过全量导入。和游标分开记，见 pullLikes 里的说明 */
-export const LIKE_IMPORTED_KEY = "like.imported";
-
-/** 本地收藏的账号归属标记（user.id）。退出不清除，供换号登录时检测 */
+/** 本地收藏的账号归属标记（user.id）。退出不清除，供换号登录时检测
+ *  注：like.imported / like.sync.seq / like.lastError 三个键在本文件一律用
+ *  字面量（不用常量），原因见 pullLikes 与 init 里的注释 —— 启动早期同步
+ *  时引用未初始化完的模块常量会掩盖真正的错误。 */
 export const LIKE_OWNER_KEY = "like.sync.owner";
 
 /**

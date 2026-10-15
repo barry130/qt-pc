@@ -22,6 +22,7 @@
 import { emitTo, listen } from "@tauri-apps/api/event";
 import { stripErrorUrls } from "@/lib/utils";
 import { log } from "@/lib/logger";
+import { SOURCE_ENGINE_WINDOW_LABEL } from "@/lib/window-labels";
 import type { Quality } from "@/types";
 import type { MusicInfo, Source } from "@/source-scripts/qt-contract/contract";
 
@@ -266,7 +267,7 @@ function onResponse(payload: EngineReply & { requestId?: number }): void {
 }
 
 async function emitRequest(payload: Record<string, unknown>): Promise<void> {
-  await emitTo("source-engine", "source-engine-request", payload);
+  await emitTo(SOURCE_ENGINE_WINDOW_LABEL, "source-engine-request", payload);
 }
 
 /** 查一次引擎生命周期；查不到（引擎窗口不在/超时）返回 null */

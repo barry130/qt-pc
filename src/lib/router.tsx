@@ -101,7 +101,9 @@ const playlistsRoute = createRoute({
 const playlistDetailRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/playlist/$platform/$id",
-  component: () => {
+  // 具名函数表达式：路由组件在属性位上调 Hook，rules-of-hooks 只认
+  // 大写开头的组件名，匿名箭头会被 lint 拦下。
+  component: function PlaylistDetailRoutePage() {
     const { platform, id } = useParams({ strict: false }) as {
       platform: string;
       id: string;
@@ -121,7 +123,7 @@ const chartsRoute = createRoute({
 const chartDetailRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/chart/$platform/$id",
-  component: () => {
+  component: function ChartDetailRoutePage() {
     const { platform, id } = useParams({ strict: false }) as {
       platform: string;
       id: string;
@@ -173,7 +175,7 @@ const myPlaylistDetailRoute = createRoute({
   path: "/my/playlist/$id",
   // 本地歌单详情与在线歌单详情**共用同一个页面组件**（见 PlaylistDetailPage 模块头）：
   // 本地歌单只是把 platform 传成 "local"，页面内据此分叉。
-  component: () => {
+  component: function MyPlaylistDetailRoutePage() {
     const { id } = useParams({ strict: false }) as { id: string };
     return <PlaylistDetailPage platform={LOCAL_PLATFORM} id={id} />;
   },
@@ -256,7 +258,7 @@ const profileEditRoute = createRoute({
 const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings/$section",
-  component: () => {
+  component: function SettingsRoutePage() {
     const { section } = useParams({ strict: false }) as { section: string };
     return <SettingsPage section={section} />;
   },

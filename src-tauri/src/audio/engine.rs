@@ -305,12 +305,12 @@ impl AudioEngine {
     }
 
     pub fn snapshot(&self) -> PlaybackStateSnapshot {
-        self.state.read().unwrap().clone()
+        self.state.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// 队列快照（cmd_get_queue 用；引擎线程是唯一写者）
     pub fn queue_snapshot(&self) -> Queue {
-        self.queue.lock().unwrap().clone()
+        self.queue.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// 注入系统媒体控制句柄（Windows SMTC；不可用时传 None）。
@@ -325,7 +325,7 @@ impl AudioEngine {
 
     /// 正在播放的流对应的磁盘缓存文件（没有在线流 = None）。
     pub fn current_cache_file(&self) -> Option<PathBuf> {
-        self.cache_file.lock().unwrap().clone()
+        self.cache_file.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -404,7 +404,7 @@ struct EngineInner {
 
 impl EngineInner {
     fn publish(&self) {
-        let snap = self.state.read().unwrap().clone();
+        let snap = self.state.read().unwrap_or_else(|e| e.into_inner()).clone();
         let _ = self.app.emit("playback-state-changed", &snap);
         // 顺带把当前曲目 / 播放状态投到系统媒体面板（Windows SMTC）
         crate::smtc::sync(&self.smtc, &snap);
@@ -414,14 +414,14 @@ impl EngineInner {
 
     fn mutate(&self, f: impl FnOnce(&mut PlaybackStateSnapshot)) {
         {
-            let mut st = self.state.write().unwrap();
+            let mut st = self.state.write().unwrap_or_else(|e| e.into_inner());
             f(&mut st);
         }
         self.publish();
     }
 
     fn effective_volume(&self) -> f32 {
-        let st = self.state.read().unwrap();
+        let st = self.state.read().unwrap_or_else(|e| e.into_inner());
         if st.muted {
             0.0
         } else {
@@ -450,7 +450,7 @@ impl EngineInner {
         // 锁内只取数据，emit（含整队列序列化）放在锁外：大队列时 json 序列化
         // 可能毫秒级，别拉长临界区（引擎线程与命令线程都会调本函数）
         let (tracks, index) = {
-            let q = self.queue.lock().unwrap();
+            let q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
             (q.tracks.clone(), q.index)
         };
         let _ = self.app.emit(
@@ -463,8 +463,8 @@ impl EngineInner {
     }
 
     fn sync_queue_to_snapshot(&self) {
-        let q = self.queue.lock().unwrap();
-        let mut st = self.state.write().unwrap();
+        let q = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.state.write().unwrap_or_else(|e| e.into_inner());
         st.queue_index = q.index;
         st.queue_len = q.len();
     }
@@ -499,7 +499,7 @@ impl EngineInner {
 
         // 迁移前记录当前曲目 / 进度 / 播放态
         let (track, pos_ms, was_playing) = {
-            let st = self.state.read().unwrap();
+            let st = self.state.read().unwrap_or_else(|e| e.into_inner());
             let pos = self.sink.get_pos().as_millis() as u64;
             (st.track.clone(), pos, st.status == PlaybackStatus::Playing)
         };
@@ -523,7 +523,7 @@ impl EngineInner {
         self.tick_anchor = None;
 
         {
-            let mut st = self.state.write().unwrap();
+            let mut st = self.state.write().unwrap_or_else(|e| e.into_inner());
             st.output_device = self.current_device.clone();
         }
 
@@ -546,8 +546,8 @@ impl EngineInner {
     /// 播放状态（index/position/quality/mode/volume/muted）写 settings。
     fn persist_state(&self) {
         let Some(db) = &self.db else { return };
-        let st = self.state.read().unwrap().clone();
-        let index = self.queue.lock().unwrap().index.unwrap_or(0);
+        let st = self.state.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let index = self.queue.lock().unwrap_or_else(|e| e.into_inner()).index.unwrap_or(0);
         let s = PlayState {
             index,
             position_ms: st.position_ms,
@@ -564,7 +564,7 @@ impl EngineInner {
     /// 队列整表入库（连带 tracks）+ 播放状态。队列语义变化时调用。
     fn persist_queue(&self) {
         let Some(db) = &self.db else { return };
-        let tracks: Vec<Track> = self.queue.lock().unwrap().tracks.clone();
+        let tracks: Vec<Track> = self.queue.lock().unwrap_or_else(|e| e.into_inner()).tracks.clone();
         if let Err(e) = db.with(|c| store::save_queue(c, &tracks)) {
             log::warn!("[db] 队列入库失败: {e}");
             return;
@@ -641,7 +641,7 @@ fn finish_pause(inner: &mut EngineInner) {
 /// 睡眠定时到期：暂停播放、清掉快照里的定时状态并发事件（前端提示）。
 fn fire_sleep_timer(inner: &mut EngineInner) {
     log::info!("[sleep] 睡眠定时到点，停止播放");
-    if inner.state.read().unwrap().status == PlaybackStatus::Playing {
+    if inner.state.read().unwrap_or_else(|e| e.into_inner()).status == PlaybackStatus::Playing {
         finish_pause(inner);
     }
     inner.mutate(|st| {
@@ -716,11 +716,11 @@ fn run_engine(deps: EngineDeps) {
         Err(e) => {
             log::error!("音频输出设备初始化失败: {e}");
             {
-                let mut st = state.write().unwrap();
+                let mut st = state.write().unwrap_or_else(|e| e.into_inner());
                 st.status = PlaybackStatus::Error;
                 st.error = Some(format!("音频输出设备初始化失败: {e}"));
             }
-            let _ = app.emit("playback-state-changed", state.read().unwrap().clone());
+            let _ = app.emit("playback-state-changed", state.read().unwrap_or_else(|e| e.into_inner()).clone());
             return;
         }
     };
@@ -782,7 +782,9 @@ fn run_engine(deps: EngineDeps) {
     let mut inner = inner;
     // 恢复用户上次选择的输出设备（存 settings：audio.outputDevice，空 = 跟随默认）
     if let Some(db) = &inner.db {
-        if let Ok(saved) = db.with(|c| store::get_setting(c, "audio.outputDevice")) {
+        if let Ok(saved) =
+            db.with(|c| store::get_setting(c, crate::settings_keys::SETTING_OUTPUT_DEVICE))
+        {
             match saved.as_deref() {
                 Some(name) if !name.is_empty() => {
                     if let Err(e) = inner.rebuild_output(Some(name)) {
@@ -796,7 +798,7 @@ fn run_engine(deps: EngineDeps) {
                         .and_then(|d| d.description().ok().map(|desc| desc.name().to_string()))
                         .unwrap_or_default();
                     {
-                        let mut st = inner.state.write().unwrap();
+                        let mut st = inner.state.write().unwrap_or_else(|e| e.into_inner());
                         st.output_device = inner.current_device.clone();
                     }
                 }
@@ -805,7 +807,7 @@ fn run_engine(deps: EngineDeps) {
     }
     // 恢复设置里的默认播放音质（settings["quality"]：128 / 320 / flac）
     if let Some(db) = &inner.db {
-        if let Ok(saved) = db.with(|c| store::get_setting(c, "quality")) {
+        if let Ok(saved) = db.with(|c| store::get_setting(c, crate::settings_keys::SETTING_QUALITY)) {
             if let Some(q) = saved.as_deref().and_then(parse_quality) {
                 inner.default_quality = q.clone();
                 inner.mutate(|st| st.quality = q);
@@ -1006,11 +1008,11 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             // Error 态下 sink 是空的，裸 sink.play() 是空操作 → 播放键失效。
             // 改为重载当前队列曲目（autoplay=true）：成功即从原进度续播，再失败
             // 走 LoadFailed 的自动跳过链。用户按播放 = 明确意图，重开自动切歌熔断。
-            let reload = inner.state.read().unwrap().status == PlaybackStatus::Error;
+            let reload = inner.state.read().unwrap_or_else(|e| e.into_inner()).status == PlaybackStatus::Error;
             if reload {
-                let track = inner.queue.lock().unwrap().current().cloned();
+                let track = inner.queue.lock().unwrap_or_else(|e| e.into_inner()).current().cloned();
                 if let Some(track) = track {
-                    let pos = inner.state.read().unwrap().position_ms;
+                    let pos = inner.state.read().unwrap_or_else(|e| e.into_inner()).position_ms;
                     inner.auto_next = true;
                     inner.fail_streak = 0;
                     inner.stall_retry = 0;
@@ -1042,7 +1044,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             // 淡出已在途时再次 Pause = 用户坚持，直接暂停。
             let fading = inner.pause_deadline.is_none()
                 && inner.fx.fade_enabled()
-                && inner.state.read().unwrap().status == PlaybackStatus::Playing;
+                && inner.state.read().unwrap_or_else(|e| e.into_inner()).status == PlaybackStatus::Playing;
             if fading {
                 let dur = inner.fx.fade_duration_ms();
                 inner.fx.begin_fade_out(epoch_ms(inner));
@@ -1057,7 +1059,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             inner.current_shared = None;
             inner.pause_deadline = None;
             inner.fx.clear_fade();
-            *inner.cache_file.lock().unwrap() = None;
+            *inner.cache_file.lock().unwrap_or_else(|e| e.into_inner()) = None;
             inner.mutate(|st| {
                 st.status = PlaybackStatus::Stopped;
                 st.position_ms = 0;
@@ -1093,7 +1095,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
         }
         AudioCmd::SetVolume(v) => {
             let v = v.clamp(0.0, 1.0);
-            let muted = inner.state.read().unwrap().muted;
+            let muted = inner.state.read().unwrap_or_else(|e| e.into_inner()).muted;
             inner.sink.set_volume(if muted { 0.0 } else { v });
             if !muted {
                 inner.volume_before_mute = v;
@@ -1102,7 +1104,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             inner.persist_state();
         }
         AudioCmd::SetMuted(m) => {
-            let v = inner.state.read().unwrap().volume;
+            let v = inner.state.read().unwrap_or_else(|e| e.into_inner()).volume;
             if m {
                 inner.volume_before_mute = v;
                 inner.sink.set_volume(0.0);
@@ -1124,7 +1126,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             inner.fail_streak = 0;
             inner.stall_retry = 0;
             inner.watch.clear();
-            let mut q = inner.queue.lock().unwrap();
+            let mut q = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
             q.set(tracks, index);
             let current = q.current().cloned();
             drop(q);
@@ -1140,7 +1142,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             // 重开熔断、清失败记录、给这首歌第二次机会。
             // 不碰 track_quality（那是「这首单独指定音质」，与队列无关）。
             let track = {
-                let mut q = inner.queue.lock().unwrap();
+                let mut q = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
                 let i = q.append_or_find(*track);
                 q.index = Some(i);
                 q.current().cloned()
@@ -1159,7 +1161,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
         }
         AudioCmd::PlayAt(index) => {
             let track = {
-                let mut q = inner.queue.lock().unwrap();
+                let mut q = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
                 if index >= q.len() {
                     None
                 } else {
@@ -1195,9 +1197,9 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             inner.current_shared = None;
             inner.pause_deadline = None;
             inner.fx.clear_fade();
-            *inner.cache_file.lock().unwrap() = None;
+            *inner.cache_file.lock().unwrap_or_else(|e| e.into_inner()) = None;
             {
-                let mut q = inner.queue.lock().unwrap();
+                let mut q = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
                 q.tracks.clear();
                 q.index = None;
             }
@@ -1212,21 +1214,21 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             inner.persist_queue();
         }
         AudioCmd::AddNext(track) => {
-            inner.queue.lock().unwrap().insert_next(*track);
+            inner.queue.lock().unwrap_or_else(|e| e.into_inner()).insert_next(*track);
             inner.sync_queue_to_snapshot();
             inner.queue_emit();
             inner.persist_queue();
         }
         AudioCmd::Append(tracks) => {
             if !tracks.is_empty() {
-                inner.queue.lock().unwrap().append(tracks);
+                inner.queue.lock().unwrap_or_else(|e| e.into_inner()).append(tracks);
                 inner.sync_queue_to_snapshot();
                 inner.queue_emit();
                 inner.persist_queue();
             }
         }
         AudioCmd::RemoveAt(index) => {
-            let removed = inner.queue.lock().unwrap().remove_at(index).is_some();
+            let removed = inner.queue.lock().unwrap_or_else(|e| e.into_inner()).remove_at(index).is_some();
             if removed {
                 inner.sync_queue_to_snapshot();
                 inner.queue_emit();
@@ -1234,7 +1236,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             }
         }
         AudioCmd::RemoveIndices(indices) => {
-            let removed = inner.queue.lock().unwrap().remove_indices(&indices);
+            let removed = inner.queue.lock().unwrap_or_else(|e| e.into_inner()).remove_indices(&indices);
             if removed > 0 {
                 inner.sync_queue_to_snapshot();
                 inner.queue_emit();
@@ -1242,7 +1244,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             }
         }
         AudioCmd::MoveItem { from, to } => {
-            let moved = inner.queue.lock().unwrap().move_item(from, to);
+            let moved = inner.queue.lock().unwrap_or_else(|e| e.into_inner()).move_item(from, to);
             if moved {
                 inner.sync_queue_to_snapshot();
                 inner.queue_emit();
@@ -1250,7 +1252,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             }
         }
         AudioCmd::ClearAfter => {
-            let removed = inner.queue.lock().unwrap().clear_after_current();
+            let removed = inner.queue.lock().unwrap_or_else(|e| e.into_inner()).clear_after_current();
             if removed > 0 {
                 inner.sync_queue_to_snapshot();
                 inner.queue_emit();
@@ -1267,7 +1269,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             quality,
         } => {
             {
-                let mut q = inner.queue.lock().unwrap();
+                let mut q = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
                 q.set(tracks, index);
             }
             inner.failed_tracks.clear();
@@ -1281,7 +1283,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                 st.error = None;
             });
             inner.sink.set_volume(inner.effective_volume());
-            let track = inner.queue.lock().unwrap().current().cloned();
+            let track = inner.queue.lock().unwrap_or_else(|e| e.into_inner()).current().cloned();
             if let Some(track) = track {
                 // 暂停态加载并定位到上次进度；用户点播放即续播
                 load_queue_track(inner, track, false, position_ms);
@@ -1292,7 +1294,9 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             // 选择存进 settings，重启后保持；切设备时重建输出流并续播当前曲
             if let Some(db) = &inner.db {
                 let key_val = name.clone().unwrap_or_default();
-                if let Err(e) = db.with(|c| store::set_setting(c, "audio.outputDevice", &key_val)) {
+                if let Err(e) = db.with(|c| {
+                    store::set_setting(c, crate::settings_keys::SETTING_OUTPUT_DEVICE, &key_val)
+                }) {
                     log::warn!("[db] 输出设备选择入库失败: {e}");
                 }
             }
@@ -1305,13 +1309,19 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
         AudioCmd::SetDefaultQuality { quality } => {
             // 默认音质（设置页）：写 settings 以便重启保持，并对当前这首立即生效
             if let Some(db) = &inner.db {
-                if let Err(e) = db.with(|c| store::set_setting(c, "quality", &quality_key(&quality)))
+                if let Err(e) = db.with(|c| {
+                    store::set_setting(
+                        c,
+                        crate::settings_keys::SETTING_QUALITY,
+                        &quality_key(&quality),
+                    )
+                })
                 {
                     log::warn!("[db] 默认音质入库失败: {e}");
                 }
             }
             inner.default_quality = quality;
-            let current = inner.queue.lock().unwrap().current().cloned();
+            let current = inner.queue.lock().unwrap_or_else(|e| e.into_inner()).current().cloned();
             if inner.track_quality.is_none() {
                 if let Some(track) = current {
                     let (autoplay, pos) = playback_resume_point(inner);
@@ -1322,7 +1332,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
         }
         AudioCmd::SetTrackQuality { quality } => {
             // 只针对当前这首（播放条入口）：按曲目 id 绑定，换歌自动回到默认，不写 settings
-            let current = inner.queue.lock().unwrap().current().cloned();
+            let current = inner.queue.lock().unwrap_or_else(|e| e.into_inner()).current().cloned();
             if let Some(track) = current {
                 let (autoplay, pos) = playback_resume_point(inner);
                 inner.track_quality = Some((track.id.clone(), quality));
@@ -1500,7 +1510,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                     log::debug!("[queue] 弱网重试时当前曲已变，丢弃 track={track_id}");
                 } else {
                     // 先出借用再play_queue_track（它要&mut inner）
-                    let track = inner.queue.lock().unwrap().current().cloned();
+                    let track = inner.queue.lock().unwrap_or_else(|e| e.into_inner()).current().cloned();
                     if let Some(track) = track {
                         log::debug!("[queue] 弱网重试：{track_id}");
                         play_queue_track(inner, track);
@@ -1522,7 +1532,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                 inner.mutate(|st| {
                     st.error = None;
                 });
-                let track = inner.queue.lock().unwrap().current().cloned();
+                let track = inner.queue.lock().unwrap_or_else(|e| e.into_inner()).current().cloned();
                 if let Some(track) = track {
                     log::debug!("[queue] 网络已恢复，重新播放当前曲 {}", track.id);
                     play_queue_track(inner, track);
@@ -1551,7 +1561,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
 /// 切音质 / 换输出设备这类「原地重取」用的续播参数：
 /// 原来在播（或正在缓冲）就继续播，并从原进度续；暂停态则保持暂停。
 fn playback_resume_point(inner: &EngineInner) -> (bool, u64) {
-    let st = inner.state.read().unwrap();
+    let st = inner.state.read().unwrap_or_else(|e| e.into_inner());
     let autoplay = matches!(
         st.status,
         PlaybackStatus::Playing | PlaybackStatus::Loading | PlaybackStatus::Buffering
@@ -1599,7 +1609,7 @@ fn advance(inner: &mut EngineInner, auto: bool) {
         inner.sleep_deadline = None;
         inner.sink.clear();
         inner.current_shared = None;
-        *inner.cache_file.lock().unwrap() = None;
+        *inner.cache_file.lock().unwrap_or_else(|e| e.into_inner()) = None;
         inner.mutate(|st| {
             st.status = PlaybackStatus::Stopped;
             st.position_ms = st.duration_ms;
@@ -1610,16 +1620,16 @@ fn advance(inner: &mut EngineInner, auto: bool) {
         inner.persist_state();
         return;
     }
-    let mode = inner.state.read().unwrap().play_mode;
+    let mode = inner.state.read().unwrap_or_else(|e| e.into_inner()).play_mode;
     let next = {
-        let q = inner.queue.lock().unwrap();
+        let q = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
         q.next_index_skipping(mode, auto, |t| inner.dislikes.matches(t))
     };
     log::debug!("[queue] advance(auto={auto}, mode={mode:?}) -> {next:?}");
     match next {
         Some(i) => {
             let track = {
-                let mut q = inner.queue.lock().unwrap();
+                let mut q = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
                 q.index = Some(i);
                 q.current().cloned()
             };
@@ -1635,7 +1645,7 @@ fn advance(inner: &mut EngineInner, auto: bool) {
                 // 顺序播放到末尾：停止并保留最后一曲信息
                 inner.sink.clear();
                 inner.current_shared = None;
-                *inner.cache_file.lock().unwrap() = None;
+                *inner.cache_file.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 inner.mutate(|st| {
                     st.status = PlaybackStatus::Stopped;
                     st.position_ms = st.duration_ms;
@@ -1806,11 +1816,11 @@ fn schedule_recovery_probe(inner: &EngineInner) {
     let tx = inner.tx.clone();
     let cache = Arc::clone(&inner.url_cache);
     let queue = Arc::clone(&inner.queue);
-    let track = queue.lock().unwrap().current().cloned();
+    let track = queue.lock().unwrap_or_else(|e| e.into_inner()).current().cloned();
     let Some(track) = track else {
         return;
     };
-    let quality = inner.state.read().unwrap().quality.clone();
+    let quality = inner.state.read().unwrap_or_else(|e| e.into_inner()).quality.clone();
     tauri::async_runtime::spawn(async move {
         let mut delay = RECOVERY_PROBE_BASE_MS;
         for attempt in 1..=RECOVERY_PROBE_LIMIT {
@@ -1846,7 +1856,7 @@ fn notify_failure(app: &tauri::AppHandle, body: &str) {
 fn skip_if_recoverable(inner: &mut EngineInner, track_id: &str, autoplay: bool) {
     inner.failed_tracks.insert(track_id.to_string());
     let (len, cur) = {
-        let q = inner.queue.lock().unwrap();
+        let q = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
         (q.len(), q.index)
     };
     if !autoplay || len <= 1 {
@@ -1886,7 +1896,7 @@ fn skip_if_recoverable(inner: &mut EngineInner, track_id: &str, autoplay: bool) 
     log::debug!("[queue] 曲目 {track_id} 失败，跳过到队列第 {} 首", i + 1);
 
     let track = {
-        let mut q = inner.queue.lock().unwrap();
+        let mut q = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
         q.index = Some(i);
         q.current().cloned()
     };
@@ -1914,7 +1924,7 @@ fn watch_pipeline(inner: &mut EngineInner) {
     let Some(hits) = inner.watch.poll(frozen_ms, Instant::now()) else {
         return;
     };
-    let Some(track) = inner.queue.lock().unwrap().current().cloned() else {
+    let Some(track) = inner.queue.lock().unwrap_or_else(|e| e.into_inner()).current().cloned() else {
         log::warn!("[watchdog] 播放位置冻结在 {frozen_ms}ms，但队列为空，跳过恢复");
         return;
     };
@@ -1959,9 +1969,9 @@ fn watch_pipeline(inner: &mut EngineInner) {
 }
 
 fn go_previous(inner: &mut EngineInner) {
-    let mode = inner.state.read().unwrap().play_mode;
+    let mode = inner.state.read().unwrap_or_else(|e| e.into_inner()).play_mode;
     let prev = {
-        let mut q = inner.queue.lock().unwrap();
+        let mut q = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
         q.previous_index(mode).map(|i| {
             q.index = Some(i);
             q.current().cloned()
@@ -2022,7 +2032,7 @@ fn spawn_resolve_and_load(
         http: inner.http.clone(),
         cache_dir: inner.cache_dir.clone(),
         history_db: inner.db.clone(),
-        quality: inner.state.read().unwrap().quality.clone(),
+        quality: inner.state.read().unwrap_or_else(|e| e.into_inner()).quality.clone(),
         track,
         autoplay,
         start_ms,
@@ -2325,7 +2335,7 @@ fn spawn_cache_prune(inner: &EngineInner) {
     }
     let dir = inner.cache_dir.clone();
     let limit = inner.cache_limit_mb;
-    let keep = inner.cache_file.lock().unwrap().clone();
+    let keep = inner.cache_file.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let _ = std::thread::Builder::new()
         .name("cache-prune".into())
         .spawn(move || {
@@ -2387,7 +2397,7 @@ fn mount_decoder(
     }
     inner.pause_deadline = None;
     // 记下这条流的磁盘缓存文件（清理缓存时跳过它，Windows 上删被占用文件会失败）
-    *inner.cache_file.lock().unwrap() = shared.as_ref().map(|s| s.path().to_path_buf());
+    *inner.cache_file.lock().unwrap_or_else(|e| e.into_inner()) = shared.as_ref().map(|s| s.path().to_path_buf());
     // 新流落盘后顺手修剪缓存（超上限时清最旧的；后台线程）
     spawn_cache_prune(inner);
     // 恢复现场：加载后先定位到上次进度（暂停态下 try_seek 同样有效）
@@ -2539,7 +2549,7 @@ fn emit_position_tick(inner: &mut EngineInner) {
             let ready = s.ready_bytes();
             match s.total_len() {
                 Some(total) if total > 0 => {
-                    let dur = inner.state.read().unwrap().duration_ms;
+                    let dur = inner.state.read().unwrap_or_else(|e| e.into_inner()).duration_ms;
                     ((ready as f64 / total as f64) * dur as f64) as u64
                 }
                 _ => (ready / 128_000) * 1000,
@@ -2547,7 +2557,7 @@ fn emit_position_tick(inner: &mut EngineInner) {
         })
         .unwrap_or(0);
 
-    let duration_ms = inner.state.read().unwrap().duration_ms;
+    let duration_ms = inner.state.read().unwrap_or_else(|e| e.into_inner()).duration_ms;
     // monotonicMs：发送时刻单调时钟（原点 = 引擎启动），歌词窗口检测漂移用（§7.11）
     let monotonic_ms = inner.epoch.elapsed().as_millis() as u64;
     let payload = serde_json::json!({

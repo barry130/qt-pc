@@ -10,7 +10,7 @@ import type { DislikeRule, Track } from "@/types";
  * 「屏蔽 A/B」与「撤销 A/B」落到不同的词上，留下撤不掉的孤儿规则。
  * 判定屏蔽与否的权威在 Rust（它按归一化键匹配），这里只用于前端回显匹配。
  */
-const SINGER_SEPARATORS = /[,，、;；/|\&＆　]/g;
+const SINGER_SEPARATORS = /[,，、;；/|&＆\u3000]/g;
 
 function splitSingerParts(raw: string): string[] {
   return (raw ?? "")

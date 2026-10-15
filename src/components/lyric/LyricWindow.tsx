@@ -315,7 +315,8 @@ export function LyricWindow(): React.JSX.Element {
           }),
         );
       } catch (e) {
-        throw new Error(`桌面歌词事件订阅注册失败：${String(e)}`);
+        // cause 保留原始异常，ErrorBoundary / 日志能看到完整失败链路
+        throw new Error(`桌面歌词事件订阅注册失败：${String(e)}`, { cause: e });
       }
     })();
 

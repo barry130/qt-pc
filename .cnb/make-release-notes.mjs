@@ -29,7 +29,6 @@ const [, , artifactsDir = "artifacts", outFile = "release-notes.md"] = process.a
 const tag = (process.env.CNB_BRANCH || process.env.GITHUB_REF_NAME || process.env.GITHUB_TAG || "").trim();
 const version = tag.replace(/^v/, "");
 const cnbSlug = process.env.CNB_REPO_SLUG || "canace/qt-pc";
-const ghRepo = process.env.GITHUB_REPOSITORY || "barry130/qt-pc";
 const onCnb = Boolean(process.env.CNB_REPO_SLUG);
 
 const dir = resolve(artifactsDir);

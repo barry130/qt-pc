@@ -92,7 +92,7 @@ fn sync_lock_checked(app: &AppHandle) {
 
 /// 显示并聚焦主窗口（托盘左键单击 / 菜单「显示主窗口」）
 fn show_main_window(app: &AppHandle) {
-    if let Some(win) = app.get_webview_window("main") {
+    if let Some(win) = app.get_webview_window(crate::MAIN_WINDOW_LABEL) {
         // 只有「本来不可见」才算一轮新的 show：左键可以连点，若每次都发事件，
         // 前端停留计时会被反复重置，统计出的时长永远接近 0。
         let was_visible = win.is_visible().unwrap_or(true);

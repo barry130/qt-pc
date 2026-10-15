@@ -81,7 +81,9 @@ async function sourceCall<T>(
     payload = await engineInvoke(entry, args, timeoutMs ?? INVOKE_TIMEOUT_MS);
   } catch (err) {
     // bundle 明确报错（入口不存在 / 入口内部失败）：带出原文，便于定位与提示更新
-    throw new Error(`音源包调用失败：${err instanceof Error ? err.message : String(err)}`);
+    throw new Error(`音源包调用失败：${err instanceof Error ? err.message : String(err)}`, {
+      cause: err,
+    });
   }
   if (payload === null) throw engineError(entry);
   const picked = pick(payload);
@@ -427,7 +429,9 @@ export async function resolvePlayUrlDetailed(
   track: Track,
   quality: Quality,
 ): Promise<{ url: string; stalled: boolean; referer: string; size: number | null; actualQuality: string }> {
-  let stalled = true;
+  // 提前返回的两条路径都直接带字面量返回；落到末尾 return 的路径上，
+  // try / catch 两路都会先赋值（resolved.stalled / true），声明处无需初始化。
+  let stalled: boolean;
   try {
     ensureScript(track.platform);
   } catch {

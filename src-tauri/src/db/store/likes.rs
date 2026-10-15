@@ -242,6 +242,7 @@ pub(crate) fn list_liked_songs(
 /// 启动对账用：未删除收藏的原始行（含主归属 pid），字段全量带出，
 /// 补推 /like/song 的请求体需要这些。返回
 /// (sid, platform, name, singer, album, hash, pic_url, 主归属 pid)。
+#[allow(clippy::type_complexity)] // 七元组布局即接口文档（见上方 doc 逐字段说明）
 pub(crate) fn list_liked_songs_raw(
     conn: &Connection,
 ) -> Result<
@@ -403,8 +404,8 @@ pub(crate) fn clear_like_local(conn: &Connection) -> Result<i64, rusqlite::Error
     ] {
         n += conn.execute(sql, [])? as i64;
     }
-    set_setting(conn, "like.sync.seq", "")?;
-    set_setting(conn, "like.imported", "")?;
+    set_setting(conn, crate::settings_keys::SETTING_LIKE_SYNC_SEQ, "")?;
+    set_setting(conn, crate::settings_keys::SETTING_LIKE_IMPORTED, "")?;
     Ok(n)
 }
 
@@ -414,8 +415,8 @@ pub(crate) fn reset_like_sync_state(conn: &Connection) -> Result<(), rusqlite::E
     ensure_pending_like_ops_table(conn)?;
     conn.execute("DELETE FROM pending_like_ops", [])?;
     conn.execute("DELETE FROM pending_like_targets", [])?;
-    set_setting(conn, "like.sync.seq", "")?;
-    set_setting(conn, "like.imported", "")?;
+    set_setting(conn, crate::settings_keys::SETTING_LIKE_SYNC_SEQ, "")?;
+    set_setting(conn, crate::settings_keys::SETTING_LIKE_IMPORTED, "")?;
     Ok(())
 }
 

@@ -41,6 +41,8 @@ export interface Track {
   fileSize?: number | null;
   /** 本地曲目：文件修改时间（秒）；在线曲目无。供本地库按修改时间排序 */
   mtime?: number | null;
+  /** 本地曲目：Rust 扫描器记录的小写容器扩展名；在线曲目无。 */
+  format?: string | null;
 }
 
 /** 播放历史条目，对齐 Rust `HistoryItem`（serde rename_all = "camelCase"，DESIGN §5.3） */

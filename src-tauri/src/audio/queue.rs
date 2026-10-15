@@ -455,7 +455,7 @@ mod tests {
         q.index = Some(1);
         let never = |_: &Track| false;
         assert_eq!(
-            q.next_index_skipping(PlayMode::Sequence, true, &never),
+            q.next_index_skipping(PlayMode::Sequence, true, never),
             q.next_index(PlayMode::Sequence, true)
         );
     }

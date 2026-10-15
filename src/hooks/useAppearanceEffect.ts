@@ -120,6 +120,10 @@ export function useAppearanceEffect(): void {
     apply();
     mq.addEventListener("change", apply);
     return () => mq.removeEventListener("change", apply);
+    // preference 只为 applySkinPrimaryForeground 读 mode/skinId/customColor，
+    // 三者已在依赖里；对象身份会随 fontScale/reduceMotion 等无关字段变化，
+    // 整体入依赖反而导致无关重跑，故刻意不列。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, skinId, followCoverColor, customColor, bgImage]);
 
   // 背景图片

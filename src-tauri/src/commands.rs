@@ -827,7 +827,8 @@ pub async fn cmd_get_appearance(state: State<'_, AppState>) -> Result<serde_json
     let Some(db) = &state.db else {
         return Ok(default_appearance());
     };
-    let saved = db.with(|c| crate::db::store::get_setting(c, "appearance"))?;
+    let saved =
+        db.with(|c| crate::db::store::get_setting(c, crate::settings_keys::SETTING_APPEARANCE))?;
     match saved {
         Some(json) => serde_json::from_str(&json).map_err(|e| format!("外观偏好解析失败: {e}")),
         None => Ok(default_appearance()),
@@ -845,16 +846,20 @@ pub async fn cmd_set_appearance(
     let Some(db) = &state.db else {
         return Ok(()); // 数据库不可用时只保持本次会话内存值
     };
-    db.with(|c| crate::db::store::set_setting(c, "appearance", &json))
+    db.with(|c| {
+        crate::db::store::set_setting(c, crate::settings_keys::SETTING_APPEARANCE, &json)
+    })
 }
 
 fn default_appearance() -> serde_json::Value {
     serde_json::json!({
         "mode": "system",
         "skinId": "default",
+        "customColor": "#6366f1",
         "followCoverColor": false,
         "reduceMotion": false,
         "fontScale": 1.0,
+        "bgImage": "",
     })
 }
 
@@ -1330,6 +1335,7 @@ pub async fn cmd_set_lyric_offset(
 /// `manual` = 这份词是不是用户在播放页「搜索歌词」手动挑的。自动取词一律传 `false`
 /// —— 见 `db/store/lyrics.rs`：手动标记写了 1 之后，取词链路就不再打源站而是直接
 /// 回读它，所以自动链路重新取到词时必须把标记交回 0，否则用户的选择会永久粘住。
+#[allow(clippy::too_many_arguments)] // 参数与前端 invoke 键 1:1，收敛成结构体会改 IPC 契约
 #[tauri::command(rename = "save_lyric")]
 pub async fn cmd_save_lyric(
     state: State<'_, AppState>,
@@ -1518,87 +1524,25 @@ pub async fn cmd_check_disliked(
 // 数据库不可用（state.db == None）时一律返回空结果，不 panic。
 
 /// 扫描目录 → 读元数据 → 入库，返回库内全部本地曲目（DESIGN §13.1 / §13.2）。
-/// 实际的文件遍历与元数据读取放进 `spawn_blocking`，避免阻塞 UI 线程。
+///
+/// 命令层只负责 IPC 参数与事件桥接；目录校验、扫描、分段事务及缺失标记由
+/// `library_scan::scan_and_persist` 编排，因此核心逻辑可脱离 Tauri 单测。
 #[tauri::command(rename = "scan_library")]
 pub async fn cmd_scan_library(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
-    dirs: Vec<String>,
-    // 时长下限（秒）：> 0 时忽略时长不足的音频（0 = 不过滤）。缺省 0，
-    // 实际默认值由前端「扫描配置」给出（默认 60）。
-    min_duration_secs: Option<u64>,
-    // 体积下限（字节）：> 0 时忽略小于该值的文件（0 = 不过滤）。
-    // 同样由前端「扫描配置」给出（默认 1 MiB）。
-    min_size_bytes: Option<u64>,
+    request: crate::library_scan::ScanLibraryRequest,
 ) -> Result<Vec<Track>, String> {
-    let filter = crate::local::ScanFilter {
-        min_duration_secs: min_duration_secs.unwrap_or(0),
-        min_size_bytes: min_size_bytes.unwrap_or(0),
-    };
-    // §13 安全：路径来自前端输入，先校验存在性
-    for dir in &dirs {
-        if !std::path::Path::new(dir).exists() {
-            return Err(format!("目录不存在: {dir}"));
-        }
-    }
     let Some(db) = state.db.clone() else {
-        log::warn!("[local] 数据库不可用，跳过本次扫描");
-        return Ok(Vec::new());
+        return Err("数据库不可用，无法扫描本地音乐库".to_string());
     };
-    // 命中的目录同时登记进 scan_dirs（幂等），保证清单与曲库一致
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        // 整盘扫描可能上万文件，进度按 200ms 节流广播，避免刷爆前端
-        let mut last_emit: Option<std::time::Instant> = None;
-        let rows =
-            crate::local::scan_dirs_with_progress(&dirs, filter, |visited, found, current| {
-                let due = last_emit.map_or(true, |t| {
-                    t.elapsed() >= std::time::Duration::from_millis(200)
-                });
-                if due {
-                    last_emit = Some(std::time::Instant::now());
-                    let _ = app.emit(
-                        crate::local::EVENT_LIBRARY_SCAN_PROGRESS,
-                        serde_json::json!({
-                            "visited": visited,
-                            "found": found,
-                            "current": current.to_string_lossy(),
-                        }),
-                    );
-                }
-            });
-        let present: std::collections::HashSet<String> =
-            rows.iter().map(|r| r.path.clone()).collect();
-        // 分段持锁入库（每段一个事务）：db 是全进程单连接 Mutex，整库一次性
-        // upsert 会把锁一直握到入库完，期间引擎线程的 persist_state（每 5s 一次）
-        // 会被阻塞到 busy_timeout(5s)，播放控制命令跟着排队。分 500 条/段，
-        // 段间放锁让其他使用者插队；中途失败直接返回错误（不能继续跑
-        // mark_missing —— present 不完整会把没入库的曲目误标成缺失）
-        const UPSERT_CHUNK: usize = 500;
-        let mut upsert_failed = false;
-        let mut first_err: Option<String> = None;
-        for chunk in rows.chunks(UPSERT_CHUNK) {
-            if let Err(e) = db.with(|conn| crate::db::store::upsert_local_tracks(conn, chunk)) {
-                log::error!("[local] 分段入库失败（段含 {} 条）: {e}", chunk.len());
-                upsert_failed = true;
-                first_err = Some(e);
-                break;
-            }
-        }
-        if upsert_failed {
-            return Err(first_err.unwrap_or_else(|| "本地曲目入库失败".to_string()));
-        }
-        db.with(|conn| {
-            crate::db::store::touch_scan_dirs(conn, &dirs)?;
-            let missing = crate::db::store::mark_missing_local_tracks(conn, &dirs, &present)?;
-            if missing > 0 {
-                log::info!("[local] 标记缺失曲目 {missing} 条");
-            }
-            crate::db::store::query_local_tracks(conn)
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::library_scan::scan_and_persist(&db, &request, |progress| {
+            let _ = app.emit(crate::local::EVENT_LIBRARY_SCAN_PROGRESS, progress);
         })
     })
     .await
-    .map_err(|e| format!("扫描任务失败: {e}"))?;
-    result
+    .map_err(|error| format!("扫描任务失败: {error}"))?
 }
 
 /// 可扫描的盘符根目录（如 `C:\`、`D:\`），供本地曲库「扫描整个磁盘」用。
@@ -2630,9 +2574,11 @@ fn effective_download_quality(requested: &str, measured: &str) -> String {
 /// 仅影响设置变更后新开始的下载；已存在的任务沿用原保存路径。
 fn download_name_format(state: &AppState) -> String {
     let v = state.db.clone().and_then(|db| {
-        db.with(|c| crate::db::store::get_setting(c, "downloadNameFormat"))
-            .ok()
-            .flatten()
+        db.with(|c| {
+            crate::db::store::get_setting(c, crate::settings_keys::SETTING_DOWNLOAD_NAME_FORMAT)
+        })
+        .ok()
+        .flatten()
     });
     match v.as_deref() {
         Some("song") => "song".to_string(),
@@ -3388,7 +3334,12 @@ async fn launch_download(
         }
         None => {
             let name_fmt = db
-                .with(|c| crate::db::store::get_setting(c, "downloadNameFormat"))
+                .with(|c| {
+                    crate::db::store::get_setting(
+                        c,
+                        crate::settings_keys::SETTING_DOWNLOAD_NAME_FORMAT,
+                    )
+                })
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "artist".to_string());
@@ -4067,7 +4018,8 @@ pub async fn cmd_like_reconcile(state: State<'_, AppState>) -> Result<u32, Strin
             let pls = crate::db::store::list_playlist_sync_rows(conn)?;
             // 云端卡片歌单（收藏的在线歌单 + 他端建的自建歌单）
             let cards = crate::db::store::list_liked_playlists(conn)?;
-            let cursor = crate::db::store::get_setting(conn, "like.sync.seq")?
+            let cursor =
+                crate::db::store::get_setting(conn, crate::settings_keys::SETTING_LIKE_SYNC_SEQ)?
                 .and_then(|v| v.parse::<i64>().ok())
                 .unwrap_or(0);
             // (sid, platform, name, singer, album, hash, pic, 主归属 pid)

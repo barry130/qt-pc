@@ -201,7 +201,9 @@ async function runJob<T>(job: Job<T>, options: PagedAllOptions<T>): Promise<void
   let total: number | null = null;
   let failed: string | null = null;
   let acc: T[] = [];
-  let seen = new Set<string>();
+  // 204 处只声明不初始化：seen 的首次赋值在下面 try 里拿到第 1 页之后
+  // （222 行），catch / finish 路径不读它，初始化空 Set 是读不到的死赋值。
+  let seen: Set<string>;
 
   const publish = (): void => {
     job.state = {

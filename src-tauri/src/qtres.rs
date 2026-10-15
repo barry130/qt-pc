@@ -803,7 +803,7 @@ mod tests {
         assert!(!starts_with_canonical(&absent, &root));
         // 但 handle_script_file 的新顺序下，这条请求会静默 404 而非告警：
         // metadata 阶段就返回，不会走到前缀校验。
-        assert!(std::fs::metadata(&absent).map(|m| m.is_file()).unwrap_or(false) == false);
+        assert!(!std::fs::metadata(&absent).map(|m| m.is_file()).unwrap_or(false));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

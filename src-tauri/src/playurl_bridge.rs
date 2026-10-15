@@ -447,7 +447,7 @@ mod tests {
             waiting.push(rx);
         }
         assert_eq!(
-            PENDING.lock().unwrap().as_ref().unwrap().by_key.len(),
+            PENDING.lock().unwrap_or_else(|e| e.into_inner()).as_ref().unwrap().by_key.len(),
             MAX_INFLIGHT
         );
         let (tx, mut rx) = tokio::sync::oneshot::channel::<BridgeReply>();
@@ -458,7 +458,7 @@ mod tests {
             "最旧的在途请求被淘汰，其调用方立刻按失败处理"
         );
         {
-            let guard = PENDING.lock().unwrap();
+            let guard = PENDING.lock().unwrap_or_else(|e| e.into_inner());
             let table = guard.as_ref().unwrap();
             assert_eq!(table.by_key.len(), MAX_INFLIGHT, "淘汰后仍然守着上限");
             assert!(
@@ -477,7 +477,7 @@ mod tests {
         let (tx1, mut rx1) = tokio::sync::oneshot::channel::<BridgeReply>();
         let (id1, _) = register("t-stale:a".into(), tx1).expect("register");
         {
-            let mut guard = PENDING.lock().unwrap();
+            let mut guard = PENDING.lock().unwrap_or_else(|e| e.into_inner());
             let flight = guard
                 .as_mut()
                 .unwrap()

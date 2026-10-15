@@ -19,7 +19,7 @@ import type { Track } from "@/types";
  * 中文「和」「与」等），而且「周杰伦 / 林妙可」和「周杰伦&林妙可」是同一批人。
  * 判定前统一替换成半角逗号，拆成集合再比对。
  */
-const ARTIST_SEPARATORS = /[\/／\\|&、,，;；+＋]|\s*(?:和|与|feat\.?|ft\.?)\s*/gi;
+const ARTIST_SEPARATORS = /[/／\\|&、,，;；+＋]|\s*(?:和|与|feat\.?|ft\.?)\s*/gi;
 
 /** 归一化匹配文本：小写 + 折叠空白（与换源 scoreCandidate 同口径） */
 function normalize(text: string): string {
@@ -41,11 +41,11 @@ function splitArtists(text: string): string[] {
  * 剥掉它们再比，`稻香 (Live)` 与 `稻香`、「某某（伴奏）」与「某某」才算同名。
  */
 const TITLE_NOISE =
-  /[（(\[【][^)）\]】]*(?:live|remix|instrumental|acoustic|cover|demo|ost|mv|伴奏|翻唱|纯音乐|清唱|现场|原声|版)[^)）\]】]*[)）\]】]/gi;
+  /[（([【][^)）\]】]*(?:live|remix|instrumental|acoustic|cover|demo|ost|mv|伴奏|翻唱|纯音乐|清唱|现场|原声|版)[^)）\]】]*[)）\]】]/gi;
 
 /** 比对前连标点/括号一起剥掉：全角半角写法不同不该影响判定 */
 const TITLE_PUNCT =
-  /[()（）\[\]【】{}<>《》「」『』""''.,，。、:：;；!！?？~～_\-—…·|/\\]/g;
+  /[()（）[\]【】{}<>《》「」『』""''.,，。、:：;；!！?？~～_\-—…·|/\\]/g;
 
 /** 歌名归一化：小写 → 剥版本修饰 → 折叠空白 → 剥标点 */
 function normalizeTitle(text: string): string {

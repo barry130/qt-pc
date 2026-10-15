@@ -266,14 +266,14 @@ mod tests {
         cache.set("stale".into(), hit("https://example.com/old.mp3", ""));
         // 直接把这条的时间戳改成 1970（同模块可访问私有字段），避免 sleep 拖慢测试
         {
-            let mut inner = cache.inner.lock().unwrap();
+            let mut inner = cache.inner.lock().unwrap_or_else(|e| e.into_inner());
             inner.map.get_mut("stale").unwrap().fetched_at = 0;
         }
         // 攒满一批插入 → 触发全量清扫
         for i in 0..SWEEP_EVERY_INSERTS {
             cache.set(format!("fresh-{i}"), hit("https://example.com/new.mp3", ""));
         }
-        let inner = cache.inner.lock().unwrap();
+        let inner = cache.inner.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             !inner.map.contains_key("stale"),
             "过期项应被批量清扫掉（物理删除）"
@@ -298,7 +298,7 @@ mod tests {
                 hit(&format!("https://example.com/{i}.mp3"), ""),
             );
         }
-        let inner = cache.inner.lock().unwrap();
+        let inner = cache.inner.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             inner.map.len() <= PLAY_URL_MAX_ENTRIES,
             "条目数 {} 超过上限 {PLAY_URL_MAX_ENTRIES}",

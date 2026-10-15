@@ -9,9 +9,11 @@ import {
   X,
   ScanSearch,
 } from "lucide-react";
+import { isLosslessAudioFormat } from "@/lib/audio-format";
 import { errMsg } from "@/lib/utils";
 import type { Track } from "@/types";
 import * as ipc from "@/services/ipc";
+import { useTauriEvent } from "@/hooks/useTauriEvent";
 import { usePlayerStore } from "@/stores/player";
 import { TrackList } from "../discovery/TrackList";
 import { AddDirButtons } from "./AddDirButtons";
@@ -49,18 +51,28 @@ const SORT_OPTIONS: { value: SortKey; label: string }[] = [
   { value: "mtime", label: "按修改时间" },
 ];
 
-/** 无损扩展名（按文件后缀判断，本地 Track 没有 format 字段） */
-const LOSSLESS_EXTS = ["flac", "wav", "ape", "alac", "aiff"];
-
-function extOf(path: string): string {
-  const name = path.split(/[\\/]/).pop() ?? "";
-  const i = name.lastIndexOf(".");
-  return i >= 0 ? name.slice(i + 1).toLowerCase() : "";
-}
-
 function dirOf(path: string): string {
   const idx = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
   return idx > 0 ? path.slice(0, idx) : path;
+}
+
+/**
+ * 把 Rust 侧的文件元数据（大小 / 修改时间 / 容器格式）合并到曲目上。
+ * Rust `Track` 是 provider 通用结构、不带这些字段，由 `get_local_track_files`
+ * 单独返回、前端按 id（= 文件绝对路径）合并。load 与 runScan 共用，避免
+ * 刚扫描完的列表丢失排序依据与无损判定。
+ */
+function mergeFileMetas(tracks: Track[], metas: ipc.LocalTrackFileMeta[]): Track[] {
+  const metaMap = new Map<string, ipc.LocalTrackFileMeta>();
+  for (const meta of metas) {
+    metaMap.set(meta.id, meta);
+  }
+  return tracks.map((tr) => {
+    const fm = metaMap.get(tr.id);
+    return fm
+      ? { ...tr, fileSize: fm.fileSize, mtime: fm.mtime, format: fm.format }
+      : tr;
+  });
 }
 
 export function LibraryPage(): React.JSX.Element {
@@ -97,18 +109,10 @@ export function LibraryPage(): React.JSX.Element {
         ipc.getMissingLocalTracks().catch(() => [] as Track[]),
         ipc.getLocalTrackFiles().catch(() => [] as ipc.LocalTrackFileMeta[]),
       ]);
-      // 合并本地曲目的文件大小 / 修改时间，供「按大小 / 修改时间」排序
-      const metaMap = new Map<string, { fileSize: number; mtime: number }>();
-      const metaArr = Array.isArray(metas) ? metas : [];
-      for (const meta of metaArr) {
-        metaMap.set(meta.id, { fileSize: meta.fileSize, mtime: meta.mtime });
-      }
-      const trackArr = Array.isArray(t) ? t : [];
-      const withMeta: Track[] = trackArr.map((tr) => {
-        const fm = metaMap.get(tr.id);
-        return fm ? { ...tr, fileSize: fm.fileSize, mtime: fm.mtime } : tr;
-      });
-      setTracks(withMeta);
+      // 合并本地曲目的文件大小 / 修改时间 / 格式，供排序与无损计数用
+      setTracks(
+        mergeFileMetas(Array.isArray(t) ? t : [], Array.isArray(metas) ? metas : []),
+      );
       setDirs(Array.isArray(d) ? d : []);
       setMissing(Array.isArray(m) ? m : []);
       // 列表换了，旧的勾选不再有意义（被删掉的曲目尤其要清掉）
@@ -128,16 +132,9 @@ export function LibraryPage(): React.JSX.Element {
   }, [active, load]);
 
   // 扫描进度订阅：整盘扫描可能上万文件，给用户实时反馈
-  useEffect(() => {
-    let unlisten: (() => void) | null = null;
-    void ipc
-      .onLibraryScanProgress((p) => setProgress(p))
-      .then((fn) => {
-        unlisten = fn;
-      })
-      .catch(() => undefined);
-    return () => unlisten?.();
-  }, []);
+  useTauriEvent<ipc.LibraryScanProgress>(ipc.LIBRARY_SCAN_PROGRESS_EVENT, (e) =>
+    setProgress(e.payload),
+  );
 
   // 读取扫描配置（沿用 settings 表，重启后保持）
   useEffect(() => {
@@ -191,7 +188,12 @@ export function LibraryPage(): React.JSX.Element {
           skipShort ? minSecs : 0,
           sizeBytes,
         );
-        setTracks(Array.isArray(scanned) ? scanned : []);
+        // 扫描返回的 Track 不带文件元数据：不合并的话刚扫完的列表按大小 /
+        // 修改时间排序显示空值、无损计数为 0，要切页回来才恢复
+        const metas = await ipc
+          .getLocalTrackFiles()
+          .catch(() => [] as ipc.LocalTrackFileMeta[]);
+        setTracks(mergeFileMetas(Array.isArray(scanned) ? scanned : [], metas));
         const m = await ipc.getMissingLocalTracks().catch(() => [] as Track[]);
         setMissing(Array.isArray(m) ? m : []);
         const d = await ipc.getScanDirs().catch(() => list);
@@ -281,7 +283,8 @@ export function LibraryPage(): React.JSX.Element {
     const sorted = [...list];
     const dir = sortDesc ? -1 : 1;
     sorted.sort((a, b) => {
-      let c = 0;
+      // switch 每个 case（含 default）都先赋值再 break，声明处初值是死赋值
+      let c: number;
       switch (sortKey) {
         case "singer":
           c =
@@ -337,7 +340,7 @@ export function LibraryPage(): React.JSX.Element {
   }, [view, visible]);
 
   const losslessCount = useMemo(
-    () => tracks.filter((t) => LOSSLESS_EXTS.includes(extOf(t.id))).length,
+    () => tracks.filter((t) => isLosslessAudioFormat(t.format)).length,
     [tracks],
   );
 

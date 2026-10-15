@@ -140,6 +140,8 @@ pub struct LocalTrackFileMeta {
     pub id: String,
     pub file_size: i64,
     pub mtime: i64,
+    /// 扫描时记录的小写文件扩展名；由前端按能力而非路径重新猜测音频格式。
+    pub format: String,
 }
 
 /// 读库内本地曲目的文件大小与修改时间（不扫磁盘）。
@@ -147,7 +149,7 @@ pub fn query_local_track_files(
     conn: &Connection,
 ) -> Result<Vec<LocalTrackFileMeta>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT id, file_size, mtime
+        "SELECT id, file_size, mtime, format
          FROM tracks
          WHERE platform = 'local' AND missing = 0",
     )?;
@@ -157,10 +159,12 @@ pub fn query_local_track_files(
         let db_id: String = row.get(0)?;
         let file_size: i64 = row.get(1)?;
         let mtime: i64 = row.get(2)?;
+        let format: String = row.get(3)?;
         out.push(LocalTrackFileMeta {
             id: strip_local_prefix(&db_id),
             file_size,
             mtime,
+            format,
         });
     }
     Ok(out)

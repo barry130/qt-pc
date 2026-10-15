@@ -318,7 +318,6 @@ export function PlaylistDetailPage(props: {
     if (!isLocal) return;
     refresh();
     // refresh 只写 ref + setState，依赖里放进来反而每渲染都跑
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [favVersion, isLocal]);
 
   const fallbackTitle = isChart ? "榜单详情" : "歌单详情";

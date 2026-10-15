@@ -116,9 +116,7 @@ fn strip_note_segments(raw: &str) -> String {
         match ch {
             '(' | '（' | '[' | '【' | '{' => depth += 1,
             ')' | '）' | ']' | '】' | '}' => {
-                if depth > 0 {
-                    depth -= 1;
-                }
+                depth = depth.saturating_sub(1);
             }
             _ => {
                 if depth == 0 {

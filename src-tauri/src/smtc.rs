@@ -235,7 +235,7 @@ fn handle_event(
         E::SetPosition(pos) => engine.send(AudioCmd::Seek(pos.0.as_millis() as u64)),
         E::Raise => {
             use tauri::Manager;
-            if let Some(win) = app.get_webview_window("main") {
+            if let Some(win) = app.get_webview_window(crate::MAIN_WINDOW_LABEL) {
                 let _ = win.unminimize();
                 let _ = win.show();
                 let _ = win.set_focus();

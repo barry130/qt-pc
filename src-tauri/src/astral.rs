@@ -1077,9 +1077,9 @@ impl AstralClient {
     /// 头像上传一条龙：预检 → 取凭证 → 直传 → 回执登记，返回头像 URL。
     pub async fn upload_avatar_file(&self, path: &str) -> Result<String, String> {
         let (name, mime, size) = Self::image_meta(path, "avatar")?;
-        let t = self.avatar_ticket(&name, &mime, size).await?;
+        let t = self.avatar_ticket(&name, mime, size).await?;
         let bytes = Self::read_image_bytes(path).await?;
-        self.direct_upload(&t, &name, &mime, bytes).await?;
+        self.direct_upload(&t, &name, mime, bytes).await?;
         self.avatar_complete(&t.upload_id).await
     }
 
@@ -1091,9 +1091,9 @@ impl AstralClient {
         path: &str,
     ) -> Result<String, String> {
         let (name, mime, size) = Self::image_meta(path, "cover")?;
-        let t = self.cover_ticket(pid, platform, &name, &mime, size).await?;
+        let t = self.cover_ticket(pid, platform, &name, mime, size).await?;
         let bytes = Self::read_image_bytes(path).await?;
-        self.direct_upload(&t, &name, &mime, bytes).await?;
+        self.direct_upload(&t, &name, mime, bytes).await?;
         self.cover_complete(pid, platform, &t.upload_id).await
     }
 

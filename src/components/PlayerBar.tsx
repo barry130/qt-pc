@@ -25,7 +25,6 @@ import {
   VolumeX,
 } from "lucide-react";
 import { useNavigate, useRouter, useRouterState } from "@tanstack/react-router";
-import { listen } from "@tauri-apps/api/event";
 import type {
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
@@ -45,6 +44,7 @@ import { PLAYER_BAR_BUTTONS, splitPlayerBarButtons } from "@/lib/player-bar";
 import { useSourceQualities } from "@/stores/sourceRegistry";
 import { usePlayerBarStore } from "@/stores/playerBar";
 import { useDismissOnOutside } from "@/hooks/useDismissOnOutside";
+import { useTauriEvent } from "@/hooks/useTauriEvent";
 import { SPEED_OPTIONS, speedLabel } from "@/lib/fx";
 import type { Quality, Track } from "@/types";
 import { useInterpolatedPosition } from "@/hooks/useInterpolatedPosition";
@@ -524,19 +524,17 @@ function SpectrumBackground(): React.JSX.Element {
   const lastAtRef = useRef(0);
   const colorRef = useRef({ rgb: "120,120,120", at: 0 });
 
-  useEffect(() => {
-    let disposed = false;
-    let unlisten: (() => void) | null = null;
-    void listen<{ bands: number[] }>("spectrum", (e) => {
-      const bands = bandsRef.current;
-      const src = e.payload.bands ?? [];
-      for (let i = 0; i < bands.length; i++) bands[i] = src[i] ?? 0;
-      lastAtRef.current = performance.now();
-    }).then((u) => {
-      if (disposed) u();
-      else unlisten = u;
-    });
+  // 频谱数据订阅：Rust 引擎每帧写入 SharedArrayBuffer 后广播，这里拷进 ref，
+  // 绘制循环只读 ref —— 订阅与绘制两个 effect 各自独立清理（useTauriEvent
+  // 处理注册/卸载竞态与退订）。
+  useTauriEvent<{ bands: number[] }>("spectrum", (e) => {
+    const bands = bandsRef.current;
+    const src = e.payload.bands ?? [];
+    for (let i = 0; i < bands.length; i++) bands[i] = src[i] ?? 0;
+    lastAtRef.current = performance.now();
+  });
 
+  useEffect(() => {
     const canvas = canvasRef.current;
     let raf = 0;
     let wasActive = false;
@@ -621,9 +619,7 @@ function SpectrumBackground(): React.JSX.Element {
     raf = window.requestAnimationFrame(draw);
 
     return () => {
-      disposed = true;
       window.cancelAnimationFrame(raf);
-      unlisten?.();
     };
   }, []);
 

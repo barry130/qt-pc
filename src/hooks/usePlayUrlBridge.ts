@@ -5,6 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { resolvePlayUrlDetailed } from "@/source-scripts";
 import { playUrlHitLine } from "@/source-scripts/playurl-line";
 import type { Quality, Track } from "@/types";
+import { MAIN_WINDOW_LABEL } from "@/lib/window-labels";
 
 /**
  * 引擎 → 前端取链桥：
@@ -25,17 +26,19 @@ interface PlayUrlRequest {
 }
 
 async function answer(req: PlayUrlRequest): Promise<void> {
-  let url = "";
+  // 五个字段 try/catch 两路都会赋值（成功取链 / 失败回退），声明处不初始化，
+  // 让 TS 的确定赋值分析保证「不漏赋」；初始化值反而是永远读不到的死赋值。
+  let url: string;
   // 本次失败是否只是环境问题（弱网 / 引擎页未就绪 / 应答超时）。
   // 引擎据此不把这首拉黑、不计入连续失败熔断（2026-10-03 弱网修复）。
-  let stalled = false;
+  let stalled: boolean;
   // 宿主取这个地址时要带的 Referer（包按源声明；空串 = 不发）。地址进引擎
   // 缓存后由播放/下载直接向 CDN 取字节，没有头可能直接 403（B 站实测）。
-  let referer = "";
+  let referer: string;
   // 取链诚实性（2026-10-06）：包侧 Range 预检顺手量到的文件总长，与按
   // 「实测字节 ÷ 时长」重标后的档位（只降不升）。null / 空串 = 没测出来。
-  let size: number | null = null;
-  let actualQuality = "";
+  let size: number | null;
+  let actualQuality: string;
   try {
     // resolvePlayUrl 内部已做源门禁（local 直接报错）并回填引擎缓存
     const res = await resolvePlayUrlDetailed(req.track, req.quality);
@@ -71,7 +74,7 @@ async function answer(req: PlayUrlRequest): Promise<void> {
 
 export function usePlayUrlBridge(): void {
   useEffect(() => {
-    if (getCurrentWindow().label !== "main") return;
+    if (getCurrentWindow().label !== MAIN_WINDOW_LABEL) return;
     let disposed = false;
     let unlisten: UnlistenFn | null = null;
     void (async () => {
@@ -89,7 +92,9 @@ export function usePlayUrlBridge(): void {
         // 架桥失败 = 引擎主导的每一次换歌（自动切歌/随机下一首/失败重取）都取不到
         // 地址，且本次会话内不会自愈，用户必须看得见。补上上下文再抛给全局兜底
         // （main.tsx 的 unhandledrejection）：只留一个裸的 listen 失败无从定位。
-        throw new Error(`取链桥事件监听注册失败：${String(e)}`);
+        // cause 保留原始异常：全局兜底（main.tsx）的 ErrorBoundary 能打出
+        // 完整链路，而不是只有一个包装后的中文提示。
+        throw new Error(`取链桥事件监听注册失败：${String(e)}`, { cause: e });
       }
     })();
     return () => {

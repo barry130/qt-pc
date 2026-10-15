@@ -184,7 +184,7 @@ pub(crate) fn download_task_by_id(
            JOIN tracks t ON t.id = d.track_id
           WHERE d.id = ?1"
     );
-    conn.query_row(&sql, params![id], |row| map_download_row(row))
+    conn.query_row(&sql, params![id], map_download_row)
         .optional()
         .map(Option::flatten)
 }
@@ -308,6 +308,7 @@ pub(crate) fn delete_download_task(
 
 /// 批量删除任务记录（单事务），返回被删任务的 `(成品路径, 临时路径)`，
 /// 供调用方在事务外决定删哪些文件。语义与 `delete_download_task` 一致。
+#[allow(clippy::type_complexity)] // (成品路径, 临时路径) 二元组即文档化的返回契约，见上方 doc
 pub(crate) fn delete_download_tasks(
     conn: &Connection,
     ids: &[String],

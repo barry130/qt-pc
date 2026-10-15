@@ -81,7 +81,7 @@ export function loadLocalConfig() {
   try {
     raw = JSON.parse(fs.readFileSync(PRIVATE_FILE, "utf8"));
   } catch (e) {
-    throw new Error(`app.config.local.json 不是合法 JSON：${e.message}`);
+    throw new Error(`app.config.local.json 不是合法 JSON：${e.message}`, { cause: e });
   }
   if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
     throw new Error("app.config.local.json 顶层必须是对象");

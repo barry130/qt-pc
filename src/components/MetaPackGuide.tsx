@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useState } from "react";
 import { useLocation, useNavigate } from "@tanstack/react-router";
-import { listen } from "@tauri-apps/api/event";
 import { Database, Settings2 } from "lucide-react";
 import { getSourceState } from "@/source-scripts/source-update";
+import { useTauriEvent } from "@/hooks/useTauriEvent";
+import { SOURCE_META_CHANGED_EVENT, SOURCE_PACK_CHANGED_EVENT } from "@/services/ipc";
 
 /**
  * 「未安装数据包」首页全屏引导（数据包不内置模型）。
@@ -39,16 +40,11 @@ export function MetaPackGuide(): React.JSX.Element | null {
 
   useEffect(() => {
     void refresh();
-    // 安装成功/停用/装载失败清槽都会广播；装载成功后这里读到非空即自动关闭
-    const unlisteners: (() => void)[] = [];
-    void listen("source-meta-changed", () => void refresh()).then((u) =>
-      unlisteners.push(u),
-    );
-    void listen("source-pack-changed", () => void refresh()).then((u) =>
-      unlisteners.push(u),
-    );
-    return () => unlisteners.forEach((u) => u());
   }, [refresh]);
+
+  // 安装成功/停用/装载失败清槽都会广播；装载成功后这里读到非空即自动关闭
+  useTauriEvent(SOURCE_META_CHANGED_EVENT, () => void refresh());
+  useTauriEvent(SOURCE_PACK_CHANGED_EVENT, () => void refresh());
 
   const goSettings = (): void => {
     // 引导是全局浮层：进设置页即让位，装好后经事件自动闭环

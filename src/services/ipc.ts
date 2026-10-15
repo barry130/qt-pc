@@ -74,7 +74,9 @@ export async function scanLibrary(
   minDurationSecs = 0,
   minSizeBytes = 0,
 ): Promise<Track[]> {
-  return invoke("scan_library", { dirs, minDurationSecs, minSizeBytes });
+  return invoke("scan_library", {
+    request: { dirs, minDurationSecs, minSizeBytes },
+  });
 }
 
 /** 扫描配置：忽略短音频的时长下限（秒）在 settings 表里的键，0 表示关闭过滤 */
@@ -125,6 +127,8 @@ export interface LocalTrackFileMeta {
   id: string;
   fileSize: number;
   mtime: number;
+  /** Rust 扫描器记录的实际容器扩展名（小写）。 */
+  format: string;
 }
 export async function getLocalTrackFiles(): Promise<LocalTrackFileMeta[]> {
   return invoke("get_local_track_files");
@@ -198,6 +202,9 @@ export async function pickFolder(title = "选择音乐文件夹"): Promise<strin
 }
 
 /** 本地扫描进度：visited 已访问条目数，found 命中音频数，current 当前路径 */
+/** Rust local.rs 广播：本地库扫描进度（对应 EVENT_LIBRARY_SCAN_PROGRESS） */
+export const LIBRARY_SCAN_PROGRESS_EVENT = "library-scan-progress";
+
 export interface LibraryScanProgress {
   visited: number;
   found: number;
@@ -207,7 +214,7 @@ export interface LibraryScanProgress {
 export function onLibraryScanProgress(
   handler: (p: LibraryScanProgress) => void,
 ): Promise<() => void> {
-  return listen<LibraryScanProgress>("library-scan-progress", (e) =>
+  return listen<LibraryScanProgress>(LIBRARY_SCAN_PROGRESS_EVENT, (e) =>
     handler(e.payload),
   );
 }
@@ -434,6 +441,12 @@ export async function revealDownload(id: string): Promise<void> {
 export function onDownloadsChanged(handler: () => void): Promise<() => void> {
   return listen("downloads-changed", () => handler());
 }
+
+/** Rust source_install.rs 广播：播放包槽变化（安装 / 切换 / 卸载后，引擎页热切换） */
+export const SOURCE_PACK_CHANGED_EVENT = "source-pack-changed";
+
+/** Rust source_install.rs 广播：数据包槽变化（meta 装载 / 停用 / 清槽后，依赖方回读状态） */
+export const SOURCE_META_CHANGED_EVENT = "source-meta-changed";
 
 export async function getDownloadDir(): Promise<string> {
   return invoke("get_download_dir");

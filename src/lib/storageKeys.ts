@@ -11,3 +11,9 @@ export const ONBOARDING_KEY = "onboarded";
 
 /** 应用级最近一次未捕获错误（ErrorBoundary 落盘，便于事后排查闪退/白屏） */
 export const LAST_ERROR_KEY = "app.lastError";
+
+/** 默认播放音质（与 Rust settings_keys.rs 的 SETTING_QUALITY 同值，契约见 tests/settings-keys-contract.test.ts） */
+export const QUALITY_KEY = "quality";
+
+/** 音频缓存上限 MB（与 Rust cache.rs 的 SETTING_AUDIO_CACHE_LIMIT_MB 同值，契约见 tests/settings-keys-contract.test.ts） */
+export const CACHE_AUDIO_LIMIT_MB_KEY = "cache.audioLimitMb";

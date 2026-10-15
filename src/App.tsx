@@ -3,14 +3,15 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { router } from "@/lib/router";
 import { LyricWindow } from "@/components/lyric/LyricWindow";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
+import { LYRICS_WINDOW_LABEL } from "@/lib/window-labels";
 
 /**
  * 应用入口：按窗口 label 分流（DESIGN §10.2）。
- * 桌面歌词窗口复用同一 index.html 入口，label === "lyrics" 时渲染歌词视图，
+ * 桌面歌词窗口复用同一 index.html 入口，label === LYRICS_WINDOW_LABEL 时渲染歌词视图，
  * 主窗口走路由。
  */
 export default function App(): React.JSX.Element {
-  if (getCurrentWindow().label === "lyrics") {
+  if (getCurrentWindow().label === LYRICS_WINDOW_LABEL) {
     return (
       // autoReset：歌词窗是无边框透明窗、也没有「重试」按钮可点，一旦被错误边界
       // 接管就是永久停在错误卡片上（用户 2026-10-12 实测：整块变成「这块内容出错了

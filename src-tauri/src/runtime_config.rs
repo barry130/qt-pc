@@ -294,12 +294,7 @@ fn str_field(value: &serde_json::Value, key: &str) -> String {
 
 /// 按文档顺序找配置文件，返回第一个存在的。
 fn find_file() -> Option<PathBuf> {
-    for candidate in candidates() {
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
+    candidates().into_iter().find(|p| p.is_file())
 }
 
 /// 候选路径（顺序即优先级，见模块文档）

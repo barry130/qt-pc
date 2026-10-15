@@ -173,7 +173,6 @@ function LyricSearchPanel(props: {
       disposed = true;
     };
     // keyword 故意不进依赖：边打字边搜会把源站打成筛子，只在点搜索/换源时重搜
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [trackKey, source, attempt]);
 
   const submit = (): void => {

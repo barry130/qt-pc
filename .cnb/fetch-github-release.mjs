@@ -298,6 +298,7 @@ async function download(name, expectedSize, expectedSha, deadline) {
         throw new Error(
           `下载 ${name} 失败（${attempt}/${maxAttempts} 次）：${err.message}` +
             (spent ? "；下载阶段的墙钟预算已用尽" : ""),
+          { cause: err },
         );
       }
       // 退避封顶 30s：连接超时是概率事件，等太久没有意义。
@@ -340,10 +341,13 @@ async function main() {
   log(`等待 ${repo} 的 Release ${tag}（最多 ${waitSeconds}s，每 ${pollSeconds}s 查一次）`);
   log(`资产清单来源：${ghToken ? "HTML + REST（带 token）" : "HTML + REST（匿名）"}`);
   const deadline = Date.now() + waitSeconds * 1000;
-  let wanted = [];
+  // 循环唯一的正常出口是资产齐全时的 break（那时必然赋过值），
+  // 另一个出口是超时 process.exit；声明处的空数组是读不到的死赋值。
+  let wanted;
 
   for (;;) {
-    let assets = [];
+    // 查询失败只 log 后进入下一轮等待，本轮不读 assets，无需初值
+    let assets;
     try {
       // 轮询期间的任何一次失败（网络抖动、限流、5xx、HTML 结构变了）都不该让
       // 整条流水线挂掉：这一轮跳过，sleep(pollSeconds) 后继续，直到预算用完。

@@ -108,7 +108,7 @@ mod imp {
     /// 3. 窗口过程万一装晚了就收不到首次那条消息，这里留一条兜底：等窗口可见后主动挂一次。
     pub fn init(app: &AppHandle) -> Result<(), String> {
         let raw = app
-            .get_webview_window("main")
+            .get_webview_window(crate::MAIN_WINDOW_LABEL)
             .and_then(|w| w.hwnd().ok())
             .map(|h| h.0 as isize)
             .ok_or_else(|| "取不到主窗口句柄".to_string())?;
@@ -350,12 +350,14 @@ mod imp {
 
     /// 组装一个缩略图工具栏按钮（图标 + 悬停提示 + 启用态）
     fn thumb_button(id: u32, icon: isize, tip: &str) -> THUMBBUTTON {
-        let mut btn = THUMBBUTTON::default();
-        // 位标志类型没实现 BitOr，按底层值合并
-        btn.dwMask = THUMBBUTTONMASK(THB_ICON.0 | THB_TOOLTIP.0 | THB_FLAGS.0);
-        btn.iId = id;
-        btn.hIcon = HICON(icon as *mut core::ffi::c_void);
-        btn.dwFlags = THBF_ENABLED;
+        let mut btn = THUMBBUTTON {
+            // 位标志类型没实现 BitOr，按底层值合并
+            dwMask: THUMBBUTTONMASK(THB_ICON.0 | THB_TOOLTIP.0 | THB_FLAGS.0),
+            iId: id,
+            hIcon: HICON(icon as *mut core::ffi::c_void),
+            dwFlags: THBF_ENABLED,
+            ..Default::default()
+        };
         let wide: Vec<u16> = tip.encode_utf16().take(btn.szTip.len() - 1).collect();
         btn.szTip[..wide.len()].copy_from_slice(&wide);
         btn
@@ -444,7 +446,7 @@ mod imp {
         bi.bmiHeader.biHeight = -size;
         bi.bmiHeader.biPlanes = 1;
         bi.bmiHeader.biBitCount = 32;
-        bi.bmiHeader.biCompression = BI_RGB.0 as u32;
+        bi.bmiHeader.biCompression = BI_RGB.0;
 
         let mut bits: *mut core::ffi::c_void = core::ptr::null_mut();
         let Ok(color) = CreateDIBSection(None, &bi, DIB_RGB_COLORS, &mut bits, None, 0) else {
