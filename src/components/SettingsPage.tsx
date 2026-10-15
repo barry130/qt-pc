@@ -2058,7 +2058,7 @@ function SourcePackageSection(): React.JSX.Element {
       ) : null}
       {clipTip !== null && !preview && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-sm rounded-xl border border-border bg-card p-4 shadow-lg">
+          <div className="w-full max-w-sm rounded-xl border border-border bg-card/90 p-4 shadow-lg backdrop-blur-xl">
             <div className="text-sm font-medium text-foreground">
               检测到剪贴板有音源包链接
             </div>
@@ -2130,7 +2130,7 @@ function InstallPreviewDialog(props: {
   ];
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-      <div className="w-full max-w-sm rounded-xl border border-border bg-card p-4 shadow-lg">
+      <div className="w-full max-w-sm rounded-xl border border-border bg-card/90 p-4 shadow-lg backdrop-blur-xl">
         <div className="text-sm font-medium text-foreground">安装音源包</div>
         <div className="mt-2 flex flex-col gap-1 text-xs">
           {rows.map(([key, value]) => (

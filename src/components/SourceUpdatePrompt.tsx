@@ -62,7 +62,7 @@ export function SourceUpdatePrompt(): React.JSX.Element | null {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-      <div className="w-full max-w-sm rounded-xl border border-border bg-card p-4 shadow-lg">
+      <div className="w-full max-w-sm rounded-xl border border-border bg-card/90 p-4 shadow-lg backdrop-blur-xl">
         <div className="flex items-start gap-3">
           <ArrowDownCircle className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
           <div className="min-w-0 flex-1">

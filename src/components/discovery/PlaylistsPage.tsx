@@ -321,7 +321,7 @@ function CategoryFilter(props: {
             onClick={() => setOpen((v) => !v)}
             aria-expanded={open}
             aria-label={open ? "收起全部分类" : "展开全部分类"}
-            className="absolute right-0 top-0 flex items-center gap-1 rounded-md bg-card px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+            className="absolute right-0 top-0 flex items-center gap-1 rounded-md bg-card/90 px-2 py-1 text-xs text-muted-foreground backdrop-blur-sm transition-colors hover:bg-secondary hover:text-foreground"
           >
             更多
             <ChevronDown

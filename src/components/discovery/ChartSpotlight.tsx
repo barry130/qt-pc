@@ -12,6 +12,9 @@ import { qtresCoverUrl } from "@/lib/lrc";
  *
  * 卡片根节点是 div 而不是 button —— 内部还有「播放」和三条曲目各自可点，
  * button 套 button 是非法 HTML，浏览器会把内层拆出去。
+ *
+ * 底色是 `bg-card/60` 而不是实底 `bg-card`：浅色主题下 `--card` 就是纯白
+ * `oklch(1 0 0)`，实底会把自定义背景图整块盖住（DESIGN §9.8 表面语言）。
  */
 export function ChartSpotlightCard(props: {
   chart: Chart;
@@ -36,7 +39,7 @@ export function ChartSpotlightCard(props: {
   const hint = total !== undefined && total > 0 ? `共 ${total} 首` : null;
 
   return (
-    <div className="group flex flex-col rounded-xl border border-border bg-card p-4 transition-shadow duration-200 hover:shadow-lg">
+    <div className="group flex flex-col rounded-xl border border-border bg-card/60 p-4 transition-shadow duration-200 hover:shadow-lg">
       <div className="mb-3 flex items-baseline justify-between gap-3">
         <button
           type="button"

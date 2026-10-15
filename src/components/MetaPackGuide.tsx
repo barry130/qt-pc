@@ -61,7 +61,7 @@ export function MetaPackGuide(): React.JSX.Element | null {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm">
-      <div className="mx-4 flex w-full max-w-md flex-col gap-5 rounded-2xl border border-border bg-card p-7 shadow-2xl">
+      <div className="mx-4 flex w-full max-w-md flex-col gap-5 rounded-2xl border border-border bg-card/90 p-7 shadow-2xl backdrop-blur-xl">
         <div className="flex items-center gap-3">
           <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-primary/10">
             <Database className="h-5 w-5 text-primary" />

@@ -176,7 +176,7 @@ export class ErrorBoundary extends Component<Props, State> {
 
     return (
       <div className="flex h-full min-h-0 items-center justify-center overflow-auto p-6">
-        <div className="w-full max-w-lg rounded-2xl border border-border bg-card p-5 text-card-foreground shadow-xl">
+        <div className="w-full max-w-lg rounded-2xl border border-border bg-card/90 p-5 text-card-foreground shadow-xl backdrop-blur-xl">
           <h2 className="text-sm font-medium">
             这块内容出错了{this.props.label ? `（${this.props.label}）` : ""}
           </h2>

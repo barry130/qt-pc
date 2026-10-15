@@ -122,7 +122,7 @@ export function StatsPage(): React.JSX.Element {
               )}
             </header>
 
-            <div className="relative mt-5 overflow-hidden rounded-2xl border border-border bg-card p-5">
+            <div className="relative mt-5 overflow-hidden rounded-2xl border border-border bg-card/60 p-5">
               <div className="pointer-events-none absolute -right-16 -top-24 h-48 w-48 rounded-full bg-primary/10 blur-3xl" />
               <div className="relative grid grid-cols-2 gap-x-4 gap-y-6 lg:grid-cols-4">
                 <HeroStat
@@ -264,7 +264,7 @@ function TrackStatCard(props: {
     <button
       type="button"
       onClick={props.onPlay}
-      className="group rounded-xl border border-border bg-card p-2.5 text-left transition-colors hover:border-primary/40"
+      className="group rounded-xl border border-border bg-card/60 p-2.5 text-left transition-colors hover:border-primary/40"
     >
       <div className="relative aspect-square overflow-hidden rounded-lg bg-secondary">
         {cover ? (
@@ -413,7 +413,7 @@ function ReportSkeleton(): React.JSX.Element {
   return (
     <>
       <div className="h-8 w-40 animate-pulse rounded-lg bg-secondary/60" />
-      <div className="mt-5 grid grid-cols-2 gap-x-4 gap-y-6 rounded-2xl border border-border bg-card p-5 lg:grid-cols-4">
+      <div className="mt-5 grid grid-cols-2 gap-x-4 gap-y-6 rounded-2xl border border-border bg-card/60 p-5 lg:grid-cols-4">
         {Array.from({ length: 4 }, (_, i) => (
           <div key={i}>
             <div className="h-3 w-14 animate-pulse rounded bg-secondary/60" />
