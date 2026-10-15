@@ -1,4 +1,4 @@
-import { useCallback, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "@tanstack/react-router";
 import { Play } from "lucide-react";
 import type { SourceId, Track } from "@/types";
@@ -8,6 +8,7 @@ import { useSearchPageMax } from "@/stores/sourceRegistry";
 import { usePagedList } from "@/hooks/usePagedList";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { TrackList } from "./TrackList";
+import { BatchBar } from "./BatchBar";
 import { ErrorRetry, TrackRowsSkeleton } from "./Skeletons";
 import { BackButton } from "@/components/layout/BackButton";
 import { IconButton } from "@/components/common/IconButton";
@@ -23,6 +24,15 @@ import { IconButton } from "@/components/common/IconButton";
  * 每页条数走数据包声明的 `searchPageMax`（useSearchPageMax；上游上限各不相同：
  * qq 要 100 会返回 0 条、酷狗恒给 30），传超限值会让「满页 = 还有下一页」的
  * 推断在第 1 页就误判到底。宿主不再内置这张表。
+ *
+ * 页头右侧挂 `BatchBar`（用户 m06865，与歌手页 / 歌单详情 / 每日新歌同位置）：
+ * 全选 + 批量下载 + 批量收藏，曲目行带勾选。专辑不是可收藏实体，所以
+ * 没有歌单级红心，收藏 / 下载只作用于曲目。专辑页是**滚动续页**，
+ * 全选 / 批量只作用于当前已加载的 songs，往下翻页是追加、已勾选的不动。
+ *
+ * 注意 hero 外层**不能**加 `overflow-hidden`：批量条的歌单面板是 absolute
+ * 展开的，一裁就只剩一条缝（歌手页 / 详情页已踩过同一个坑），裁切只加在
+ * 铺底图那一层里。
  */
 export function AlbumPage(): React.JSX.Element {
   const { platform, id } = useParams({ strict: false }) as {
@@ -69,14 +79,39 @@ export function AlbumPage(): React.JSX.Element {
     pageSize,
   });
 
+  // 批量管理的已勾选曲目 id 集合（见 BatchBar）
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  /** 批量操作的失败提示：与整页加载失败分开，别把已加载的列表顶掉 */
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const toggleSelect = useCallback((trackId: string): void => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(trackId)) next.delete(trackId);
+      else next.add(trackId);
+      return next;
+    });
+  }, []);
+
+  // 换专辑 / 重载后列表整体作废，勾选集里若还留着这些 id，「已选 N 首」就虚高；
+  // 往下翻页时列表是**追加**的，已勾选的不会消失，所以这里只做收窄、不清空。
+  useEffect(() => {
+    setSelected((prev) => {
+      if (prev.size === 0) return prev;
+      const ids = new Set(songs.map((t) => t.id));
+      const next = new Set([...prev].filter((x) => ids.has(x)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, [songs]);
+
   const cover = songs.find((t) => t.picUrl)?.picUrl;
   const coverUrl = cover ? qtresCoverUrl(cover) : null;
 
   return (
     <div className="flex h-full min-w-0 flex-col">
-      <header className="relative shrink-0 overflow-hidden border-b border-border">
+      <header className="relative shrink-0 border-b border-border">
         {coverUrl ? (
-          <>
+          <div className="absolute inset-0 overflow-hidden">
             <img
               src={coverUrl}
               alt=""
@@ -85,7 +120,7 @@ export function AlbumPage(): React.JSX.Element {
               className="absolute inset-0 h-full w-full scale-125 select-none object-cover opacity-45 blur-3xl saturate-150"
             />
             <div className="absolute inset-0 bg-gradient-to-b from-background/10 to-[color:var(--page-fade)]" />
-          </>
+          </div>
         ) : null}
 
         <div className="relative flex items-center px-6 pt-5">
@@ -131,10 +166,30 @@ export function AlbumPage(): React.JSX.Element {
               </div>
             )}
           </div>
+
+          {/* 批量条摆在页头右侧，与左边那颗「播放全部」同一行（用户 m06865，
+              与歌手页 / 歌单详情 / 每日新歌同位置：批量操作属于页头，不在列表
+              上方另占一行）。专辑不是可收藏实体，没有宿主歌单，不传
+              hostPlaylistId；收藏 / 下载只作用于当前已加载的 songs。
+              `items-end` + `pb-1` 与信息列底线对齐（同歌手页）。 */}
+          {!loading && !error && songs.length > 0 ? (
+            <div className="relative flex shrink-0 items-end pb-1">
+              <BatchBar
+                embedded
+                tracks={songs}
+                selected={selected}
+                onSelectedChange={setSelected}
+                onError={setActionError}
+              />
+            </div>
+          ) : null}
         </div>
       </header>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
+        {actionError && (
+          <div className="px-6 pt-4 text-center text-sm text-destructive">{actionError}</div>
+        )}
         {error ? (
           <ErrorRetry message={`加载失败：${error}`} onRetry={reload} />
         ) : loading ? (
@@ -145,7 +200,13 @@ export function AlbumPage(): React.JSX.Element {
           </div>
         ) : (
           <>
-            <TrackList tracks={songs} showIndex showCollect showDownload />
+            <TrackList
+              tracks={songs}
+              showIndex
+              showCollect
+              showDownload
+              selection={{ ids: selected, onToggle: toggleSelect }}
+            />
             {/* 哨兵：进入视口就拉下一页 */}
             <div ref={sentinelRef} className="h-1" />
             <div className="py-4 text-center text-xs text-muted-foreground">
