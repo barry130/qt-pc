@@ -44,6 +44,10 @@
   /* 标题栏 / 侧边栏底色。默认等同 --sidebar（首帧回退）；
      设了背景图时由 useAppearanceEffect 覆写成带 alpha 的版本，让壁纸透出。 */
   --sidebar-surface: var(--sidebar);
+  /* 页头 hero 渐隐的收尾色（歌手 / 专辑 / 歌单详情 / 每日新歌共用）。
+     默认等同 --background，外观零变化；设了背景图时由 useAppearanceEffect
+     覆写成 ~80% 不透明，壁纸能连过页头，同时仍压住底下的模糊封面。 */
+  --page-fade: var(--background);
   --lyric-highlight: var(--primary);
   --lyric-inactive: oklch(0.55 0.02 265);
 }

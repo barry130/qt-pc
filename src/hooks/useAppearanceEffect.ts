@@ -9,7 +9,8 @@ import type { AppearancePreference } from "@/types";
  * - skinId → 根据皮肤定义设置 --primary / --ring / --background / --sidebar / --sidebar-primary
  * - customColor → skinId="custom" 时覆盖主色
  * - followCoverColor → --primary 优先使用 --cover-primary（由 useCoverColor 设置）
- * - bgImage → 设置 --bg-image CSS 变量，并把标题栏/侧栏底色派生为半透明的 --sidebar-surface
+ * - bgImage → 设置 --bg-image CSS 变量，并把标题栏/侧栏底色派生为半透明的 --sidebar-surface，
+ *   同时把页头渐隐的收尾色 --page-fade 放宽到 ~80% 不透明
  * - fontScale → html font-size（rem 基准，0.85–1.25）
  * - reduceMotion → html 上的 .reduce-motion 类
  */
@@ -20,6 +21,14 @@ import type { AppearancePreference } from "@/types";
  * 35 时约 26%：壁纸能看清，同时给侧栏那几行导航文字留了压底。
  */
 const SIDEBAR_BG_ALPHA = 35;
+
+/**
+ * 有背景图时页头 hero 渐隐收尾色的不透明度（%）。
+ * 原先收尾色是实底 --background，页头底部会在壁纸上压出一条本色带，
+ * 与紧邻的内容区（半透明砖，壁纸透出）之间出现明显接缝。
+ * 80 是折中：壁纸连得过去，底下的模糊封面仍被压住，页头文字对比度不受影响。
+ */
+const PAGE_FADE_ALPHA = 80;
 
 /**
  * 非跟随封面时按皮肤主色明度设置 --primary-foreground（亮主色配深色前景）。
@@ -98,6 +107,14 @@ export function useAppearanceEffect(): void {
         bgImage
           ? `color-mix(in srgb, ${sidebarColor} ${SIDEBAR_BG_ALPHA}%, transparent)`
           : sidebarColor,
+      );
+      // 页头 hero 渐隐的收尾色（--page-fade）。无背景图时等同 --background，
+      // 有背景图时留 20% 缝隙让壁纸连过页头 —— 与 --sidebar-surface 同一套思路。
+      root.style.setProperty(
+        "--page-fade",
+        bgImage
+          ? `color-mix(in srgb, ${skinBg} ${PAGE_FADE_ALPHA}%, transparent)`
+          : skinBg,
       );
       root.style.setProperty("--sidebar-primary", primary);
       root.style.setProperty("--sidebar-primary-foreground", "#ffffff");

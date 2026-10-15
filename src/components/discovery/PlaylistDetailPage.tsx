@@ -339,7 +339,7 @@ export function PlaylistDetailPage(props: {
               draggable={false}
               className="absolute inset-0 h-full w-full scale-125 select-none object-cover opacity-45 blur-3xl saturate-150"
             />
-            <div className="absolute inset-0 bg-gradient-to-b from-background/10 to-background" />
+            <div className="absolute inset-0 bg-gradient-to-b from-background/10 to-[color:var(--page-fade)]" />
           </div>
         ) : null}
 
