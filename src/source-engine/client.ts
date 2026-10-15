@@ -23,6 +23,7 @@ import { emitTo, listen } from "@tauri-apps/api/event";
 import { stripErrorUrls } from "@/lib/utils";
 import { log } from "@/lib/logger";
 import { SOURCE_ENGINE_WINDOW_LABEL } from "@/lib/window-labels";
+import { SOURCE_PACK_CHANGED_EVENT } from "@/services/ipc";
 import type { Quality } from "@/types";
 import type { MusicInfo, Source } from "@/source-scripts/qt-contract/contract";
 
@@ -364,7 +365,7 @@ async function ensureBound(): Promise<void> {
       // 播放包安装/切换/卸载后引擎页热切换（窗口不重建）：复位生命周期缓存，
       // 下次取链前重新查询；在途请求不拆——引擎页 onRequest 全程在线，应答
       // 要么来自旧包（已发出的取链）要么等新包装好后正常返回。
-      await listen("source-pack-changed", () => {
+      await listen(SOURCE_PACK_CHANGED_EVENT, () => {
         setPhase(null);
         remoteCode = null;
         engineDetail = null;

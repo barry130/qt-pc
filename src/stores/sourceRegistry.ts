@@ -5,6 +5,7 @@ import type { RegistryQuality, RegistrySource } from "@/types";
 import { DEFAULT_SEARCH_PAGE_MAX, getSourceRegistry } from "@/source-scripts";
 import { onEnginePhaseChange } from "@/source-engine/client";
 import { useMusicSourceStore } from "@/stores/musicSource";
+import { SOURCE_META_CHANGED_EVENT, SOURCE_PACK_CHANGED_EVENT } from "@/services/ipc";
 
 /**
  * 音源/音质注册表（数据包声明，宿主不内置清单）——DESIGN §6.2/§6.4。
@@ -52,7 +53,7 @@ let packListenerBound = false;
 function bindPackListener(): void {
   if (packListenerBound) return;
   packListenerBound = true;
-  void listen("source-pack-changed", () => {
+  void listen(SOURCE_PACK_CHANGED_EVENT, () => {
     if (useSourceRegistryStore.getState().ready) return;
     const retry = (): void => {
       void useSourceRegistryStore.getState().ensure();
@@ -72,7 +73,7 @@ let metaListenerBound = false;
 function bindMetaListener(): void {
   if (metaListenerBound) return;
   metaListenerBound = true;
-  void listen("source-meta-changed", () => {
+  void listen(SOURCE_META_CHANGED_EVENT, () => {
     const retry = (): void => {
       void useSourceRegistryStore.getState().refresh();
     };
