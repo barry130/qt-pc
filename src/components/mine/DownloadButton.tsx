@@ -17,8 +17,10 @@ import { IconButton } from "@/components/common/IconButton";
  * 本地曲目本来就在磁盘上，不给下载入口。
  * 已下载 / 正在下载的曲目按钮变成状态提示，避免重复点击（后端也会去重）。
  *
- * 点击后的「已开始 / 失败原因」走右上角 Toast（图标按钮没有可写的文字位，
- * 就地气泡又受行高挤压会互相遮挡）；错误也不能只留在 title 里。
+ * 点击后的「加入下载队列成功 / 失败原因」走右上角 Toast（图标按钮没有可写的
+ * 文字位，就地气泡又受行高挤压会互相遮挡）；错误也不能只留在 title 里。
+ * 下载是纯入队（§13.4）：真正的取址与下载由后台并发闸门轮着来，这里的回执
+ * 只说「进队了」，不说「开始下了」。
  */
 
 /** 列表行内的状态图标：与 IconButton 的 sm 档同尺寸，只提示不可点 */
@@ -60,7 +62,7 @@ export function DownloadButton(props: {
       const wanted = quality ?? (await ipc.getDownloadQuality());
       // 默认音质按该曲目所在的源收敛（B 站等无真无损的源自动落到可用档）
       await ipc.startDownload(track, clampQualityForPlatform(track.platform, wanted));
-      toastSuccess(`已开始下载「${track.title}」`);
+      toastSuccess("加入下载队列成功");
     } catch (err) {
       toastError(`下载发起失败：${errMsg(err)}`);
     } finally {

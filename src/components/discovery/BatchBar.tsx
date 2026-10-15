@@ -267,7 +267,12 @@ export function BatchBar(props: {
       await Promise.all(
         Array.from({ length: Math.min(DOWNLOAD_CONCURRENCY, list.length) }, () => worker()),
       );
-      if (failed > 0) onError?.(`批量下载：${failed} 首没能取到播放地址`);
+      // 下载是纯入队（§13.4）：回执只说进队，不说开始下载；部分失败时绿色
+      // 回执报进队数、红色行内错误报失败数，两条信号不混在一起
+      if (list.length - failed > 0) {
+        report(`加入下载队列成功：${list.length - failed} 首`);
+      }
+      if (failed > 0) onError?.(`批量下载：${failed} 首加入队列失败`);
     } catch (err) {
       onError?.(`批量下载失败：${errMsg(err)}`);
     } finally {
