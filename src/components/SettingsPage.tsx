@@ -60,6 +60,7 @@ import { useMusicSourceStore } from "@/stores/musicSource";
 import { useDislikesStore } from "@/stores/dislikes";
 import { usePlayerBarStore } from "@/stores/playerBar";
 import { useAuthStore, isAdmin } from "@/stores/auth";
+import { toast, toastError, toastSuccess } from "@/stores/toast";
 import {
   countPlayerBarVisible,
   PLAYER_BAR_BUTTONS,
@@ -1188,7 +1189,6 @@ function GeneralSection(): React.JSX.Element {
   const [clearAudio, setClearAudio] = useState(true);
   const [clearWeb, setClearWeb] = useState(true);
   const [clearing, setClearing] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   // 日志配置（级别 / 单文件上限 / 保留份数 / 目录）。null = 还没读到
   const [logCfg, setLogCfg] = useState<ipc.LogConfig | null>(null);
@@ -1284,13 +1284,16 @@ function GeneralSection(): React.JSX.Element {
       const results = await Promise.all(tasks);
       const freed = results.reduce((sum, r) => sum + r.freedBytes, 0);
       const failed = results.reduce((sum, r) => sum + r.failedCount, 0);
-      setMessage(
-        freed === 0 && failed === 0
-          ? "没有可清理的内容"
-          : failed > 0
-            ? `已清理 ${formatBytes(freed)}；${failed} 个文件被占用跳过（正在播放的不会删）`
-            : `已清理 ${formatBytes(freed)}`,
-      );
+      // 清理结果是一次性回执（表单校验那种要停留的错误走上面的 error 行内提示）
+      if (freed === 0 && failed === 0) {
+        toast("没有可清理的内容");
+      } else if (failed > 0) {
+        toastSuccess(
+          `已清理 ${formatBytes(freed)}；${failed} 个文件被占用跳过（正在播放的不会删）`,
+        );
+      } else {
+        toastSuccess(`已清理 ${formatBytes(freed)}`);
+      }
       await refreshCache();
     } catch (err) {
       setError(errMsg(err));
@@ -1562,7 +1565,6 @@ function GeneralSection(): React.JSX.Element {
           </SettingRow>
         </>
       )}
-      {message && <p className="py-2 text-xs text-muted-foreground">{message}</p>}
       {error && <p className="py-2 text-xs text-destructive">{error}</p>}
     </div>
   );
@@ -1641,10 +1643,8 @@ const PROMPTED_CLIPBOARD_LINKS = new Set<string>();
 function SourcePackageSection(): React.JSX.Element {
   const local = useSourceUpdateStore((s) => s.local);
   const offers = useSourceUpdateStore((s) => s.offers);
-  const message = useSourceUpdateStore((s) => s.message);
   const busy = useSourceUpdateStore((s) => s.busy);
   const setBusy = useSourceUpdateStore((s) => s.setBusy);
-  const setMessage = useSourceUpdateStore((s) => s.setMessage);
   const setLocal = useSourceUpdateStore((s) => s.setLocal);
   const setOffers = useSourceUpdateStore((s) => s.setOffers);
   const dropOffer = useSourceUpdateStore((s) => s.dropOffer);
@@ -1725,12 +1725,25 @@ function SourcePackageSection(): React.JSX.Element {
     };
   }, [clipboardBusy, preview, clipTip]);
 
+  /**
+   * 动作回执按性质分流后走右上角 Toast：动词开头（已切换/已安装/已卸载…）
+   * 是成功回执给绿勾；「已是最新 / 发现 N 个 / 再点一次」这类中性提示走
+   * 普通样式，不打断也不需要在页面里停留。
+   */
+  const report = (text: string): void => {
+    if (text.startsWith("已") || text.includes("已安装")) {
+      toastSuccess(text);
+    } else {
+      toast(text);
+    }
+  };
+
   const run = async (action: () => Promise<string>): Promise<void> => {
     setBusy(true);
     try {
-      setMessage(await action());
+      report(await action());
     } catch (e) {
-      setMessage(`操作失败：${stripErrorUrls(String(e))}`);
+      toastError(`操作失败：${stripErrorUrls(String(e))}`);
     } finally {
       setBusy(false);
     }
@@ -1796,7 +1809,7 @@ function SourcePackageSection(): React.JSX.Element {
       try {
         setPreview(await stageSourceFromUrl(link));
       } catch (e) {
-        setMessage(`获取包信息失败：${stripErrorUrls(String(e))}`);
+        toastError(`获取包信息失败：${stripErrorUrls(String(e))}`);
       } finally {
         setInstalling(false);
       }
@@ -1806,7 +1819,8 @@ function SourcePackageSection(): React.JSX.Element {
   const installUrl = (): void => {
     const trimmed = url.trim();
     if (!trimmed) {
-      setMessage("请先粘贴音源包 .js 直链");
+      // 按钮在链接为空时本来就是 disabled，这里只是兜底
+      toast("请先粘贴音源包 .js 直链");
       return;
     }
     stageFromLink(trimmed);
@@ -1818,13 +1832,10 @@ function SourcePackageSection(): React.JSX.Element {
     void (async () => {
       try {
         const staged = await stageSourceFromFile();
-        if (!staged) {
-          setMessage(""); // 用户取消选择，不打扰
-          return;
-        }
-        setPreview(staged);
+        // staged 为 null = 用户取消了选择框，不打扰
+        if (staged) setPreview(staged);
       } catch (e) {
-        setMessage(`获取包信息失败：${stripErrorUrls(String(e))}`);
+        toastError(`获取包信息失败：${stripErrorUrls(String(e))}`);
       } finally {
         setInstalling(false);
       }
@@ -1842,12 +1853,12 @@ function SourcePackageSection(): React.JSX.Element {
         setPreview(null);
         setUrl("");
         await refresh();
-        setMessage(
+        toastSuccess(
           `${kindLabel(outcome.kind)}已安装${outcome.activated ? "并生效" : "，列表中可启用"}`,
         );
       } catch (e) {
         setPreview(null);
-        setMessage(`安装失败：${stripErrorUrls(String(e))}`);
+        toastError(`安装失败：${stripErrorUrls(String(e))}`);
       } finally {
         setConfirming(false);
       }
@@ -2086,7 +2097,6 @@ function SourcePackageSection(): React.JSX.Element {
           onCancel={() => setPreview(null)}
         />
       )}
-      {message && <div className="py-3 text-xs text-muted-foreground">{message}</div>}
     </div>
   );
 }
@@ -2226,7 +2236,6 @@ function PackRow(props: {
 function AboutSection(): React.JSX.Element {
   const [version, setVersion] = useState<AppVersion | null>(null);
   const [checking, setChecking] = useState(false);
-  const [result, setResult] = useState<string>("");
   const setUpdate = useUpdateStore((s) => s.setUpdate);
   /** 官网根地址（未配置时为空串 → 下面四行整块不渲染） */
   const siteUrl = useOfficialSiteUrl();
@@ -2237,7 +2246,6 @@ function AboutSection(): React.JSX.Element {
 
   const checkUpdate = async (): Promise<void> => {
     setChecking(true);
-    setResult("");
     try {
       // 手动检查：无条件查一次。复用 runCheck：把结果写入全局 update store
       // → UpdateDialog 会弹出。
@@ -2247,14 +2255,13 @@ function AboutSection(): React.JSX.Element {
           update.fileSize > 0
             ? ` · ${(update.fileSize / 1024 / 1024).toFixed(1)} MB`
             : "";
-        setResult(
-          `发现新版本 ${update.versionName}${sizeStr}：${update.versionInfo || "暂无更新说明"}`,
-        );
+        // 发现新版本走 UpdateDialog 弹窗，这里只留一条 toast 说明更新说明在哪看
+        toast(`发现新版本 ${update.versionName}${sizeStr}，稍后弹窗确认`);
       } else {
-        setResult("当前已是最新版本");
+        toastSuccess("当前已是最新版本");
       }
     } catch (e) {
-      setResult(`检查失败：${stripErrorUrls(String(e))}`);
+      toastError(`检查失败：${stripErrorUrls(String(e))}`);
       setUpdate(null);
     } finally {
       setChecking(false);
@@ -2278,9 +2285,6 @@ function AboutSection(): React.JSX.Element {
           {checking ? "检查中…" : "检查更新"}
         </button>
       </SettingRow>
-      {result && (
-        <div className="py-3 text-xs text-muted-foreground">{result}</div>
-      )}
       {/* 官网条款与开源信息：协议正文、隐私说明与仓库地址都只在官网维护一份，
           客户端只保留入口，避免两边各写一份然后慢慢对不上。
           官网地址是自有地址（只在 Rust 侧持有）：未配置时整块不渲染，

@@ -28,6 +28,8 @@
   --accent: oklch(0.955 0.007 260);
   --accent-foreground: oklch(0.25 0.02 265);
   --destructive: oklch(0.58 0.22 27);
+  /* 成功色（Toast / 收藏回执用）：浅色用 green-600，白底对比够；深色提亮到 green-500 */
+  --success: #16a34a;
   --border: oklch(0.915 0.008 260);
   --input: oklch(0.915 0.008 260);
   --ring: #4f46e5;
@@ -63,6 +65,7 @@
   --accent: #26263e;
   --accent-foreground: #f8fafc;
   --destructive: #ef4444;
+  --success: #22c55e;
   --border: #2a2a45;
   --input: #2a2a45;
   --ring: #6366f1;
@@ -99,6 +102,7 @@
   --color-accent: var(--accent);
   --color-accent-foreground: var(--accent-foreground);
   --color-destructive: var(--destructive);
+  --color-success: var(--success);
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
@@ -257,13 +261,16 @@
   }
 }
 
-/* 右上角轻提示（common/ToastHost，3 秒自动消失的回执）：只做「淡入 + 轻微下落」，
- * 淡出走 transition（见组件里的 leaving 态，动画结束后才切 opacity，不打架）。
- * 减弱动效由文件末尾的 .reduce-motion 统一关掉。 */
+/* 右上角轻提示（common/ToastHost）：进场「右侧滑入 + 轻微放大回弹」，出场的
+ * 位移/透明走组件里 leaving 态的 transition（这里不掺和，避免两套动画打架）。
+ * 停留期间的进度条由 qt-toast-progress 从满宽线性收到零（时长随 kind 不同，
+ * 组件里用 style.animationDuration 下发），让「还剩多久消失」看得见。
+ * 减弱动效由文件末尾的 .reduce-motion 统一关掉；进度条在那种情况下单独
+ * 静音成「满宽、半透明」的静态条（forwards 会把动画钉在 scaleX(0)，必须显式停掉）。 */
 @keyframes qt-toast-in {
   from {
     opacity: 0;
-    transform: translateY(-6px);
+    transform: translateX(16px) scale(0.97);
   }
   to {
     opacity: 1;
@@ -271,7 +278,25 @@
   }
 }
 .qt-toast {
-  animation: qt-toast-in 0.18s ease-out;
+  animation: qt-toast-in 0.22s cubic-bezier(0.21, 1.02, 0.73, 1);
+}
+@keyframes qt-toast-progress {
+  from {
+    transform: scaleX(1);
+  }
+  to {
+    transform: scaleX(0);
+  }
+}
+.qt-toast-progress {
+  animation: qt-toast-progress linear forwards;
+}
+@media (prefers-reduced-motion: reduce) {
+  .qt-toast-progress {
+    animation: none;
+    transform: none;
+    opacity: 0.4;
+  }
 }
 
 /* 播放页黑胶封面旋转。

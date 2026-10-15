@@ -4,6 +4,7 @@ import { cn, errMsg } from "@/lib/utils";
 import type { Quality, Track } from "@/types";
 import * as ipc from "@/services/ipc";
 import { useDownloadsStore } from "@/stores/downloads";
+import { toastError, toastSuccess } from "@/stores/toast";
 import { clampQualityForPlatform } from "@/stores/sourceRegistry";
 import { IconButton } from "@/components/common/IconButton";
 
@@ -16,8 +17,8 @@ import { IconButton } from "@/components/common/IconButton";
  * 本地曲目本来就在磁盘上，不给下载入口。
  * 已下载 / 正在下载的曲目按钮变成状态提示，避免重复点击（后端也会去重）。
  *
- * 列表里是纯图标（文字进 title），点击后的「已开始 / 失败原因」用贴着图标
- * 弹出的短气泡就地反馈——图标按钮没有可写的文字位，错误不能只留在 title 里。
+ * 点击后的「已开始 / 失败原因」走右上角 Toast（图标按钮没有可写的文字位，
+ * 就地气泡又受行高挤压会互相遮挡）；错误也不能只留在 title 里。
  */
 
 /** 列表行内的状态图标：与 IconButton 的 sm 档同尺寸，只提示不可点 */
@@ -48,7 +49,6 @@ export function DownloadButton(props: {
   variant?: "list" | "icon";
 }): React.JSX.Element {
   const { track, quality, variant = "list" } = props;
-  const [tip, setTip] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const isDownloaded = useDownloadsStore((s) => s.isDownloaded(track));
   const isActive = useDownloadsStore((s) => s.isActive(track));
@@ -56,15 +56,13 @@ export function DownloadButton(props: {
   const start = async (): Promise<void> => {
     if (busy) return;
     setBusy(true);
-    setTip(null);
     try {
       const wanted = quality ?? (await ipc.getDownloadQuality());
       // 默认音质按该曲目所在的源收敛（B 站等无真无损的源自动落到可用档）
       await ipc.startDownload(track, clampQualityForPlatform(track.platform, wanted));
-      setTip("已开始");
-      window.setTimeout(() => setTip(null), 1200);
+      toastSuccess(`已开始下载「${track.title}」`);
     } catch (err) {
-      setTip(errMsg(err));
+      toastError(`下载发起失败：${errMsg(err)}`);
     } finally {
       setBusy(false);
     }
@@ -108,7 +106,7 @@ export function DownloadButton(props: {
           e.stopPropagation();
           void start();
         }}
-        title={tip ?? "下载"}
+        title="下载"
         aria-label="下载"
         className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-foreground/80 transition-all hover:bg-secondary/50 hover:text-foreground disabled:opacity-50"
       >
@@ -118,22 +116,15 @@ export function DownloadButton(props: {
   }
 
   return (
-    <span className="relative flex shrink-0 items-center">
-      <IconButton
-        label={tip ?? "下载"}
-        disabled={busy}
-        onClick={(e) => {
-          e.stopPropagation();
-          void start();
-        }}
-      >
-        <Download />
-      </IconButton>
-      {tip && (
-        <span className="pointer-events-none absolute right-full z-20 mr-1 whitespace-nowrap rounded border border-border bg-popover px-1.5 py-0.5 text-[11px] text-muted-foreground shadow-md">
-          {tip}
-        </span>
-      )}
-    </span>
+    <IconButton
+      label="下载"
+      disabled={busy}
+      onClick={(e) => {
+        e.stopPropagation();
+        void start();
+      }}
+    >
+      <Download />
+    </IconButton>
   );
 }

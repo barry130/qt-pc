@@ -9,6 +9,7 @@ import { useDislikesStore } from "@/stores/dislikes";
 import { useDislikeFlags } from "@/hooks/useDislikeFlags";
 import { useFavoritesStore } from "@/stores/favorites";
 import { useFavoriteFlags } from "@/hooks/useFavoriteFlags";
+import { toastError, toastSuccess } from "@/stores/toast";
 import * as ipc from "@/services/ipc";
 import { errMsg } from "@/lib/utils";
 import { CollectButton } from "../mine/CollectButton";
@@ -415,7 +416,12 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
             if (localRow) {
               void play(t);
             } else {
-              void ipc.queueAddNext(t);
+              // 队列动作对界面没有任何可见变化（不切歌、列表也不动），给一条
+              // 绿勾回执，不然用户会怀疑刚才那下点了没
+              void ipc.queueAddNext(t).then(
+                () => toastSuccess(`已将「${t.title}」设为下一首播放`),
+                (err) => toastError(`加入下一首播放失败：${errMsg(err)}`),
+              );
             }
           }}
           className="rounded p-1 text-muted-foreground transition-colors hover:bg-background hover:text-foreground"
@@ -435,7 +441,10 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
           aria-label="加入播放队列"
           onClick={(e) => {
             e.stopPropagation();
-            void ipc.queueAppend([t]);
+            void ipc.queueAppend([t]).then(
+              () => toastSuccess(`已将「${t.title}」加入播放队列`),
+              (err) => toastError(`加入播放队列失败：${errMsg(err)}`),
+            );
           }}
           className="rounded p-1 text-muted-foreground transition-colors hover:bg-background hover:text-foreground"
         >

@@ -14,19 +14,16 @@ interface SourceUpdateStore {
   local: SourceStateVo | null;
   /** 待用户确认的更新 offer（非空 = 设置页入口亮红点） */
   offers: PackUpdateOfferVo[];
-  message: string;
   busy: boolean;
   setLocal: (v: SourceStateVo | null) => void;
   setOffers: (v: PackUpdateOfferVo[]) => void;
   dropOffer: (targetId: string, kind: string) => void;
-  setMessage: (v: string) => void;
   setBusy: (v: boolean) => void;
 }
 
 export const useSourceUpdateStore = create<SourceUpdateStore>((set) => ({
   local: null,
   offers: [],
-  message: "",
   busy: false,
   setLocal: (v) => set({ local: v }),
   setOffers: (v) => set({ offers: v }),
@@ -34,6 +31,5 @@ export const useSourceUpdateStore = create<SourceUpdateStore>((set) => ({
     set((s) => ({
       offers: s.offers.filter((o) => !(o.targetId === targetId && o.kind === kind)),
     })),
-  setMessage: (v) => set({ message: v }),
   setBusy: (v) => set({ busy: v }),
 }));

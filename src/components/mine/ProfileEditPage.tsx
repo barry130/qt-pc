@@ -13,6 +13,7 @@ import {
 } from "@/lib/auth-tip";
 import { qtresCoverUrl } from "@/lib/lrc";
 import * as ipc from "@/services/ipc";
+import { toastError, toastSuccess } from "@/stores/toast";
 
 /**
  * 修改个人信息（路由 /profile/edit）。
@@ -55,9 +56,10 @@ export function ProfileEditPage(): React.JSX.Element {
     try {
       const { url } = await ipc.astralUploadAvatar(path);
       setLocalAvatar(url);
-      setTip("头像已更新");
+      // 头像区旁边没有常驻的文字位，回执走右上角 Toast（tip 那行留给保存表单）
+      toastSuccess("头像已更新");
     } catch (err) {
-      setTip(authTip(err));
+      toastError(authTip(err));
     } finally {
       setAvatarBusy(false);
     }

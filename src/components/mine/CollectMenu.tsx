@@ -4,6 +4,7 @@ import { errMsg } from "@/lib/utils";
 import { findCrossSourceDup } from "@/lib/collect-dup";
 import { useSourceLabelFn } from "@/stores/sourceRegistry";
 import { useFavoritesStore } from "@/stores/favorites";
+import { toastSuccess } from "@/stores/toast";
 import type { MyPlaylistSummary, Track } from "@/types";
 import * as ipc from "@/services/ipc";
 
@@ -88,6 +89,9 @@ export function CollectMenu(props: {
     setError(null);
     try {
       await ipc.addFavorite(track, p.pid);
+      // 面板马上就收起，勾选结果看不见 —— 收藏到哪儿得给条回执
+      // （与批量收藏的文案口径一致：「到哪儿」必须写清楚）
+      toastSuccess(`已收藏到「${p.name}」`);
       await reload();
       await syncLiked();
       setPending(null);
@@ -145,6 +149,7 @@ export function CollectMenu(props: {
       const pid = await ipc.createPlaylist(n);
       setNewName("");
       await ipc.addFavorite(track, pid);
+      toastSuccess(`已收藏到「${n}」（新建歌单）`);
       await reload();
       await syncLiked();
       onClose();

@@ -4,6 +4,7 @@ import { errMsg } from "@/lib/utils";
 import type { DownloadTask } from "@/types";
 import * as ipc from "@/services/ipc";
 import { useDownloadsStore } from "@/stores/downloads";
+import { toastError } from "@/stores/toast";
 import { BatchDeleteButton, RowActions } from "@/components/common/RowActions";
 import { IconButton } from "@/components/common/IconButton";
 import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
@@ -44,7 +45,6 @@ export function DownloadsPage(): React.JSX.Element {
   const loaded = useDownloadsStore((s) => s.loaded);
   const refresh = useDownloadsStore((s) => s.refresh);
   const [dir, setDir] = useState("");
-  const [error, setError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const allRef = useRef<HTMLInputElement | null>(null);
@@ -104,22 +104,21 @@ export function DownloadsPage(): React.JSX.Element {
     }
   }, [allSelected, selected]);
 
-  /** 统一包装：调用 IPC → 报错 → 刷新（行内的暂停 / 继续 / 重试 / 取消用） */
+  /** 统一包装：调用 IPC → 报错 → 刷新（行内的暂停 / 继续 / 重试 / 取消用）。
+   *  失败走右上角 Toast：行级操作没有对应文字位，页面顶部横幅又会把列表往下推 */
   const act = async (id: string, fn: () => Promise<void>): Promise<void> => {
-    setError(null);
     setBusyId(id);
     try {
       await fn();
       await load();
     } catch (err) {
-      setError(errMsg(err));
+      toastError(`操作失败：${errMsg(err)}`);
     } finally {
       setBusyId(null);
     }
   };
 
   const pauseAll = async (): Promise<void> => {
-    setError(null);
     try {
       await Promise.all(
         tasks
@@ -128,12 +127,11 @@ export function DownloadsPage(): React.JSX.Element {
       );
       await load();
     } catch (err) {
-      setError(errMsg(err));
+      toastError(`全部暂停失败：${errMsg(err)}`);
     }
   };
 
   const clearFinished = async (): Promise<void> => {
-    setError(null);
     try {
       await Promise.all(
         tasks
@@ -142,7 +140,7 @@ export function DownloadsPage(): React.JSX.Element {
       );
       await load();
     } catch (err) {
-      setError(errMsg(err));
+      toastError(`清理已完成失败：${errMsg(err)}`);
     }
   };
 
@@ -213,7 +211,7 @@ export function DownloadsPage(): React.JSX.Element {
                 await load();
               }}
               onDeleted={() => setSelected(new Set())}
-              onError={(msg) => setError(msg)}
+              onError={(msg) => toastError(msg)}
             />
             {selected.size > 0 && (
               <>
@@ -230,11 +228,6 @@ export function DownloadsPage(): React.JSX.Element {
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
-        {error && (
-          <div className="border-b border-border bg-destructive/10 p-3 text-center text-sm text-destructive">
-            操作失败：{error}
-          </div>
-        )}
         {!loaded ? (
           <div className="py-10 text-center text-sm text-muted-foreground">
             加载中…
@@ -261,7 +254,7 @@ export function DownloadsPage(): React.JSX.Element {
                   await ipc.deleteDownload(t.id, deleteFile);
                   await load();
                 }}
-                onError={(msg) => setError(msg)}
+                onError={(msg) => toastError(msg)}
               />
             ))}
           </ul>

@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Check, Download, Loader2, Share2 } from "lucide-react";
+import { Download, Loader2, Share2 } from "lucide-react";
 import { getPlaybackLyric } from "@/lib/localOnline";
 import { parseLrc, qtresCoverUrl } from "@/lib/lrc";
 import * as ipc from "@/services/ipc";
 import type { Track } from "@/types";
 import { cn } from "@/lib/utils";
+import { toastSuccess } from "@/stores/toast";
 
 export const SHARE_CARD_BRAND = "轻听音乐";
 export const SHARE_CARD_BRAND_SUB = "QuietMusic";
@@ -110,7 +111,6 @@ export function ShareCardPanel(props: { track: Track }): React.JSX.Element {
   const [coverReady, setCoverReady] = useState(false);
   const [busy, setBusy] = useState(false);
   const [hint, setHint] = useState<string | null>(null);
-  const [done, setDone] = useState<"copy" | "save" | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const coverRef = useRef<HTMLImageElement | null>(null);
 
@@ -276,12 +276,15 @@ export function ShareCardPanel(props: { track: Track }): React.JSX.Element {
     return canvas.toDataURL("image/png").split(",")[1] ?? null;
   };
 
-  const flash = (kind: "copy" | "save", ok: boolean, msg: string): void => {
+  /** 动作收尾：失败留在面板里的红字（有补救建议，可操作），成功走右上角绿勾 */
+  const finish = (ok: boolean, msg: string, okText: string): void => {
     setBusy(false);
-    setHint(ok ? null : msg);
-    if (!ok) return;
-    setDone(kind);
-    setTimeout(() => setDone(null), 1600);
+    if (ok) {
+      setHint(null);
+      toastSuccess(okText);
+    } else {
+      setHint(msg);
+    }
   };
 
   const copyImage = async (): Promise<void> => {
@@ -290,15 +293,15 @@ export function ShareCardPanel(props: { track: Track }): React.JSX.Element {
     setHint(null);
     const b64 = render();
     if (b64 === null) {
-      flash("copy", false, "生成图片失败");
+      finish(false, "生成图片失败", "");
       return;
     }
     try {
       const blob = await fetch(`data:image/png;base64,${b64}`).then((r) => r.blob());
       await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
-      flash("copy", true, "");
+      finish(true, "", "已复制图片到剪贴板");
     } catch {
-      flash("copy", false, "复制失败，可改用保存为图片");
+      finish(false, "复制失败，可改用保存为图片", "");
     }
   };
 
@@ -308,7 +311,7 @@ export function ShareCardPanel(props: { track: Track }): React.JSX.Element {
     setHint(null);
     const b64 = render();
     if (b64 === null) {
-      flash("save", false, "生成图片失败");
+      finish(false, "生成图片失败", "");
       return;
     }
     try {
@@ -319,9 +322,9 @@ export function ShareCardPanel(props: { track: Track }): React.JSX.Element {
         return;
       }
       await ipc.saveBinaryFile(path, b64);
-      flash("save", true, "");
+      finish(true, "", "已保存分享卡片");
     } catch (e: unknown) {
-      flash("save", false, `保存失败：${e instanceof Error ? e.message : String(e)}`);
+      finish(false, `保存失败：${e instanceof Error ? e.message : String(e)}`, "");
     }
   };
 
@@ -381,12 +384,10 @@ export function ShareCardPanel(props: { track: Track }): React.JSX.Element {
         >
           {busy ? (
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          ) : done === "copy" ? (
-            <Check className="h-3.5 w-3.5" />
           ) : (
             <Share2 className="h-3.5 w-3.5" />
           )}
-          {done === "copy" ? "已复制" : "复制图片"}
+          复制图片
         </button>
         <button
           type="button"
@@ -399,12 +400,10 @@ export function ShareCardPanel(props: { track: Track }): React.JSX.Element {
         >
           {busy ? (
             <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          ) : done === "save" ? (
-            <Check className="h-3.5 w-3.5" />
           ) : (
             <Download className="h-3.5 w-3.5" />
           )}
-          {done === "save" ? "已保存" : "保存为图片"}
+          保存为图片
         </button>
       </div>
       <div className="mt-1.5 text-center text-[10px] text-muted-foreground">

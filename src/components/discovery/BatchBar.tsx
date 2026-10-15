@@ -4,7 +4,7 @@ import { cn, errMsg } from "@/lib/utils";
 import { findCrossSourceDup } from "@/lib/collect-dup";
 import { clampQualityForPlatform, useSourceLabelFn } from "@/stores/sourceRegistry";
 import { useFavoritesStore } from "@/stores/favorites";
-import { toast } from "@/stores/toast";
+import { toastSuccess } from "@/stores/toast";
 import { useFavoriteFlags } from "@/hooks/useFavoriteFlags";
 import type { MyPlaylistSummary, Track } from "@/types";
 import * as ipc from "@/services/ipc";
@@ -223,12 +223,12 @@ export function BatchBar(props: {
   };
 
   /**
-   * 上一次动作的回执。**走全局右上角轻提示**（3 秒自动消失），不写在条子里 ——
+   * 上一次动作的回执。**走全局右上角轻提示**（绿勾回执，自动消失），不写在条子里 ——
    * 文案长短不一会把页头那排控件推来推去（用户 m09470）；也不往 `onError` 里塞，
    * 成功挂红字会让人以为出错。
    */
   const report = (message: string): void => {
-    toast(message);
+    toastSuccess(message);
   };
 
   const download = async (): Promise<void> => {

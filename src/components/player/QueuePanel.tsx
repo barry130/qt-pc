@@ -12,8 +12,9 @@ import {
 import * as ipc from "@/services/ipc";
 import { usePlayerStore } from "@/stores/player";
 import { qtresCoverUrl, formatTime } from "@/lib/lrc";
-import { cn } from "@/lib/utils";
+import { cn, errMsg } from "@/lib/utils";
 import { log } from "@/lib/logger";
+import { toastError } from "@/stores/toast";
 import { LocalCover } from "@/components/library/LocalCover";
 import { IconButton } from "@/components/common/IconButton";
 import { PlayNextIcon } from "@/components/common/PlayNextIcon";
@@ -209,8 +210,10 @@ export function QueuePanel(): React.JSX.Element | null {
       await ipc.queueRemoveIndices([...selected]);
       setSelecting(false);
     } catch (err) {
-      // 批量删除失败不上浮全局错误浮层：与列表页就地报错对齐，留日志可排查
+      // 批量删除失败不上浮全局错误浮层，也不在面板里堆红字（选择集还得留着
+      // 重试）：右上角一条红 Toast 告知即可，日志照留可排查
       log.warn("[queue] 批量删除失败", err);
+      toastError(`批量删除失败：${errMsg(err)}`);
     } finally {
       setDeleting(false);
     }
@@ -284,6 +287,7 @@ export function QueuePanel(): React.JSX.Element | null {
                   onClick={() =>
                     void ipc.queueClearAfter().catch((err) => {
                       log.warn("[queue] 清空后续失败", err);
+                      toastError(`清空后续失败：${errMsg(err)}`);
                     })
                   }
                 >
@@ -299,6 +303,7 @@ export function QueuePanel(): React.JSX.Element | null {
                   onClick={() =>
                     void ipc.clearQueue().catch((err) => {
                       log.warn("[queue] 清空队列失败", err);
+                      toastError(`清空队列失败：${errMsg(err)}`);
                     })
                   }
                 >

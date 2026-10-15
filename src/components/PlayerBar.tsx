@@ -64,6 +64,7 @@ import {
   setTrackQuality,
   showDesktopLyric,
 } from "@/services/ipc";
+import { toastSuccess } from "@/stores/toast";
 
 /**
  * 播放条（DESIGN §5.5）：
@@ -940,21 +941,13 @@ function PlayModeButton(props: {
  */
 function PlayUrlButton(props: { url: string | null; line: string; miss: string }): React.JSX.Element {
   const [open, setOpen] = useState(false);
-  const [copied, setCopied] = useState(false);
-
-  // 收起时把「已复制」复位，下次打开是干净状态
-  useEffect(() => {
-    if (!open) setCopied(false);
-  }, [open]);
 
   const copy = (): void => {
     if (!props.url) return;
+    // 回执走右上角 Toast：面板里那行「已复制」原来只有 1.2 秒，还挤在最底部
     void navigator.clipboard
       .writeText(props.url)
-      .then(() => {
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1200);
-      })
+      .then(() => toastSuccess("已复制到剪贴板"))
       .catch(() => {});
   };
 
@@ -1006,16 +999,9 @@ function PlayUrlButton(props: { url: string | null; line: string; miss: string }
               <span className="break-all font-mono text-amber-500/90">{props.miss}</span>
             </div>
           ) : null}
-          <div className="mt-1.5 flex items-center gap-1 text-[10px] text-muted-foreground">
-            {copied ? (
-              <>
-                <Check className="h-3 w-3 text-primary" />
-                已复制到剪贴板
-              </>
-            ) : (
-              props.url ? "点击地址可复制" : ""
-            )}
-          </div>
+          {props.url ? (
+            <div className="mt-1.5 text-[10px] text-muted-foreground">点击地址可复制</div>
+          ) : null}
         </div>
       )}
     </Popover>

@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { errMsg } from "@/lib/utils";
 import * as ipc from "@/services/ipc";
+import { toastError, toastSuccess } from "@/stores/toast";
 import { BackButton } from "@/components/layout/BackButton";
 
 /**
@@ -21,24 +22,23 @@ export function FeedbackSubmitPage(): React.JSX.Element {
   const [contact, setContact] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [done, setDone] = useState(false);
 
   const submit = async (): Promise<void> => {
     setError(null);
-    setDone(false);
     if (!title.trim() || !content.trim()) {
+      // 表单没填完的校验留在表单里（用户要照着改），提交结果走右上角 Toast
       setError("标题和内容不能为空");
       return;
     }
     setSubmitting(true);
     try {
       await ipc.astralSubmitFeedback(kind, title.trim(), content.trim(), contact.trim());
-      setDone(true);
+      toastSuccess("感谢反馈，已提交成功");
       setTitle("");
       setContent("");
       setContact("");
     } catch (err) {
-      setError(errMsg(err));
+      toastError(`提交失败：${errMsg(err)}`);
     } finally {
       setSubmitting(false);
     }
@@ -107,12 +107,7 @@ export function FeedbackSubmitPage(): React.JSX.Element {
 
         {error && (
           <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-            提交失败：{error}
-          </div>
-        )}
-        {done && (
-          <div className="rounded-md border border-primary/40 bg-primary/10 px-3 py-2 text-sm">
-            感谢反馈，已提交成功
+            {error}
           </div>
         )}
 

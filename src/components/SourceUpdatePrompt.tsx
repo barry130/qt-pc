@@ -8,6 +8,7 @@ import {
 } from "@/source-scripts/source-update";
 import { useSourceUpdateStore } from "@/stores/source-update";
 import { stripErrorUrls } from "@/lib/utils";
+import { toastSuccess } from "@/stores/toast";
 
 /**
  * 音源包更新逐条确认提示（v3，与 qt-uniappx 的更新确认弹窗同口径）。
@@ -23,7 +24,6 @@ export function SourceUpdatePrompt(): React.JSX.Element | null {
   const navigate = useNavigate();
   const offers = useSourceUpdateStore((s) => s.offers);
   const dropOffer = useSourceUpdateStore((s) => s.dropOffer);
-  const setMessage = useSourceUpdateStore((s) => s.setMessage);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
 
@@ -42,7 +42,8 @@ export function SourceUpdatePrompt(): React.JSX.Element | null {
     void (async () => {
       try {
         const outcome = await applySourceUpdate(offer);
-        setMessage(
+        // 确认后提示自动消失，安装结果用户看不见 → 右上角绿勾兜底
+        toastSuccess(
           `${kindLabel(outcome.kind)}已更新到 v${outcome.pack.versionCode}（${outcome.pack.name}）`,
         );
         dropOffer(offer.targetId, offer.kind);

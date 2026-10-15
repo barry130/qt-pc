@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { errMsg } from "@/lib/utils";
 import { RefreshCw, Trash2 } from "lucide-react";
 import * as ipc from "@/services/ipc";
+import { toast, toastError, toastSuccess } from "@/stores/toast";
 import { BackButton } from "@/components/layout/BackButton";
 import { AddDirButtons } from "./AddDirButtons";
 import { IconButton } from "@/components/common/IconButton";
@@ -10,12 +11,14 @@ import { IconButton } from "@/components/common/IconButton";
  * 本地音乐文件夹管理（路由 /library/folders，DESIGN §13）。
  * 目录选择走 tauri-plugin-dialog 的目录选择器，路径落在 scan_dirs 表；
  * 改完点「立即扫描」才真正把音频文件读进本地曲库。
+ *
+ * 回执 / 失败走右上角 Toast：这一页的提示都是「知道一下就行」的一次性文案，
+ * 页面上没有可以承载它们的表单，原先那行会随文案长度伸缩的灰底条反而挤布局。
  */
 export function LibraryFoldersPage(): React.JSX.Element {
   const [dirs, setDirs] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
-  const [tip, setTip] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     const list = await ipc.getScanDirs();
@@ -28,7 +31,8 @@ export function LibraryFoldersPage(): React.JSX.Element {
       try {
         await refresh();
       } catch (err) {
-        setTip(errMsg(err));
+        // 列表读不出来时页面会一直空着，必须有个说法
+        toastError(`读取音乐文件夹失败：${errMsg(err)}`);
       } finally {
         setLoading(false);
       }
@@ -42,9 +46,9 @@ export function LibraryFoldersPage(): React.JSX.Element {
     try {
       await ipc.addScanDir(p);
       await refresh();
-      setTip(`已添加：${p}`);
+      toastSuccess(`已添加：${p}`);
     } catch (err) {
-      setTip(errMsg(err));
+      toastError(`添加失败：${errMsg(err)}`);
     } finally {
       setBusy(false);
     }
@@ -55,9 +59,8 @@ export function LibraryFoldersPage(): React.JSX.Element {
     try {
       await ipc.removeScanDir(path);
       await refresh();
-      setTip(null);
     } catch (err) {
-      setTip(errMsg(err));
+      toastError(`移除失败：${errMsg(err)}`);
     } finally {
       setBusy(false);
     }
@@ -65,11 +68,11 @@ export function LibraryFoldersPage(): React.JSX.Element {
 
   const rescan = async (): Promise<void> => {
     if (dirs.length === 0) {
-      setTip("先添加一个文件夹");
+      // 按钮在无文件夹时本来就是 disabled，这里只是兜底
+      toast("先添加一个文件夹");
       return;
     }
     setBusy(true);
-    setTip("扫描中…");
     try {
       // 与本地音乐页共用同一份扫描配置（忽略短音频 / 过小文件），避免两个入口行为不一致
       const [minSecs, minSize] = await Promise.all([
@@ -77,9 +80,9 @@ export function LibraryFoldersPage(): React.JSX.Element {
         ipc.getScanMinSize().catch(() => ipc.DEFAULT_SCAN_MIN_SIZE),
       ]);
       const tracks = await ipc.scanLibrary(dirs, minSecs, minSize);
-      setTip(`扫描完成，共 ${tracks.length} 首`);
+      toastSuccess(`扫描完成，共 ${tracks.length} 首`);
     } catch (err) {
-      setTip(errMsg(err));
+      toastError(`扫描失败：${errMsg(err)}`);
     } finally {
       setBusy(false);
     }
@@ -109,12 +112,6 @@ export function LibraryFoldersPage(): React.JSX.Element {
           <RefreshCw />
         </IconButton>
       </div>
-
-      {tip && (
-        <p className="mt-3 rounded-md bg-secondary px-3 py-2 text-xs text-muted-foreground">
-          {tip}
-        </p>
-      )}
 
       {loading ? (
         <p className="py-10 text-center text-sm text-muted-foreground">
