@@ -9,7 +9,7 @@ import { getRecommendations } from "@/source-scripts";
 import { engineSnapshot } from "@/source-engine/client";
 import { useMusicSourceStore } from "@/stores/musicSource";
 import { usePlayerStore } from "@/stores/player";
-import { CoverCard, CoverGrid, SectionTitle } from "./CoverCard";
+import { CoverCard, SectionTitle } from "./CoverCard";
 import { ChartSpotlightCard } from "./ChartSpotlight";
 import { HorizontalScroller } from "./HorizontalScroller";
 import { TrackCard } from "./TrackCard";
@@ -18,7 +18,9 @@ import { TrackCard } from "./TrackCard";
  * 首页 / 发现（路由 /，DESIGN §5.2 / §5.3）。
  *
  * 布局自上而下：Hero（当前音源 + 快捷入口）→ 榜单精选（两列卡片，封面 + 前三首）
- * → 新歌速递（横向歌曲卡）→ 推荐歌单（一行网格）。
+ * → 新歌速递（横向歌曲卡）→ 推荐歌单（横向封面卡）。
+ * 后两个区块同为一行横向滚动、条数一致（HOME_ROW_COUNT）：一上一下两个行，
+ * 一行满一行空会被读成「数据没加载完」，同口径才像同一套版式。
  * 三个区块统一跟随全局音源（§6.4 要点 5）：榜单此前用四源聚合命令，但点进详情
  * 后该 chart 可能不属于当前源、详情页拉不到标题，故一并改为按源取。
  * 任一区块失败只降级为空区块，不弹全局错误（首页是聚合视图，允许部分为空）。
@@ -31,6 +33,14 @@ import { TrackCard } from "./TrackCard";
 const SPOTLIGHT_COUNT = 4;
 /** 每张卡右侧的曲目条数 */
 const SPOTLIGHT_TRACKS = 3;
+/**
+ * 首页两条横滚行（新歌速递 / 推荐歌单）各自装多少张卡。
+ *
+ * 两行取同一个数：一条 20 一条 30 时，滑到底的时间不一样、右箭头消失的位置
+ * 也不一样，用户会以为其中一行没加载完。20 是原来新歌速递的口径（一次请求的量），
+ * 也够铺满宽屏再滑一屏。
+ */
+const HOME_ROW_COUNT = 20;
 
 /**
  * 榜单详情缓存（进程内，键 = 音源:榜单 id）。
@@ -135,7 +145,7 @@ export function DiscoverPage(): React.JSX.Element {
     void (async () => {
       const [s, p] = await Promise.all([
         showLatest
-          ? sourceApi.getLatestSongs(activeSourceId, 20, 0).catch(() => [] as Track[])
+          ? sourceApi.getLatestSongs(activeSourceId, HOME_ROW_COUNT, 0).catch(() => [] as Track[])
           : ([] as Track[]),
         // 插件化试点：推荐歌单经 source-scripts 统一入口分发
         // （scheme=script 走共享脚本包，否则原 Rust 通道），其余调用不变
@@ -145,9 +155,10 @@ export function DiscoverPage(): React.JSX.Element {
       ]);
       // IPC 在测试/异常环境下可能返回非数组，这里统一兜底（页面只做展示，允许区块为空）
       if (cancelled) return;
-      setSongs(Array.isArray(s) ? s : []);
-      // 多取一些，配合 CoverGrid 的 fillRows 裁剪后正好铺满整数排
-      setPlaylists(Array.isArray(p) ? p.slice(0, 30) : []);
+      setSongs(Array.isArray(s) ? s.slice(0, HOME_ROW_COUNT) : []);
+      // 首页只展示一行，按 HOME_ROW_COUNT 截断；接口按页给 30 条，多的不进 DOM。
+      // 与「新歌速递」同数：两行长短不一会被读成其中一行没加载完。
+      setPlaylists(Array.isArray(p) ? p.slice(0, HOME_ROW_COUNT) : []);
     })();
     return () => {
       cancelled = true;
@@ -243,7 +254,7 @@ export function DiscoverPage(): React.JSX.Element {
         <div className="rounded-2xl border border-border bg-gradient-to-br from-primary/10 via-primary/5 to-transparent p-6">
           <h1 className="text-2xl font-bold">发现音乐</h1>
           <p className="mt-2 text-sm text-muted-foreground">
-            当前音源：{sourceLabel} · 榜单聚合四个音源，新歌与推荐歌单随音源切换
+            当前音源：{sourceLabel}
           </p>
           <div className="mt-4 flex flex-wrap gap-2">
             {quickLinks.map((item) => (
@@ -401,12 +412,13 @@ export function DiscoverPage(): React.JSX.Element {
         {playlists.length === 0 ? (
           <EmptyBlock icon={Disc3} text="暂无推荐歌单" />
         ) : (
-          // 只要一行：多出来的不进 DOM（maxRows 按实测列数换算），
-          // 竖着堆两三排会把下面的内容顶得太远，首页是导流不是列表页。
-          <CoverGrid maxRows={1}>
+          // 与「新歌速递」同款横向滚动行（同宽卡片、同箭头、同滚轮转横滚）。
+          // 此前是一行静态网格（CoverGrid maxRows={1}），滑不动也点不到被裁掉的歌单。
+          <HorizontalScroller>
             {playlists.map((p) => (
               <CoverCard
                 key={p.id}
+                layout="row"
                 name={p.name}
                 picUrl={p.picUrl}
                 subtitle={p.playCount ? `${p.playCount} 次播放` : undefined}
@@ -418,7 +430,7 @@ export function DiscoverPage(): React.JSX.Element {
                 }
               />
             ))}
-          </CoverGrid>
+          </HorizontalScroller>
         )}
       </section>
       )}

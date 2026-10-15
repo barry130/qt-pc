@@ -1,6 +1,7 @@
-import { Children, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Play } from "lucide-react";
 import { qtresCoverUrl } from "@/lib/lrc";
+import { cn } from "@/lib/utils";
 
 /**
  * 封面卡片（歌单广场 / 排行榜 / 首页推荐共用）。
@@ -11,9 +12,16 @@ export function CoverCard(props: {
   picUrl: string;
   /** 副标题：歌单显示播放量，榜单显示简介 */
   subtitle?: string;
+  /**
+   * 版式：`grid`（默认）铺满所在网格列；`row` 用于横向滚动行，固定 128px 不伸缩。
+   *
+   * 不用「外部传 className 覆盖」是因为根节点已带 `w-full`，再叠一个 `w-32`
+   * 两者特异性相同，最终宽度取决于样式表里的先后顺序 —— 属于看运气的写法。
+   */
+  layout?: "grid" | "row";
   onClick: () => void;
 }): React.JSX.Element {
-  const { name, picUrl, subtitle, onClick } = props;
+  const { name, picUrl, subtitle, layout = "grid", onClick } = props;
   const cover = qtresCoverUrl(picUrl);
   // 上游 404 / 代取失败 → <img> error，退到首字兜底，不留空白卡
   const [loadFailed, setLoadFailed] = useState(false);
@@ -21,10 +29,14 @@ export function CoverCard(props: {
     <button
       type="button"
       onClick={onClick}
-      // w-full 不能省：grid item 会 stretch 撑开，但放进横向滚动卡片行
-      // （普通 flex/div 容器）时 button 是 inline-block，不写 w-full 会按内容收缩
+      // grid：w-full 不能省 —— grid item 会 stretch 撑开，但放进横向滚动卡片行
+      // （普通 flex/div 容器）时 button 是 inline-block，不写 w-full 会按内容收缩。
+      // row：w-32 shrink-0 与「新歌速递」的 TrackCard 同宽，行内不参与压缩。
       // active:scale 是按压反馈（80-150ms、不改布局边界）
-      className="group block w-full text-left transition-transform duration-150 active:scale-[0.98]"
+      className={cn(
+        "group block text-left transition-transform duration-150 active:scale-[0.98]",
+        layout === "row" ? "w-32 shrink-0 snap-start" : "w-full",
+      )}
     >
       <div className="relative aspect-square w-full overflow-hidden rounded-xl shadow-md transition-shadow duration-200 group-hover:shadow-xl">
         {cover && !loadFailed ? (
@@ -51,26 +63,39 @@ export function CoverCard(props: {
           </span>
         </div>
       </div>
-      <div className="mt-2 truncate text-sm font-medium">{name}</div>
+      {/* 字号随版式走：row 与相邻的「新歌速递」TrackCard 逐级对齐（12px / 11px），
+          两行卡片同宽同构却差 2px 字号会被看成没对齐的 bug */}
+      <div
+        className={cn(
+          "mt-2 truncate font-medium",
+          layout === "row" ? "text-xs" : "text-sm",
+        )}
+      >
+        {name}
+      </div>
       {subtitle ? (
-        <div className="mt-0.5 truncate text-xs text-muted-foreground">{subtitle}</div>
+        <div
+          className={cn(
+            "mt-0.5 truncate text-muted-foreground",
+            layout === "row" ? "text-[11px]" : "text-xs",
+          )}
+        >
+          {subtitle}
+        </div>
       ) : null}
     </button>
   );
 }
 
 /**
- * 卡片网格容器。
+ * 卡片网格容器（歌单广场 / 排行榜 / 搜索结果共用，一律整排铺满）。
  *
  * 列数按**容器实测宽度**算，而不是 Tailwind 的视口断点：主内容区会被侧边栏和
- * 队列面板挤压，视口宽度对不上内容区宽度。列数只取 3/4/6/8，这几个数能整除 24，
- * 配合 fillRows 可以保证每一排都是满的（不会出现最后一行缺一块）。
+ * 队列面板挤压，视口宽度对不上内容区宽度。
  *
- * fillRows：把数量裁到列数的整数倍，用于首页这种「多一个少一个无所谓」的展示区；
- * 列表页（歌单广场 / 榜单）不能裁，否则会吞掉分页数据，所以默认关闭。
- *
- * maxRows：最多渲染几排（配合列数换算成条数）。首页「推荐歌单」只要一排，
- * 多出来的数据不进 DOM —— 比 CSS 裁切干净，也不会留下可聚焦的隐藏卡片。
+ * 此前还有 `fillRows` / `maxRows` 两个入参，用于首页「推荐歌单」裁成整排、只留一行。
+ * 该区块已改为横向滚动行（见 DiscoverPage），两个入参失去调用方，一并删除 ——
+ * 留着会让人以为首页仍在用网格，而它们的语义（裁数据）对滚动行也不成立。
  */
 /** 目标卡片宽度（px）与间隙：128 与「新歌速递」的横滚卡片同宽 */
 const TARGET_CARD_W = 128;
@@ -78,13 +103,9 @@ const GAP = 12;
 
 export function CoverGrid(props: {
   children: React.ReactNode;
-  fillRows?: boolean;
-  /** 最多渲染几排；不传 = 不限 */
-  maxRows?: number;
 }): React.JSX.Element {
   const ref = useRef<HTMLDivElement | null>(null);
   const [cols, setCols] = useState(5);
-  const [measured, setMeasured] = useState(false);
 
   useEffect(() => {
     const el = ref.current;
@@ -94,19 +115,10 @@ export function CoverGrid(props: {
       if (w <= 0) return;
       const c = Math.floor((w + GAP) / (TARGET_CARD_W + GAP));
       setCols(Math.max(3, Math.min(14, c)));
-      setMeasured(true);
     });
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
-
-  const items = Children.toArray(props.children);
-  const capped =
-    props.maxRows !== undefined ? items.slice(0, props.maxRows * cols) : items;
-  const shown =
-    props.fillRows && measured && capped.length > cols
-      ? capped.slice(0, Math.floor(capped.length / cols) * cols)
-      : capped;
 
   return (
     <div
@@ -115,7 +127,7 @@ export function CoverGrid(props: {
       // 1fr 均分 → 每行铺满整屏；卡片宽度会在 128px 基础上略微拉伸吃掉余数
       style={{ gridTemplateColumns: `repeat(${cols}, minmax(0, 1fr))` }}
     >
-      {shown}
+      {props.children}
     </div>
   );
 }
