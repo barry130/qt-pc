@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
-import { BarChart3, ChevronRight, Disc3, FileMusic, Flame, PackageOpen, Sparkles } from "lucide-react";
+import { BarChart3, ChevronRight, Disc3, FileMusic, Flame, PackageOpen, RefreshCw, Sparkles } from "lucide-react";
 import type { Chart, Playlist, Track } from "@/types";
+import { cn } from "@/lib/utils";
 import { useSourceLabel, useSourceRegistryStore, useSourceSupports } from "@/stores/sourceRegistry";
 import * as sourceApi from "@/source-scripts";
 import { getRecommendations } from "@/source-scripts";
@@ -9,18 +10,49 @@ import { engineSnapshot } from "@/source-engine/client";
 import { useMusicSourceStore } from "@/stores/musicSource";
 import { usePlayerStore } from "@/stores/player";
 import { CoverCard, CoverGrid, SectionTitle } from "./CoverCard";
+import { ChartSpotlightCard } from "./ChartSpotlight";
 import { HorizontalScroller } from "./HorizontalScroller";
 import { TrackCard } from "./TrackCard";
 
 /**
  * 首页 / 发现（路由 /，DESIGN §5.2 / §5.3）。
  *
- * 布局自上而下：Hero（当前音源 + 快捷入口）→ 热门榜单（横向大卡）→
- * 新歌速递（横向歌曲卡）→ 推荐歌单（网格）。
+ * 布局自上而下：Hero（当前音源 + 快捷入口）→ 榜单精选（两列卡片，封面 + 前三首）
+ * → 新歌速递（横向歌曲卡）→ 推荐歌单（一行网格）。
  * 三个区块统一跟随全局音源（§6.4 要点 5）：榜单此前用四源聚合命令，但点进详情
  * 后该 chart 可能不属于当前源、详情页拉不到标题，故一并改为按源取。
  * 任一区块失败只降级为空区块，不弹全局错误（首页是聚合视图，允许部分为空）。
+ *
+ * 榜单精选取代了此前的「热门榜单」横向封面行：两处展示的是同一批榜单，
+ * 而卡片版已经把「榜里有什么歌」摆出来了，封面行只是它的信息子集。
  */
+
+/** 首页「榜单精选」展示的榜单数量（两列 × 两排） */
+const SPOTLIGHT_COUNT = 4;
+/** 每张卡右侧的曲目条数 */
+const SPOTLIGHT_TRACKS = 3;
+
+/**
+ * 榜单详情缓存（进程内，键 = 音源:榜单 id）。
+ *
+ * 卡片只要前 3 首，但 chartDetail 契约没有 limit 参数、只能整榜拉回来
+ * （酷我/咪咕在脚本侧还是翻页取的），既然拉都拉了就留着：重渲染、切走再切回、
+ * 以及「播放整榜」都直接命中，不至于为同一个榜反复打源站。
+ * 只有区块标题上的刷新按钮会绕过它（force）。
+ */
+const chartDetailCache = new Map<string, Track[]>();
+
+async function loadChartDetail(chart: Chart, force = false): Promise<Track[]> {
+  const key = `${chart.platform}:${chart.id}`;
+  if (!force) {
+    const hit = chartDetailCache.get(key);
+    if (hit !== undefined) return hit;
+  }
+  const rows = await sourceApi.getChartDetail(chart);
+  const list = Array.isArray(rows) ? rows : [];
+  chartDetailCache.set(key, list);
+  return list;
+}
 
 const QUICK_LINKS = [
   {
@@ -49,6 +81,7 @@ export function DiscoverPage(): React.JSX.Element {
   const navigate = useNavigate();
   const activeSourceId = useMusicSourceStore((s) => s.activeSourceId);
   const play = usePlayerStore((s) => s.play);
+  const playQueue = usePlayerStore((s) => s.playQueue);
 
   // 功能面门控（v4 契约）：数据包声明当前源有没有新歌流/歌单载体、还有没有
   // 任何源有榜单。不支持的区块/快捷入口直接不渲染，也不发对应请求；
@@ -72,6 +105,10 @@ export function DiscoverPage(): React.JSX.Element {
   const [songs, setSongs] = useState<Track[]>([]);
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
   const [charts, setCharts] = useState<Chart[]>([]);
+  /** 榜单精选的曲目：键 = `音源:榜单 id`；未到 = 骨架屏 */
+  const [chartTracks, setChartTracks] = useState<Record<string, Track[]>>({});
+  /** 刷新按钮的在飞态（只挡重复点击，不挡卡片渲染） */
+  const [refreshing, setRefreshing] = useState(false);
   // 引擎相位 + 播放包装配状态：数据面由已装数据包提供（不内置）；error（引擎
   // 异常）或 ready 但未装配播放包时，在线试听不可用 → 给「去安装播放包」引导卡
   const [enginePhase, setEnginePhase] = useState<string | null>("booting");
@@ -133,6 +170,67 @@ export function DiscoverPage(): React.JSX.Element {
       cancelled = true;
     };
   }, [showCharts, activeSourceId, metaGeneration]);
+
+  // 榜单精选：拿前 4 个榜各拉一次详情，取前 3 首。
+  // 每个榜各自 catch —— 一个榜挂了不该让另外三张卡空着；失败记成空数组，
+  // 卡片显示「暂无曲目」，和「这个榜真的没歌」是同一副样子（首页不做错误态）。
+  useEffect(() => {
+    let cancelled = false;
+    if (!showCharts || charts.length === 0) return;
+    const picked = charts.slice(0, SPOTLIGHT_COUNT);
+    void (async () => {
+      const rows = await Promise.all(
+        picked.map(async (c) => {
+          const key = `${c.platform}:${c.id}`;
+          const list = await loadChartDetail(c).catch(() => [] as Track[]);
+          return [key, list] as const;
+        }),
+      );
+      if (cancelled) return;
+      setChartTracks((prev) => {
+        const next = { ...prev };
+        for (const [key, list] of rows) next[key] = list;
+        return next;
+      });
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [charts, showCharts]);
+
+  // 刷新：绕过详情缓存重拉榜单列表与每张卡的曲目（源站榜单是按天/按小时更新的，
+  // 用户点它就是想看最新名次）。缓存整体丢弃，避免新旧混着显示。
+  const refreshSpotlight = async (): Promise<void> => {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      const c = await sourceApi
+        .getCharts(activeSourceId)
+        .catch(() => [] as Chart[]);
+      const picked = (Array.isArray(c) ? c : []).slice(0, SPOTLIGHT_COUNT);
+      const rows = await Promise.all(
+        picked.map(async (chart) => {
+          const list = await loadChartDetail(chart, true).catch(() => [] as Track[]);
+          return [`${chart.platform}:${chart.id}`, list] as const;
+        }),
+      );
+      // 整体替换而不是合并：只保留本次仍在展示的榜，换源后旧源的曲目不再留在表里
+      const next: Record<string, Track[]> = {};
+      for (const [key, list] of rows) next[key] = list;
+      setChartTracks(next);
+      setCharts(Array.isArray(c) ? c.slice(0, 10) : []);
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  /** 整张榜入队播放：用已经拉回来的详情，不再打一次源站 */
+  const playChart = async (chart: Chart): Promise<void> => {
+    const list =
+      chartTracks[`${chart.platform}:${chart.id}`] ??
+      (await loadChartDetail(chart).catch(() => [] as Track[]));
+    if (list.length > 0) await playQueue(list, 0);
+  };
 
   const activeSourceLabel = useSourceLabel(activeSourceId);
   const sourceLabel =
@@ -197,45 +295,57 @@ export function DiscoverPage(): React.JSX.Element {
         </section>
       )}
 
-      {/* 热门榜单（跟随当前音源；当前源没声明榜单时整块隐藏） */}
+      {/* 榜单精选（跟随当前音源；当前源没声明榜单时整块隐藏）。
+          两列卡片：左封面 + 右前三首。比原来的横向封面行多给了一层信息，
+          所以原来那条「热门榜单」行已经删掉，不再重复展示同一批榜单。 */}
       {showCharts && (
       <section className="mt-6 px-5">
         <SectionTitle
-          title="热门榜单"
+          title="榜单精选"
           action={
-            <button
-              type="button"
-              onClick={() => void navigate({ to: "/charts" })}
-              className="flex items-center gap-0.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
-            >
-              全部榜单
-              <ChevronRight className="h-3 w-3" />
-            </button>
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={() => void refreshSpotlight()}
+                disabled={refreshing}
+                title="刷新榜单"
+                aria-label="刷新榜单"
+                className="text-muted-foreground transition-colors hover:text-foreground disabled:opacity-50"
+              >
+                <RefreshCw className={cn("h-3.5 w-3.5", refreshing && "animate-spin")} />
+              </button>
+              <button
+                type="button"
+                onClick={() => void navigate({ to: "/charts" })}
+                className="flex items-center gap-0.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
+              >
+                全部榜单
+                <ChevronRight className="h-3 w-3" />
+              </button>
+            </div>
           }
         />
         {charts.length === 0 ? (
           <EmptyBlock icon={BarChart3} text="暂无榜单" />
         ) : (
-          <HorizontalScroller>
-            {charts.map((c) => (
-              <div
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+            {charts.slice(0, SPOTLIGHT_COUNT).map((c) => (
+              <ChartSpotlightCard
                 key={`${c.platform}-${c.id}`}
-                className="w-32 shrink-0 snap-start"
-              >
-                <CoverCard
-                  name={c.name}
-                  picUrl={c.picUrl}
-                  subtitle={c.description || undefined}
-                  onClick={() =>
-                    void navigate({
-                      to: "/chart/$platform/$id",
-                      params: { platform: c.platform, id: c.id },
-                    })
-                  }
-                />
-              </div>
+                chart={c}
+                tracks={chartTracks[`${c.platform}:${c.id}`]?.slice(0, SPOTLIGHT_TRACKS)}
+                total={chartTracks[`${c.platform}:${c.id}`]?.length}
+                onOpen={() =>
+                  void navigate({
+                    to: "/chart/$platform/$id",
+                    params: { platform: c.platform, id: c.id },
+                  })
+                }
+                onPlayAll={() => void playChart(c)}
+                onPlayTrack={(t) => void play(t)}
+              />
             ))}
-          </HorizontalScroller>
+          </div>
         )}
       </section>
       )}
@@ -291,7 +401,9 @@ export function DiscoverPage(): React.JSX.Element {
         {playlists.length === 0 ? (
           <EmptyBlock icon={Disc3} text="暂无推荐歌单" />
         ) : (
-          <CoverGrid fillRows>
+          // 只要一行：多出来的不进 DOM（maxRows 按实测列数换算），
+          // 竖着堆两三排会把下面的内容顶得太远，首页是导流不是列表页。
+          <CoverGrid maxRows={1}>
             {playlists.map((p) => (
               <CoverCard
                 key={p.id}

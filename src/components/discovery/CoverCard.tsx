@@ -68,6 +68,9 @@ export function CoverCard(props: {
  *
  * fillRows：把数量裁到列数的整数倍，用于首页这种「多一个少一个无所谓」的展示区；
  * 列表页（歌单广场 / 榜单）不能裁，否则会吞掉分页数据，所以默认关闭。
+ *
+ * maxRows：最多渲染几排（配合列数换算成条数）。首页「推荐歌单」只要一排，
+ * 多出来的数据不进 DOM —— 比 CSS 裁切干净，也不会留下可聚焦的隐藏卡片。
  */
 /** 目标卡片宽度（px）与间隙：128 与「新歌速递」的横滚卡片同宽 */
 const TARGET_CARD_W = 128;
@@ -76,6 +79,8 @@ const GAP = 12;
 export function CoverGrid(props: {
   children: React.ReactNode;
   fillRows?: boolean;
+  /** 最多渲染几排；不传 = 不限 */
+  maxRows?: number;
 }): React.JSX.Element {
   const ref = useRef<HTMLDivElement | null>(null);
   const [cols, setCols] = useState(5);
@@ -96,10 +101,12 @@ export function CoverGrid(props: {
   }, []);
 
   const items = Children.toArray(props.children);
+  const capped =
+    props.maxRows !== undefined ? items.slice(0, props.maxRows * cols) : items;
   const shown =
-    props.fillRows && measured && items.length > cols
-      ? items.slice(0, Math.floor(items.length / cols) * cols)
-      : items;
+    props.fillRows && measured && capped.length > cols
+      ? capped.slice(0, Math.floor(capped.length / cols) * cols)
+      : capped;
 
   return (
     <div
