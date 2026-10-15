@@ -3019,6 +3019,122 @@ pub async fn cmd_cancel_download(
     Ok(())
 }
 
+/// 批量暂停（下载页多选用）。先逐个请求停止，再一次性把仍在进行的行
+/// （pending / downloading）落成 paused（过滤在 store 层，见 pause_download_tasks）。
+/// 返回实际暂停的条数，让前端能提示「已暂停 N 个」。
+#[tauri::command(rename = "pause_downloads")]
+pub async fn cmd_pause_downloads(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    ids: Vec<String>,
+) -> Result<usize, String> {
+    let Some(db) = state.db.clone() else {
+        return Err("数据库不可用".to_string());
+    };
+    for id in &ids {
+        state.downloads.request_stop(id);
+    }
+    let paused = tauri::async_runtime::spawn_blocking(move || {
+        db.with(|c| crate::db::store::pause_download_tasks(c, &ids))
+    })
+    .await
+    .map_err(|e| format!("批量暂停失败: {e}"))??;
+    let _ = app.emit(EVENT_DOWNLOADS_CHANGED, ());
+    Ok(paused)
+}
+
+/// 批量取消（下载页多选用）。与单条取消同语义：停止 + 删 `.part` + 落 canceled，
+/// 只对仍在进行 / 暂停中的任务生效，返回实际取消的条数。
+#[tauri::command(rename = "cancel_downloads")]
+pub async fn cmd_cancel_downloads(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    ids: Vec<String>,
+) -> Result<usize, String> {
+    let Some(db) = state.db.clone() else {
+        return Err("数据库不可用".to_string());
+    };
+    for id in &ids {
+        state.downloads.request_stop(id);
+    }
+    let (canceled, parts) = tauri::async_runtime::spawn_blocking(move || {
+        db.with(|c| crate::db::store::cancel_download_tasks(c, &ids))
+    })
+    .await
+    .map_err(|e| format!("批量取消失败: {e}"))??;
+    // `.part` 取消后没有续传价值，删掉；文件不在就当已删（与单条取消一致）
+    for p in parts {
+        let _ = std::fs::remove_file(p);
+    }
+    let _ = app.emit(EVENT_DOWNLOADS_CHANGED, ());
+    Ok(canceled)
+}
+
+/// 批量继续 / 重试（下载页多选用）。逐条走 relaunch_download：与单条「继续 /
+/// 重试」完全同链路，排队等并发位由闸门自己排，恢复多少都不会突破同时下载数。
+/// 返回实际续上的条数；个别任务（已完成 / 不存在）跳过不算失败，
+/// 只有全部失败才把首个错误抛给前端。
+#[tauri::command(rename = "resume_downloads")]
+pub async fn cmd_resume_downloads(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    ids: Vec<String>,
+) -> Result<usize, String> {
+    let mut resumed = 0;
+    let mut first_err: Option<String> = None;
+    for id in ids {
+        match relaunch_download(app.clone(), &state, id).await {
+            Ok(()) => resumed += 1,
+            Err(e) => {
+                log::warn!("[download] 批量继续跳过: {e}");
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    let _ = app.emit(EVENT_DOWNLOADS_CHANGED, ());
+    if resumed == 0 {
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+    }
+    Ok(resumed)
+}
+
+/// 把前端取到的歌词写进下载目录（`<音频文件名>.lrc`）。下载完成时 Rust 侧
+/// 会先落一次本地缓存词（见 launch_download 的 sidecar）；这条命令兜另一种
+/// 情况：下载完成当时本地还没有歌词，之后播放 / 取词拿到再补写。
+#[tauri::command(rename = "write_download_lyric")]
+pub async fn cmd_write_download_lyric(
+    state: State<'_, AppState>,
+    id: String,
+    lrc: String,
+) -> Result<(), String> {
+    let Some(db) = state.db.clone() else {
+        return Err("数据库不可用".to_string());
+    };
+    if lrc.trim().is_empty() {
+        return Ok(()); // 纯音乐 / 空词不落文件
+    }
+    let task = tauri::async_runtime::spawn_blocking(move || {
+        db.with(|c| crate::db::store::download_task_by_id(c, &id))
+    })
+    .await
+    .map_err(|e| format!("读取下载任务失败: {e}"))??
+    .ok_or_else(|| "下载任务不存在".to_string())?;
+    if task.status != download::status::DONE {
+        return Err("该任务尚未下载完成".to_string());
+    }
+    let Some(file) = task.file_path else {
+        return Err("该任务没有音频文件".to_string());
+    };
+    let path = std::path::PathBuf::from(&file).with_extension("lrc");
+    tauri::async_runtime::spawn_blocking(move || std::fs::write(&path, lrc.as_bytes()))
+        .await
+        .map_err(|e| format!("写入歌词失败: {e}"))?
+        .map_err(|e| format!("写入歌词失败: {e}"))?;
+    Ok(())
+}
+
 /// 生成 explorer 的 `/select,` 参数。explorer 不按标准 argv 解析：路径必须
 /// **紧跟逗号**并被双引号包住，写成 `/select,<裸路径>` 会被空格截断，
 /// 资源管理器退回默认目录而不选中文件。
@@ -3385,7 +3501,9 @@ async fn launch_download(
 
     // 并发位已在函数开头 `begin` 过了（取址也算闸门内），这里直接带位执行：
     // 再 `begin` 一次会把自己锁死（自己占着位子等自己让位）。
-    download::run_job_with_slot(
+    let final_for_extras = final_path.clone();
+    let db_for_extras = Arc::clone(&db);
+    let outcome = download::run_job_with_slot(
         app,
         db,
         manager,
@@ -3400,6 +3518,13 @@ async fn launch_download(
         slot,
     )
     .await;
+
+    // 下载成功后把封面 / 歌词存到歌曲旁边（用户 2026-11「同时下载封面和歌词」）。
+    // 放在闸门 slot 释放**之后**——并发位是给下载占的，sidecar 是事后添头，
+    // 不能让它挡住排在后面的任务开跑。
+    if matches!(outcome, download::DownloadOutcome::Done(_)) {
+        download::save_download_extras(db_for_extras, &track, &final_for_extras).await;
+    }
 
     Ok(())
 }

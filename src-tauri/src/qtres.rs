@@ -650,6 +650,26 @@ fn fetch_cover_bytes(client: &reqwest::blocking::Client, url: &str) -> Option<Ve
         })
 }
 
+/// 下载完成时把封面**原图**存到歌曲旁边（用户 2026-11「下载歌曲同时下载封面」）。
+/// 供 download.rs 的 sidecar 用。与代取接口不同：不走缩略图改写也不进内存缓存
+/// （存盘要原图；大封面不该把内存缓存挤爆），只复用代取的客户端、referer 与
+/// https 升级。失败返回 None —— 封面是锦上添花，绝不阻断下载主流程。
+pub(crate) fn fetch_cover_original_bytes(url: &str) -> Option<Vec<u8>> {
+    if !host_allowed(url) {
+        log::warn!("[qtres] 封面 URL 主机不可信，跳过存盘: {url}");
+        return None;
+    }
+    let client = cover_client();
+    let https = upgrade_to_https(url);
+    let mut out = fetch_cover_bytes(client, &https);
+    if out.is_none() && https != url {
+        out = fetch_cover_bytes(client, url);
+    }
+    // 封面正常不过几 MB；网易云见过 12MB 的大图。再大的多半不是封面图，
+    // 稳妥起见不落盘。
+    out.filter(|b| !b.is_empty() && b.len() <= 20 * 1024 * 1024)
+}
+
 fn handle_cover(original_url: String, target_px: u32) -> Response<Vec<u8>> {
     // 缓存键 = 原始 URL + 目标边长：同一张封面在列表（300）和播放页（900）
     // 是两个不同的资源，混用同一个键会让播放页拿到 300px 的糊图。

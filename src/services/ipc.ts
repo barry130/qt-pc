@@ -432,6 +432,33 @@ export async function cancelDownload(id: string): Promise<void> {
   return invoke("cancel_download", { id });
 }
 
+// ---------- 批量操作（下载页多选，2026-11 下载管理完善） ----------
+// 与单条版同语义，只是按 id 列表过滤执行；服务端只动仍在进行 / 暂停中的行，
+// 返回实际生效的条数，让页面能提示「已暂停 N 个」。
+
+/** 批量暂停（多选后用）。返回实际暂停的条数（已完成 / 失败的自动跳过） */
+export async function pauseDownloads(ids: string[]): Promise<number> {
+  return invoke("pause_downloads", { ids });
+}
+
+/** 批量继续 / 重试（多选后用）。返回实际续上的条数 */
+export async function resumeDownloads(ids: string[]): Promise<number> {
+  return invoke("resume_downloads", { ids });
+}
+
+/** 批量取消（多选后用）。返回实际取消的条数 */
+export async function cancelDownloads(ids: string[]): Promise<number> {
+  return invoke("cancel_downloads", { ids });
+}
+
+/**
+ * 把取到的歌词补写成 `<音频文件名>.lrc`（下载完成时 Rust 侧已先落一份本地
+ * 缓存词；这条兜「下载当时还没词、之后才拿到」的情况）。空词不落文件。
+ */
+export async function writeDownloadLyric(id: string, lrc: string): Promise<void> {
+  return invoke("write_download_lyric", { id, lrc });
+}
+
 /** 在资源管理器中定位已下载的文件 */
 export async function revealDownload(id: string): Promise<void> {
   return invoke("reveal_download", { id });
@@ -487,6 +514,33 @@ export async function getDownloadNameFormat(): Promise<DownloadNameFormat> {
 /** 设置里的默认下载文件名格式：新开始的下载按此命名 */
 export async function setDownloadNameFormat(format: DownloadNameFormat): Promise<void> {
   await setSetting(DOWNLOAD_NAME_FORMAT_KEY, format);
+}
+
+// ---------- 下载 sidecar 开关（下载完成后同时存封面 / 歌词，2026-11） ----------
+// 键与 Rust 侧 download.rs 的 SETTING_DOWNLOAD_SAVE_COVER / SETTING_DOWNLOAD_SAVE_LYRIC
+// 一一对应；两边共用同一个默认口径：值 "0" = 关，其他 / 未设置 = 开（默认开）。
+
+/** 「下载完成后同时保存封面」的设置键（Rust 侧同名常量） */
+const DOWNLOAD_SAVE_COVER_KEY = "download.saveCover";
+/** 「下载完成后同时保存歌词」的设置键（Rust 侧同名常量） */
+const DOWNLOAD_SAVE_LYRIC_KEY = "download.saveLyric";
+
+/** 下载完成后是否同时保存封面（默认开） */
+export async function getDownloadSaveCover(): Promise<boolean> {
+  return (await getSetting(DOWNLOAD_SAVE_COVER_KEY)) !== "0";
+}
+
+export async function setDownloadSaveCover(on: boolean): Promise<void> {
+  await setSetting(DOWNLOAD_SAVE_COVER_KEY, on ? "1" : "0");
+}
+
+/** 下载完成后是否同时保存歌词（默认开） */
+export async function getDownloadSaveLyric(): Promise<boolean> {
+  return (await getSetting(DOWNLOAD_SAVE_LYRIC_KEY)) !== "0";
+}
+
+export async function setDownloadSaveLyric(on: boolean): Promise<void> {
+  await setSetting(DOWNLOAD_SAVE_LYRIC_KEY, on ? "1" : "0");
 }
 
 /** 同时下载数的合法范围（与 Rust `download::MIN/MAX_CONCURRENCY`、设置页选项一致） */

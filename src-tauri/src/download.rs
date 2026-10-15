@@ -632,6 +632,99 @@ async fn with_db<T: Send + 'static>(
         .map_err(|e| format!("数据库任务异常: {e}"))?
 }
 
+/// 「下载完成后同时保存封面 / 歌词」两个开关的设置键（用户 2026-11 下载管理
+/// 完善：参考网易云等，歌拷到别的播放器 / 设备上也能有图有词）。
+/// 与 settings 表通用口径一致：`"0"` = 关，其他 / 未设置 = 开，**默认开**。
+pub const SETTING_DOWNLOAD_SAVE_COVER: &str = "download.saveCover";
+pub const SETTING_DOWNLOAD_SAVE_LYRIC: &str = "download.saveLyric";
+
+/// 封面字节 → 扩展名。只认常见的四种魔数；认不出（错误页 / HTML）就不落盘，
+/// 免得在下载目录里攒垃圾文件。
+fn cover_ext(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("jpg")
+    } else if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        Some("png")
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        Some("webp")
+    } else if bytes.starts_with(b"GIF8") {
+        Some("gif")
+    } else {
+        None
+    }
+}
+
+/// 读取「下载 sidecar」类开关：`"0"` = 关，其他（含未设置）= 开。默认开——
+/// 网易云 / QQ 音乐也都是默认连封面歌词一起存，想要干净目录的去设置页关。
+async fn download_flag_on(db: &Arc<Database>, key: &str) -> bool {
+    let key = key.to_string();
+    with_db(db, move |c| crate::db::store::get_setting(c, &key))
+        .await
+        .ok()
+        .flatten()
+        .map(|v| v != "0")
+        .unwrap_or(true)
+}
+
+/// 下载成功后把封面 / 歌词存到歌曲旁边（`<音频文件名>.<ext>` / `.lrc`）。
+/// 由 `launch_download` 在 [`run_job_with_slot`] 拿到 Done 之后调用：
+/// - 封面：取**原图**（不走代取的缩略图改写与内存缓存，见
+///   `qtres::fetch_cover_original_bytes`），按魔数定扩展名；
+/// - 歌词：把库里已有的歌词先落一份 `.lrc`。下载当时还没词的（比如刚加的新歌），
+///   前端在之后拿到词时经 `write_download_lyric` 命令补写同一个文件。
+///
+/// 任何一步失败都只记日志：sidecar 是锦上添花，不能反过来把下载链路拖挂。
+pub async fn save_download_extras(
+    db: Arc<Database>,
+    track: &crate::provider::types::Track,
+    final_path: &Path,
+) {
+    let save_cover = download_flag_on(&db, SETTING_DOWNLOAD_SAVE_COVER).await;
+    let save_lyric = download_flag_on(&db, SETTING_DOWNLOAD_SAVE_LYRIC).await;
+
+    if save_cover && !track.pic_url.trim().is_empty() {
+        let url = track.pic_url.clone();
+        // 封面代取是阻塞 HTTP，挪进 blocking 池，别占着 tokio worker
+        let bytes = tauri::async_runtime::spawn_blocking(move || {
+            crate::qtres::fetch_cover_original_bytes(&url)
+        })
+        .await
+        .ok()
+        .flatten();
+        if let Some(bytes) = bytes {
+            match cover_ext(&bytes) {
+                Some(ext) => {
+                    let cover_path = final_path.with_extension(ext);
+                    if let Err(e) = std::fs::write(&cover_path, &bytes) {
+                        log::warn!("[download] 封面存盘失败: {e}");
+                    } else {
+                        log::info!("[download] 封面已存: {}", cover_path.display());
+                    }
+                }
+                None => log::warn!("[download] 封面格式未识别，跳过存盘"),
+            }
+        }
+    }
+
+    if save_lyric {
+        let track_key = crate::db::store::db_track_id(track);
+        let existing = with_db(&db, move |c| crate::db::store::get_lyric(c, &track_key))
+            .await
+            .ok()
+            .flatten();
+        if let Some(rec) = existing {
+            if !rec.lrc.trim().is_empty() {
+                let lrc_path = final_path.with_extension("lrc");
+                if let Err(e) = std::fs::write(&lrc_path, rec.lrc.as_bytes()) {
+                    log::warn!("[download] 歌词存盘失败: {e}");
+                } else {
+                    log::info!("[download] 歌词已存: {}", lrc_path.display());
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

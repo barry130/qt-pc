@@ -2558,21 +2558,28 @@ function DownloadSection(): React.JSX.Element {
   const [concurrency, setConcurrency] = useState(ipc.DEFAULT_DOWNLOAD_CONCURRENCY);
   // 选了 >3 时先挂在这里等用户确认。沿用全项目唯一的二次确认手法：原地换文案再点第二下
   const [pendingConcurrency, setPendingConcurrency] = useState<number | null>(null);
+  // 下载成功的就地附件（封面原图 / 歌词），Rust 侧默认开，这里只做镜像
+  const [saveCover, setSaveCover] = useState(true);
+  const [saveLyric, setSaveLyric] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async (): Promise<void> => {
     try {
-      const [d, q, f, c] = await Promise.all([
+      const [d, q, f, c, sc, sl] = await Promise.all([
         ipc.getDownloadDir(),
         ipc.getDownloadQuality(),
         ipc.getDownloadNameFormat(),
         ipc.getDownloadConcurrency(),
+        ipc.getDownloadSaveCover(),
+        ipc.getDownloadSaveLyric(),
       ]);
       setDir(d);
       setQuality(q);
       setNameFormat(f);
       setConcurrency(c);
+      setSaveCover(sc);
+      setSaveLyric(sl);
     } catch (err) {
       setError(errMsg(err));
     }
@@ -2626,6 +2633,34 @@ function DownloadSection(): React.JSX.Element {
     try {
       await ipc.setDownloadNameFormat(f);
       setNameFormat(f);
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // 附件开关是「只影响之后完成的任务」：关掉时已落盘的封面 / .lrc 不回收，
+  // 描述里说清楚了，这里不弹确认
+  const chooseSaveCover = async (v: boolean): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    try {
+      await ipc.setDownloadSaveCover(v);
+      setSaveCover(v);
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const chooseSaveLyric = async (v: boolean): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    try {
+      await ipc.setDownloadSaveLyric(v);
+      setSaveLyric(v);
     } catch (err) {
       setError(errMsg(err));
     } finally {
@@ -2713,6 +2748,18 @@ function DownloadSection(): React.JSX.Element {
           <option value="artist">歌手 - 歌名</option>
           <option value="song">歌名 - 歌手</option>
         </select>
+      </SettingRow>
+      <SettingRow
+        title="同时下载封面"
+        description="下载完成后把封面原图存到歌曲旁边（文件名与歌曲相同）。仅影响之后完成的任务。"
+      >
+        <Switch checked={saveCover} onToggle={() => void chooseSaveCover(!saveCover)} />
+      </SettingRow>
+      <SettingRow
+        title="同时下载歌词"
+        description="下载完成后把歌词存为同名 .lrc 文件（优先用已缓存的词，没有才联网补取）。仅影响之后完成的任务。"
+      >
+        <Switch checked={saveLyric} onToggle={() => void chooseSaveLyric(!saveLyric)} />
       </SettingRow>
       <SettingRow
         title="同时下载数"

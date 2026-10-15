@@ -276,6 +276,61 @@ pub(crate) fn set_download_part_path(
     Ok(())
 }
 
+/// 批量暂停（多选 / 全部暂停共用）：只把仍在进行的任务（pending / downloading）
+/// 置为 paused 并写上继续提示，已完成 / 失败 / 已取消的行原样跳过。
+/// 返回实际置上的条数。逐条 UPDATE + 状态过滤，天然幂等：重复调用不会把
+/// paused 改成 paused 之外的任何东西，也不会碰已完成的行。
+pub(crate) fn pause_download_tasks(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<usize, rusqlite::Error> {
+    let mut paused = 0;
+    for id in ids {
+        paused += conn.execute(
+            "UPDATE download_tasks
+                SET status = 'paused', error = '已暂停，点击「继续」接着下载', updated_at = ?2
+              WHERE id = ?1 AND status IN ('pending', 'downloading')",
+            params![id, now_ms()],
+        )?;
+    }
+    Ok(paused)
+}
+
+/// 批量取消（多选 / 单选取消共用）：把仍在进行或暂停的任务置为 canceled，
+/// 返回 (实际取消的条数, 这些任务的 `.part` 路径)，调用方负责删临时文件。
+/// `.part` 在取消后没有续传价值，留在磁盘上只会被用户当成垃圾文件。
+pub(crate) fn cancel_download_tasks(
+    conn: &Connection,
+    ids: &[String],
+) -> Result<(usize, Vec<String>), rusqlite::Error> {
+    let mut canceled = 0;
+    let mut parts: Vec<String> = Vec::new();
+    for id in ids {
+        let affected = conn.execute(
+            "UPDATE download_tasks
+                SET status = 'canceled', error = NULL, updated_at = ?2
+              WHERE id = ?1 AND status IN ('pending', 'downloading', 'paused')",
+            params![id, now_ms()],
+        )?;
+        if affected == 0 {
+            continue;
+        }
+        canceled += affected;
+        if let Some(part) = conn
+            .query_row(
+                "SELECT part_path FROM download_tasks WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten()
+        {
+            parts.push(part);
+        }
+    }
+    Ok((canceled, parts))
+}
+
 /// 应用启动时清理：上次退出时仍在 pending / downloading 的任务已无工作线程，
 /// 统一落成 paused，避免界面永远显示「下载中」。
 pub(crate) fn mark_stale_downloads_paused(conn: &Connection) -> Result<usize, rusqlite::Error> {

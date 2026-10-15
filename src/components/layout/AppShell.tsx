@@ -26,6 +26,7 @@ import { usePlayerStore } from "@/stores/player";
 import { useSourceRegistryStore } from "@/stores/sourceRegistry";
 import { useDownloadsStore } from "@/stores/downloads";
 import { useDislikesStore } from "@/stores/dislikes";
+import { syncDownloadLyricSidecars } from "@/lib/downloadSidecars";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { initStat, trackStatPage } from "@/lib/stat";
 import { syncLogLevel } from "@/lib/logger";
@@ -132,6 +133,18 @@ export function AppShell(): React.JSX.Element {
       off?.();
     };
   }, [refreshDownloads]);
+
+  // 歌词 sidecar 补写（2026-11「下载歌曲同时下载封面和歌词」）：任务翻到
+  // 「已完成」的那一次串行补取词并写 `<音频文件名>.lrc`（封面与已缓存词由
+  // Rust 侧在下载成功时就地落盘，见 download.rs 的 save_download_extras）。
+  // 订阅 store 而不是 downloads-changed 事件：事件只驱动 refresh，词要等
+  // refresh 把新状态写进 store 后才有得看。
+  useEffect(() => {
+    const off = useDownloadsStore.subscribe((s) => {
+      syncDownloadLyricSidecars(s.tasks);
+    });
+    return off;
+  }, []);
 
   // 屏蔽规则：启动拉一次。它不像下载那样有 Rust 事件驱动 —— 规则只可能由本窗口
   // 的写命令改动，而写命令所在的 store 动作自己会 refresh，这里补上冷启动那一次。

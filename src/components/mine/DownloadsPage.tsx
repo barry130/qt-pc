@@ -38,7 +38,9 @@ function formatBytes(n: number | null | undefined): string {
  * 进行中的任务额外按 1s 轮询拿进度（进度写库不广播，避免高频事件）。
  *
  * 行内操作与本地曲库一致：定位 / 删除都是图标按钮（悬停有文字提示），
- * 删除走下拉菜单（只删记录 / 连文件一起删）；列表支持全选 + 批量删除。
+ * 删除走下拉菜单（只删记录 / 连文件一起删）；列表支持全选 + 批量管理
+ * （删除 / 暂停 / 继续 / 取消，2026-11 下载管理完善）。批量版 IPC 与单条
+ * 同语义，只是按 id 列表过滤执行，不适用状态（已完成 / 失败）自动跳过。
  */
 export function DownloadsPage(): React.JSX.Element {
   const tasks = useDownloadsStore((s) => s.tasks);
@@ -46,6 +48,7 @@ export function DownloadsPage(): React.JSX.Element {
   const refresh = useDownloadsStore((s) => s.refresh);
   const [dir, setDir] = useState("");
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [batchBusy, setBatchBusy] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const allRef = useRef<HTMLInputElement | null>(null);
 
@@ -118,36 +121,59 @@ export function DownloadsPage(): React.JSX.Element {
     }
   };
 
-  const pauseAll = async (): Promise<void> => {
+  /** 批量版同款：整个批量期间锁住所有批量 / 全局按钮，成功静默（列表自会刷新） */
+  const runBatch = async (fn: () => Promise<number>, errLabel: string): Promise<void> => {
+    setBatchBusy(true);
     try {
-      await Promise.all(
-        tasks
-          .filter((t) => t.status === "downloading" || t.status === "pending")
-          .map((t) => ipc.pauseDownload(t.id)),
-      );
+      await fn();
       await load();
     } catch (err) {
-      toastError(`全部暂停失败：${errMsg(err)}`);
+      toastError(`${errLabel}：${errMsg(err)}`);
+    } finally {
+      setBatchBusy(false);
     }
   };
 
-  const clearFinished = async (): Promise<void> => {
-    try {
-      await Promise.all(
-        tasks
-          .filter((t) => t.status === "done")
-          .map((t) => ipc.deleteDownload(t.id, false)),
-      );
-      await load();
-    } catch (err) {
-      toastError(`清理已完成失败：${errMsg(err)}`);
-    }
-  };
+  const inflightIds = tasks
+    .filter((t) => t.status === "downloading" || t.status === "pending")
+    .map((t) => t.id);
+  const pausedIds = tasks.filter((t) => t.status === "paused").map((t) => t.id);
+  const doneIds = tasks.filter((t) => t.status === "done").map((t) => t.id);
 
-  const doneCount = tasks.filter((t) => t.status === "done").length;
-  const activeCount = tasks.filter(
+  // 批量按钮的适用范围与 Rust 侧过滤保持一致：暂停 = 进行中；继续 / 重试 =
+  // 暂停 / 失败 / 已取消；取消 = 进行中 / 暂停（已完成两种都不动）
+  const selTasks = tasks.filter((t) => selected.has(t.id));
+  const selInFlight = selTasks.filter(
     (t) => t.status === "downloading" || t.status === "pending",
-  ).length;
+  );
+  const selResumable = selTasks.filter(
+    (t) => t.status === "paused" || t.status === "failed" || t.status === "canceled",
+  );
+  const selCancelable = selTasks.filter(
+    (t) =>
+      t.status === "downloading" ||
+      t.status === "pending" ||
+      t.status === "paused",
+  );
+
+  const pauseAll = () =>
+    runBatch(() => ipc.pauseDownloads(inflightIds), "全部暂停失败");
+  /** 全部继续只续「已暂停」：失败 / 已取消混在列表里时挨个重试是明确动作，不替用户做主 */
+  const resumeAll = () =>
+    runBatch(() => ipc.resumeDownloads(pausedIds), "全部继续失败");
+  const clearFinished = () =>
+    runBatch(() => ipc.deleteDownloads(doneIds, false), "清理已完成失败");
+
+  const pauseSelected = () =>
+    runBatch(() => ipc.pauseDownloads(selInFlight.map((t) => t.id)), "批量暂停失败");
+  const resumeSelected = () =>
+    runBatch(() => ipc.resumeDownloads(selResumable.map((t) => t.id)), "批量继续失败");
+  const cancelSelected = () =>
+    runBatch(() => ipc.cancelDownloads(selCancelable.map((t) => t.id)), "批量取消失败");
+
+  const doneCount = doneIds.length;
+  const activeCount = inflightIds.length;
+  const pausedCount = pausedIds.length;
 
   return (
     <div className="flex h-full min-w-0 flex-col">
@@ -155,12 +181,25 @@ export function DownloadsPage(): React.JSX.Element {
         <div className="flex items-center justify-between gap-3">
           <h1 className="text-base font-medium">下载管理</h1>
           <div className="flex items-center gap-1">
+            {pausedCount > 0 && (
+              <IconButton
+                label="全部继续"
+                variant="outline"
+                size="md"
+                hover="secondary"
+                disabled={batchBusy}
+                onClick={() => void resumeAll()}
+              >
+                <Play />
+              </IconButton>
+            )}
             {activeCount > 0 && (
               <IconButton
                 label="全部暂停"
                 variant="outline"
                 size="md"
                 hover="secondary"
+                disabled={batchBusy}
                 onClick={() => void pauseAll()}
               >
                 <Pause />
@@ -173,6 +212,7 @@ export function DownloadsPage(): React.JSX.Element {
                 size="md"
                 hover="secondary"
                 danger
+                disabled={batchBusy}
                 onClick={() => void clearFinished()}
               >
                 <Eraser />
@@ -213,6 +253,43 @@ export function DownloadsPage(): React.JSX.Element {
               onDeleted={() => setSelected(new Set())}
               onError={(msg) => toastError(msg)}
             />
+            {selResumable.length > 0 && (
+              <IconButton
+                label={`继续 / 重试所选（${selResumable.length}）`}
+                variant="outline"
+                size="md"
+                hover="secondary"
+                disabled={batchBusy}
+                onClick={() => void resumeSelected()}
+              >
+                <Play />
+              </IconButton>
+            )}
+            {selInFlight.length > 0 && (
+              <IconButton
+                label={`暂停所选（${selInFlight.length}）`}
+                variant="outline"
+                size="md"
+                hover="secondary"
+                disabled={batchBusy}
+                onClick={() => void pauseSelected()}
+              >
+                <Pause />
+              </IconButton>
+            )}
+            {selCancelable.length > 0 && (
+              <IconButton
+                label={`取消所选（${selCancelable.length}）`}
+                variant="outline"
+                size="md"
+                hover="secondary"
+                danger
+                disabled={batchBusy}
+                onClick={() => void cancelSelected()}
+              >
+                <X />
+              </IconButton>
+            )}
             {selected.size > 0 && (
               <>
                 <span className="text-xs text-muted-foreground">

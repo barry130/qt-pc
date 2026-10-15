@@ -560,6 +560,71 @@ fn delete_download_tasks_batch_returns_paths_of_selected_only() {
     assert_eq!(list_download_tasks(&conn).expect("list").len(), 1);
 }
 
+/// 批量暂停 / 取消：只动仍在进行（或暂停中）的任务，其余状态原样跳过；
+/// 取消还要把被取消任务的 `.part` 路径回传给调用方删文件
+///（用户 2026-11「批量暂停、批量取消等通用的下载管理」）
+#[test]
+fn download_batch_pause_and_cancel_filter_by_status() {
+    let conn = test_conn();
+    let a = create_download_task(&conn, &track("8001", "甲"), "320", Some("a.part"), None)
+        .expect("a");
+    let b = create_download_task(&conn, &track("8002", "乙"), "320", Some("b.part"), None)
+        .expect("b");
+    let c = create_download_task(&conn, &track("8003", "丙"), "320", Some("c.part"), None)
+        .expect("c");
+    let d = create_download_task(&conn, &track("8004", "丁"), "320", Some("d.part"), None)
+        .expect("d");
+    update_download_progress(&conn, &b, 0.3).expect("b -> downloading");
+    finish_download_task(&conn, &c, "D:\\dl\\c.mp3", 10).expect("c -> done");
+    fail_download_task(&conn, &d, "网络错误").expect("d -> failed");
+
+    // 批量暂停：只有 pending / downloading 的甲、乙被置为 paused 并带上继续提示；
+    // 已完成 / 失败的丙、丁原样不动
+    let paused = pause_download_tasks(&conn, &[a.clone(), b.clone(), c.clone(), d.clone()])
+        .expect("pause batch");
+    assert_eq!(paused, 2);
+    let tasks = list_download_tasks(&conn).expect("list");
+    let status_of = |id: &str| tasks.iter().find(|x| x.id == id).expect("找到").status.clone();
+    assert_eq!(status_of(&a), "paused");
+    assert_eq!(status_of(&b), "paused");
+    assert_eq!(status_of(&c), "done");
+    assert_eq!(status_of(&d), "failed");
+    assert!(
+        tasks
+            .iter()
+            .find(|x| x.id == a)
+            .expect("找到")
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("继续")),
+        "暂停要带「继续」提示"
+    );
+    // 暂停不动 `.part`（续传要用）
+    assert!(tasks.iter().find(|x| x.id == a).expect("找到").part_path.is_some());
+
+    // 批量取消：暂停中的甲、乙被取消并回传 `.part`；done / failed 的丙、丁跳过
+    let (canceled, parts) =
+        cancel_download_tasks(&conn, &[a.clone(), b.clone(), c.clone(), d.clone()])
+            .expect("cancel batch");
+    assert_eq!(canceled, 2);
+    let parts: Vec<String> = parts;
+    assert!(parts.contains(&"a.part".to_string()));
+    assert!(parts.contains(&"b.part".to_string()));
+    assert!(!parts.iter().any(|p| p.contains("c.part")));
+    let tasks = list_download_tasks(&conn).expect("list");
+    let status_of = |id: &str| tasks.iter().find(|x| x.id == id).expect("找到").status.clone();
+    assert_eq!(status_of(&a), "canceled");
+    assert_eq!(status_of(&b), "canceled");
+    assert_eq!(status_of(&c), "done");
+    assert_eq!(status_of(&d), "failed");
+    // 取消清错误列（不该留上一步的暂停提示）
+    assert!(tasks.iter().find(|x| x.id == a).expect("找到").error.is_none());
+
+    // 空数组：不动任何数据
+    assert_eq!(pause_download_tasks(&conn, &[]).expect("pause empty"), 0);
+    assert!(cancel_download_tasks(&conn, &[]).expect("cancel empty").0 == 0);
+}
+
 /// 下载 2.0：去重命中范围、离线文件查找、启动时把旧任务落成 paused（§5.3）
 #[test]
 fn download_dedupe_offline_lookup_and_stale_cleanup() {

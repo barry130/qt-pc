@@ -556,7 +556,7 @@ Windows 平台注意事项（原文未覆盖，均为实测坑点）：
 | `/my/playlists` | 我的歌单 | 本地歌单管理（原「收藏」已并入本页）；「导入」用 `ClipboardPaste` 而非 `Import`（后者 16px 下与「下载」同形），本地歌单行尾删除入口用**实心红心**（与详情页「本地歌单恒为已收藏态」红心同观感）且走二次确认（在线歌单「取消收藏」是 `HeartOff`，不动歌，一次点击） |
 | `/my/playlist/:id` | 本地歌单详情 | 本地歌单曲目（与 `/playlist/:platform/:id` **共用同一页面组件**，platform 传 `local` 分叉；曲目行只有「收藏」红心，取消勾选当前歌单即从本歌单移除；页头红心恒为已收藏态，点它 = 二次确认后删除歌单并回本页） |
 | `/history` | 播放历史 | 最近播放与完整历史 |
-| `/downloads` | 下载管理 | 下载队列与已完成 |
+| `/downloads` | 下载管理 | 下载队列与已完成；全选 + 批量暂停 / 继续 / 取消 / 删除，工具栏全部暂停 / 全部继续 / 清理已完成（批量口径见 §13.4） |
 | `/playing` | 播放页 | 大封面、滚动歌词、频谱、队列预览 |
 | `/stats` | 听歌报告 | 本地播放统计（对齐移动端 `pages/stats`，原文缺失） |
 | `/feedback` | 意见反馈 | 提交、我的、公开反馈 |
@@ -2489,14 +2489,19 @@ Provider.lyric() （wyy 额外取 translation）
 | `open_cache_folder` | 无 | `boolean` |
 | `get_cache_size` | 无 | `CacheInfo` |
 | `clear_cache` | `types` | `CacheInfo` |
-| `get_download_tasks` | 无 | `DownloadTask[]` |
-| `enqueue_download` | `trackId, quality` | `DownloadTask` |
-| `cancel_download` | `taskId` | `DownloadTask` |
-| `retry_download` | `taskId` | `DownloadTask` |
-| `remove_download` | `taskId, deleteFile` | `boolean` |
-| `clear_downloads` | `deleteFiles` | `boolean` |
-| `set_download_dir` | `path` | `Settings` |
-| `open_download_folder` | 无 | `boolean` |
+| `list_downloads` | 无 | `DownloadTask[]` |
+| `list_downloaded_track_ids` | 无 | `string[]`（曲目行「已下载」标） |
+| `start_download` | `track, quality` | `taskId`（只入队不取址，见 §13.4） |
+| `pause_download` / `pause_downloads` | `taskId` / `ids` | 无 / 实际生效条数 |
+| `resume_download` / `resume_downloads` | `taskId` / `ids` | 无 / 实际生效条数 |
+| `retry_download` | `taskId` | 无（与「继续」同链路，语义上区分便于文案） |
+| `cancel_download` / `cancel_downloads` | `taskId` / `ids` | 无 / 实际生效条数（均会删 `.part`） |
+| `delete_download` / `delete_downloads` | `taskId, deleteFile` / `ids, deleteFile` | `boolean` / `boolean` |
+| `write_download_lyric` | `taskId, lrc` | `boolean`（歌词附件补写，见 §13.4） |
+| `reveal_download` | `taskId` | `boolean`（资源管理器定位） |
+| `get_download_dir` / `choose_download_dir` / `reset_download_dir` | 无 / 无 / 无 | 目录路径 |
+| `get_download_concurrency` / `set_download_concurrency` | 无 / `n` | 生效并发数（Rust 侧夹 1–6） |
+| 其余下载偏好（默认音质 / 文件名格式 / 同时下载封面 / 同时下载歌词） | 走通用 `get_setting` / `set_setting`（键 `download.*`） | — |
 | `backup_database` | `path` | `boolean` |
 | `restore_database` | `path` | `boolean` |
 ## 11.7 Astral 服务相关
@@ -2873,6 +2878,11 @@ export interface DownloadTask {
    │
    ▼
 更新任务状态为 completed
+   │
+   ▼
+按设置落盘附件：封面原图（与歌曲同名，按魔数定扩展名）+ 同名 `.lrc` 歌词
+（附件失败不影响音频，安静跳过）
+
 ```
 
 > 「只入队不取址」（2026-11 用户口径）：播放地址是音源限时签发的短时凭据，
@@ -2881,17 +2891,40 @@ export interface DownloadTask {
 > `launch_download` 拿到并发位之后 —— 与「继续 / 重试」同一条链路，
 > 轮到哪首取哪首。取址失败不再发生在点击时，而是在后台落成 failed 终态
 > （带原因并广播），下载列表里看得到、可重试。
+>
+> 「同时下载封面和歌词」（2026-11 用户口径，参考主流音乐软件）：任务完成时
+> 就地把附件存到歌曲旁边，而不是打包成 zip 或塞进二进制标签。封面走 `qtres`
+> 的代取基础设施（域名白名单 + referer + https 升级），取**原图**而非缩略图，
+> 魔数嗅探定 `.jpg/.png/.webp`、上限 20MB；歌词是纯文本 `.lrc`（不带翻译），
+> Rust 侧先查本地词库缓存，缓存没有时由前端在任务翻到 completed 的那一刻
+> 联网补取并经 `write_download_lyric` 写盘（避免后端为写一个文件引入整套
+> 取词脚本）。附件是「锦上添花」：任何一步失败只跳过该附件，不回滚音频、
+> 不把任务改回失败。两个开关（`download.saveCover` / `download.saveLyric`，
+> 默认开）只影响**之后完成**的任务，关掉不回收已落盘的附件。
+
+### 批量管理
+
+下载页与本地曲库同一套多选交互：全选框 + 已选 N + 批量按钮。批量命令
+（`pause_downloads` / `resume_downloads` / `cancel_downloads` /
+`delete_downloads`）与单条同语义，只是按 id 列表执行；**不适用的状态在
+store 层过滤**（如暂停只作用于 pending / downloading），返回实际生效条数，
+前端按返回数提示。工具栏的「全部暂停 / 全部继续 / 清理已完成」就是对应
+批量命令套在过滤后的 id 列表上，不再前端 `Promise.all` 逐条打单条接口
+（N 条任务会放大成 N 次广播，且中途失败没有部分成功的语义）。「全部继续」
+只续**已暂停**的；失败 / 已取消的挨个重试是用户的明确动作，不替用户做主。
 
 ### 设计规则
 
 1. 下载队列默认低并发执行，避免占用过多带宽。
 2. 下载使用临时文件，完成后原子移动到目标目录。
-3. 下载过程中应用退出后，下次启动将未完成任务标记为失败并支持重试。
+3. 下载过程中应用退出后，下次启动把未完成任务标记为已暂停，支持继续 / 重试。
 4. 远程播放地址只在任务轮到并发位后才获取（见上方流程图与引注）。
 5. 本地已存在同 `platform + trackId + quality` 文件时不重复下载。
 6. 离线播放时优先匹配本地文件。
 7. 删除下载记录时可选择是否删除文件。
 8. 下载目录可在设置中修改。
+9. 批量操作按 id 列表在 store 层过滤不适用状态，返回实际生效数（见「批量管理」）。
+10. 完成的任务按设置落盘封面 / 歌词附件；附件失败不影响任务本身（见引注）。
 ## 14. 系统集成设计
 
 ## 14.1 托盘
