@@ -245,6 +245,7 @@ pub(crate) const MIGRATIONS: &[(i64, &str)] = &[
     (12, V12),
     (13, V13),
     (14, V14),
+    (15, V15),
 ];
 
 const V1: &str = r#"
@@ -514,8 +515,21 @@ const V14: &str = r#"
 ALTER TABLE download_tasks ADD COLUMN actual_quality TEXT;
 "#;
 
+/// V15：听歌统计的「完播次数」。
+///
+/// 背景：统计的老口径是**起播即结算** —— 次数 +1、`total_played_ms` 直接加上整曲
+/// 时长，点开听 3 秒跳过的歌与完整听完的歌在报告里一模一样（累计时长因此虚高）。
+/// 改成按真实收听结算后，「有效播放次数」和「完整听完的次数」是两件事，
+/// 需要单独一列把完播记下来，报告页才能给出完播率。
+///
+/// 默认 0：老数据的完播情况无从考证（那时根本没记），归零比编一个数诚实；
+/// 新库由 V1 建表后紧跟这条 ALTER，列一定在。
+const V15: &str = r#"
+ALTER TABLE play_stats ADD COLUMN finished_count INTEGER NOT NULL DEFAULT 0;
+"#;
+
 /// 当前程序支持的最新 schema 版本。
-pub(crate) const CURRENT_VERSION: i64 = 14;
+pub(crate) const CURRENT_VERSION: i64 = 15;
 
 /// 建表 schema_migrations 并把所有未应用版本按序执行。
 pub(crate) fn run(conn: &Connection) -> Result<(), rusqlite::Error> {

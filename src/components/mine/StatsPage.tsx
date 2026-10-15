@@ -17,7 +17,9 @@ import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 /**
  * 听歌报告（路由 /stats，侧边栏同名，DESIGN §5.3）。
  *
- * 数据由播放引擎在起播时写进 play_stats：次数 +1、时长按曲目时长累加；
+ * 数据由播放引擎按**真实收听**结算后写进 play_stats（切歌 / 停止 / 播完时）：
+ * 时长记的是真听了多久（暂停与拖动跳过的不算），次数只在「播完，或听满曲目
+ * 一半且不少于 30 秒」时 +1，播完的另外单独记一列成完播率（DESIGN §5.3）；
  * 曲目 / 歌手排行都出自同一张表。没有记录时给空态，而不是一堆 0。
  *
  * 版面按「报告」而不是「后台统计」排（2026-11 用户：原页太丑）：
@@ -27,8 +29,8 @@ import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
  *   压在封面上；5 名以后退回紧凑行 + 次数占比条，一屏内看全；
  * - 常听歌手没有头像可用（统计表只存名字），用首字圆形占位 + 占比条，
  *   与歌手页 hero 的首字占位同一观感。
- * 所有数字都是库里的真值或直接均值（平均每次时长 = 总时长 / 总次数），
- * 不造「活跃天数」这类库里有但我们没记的指标。
+ * 所有数字都是库里的真值或直接均值（平均每次时长 = 总时长 / 总次数、
+ * 完播率 = 完播次数 / 总次数），不造「活跃天数」这类库里有但我们没记的指标。
  */
 export function StatsPage(): React.JSX.Element {
   const navigate = useNavigate();
@@ -76,7 +78,15 @@ export function StatsPage(): React.JSX.Element {
     };
   }, [active]);
 
-  const empty = !overview || overview.totalPlays === 0;
+  // 空态看「有没有听过」而不是「有没有有效播放」：新用户一路跳着听，
+  // 时长不为 0 但一次有效播放都攒不出来，报「没有记录」是撒谎
+  const empty = !overview || (overview.totalPlays === 0 && overview.totalMs === 0);
+  // 完播率 / 平均每次：库里的真值相除（有效播放为 0 时那两个小注不渲染）
+  const hasPlays = !!overview && overview.totalPlays > 0;
+  const finishRate =
+    overview && hasPlays
+      ? Math.round((overview.finishedPlays / overview.totalPlays) * 100)
+      : 0;
 
   return (
     <div className="h-full min-w-0 overflow-y-auto px-6 py-6">
@@ -91,7 +101,7 @@ export function StatsPage(): React.JSX.Element {
               <div className="min-w-0">
                 <h1 className="text-2xl font-bold tracking-tight">听歌报告</h1>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  数据来自本地播放记录：起播即计数，与音源无关，只存在你自己的库里。
+                  数据来自本地播放记录：听完或听满一半才算一次，与音源无关，只存在你自己的库里。
                 </p>
               </div>
               {tracks.length > 0 && (
@@ -122,9 +132,13 @@ export function StatsPage(): React.JSX.Element {
                 <HeroStat
                   label="累计时长"
                   value={formatMs(overview.totalMs)}
-                  sub={`平均每次 ${formatMs(
-                    Math.round(overview.totalMs / overview.totalPlays),
-                  )}`}
+                  sub={
+                    hasPlays
+                      ? `平均每次 ${formatMs(
+                          Math.round(overview.totalMs / overview.totalPlays),
+                        )}`
+                      : undefined
+                  }
                 />
                 <HeroStat label="曲目数" value={`${overview.trackCount} 首`} />
                 <HeroStat
@@ -136,6 +150,15 @@ export function StatsPage(): React.JSX.Element {
                   }
                 />
               </div>
+              {overview.finishedPlays > 0 && (
+                <p className="relative mt-5 border-t border-border/60 pt-3 text-xs text-muted-foreground">
+                  其中完整听完{" "}
+                  <span className="font-medium text-foreground">
+                    {overview.finishedPlays}
+                  </span>{" "}
+                  次 · 完播率 {finishRate}%
+                </p>
+              )}
             </div>
 
             {tracks.length > 0 && (

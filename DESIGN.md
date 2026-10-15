@@ -558,7 +558,7 @@ Windows 平台注意事项（原文未覆盖，均为实测坑点）：
 | `/history` | 播放历史 | 最近播放与完整历史 |
 | `/downloads` | 下载管理 | 下载队列与已完成；全选 + 批量暂停 / 继续 / 取消 / 删除，工具栏全部暂停 / 全部继续 / 清理已完成（批量口径见 §13.4） |
 | `/playing` | 播放页 | 大封面、滚动歌词、频谱、队列预览 |
-| `/stats` | 听歌报告 | 本地播放统计（对齐移动端 `pages/stats`，原文缺失）；报告式版面：hero 数字带（总播放 / 累计时长 / 曲目数 / 最近播放）+ 常听歌曲前 4 封面卡、其后紧凑行带占比条 + 常听歌手首字圆 + 占比条，数字只写真值与直接均值（2026-11 重排，用户嫌原版太丑） |
+| `/stats` | 听歌报告 | 本地播放统计（对齐移动端 `pages/stats`，原文缺失）；报告式版面：hero 数字带（总播放 / 累计时长 / 曲目数 / 最近播放）+ 完播率脚注 + 常听歌曲前 4 封面卡、其后紧凑行带占比条 + 常听歌手首字圆 + 占比条，数字只写真值与直接均值（2026-11 重排，用户嫌原版太丑；同月改为按真实收听结算，见 §5.3 play_stats） |
 | `/feedback` | 意见反馈 | 提交、我的、公开反馈 |
 | `/profile` | 个人中心 | 资料、签到、退出登录 |
 | `/login` | 登录 / 注册 | 含邮箱验证码、忘记密码（`changePass`） |
@@ -1602,10 +1602,14 @@ CREATE INDEX idx_play_history_time ON play_history(played_at DESC);
 
 ### play_stats
 
+v1 建表，v15 补 `finished_count`（下方为**当前**完整形态）：
+
 ```sql
 CREATE TABLE play_stats (
   track_id TEXT PRIMARY KEY,
   play_count INTEGER NOT NULL DEFAULT 0,
+  -- 其中完整听完的次数（v15）；老数据的完播情况当年没记，补列时归 0
+  finished_count INTEGER NOT NULL DEFAULT 0,
   last_played_at INTEGER NOT NULL,
   total_played_ms INTEGER NOT NULL DEFAULT 0,
   FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
@@ -1613,6 +1617,25 @@ CREATE TABLE play_stats (
 
 CREATE INDEX idx_play_stats_count ON play_stats(play_count DESC);
 ```
+
+**结算口径（2026-11 修正，用户：累计时长要考虑一首歌是不是听完了）**：
+旧口径是「起播即结算」——挂载成功就把整曲时长记进 `total_played_ms`、`play_count`
++1，中途跳过从不回写，于是「点开听 10 秒切掉」与完整听完在报告里完全一样，
+累计时长与平均每次都被抬高。现在由 `audio/engine.rs` 的 `ListenSession`
+按**真实收听**记账并在结束时结算（切歌 / 停止 / 播完 / 退出，另有每 30 秒的
+定期落库兜底）：
+
+- **时长**按墙钟累计，且只在内容位置**真的在推进**时计：暂停、缓冲卡住、
+  拖动 seek 跳过的那一段都不算；倍速不影响（听 1 分钟就是 1 分钟）。
+- **一次有效播放**（`play_count`）＝ 自然播完，或收听 ≥ 曲目时长一半**且**
+  ≥ 30 秒（`db::store::counts_as_play`；时长未知时只认 30 秒门槛）。
+- **完播**（`finished_count`）单独一列，只在自然播完时 +1，报告页用它算完播率。
+- 同一首的**重载**（弱网原地重试 / 恢复现场 / 换音质续播）不重开会话，
+  仍算同一次收听；`play_history` 仍在起播时写（最近播放语义），结束时回填
+  `played_duration_ms` / `completed`。
+
+规则本身放在 `db::store::stats`（`counts_as_play`），引擎只负责记账，
+改口径不用碰音频线程。
 ### download_tasks
 
 v1 建表，v7 / v14 各补列（下方为**当前**完整形态）：

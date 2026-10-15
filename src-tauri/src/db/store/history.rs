@@ -48,6 +48,24 @@ pub(crate) fn record_play_history(conn: &Connection, track: &Track) -> Result<()
     Ok(())
 }
 
+/// 播放结束时回填这一条历史的真实收听时长与完播标记。
+///
+/// `play_history` 一首歌只留最近一条（见 [`record_play_history`]），所以这里按
+/// `track_id` 直接覆盖绝对值：`listened_ms` 是本次收听的累计秒数，不是增量。
+/// 与统计同源、同一批结算调用（引擎切歌 / 停止 / 播完），失败只记日志 —— 历史是旁路数据。
+pub(crate) fn update_play_history_progress(
+    conn: &Connection,
+    track: &Track,
+    listened_ms: i64,
+    completed: bool,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "UPDATE play_history SET played_duration_ms = ?2, completed = ?3 WHERE track_id = ?1",
+        params![db_track_id(track), listened_ms, completed as i64],
+    )?;
+    Ok(())
+}
+
 /// 最近播放（按时间倒序）。`limit = 0` 时给默认 100 条。
 pub(crate) fn list_play_history(
     conn: &Connection,

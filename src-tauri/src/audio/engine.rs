@@ -400,6 +400,9 @@ struct EngineInner {
     /// 改的又是几十条的小表，成本可以忽略。库不可用时保持空集：**宁可多放一首，
     /// 也不能把自动切歌弄坏**。
     dislikes: crate::db::store::DislikeMatcher,
+    /// 当前这次收听的会话（挂载成功时开始，切歌 / 停止 / 播完时结算落库）。
+    /// 听歌统计的「次数 / 时长 / 完播」全部由它记账，见 [`ListenSession`]。
+    listen: Option<ListenSession>,
 }
 
 impl EngineInner {
@@ -627,6 +630,8 @@ fn sink_seek_content(inner: &EngineInner, pos_ms: u64) -> Result<(), rodio::sour
 
 /// 真正执行暂停（淡出到期 / 无淡出的 Pause 共用）。
 fn finish_pause(inner: &mut EngineInner) {
+    // 暂停是天然的落库时机：先把这段收听结算掉（会话不结束，继续播还能接着记）
+    inner.settle_listen(false, false);
     inner.sink.pause();
     let pos = content_pos_ms(inner);
     inner.mutate(|st| {
@@ -777,6 +782,7 @@ fn run_engine(deps: EngineDeps) {
         cache_limit_mb: crate::cache::DEFAULT_AUDIO_CACHE_LIMIT_MB,
         watch: StallWatch::default(),
         dislikes: crate::db::store::DislikeMatcher::empty(),
+        listen: None,
     };
 
     let mut inner = inner;
@@ -1072,6 +1078,8 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             }
         }
         AudioCmd::Stop => {
+            // 停止 = 这次收听结束：先把真实收听结算进统计（没播完就不算完播）
+            inner.settle_listen(false, true);
             inner.sink.clear();
             inner.current_shared = None;
             inner.pause_deadline = None;
@@ -1570,7 +1578,12 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             // 软重载直接重建输出流 —— 没有回调来拉样本，重新挂源是白费。
             inner.watch.mark_dead(fatal);
         }
-        AudioCmd::Shutdown => return true,
+        AudioCmd::Shutdown => {
+            // 退出前把这段收听落库（异步写，尽力而为：进程可能先一步结束，
+            // 兜底是每 30s 一次的定期落库，最多丢 30 秒）
+            inner.settle_listen(false, true);
+            return true;
+        }
     }
     false
 }
@@ -1593,6 +1606,15 @@ fn play_queue_track(inner: &mut EngineInner, track: Track) {
 
 /// 暂停态变体：恢复现场用（autoplay=false，start_ms>0 时加载后定位）。
 fn load_queue_track(inner: &mut EngineInner, track: Track, autoplay: bool, start_ms: u64) {
+    // 切换到别的曲目 = 这次收听结束，先结算（同曲**重载**不结算：弱网原地重试 /
+    // 恢复现场 / 换音质续播都还是同一次收听，见 begin_listen）
+    let switched = inner
+        .listen
+        .as_ref()
+        .is_some_and(|s| s.track.id != track.id);
+    if switched {
+        inner.settle_listen(false, true);
+    }
     // 有效音质：这首歌被播放条单独指定过就用指定的，否则用设置里的默认
     let quality = match &inner.track_quality {
         Some((id, q)) if *id == track.id => q.clone(),
@@ -1620,6 +1642,9 @@ fn load_queue_track(inner: &mut EngineInner, track: Track, autoplay: bool, start
 
 /// 按播放模式切到下一首。`auto` = 自然播完触发。
 fn advance(inner: &mut EngineInner, auto: bool) {
+    // 切歌即这次收听的结束：先按真实收听结算（auto = 自然播完，算一次完播）。
+    // 放在最前面，睡眠定时「播完停止」那条提前 return 的路径才不会被漏掉。
+    inner.settle_listen(auto, true);
     // 睡眠定时「播完当前曲目后停止」：只在自然播完时消费，手动切歌不受影响
     if auto && inner.sleep_after_track {
         inner.sleep_after_track = false;
@@ -1667,8 +1692,11 @@ fn advance(inner: &mut EngineInner, auto: bool) {
                     st.status = PlaybackStatus::Stopped;
                     st.position_ms = st.duration_ms;
                 });
+            } else {
+                // 手动 next 无下一首（空队列）：保持现状继续播。会话在上面结算过，
+                // 重开一段继续记账，不因为一次空操作丢掉后面的收听。
+                inner.reopen_listen();
             }
-            // 手动 next 无下一首（空队列）：保持现状
         }
     }
 }
@@ -2002,20 +2030,19 @@ fn go_previous(inner: &mut EngineInner) {
     inner.persist_queue();
 }
 
-/// 播放开始即计入播放历史与听歌统计（DESIGN §5.3）。
+/// 播放开始即计入播放历史（DESIGN §5.3）。
 /// 写库失败只记 warn 日志 —— 历史与统计都是旁路数据，绝不能影响播放。
+///
+/// 只写历史、不写统计：统计（次数 / 时长）要等这次收听结束时按真实收听结算，
+/// 见 [`ListenSession`] —— 起播即记满整曲时长会让「点开就跳」和「完整听完」
+/// 在报告里长得一模一样。
 fn record_play_start(db: Option<Arc<Database>>, track: Track) {
     let Some(db) = db else {
         return;
     };
     tauri::async_runtime::spawn(async move {
         let result = tauri::async_runtime::spawn_blocking(move || {
-            db.with(|conn| {
-                crate::db::store::record_play_history(conn, &track)?;
-                // 时长按曲目时长累计：起播即计一次，中途切歌不回写实际听完的秒数
-                let played_ms = (track.duration * 1000.0).round() as i64;
-                crate::db::store::record_play_stat(conn, &track, played_ms)
-            })
+            db.with(|conn| crate::db::store::record_play_history(conn, &track))
         })
         .await;
         match result {
@@ -2024,6 +2051,210 @@ fn record_play_start(db: Option<Arc<Database>>, track: Track) {
             Err(e) => log::warn!("[history] 任务异常: {e}"),
         }
     });
+}
+
+// ---------- 听歌统计：按真实收听结算（DESIGN §5.3） ----------
+
+/// 单次 tick 最多计入的墙钟毫秒。位置 tick 是 250ms 节流，正常每次约 250ms；
+/// 超过这个数说明引擎被挂起过（系统休眠 / 调度饿死），那段时间没人在听。
+const LISTEN_TICK_MAX_MS: i64 = 1_000;
+/// 位置单步推进超过它就视为 seek：用户拖过去的那一段并没有听，不计入时长。
+const LISTEN_JUMP_MAX_MS: u64 = 3_000;
+/// 累计这么多收听毫秒就先落一次库：应用被强杀时最多丢这么多。
+const LISTEN_FLUSH_MS: i64 = 30_000;
+
+/// 一次收听会话：从曲目挂载成功开始，到切歌 / 停止 / 播完结算。
+///
+/// 为什么要有它：老口径在**起播那一刻**就把整曲时长记进 `total_played_ms`、
+/// 次数 +1，中途跳过从不回写，于是「点开听 10 秒切掉」在听歌报告里与完整听完
+/// 完全一样，累计时长与平均每次都跟着虚高（用户 m05920 的反馈）。
+/// 现在引擎只按「位置真的在推进」的墙钟时间记账，结算时才落库。
+struct ListenSession {
+    track: Track,
+    /// 上次观察到的内容位置（seek 跳变的判据）
+    last_pos_ms: u64,
+    /// 上次累计的时刻（墙钟）：暂停时位置不推进，自然不计入
+    last_seen: std::time::Instant,
+    /// 已累计但还没落库的毫秒
+    pending_ms: i64,
+    /// 本次会话累计的收听毫秒（判定有效播放用）
+    listened_ms: i64,
+    /// 曲目时长（毫秒，0 = 未知）
+    duration_ms: i64,
+    /// 是否自然播完
+    finished: bool,
+    /// 有效播放次数是否已落库（一次会话最多 +1）
+    counted: bool,
+    /// 完播次数是否已落库
+    finished_written: bool,
+}
+
+/// 一次结算要写进库的量（借用结束后才异步落库）。
+struct ListenSettle {
+    track: Track,
+    /// 本次要累加的收听毫秒（增量）
+    listened_ms: i64,
+    /// 本次要 +1 的有效播放次数（0/1）
+    plays: i64,
+    /// 本次要 +1 的完播次数（0/1）
+    finished_plays: i64,
+    /// 本次会话累计的收听毫秒（回填 play_history，绝对值）
+    session_ms: i64,
+    /// 会话是否播完（回填 play_history）
+    finished: bool,
+}
+
+/// 落库（后台线程）。失败只记 warn —— 统计是旁路数据，绝不能影响播放。
+fn write_listen(db: Option<Arc<Database>>, s: ListenSettle) {
+    let Some(db) = db else {
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            db.with(|conn| {
+                crate::db::store::record_listen(
+                    conn,
+                    &s.track,
+                    s.listened_ms,
+                    s.plays,
+                    s.finished_plays,
+                )?;
+                // play_history 一首只留最近一条：回填真实收听时长与完播标记，
+                // 让「最近播放」里那一行的 played_duration_ms / completed 不再是死值 0
+                crate::db::store::update_play_history_progress(
+                    conn,
+                    &s.track,
+                    s.session_ms,
+                    s.finished,
+                )
+            })
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => log::warn!("[stats] 写入失败: {e}"),
+            Err(e) => log::warn!("[stats] 任务异常: {e}"),
+        }
+    });
+}
+
+impl EngineInner {
+    /// 曲目挂载成功 = 收听会话开始。
+    ///
+    /// 同一首的**重载**（弱网原地重试 / 启动恢复现场 / 输出流重建续播）不重开会话：
+    /// 那还是同一次收听，重开会让「听了一半」永远攒不够有效播放的门槛。
+    fn begin_listen(&mut self, track: &Track, duration_ms: u64) {
+        let pos = self.state.read().unwrap_or_else(|e| e.into_inner()).position_ms;
+        if let Some(s) = self.listen.as_mut() {
+            if s.track.id == track.id {
+                s.last_pos_ms = pos;
+                s.last_seen = std::time::Instant::now();
+                if duration_ms > 0 {
+                    s.duration_ms = duration_ms as i64;
+                }
+                return;
+            }
+        }
+        self.listen = Some(ListenSession {
+            track: track.clone(),
+            last_pos_ms: pos,
+            last_seen: std::time::Instant::now(),
+            pending_ms: 0,
+            listened_ms: 0,
+            duration_ms: duration_ms as i64,
+            finished: false,
+            counted: false,
+            finished_written: false,
+        });
+    }
+
+    /// 位置 tick 里累计收听：只有位置**在推进**时才按墙钟时间记账。
+    /// 暂停（位置冻结）不计；seek 跳变（一步推进过大）不计；倍速无关（按墙钟算）。
+    fn accrue_listen(&mut self, pos_ms: u64) {
+        let due = {
+            let Some(s) = self.listen.as_mut() else {
+                return;
+            };
+            let now = std::time::Instant::now();
+            let dt = now.saturating_duration_since(s.last_seen).as_millis() as i64;
+            let advanced =
+                pos_ms > s.last_pos_ms && pos_ms - s.last_pos_ms <= LISTEN_JUMP_MAX_MS;
+            s.last_pos_ms = pos_ms;
+            s.last_seen = now;
+            if advanced {
+                let dt = dt.clamp(0, LISTEN_TICK_MAX_MS);
+                s.pending_ms += dt;
+                s.listened_ms += dt;
+            }
+            s.pending_ms >= LISTEN_FLUSH_MS
+        };
+        if due {
+            self.settle_listen(false, false);
+        }
+    }
+
+    /// 结算收听。`finished` = 自然播完；`end` = 会话就此结束（切歌 / 停止）。
+    ///
+    /// 可反复调用：只有没落过库的增量会被写（pending 清零、两个旗标各管一次 +1），
+    /// 所以「每 30 秒落一次 + 暂停时落一次 + 结束时落最后一次」不会重复计数。
+    fn settle_listen(&mut self, finished: bool, end: bool) {
+        let payload = {
+            let Some(s) = self.listen.as_mut() else {
+                return;
+            };
+            if finished {
+                s.finished = true;
+            }
+            let plays = if !s.counted
+                && crate::db::store::counts_as_play(s.finished, s.listened_ms, s.duration_ms)
+            {
+                s.counted = true;
+                1
+            } else {
+                0
+            };
+            let finished_plays = if s.finished && !s.finished_written {
+                s.finished_written = true;
+                1
+            } else {
+                0
+            };
+            ListenSettle {
+                track: s.track.clone(),
+                listened_ms: std::mem::take(&mut s.pending_ms),
+                plays,
+                finished_plays,
+                session_ms: s.listened_ms,
+                finished: s.finished,
+            }
+        };
+        if end {
+            self.listen = None;
+        }
+        if payload.listened_ms > 0 || payload.plays > 0 || payload.finished_plays > 0 {
+            write_listen(self.db.clone(), payload);
+        }
+    }
+
+    /// 结算后仍在播同一首（手动 next 却没有下一首）：重开一段会话，
+    /// 尾巴上的收听照常计入，不因为一次空操作丢掉。
+    fn reopen_listen(&mut self) {
+        let track = self
+            .queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .current()
+            .cloned();
+        let Some(track) = track else {
+            return;
+        };
+        let duration_ms = self
+            .state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .duration_ms;
+        self.begin_listen(&track, duration_ms);
+    }
 }
 
 /// 异步取播放地址（内存缓存 10 分钟）+ 构建解码器，完成后回发 LoadReady。
@@ -2452,6 +2683,9 @@ fn mount_decoder(
         st.play_url = play_url;
         st.bitrate_kbps = bitrate_kbps;
     });
+    // 收听会话从挂载成功这一刻开始（同曲重载不重开：那还是同一次收听）。
+    // duration_ms 用解码器报的时长，有效播放的「听满一半」按它算。
+    inner.begin_listen(track, duration_ms);
     inner.tick_anchor = None;
     emit_position_tick(inner);
     inner.persist_state();
@@ -2558,6 +2792,8 @@ fn emit_position_tick(inner: &mut EngineInner) {
     // rodio 的真实播放位置（暂停时冻结）。它走「真实时间」口径（见
     // content_pos_ms 的说明），换算回内容时间域，与倍速无关
     let pos_ms = content_pos_ms(inner);
+    // 收听时长按「位置真的在推进」的墙钟时间累计（暂停 / seek 跳过的不计）
+    inner.accrue_listen(pos_ms);
     let buffered_ms = inner
         .current_shared
         .as_ref()

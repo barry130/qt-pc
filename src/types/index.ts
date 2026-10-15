@@ -88,10 +88,14 @@ export interface AuthSession {
 
 /** 听歌统计概览，对齐 Rust `PlayOverview`（DESIGN §5.3） */
 export interface PlayOverview {
+  /** 有效播放次数：播完，或听满曲目一半且不少于 30 秒 */
   totalPlays: number;
+  /** 真实累计收听时长（毫秒；暂停与拖动跳过的不算） */
   totalMs: number;
   /** 有统计的曲目数，不是总播放次数 */
   trackCount: number;
+  /** 其中完整听完的次数（≤ totalPlays） */
+  finishedPlays: number;
   lastPlayedAt: number | null;
 }
 

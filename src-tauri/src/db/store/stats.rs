@@ -1,8 +1,8 @@
 //! 听歌统计域（DESIGN §5.3）：`play_stats` 累计、概览与排行。
 //!
 //! 拆自原 `db/store.rs`（P2-7），函数体与 SQL 一行未改。
-//! 统计由播放引擎在起播时累计，必须允许失败（本地曲目未入库时撞外键就跳过），
-//! 不能因为统计写库失败影响播放链路。
+//! 统计由播放引擎在**一次收听结束时**结算（切歌 / 停止 / 播完），必须允许失败
+//! （本地曲目未入库时撞外键就跳过），不能因为统计写库失败影响播放链路。
 
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -13,7 +13,9 @@ use crate::provider::types::Track;
 use super::*;
 // ---------- 听歌统计（DESIGN §5.3） ----------
 //
-// play_stats 由播放引擎在每次起播时累计（次数 +1 / 时长累加），这里只负责落库与查询。
+// play_stats 由播放引擎按**真实收听**累计：收听的秒数、有效播放次数、完播次数。
+// 口径规则本身（`counts_as_play`）放在这一域里：它是「什么算一次播放」的业务定义，
+// 引擎只负责按墙钟时间记账，判定与落库都在这里，改口径不用碰音频线程。
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,19 +38,52 @@ pub struct SingerStat {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlayOverview {
+    /// 有效播放次数（半途跳过的歌不计，见 `counts_as_play`）
     pub total_plays: i64,
+    /// 真实累计收听时长（毫秒；seek 跳过的那段不算）
     pub total_ms: i64,
     /// 有统计的曲目数（不是总播放次数）
     pub track_count: i64,
+    /// 其中自然播完的次数
+    pub finished_plays: i64,
     pub last_played_at: Option<i64>,
 }
 
-/// 累计一次播放。`played_ms` 是本次计入的时长（起播时按曲目时长记）。
-/// 本地曲目没被扫描进 tracks 时会撞外键，这里直接跳过——统计不该影响播放。
-pub(crate) fn record_play_stat(
+/// 一次「有效播放」的最低门槛：至少听满这么久（曲目时长未知时的兜底）。
+pub(crate) const PLAY_MIN_MS: i64 = 30_000;
+
+/// 这次收听算不算「一次播放」。
+///
+/// 规则（DESIGN §5.3）：① 自然播完 —— 一定算；② 没播完则要求
+/// 收听时长 ≥ 曲目时长的一半**且**不少于 [`PLAY_MIN_MS`]。
+///
+/// 为什么不是「起播就算」：旧口径在起播那一刻就记满整曲时长 + 次数 +1，
+/// 于是「点开听 3 秒跳过」和「完整听完」在报告里一模一样，累计时长也跟着虚高
+/// （用户 m05920 的反馈：累计时长要考虑一首歌是不是听完了）。
+/// 为什么是「一半 + 30 秒」而不是「必须听完」：纯完播口径会把
+/// 「听了 90% 手动切掉」的真实收听全部丢掉，报告反而失真。
+pub(crate) fn counts_as_play(finished: bool, listened_ms: i64, duration_ms: i64) -> bool {
+    if finished {
+        return true;
+    }
+    if listened_ms < PLAY_MIN_MS {
+        return false;
+    }
+    // 时长未知（0）时只认 30 秒门槛：没有分母就没法算比例
+    duration_ms <= 0 || listened_ms * 2 >= duration_ms
+}
+
+/// 结算一次收听：累加真实收听毫秒、有效播放次数、完播次数。
+///
+/// `listened_ms` 是引擎按墙钟累计的本次收听时长（暂停与 seek 跳过的不计），
+/// `plays` / `finished_plays` 由引擎按 [`counts_as_play`] 判定后传入，取值 0 或 1。
+/// 三个值都为 0 时调用方不会来（引擎侧短路），这里不做特判。
+pub(crate) fn record_listen(
     conn: &Connection,
     track: &Track,
-    played_ms: i64,
+    listened_ms: i64,
+    plays: i64,
+    finished_plays: i64,
 ) -> Result<(), rusqlite::Error> {
     upsert_tracks(conn, &[track])?;
     let id = db_track_id(track);
@@ -64,33 +99,41 @@ pub(crate) fn record_play_stat(
         return Ok(());
     }
     conn.execute(
-        "INSERT INTO play_stats (track_id, play_count, last_played_at, total_played_ms)
-         VALUES (?1, 1, ?2, ?3)
+        "INSERT INTO play_stats (track_id, play_count, finished_count, last_played_at, total_played_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5)
          ON CONFLICT(track_id) DO UPDATE SET
-           play_count = play_count + 1,
+           play_count = play_count + excluded.play_count,
+           finished_count = finished_count + excluded.finished_count,
            last_played_at = excluded.last_played_at,
            total_played_ms = total_played_ms + excluded.total_played_ms",
-        params![id, now_ms(), played_ms],
+        params![id, plays, finished_plays, now_ms(), listened_ms],
     )?;
     Ok(())
 }
 
-/// 概览：总次数 / 总时长 / 曲目数 / 最近播放时间
+/// 概览：有效播放次数 / 真实收听时长 / 曲目数 / 完播次数 / 最近播放时间
 pub(crate) fn play_overview(conn: &Connection) -> Result<PlayOverview, rusqlite::Error> {
-    let (total_plays, total_ms, track_count, last_played_at): (i64, i64, i64, Option<i64>) = conn
-        .query_row(
+    let (total_plays, total_ms, track_count, finished_plays, last_played_at): (
+        i64,
+        i64,
+        i64,
+        i64,
+        Option<i64>,
+    ) = conn.query_row(
         "SELECT COALESCE(SUM(play_count), 0),
                     COALESCE(SUM(total_played_ms), 0),
                     COUNT(*),
+                    COALESCE(SUM(finished_count), 0),
                     MAX(last_played_at)
                FROM play_stats",
         [],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
     )?;
     Ok(PlayOverview {
         total_plays,
         total_ms,
         track_count,
+        finished_plays,
         last_played_at,
     })
 }

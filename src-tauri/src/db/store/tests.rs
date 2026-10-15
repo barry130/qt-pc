@@ -684,35 +684,66 @@ fn download_dedupe_offline_lookup_and_stale_cleanup() {
         .is_none());
 }
 
-/// 播放统计：单次播放累计 / 概览 / 排名（DESIGN §5.3）
+/// 播放统计：真实收听累计 / 概览 / 排名（DESIGN §5.3）
+///
+/// 口径与老版本的区别就在这几个数上：老口径每次起播都 play_count+1 且把整曲
+/// 时长记满；现在是「听了多久记多久」，次数只在有效播放时 +1（见 counts_as_play）。
 #[test]
 fn play_stats_accumulate_overview_and_rank() {
     let conn = test_conn();
     let a = track("1001", "晴天");
     let b = track("1002", "稻香");
 
-    record_play_stat(&conn, &a, 1000).expect("stat 1");
-    record_play_stat(&conn, &a, 1000).expect("stat 2");
-    record_play_stat(&conn, &b, 2000).expect("stat 3");
+    // a：先听 60 秒（够一半 → 算一次播放，但还没播完），再听 30 秒并播完
+    //（完播 +1，次数不再重复 +1）
+    record_listen(&conn, &a, 60_000, 1, 0).expect("stat 1");
+    record_listen(&conn, &a, 30_000, 0, 1).expect("stat 2");
+    // b：完整听完两次
+    record_listen(&conn, &b, 200_000, 1, 1).expect("stat 3");
+    record_listen(&conn, &b, 200_000, 1, 1).expect("stat 4");
 
     let overview = play_overview(&conn).expect("overview");
     assert_eq!(overview.total_plays, 3);
-    assert_eq!(overview.total_ms, 4000);
+    assert_eq!(overview.total_ms, 490_000);
     assert_eq!(overview.track_count, 2);
+    assert_eq!(overview.finished_plays, 3);
     assert!(overview.last_played_at.is_some());
 
     let top = list_top_tracks(&conn, 10).expect("top tracks");
     assert_eq!(top.len(), 2);
     // 播放 2 次的排前面
-    assert_eq!(top[0].track.title, "晴天");
+    assert_eq!(top[0].track.title, "稻香");
     assert_eq!(top[0].play_count, 2);
+    assert_eq!(top[0].total_played_ms, 400_000);
+    // 听满一半算一次播放、播完只补完播不补次数
     assert_eq!(top[1].play_count, 1);
-    assert_eq!(top[0].total_played_ms, 2000);
+    assert_eq!(top[1].total_played_ms, 90_000);
 
     let singers = list_top_singers(&conn, 10).expect("top singers");
     assert_eq!(singers.len(), 1);
     assert_eq!(singers[0].singer, "测试歌手");
     assert_eq!(singers[0].play_count, 3);
+}
+
+/// 有效播放的口径（DESIGN §5.3）：播完一定算；没播完要听满一半且不少于 30 秒。
+/// 这条规则是「累计时长 / 次数要考虑一首歌是不是听完了」的落点（用户 m05920）。
+#[test]
+fn counts_as_play_needs_half_the_track_or_a_finish() {
+    // 播完：再短也算（试听片段 / 前奏型曲目）
+    assert!(counts_as_play(true, 3_000, 30_000));
+    // 起播就跳过：不算 —— 老口径在这里记满整曲时长 + 一次播放
+    assert!(!counts_as_play(false, 3_000, 210_000));
+    // 听满一半：算；差一点：不算
+    assert!(counts_as_play(false, 105_000, 210_000));
+    assert!(!counts_as_play(false, 100_000, 210_000));
+    // 长曲：听满 30 秒但远不到一半，仍不算
+    assert!(!counts_as_play(false, 60_000, 600_000));
+    // 短曲：一半不足 30 秒也照样要 30 秒
+    assert!(!counts_as_play(false, 10_000, 40_000));
+    assert!(counts_as_play(false, 30_000, 40_000));
+    // 时长未知（0）：只认 30 秒门槛
+    assert!(!counts_as_play(false, 29_000, 0));
+    assert!(counts_as_play(false, 30_000, 0));
 }
 
 /// 没被扫描进库的本地曲目：跳过统计而不是撞外键报错（统计不能影响播放）
@@ -729,7 +760,7 @@ fn play_stats_skips_local_track_missing_from_library() {
         duration: 180.0,
         music_id: None,
     };
-    record_play_stat(&conn, &local, 1000).expect("本地曲目统计不该报错");
+    record_listen(&conn, &local, 1000, 1, 1).expect("本地曲目统计不该报错");
     assert_eq!(play_overview(&conn).expect("overview").total_plays, 0);
 }
 
@@ -753,7 +784,7 @@ fn lists_keep_track_cover_url() {
     let pid = create_playlist(&conn, "测试歌单").expect("建歌单");
     add_liked_song(&conn, &t, &pid).expect("收藏");
     record_play_history(&conn, &t).expect("历史");
-    record_play_stat(&conn, &t, 210_000).expect("统计");
+    record_listen(&conn, &t, 210_000, 1, 1).expect("统计");
     add_tracks_to_playlist(&conn, &pid, std::slice::from_ref(&t)).expect("加歌");
 
     assert_eq!(

@@ -4411,7 +4411,8 @@ pub async fn cmd_set_setting(
 }
 
 // ---------- 听歌统计（DESIGN §5.3） ----------
-// 数据由播放引擎在起播时写入 play_stats，这里只做查询。
+// 数据由播放引擎按真实收听结算后写入 play_stats（切歌 / 停止 / 播完时，
+// 见 audio/engine.rs 的 ListenSession），这里只做查询。
 
 #[tauri::command(rename = "get_play_overview")]
 pub async fn cmd_get_play_overview(
@@ -4422,6 +4423,7 @@ pub async fn cmd_get_play_overview(
             total_plays: 0,
             total_ms: 0,
             track_count: 0,
+            finished_plays: 0,
             last_played_at: None,
         });
     };
