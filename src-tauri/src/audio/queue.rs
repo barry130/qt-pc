@@ -2,7 +2,7 @@
 //!
 //! 纯函数 + 数据结构，不依赖 IO；引擎线程独占持有（单线程无锁）。
 //! 语义约定：
-//! - 自然播完（auto）：Sequence 末尾停止；ListLoop 循环；OneLoop 重播当前；Random 随机换曲
+//! - 自然播完（auto）：ListLoop 循环回开头；OneLoop 重播当前；Random 随机换曲
 //! - 手动 next / previous：均按列表顺序移动并循环（OneLoop 也不例外），
 //!   仅 Random 随机挑一首不同的曲子
 //!
@@ -69,14 +69,8 @@ impl Queue {
                 let next = cur + 1;
                 if next < len {
                     Some(next)
-                } else if auto {
-                    match mode {
-                        PlayMode::Sequence => None, // 顺序播放到末尾即停
-                        // ListLoop / OneLoop(手动) 循环回开头
-                        _ => Some(0),
-                    }
                 } else {
-                    // 手动 next：循环回开头（Sequence 也允许手动绕回，与移动端一致）
+                    // 列表循环：末尾回到开头。手动 next 同样绕回（与移动端一致）
                     Some(0)
                 }
             }
@@ -128,10 +122,6 @@ impl Queue {
                 for _ in 0..len {
                     i += 1;
                     if i >= len {
-                        if auto && matches!(mode, PlayMode::Sequence) {
-                            // 顺序播放自然播完到末尾就该停，不该绕回头
-                            return None;
-                        }
                         i = 0;
                     }
                     if i == cur {
@@ -306,19 +296,13 @@ mod tests {
     }
 
     #[test]
-    fn sequence_auto_stops_at_end() {
-        let mut q = queue_of(3);
-        q.index = Some(2);
-        assert_eq!(q.next_index(PlayMode::Sequence, true), None);
-        q.index = Some(0);
-        assert_eq!(q.next_index(PlayMode::Sequence, true), Some(1));
-    }
-
-    #[test]
     fn list_loop_auto_wraps() {
         let mut q = queue_of(3);
         q.index = Some(2);
         assert_eq!(q.next_index(PlayMode::ListLoop, true), Some(0));
+        // 非末尾：正常前进一首
+        q.index = Some(0);
+        assert_eq!(q.next_index(PlayMode::ListLoop, true), Some(1));
     }
 
     #[test]
@@ -330,19 +314,19 @@ mod tests {
     }
 
     #[test]
-    fn manual_next_wraps_even_in_sequence() {
+    fn manual_next_wraps_at_end() {
         let mut q = queue_of(3);
         q.index = Some(2);
-        assert_eq!(q.next_index(PlayMode::Sequence, false), Some(0));
+        assert_eq!(q.next_index(PlayMode::ListLoop, false), Some(0));
     }
 
     #[test]
     fn manual_previous_wraps_to_end() {
         let mut q = queue_of(3);
         q.index = Some(0);
-        assert_eq!(q.previous_index(PlayMode::Sequence), Some(2));
+        assert_eq!(q.previous_index(PlayMode::ListLoop), Some(2));
         q.index = Some(1);
-        assert_eq!(q.previous_index(PlayMode::Sequence), Some(0));
+        assert_eq!(q.previous_index(PlayMode::ListLoop), Some(0));
     }
 
     #[test]
@@ -360,7 +344,7 @@ mod tests {
     #[test]
     fn single_track_queue_always_replays() {
         let q = queue_of(1);
-        assert_eq!(q.next_index(PlayMode::Sequence, true), Some(0));
+        assert_eq!(q.next_index(PlayMode::ListLoop, true), Some(0));
         assert_eq!(q.previous_index(PlayMode::ListLoop), Some(0));
     }
 
@@ -392,8 +376,8 @@ mod tests {
     fn skipping_next_scans_past_disliked_tracks() {
         let q = queue_of(5);
         let skip = skip_titled(&["t1", "t2"]);
-        // Sequence 从 0 出发：跳过 1、2，落在 3
-        assert_eq!(q.next_index_skipping(PlayMode::Sequence, true, &skip), Some(3));
+        // 从 0 出发：跳过 1、2，落在 3
+        assert_eq!(q.next_index_skipping(PlayMode::ListLoop, true, &skip), Some(3));
     }
 
     #[test]
@@ -406,14 +390,12 @@ mod tests {
     }
 
     #[test]
-    fn skipping_next_respects_sequence_end() {
+    fn skipping_next_wraps_past_a_disliked_tail() {
         let mut q = queue_of(3);
         q.index = Some(1);
         let skip = skip_titled(&["t2"]);
-        // 顺序播放到末尾即停，不该为了找一首能播的绕回开头
-        assert_eq!(q.next_index_skipping(PlayMode::Sequence, true, &skip), None);
-        // 手动 next 允许绕回
-        assert_eq!(q.next_index_skipping(PlayMode::Sequence, false, &skip), Some(0));
+        // 末尾那首被屏蔽 → 绕回开头继续找（列表循环不该因为屏蔽就停下）
+        assert_eq!(q.next_index_skipping(PlayMode::ListLoop, true, &skip), Some(0));
     }
 
     #[test]
@@ -455,8 +437,8 @@ mod tests {
         q.index = Some(1);
         let never = |_: &Track| false;
         assert_eq!(
-            q.next_index_skipping(PlayMode::Sequence, true, never),
-            q.next_index(PlayMode::Sequence, true)
+            q.next_index_skipping(PlayMode::ListLoop, true, never),
+            q.next_index(PlayMode::ListLoop, true)
         );
     }
 

@@ -445,6 +445,8 @@ pub async fn cmd_restore_last_session(
         return Ok(None);
     };
     let s = &session.state;
+    // 历史版本存过 "sequence"（顺序播放，已删除）：读不出来就回落列表循环，
+    // 老库不该因为一个已下线的枚举值启动失败。
     let play_mode: PlayMode =
         serde_json::from_value(serde_json::json!(s.play_mode)).unwrap_or(PlayMode::ListLoop);
     // 音质档位由音源包声明，宿主不再持有白名单：只拒绝读不出来的空值。

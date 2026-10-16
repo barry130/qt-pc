@@ -59,7 +59,7 @@ export const PLAYER_BAR_BUTTONS: PlayerBarButtonMeta[] = [
   {
     id: "mode",
     label: "播放模式",
-    hint: "顺序 / 列表循环 / 单曲循环 / 随机",
+    hint: "列表循环 / 单曲循环 / 随机",
     adminOnly: false,
     slot: "inline",
   },

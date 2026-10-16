@@ -260,7 +260,7 @@ export interface PlaybackState {
   bufferedMs: number;
   volume: number;
   muted: boolean;
-  playMode: "sequence" | "listLoop" | "oneLoop" | "random";
+  playMode: "listLoop" | "oneLoop" | "random";
   quality: Quality;
   queueIndex: number | null;
   queueLen: number;

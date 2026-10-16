@@ -97,7 +97,7 @@ interface PlayerStore {
   setQueueOpen: (open: boolean) => void;
 }
 
-const MODE_ORDER = ["sequence", "listLoop", "oneLoop", "random"] as const;
+const MODE_ORDER = ["listLoop", "oneLoop", "random"] as const;
 
 /**
  * tick 落在乐观 seek 目标 ±该值内，即认为 seek 已生效。

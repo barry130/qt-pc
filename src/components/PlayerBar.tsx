@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  ArrowRightToLine,
   AudioWaveform,
   Captions,
   Check,
@@ -911,13 +910,13 @@ function SleepTimerMenu(props: {
   );
 }
 
-/** 播放模式四态：顺序 → 列表循环 → 单曲循环 → 随机（REQUIREMENTS §3.2） */
+/** 播放模式三态：列表循环 → 单曲循环 → 随机（REQUIREMENTS §3.2）。
+ *  「顺序播放」已删除（放完就停的用法一般音乐播放器都没有，用户确认去掉）。 */
 function PlayModeButton(props: {
-  mode: "sequence" | "listLoop" | "oneLoop" | "random";
+  mode: "listLoop" | "oneLoop" | "random";
   onCycle: () => void;
 }): React.JSX.Element {
   const meta = {
-    sequence: { label: "顺序播放", Icon: ArrowRightToLine },
     listLoop: { label: "列表循环", Icon: Repeat },
     oneLoop: { label: "单曲循环", Icon: Repeat1 },
     random: { label: "随机播放", Icon: Shuffle },

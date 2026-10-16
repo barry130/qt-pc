@@ -1156,7 +1156,7 @@ pub enum PlaybackStatus { Stopped, Loading, Buffering, Playing, Paused, Error }
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy)]
 #[serde(rename_all = "camelCase")]
-pub enum PlayMode { Sequence, ListLoop, OneLoop, Random }
+pub enum PlayMode { ListLoop, OneLoop, Random }
 
 /// 音质档位直接复用 provider 的类型：档位清单由音源包声明
 /// （`128` / `320` / `flac` / `flac24bit` …），宿主只透传字符串，

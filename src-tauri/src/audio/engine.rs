@@ -602,7 +602,7 @@ fn parse_quality(s: &str) -> Option<Quality> {
     Quality::parse(s)
 }
 
-/// settings 中的 play_mode 键值：sequence / listLoop / oneLoop / random
+/// settings 中的 play_mode 键值：listLoop / oneLoop / random
 fn mode_key(m: PlayMode) -> String {
     serde_json::to_string(&m).unwrap().trim_matches('"').into()
 }
@@ -1914,7 +1914,8 @@ fn advance(inner: &mut EngineInner, auto: bool) {
         }
         None => {
             if auto {
-                // 顺序播放到末尾：停止并保留最后一曲信息
+                // 自然播完却算不出下一首：随机模式下除了当前这首全被屏蔽（列表循环
+                // 永远能绕回开头，不会走到这里）。停下并保留最后一曲信息。
                 inner.sink.clear();
                 inner.current_shared = None;
                 *inner.cache_file.lock().unwrap_or_else(|e| e.into_inner()) = None;
