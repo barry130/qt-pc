@@ -2685,7 +2685,12 @@ function DownloadSection(): React.JSX.Element {
   const chooseConcurrency = (n: number): void => {
     // 3 以内直接生效；>3 先弹确认 —— 批量下载不限流会被音源/CDN 判成爬虫，
     // LX Music 就因此被封过 IP（issue #1992），它同样把 >3 做成需要确认。
-    if (n > SAFE_DOWNLOAD_CONCURRENCY) {
+    //
+    // 「待确认的就是这一项」才算第二下。少了这个判断，第二下只会把同一个值再
+    // set 一遍（React 看到值没变，不重渲染也不提交），按钮永远停在「6 个？」。
+    // 与卸载音源包（armed?.packId !== pack.id）、删歌单（confirmRemoveId !== p.pid）
+    // 同一套写法；点别的数字则改成武装那一项。
+    if (n > SAFE_DOWNLOAD_CONCURRENCY && pendingConcurrency !== n) {
       setPendingConcurrency(n);
       return;
     }
