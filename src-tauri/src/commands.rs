@@ -724,7 +724,7 @@ pub async fn cmd_set_autostart(app: tauri::AppHandle, enable: bool) -> Result<()
     }
 }
 
-// ---------- 音频输出设备（蓝牙耳机 / HDMI 插拔时无缝切换） ----------
+// ---------- 音频输出设备（蓝牙耳机 / HDMI 插拔） ----------
 
 /// 枚举系统输出设备（设置页下拉用）。
 #[tauri::command(rename = "list_output_devices")]
@@ -741,8 +741,9 @@ pub async fn cmd_list_output_devices() -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// 切换输出设备。`name` 不传/空 = 跟随系统默认（插拔蓝牙自动跟随）；
-/// 传入具体设备名 = 固定到该设备。切换时当前曲目从原进度无缝续播。
+/// 切换输出设备。`name` 不传/空 = 跟随系统默认（默认设备变化时自动跟随）；
+/// 传入具体设备名 = 固定到该设备。主动切换时当前曲目从原进度无缝续播；
+/// 目标设备当前不可用则暂停播放并说明。
 #[tauri::command(rename = "set_output_device")]
 pub async fn cmd_set_output_device(
     state: State<'_, AppState>,

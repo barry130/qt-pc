@@ -777,7 +777,7 @@ function PlaybackSection(): React.JSX.Element {
     <div className="max-w-4xl divide-y divide-border">
       <SettingRow
         title="音频输出设备"
-        description="连蓝牙耳机后自动无声？选「跟随系统默认」即可插拔自动切换；固定设备适合挂多套输出。切换时当前曲目从原进度无缝续播。"
+        description="连蓝牙耳机后自动无声？选「跟随系统默认」即可跟随设备变化；固定设备适合挂多套输出。主动切换时当前曲目从原进度续播；设备被拔掉（蓝牙断开）则暂停播放并保留进度。"
       >
         <select
           value={current}

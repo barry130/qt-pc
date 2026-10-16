@@ -120,8 +120,10 @@ pub enum AudioCmd {
         muted: bool,
         quality: Quality,
     },
-    /// 切换音频输出设备。`None` = 跟随系统默认（设备插拔自动切换）；
-    /// `Some(设备名)` = 固定到该设备。切换时当前曲目从原进度无缝续播。
+    /// 切换音频输出设备。`None` = 跟随系统默认（默认设备变化时自动跟随）；
+    /// `Some(设备名)` = 固定到该设备。用户主动切换时当前曲目从原进度无缝续播；
+    /// 而被固定的设备当前不可用（或跟随默认时旧设备被拔掉）则暂停播放并说明
+    /// —— 见 `pause_for_device_loss`。
     SetOutputDevice {
         name: Option<String>,
     },
@@ -477,6 +479,9 @@ impl EngineInner {
     /// 重建后当前曲目从原进度无缝续播：重走 load 链路（resolve 走 10 分钟
     /// URL 缓存，几乎瞬时），音量/播放态一并迁移。失败时保留旧流不动 ——
     /// 切设备失败不该让播放中断。
+    ///
+    /// 用于「用户主动切设备」「看门狗重建」「掉设备后兜底」三条路径；按重建前
+    /// 的播放态续播，所以掉设备那条必须**先** `finish_pause`（见 pause_for_device_loss）。
     fn rebuild_output(&mut self, choice: Option<&str>) -> Result<(), String> {
         // 重建出来的流同样要挂错误回调：否则「看门狗重建过的流」又变成哑巴
         let new_stream = match choice {
@@ -503,7 +508,15 @@ impl EngineInner {
         // 迁移前记录当前曲目 / 进度 / 播放态
         let (track, pos_ms, was_playing) = {
             let st = self.state.read().unwrap_or_else(|e| e.into_inner());
-            let pos = self.sink.get_pos().as_millis() as u64;
+            // Playing 时以 sink 实时位置为准（快照 tick 有节流，最多落后 250ms）；
+            // 其余状态用快照里的 position_ms —— Loading 期间 sink 里还是**上一首**
+            // （新流要等 mount_decoder 才 clear），get_pos() 取到的是上一首的位置，
+            // 会把新曲定位到错误的地方；暂停/错误态两者等价，快照更权威。
+            let pos = if st.status == PlaybackStatus::Playing {
+                self.sink.get_pos().as_millis() as u64
+            } else {
+                st.position_ms
+            };
             (st.track.clone(), pos, st.status == PlaybackStatus::Playing)
         };
 
@@ -862,7 +875,7 @@ fn run_engine(deps: EngineDeps) {
     spawn_cache_prune(&inner);
     // 心跳用：上次补发全量快照的时刻（防前端漏收事件后状态停死）
     let mut last_publish = std::time::Instant::now();
-    // 输出设备变化检测用（跟随默认模式下每 2s 对比一次设备名）
+    // 输出设备变化检测用（每 2s 对比一次默认设备名；被动掉设备 → 暂停）
     let mut last_device_check = std::time::Instant::now();
     loop {
         // playing 时以 25ms 粒度轮询（发 250ms 节流 tick + 检测自然播完），
@@ -890,7 +903,7 @@ fn run_engine(deps: EngineDeps) {
 
         // 到期检查（淡出暂停 / 睡眠定时）与设备热插拔检测，详见各函数注释
         apply_expired_deadlines(&mut inner);
-        check_default_device_change(&mut inner, &mut last_device_check);
+        check_output_device(&mut inner, &mut last_device_check);
 
         if playing {
             playing_cycle(&mut inner, &mut last_publish);
@@ -932,30 +945,237 @@ fn apply_expired_deadlines(inner: &mut EngineInner) {
     }
 }
 
-/// 输出设备热插拔检测（跟随默认模式下每 2s 对比一次设备名）。
-fn check_default_device_change(inner: &mut EngineInner, last_check: &mut std::time::Instant) {
-    // 输出设备变化检测（仅"跟随系统默认"模式）：默认设备变了
-    // （插拔蓝牙耳机 / HDMI 等）就重建输出流并从原进度无缝续播 ——
-    // 否则旧流被系统拆除后 sink 照常推进，声音却写进了死端点。
-    if inner.output_choice.is_none()
-        && last_check.elapsed() >= std::time::Duration::from_secs(2)
-    {
-        *last_check = std::time::Instant::now();
-        if let Some(dev) = cpal::default_host().default_output_device() {
-            if let Ok(desc) = dev.description() {
-                let name = desc.name().to_string();
-                if name != inner.current_device && !name.is_empty() {
-                    log::info!(
-                        "[device] 默认输出设备变化：{} → {}，重建输出流",
-                        inner.current_device,
-                        name
-                    );
-                    if let Err(e) = inner.rebuild_output(None) {
-                        log::warn!("[device] 重建输出流失败: {e}");
-                    }
-                }
+/// 系统默认输出设备名。取不到（无输出设备）或名字为空时返回 None。
+fn default_output_device_name() -> Option<String> {
+    cpal::default_host()
+        .default_output_device()
+        .and_then(|d| d.description().ok().map(|desc| desc.name().to_string()))
+        .filter(|n| !n.is_empty())
+}
+
+/// 设备是否仍在输出设备枚举里。
+///
+/// WASAPI 只枚举 `DEVICE_STATE_ACTIVE` 端点，所以「拔耳机 / 蓝牙断开 / 设备被禁用」
+/// 之后这个设备名会直接消失 —— 这就是「被动移除」的判据。
+/// 枚举本身失败时保守地当作「还在」：宁可不动，也不要因为一次枚举失败把播放停掉。
+fn device_present(name: &str) -> bool {
+    cpal::default_host()
+        .output_devices()
+        .map(|it| {
+            it.into_iter().any(|d| {
+                d.description()
+                    .map(|desc| desc.name() == name)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(true)
+}
+
+/// 一次输出设备轮询的判定结果。
+///
+/// 抽成纯枚举是为了可单测：`cpal` 那几行调用在单元测试里跑不起来
+/// （没有音频端点），但「该不该暂停」的规则本身很容易写错，
+/// 也最容易在后续维护中被改回无缝续播。
+#[derive(Debug, PartialEq, Eq)]
+enum DeviceAction {
+    /// 无需动作
+    None,
+    /// 旧设备从枚举里消失（被动移除）→ 暂停。`fallback` = 接下来会用的兜底设备
+    Lost { fallback: Option<String> },
+    /// 默认设备换了人且当前跟随默认 → 重建续播
+    Follow { name: String },
+    /// 启动时没拿到设备名（当时没有任何输出设备）→ 补记当前默认
+    Adopt { name: String },
+}
+
+/// 输出设备轮询的判定规则（纯函数）。
+///
+/// - `old`：引擎当前挂着的设备名（空串 = 启动时就没有）
+/// - `old_present`：`old` 是否仍在输出设备枚举里（枚举失败时调用方传 `true`）
+/// - `default_name`：系统当前默认输出设备名（取不到传 `None`）
+/// - `pinned`：用户是否固定了设备（`output_choice.is_some()`）
+fn decide_device_action(
+    old: &str,
+    old_present: bool,
+    default_name: Option<&str>,
+    pinned: bool,
+) -> DeviceAction {
+    // 旧设备消失 = 被动移除，优先级最高。这里**不**以 `default_name` 为前提：
+    // 只剩一个 USB DAC 时拔掉它，`default_output_device()` 会返回 None，
+    // 若要求先取到默认设备名，这种「最后一个设备也没了」的情况就漏判了。
+    if !old.is_empty() && !old_present {
+        return DeviceAction::Lost {
+            fallback: default_name.map(str::to_string),
+        };
+    }
+    // 一次没取到默认设备（枚举瞬时失败 / 正好没有输出设备）：不当作变化
+    let Some(name) = default_name else {
+        return DeviceAction::None;
+    };
+    if name == old {
+        return DeviceAction::None;
+    }
+    if !pinned {
+        // 旧设备还在，只是默认换了人（插耳机 / 插 HDMI）→ 维持无缝续播
+        DeviceAction::Follow {
+            name: name.to_string(),
+        }
+    } else if old.is_empty() {
+        // 固定设备模式下默认换人与本应用无关（流还挂在用户指定的设备上）
+        DeviceAction::Adopt {
+            name: name.to_string(),
+        }
+    } else {
+        DeviceAction::None
+    }
+}
+
+/// 设备不可用时的说明文案。`verb` 区分「已断开」（曾连上、现在没了）
+/// 与「不可用」（选定的设备当前就不在）；`active` 决定要不要带「播放已暂停」
+/// —— 本来就没在播时，说「播放已暂停」是误导。
+fn device_gone_reason(name: &str, verb: &str, active: bool) -> String {
+    if active {
+        format!("输出设备「{name}」{verb}，播放已暂停")
+    } else {
+        format!("输出设备「{name}」{verb}")
+    }
+}
+
+/// 输出设备热插拔检测（每 2s 轮询一次）。
+fn check_output_device(inner: &mut EngineInner, last_check: &mut std::time::Instant) {
+    if last_check.elapsed() < std::time::Duration::from_secs(2) {
+        return;
+    }
+    *last_check = std::time::Instant::now();
+    let old = inner.current_device.clone();
+    let action = decide_device_action(
+        &old,
+        old.is_empty() || device_present(&old),
+        default_output_device_name().as_deref(),
+        inner.output_choice.is_some(),
+    );
+    match action {
+        DeviceAction::None => {}
+        DeviceAction::Lost { fallback } => {
+            pause_for_device_loss(inner, &old, fallback.as_deref());
+        }
+        DeviceAction::Follow { name } => {
+            log::info!("[device] 默认输出设备变化：{old} → {name}，重建输出流");
+            if let Err(e) = inner.rebuild_output(None) {
+                log::warn!("[device] 重建输出流失败: {e}");
             }
         }
+        DeviceAction::Adopt { name } => {
+            inner.current_device = name.clone();
+            inner.mutate(|st| st.output_device = name);
+        }
+    }
+}
+
+/// 输出设备被动移除：暂停播放（轮询检测到旧设备从枚举里消失）。
+///
+/// 与 `rebuild_output` 的无缝续播刻意相反。旧行为是「设备变了就重建并续播」，
+/// 拔耳机后声音从扬声器接着响；而设备真消失时旧流其实已经写进死端点 ——
+/// 声音早就没了，状态却还是 Playing、位置还在走，等于骗人。
+///
+/// `fallback` = 系统当前默认设备（也就是接下来实际会用的那个），可能没有
+/// （一个输出设备都不剩）。
+fn pause_for_device_loss(inner: &mut EngineInner, old: &str, fallback: Option<&str>) {
+    let reason = device_gone_reason(old, "已断开", is_active_playback(inner));
+    pause_playback_for_device(inner, reason, fallback, false);
+}
+
+/// 用户（或启动恢复）选定的固定设备当前不存在：同样暂停并说明。
+///
+/// 过去这里只是 `rebuild_output` 失败后写一条错误行，播放态照旧停在 Playing ——
+/// 界面显示在播、实际一个采样都出不去。与掉设备是同一种处境，用同一条路径处理。
+fn pause_for_device_loss_named(inner: &mut EngineInner, name: &str) {
+    let reason = device_gone_reason(name, "不可用", is_active_playback(inner));
+    let fallback = default_output_device_name();
+    // 用户主动选了不存在的设备，即使没在播也要给个回执
+    pause_playback_for_device(inner, reason, fallback.as_deref(), true);
+}
+
+/// 此刻是否真的在出声音（正在播 / 正在为播放取址）。
+fn is_active_playback(inner: &EngineInner) -> bool {
+    matches!(
+        inner.state.read().unwrap_or_else(|e| e.into_inner()).status,
+        PlaybackStatus::Playing | PlaybackStatus::Loading
+    )
+}
+
+/// 掉设备的公共收尾：先暂停、再换到兜底设备、写错误、发通知。
+///
+/// 顺序是「先暂停、再重建」：`rebuild_output` 按重建**前**的播放态决定是否续播，
+/// 所以暂停必须发生在它之前，否则兜底设备会接着把这首放下去。
+/// 重建顺带把 `load_gen` 推进一格，在途的 `LoadReady` 作废 —— 否则异步取址
+/// 回来后会把曲目挂到刚死掉的那条流上自动播（正是本次要消除的行为）。
+///
+/// `announce`：没在播也要报错（用户主动选了不存在的设备，必须给个回执）。
+/// 被动掉设备时没在播就完全静默 —— 那时弹一条「播放已暂停」纯属噪音。
+fn pause_playback_for_device(
+    inner: &mut EngineInner,
+    reason: String,
+    fallback: Option<&str>,
+    announce: bool,
+) {
+    let (status, pos_ms) = {
+        let st = inner.state.read().unwrap_or_else(|e| e.into_inner());
+        (st.status, st.position_ms)
+    };
+    let active = matches!(status, PlaybackStatus::Playing | PlaybackStatus::Loading);
+    log::info!(
+        "[device] {reason}（兜底设备：{}）",
+        fallback.unwrap_or("无")
+    );
+    match status {
+        // 正在响：走标准暂停（结算收听 + 落库 + 位置取实时值）
+        PlaybackStatus::Playing => finish_pause(inner),
+        // 取址途中掉设备：`finish_pause` 只在 Playing 时改状态，这里必须自己落
+        // Paused —— 否则重建后 `load_queue_track` 会把状态推成 Loading，
+        // 而位置沿用加载目标（`position_ms` 此刻正是 start_at，不能取 sink
+        // 实时值，那条流还是上一首的）
+        PlaybackStatus::Loading => {
+            inner.sink.pause();
+            inner.mutate(|st| {
+                st.status = PlaybackStatus::Paused;
+                st.position_ms = pos_ms;
+            });
+            inner.persist_state();
+        }
+        // 本来就是暂停 / 停止：位置已经是冻结的，重建即可
+        _ => {}
+    }
+    // 再换到兜底设备：否则 sink 还挂在死流上，用户按播放既没声音也不推进位置，
+    // 只能等看门狗 12s 软重载 + 再 12s 重建输出流
+    if let Err(e) = inner.rebuild_output(None) {
+        log::warn!("[device] 断开后重建到兜底设备失败: {e}");
+        // 记下系统当前的兜底设备名（没有就记空）：否则下一轮轮询仍判定
+        // 「设备变了」，每 2s 重试一次并重复弹通知
+        inner.current_device = fallback.unwrap_or_default().to_string();
+    }
+    let dev = inner.current_device.clone();
+    inner.mutate(|st| {
+        st.output_device = dev;
+        if active || announce {
+            // 应用内原因。这条文案的寿命取决于上面的重建：
+            // - 重建**成功** → 发起一次暂停态重载，异步挂载成功时 `mount_decoder`
+            //   会清空 `error`（新流就位 = 旧问题已了结），这里只是一闪而过；
+            // - 重建**失败**（一个输出设备都不剩）→ 不重载，文案持续显示，
+            //   这正是用户最需要看到原因的情况。
+            // 所以持久的告知靠下面那条系统通知，不能只指望这一行。
+            st.error = Some(reason.clone());
+        }
+    });
+    // 管线换了一条新的：旧的冻结判定不该带过来
+    inner.watch.clear();
+    // 淡出状态与 deadline 一并作废：重建若失败，残留的 FadeState::Out 会让
+    // 下一次播放走静音路径，过期的 pause_deadline 还会补一枪假暂停
+    inner.fx.clear_fade();
+    inner.pause_deadline = None;
+    if active {
+        // 最小化到托盘时应用内错误条看不到，必须走系统通知
+        notify_failure(&inner.app, &reason);
     }
 }
 
@@ -1058,6 +1278,9 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                     if st.status == PlaybackStatus::Paused {
                         st.status = PlaybackStatus::Playing;
                     }
+                    // 恢复播放 = 用户已经看到并接受了那条说明（掉设备暂停等）。
+                    // 不清掉的话，之后任何一次普通暂停都会把旧文案重新顶出来。
+                    st.error = None;
                 });
             }
         }
@@ -1326,7 +1549,14 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                 }
             }
             inner.output_choice = name.clone();
-            if let Err(e) = inner.rebuild_output(name.as_deref()) {
+            // 选定的固定设备当前不在枚举里（拔了 / 蓝牙没连上）：与「被动掉设备」
+            // 同一种处境 —— 继续显示 Playing 却一个采样都出不去。走暂停路径说明。
+            let missing = name.as_deref().is_some_and(|n| !device_present(n));
+            if missing {
+                if let Some(n) = name.as_deref() {
+                    pause_for_device_loss_named(inner, n);
+                }
+            } else if let Err(e) = inner.rebuild_output(name.as_deref()) {
                 log::warn!("[device] 切换输出设备失败: {e}");
                 inner.mutate(|st| st.error = Some(format!("切换输出设备失败: {e}")));
             }
@@ -3032,5 +3262,109 @@ mod buffer_limit_tests {
                 "「{other}」不该被判成文件过大"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod device_action_tests {
+    use super::{decide_device_action, device_gone_reason, DeviceAction};
+
+    /// 拔耳机（旧设备消失）→ 暂停，哪怕系统已经换好兜底设备。
+    #[test]
+    fn removed_device_pauses() {
+        assert_eq!(
+            decide_device_action("耳机", false, Some("扬声器"), false),
+            DeviceAction::Lost {
+                fallback: Some("扬声器".into())
+            }
+        );
+    }
+
+    /// 最后一个输出设备也被拔掉：`default_output_device()` 此时返回 None，
+    /// 仍然必须判定为「掉设备」。若把「能取到默认设备名」当作前提，
+    /// 这种只剩一个 USB DAC 的场景就会漏判、继续假装在播。
+    #[test]
+    fn removed_last_device_pauses_without_fallback() {
+        assert_eq!(
+            decide_device_action("USB DAC", false, None, false),
+            DeviceAction::Lost { fallback: None }
+        );
+    }
+
+    /// 被动移除的判定与「是否固定设备」无关：固定设备被拔掉同样要暂停。
+    #[test]
+    fn removed_pinned_device_also_pauses() {
+        assert_eq!(
+            decide_device_action("耳机", false, Some("扬声器"), true),
+            DeviceAction::Lost {
+                fallback: Some("扬声器".into())
+            }
+        );
+    }
+
+    /// 插上耳机 / HDMI：旧设备还在，只是默认换了人 → 跟随默认时重建续播。
+    #[test]
+    fn default_switch_while_following_rebuilds() {
+        assert_eq!(
+            decide_device_action("扬声器", true, Some("耳机"), false),
+            DeviceAction::Follow {
+                name: "耳机".into()
+            }
+        );
+    }
+
+    /// 固定设备模式下默认换人与本应用无关：流还挂在用户指定的设备上，不动。
+    #[test]
+    fn default_switch_while_pinned_is_ignored() {
+        assert_eq!(
+            decide_device_action("DAC", true, Some("耳机"), true),
+            DeviceAction::None
+        );
+    }
+
+    /// 枚举瞬时失败（拿不到默认设备名）不能当成设备变化 —— 否则会误暂停。
+    #[test]
+    fn transient_missing_default_is_not_a_change() {
+        assert_eq!(decide_device_action("耳机", true, None, false), DeviceAction::None);
+    }
+
+    /// 名字没变：什么都不做。
+    #[test]
+    fn unchanged_device_is_a_noop() {
+        assert_eq!(
+            decide_device_action("耳机", true, Some("耳机"), false),
+            DeviceAction::None
+        );
+    }
+
+    /// 启动时没有任何输出设备（old 为空）：等系统有默认设备了就接管，
+    /// 绝不走「掉设备」分支（那时根本没设备可掉）。
+    #[test]
+    fn empty_old_never_counts_as_device_loss() {
+        // 跟随默认：直接重建到新出现的默认设备
+        assert_eq!(
+            decide_device_action("", false, Some("扬声器"), false),
+            DeviceAction::Follow {
+                name: "扬声器".into()
+            }
+        );
+        // 固定设备：只补记设备名，不动流
+        assert_eq!(
+            decide_device_action("", false, Some("扬声器"), true),
+            DeviceAction::Adopt {
+                name: "扬声器".into()
+            }
+        );
+        // 一个都没有：什么都不做
+        assert_eq!(decide_device_action("", false, None, false), DeviceAction::None);
+    }
+
+    /// 文案：没在播时不能说「播放已暂停」（用户只是选了个没插上的设备）。
+    #[test]
+    fn reason_only_mentions_pause_when_playback_was_active() {
+        let active = device_gone_reason("耳机", "已断开", true);
+        assert!(active.contains("耳机") && active.contains("播放已暂停"));
+        let idle = device_gone_reason("耳机", "不可用", false);
+        assert!(idle.contains("耳机") && !idle.contains("播放已暂停"));
     }
 }

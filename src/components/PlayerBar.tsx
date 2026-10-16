@@ -355,8 +355,10 @@ export function PlayerBar(): React.JSX.Element {
       <div aria-hidden className="pointer-events-none absolute inset-0 -z-10 backdrop-blur-xl" />
       {/* 频谱背景：与毛玻璃同为 -z-10，DOM 顺序靠后所以画在毛玻璃之上、内容之下 */}
       <SpectrumBackground />
-      {/* 播放失败提示（REQUIREMENTS §3.1：重取仍失败时提示不可播放） */}
-      {state?.status === "error" && state.error && (
+      {/* 播放失败提示（REQUIREMENTS §3.1：重取仍失败时提示不可播放）。
+          暂停态也显示：掉设备（拔耳机 / 蓝牙断开）是「暂停 + 说明」而不是错误态，
+          状态是 paused，只在 error 态显示的话这句说明就没人看得见。 */}
+      {state?.error && (state.status === "error" || state.status === "paused") && (
         <div className="pointer-events-none absolute bottom-full left-1/2 mb-1 max-w-[60%] -translate-x-1/2 truncate rounded-md bg-destructive/10 px-3 py-1 text-xs text-destructive shadow">
           {state.error}
         </div>
