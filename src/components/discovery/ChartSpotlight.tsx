@@ -107,21 +107,23 @@ export function ChartSpotlightCard(props: {
 
   return (
     <div className="group flex flex-col rounded-xl border border-border bg-card/60 p-4 transition-shadow duration-200 hover:shadow-lg">
-      <div className="mb-3 flex items-baseline justify-between gap-3">
-        <button
-          type="button"
-          onClick={onOpen}
-          title={chart.name}
-          className="min-w-0 truncate text-base font-bold transition-colors hover:text-primary"
-        >
-          {chart.name}
-        </button>
+      {/* 整条标题行都是「进榜单详情」的命中区：只让标题那几个字可点太小，右侧的
+          「共 N 首」看着也是这一条的一部分，点它没反应就是坏的。
+          所以整行做成一个按钮、标题退成 span —— 按钮里不能再套按钮。
+          -mx-2 / -mt-1 配 px-2 / pt-1 把命中区扩进卡片内边距，文字位置一动没动。 */}
+      <button
+        type="button"
+        onClick={onOpen}
+        title={chart.name}
+        className="-mx-2 -mt-1 mb-3 flex items-baseline justify-between gap-3 rounded px-2 pt-1 text-left transition-colors hover:text-primary"
+      >
+        <span className="min-w-0 truncate text-base font-bold">{chart.name}</span>
         {hint !== null ? (
           <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
             {hint}
           </span>
         ) : null}
-      </div>
+      </button>
 
       <div className="flex items-start gap-3">
         {/* 封面做成「一叠」：后面两层错位的空壳，模仿参考稿里榜单封面堆叠的样子。
