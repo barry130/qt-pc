@@ -1,11 +1,78 @@
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { Play } from "lucide-react";
 import type { Chart, Track } from "@/types";
 import { qtresCoverUrl } from "@/lib/lrc";
 
 /**
- * 首页「榜单精选」卡片：左侧榜单封面 + 右侧前 3 首，点歌名直接播这一首，
- * 点封面上的播放键把整张榜入队。
+ * 「榜单精选」版式的几何常量。
+ *
+ * 首页 / 与 /charts（排行榜）**共用这一套**，两页的卡片大小、列数上限、每行间的
+ * 疏密因此天然一致 —— 排行榜页是把首页那块版式铺满整页，不是另做一版长得像的。
+ * 只把几何放这里；「取几条、点刷新绕不绕缓存」这类页面策略留在各自页面。
+ */
+/** 列数下限 2：改造前首页的固定列数，窗口收到最窄也不至于退成单列 */
+export const SPOTLIGHT_MIN_COLS = 2;
+/**
+ * 列数上限 5。
+ *
+ * 首页那边它同时决定了最多一次拉几个榜的详情（见 DiscoverPage 的 SPOTLIGHT_FETCH）；
+ * 每多展示一张卡就多一次 chartDetail 请求，不封顶的话 4K 屏会一次甩出十几个请求。
+ * 排行榜页虽然整页都是卡，但按可视区懒加载详情，同样不需要更大的列数。
+ */
+export const SPOTLIGHT_MAX_COLS = 5;
+/**
+ * 卡片的最小宽度（px）与卡片间隙（与 grid 的 gap-4 对齐）。
+ *
+ * 360 的来由：卡片左侧是 80px 封面，右侧一列曲目（名次 + 歌名 - 歌手），
+ * 两侧各 16px 内边距、中间 12px 间距 —— 再窄曲目名就只剩几个字。
+ * 与 CoverGrid 的 128 不是一回事：那是纯封面卡，这里一张卡的信息量顶三张封面。
+ */
+export const SPOTLIGHT_CARD_MIN_W = 360;
+export const SPOTLIGHT_GAP = 16;
+/** 每张卡右侧的曲目条数 */
+export const SPOTLIGHT_TRACKS = 3;
+
+/**
+ * 榜单卡网格的列数：按**容器实测宽度**算，不用 Tailwind 的视口断点 —— 主内容区
+ * 会被侧边栏和播放队列面板挤压，视口宽度对不上内容区宽度（同 CoverGrid 的口径）。
+ *
+ * 用 useLayoutEffect 而不是 useEffect：测到之前会先按初始列数画一帧，等 effect
+ * 再改成 3~5 列，宽屏上能看见卡片「重新排版」的那一下。布局阶段同步测完，第一帧
+ * 就是最终列数。
+ *
+ * `mounted` 是重测触发条件：空态时渲染的是空区块、没有 grid 可测，等数据到了
+ * grid 才出现、这个布尔量翻转，effect 才拿得到 ref（依赖 ref.current 本身不触发重跑）。
+ */
+export function useSpotlightColumns(mounted: boolean): {
+  gridRef: React.RefObject<HTMLDivElement | null>;
+  cols: number;
+} {
+  const gridRef = useRef<HTMLDivElement | null>(null);
+  const [cols, setCols] = useState(SPOTLIGHT_MIN_COLS);
+
+  useLayoutEffect(() => {
+    const el = gridRef.current;
+    if (el === null || typeof ResizeObserver === "undefined") return;
+    const measure = (): void => {
+      const w = el.clientWidth;
+      // 切走（KeepAliveOutlet 的 display:none）时宽度归零，保留上一次的列数，
+      // 切回来 ResizeObserver 会再报一次真实宽度
+      if (w <= 0) return;
+      const c = Math.floor((w + SPOTLIGHT_GAP) / (SPOTLIGHT_CARD_MIN_W + SPOTLIGHT_GAP));
+      setCols(Math.max(SPOTLIGHT_MIN_COLS, Math.min(SPOTLIGHT_MAX_COLS, c)));
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [mounted]);
+
+  return { gridRef, cols };
+}
+
+/**
+ * 「榜单精选」卡片：左侧榜单封面 + 右侧前 3 首，点歌名直接播这一首，
+ * 点封面上的播放键把整张榜入队。首页区块与排行榜页共用。
  *
  * 与 CoverCard 的区别是信息密度：这里要一眼看到榜里有什么歌，所以封面缩小到
  * 80px，右侧换成曲目列表。封面仍走 qtres:// 透传（DESIGN §6.13，带 Referer）。
