@@ -82,6 +82,16 @@ function buttonByText(container: HTMLElement, text: string): HTMLButtonElement {
   return el as HTMLButtonElement;
 }
 
+/** 「清理缓存」组里的勾选项按 label 文字取（label 文本就是选项名） */
+function checkboxByLabel(container: HTMLElement, text: string): HTMLInputElement {
+  const label = [...container.querySelectorAll("label")].find(
+    (l) => (l.textContent ?? "").trim() === text,
+  );
+  const input = label?.querySelector('input[type="checkbox"]');
+  expect(input, `勾选项「${text}」应存在`).toBeTruthy();
+  return input as HTMLInputElement;
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
   useAuthStore.setState({ profile: null });
@@ -152,8 +162,10 @@ describe("设置页 · 通用 · 日志区", () => {
     expect(c.textContent).toContain("不删除下载、登录、设置");
 
     const checks = [...c.querySelectorAll('input[type="checkbox"]')] as HTMLInputElement[];
-    expect(checks.length).toBeGreaterThanOrEqual(7);
-    expect(checks.every((input) => input.checked)).toBe(true);
+    expect(checks.length).toBeGreaterThanOrEqual(8);
+    // 可再生缓存默认全勾；不可再生的「听歌统计」是唯一例外，默认不勾
+    expect(checkboxByLabel(c, "听歌统计").checked).toBe(false);
+    expect(checks.filter((input) => input.checked).length).toBe(checks.length - 1);
 
     fireEvent.click(buttonByText(c, "清理"));
     await waitFor(() => expect(mocks.clearAudioCache).toHaveBeenCalledTimes(1));
@@ -168,22 +180,43 @@ describe("设置页 · 通用 · 日志区", () => {
     await waitFor(() => expect(buttonByText(c, "调试").className).toContain("bg-primary"));
   });
 
-  it("清除听歌统计：第一击只武装，第二击才真删", async () => {
+  it("听歌统计是「清理缓存」里的可选项：默认不勾，勾上后两次「清理」才真删", async () => {
     const c = await renderGeneral(PLAIN);
-    // 统计不可再生（累计时长、趋势删了就没了），一击不该生效
-    fireEvent.click(buttonByText(c, "清除"));
-    expect(mocks.clearListenStats).not.toHaveBeenCalled();
+    const stats = checkboxByLabel(c, "听歌统计");
+    expect(stats.checked).toBe(false);
+
+    fireEvent.click(stats);
+    // 统计不可再生（累计时长、日榜、最近播放删了就没了），第一击只武装，
+    // 连可再生缓存都不该跟着清 —— 否则用户以为只是清缓存
+    fireEvent.click(buttonByText(c, "清理"));
     expect(c.textContent).toContain("再点一次确认清除");
+    expect(mocks.clearListenStats).not.toHaveBeenCalled();
+    expect(mocks.clearAudioCache).not.toHaveBeenCalled();
 
     fireEvent.click(buttonByText(c, "再点一次确认清除"));
     await waitFor(() => expect(mocks.clearListenStats).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(mocks.clearAudioCache).toHaveBeenCalledTimes(1));
   });
 
-  it("清理缓存不会连带清掉听歌统计", async () => {
+  it("默认不勾听歌统计时，清理缓存不会连带清掉它", async () => {
     const c = await renderGeneral(PLAIN);
+    expect(checkboxByLabel(c, "听歌统计").checked).toBe(false);
     fireEvent.click(buttonByText(c, "清理"));
     await waitFor(() => expect(mocks.clearAudioCache).toHaveBeenCalledTimes(1));
-    // 「清理缓存」默认全选、一键执行，听歌统计必须留在它外面
+    expect(mocks.clearListenStats).not.toHaveBeenCalled();
+  });
+
+  it("取消勾选听歌统计会撤掉待确认状态", async () => {
+    const c = await renderGeneral(PLAIN);
+    const stats = checkboxByLabel(c, "听歌统计");
+    fireEvent.click(stats);
+    fireEvent.click(buttonByText(c, "清理"));
+    expect(c.textContent).toContain("再点一次确认清除");
+    fireEvent.click(stats);
+    expect(c.textContent).not.toContain("再点一次确认清除");
+    // 回到普通清理：一次点击就执行，且不再带统计
+    fireEvent.click(buttonByText(c, "清理"));
+    await waitFor(() => expect(mocks.clearAudioCache).toHaveBeenCalledTimes(1));
     expect(mocks.clearListenStats).not.toHaveBeenCalled();
   });
 });

@@ -581,16 +581,17 @@ Windows 平台注意事项（原文未覆盖，均为实测坑点）：
 
 | key | 标题 | 出场条件（每类都要 ≥ `MIN_TRACKS` = 5 首） |
 |---|---|---|
-| `recent` | 最近在听 | 最近 14 天内（`RECENT_WINDOW_MS`）播放过 |
+| `recent` | 最近在听 | 最后一次播放（`play_stats.last_played_at`）落在最近 14 天内（`RECENT_WINDOW_MS`） |
 | `most_played` | 循环最多的歌 | 全历史播放次数 ≥ 2（`MOST_PLAYED_MIN_PLAYS`） |
 | `favorite_picks` | 收藏里的常客 | `liked_songs`（`deleted_at IS NULL`）× `play_stats`（`play_count ≥ 1`）的交集；从没播过的收藏不进榜，已删除的收藏不算 |
-| `late_night` | 深夜歌单 | 最后一次播放落在本地 22:00–次日 06:00（`NIGHT_START_HOUR` / `NIGHT_END_HOUR`），与当前钟点无关 |
+| `late_night` | 深夜歌单 | 最后一次播放（`play_stats.last_played_at`）落在本地 22:00–次日 06:00（`NIGHT_START_HOUR` / `NIGHT_END_HOUR`），与当前钟点无关 |
 | `nostalgic` | 久未重温 | 听过 ≥ 3 次（`UNHEARD_MIN_PLAYS`）且 30 天没再碰（`UNHEARD_WINDOW_MS`），最久没听的排最前 |
 
+- **五类统一读累计表 `play_stats`**，外加一张 `liked_songs`，没有一路读 `play_history`。这不是随手选的：`play_history` 一首歌只留最近一条、时间戳与 `play_stats.last_played_at` 本是同一个，但它只留 20 来行而统计表覆盖全部有效播放的曲目，精度天然更差；更重要的是「清除听歌统计」现在连它一起清，两边同源同命，不会出现「清完统计首页还在推荐歌」。
 - **整区的出场门槛是「五类中至少 2 类」，不是五类全齐**（`LocalMixSection.tsx` 的 `MIN_SHOWN_MIXES`）。五类各有各的门槛：新用户还没在深夜听过歌、旧歌没攒够 30 天、收藏还没归进现存歌单；硬凑五类会让这一区长期消失，攒了半年的记录也换不来一张卡。反过来只出一类又像数据坏了，所以折中取 2 —— 凑够两类就展示，凑不满整区不渲染，不摆半成品区域。
 - 单类不足 5 首时该类不生成（`finish_mix` 返回 `None`），但**不影响其余类照常出场**。
 - 每类最多取 `MAX_TRACKS` = 20 首；卡片封面取前 3 张非空图。
-- 移动端同规则的实现是 `qt-uniappx/services/local-mixes.ts`（`MIN_SONGS` / `finish()` / `shouldShowLocalMixes`），两端门槛与条件必须保持一致。差异一处：移动端「收藏里的常客」还要求收藏带 `pids` 且该歌单仍在现存本地歌单里，避免已删除的歌单把收藏「复活」。
+- 移动端同规则的实现是 `qt-uniappx/services/local-mixes.ts`（`MIN_SONGS` / `finish()` / `shouldShowLocalMixes`），两端门槛与条件必须保持一致。移动端五类**全部**只读听歌统计存档，而它的「清除听歌统计」会把整份存档清空，所以移动端天然同源、不会出现本节记的 PC 那个不一致。差异一处：移动端「收藏里的常客」还要求收藏带 `pids` 且该歌单仍在现存本地歌单里，避免已删除的歌单把收藏「复活」。
 
 ## 5.3 标题栏
 
@@ -1690,7 +1691,8 @@ CREATE INDEX idx_play_days_day ON play_days(day DESC);
 - **日期用本地自然日**，与移动端 `listenDayKey` 同口径；不能用 UTC，否则东八区凌晨 0-8 点的播放会算进前一天。
 - **窗口下界**与写入侧共用同一段 SQL 表达式（`listen_report.rs` 的 `window_start`），避免读写两侧各算一次日期而错开一天。
 - **迁移不回填、首次进报告页补齐**：v18 迁移本身不写 `play_days`（老数据的按天分布毫无依据，在迁移里编一个分布比留空更不诚实）；存量播放由报告页首次打开时调用的 `seed_listen_days` 统一归到「今天」。该函数只搬「`play_stats` 累计 − `play_days` 已有之和」的**差额**（整笔搬会把今天已经按天记过的播放再加一遍），因此**天然幂等**、不需要 `daysSeeded` 之类的持久化标记，恢复备份后也能自动补齐。`play_overview.active_days` 只数 `play_days` 里 `play_count > 0 OR total_played_ms > 0` 的日子（全零补行不算活跃）。
-- **清除听歌统计**：设置页「通用」的「清理缓存」下方另有 `clear_listen_stats`，一次事务删掉 `play_days` 与 `play_stats`（不可再生，界面走两击确认）；刻意不并进「清理缓存」的勾选项 —— 那边默认全选、一次「清理」就执行，语义与风险都不该混。`play_history`（播放记录）、收藏、歌单不受影响。`play_days` 与 `play_stats` 都在 `backup.rs` 的 `TABLES` 里，导出/导入不会丢按天明细。
+- **听歌统计清除**：`clear_listen_stats` 是「清理缓存」勾选组里的一个选项（默认**不勾**），一次事务删掉 `play_stats`、`play_days` 与 `play_history` 三张表；因为不可再生，勾上后「清理」按钮要走两击确认（第一击只武装成「再点一次确认清除」，3 秒复位），且武装状态下**连可再生缓存也一起不执行** —— 用户点「清理」的心智是「清缓存」，不能顺手把累计删了。可再生缓存那几项仍是默认全勾、一次点击就执行。
+- **统计与播放记录是一起清的**：两者本来就是同一份收听数据的两种看法（`play_history` 记最后一次播放、`play_stats` 记累计），只清一半会留下「统计归零、但最近播放还在」的反直觉状态，用户点完还得再去历史页清一次。收藏、歌单不受影响。随之归零的还有首页「为你整理」（§5.2，它读的就是 `play_stats`）与听歌报告。`play_days` / `play_stats` / `play_history` 都在 `backup.rs` 的 `TABLES` 里，导出/导入不会丢。
 - 读它的两条路径：`get_listen_day_report`（逐日趋势 + 窗口总量 + Top N）与 `get_listen_report` 带 `days` 时（窗口内分页明细）。两者走同一段分组 / 排序 SQL，所以日榜上点进去看到的行必定对得上。
 
 ### download_tasks

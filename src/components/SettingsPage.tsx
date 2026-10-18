@@ -1284,10 +1284,12 @@ function GeneralSection(): React.JSX.Element {
   const [clearRuntime, setClearRuntime] = useState<RuntimeCacheKind[]>(
     RUNTIME_CACHE_OPTIONS.map((option) => option.kind),
   );
+  // 听歌统计不可再生（累计时长、日榜、最近播放删了就没了），所以默认不勾，
+  // 且勾上后「清理」按钮要走两击确认，不能像可再生缓存那样一键执行。
+  const [clearStats, setClearStats] = useState(false);
   const [clearing, setClearing] = useState(false);
-  // 「清除听歌统计」不可撤销，走两击确认：第一击武装，3 秒内再点才真删
+  // 勾上听歌统计后的第一击只武装，3 秒内再点才真删
   const [armedStats, setArmedStats] = useState(false);
-  const [clearingStats, setClearingStats] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // 日志配置（级别 / 单文件上限 / 保留份数 / 目录）。null = 还没读到
   const [logCfg, setLogCfg] = useState<ipc.LogConfig | null>(null);
@@ -1378,6 +1380,13 @@ function GeneralSection(): React.JSX.Element {
   };
 
   const clearCache = async (): Promise<void> => {
+    // 勾了听歌统计就意味着不可逆删除：第一击只武装，不清任何东西，3 秒内再点才真执行
+    if (clearStats && !armedStats) {
+      setArmedStats(true);
+      window.setTimeout(() => setArmedStats(false), 3000);
+      return;
+    }
+    if (armedStats) setArmedStats(false);
     setClearing(true);
     setError(null);
     try {
@@ -1399,15 +1408,19 @@ function GeneralSection(): React.JSX.Element {
         0,
       );
       const summary = runtimeCount > 0 ? `，进程内缓存 ${runtimeCount} 项` : "";
+      // 统计单独走：它返回删掉的曲目数，混不进上面的字节 / 文件统计
+      const statsRemoved = clearStats ? await ipc.clearListenStats() : 0;
+      const statsNote =
+        clearStats && statsRemoved > 0 ? `；听歌统计 ${statsRemoved} 首已归零` : "";
       // 清理结果是一次性回执（表单校验那种要停留的错误走上面的 error 行内提示）
-      if (freed === 0 && failed === 0 && runtimeCount === 0) {
+      if (freed === 0 && failed === 0 && runtimeCount === 0 && statsNote === "") {
         toast("没有可清理的内容");
       } else if (failed > 0) {
         toastSuccess(
-          `已清理 ${formatBytes(freed)}${summary}；${failed} 个文件被占用跳过（正在播放的不会删）`,
+          `已清理 ${formatBytes(freed)}${summary}${statsNote}；${failed} 个文件被占用跳过（正在播放的不会删）`,
         );
       } else {
-        toastSuccess(`已清理 ${formatBytes(freed)}${summary}`);
+        toastSuccess(`已清理 ${formatBytes(freed)}${summary}${statsNote}`);
       }
       await refreshCache();
     } catch (err) {
@@ -1417,34 +1430,7 @@ function GeneralSection(): React.JSX.Element {
     }
   };
 
-  const nothingSelected = !clearAudio && !clearWeb && clearRuntime.length === 0;
-
-  /**
-   * 两击确认的「清除听歌统计」：第一击武装（3 秒内再点确认），第二击才真删。
-   *
-   * 刻意不放进上面「清理缓存」那组勾选：那边默认全选、一次「清理」就执行，
-   * 而听歌统计**不可再生**（累计时长、趋势、活跃天数删了就没了），
-   * 与「只清可再生缓存」的语义和风险都不该混在一起。
-   */
-  const clearListenStats = async (): Promise<void> => {
-    if (!armedStats) {
-      setArmedStats(true);
-      window.setTimeout(() => setArmedStats(false), 3000);
-      return;
-    }
-    setArmedStats(false);
-    setClearingStats(true);
-    setError(null);
-    try {
-      const removed = await ipc.clearListenStats();
-      if (removed === 0) toast("没有可清除的听歌统计");
-      else toastSuccess(`已清除听歌统计（${removed} 首歌曲的累计与按天明细）`);
-    } catch (err) {
-      setError(errMsg(err));
-    } finally {
-      setClearingStats(false);
-    }
-  };
+  const nothingSelected = !clearAudio && !clearWeb && clearRuntime.length === 0 && !clearStats;
 
   const openLogs = async (): Promise<void> => {
     setError(null);
@@ -1658,8 +1644,8 @@ function GeneralSection(): React.JSX.Element {
         title="清理缓存"
         description={
           cache
-            ? `默认只清理可再生缓存：播放 ${formatBytes(cache.totalBytes)} / 图片 ${formatBytes(cache.webBytes)}；不删除下载、登录、设置或已保存歌词`
-            : "默认只清理可再生缓存；不删除已下载音乐、登录状态、应用设置或已保存歌词"
+            ? `默认只清理可再生缓存：播放 ${formatBytes(cache.totalBytes)} / 图片 ${formatBytes(cache.webBytes)}；不删除下载、登录、设置或已保存歌词。「听歌统计」是可选项，默认不勾`
+            : "默认只清理可再生缓存；不删除已下载音乐、登录状态、应用设置或已保存歌词。「听歌统计」是可选项，默认不勾"
         }
       >
         <div className="flex max-w-md flex-wrap items-center justify-end gap-x-3 gap-y-2">
@@ -1702,53 +1688,62 @@ function GeneralSection(): React.JSX.Element {
               {option.label}
             </label>
           ))}
+          <label
+            className="flex items-center gap-1 text-xs text-muted-foreground"
+            title="累计时长、有效播放、日榜与「最近播放」一起归零，不可恢复；勾上后需要点两次「清理」"
+          >
+            <input
+              type="checkbox"
+              checked={clearStats}
+              onChange={(e) => {
+                setClearStats(e.target.checked);
+                // 取消勾选时把武装状态一起撤掉，避免上一轮的「再点一次」留在界面上
+                if (!e.target.checked) setArmedStats(false);
+              }}
+              className="h-3.5 w-3.5 accent-primary"
+            />
+            听歌统计
+          </label>
           <button
             type="button"
             onClick={() => {
               // 「全选 / 全不选」必须从当前合计判断，不能各自取反：
               // 分项里取消过一个，全选再点一次应当补回全部而不是反向清掉。
-              const allOn = clearAudio && clearWeb && clearRuntime.length === RUNTIME_CACHE_OPTIONS.length;
+              const allOn =
+                clearAudio &&
+                clearWeb &&
+                clearRuntime.length === RUNTIME_CACHE_OPTIONS.length &&
+                clearStats;
               setClearAudio(!allOn);
               setClearWeb(!allOn);
               setClearRuntime(allOn ? [] : RUNTIME_CACHE_OPTIONS.map((option) => option.kind));
+              setClearStats(!allOn);
+              if (!allOn) setArmedStats(false);
             }}
             className="rounded-md px-1.5 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
           >
-            {clearAudio && clearWeb && clearRuntime.length === RUNTIME_CACHE_OPTIONS.length ? "全不选" : "全选"}
+            {clearAudio &&
+            clearWeb &&
+            clearRuntime.length === RUNTIME_CACHE_OPTIONS.length &&
+            clearStats
+              ? "全不选"
+              : "全选"}
           </button>
           <button
             type="button"
             onClick={() => void clearCache()}
             disabled={clearing || nothingSelected}
-            className="rounded-md border border-border px-3 py-1.5 text-xs transition-colors hover:bg-accent disabled:opacity-50"
-          >
-            {clearing ? "清理中…" : "清理"}
-          </button>
-          <p className="basis-full text-right text-[11px] text-muted-foreground">
-            进程内缓存可重新获取；清理歌词只清内存候选与当前歌词，不删除已保存歌词。
-          </p>
-        </div>
-      </SettingRow>
-      <SettingRow
-        title="清除听歌统计"
-        description="把累计时长、有效播放、听过歌曲、活跃天数与听歌趋势全部归零，之后从零重新累计；不影响收藏、歌单、下载与播放记录。"
-      >
-        <div className="flex max-w-md flex-wrap items-center justify-end gap-x-3 gap-y-2">
-          <p className="basis-full text-right text-[11px] text-muted-foreground">
-            不可再生数据，删除后无法恢复；想留个底可以先「导出备份」。
-          </p>
-          <button
-            type="button"
-            onClick={() => void clearListenStats()}
-            disabled={clearingStats}
             className={`rounded-md border px-3 py-1.5 text-xs transition-colors disabled:opacity-50 ${
               armedStats
                 ? "border-destructive/60 bg-destructive/10 text-destructive hover:bg-destructive/20"
-                : "border-border text-destructive/80 hover:bg-accent"
+                : "border-border hover:bg-accent"
             }`}
           >
-            {clearingStats ? "清除中…" : armedStats ? "再点一次确认清除" : "清除"}
+            {clearing ? "清理中…" : armedStats ? "再点一次确认清除" : "清理"}
           </button>
+          <p className="basis-full text-right text-[11px] text-muted-foreground">
+            进程内缓存可重新获取；清理歌词只清内存候选与当前歌词，不删除已保存歌词。听歌统计不可再生，勾上后需点两次「清理」；想留个底可以先「导出备份」。
+          </p>
         </div>
       </SettingRow>
       <SettingRow

@@ -4814,14 +4814,14 @@ pub async fn cmd_seed_listen_days(state: State<'_, AppState>) -> Result<usize, S
         .map_err(|e| format!("初始化按天明细失败: {e}"))?
 }
 
-/// 清除听歌统计（累计 + 按天明细）。不可撤销，前端必须二次确认；
-/// 返回删掉的曲目数。播放记录、收藏、歌单不受影响。
+/// 清除听歌统计（累计 + 按天明细 + 播放记录）。不可撤销，前端必须二次确认；
+/// 返回删掉的曲目数。收藏、歌单不受影响。
 #[tauri::command(rename = "clear_listen_stats")]
 pub async fn cmd_clear_listen_stats(state: State<'_, AppState>) -> Result<i64, String> {
     let Some(db) = state.db.clone() else {
         return Ok(0);
     };
-    tauri::async_runtime::spawn_blocking(move || db.with(crate::db::store::clear_play_stats))
+    tauri::async_runtime::spawn_blocking(move || db.with(crate::db::store::clear_listen_stats))
         .await
         .map_err(|e| format!("清除听歌统计失败: {e}"))?
 }

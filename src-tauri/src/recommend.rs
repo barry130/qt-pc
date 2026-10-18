@@ -1,11 +1,16 @@
 //! 本地化推荐合辑（第二波）：纯本地听歌数据驱动的合辑卡片。
 //!
-//! 「推荐」在这里**不联网**，也不伪造任何数据：每条规则只消费本地库的
-//! 既有表 ——
-//! · `play_history`（最近一次播放，一首歌只留最近一条）→「最近在听」「深夜歌单」；
-//! · `play_stats`（全历史累计：次数 / 最后播放时间）→「循环最多的歌」「久未重温」；
+//! 「推荐」在这里**不联网**，也不伪造任何数据：五类规则**统一消费本地库的
+//! 累计表** ——
+//! · `play_stats`（全历史累计：最后播放时间 / 次数）→「最近在听」「深夜歌单」
+//!   「循环最多的歌」「久未重温」（四类）；
 //! · `liked_songs` × `play_stats` →「收藏里的常客」。
 //! 取数函数全部在 db/store/stats.rs 的追加段（只读 SELECT，无新表无迁移）。
+//!
+//! 刻意不读 `play_history`：它一首歌只留最近一条，时间戳与
+//! `play_stats.last_played_at` 记的是同一个，但只覆盖最近播过的那 20 来行 ——
+//! 拿它算「最近在听」会把大半有累计的曲目挡在门外。「清除听歌统计」已经连
+//! `play_history` 一起清，但那是「同源同命」；五类规则统一读累计表口径才一致。
 //!
 //! 合辑顺序写死（[`build_mixes`] 里 push 的次序），前端照单全收无需再排；
 //! 曲目凑不够 [`MIN_TRACKS`] 的合辑直接不出现 —— 推荐位宁缺毋滥，
@@ -77,7 +82,8 @@ fn finish_mix(
     subtitle: String,
     tracks: Vec<Track>,
 ) -> Option<LocalMix> {
-    (tracks.len() >= MIN_TRACKS).then(|| LocalMix {
+    // then_some 而非 then：构造只是搬四个字段，没有额外开销
+    (tracks.len() >= MIN_TRACKS).then_some(LocalMix {
         key,
         title,
         subtitle,
@@ -237,8 +243,9 @@ mod tests {
         }
     }
 
-    /// 种一首曲目 + 播放历史 + 全历史统计（原始 SQL，时间戳精确可控，
-    /// 绕开 record_play_history / record_listen 的「当前时刻」取值）。
+    /// 种一首曲目 + 全历史统计（原始 SQL，时间戳精确可控，绕开
+    /// record_listen 的「当前时刻」取值）。顺带写一条播放记录，好让
+    /// 「清完统计播放记录仍在」那条断言在合辑测试里也成立。
     fn seed_history_and_stat(conn: &Connection, t: &Track, played_at: i64, play_count: i64) {
         upsert_tracks(conn, &[t]).expect("upsert");
         let db_id = db_track_id(t);
@@ -378,6 +385,51 @@ mod tests {
         assert!(
             mix_tracks(&conn, "nope").expect("db").is_none(),
             "未知 key 必须是 None"
+        );
+    }
+
+    /// 清完听歌统计，首页不该还有任何合辑 —— 统计与播放记录一起清，同源同命。
+    ///
+    /// 背景：早先「最近在听」「深夜歌单」读 `play_history`，而清除只删统计表，
+    /// 用户清完统计回到首页照样看到推荐歌；合辑门槛降到「至少 2 类」后更显眼。
+    /// 这里是 UI 真正调用的那条路径（`build_mixes`），把现象钉在这一层。
+    #[test]
+    fn clearing_listen_stats_empties_mixes_and_history() {
+        let conn = conn();
+        let now = now_ms();
+        let hour = 3600 * 1000;
+        // 6 首近期、每首 3 次 → 「最近在听」+「循环最多的歌」正好两类
+        for i in 0..6 {
+            seed_history_and_stat(
+                &conn,
+                &track(&format!("c{i}"), &format!("清{i}"), ""),
+                now - i as i64 * hour,
+                3,
+            );
+        }
+        assert_eq!(
+            build_mixes(&conn).expect("build").len(),
+            2,
+            "清之前应当凑够两类"
+        );
+
+        crate::db::store::clear_listen_stats(&conn).expect("清除");
+        let count = |table: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .expect("计数")
+        };
+        assert_eq!(
+            (count("play_stats"), count("play_history")),
+            (0, 0),
+            "统计与播放记录一起清"
+        );
+        assert!(
+            build_mixes(&conn).expect("build after clear").is_empty(),
+            "清完统计不该还有合辑"
+        );
+        assert!(
+            mix_tracks(&conn, "recent").expect("db").is_none(),
+            "详情页也不该再拿到曲目"
         );
     }
 }

@@ -207,14 +207,18 @@ pub(crate) fn seed_play_days(conn: &Connection) -> Result<usize, rusqlite::Error
     )
 }
 
-/// 清除听歌统计：累计表与按天明细一起删，返回删掉的曲目数。
+/// 清除听歌统计：累计表、按天明细与播放记录一起删，返回删掉的曲目数。
 ///
-/// 只动这两张表 —— `play_history`（播放记录）、收藏、歌单、下载都不受影响，
-/// 与移动端「清除听歌统计」同口径：统计归零，但「最近听了什么」还在。
-pub(crate) fn clear_play_stats(conn: &Connection) -> Result<i64, rusqlite::Error> {
+/// 三张表在**同一个事务**里清 —— 统计与「最近播放」本来就是同一份收听数据的
+/// 两种看法（`play_history` 记最后一次播放，`play_stats` 记累计），只清一半会
+/// 出现「统计归零但最近播放还在」的反直觉状态，用户点完还得再点一次清空。
+///
+/// 收藏、歌单、下载一概不动。
+pub(crate) fn clear_listen_stats(conn: &Connection) -> Result<i64, rusqlite::Error> {
     let tx = conn.unchecked_transaction()?;
-    tx.execute("DELETE FROM play_days", [])?;
     let removed = tx.execute("DELETE FROM play_stats", [])? as i64;
+    tx.execute("DELETE FROM play_days", [])?;
+    tx.execute("DELETE FROM play_history", [])?;
     tx.commit()?;
     Ok(removed)
 }
@@ -289,12 +293,17 @@ pub(crate) fn list_top_singers(
 
 // ---------- 本地化推荐合辑取数（recommend.rs 消费，纯只读 SELECT） ----------
 //
-// 「本地化推荐合辑」完全用本地既有数据拼出几个合辑卡片，不联网：
-//   · play_history —— 最近一次播放（历史表一首歌只留最近一条，见
-//     record_play_history），「最近在听」「深夜歌单」按它判定；
-//   · play_stats —— 全历史累计（次数 / 最后播放时间），「循环最多的歌」
-//     与「久未重温」按它判定；
+// 「本地化推荐合辑」完全用本地既有数据拼出几个合辑卡片，不联网。
+// 五类**统一读 play_stats**（累计口径：最后播放时间 / 次数），外加一张 liked_songs：
+//   · play_stats.last_played_at —— 「最近在听」「深夜歌单」；
+//   · play_stats.play_count —— 「循环最多的歌」（次数 ≥ 2）与
+//     「久未重温」（次数 ≥ 3 且最后播放早于 30 天）；
 //   · liked_songs × play_stats —— 「收藏里的常客」。
+// 早先「最近在听」「深夜歌单」读的是 play_history，而「清除听歌统计」按设计只删
+// play_days + play_stats、保留播放历史，于是清完统计首页还剩这两类（外加新的
+// MIN_SHOWN_MIXES 门槛）照常显示。play_history 一首歌只留最近一条（见
+// record_play_history），与 play_stats.last_played_at 本就是同一批「最后一次播放」，
+// 换表不丢精度，只是让「清除听歌统计」真正清得干净。
 // 不建新表、不加迁移，这里只有 SELECT。所有查询都过滤 `t.missing = 0`：
 // 文件已经不在的曲目不该再被推荐出来。
 //
@@ -332,8 +341,10 @@ fn stat_item_from_row(row: &rusqlite::Row<'_>) -> Result<Option<PlayStatItem>, r
 
 /// 近一段时间（`since_ms` 毫秒起）听过的曲目，最近播放在前。
 ///
-/// `play_history` 天然一首一条（见 [`record_play_history`]），无需再去重。
-/// 列序刻意对齐 [`track_from_row`]（sid 由 substr 拆出），直接复用既有行映射。
+/// 按 `play_stats.last_played_at` 判定：累计表一首歌一行、该字段就是最后一次
+/// 播放的时刻，与 `play_history` 存的同一个时间（历史表同样一首一条），换表
+/// 不丢精度，只是和「清除听歌统计」同源同命。列序刻意对齐 [`track_from_row`]
+/// （sid 由 substr 拆出），直接复用既有行映射。
 pub(crate) fn list_recent_tracks(
     conn: &Connection,
     since_ms: i64,
@@ -342,10 +353,10 @@ pub(crate) fn list_recent_tracks(
     let mut stmt = conn.prepare(
         "SELECT substr(t.id, instr(t.id, ':') + 1), t.platform, t.title, t.singer,
                 t.album, t.pic_url, t.duration_ms, t.music_id, t.start_ms, t.end_ms
-           FROM play_history h
-           JOIN tracks t ON t.id = h.track_id
-          WHERE h.played_at >= ?1 AND t.missing = 0
-          ORDER BY h.played_at DESC, h.rowid DESC
+           FROM play_stats s
+           JOIN tracks t ON t.id = s.track_id
+          WHERE s.last_played_at >= ?1 AND t.missing = 0
+          ORDER BY s.last_played_at DESC
           LIMIT ?2",
     )?;
     let mut rows = stmt.query(params![since_ms, limit])?;
@@ -363,8 +374,8 @@ pub(crate) fn list_recent_tracks(
 pub(crate) fn count_recent_tracks(conn: &Connection, since_ms: i64) -> Result<i64, rusqlite::Error> {
     conn.query_row(
         "SELECT COUNT(*)
-           FROM play_history h JOIN tracks t ON t.id = h.track_id
-          WHERE h.played_at >= ?1 AND t.missing = 0",
+           FROM play_stats s JOIN tracks t ON t.id = s.track_id
+          WHERE s.last_played_at >= ?1 AND t.missing = 0",
         params![since_ms],
         |r| r.get(0),
     )
@@ -443,7 +454,7 @@ pub(crate) fn count_unreplayed_tracks(
 /// 两个参数是内部常量传进来的 i64 字面量，`format!` 拼接没有注入面。
 fn late_night_window(start_hour: i64, end_hour: i64) -> String {
     let hour =
-        "CAST(strftime('%H', h.played_at / 1000, 'unixepoch', 'localtime') AS INTEGER)";
+        "CAST(strftime('%H', s.last_played_at / 1000, 'unixepoch', 'localtime') AS INTEGER)";
     if start_hour <= end_hour {
         format!("{hour} >= {start_hour} AND {hour} < {end_hour}")
     } else {
@@ -452,7 +463,7 @@ fn late_night_window(start_hour: i64, end_hour: i64) -> String {
 }
 
 /// 播放时刻落在本地时区 `[start_hour, end_hour)` 的曲目，最近播放在前。
-/// 同 [`list_recent_tracks`]，以**最近一次播放**的时刻判定（历史表一首一条）。
+/// 同 [`list_recent_tracks`]，以 `play_stats.last_played_at`（最后一次播放）判定。
 pub(crate) fn list_late_night_tracks(
     conn: &Connection,
     start_hour: i64,
@@ -462,10 +473,10 @@ pub(crate) fn list_late_night_tracks(
     let sql = format!(
         "SELECT substr(t.id, instr(t.id, ':') + 1), t.platform, t.title, t.singer,
                 t.album, t.pic_url, t.duration_ms, t.music_id, t.start_ms, t.end_ms
-           FROM play_history h
-           JOIN tracks t ON t.id = h.track_id
+           FROM play_stats s
+           JOIN tracks t ON t.id = s.track_id
           WHERE t.missing = 0 AND ({})
-          ORDER BY h.played_at DESC, h.rowid DESC
+          ORDER BY s.last_played_at DESC
           LIMIT ?1",
         late_night_window(start_hour, end_hour)
     );
@@ -489,7 +500,7 @@ pub(crate) fn count_late_night_tracks(
     conn.query_row(
         &format!(
             "SELECT COUNT(*)
-               FROM play_history h JOIN tracks t ON t.id = h.track_id
+               FROM play_stats s JOIN tracks t ON t.id = s.track_id
               WHERE t.missing = 0 AND ({})",
             late_night_window(start_hour, end_hour)
         ),
@@ -542,8 +553,11 @@ mod local_mix_queries_tests {
         crate::db::store::tests::sample_track_with(title, "测试歌手")
     }
 
-    /// 种一首曲目：入库 + 一条播放历史 + 一份全历史统计（原始 SQL，
+    /// 种一首曲目：入库 + 一条播放记录 + 一份全历史统计（原始 SQL，
     /// 时间戳精确可控，绕开 record_play_history / record_listen 的「当前时刻」）。
+    ///
+    /// 合辑五类现在统一读 `play_stats`，`play_history` 这一条只为「清除统计后
+    /// 播放记录仍在、合辑却空了」那个用例准备。
     fn seed(conn: &Connection, track: &Track, played_at: i64, play_count: i64) {
         upsert_tracks(conn, &[track]).expect("upsert");
         let db_id = db_track_id(track);
@@ -682,12 +696,50 @@ mod local_mix_queries_tests {
         let n = count_late_night_tracks(&conn, 22, 6).expect("跨零点计数 SQL 必须合法");
         assert_eq!(n, wrap.len() as i64, "计数与列表同口径");
     }
+
+    /// 合辑前两类只认 `play_stats`：就算统计表被清空、播放记录原封不动，也取不到歌。
+    ///
+    /// 背景：这两类原本读 `play_history`，于是「清完统计首页还在推荐歌」；合辑
+    /// 渲染门槛降到「至少 2 类」后这个一直存在的口径不一致直接变成 bug。这里
+    /// 绕开 [`clear_listen_stats`]（它现在连播放记录一起清）、只删统计表，把
+    /// 「合辑与统计同源」这个不变量单独锁死，防止有人改回读历史表。
+    #[test]
+    fn mixes_ignore_play_history_even_when_stats_are_cleared() {
+        let conn = conn();
+        let now = now_ms();
+        let day = 24 * 3600 * 1000;
+        for i in 0..8 {
+            seed(&conn, &sample(&format!("T{i}")), now - i * 60 * 1000, 3);
+        }
+        let history: i64 = conn
+            .query_row("SELECT COUNT(*) FROM play_history", [], |r| r.get(0))
+            .expect("计数播放记录");
+        assert_eq!(history, 8, "seed 同时写了两张表，播放记录确实还在");
+
+        conn.execute("DELETE FROM play_stats", []).expect("只清累计表");
+        conn.execute("DELETE FROM play_days", []).expect("只清按天明细");
+        assert!(
+            list_recent_tracks(&conn, now - 14 * day, 20)
+                .expect("recent")
+                .is_empty(),
+            "统计清空后「最近在听」不该还能从播放记录里捞出歌"
+        );
+        assert!(
+            list_late_night_tracks(&conn, 0, 24, 20)
+                .expect("late night")
+                .is_empty(),
+            "统计清空后「深夜歌单」不该还能从播放记录里捞出歌（全天窗口，别依赖钟点）"
+        );
+        assert_eq!(count_recent_tracks(&conn, now - 14 * day).expect("count"), 0);
+        assert_eq!(count_late_night_tracks(&conn, 0, 24).expect("count"), 0);
+    }
 }
 
 /// 按天明细（V18 `play_days`）与累计表同源同刻，日榜据此按自然日切窗口。
 #[cfg(test)]
 mod play_day_tests {
     use super::*;
+    use crate::db::store::add_liked_song;
 
     fn conn() -> Connection {
         crate::db::store::tests::new_conn()
@@ -860,13 +912,17 @@ mod play_day_tests {
         );
     }
 
-    /// 清除统计：两张表一起清空，但播放记录、收藏等别的数据一概不动。
+    /// 清除听歌统计：三张表（累计、按天明细、播放记录）一起清空，收藏等不动。
+    ///
+    /// 统计与播放记录本来就是同一份收听数据的两种看法，只清一半会留下
+    /// 「统计归零但最近播放还在」的反直觉状态。
     #[test]
-    fn clear_play_stats_empties_both_tables_and_keeps_history() {
+    fn clear_listen_stats_empties_stats_days_and_history() {
         let conn = conn();
         let track = sample("清统计");
         record_listen(&conn, &track, 30_000, 1, 0).expect("结算");
         let id = db_track_id(&track);
+        add_liked_song(&conn, &track, "p1").expect("收藏一首，验证不受影响");
         conn.execute(
             "INSERT OR REPLACE INTO play_history
                  (id, track_id, played_at, played_duration_ms, completed)
@@ -875,13 +931,17 @@ mod play_day_tests {
         )
         .expect("写播放记录");
 
-        assert_eq!(clear_play_stats(&conn).expect("清除"), 1, "返回删掉的曲目数");
+        assert_eq!(clear_listen_stats(&conn).expect("清除"), 1, "返回删掉的曲目数");
         let count = |table: &str| -> i64 {
             conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
                 .expect("计数")
         };
-        assert_eq!((count("play_days"), count("play_stats")), (0, 0), "两张统计表都清空");
-        assert_eq!(count("play_history"), 1, "播放记录不受影响");
+        assert_eq!(
+            (count("play_days"), count("play_stats"), count("play_history")),
+            (0, 0, 0),
+            "统计、按天明细、播放记录三张表都清空"
+        );
+        assert_eq!(count("liked_songs"), 1, "收藏不受影响");
         let overview = play_overview(&conn).expect("概览");
         assert_eq!(
             (overview.total_plays, overview.total_ms, overview.active_days),
