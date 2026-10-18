@@ -456,7 +456,10 @@ mod tests {
         assert_eq!(parsed.kind, KIND);
         assert_eq!(parsed.version, VERSION);
         assert_eq!(parsed.tracks.len(), 2);
-        assert_eq!(parsed.tracks[0].title, "晴天");
+        // 不按索引断言：导出的顺序取决于 SQLite 选查询计划，跨平台不保证
+        // （Ubuntu 与 macOS runner 上本地曲会排到在线曲前面，这里曾因此红过）。按属性找。
+        assert!(parsed.tracks.iter().any(|t| t.title == "晴天"), "在线曲目也要导出");
+        assert!(parsed.tracks.iter().any(|t| t.title == "本地曲"), "本地曲目也要导出");
 
         let m3u8_path = out.m3u8_path.clone().expect("有本地条目就该写 m3u8");
         let m3u8 = std::fs::read_to_string(&m3u8_path).expect("读 m3u8");
