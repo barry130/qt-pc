@@ -63,6 +63,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.99.1
+          # components 必须显式写：action 只在**用 ref 指定**工具链（@stable）
+          # 时才带默认组件；改成 with: toolchain: 钉版本后装的是 --profile minimal，
+          # minimal 不含 clippy，下一步 cargo clippy 会秒挂在
+          # 「'cargo-clippy.exe' is not installed for the toolchain」。踩过一次。
+          components: clippy
       # Linux：Tauri 2 需要 webkit2gtk-4.1 + libayatana-appindicator（托盘）。
       # Ubuntu 22.04+ 才有 webkit2gtk-4.1（4.0 已随 21.04 退役）。
       - name: Install Linux system deps
