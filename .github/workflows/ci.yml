@@ -53,7 +53,16 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      # 工具链**刻意钉住版本**，不用 @stable 浮动：
+      # clippy 的 lint 集随工具链变，@stable 一升版（每 6 周一次）就会在
+      # 代码一行没动的情况下把 -D warnings 打红 —— 上一次就是这么红的
+      # （run 41/42：本地 1.98.1 全绿，CI 的 stable 已经是 1.99.1，
+      #  新增的 clippy::single_element_loop 命中 db/migrations.rs）。
+      # 升级工具链改成一次有意识的动作：本地 `rustup update stable` 后
+      # 跑一遍 clippy，绿了再改这里这一行。
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.99.1
       # Linux：Tauri 2 需要 webkit2gtk-4.1 + libayatana-appindicator（托盘）。
       # Ubuntu 22.04+ 才有 webkit2gtk-4.1（4.0 已随 21.04 退役）。
       - name: Install Linux system deps

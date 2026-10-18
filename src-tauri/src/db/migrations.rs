@@ -900,13 +900,12 @@ fn ensure_liked_playlists_columns(conn: &Connection) -> Result<(), rusqlite::Err
         .query_map([], |r| r.get::<_, String>(1))?
         .collect::<Result<_, _>>()?;
 
-    for (column, ddl) in [("pic_url", "TEXT")] {
-        if !names.iter().any(|n| n == column) {
-            conn.execute_batch(&format!(
-                "ALTER TABLE liked_playlists ADD COLUMN {column} {ddl};"
-            ))?;
-            log::info!("[db] liked_playlists 补上 {column} 列");
-        }
+    // 只剩 pic_url 一列要补，所以直接写死而不是循环：循环单元素列表在
+    // clippy 里是 single_element_loop（1.99 起默认 warn，-D warnings 直接红）。
+    // 真要再加列时再改回列表。
+    if !names.iter().any(|n| n == "pic_url") {
+        conn.execute_batch("ALTER TABLE liked_playlists ADD COLUMN pic_url TEXT;")?;
+        log::info!("[db] liked_playlists 补上 pic_url 列");
     }
     Ok(())
 }
