@@ -407,11 +407,12 @@ mod tests {
                 3,
             );
         }
-        assert_eq!(
-            build_mixes(&conn).expect("build").len(),
-            2,
-            "清之前应当凑够两类"
-        );
+        // 只断言「至少两类」：`build_mixes` 里的「深夜歌单」按种子行的**本机钟点**
+        // 判定（22:00–次日 06:00），而种子是 now - i 小时。CI 的 Windows runner 是
+        // UTC，凌晨跑时这 6 条全落在夜里，会多出第三类；本机白天跑则不会。
+        // 与 mixes_fixed_order_subtitles_and_covers 同一个坑，那条也是这么处理的。
+        let before = build_mixes(&conn).expect("build").len();
+        assert!(before >= 2, "清之前应当凑够至少两类，实得 {before} 类");
 
         crate::db::store::clear_listen_stats(&conn).expect("清除");
         let count = |table: &str| -> i64 {

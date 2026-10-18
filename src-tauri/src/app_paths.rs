@@ -16,6 +16,9 @@
 //! 是全新口径，直接落新目录。）
 
 use std::path::PathBuf;
+// 只被 install_base()（macOS 除外）用到，所以跟着它一起条件编译：
+// macOS 上留着这个 import 会撞 `-D unused-imports`
+#[cfg(not(target_os = "macos"))]
 use std::sync::OnceLock;
 use tauri::Manager;
 

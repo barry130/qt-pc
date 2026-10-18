@@ -6,6 +6,10 @@ use serde::Serialize;
 pub const PROG_ID: &str = "QuietMusic.AudioFile";
 pub const APPLICATION_NAME: &str = "QuietMusic";
 pub const EXTENSIONS: [&str; 5] = ["mp3", "flac", "wav", "ogg", "m4a"];
+// 用处在两处：注册表写入用的 entries()（windows 或单测）与 windows 的
+// unregister()。非 Windows 的非测试构建两处都没有 → 必须跟着条件编译，
+// 否则撞 `-D dead-code`。
+#[cfg(any(windows, test))]
 const CAPABILITIES: &str = r"Software\QuietMusic\Capabilities";
 
 #[derive(Debug, Serialize)]

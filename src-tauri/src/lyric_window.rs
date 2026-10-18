@@ -71,8 +71,10 @@ fn force_windows_topmost(_win: &tauri::WebviewWindow) -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn attach_lyric_to_taskbar(_win: &tauri::WebviewWindow) -> Result<(), String> {
-    Ok(())
+fn attach_lyric_to_taskbar(win: &tauri::WebviewWindow) -> Result<(), String> {
+    // 仍然走 force_windows_topmost，而不是直接 Ok(())：非 Windows 的替身得被
+    // 调用，否则它自己变成 dead code，撞 `-D dead_code`（非 Windows 平台 CI 红过）
+    force_windows_topmost(win)
 }
 
 /// 将歌词窗口重新放到 TOPMOST 组最前端，不激活窗口、不改变位置和大小。
