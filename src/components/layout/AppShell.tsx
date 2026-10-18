@@ -16,12 +16,14 @@ import { useAppearanceEffect } from "@/hooks/useAppearanceEffect";
 import { useCoverColor } from "@/hooks/useCoverColor";
 import { usePlayingCoverBg } from "@/hooks/usePlayingCoverBg";
 import { useLocalTrackOnlineMeta } from "@/hooks/useLocalTrackOnlineMeta";
+import { useExternalOpen } from "@/hooks/useExternalOpen";
 import { useUpdateCheck } from "@/hooks/useUpdateCheck";
 import { useSourceUpdateCheck } from "@/hooks/useSourceUpdateCheck";
 import { PlayPackPrompt } from "@/components/PlayPackPrompt";
 import { SourceUpdatePrompt } from "@/components/SourceUpdatePrompt";
 import { MetaPackGuide } from "@/components/MetaPackGuide";
 import { useAppearanceStore } from "@/stores/appearance";
+import { toastError } from "@/stores/toast";
 import { usePlayerStore } from "@/stores/player";
 import { useSourceRegistryStore } from "@/stores/sourceRegistry";
 import { useDownloadsStore } from "@/stores/downloads";
@@ -49,6 +51,18 @@ export function AppShell(): React.JSX.Element {
   useCoverColor();
   usePlayingCoverBg();
   useLocalTrackOnlineMeta();
+  // 外部打开（拖拽入窗 / 命令行参数 / 第二实例转发）：只挂一次，返回值只用于拖拽提示浮层
+  const { dragging: externalDragging, count: externalDragCount } = useExternalOpen();
+  // 数据库自愈回执：启动体检发现库损坏、已隔离重建时如实提示一次（Rust 侧取过即消失）。
+  // 放在挂载时读一次而不是轮询：这条说明只在本次启动有意义。
+  useEffect(() => {
+    void ipc
+      .takeDbNotice()
+      .then((notice) => {
+        if (notice) toastError(notice);
+      })
+      .catch(() => undefined);
+  }, []);
   useUpdateCheck();
   // 播放音源包启动静默检查（只更新已装的官方包；未安装时不打扰）
   useSourceUpdateCheck();
@@ -265,6 +279,22 @@ export function AppShell(): React.JSX.Element {
         {/* 未装数据包时的首页全屏引导（只指路设置页，不带下载动作） */}
         <MetaPackGuide />
       </ErrorBoundary>
+
+      {/* 拖拽入窗提示：从系统里把音频/文件夹拖到窗口上，松手即开始播放（见 useExternalOpen）。
+          整层 pointer-events-none —— 拖拽期间鼠标事件归系统管，这层只是提示 */}
+      {externalDragging && (
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-0 z-50 flex items-center justify-center"
+        >
+          <div className="absolute inset-3 rounded-xl border-2 border-dashed border-primary/60 bg-background/80" />
+          <div className="relative rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground shadow-lg">
+            {externalDragCount > 0
+              ? `松手即播放这 ${externalDragCount} 个条目`
+              : "松手即播放"}
+          </div>
+        </div>
+      )}
 
       {/* 8 向 resize 命中区（fixed 覆盖层，最后挂载保证在最上） */}
       <div aria-hidden className="pointer-events-none">

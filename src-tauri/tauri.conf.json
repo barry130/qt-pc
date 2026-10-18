@@ -34,6 +34,14 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "fileAssociations": [
+      {
+        "ext": ["mp3", "flac", "wav", "ogg", "m4a"],
+        "name": "QuietMusic.AudioFile",
+        "description": "轻听音频文件",
+        "role": "Viewer"
+      }
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/64x64.png",

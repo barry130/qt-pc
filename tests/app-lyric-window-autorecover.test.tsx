@@ -58,7 +58,7 @@ afterEach(() => {
 
 describe("桌面歌词窗口的自愈接线", () => {
   it("歌词窗崩掉后自动重试，故障消失即恢复（不再永久停在错误卡片）", async () => {
-    render(<App />);
+    await act(async () => { render(<App />); await vi.dynamicImportSettled(); });
     expect(screen.queryByText(/这块内容出错了/)).toBeTruthy();
 
     // 故障消失（真实场景：越界的那一帧过去了 / 数据到了）
@@ -72,10 +72,11 @@ describe("桌面歌词窗口的自愈接线", () => {
     expect(screen.getByTestId("lyric-ok")).toBeTruthy();
   });
 
-  it("主窗口分支不进歌词视图（按 label 分流没被写反）", () => {
+  it("主窗口分支不进歌词视图（按 label 分流没被写反）", async () => {
+    vi.useRealTimers();
     h.label = "main";
-    render(<App />);
-    expect(screen.getByTestId("router")).toBeTruthy();
+    await act(async () => { render(<App />); await vi.dynamicImportSettled(); });
+    expect(await screen.findByTestId("router")).toBeTruthy();
     // 歌词视图若被误渲染，会因 boom 抛错、并被歌词窗的边界接住 —— 两者都不该出现
     expect(screen.queryByTestId("lyric-ok")).toBeNull();
     expect(screen.queryByText(/这块内容出错了/)).toBeNull();

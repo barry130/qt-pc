@@ -74,7 +74,7 @@ pub(crate) fn list_play_history(
     let limit = if limit == 0 { 100 } else { limit };
     let mut stmt = conn.prepare(
         "SELECT h.played_at, t.id, t.platform, t.title, t.singer, t.album,
-                t.pic_url, t.duration_ms, t.music_id
+                t.pic_url, t.duration_ms, t.music_id, t.start_ms, t.end_ms
            FROM play_history h
            JOIN tracks t ON t.id = h.track_id
           WHERE t.missing = 0
@@ -98,6 +98,8 @@ pub(crate) fn list_play_history(
                 pic_url: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                 duration: row.get::<_, Option<i64>>(7)?.unwrap_or(0) as f64 / 1000.0,
                 music_id: row.get(8)?,
+                start_ms: row.get::<_, Option<i64>>(9)?.and_then(|v| u64::try_from(v).ok()),
+                end_ms: row.get::<_, Option<i64>>(10)?.and_then(|v| u64::try_from(v).ok()),
             },
             played_at: row.get(0)?,
         });
@@ -108,4 +110,65 @@ pub(crate) fn list_play_history(
 pub(crate) fn clear_play_history(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute("DELETE FROM play_history", [])?;
     Ok(())
+}
+
+/// 删掉一首歌的播放记录（`db_id` 是 tracks 主键口径 `platform:原始id`）。返回是否真删到。
+///
+/// 历史页此前只有「清空」：手滑听过一首不想留痕的歌，只能把整页记录一起清掉。
+/// `play_history` 一首歌只留最近一条（见 [`record_play_history`]），
+/// 所以按 `track_id` 删就等于「删掉这首歌的记录」。
+pub(crate) fn remove_play_history(
+    conn: &Connection,
+    db_id: &str,
+) -> Result<bool, rusqlite::Error> {
+    let n = conn.execute(
+        "DELETE FROM play_history WHERE track_id = ?1",
+        params![db_id],
+    )?;
+    Ok(n > 0)
+}
+
+/// 批量删除播放记录（历史页多选删除）。返回真正删掉的行数。
+///
+/// 空列表直接返回 0：拼出来会是 `IN ()`，SQLite 直接报语法错误。
+pub(crate) fn remove_play_history_many(
+    conn: &Connection,
+    db_ids: &[String],
+) -> Result<usize, rusqlite::Error> {
+    if db_ids.is_empty() {
+        return Ok(0);
+    }
+    let placeholders = std::iter::repeat_n("?", db_ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let n = conn.execute(
+        &format!("DELETE FROM play_history WHERE track_id IN ({placeholders})"),
+        rusqlite::params_from_iter(db_ids.iter()),
+    )?;
+    Ok(n)
+}
+
+/// 统计「指向已丢失文件」的播放记录条数。
+///
+/// [`list_play_history`] 过滤了 `t.missing = 1`，这些行在界面上根本看不见 ——
+/// 用户清空后如果还有残留，页面上没有任何线索。所以单独给一个计数，
+/// 让历史页能提示「另有 N 条记录的文件已不在」并一键清掉。
+pub(crate) fn count_missing_play_history(conn: &Connection) -> Result<i64, rusqlite::Error> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM play_history h
+           JOIN tracks t ON t.id = h.track_id
+          WHERE t.missing = 1",
+        [],
+        |r| r.get(0),
+    )
+}
+
+/// 清掉指向已丢失文件的播放记录，返回条数。这些条目在列表里本来就看不到，纯占地方。
+pub(crate) fn purge_missing_play_history(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    let n = conn.execute(
+        "DELETE FROM play_history
+          WHERE track_id IN (SELECT id FROM tracks WHERE missing = 1)",
+        [],
+    )?;
+    Ok(n)
 }

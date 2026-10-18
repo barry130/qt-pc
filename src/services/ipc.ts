@@ -13,6 +13,10 @@ import type {
   PlayOverview,
   PlayStatItem,
   SingerStat,
+  ListenReportPage,
+  ListenReportQuery,
+  ListenDayReport,
+  ListenDayReportQuery,
   AuthSession,
   DesktopLyricState,
   DesktopLyricStylePatch,
@@ -25,8 +29,14 @@ import type {
   PositionChanged,
   QueueChanged,
   Quality,
+  RuntimeCacheClearResult,
   Track,
   UpdateDownloadProgress,
+  NetConfigView,
+  NetTestResult,
+  MiniPlayerState,
+  FileAssociationState,
+  LocalMixSummary,
 } from "@/types";
 import { isQuality } from "@/lib/quality";
 
@@ -122,6 +132,15 @@ export async function getLocalTracks(): Promise<Track[]> {
   return invoke("get_local_tracks");
 }
 
+/** 本地规则合辑；数据不够门槛的合辑不出现在列表中。 */
+export async function listLocalMixes(): Promise<LocalMixSummary[]> {
+  return invoke("list_local_mixes");
+}
+
+export async function getLocalMixTracks(key: string): Promise<Track[]> {
+  return invoke("get_local_mix_tracks", { key });
+}
+
 /** 本地曲目的文件大小 / 修改时间（供按大小、修改时间排序） */
 export interface LocalTrackFileMeta {
   id: string;
@@ -144,9 +163,96 @@ export async function purgeMissingLocalTracks(): Promise<number> {
   return invoke("purge_missing_local_tracks");
 }
 
+export interface MaintenanceIssue {
+  path: string;
+  message: string;
+}
+export interface DuplicateGroup {
+  sha256: string;
+  fileSize: number;
+  files: { path: string; trackCount: number }[];
+}
+export interface DuplicateReport {
+  scannedFiles: number;
+  hashedFiles: number;
+  groups: DuplicateGroup[];
+  issues: MaintenanceIssue[];
+  cancelled: boolean;
+}
+export interface DuplicateProgress {
+  scanId: string;
+  checked: number;
+  total: number;
+  current: string;
+}
+export const LIBRARY_DUPLICATE_PROGRESS_EVENT = "library-duplicate-progress";
+/** 只读检测：先按大小筛选，再计算完整 SHA-256；同一 CUE 物理文件只计一次。 */
+export async function findLibraryDuplicates(scanId: string): Promise<DuplicateReport> {
+  return invoke("find_library_duplicates", { scanId });
+}
+export async function cancelLibraryDuplicateScan(scanId: string): Promise<boolean> {
+  return invoke("cancel_library_duplicate_scan", { scanId });
+}
+export interface OrganizeEntry {
+  source: string;
+  target: string;
+  trackCount: number;
+  status: "ready" | "blocked" | "unchanged";
+  message: string;
+}
+export interface OrganizePreview {
+  entries: OrganizeEntry[];
+  ready: number;
+  blocked: number;
+  unchanged: number;
+}
+/** 仅生成 歌手/专辑/标题 的目标路径与冲突信息，不移动文件、不改数据库。 */
+export async function previewLibraryOrganization(destination: string): Promise<OrganizePreview> {
+  return invoke("preview_library_organization", { destination });
+}
+
 /** 读本地音频的内嵌封面（data URL）；没有封面返回 null。path 即本地 Track.id */
 export async function getLocalCover(path: string): Promise<string | null> {
   return invoke("get_local_cover", { path });
+}
+
+/**
+ * 「外部打开」的唤醒事件名（Rust `external_open::EVENT_OPEN_LOCAL_PATHS`）。
+ * **载荷为空**：路径放在 Rust 侧待取队列里，收到事件后调 `takePendingOpenPaths()`
+ * 取空 —— 这样「事件早于监听注册」不会丢参数，也不会重复播同一批文件。
+ */
+export const OPEN_LOCAL_PATHS_EVENT = "open-local-paths";
+
+/** `openLocalPaths` 的结果：可播放的曲目 + 没能打开的入参（不存在 / 格式不支持） */
+export interface OpenedLocalPaths {
+  tracks: Track[];
+  skipped: string[];
+}
+
+/**
+ * 打开外部传入的本地文件 / 文件夹（拖拽入窗、命令行参数、第二实例转发共用）。
+ *
+ * Rust 侧会顺手把它们入库（与扫描同一段代码），所以拖进来的曲目同样有歌词、封面、
+ * 播放历史；但**不会**把所在文件夹加进扫描目录。返回的 `tracks` 已按入参顺序排好，
+ * 调用方直接 `playQueue(tracks, 0)` 即是用户松手时的顺序。
+ */
+export async function openLocalPaths(paths: string[]): Promise<OpenedLocalPaths> {
+  return invoke("open_local_paths", { paths });
+}
+
+/** 取走待打开的路径队列（取空是原子的：重复调用不会拿到同一批路径）。 */
+export async function takePendingOpenPaths(): Promise<string[]> {
+  return invoke("take_pending_open_paths");
+}
+
+/**
+ * 取走「数据库自愈」的一次性说明（启动体检发现库损坏、已隔离重建时才有内容）。
+ *
+ * 取一次就没了（Rust 侧 `Option::take`），所以只能在挂载时读一次并立刻提示用户，
+ * 不能放进轮询或渲染路径里。
+ */
+export async function takeDbNotice(): Promise<string | null> {
+  return invoke<string | null>("take_db_notice");
 }
 
 export async function getScanDirs(): Promise<string[]> {
@@ -271,6 +377,32 @@ export async function clearHistory(): Promise<void> {
   return invoke("clear_history");
 }
 
+/**
+ * 删掉一首歌的播放记录，返回是否真删到。
+ * 按 `Track` 的 platform + id 定位（后端拼 tracks 主键 `platform:id`，
+ * 本地曲目的 id 是文件路径、本身带冒号，前端别自己拼）。
+ */
+export async function removeHistory(track: Track): Promise<boolean> {
+  return invoke("remove_history", { platform: track.platform, id: track.id });
+}
+
+/** 批量删除播放记录（历史页多选），返回真正删掉的条数。 */
+export async function removeHistoryMany(tracks: Track[]): Promise<number> {
+  return invoke("remove_history_many", {
+    items: tracks.map((t) => ({ platform: t.platform, id: t.id })),
+  });
+}
+
+/** 统计指向已丢失文件的播放记录条数（这些行在列表里看不见）。 */
+export async function countMissingHistory(): Promise<number> {
+  return invoke("count_missing_history");
+}
+
+/** 清掉指向已丢失文件的播放记录，返回条数。 */
+export async function purgeMissingHistory(): Promise<number> {
+  return invoke("purge_missing_history");
+}
+
 // ---------- 音频输出设备 ----------
 
 /** 系统当前可用的音频输出设备名列表 */
@@ -348,10 +480,9 @@ export async function addTracksToPlaylist(
 /**
  * 从歌单移除单首曲目。
  *
- * 界面上暂时没有调用方：本地歌单详情页的曲目必然是收藏态，所以「从歌单移除」
- * 与「取消收藏」是同一件事，那一行现在只有收藏红心（走 `removeFavorite`）。
- * 保留这个原语是因为它是 `remove_tracks_from_playlist` 的单首版本，且
- * REQUIREMENTS 里规划的列表右键菜单「从歌单移除」还要用它。
+ * 调用方只有一个：歌曲列表右键菜单的「从歌单移除」，且只在本地自建歌单详情页
+ * 出现（在线歌单 / 榜单的曲目归属由音源决定，移不掉）。它是
+ * `remove_tracks_from_playlist` 的单首版本，比"先读全部再批量写回"少一次读。
  */
 export async function removeTrackFromPlaylist(
   id: string,
@@ -590,6 +721,11 @@ export async function setSpeed(speed: number): Promise<void> {
   return invoke("set_speed", { speed });
 }
 
+/** 预载下一首并连续输出音频；开关由引擎持久化。 */
+export async function setGapless(enabled: boolean): Promise<void> {
+  return invoke("set_gapless", { enabled });
+}
+
 /** 武装 / 取消睡眠定时。remainingMs=倒计时毫秒（null 取消）；afterTrack=播完当前歌停 */
 export async function setSleepTimer(
   remainingMs: number | null,
@@ -636,6 +772,11 @@ export async function clearAudioCache(): Promise<AudioCacheClearResult> {
 /** 清理网页缓存（封面/脚本/HTTP 资源；不碰登录状态与界面设置） */
 export async function clearWebCache(): Promise<AudioCacheClearResult> {
   return invoke("clear_web_cache");
+}
+
+/** 清理进程内播放地址缓存（不删除磁盘音频文件）。 */
+export async function clearPlayUrlCache(): Promise<RuntimeCacheClearResult> {
+  return invoke("clear_play_url_cache");
 }
 
 /** 播放缓存体积上限（MB，0 = 不限）；引擎落 settings 并立即修剪 */
@@ -713,6 +854,125 @@ export async function chooseCacheDir(): Promise<string | null> {
 /** 重置缓存目录为默认（安装目录/cache），返回重置后的根目录 */
 export async function resetCacheDir(): Promise<string> {
   return invoke("reset_cache_dir");
+}
+
+// ---------- 数据备份 / 恢复（报告 §3.1，见 src-tauri/src/backup.rs） ----------
+
+/** 导出结果（与 Rust `backup::BackupInfo` 对齐） */
+export interface BackupInfo {
+  path: string;
+  manifestPath: string;
+  schemaVersion: number;
+  tracks: number;
+  playlists: number;
+  likedPlaylists: number;
+  history: number;
+}
+
+/** 导入结果（与 Rust `backup::ImportSummary` 对齐） */
+export interface ImportSummary {
+  mode: string;
+  rows: number;
+  tracks: number;
+  playlists: number;
+  history: number;
+  /** 覆盖模式下自动留下的「导入前快照」路径（反悔时把这份导回来即可） */
+  safetyCopy: string | null;
+}
+
+/**
+ * 把用户数据（歌单/收藏/播放记录/设置/歌词）导出到 `dir`：
+ * 产出一份 `quietmusic-backup-<时间戳>.db` 快照 + 同名 `.json` 清单。
+ * **不含**下载的音频文件本体（备份的是"记录"不是"文件"）。
+ */
+export async function exportBackup(dir: string): Promise<BackupInfo> {
+  return invoke<BackupInfo>("export_backup", { dir });
+}
+
+/** 从备份文件导入：`replace` 覆盖（导入前自动拍快照）/ `merge` 合并（保留现状） */
+export async function importBackup(
+  path: string,
+  mode: "replace" | "merge",
+): Promise<ImportSummary> {
+  return invoke<ImportSummary>("import_backup", { path, mode });
+}
+
+/** 打开系统「选择备份文件」对话框（.db）；用户取消返回 null */
+export async function pickBackupFile(): Promise<string | null> {
+  const result = await invoke<string | string[] | null>("plugin:dialog|open", {
+    options: {
+      directory: false,
+      multiple: false,
+      title: "选择备份文件",
+      filters: [{ name: "轻听备份", extensions: ["db"] }],
+    },
+  });
+  return Array.isArray(result) ? (result[0] ?? null) : result;
+}
+
+// ---------- 歌单导出 / 导入（REQUIREMENTS §3.21.5） ----------
+
+/** 导出结果（与 Rust `playlist_io::ExportSummary` 对齐） */
+export interface PlaylistExportSummary {
+  name: string;
+  /** `.json` 一定写了 */
+  jsonPath: string;
+  /** 一首本地文件都没有时为 null（不留空 m3u8） */
+  m3u8Path: string | null;
+  total: number;
+  /** 写进 `.m3u8` 的条目数 */
+  local: number;
+  /** 写不进去的条目数（在线曲目 + 本机已不存在的本地文件） */
+  skipped: number;
+}
+
+/** `.json` 歌单解析结果（与 Rust `playlist_io::JsonPreview` 对齐） */
+export interface PlaylistJsonPreview {
+  name: string;
+  exportedAt: number;
+  tracks: Track[];
+  /** 本机不存在 / 缺字段而被丢掉的条目数 */
+  skipped: number;
+}
+
+/**
+ * 把一个本地歌单导出到 `dir`：`.json`（完整元数据，可跨设备恢复）
+ * + `.m3u8`（只有本地文件条目，在线曲目跳过并计数）。
+ * 目录由 `pickDirectory` 选出来，Rust 侧不代建目录。
+ */
+export async function exportPlaylist(
+  pid: string,
+  dir: string,
+): Promise<PlaylistExportSummary> {
+  return invoke<PlaylistExportSummary>("export_playlist", { pid, dir });
+}
+
+/** 解析 `.json` 歌单文件（只读不落库，导入目标由前端再选） */
+export async function parsePlaylistJson(
+  path: string,
+): Promise<PlaylistJsonPreview> {
+  return invoke<PlaylistJsonPreview>("parse_playlist_json", { path });
+}
+
+/** 打开系统「选择文件夹」对话框；用户取消返回 null */
+export async function pickDirectory(title = "选择文件夹"): Promise<string | null> {
+  const result = await invoke<string | string[] | null>("plugin:dialog|open", {
+    options: { directory: true, multiple: false, title },
+  });
+  return Array.isArray(result) ? (result[0] ?? null) : result;
+}
+
+/** 打开系统「选择歌单文件」对话框（.json）；用户取消返回 null */
+export async function pickPlaylistJsonFile(): Promise<string | null> {
+  const result = await invoke<string | string[] | null>("plugin:dialog|open", {
+    options: {
+      directory: false,
+      multiple: false,
+      title: "选择歌单文件",
+      filters: [{ name: "轻听歌单", extensions: ["json"] }],
+    },
+  });
+  return Array.isArray(result) ? (result[0] ?? null) : result;
 }
 
 /** 开机自启是否已开启 */
@@ -938,6 +1198,35 @@ export async function getTopTracks(limit = 20): Promise<PlayStatItem[]> {
 
 export async function getTopSingers(limit = 10): Promise<SingerStat[]> {
   return invoke("get_top_singers", { limit });
+}
+
+/** 按歌曲、歌手或音源分页读取累计报告，排序和精确筛选都在数据库完成。 */
+export async function getListenReport(query: ListenReportQuery): Promise<ListenReportPage> {
+  return invoke("get_listen_report", { query });
+}
+
+/**
+ * 日榜：一次拿到逐日趋势、窗口总量与前 N 条排行。
+ * 与 `getListenReport({ days })` 读同一张按天明细表，两处口径必须一致。
+ */
+export async function getListenDayReport(query: ListenDayReportQuery): Promise<ListenDayReport> {
+  return invoke("get_listen_day_report", { query });
+}
+
+/**
+ * 把升级前只有累计值、没有按天明细的存量播放归到今天（报告页首次打开时调用）。
+ * 只补「累计 − 明细已有之和」的差额，幂等；返回补齐的行数。
+ */
+export async function seedListenDays(): Promise<number> {
+  return invoke("seed_listen_days");
+}
+
+/**
+ * 清除听歌统计（累计与按天明细一起删），不影响收藏、歌单与播放记录。
+ * 不可撤销，调用方必须先做二次确认；返回删掉的曲目数。
+ */
+export async function clearListenStats(): Promise<number> {
+  return invoke("clear_listen_stats");
 }
 
 // ---------- 收藏同步（DESIGN §5.3；契约同 qt-uniappx services/like.ts） ----------
@@ -1461,6 +1750,31 @@ export async function getLyric(trackId: string): Promise<LyricRecord | null> {
   return invoke("get_lyric", { trackId });
 }
 
+/**
+ * 本地歌曲自带的歌词（同名 `.lrc` 优先，其次音频文件内嵌标签）。
+ *
+ * `source` 的两个取值与后端 `local.rs` 的常量一一对应：
+ * `local-lrc` = 同名 `.lrc` 旁挂文件，`local-tag` = 音频文件的内嵌标签。
+ * 两者都取不到时后端返回 null。
+ */
+export interface LocalLyric {
+  lrc: string;
+  /** `local-lrc` / `local-tag` */
+  source: string;
+  /** `.lrc` 文件路径；内嵌歌词为 null */
+  path: string | null;
+}
+
+/**
+ * 读本地音频文件自带的歌词（2026-10-18）。纯读盘，不碰数据库。
+ *
+ * 扫描时已经把文件里的词落过一次库（`library_scan`），这条链路补的是扫描之外的三种
+ * 情况：拖进来还没入库的文件、扫描之后才放进来的 `.lrc`、以及用户改了 `.lrc` 内容。
+ */
+export async function readLocalLyric(path: string): Promise<LocalLyric | null> {
+  return invoke("read_local_lyric", { path });
+}
+
 // ---------- 不喜欢列表（屏蔽规则） ----------
 //
 // 规则按「歌名 + 歌手」匹配，不按曲目 id —— id 是平台私有的，换源兜底后同一首歌的
@@ -1551,4 +1865,171 @@ export function onLyricWindowChanged(
 /** 歌词工具条请求打开主窗口的「设置 · 桌面歌词」页（Rust 唤起主窗口后发出） */
 export function onLyricOpenSettings(handler: () => void): Promise<() => void> {
   return listen("lyric-open-settings", () => handler());
+}
+
+// ---------- 网络设置（第二波：代理与单源超时） ----------
+
+export async function getNetConfig(): Promise<NetConfigView> {
+  return invoke("get_net_config");
+}
+
+/** 校验 → 落库 → 更新全局代际；常驻客户端对下一次请求生效（详见 Rust net_config 模块注释） */
+export async function setNetConfig(
+  proxyMode: string,
+  proxyUrl: string,
+  sourceTimeoutMs: number,
+): Promise<NetConfigView> {
+  return invoke("set_net_config", { proxyMode, proxyUrl, sourceTimeoutMs });
+}
+
+/** 试连用表单值临时构建客户端，不动已保存配置；失败时 error 带原因 */
+export async function testNetConfig(
+  proxyMode: string,
+  proxyUrl: string,
+): Promise<NetTestResult> {
+  return invoke("test_net_config", { proxyMode, proxyUrl });
+}
+
+/**
+ * 进入 / 退出迷你播放器模式（REQUIREMENTS §3.21.7.2）。
+ *
+ * 互切由 Rust 侧一起做：返回 visible=true 表示已切到迷你窗（主窗随即被收起），
+ * visible=false 表示已回到主窗（迷你窗已收起）。前端不需要自己调窗口 API。
+ */
+export async function toggleMiniPlayer(): Promise<MiniPlayerState> {
+  return invoke("toggle_mini_player");
+}
+
+export async function getFileAssociationState(): Promise<FileAssociationState> {
+  return invoke("get_file_association_state");
+}
+
+export async function registerFileAssociations(): Promise<FileAssociationState> {
+  return invoke("register_file_associations");
+}
+
+export async function unregisterFileAssociations(): Promise<FileAssociationState> {
+  return invoke("unregister_file_associations");
+}
+
+export async function openDefaultAppsSettings(): Promise<void> {
+  return invoke("open_default_apps_settings");
+}
+
+// ---------- AI 助手 ----------
+//
+// 与 qt-uniappx 完全同一套 App 端契约（`/api/v1/app/ai/**`）。本端不能直连后端
+// —— CSP 的 connect-src 只放 self/ipc/qtres —— 所以每个接口都在 Rust 里转一手，
+// 并且由 Rust 侧显式带上 `clientType=QT_PC`（后端兜底值是 QT_UNIAPPX，不传就会
+// 被当成手机端，智能体按客户端过滤后可能压根不返回）。
+//
+// 返回值统一 `unknown`：逐字段规整放在 `src/lib/ai.ts`。这里不标强类型，是因为
+// Rust 侧透传的是 `serde_json::Value`，写 `Promise<AiConversation>` 只是把
+// 「后端改了字段」藏起来，真出问题时更难查。
+
+/** 本端可见的音乐助手列表（后端已按 clientType 过滤成 QT_PC） */
+export async function astralAiAgents(): Promise<unknown> {
+  return invoke("astral_ai_agents");
+}
+
+/** 智能体能力（是否支持会话/反馈/引用等） */
+export async function astralAiCapabilities(agentCode: string): Promise<unknown> {
+  return invoke("astral_ai_capabilities", { agentCode });
+}
+
+/** 当前用户在该智能体下的会话列表 */
+export async function astralAiConversations(agentCode: string): Promise<unknown> {
+  return invoke("astral_ai_conversations", { agentCode });
+}
+
+/** 建会话；标题由前端传，后端只存不猜 */
+export async function astralAiCreateConversation(
+  agentCode: string,
+  title: string,
+): Promise<unknown> {
+  return invoke("astral_ai_create_conversation", { agentCode, title });
+}
+
+export async function astralAiConversation(id: number): Promise<unknown> {
+  return invoke("astral_ai_conversation", { id });
+}
+
+export async function astralAiDeleteConversation(id: number): Promise<unknown> {
+  return invoke("astral_ai_delete_conversation", { id });
+}
+
+/** 历史消息（倒序游标：`beforeId` 为空表示取最近一页） */
+export async function astralAiMessages(
+  conversationId: number,
+  beforeId?: number,
+  limit?: number,
+): Promise<unknown> {
+  return invoke("astral_ai_messages", { conversationId, beforeId, limit });
+}
+
+/**
+ * 发消息。只受理、不返回回答：真正的回答靠轮询 `astralAiEvents` 拿。
+ *
+ * `context` 里必须带客户端掌握的现状（当前歌曲/队列/音源清单/候选），后端按白名单
+ * 过滤后才给模型看。`idempotencyKey` 由调用方生成，重试同一个 key 不会重复扣额度。
+ */
+export async function astralAiSendMessage(
+  conversationId: number,
+  content: string,
+  context: Record<string, unknown>,
+  idempotencyKey: string,
+): Promise<unknown> {
+  return invoke("astral_ai_send_message", {
+    conversationId,
+    content,
+    context,
+    idempotencyKey,
+  });
+}
+
+/** 拉一轮事件；`after` 是上一轮的 `nextSequence`，按 sequence 升序增量返回 */
+export async function astralAiEvents(
+  requestId: number,
+  after: number,
+  limit: number,
+): Promise<unknown> {
+  return invoke("astral_ai_events", { requestId, after, limit });
+}
+
+/** 停止生成（后端幂等：已终态时直接返回现状，不报错） */
+export async function astralAiCancelRequest(
+  requestId: number,
+  reason: string,
+): Promise<unknown> {
+  return invoke("astral_ai_cancel_request", { requestId, reason });
+}
+
+/** 消息反馈（LIKE/DISLIKE/REGENERATE/REPORT） */
+export async function astralAiFeedback(
+  messageId: number,
+  feedbackType: string,
+  reasonCode: string,
+  comment: string,
+): Promise<unknown> {
+  return invoke("astral_ai_feedback", {
+    messageId,
+    feedbackType,
+    reasonCode,
+    comment,
+  });
+}
+
+/** 回报动作执行结果，供后台统计采纳率（只报真执行了的，不支持的不报） */
+export async function astralAiExecuteAction(
+  actionId: string,
+  actionType: string,
+  success: boolean,
+  message: string,
+): Promise<unknown> {
+  return invoke("astral_ai_execute_action", {
+    actionId,
+    actionType,
+    success,
+    message,
+  });
 }

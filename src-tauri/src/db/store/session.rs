@@ -55,7 +55,7 @@ pub(crate) fn load_session(conn: &Connection) -> Result<Option<SavedSession>, ru
 
     let mut stmt = conn.prepare(
         "SELECT q.position, t.id, t.platform, t.title, t.singer, t.album, t.pic_url,
-                t.duration_ms, t.music_id
+                t.duration_ms, t.music_id, t.start_ms, t.end_ms
          FROM play_queue q JOIN tracks t ON t.id = q.track_id
          WHERE t.missing = 0
          ORDER BY q.position",
@@ -80,6 +80,8 @@ pub(crate) fn load_session(conn: &Connection) -> Result<Option<SavedSession>, ru
             pic_url: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
             duration: duration_ms.unwrap_or(0) as f64 / 1000.0,
             music_id: row.get(8)?,
+            start_ms: row.get::<_, Option<i64>>(9)?.and_then(|v| u64::try_from(v).ok()),
+            end_ms: row.get::<_, Option<i64>>(10)?.and_then(|v| u64::try_from(v).ok()),
         });
         if is_current {
             index = tracks.len() - 1;

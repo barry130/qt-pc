@@ -82,10 +82,12 @@ export function peekArtistId(platform: SourceId, name: string): string | null {
   return v === undefined ? null : v;
 }
 
-/** 清空缓存（测试用） */
-export function clearArtistIdCache(): void {
+/** 清空缓存（测试用 / 设置页可选清理） */
+export function clearArtistIdCache(): number {
+  const count = new Set([...pending.keys(), ...settled.keys()]).size;
   pending.clear();
   settled.clear();
+  return count;
 }
 
 function trim(): void {

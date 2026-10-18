@@ -234,12 +234,7 @@ fn handle_event(
         E::SeekBy(dir, d) => seek_by(engine, dir, d.as_millis() as u64),
         E::SetPosition(pos) => engine.send(AudioCmd::Seek(pos.0.as_millis() as u64)),
         E::Raise => {
-            use tauri::Manager;
-            if let Some(win) = app.get_webview_window(crate::MAIN_WINDOW_LABEL) {
-                let _ = win.unminimize();
-                let _ = win.show();
-                let _ = win.set_focus();
-            }
+            let _ = crate::mini_window::hide(app);
         }
         // 音量 / 打开链接 / 退出系统面板不属于播放器职责，忽略
         _ => {}

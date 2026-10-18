@@ -52,14 +52,24 @@ const ALLOWED_REQUEST_METHODS: [&str; 7] =
 /// 单次响应正文的上限：脚本可能被诱导去拉一个巨大文件，而正文是一次性读进内存的
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// 内置 HTTP 客户端：桌面浏览器 UA 兜底（各平台特殊头由脚本按需覆盖）
-fn source_builtin_client() -> &'static reqwest::Client {
-    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-            .build()
-            .expect("source builtin client")
+/// 内置 HTTP 客户端：桌面浏览器 UA 兜底（各平台特殊头由脚本按需覆盖）。
+///
+/// 第二波（代理）：走 net_config 的代际缓存 —— 用户改代理后 generation 失配，
+/// 下一次请求在锁外重建客户端（对**下一次音源请求**生效，不打断当前播放）。
+/// 返回值改为按值 clone（reqwest::Client 是 Arc 句柄，调用点无感）。
+static SOURCE_BUILTIN_CLIENT_CACHE: std::sync::OnceLock<
+    std::sync::RwLock<(u64, reqwest::Client)>,
+> = std::sync::OnceLock::new();
+
+fn source_builtin_client() -> reqwest::Client {
+    crate::net_config::shared_async_client(&SOURCE_BUILTIN_CLIENT_CACHE, || {
+        crate::net_config::configure(
+            reqwest::Client::builder().user_agent(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            ),
+        )
+        .build()
+        .expect("source builtin client")
     })
 }
 
@@ -79,8 +89,13 @@ pub(crate) async fn source_builtin_request(
     if !ALLOWED_REQUEST_METHODS.contains(&method.as_str()) {
         return Err(format!("不支持的请求方法 {method}"));
     }
-    let timeout =
-        std::time::Duration::from_millis(options.and_then(|o| o.timeout_ms).unwrap_or(15_000));
+    // 单源超时兜底可调（第二波）：脚本显式传 timeoutMs 仍优先，
+    // 未传时用网络设置里的值（默认 10s，见 net_config）。
+    let timeout = std::time::Duration::from_millis(
+        options
+            .and_then(|o| o.timeout_ms)
+            .unwrap_or_else(crate::net_config::source_timeout_ms),
+    );
     let mut req = source_builtin_client()
         .request(
             reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?,
@@ -518,6 +533,13 @@ pub async fn cmd_set_speed(state: State<'_, AppState>, speed: f32) -> Result<(),
     Ok(())
 }
 
+/// 无缝播放开关：引擎立即应用并持久化，下次启动恢复。
+#[tauri::command(rename = "set_gapless")]
+pub async fn cmd_set_gapless(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    state.engine.set_gapless(enabled);
+    Ok(())
+}
+
 /// 武装 / 取消睡眠定时。`remainingMs` = 倒计时剩余毫秒（None = 取消）；
 /// `afterTrack` = 播完当前曲目后停止。到点引擎暂停播放并广播 sleep-timer-fired。
 #[tauri::command(rename = "set_sleep_timer")]
@@ -586,6 +608,13 @@ pub struct AudioCacheStats {
 pub struct AudioCacheClearResult {
     pub freed_bytes: u64,
     pub failed_count: u64,
+}
+
+/// 进程内可再生缓存清理结果：实际移除的条目数。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeCacheClearResult {
+    pub cleared_count: u64,
 }
 
 /// 递归统计目录体积。缓存目录通常只有一层 `.part` 文件，按通用目录处理以兜底。
@@ -697,6 +726,16 @@ pub async fn cmd_clear_web_cache(app: tauri::AppHandle) -> Result<AudioCacheClea
     })
     .await
     .map_err(|e| format!("清理网页缓存失败: {e}"))?
+}
+
+/// 清空 Rust 进程内播放地址缓存。下一次播放会重新走前端音源脚本取链。
+#[tauri::command(rename = "clear_play_url_cache")]
+pub async fn cmd_clear_play_url_cache(
+    state: State<'_, AppState>,
+) -> Result<RuntimeCacheClearResult, String> {
+    Ok(RuntimeCacheClearResult {
+        cleared_count: state.url_cache.clear() as u64,
+    })
 }
 
 /// 设置播放缓存体积上限（MB，0 = 不限）。引擎侧落 settings 并立即修剪；
@@ -1206,6 +1245,135 @@ pub async fn cmd_astral_reply_feedback(
     state.astral.reply_feedback(feedback_id, &content).await
 }
 
+// ---------- AI 助手（与 qt-uniappx 同一套 App 端契约） ----------
+//
+// 前端不能直连后端（CSP 只允许 self/ipc），每个接口都要一个命令转一手。
+
+#[tauri::command(rename = "astral_ai_agents")]
+pub async fn cmd_astral_ai_agents(
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    state.astral.ai_agents().await
+}
+
+#[tauri::command(rename = "astral_ai_capabilities")]
+pub async fn cmd_astral_ai_capabilities(
+    state: State<'_, AppState>,
+    agent_code: String,
+) -> Result<serde_json::Value, String> {
+    state.astral.ai_capabilities(&agent_code).await
+}
+
+#[tauri::command(rename = "astral_ai_conversations")]
+pub async fn cmd_astral_ai_conversations(
+    state: State<'_, AppState>,
+    agent_code: String,
+) -> Result<serde_json::Value, String> {
+    state.astral.ai_conversations(&agent_code).await
+}
+
+#[tauri::command(rename = "astral_ai_create_conversation")]
+pub async fn cmd_astral_ai_create_conversation(
+    state: State<'_, AppState>,
+    agent_code: String,
+    title: String,
+) -> Result<serde_json::Value, String> {
+    state
+        .astral
+        .ai_create_conversation(&agent_code, &title)
+        .await
+}
+
+#[tauri::command(rename = "astral_ai_conversation")]
+pub async fn cmd_astral_ai_conversation(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<serde_json::Value, String> {
+    state.astral.ai_conversation(id).await
+}
+
+#[tauri::command(rename = "astral_ai_delete_conversation")]
+pub async fn cmd_astral_ai_delete_conversation(
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<serde_json::Value, String> {
+    state.astral.ai_delete_conversation(id).await
+}
+
+#[tauri::command(rename = "astral_ai_messages")]
+pub async fn cmd_astral_ai_messages(
+    state: State<'_, AppState>,
+    conversation_id: i64,
+    before_id: Option<i64>,
+    limit: Option<i64>,
+) -> Result<serde_json::Value, String> {
+    state
+        .astral
+        .ai_messages(conversation_id, before_id, limit)
+        .await
+}
+
+#[tauri::command(rename = "astral_ai_send_message")]
+pub async fn cmd_astral_ai_send_message(
+    state: State<'_, AppState>,
+    conversation_id: i64,
+    content: String,
+    context: serde_json::Value,
+    idempotency_key: String,
+) -> Result<serde_json::Value, String> {
+    state
+        .astral
+        .ai_send_message(conversation_id, &content, context, &idempotency_key)
+        .await
+}
+
+#[tauri::command(rename = "astral_ai_events")]
+pub async fn cmd_astral_ai_events(
+    state: State<'_, AppState>,
+    request_id: i64,
+    after: i64,
+    limit: i64,
+) -> Result<serde_json::Value, String> {
+    state.astral.ai_events(request_id, after, limit).await
+}
+
+#[tauri::command(rename = "astral_ai_cancel_request")]
+pub async fn cmd_astral_ai_cancel_request(
+    state: State<'_, AppState>,
+    request_id: i64,
+    reason: String,
+) -> Result<serde_json::Value, String> {
+    state.astral.ai_cancel_request(request_id, &reason).await
+}
+
+#[tauri::command(rename = "astral_ai_feedback")]
+pub async fn cmd_astral_ai_feedback(
+    state: State<'_, AppState>,
+    message_id: i64,
+    feedback_type: String,
+    reason_code: String,
+    comment: String,
+) -> Result<serde_json::Value, String> {
+    state
+        .astral
+        .ai_feedback(message_id, &feedback_type, &reason_code, &comment)
+        .await
+}
+
+#[tauri::command(rename = "astral_ai_execute_action")]
+pub async fn cmd_astral_ai_execute_action(
+    state: State<'_, AppState>,
+    action_id: String,
+    action_type: String,
+    success: bool,
+    message: String,
+) -> Result<serde_json::Value, String> {
+    state
+        .astral
+        .ai_execute_action(&action_id, &action_type, success, &message)
+        .await
+}
+
 /// 当前版本（§15.7 单一真值：Cargo 包版本派生，前端不手写）
 #[tauri::command(rename = "get_app_version")]
 pub async fn cmd_get_app_version() -> std::collections::HashMap<String, serde_json::Value> {
@@ -1611,7 +1779,7 @@ pub async fn cmd_purge_missing_local_tracks(state: State<'_, AppState>) -> Resul
 pub async fn cmd_get_local_cover(path: String) -> Result<Option<String>, String> {
     use base64::Engine as _;
     tauri::async_runtime::spawn_blocking(move || {
-        crate::local::read_cover(std::path::Path::new(&path)).map(|(mime, bytes)| {
+        crate::local::read_cover(std::path::Path::new(crate::cue::strip_cue_suffix(&path))).map(|(mime, bytes)| {
             format!(
                 "data:{mime};base64,{}",
                 base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -1620,6 +1788,120 @@ pub async fn cmd_get_local_cover(path: String) -> Result<Option<String>, String>
     })
     .await
     .map_err(|e| format!("读取封面失败: {e}"))
+}
+
+/// 本地歌词的 IPC 形状（前端 `LocalLyric`）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalLyricDto {
+    pub lrc: String,
+    /// `local-lrc`（同名 .lrc 旁挂文件）/ `local-tag`（内嵌标签）
+    pub source: String,
+    /// `.lrc` 文件路径；内嵌歌词为 None
+    pub path: Option<String>,
+}
+
+/// 读本地音频自带的歌词：同名 `.lrc` 优先，其次内嵌标签（没有则返回 None）。
+///
+/// 扫描时已经落过一次库（`library_scan::persist_local_lyrics`），这条命令服务扫描之外的
+/// 三种情况：拖进来还没入库的文件、扫描之后才放进来的 `.lrc`、以及用户改了 `.lrc` 内容。
+/// 与 `get_local_cover` 同一套路：纯读盘，不碰数据库。
+#[tauri::command(rename = "read_local_lyric")]
+pub async fn cmd_read_local_lyric(path: String) -> Result<Option<LocalLyricDto>, String> {
+    // 子轨时间轴从零开始；整轨旁挂/内嵌歌词尚未分割，不能直接复用。
+    if crate::cue::strip_cue_suffix(&path) != path {
+        return Ok(None);
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::local::read_local_lyric(std::path::Path::new(&path)).map(|found| LocalLyricDto {
+            lrc: found.text,
+            source: found.source.to_string(),
+            path: found.path,
+        })
+    })
+    .await
+    .map_err(|e| format!("读取本地歌词失败: {e}"))
+}
+
+/// 「外部打开」的结果：可直接入队播放的曲目 + 没能打开的入参。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenedLocalPaths {
+    pub tracks: Vec<Track>,
+    /// 被跳过的入参（不存在 / 扩展名不支持 / 文件夹里没有音频），供前端提示
+    pub skipped: Vec<String>,
+}
+
+/// 打开外部传入的本地文件与文件夹：拖拽入窗、命令行参数、第二实例转发三条路径共用。
+///
+/// 为什么顺手入库（而不是造一条「临时播放」链路）：本地曲目的歌词、封面、播放进度、
+/// 播放历史、统计都以 `tracks` 行为锚点（`id = local:<路径>`）。不入库的话，拖进来的
+/// 那首歌会出现「没有封面、歌词、听完不进历史」的怪状态，而它明明和库里那首是同一个
+/// 文件。入库走的是与扫描完全相同的一段代码，所以重复拖入只是更新同一行。
+///
+/// 注意这里**不碰** `scan_dirs`：用户拖一个文件不等于「把这个文件夹纳入音乐库」，
+/// 那是扫描目录页的动作。因此该曲目会出现在本地曲库里，但不会被后续扫描标成缺失。
+#[tauri::command(rename = "open_local_paths")]
+pub async fn cmd_open_local_paths(
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<OpenedLocalPaths, String> {
+    if paths.is_empty() {
+        return Ok(OpenedLocalPaths {
+            tracks: Vec::new(),
+            skipped: Vec::new(),
+        });
+    }
+    // 扫描要读标签 / 试解码，放 blocking 线程；与 cmd_scan_library 同一取舍
+    let (rows, skipped) = tauri::async_runtime::spawn_blocking(move || crate::local::scan_files(&paths))
+        .await
+        .map_err(|e| format!("打开本地文件失败: {e}"))?;
+
+    let tracks: Vec<Track> = rows
+        .iter()
+        .map(|row| Track {
+            id: row.id.clone(),
+            platform: crate::provider::types::SourceId::local(),
+            title: row.title.clone(),
+            singer: row.singer.clone(),
+            album: row.album.clone(),
+            pic_url: String::new(),
+            duration: row.duration_ms as f64 / 1000.0,
+            music_id: None,
+            start_ms: row.start_ms,
+            end_ms: row.end_ms,
+        })
+        .collect();
+
+    if let (Some(db), false) = (state.db.clone(), rows.is_empty()) {
+        // 入库失败不该让「拖进去播不了」——用户要的动作是播放，入库只是附带
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            db.with(|conn| {
+                crate::db::store::upsert_local_tracks(conn, &rows)?;
+                crate::db::store::reconcile_local_cue_tracks(conn, &rows)?;
+                let written = crate::library_scan::persist_local_lyrics(conn, &rows);
+                if written > 0 {
+                    log::info!("[local] 外部打开：本地歌词入库 {written} 条");
+                }
+                Ok::<(), rusqlite::Error>(())
+            })
+        })
+        .await;
+        if let Ok(Err(err)) = result {
+            log::warn!("[local] 外部打开入库失败（仍继续播放）: {err}");
+        }
+    }
+
+    Ok(OpenedLocalPaths { tracks, skipped })
+}
+
+/// 取走「外部打开」待处理队列（命令行参数 / 第二实例转发攒下的路径）。
+///
+/// 前端在收到 `open-local-paths` 事件时、以及主窗口挂载时各取一次；取空是原子的，
+/// 所以两条触发路径不会把同一批文件播两遍（见 `crate::external_open` 模块注释）。
+#[tauri::command(rename = "take_pending_open_paths")]
+pub fn cmd_take_pending_open_paths() -> Vec<String> {
+    crate::external_open::take()
 }
 
 /// 扫描目录清单（scan_dirs 表）。
@@ -2138,6 +2420,84 @@ pub async fn cmd_clear_history(state: State<'_, AppState>) -> Result<(), String>
         .map_err(|e| format!("清空播放历史失败: {e}"))?
 }
 
+/// 播放记录的定位键。
+///
+/// tracks 主键口径是 `platform:原始id`，而前端手里只有 `Track` 的 platform / id
+/// 两个字段 —— 拼接放在后端做，免得两边口径漂移（本地曲目的 id 是文件路径，
+/// 里面本身带冒号，前端拼串最容易在这里出错）。
+#[derive(serde::Deserialize)]
+pub struct HistoryKey {
+    pub platform: String,
+    pub id: String,
+}
+
+impl HistoryKey {
+    fn db_id(&self) -> String {
+        format!("{}:{}", self.platform, self.id)
+    }
+}
+
+/// 删除一首歌的播放记录。
+#[tauri::command(rename = "remove_history")]
+pub async fn cmd_remove_history(
+    state: State<'_, AppState>,
+    platform: String,
+    id: String,
+) -> Result<bool, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(false);
+    };
+    let key = HistoryKey { platform, id };
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| crate::db::store::remove_play_history(conn, &key.db_id()))
+    })
+    .await
+    .map_err(|e| format!("删除播放记录失败: {e}"))?
+}
+
+/// 批量删除播放记录（历史页多选），返回真正删掉的条数。
+#[tauri::command(rename = "remove_history_many")]
+pub async fn cmd_remove_history_many(
+    state: State<'_, AppState>,
+    items: Vec<HistoryKey>,
+) -> Result<usize, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(0);
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let ids: Vec<String> = items.iter().map(HistoryKey::db_id).collect();
+        db.with(|conn| crate::db::store::remove_play_history_many(conn, &ids))
+    })
+    .await
+    .map_err(|e| format!("批量删除播放记录失败: {e}"))?
+}
+
+/// 统计指向已丢失文件的播放记录条数（列表里看不见的那部分）。
+#[tauri::command(rename = "count_missing_history")]
+pub async fn cmd_count_missing_history(state: State<'_, AppState>) -> Result<i64, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(0);
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(crate::db::store::count_missing_play_history)
+    })
+    .await
+    .map_err(|e| format!("统计丢失记录失败: {e}"))?
+}
+
+/// 清掉指向已丢失文件的播放记录，返回条数。
+#[tauri::command(rename = "purge_missing_history")]
+pub async fn cmd_purge_missing_history(state: State<'_, AppState>) -> Result<usize, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(0);
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(crate::db::store::purge_missing_play_history)
+    })
+    .await
+    .map_err(|e| format!("清理丢失记录失败: {e}"))?
+}
+
 // ---------- 我的歌单（DESIGN §5.3） ----------
 // 本地自建歌单（区别于音源侧的在线歌单），曲目通过 add_tracks_to_playlist 加入。
 // 歌单对外一律用 pid（UUID，创建后永不变）：新建时生成并上送云端登记，
@@ -2372,7 +2732,7 @@ pub async fn cmd_add_tracks_to_playlist(
     let for_db = tracks.clone();
     let push_id = id.clone();
     let added = tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| crate::db::store::add_tracks_to_playlist(conn, &id, &for_db))
+        db.with(|conn| crate::playlist_io::add_imported_tracks(conn, &id, &for_db))
     })
     .await
     .map_err(|e| format!("添加歌曲到歌单失败: {e}"))?
@@ -3897,6 +4257,8 @@ pub async fn cmd_like_apply(
                     } else {
                         Some(c.hash.clone())
                     },
+                    start_ms: None,
+                    end_ms: None,
                 };
 
                 if c.deleted {
@@ -4318,6 +4680,8 @@ pub async fn cmd_like_reconcile(state: State<'_, AppState>) -> Result<u32, Strin
             } else {
                 Some(hash.clone())
             },
+            start_ms: None,
+            end_ms: None,
         };
         missing += 1;
         backfill.push((track, "add".to_string(), Some(pid.clone())));
@@ -4428,11 +4792,38 @@ pub async fn cmd_get_play_overview(
             track_count: 0,
             finished_plays: 0,
             last_played_at: None,
+            active_days: 0,
         });
     };
     tauri::async_runtime::spawn_blocking(move || db.with(crate::db::store::play_overview))
         .await
         .map_err(|e| format!("读取听歌统计失败: {e}"))?
+}
+
+/// 报告页首次打开时调用：把升级前只有累计值、没有按天明细的存量播放归到今天。
+///
+/// 幂等（只补「累计 − 明细已有」的差额），所以每次进页面调一次也无副作用；
+/// 返回补齐的行数，仅供日志/调试看，前端不依赖它。
+#[tauri::command(rename = "seed_listen_days")]
+pub async fn cmd_seed_listen_days(state: State<'_, AppState>) -> Result<usize, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(0);
+    };
+    tauri::async_runtime::spawn_blocking(move || db.with(crate::db::store::seed_play_days))
+        .await
+        .map_err(|e| format!("初始化按天明细失败: {e}"))?
+}
+
+/// 清除听歌统计（累计 + 按天明细）。不可撤销，前端必须二次确认；
+/// 返回删掉的曲目数。播放记录、收藏、歌单不受影响。
+#[tauri::command(rename = "clear_listen_stats")]
+pub async fn cmd_clear_listen_stats(state: State<'_, AppState>) -> Result<i64, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(0);
+    };
+    tauri::async_runtime::spawn_blocking(move || db.with(crate::db::store::clear_play_stats))
+        .await
+        .map_err(|e| format!("清除听歌统计失败: {e}"))?
 }
 
 #[tauri::command(rename = "get_top_tracks")]
@@ -4769,6 +5160,262 @@ fn flac_bits_of(bytes: &[u8]) -> Option<u8> {
     }
 }
 
+/// 取走「数据库自愈」的一次性说明（启动体检发现库损坏并隔离重建时才有内容）。
+///
+/// 为什么用"取走"而不是读设置项：这条说明只在**本次启动**有意义，取过就该消失，
+/// 否则用户每次开界面都会被同一条历史消息打扰（详见 `db::health::take_notice`）。
+#[tauri::command(rename = "take_db_notice")]
+pub fn cmd_take_db_notice() -> Option<String> {
+    crate::db::health::take_notice()
+}
+
+/// 导出用户数据备份到指定目录（报告 §3.1）。
+///
+/// 目录由前端文件夹选择框给出；真正的活儿（`VACUUM INTO` 快照 + JSON 清单）在
+/// `crate::backup` 里。跑 `VACUUM` 期间会占住线程（库越大越久），所以丢给阻塞线程池，
+/// 别卡住 IPC。
+#[tauri::command(rename = "export_backup")]
+pub async fn cmd_export_backup(
+    dir: String,
+    state: State<'_, AppState>,
+) -> Result<crate::backup::BackupInfo, String> {
+    let db = state
+        .db
+        .clone()
+        .ok_or_else(|| "本次运行没有可用的数据库，无法导出备份".to_string())?;
+    let dir = std::path::PathBuf::from(dir.trim());
+    if dir.as_os_str().is_empty() {
+        return Err("请先选择备份目录".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || crate::backup::export(&db, &dir))
+        .await
+        .map_err(|e| format!("导出备份任务失败: {e}"))?
+}
+
+/// 从备份文件导入（报告 §3.1）：`mode` 取 `replace`（覆盖）/ `merge`（合并）。
+///
+/// 覆盖模式会先自动拍一张现状快照（见 `backup::import`），临时文件与快照都写在数据目录下。
+#[tauri::command(rename = "import_backup")]
+pub async fn cmd_import_backup(
+    path: String,
+    mode: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<crate::backup::ImportSummary, String> {
+    let db = state
+        .db
+        .clone()
+        .ok_or_else(|| "本次运行没有可用的数据库，无法导入备份".to_string())?;
+    let mode = crate::backup::ImportMode::parse(&mode)?;
+    let source = std::path::PathBuf::from(path.trim());
+    if source.as_os_str().is_empty() {
+        return Err("请先选择备份文件".into());
+    }
+    let work_dir = crate::app_paths::data_root(&app).join("data");
+    let summary = tauri::async_runtime::spawn_blocking(move || {
+        crate::backup::import(&db, &source, mode, &work_dir)
+    })
+    .await
+    .map_err(|e| format!("导入备份任务失败: {e}"))??;
+    state.engine.send(AudioCmd::ReloadDislikes);
+    Ok(summary)
+}
+
+/// 导出单个本地歌单（REQUIREMENTS §3.21.5 / 报告 §6.1）。
+///
+/// 目录由前端文件夹选择框给出；真正的写盘（`.json` + 本地条目 `.m3u8`）在
+/// `crate::playlist_io` 里。文件 IO 走阻塞线程池，别卡住 IPC。
+#[tauri::command(rename = "export_playlist")]
+pub async fn cmd_export_playlist(
+    pid: String,
+    dir: String,
+    state: State<'_, AppState>,
+) -> Result<crate::playlist_io::ExportSummary, String> {
+    let db = state
+        .db
+        .clone()
+        .ok_or_else(|| "本次运行没有可用的数据库，无法导出歌单".to_string())?;
+    let pid = pid.trim().to_string();
+    if pid.is_empty() {
+        return Err("请先选择要导出的歌单".into());
+    }
+    let dir = std::path::PathBuf::from(dir.trim());
+    if dir.as_os_str().is_empty() {
+        return Err("请先选择导出目录".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || crate::playlist_io::export(&db, &pid, &dir))
+        .await
+        .map_err(|e| format!("导出歌单任务失败: {e}"))?
+}
+
+/// 解析 `.json` 歌单文件：只做读取与校验（含"本地条目在本机不存在就丢掉"），
+/// 落库交给既有的 `add_tracks_to_playlist` —— 导入目标的选择留在前端（与"导入歌曲"
+/// 共用那套新建/选歌单的界面）。
+#[tauri::command(rename = "parse_playlist_json")]
+pub async fn cmd_parse_playlist_json(
+    path: String,
+) -> Result<crate::playlist_io::JsonPreview, String> {
+    let path = std::path::PathBuf::from(path.trim());
+    if path.as_os_str().is_empty() {
+        return Err("请先选择歌单文件".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || crate::playlist_io::read_json(&path))
+        .await
+        .map_err(|e| format!("读取歌单文件任务失败: {e}"))?
+}
+
+// ---------- 网络设置（第二波：代理与单源超时） ----------
+
+/// 网络配置的前端视图（camelCase；字段口径见 net_config::NetConfig）。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetConfigView {
+    pub proxy_mode: String,
+    pub proxy_url: String,
+    pub source_timeout_ms: u64,
+}
+
+impl From<crate::net_config::NetConfig> for NetConfigView {
+    fn from(c: crate::net_config::NetConfig) -> Self {
+        Self {
+            proxy_mode: c.proxy_mode,
+            proxy_url: c.proxy_url,
+            source_timeout_ms: c.source_timeout_ms,
+        }
+    }
+}
+
+/// 读当前网络配置（主窗与迷你窗的设置区共用）。
+#[tauri::command(rename = "get_net_config")]
+pub fn cmd_get_net_config() -> NetConfigView {
+    crate::net_config::current().into()
+}
+
+/// 保存网络配置：校验 → 落库 → 更新全局并 bump 代际。生效时机见
+/// net_config 模块注释（常驻客户端对下一次请求生效，当前播放不断流）。
+#[tauri::command(rename = "set_net_config")]
+pub fn cmd_set_net_config(
+    state: State<'_, AppState>,
+    proxy_mode: String,
+    proxy_url: String,
+    source_timeout_ms: u64,
+) -> Result<NetConfigView, String> {
+    let db = state
+        .db
+        .clone()
+        .ok_or_else(|| "数据库未就绪，无法保存网络设置".to_string())?;
+    let cfg = crate::net_config::NetConfig {
+        proxy_mode,
+        proxy_url,
+        source_timeout_ms,
+    };
+    // db.with 只认 rusqlite 错误；apply 的业务错误（非法代理地址）是 String，
+    // 包一层让两层错误各走各的通道
+    let applied = match db.with(|conn| Ok(crate::net_config::apply(conn, cfg))) {
+        Ok(inner) => inner,
+        Err(e) => return Err(format!("网络设置写入失败：{e}")),
+    }?;
+    Ok(applied.into())
+}
+
+/// 代理连通性试连（设置页「测试」按钮）：用**表单值**临时构建客户端，
+/// 不动全局配置、不落库。返回 ok/status/elapsedMs（失败带错误信息）。
+#[tauri::command(rename = "test_net_config")]
+pub async fn cmd_test_net_config(
+    proxy_mode: String,
+    proxy_url: String,
+    target: Option<String>,
+) -> Result<NetTestResult, String> {
+    let mut cfg = crate::net_config::NetConfig {
+        proxy_mode,
+        proxy_url,
+        // 试连只关心代理；超时字段不用（本命令自带 8s 总超时）
+        source_timeout_ms: 0,
+    };
+    if cfg.proxy_mode == crate::net_config::PROXY_MODE_CUSTOM {
+        cfg.proxy_url = crate::net_config::validate_proxy_url(&cfg.proxy_url)?;
+    }
+    let client = crate::net_config::configure_with(
+        reqwest::Client::builder()
+            .user_agent("Mozilla/5.0")
+            .timeout(std::time::Duration::from_secs(8)),
+        &cfg,
+    )
+    .build()
+    .map_err(|e| format!("构建测试客户端失败：{e}"))?;
+    // 试连目标默认走国内可达的轻量入口（204 类最理想；baidu 首页稳定且
+    // 直连/代理两种形态下都能判通）。完整 URL 只进日志。
+    let url = target.unwrap_or_else(|| "https://www.baidu.com/".to_string());
+    let started = std::time::Instant::now();
+    match client.get(&url).send().await {
+        Ok(resp) => {
+            let ok = resp.status().is_success();
+            let status = resp.status().as_u16();
+            Ok(NetTestResult {
+                ok,
+                status: Some(status),
+                elapsed_ms: started.elapsed().as_millis(),
+                error: if ok {
+                    None
+                } else {
+                    Some(format!("HTTP {status}"))
+                },
+            })
+        }
+        Err(e) => Ok(NetTestResult {
+            ok: false,
+            status: None,
+            elapsed_ms: started.elapsed().as_millis(),
+            error: Some(crate::astral::sanitize_err(e)),
+        }),
+    }
+}
+
+/// 试连结果（毫秒取 u128：elapsed() 精度就是 u128，不裁剪）。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetTestResult {
+    pub ok: bool,
+    pub status: Option<u16>,
+    pub elapsed_ms: u128,
+    pub error: Option<String>,
+}
+
+/// 进入 / 退出迷你模式（REQUIREMENTS §3.21.7.2）：返回切换后的可见性。
+/// 互切的另一半在 Rust 侧一起做——进迷你藏主窗、退迷你唤回主窗，
+/// 前端只管发一条命令（避免两窗各调一次 show/hide 出现中间态）。
+#[tauri::command(rename = "toggle_mini_player")]
+pub async fn cmd_toggle_mini_player(app: tauri::AppHandle) -> Result<MiniPlayerState, String> {
+    crate::mini_window::toggle(&app).map(|visible| MiniPlayerState { visible })
+}
+
+/// 迷你播放器可见性回执（播放条按钮与迷你窗「返回主窗」共用同一形状）
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MiniPlayerState {
+    pub visible: bool,
+}
+
+#[tauri::command(rename = "get_file_association_state")]
+pub async fn cmd_get_file_association_state() -> Result<crate::file_assoc::FileAssociationState, String> {
+    crate::file_assoc::state()
+}
+
+#[tauri::command(rename = "register_file_associations")]
+pub async fn cmd_register_file_associations() -> Result<crate::file_assoc::FileAssociationState, String> {
+    crate::file_assoc::register()
+}
+
+#[tauri::command(rename = "unregister_file_associations")]
+pub async fn cmd_unregister_file_associations() -> Result<crate::file_assoc::FileAssociationState, String> {
+    crate::file_assoc::unregister()
+}
+
+#[tauri::command(rename = "open_default_apps_settings")]
+pub async fn cmd_open_default_apps_settings() -> Result<(), String> {
+    crate::file_assoc::open_settings()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -4876,6 +5523,8 @@ mod tests {
             pic_url: String::new(),
             duration: 0.0,
             music_id: None,
+            start_ms: None,
+            end_ms: None,
         }
     }
 

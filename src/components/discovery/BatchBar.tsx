@@ -1,10 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Check, Download, Heart, Loader2, Plus, X } from "lucide-react";
 import { cn, errMsg } from "@/lib/utils";
 import { findCrossSourceDup } from "@/lib/collect-dup";
+import { legacyTrackSelectionKey, trackSelectionKey, type TrackSelectionKey } from "@/lib/track-selection";
 import { clampQualityForPlatform, useSourceLabelFn } from "@/stores/sourceRegistry";
 import { useFavoritesStore } from "@/stores/favorites";
-import { toastSuccess } from "@/stores/toast";
+import { toastSuccess, toastUndo } from "@/stores/toast";
 import { useFavoriteFlags } from "@/hooks/useFavoriteFlags";
 import type { MyPlaylistSummary, Track } from "@/types";
 import * as ipc from "@/services/ipc";
@@ -54,6 +55,8 @@ export function BatchBar(props: {
   tracks: Track[];
   selected: Set<string>;
   onSelectedChange: (next: Set<string>) => void;
+  /** 与 TrackList.selection.keyOf 一致；迁移后的页面使用 trackSelectionKey。 */
+  selectionKey?: TrackSelectionKey;
   /**
    * 宿主页自己的歌单 pid（本地歌单详情页传自己）：**只有动到本页这个歌单**
    * 才需要重拉 —— 从本页歌单里取消收藏后，那几行必须跟着消失。
@@ -74,6 +77,7 @@ export function BatchBar(props: {
     tracks,
     selected,
     onSelectedChange,
+    selectionKey = legacyTrackSelectionKey,
     hostPlaylistId,
     onChanged,
     onError,
@@ -111,17 +115,31 @@ export function BatchBar(props: {
   const sourceLabel = useSourceLabelFn();
   const bump = useFavoritesStore((s) => s.bump);
   const favVersion = useFavoritesStore((s) => s.version);
+  const scopeVersion = useRef(0);
   const closeMenu = (): void => {
+    scopeVersion.current += 1;
     setMenuOpen(false);
     setPending(null);
   };
 
   const targets = useMemo(
-    () => tracks.filter((t) => selected.has(t.id)),
-    [tracks, selected],
+    () => tracks.filter((t) => selected.has(selectionKey(t))),
+    [tracks, selected, selectionKey],
   );
   const count = targets.length;
   const allSelected = tracks.length > 0 && count === tracks.length;
+  const allCheckbox = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (allCheckbox.current) allCheckbox.current.indeterminate = count > 0 && !allSelected;
+  }, [count, allSelected]);
+  // 过滤 / 重载后关闭旧的确认面板，避免继续操作已隐藏的 pending.adds。
+  useEffect(() => {
+    scopeVersion.current += 1;
+    setMenuOpen(false);
+    setPending(null);
+    setMenuError(null);
+    setNewName("");
+  }, [tracks, selected]);
 
   /**
    * 红心实心与否，判定口径与**单曲红心一模一样**（`is_liked_song`：挂在任一
@@ -145,13 +163,13 @@ export function BatchBar(props: {
   const likedIds = useMemo(() => {
     const set = new Set<string>();
     tracks.forEach((t, i) => {
-      if (favFlags[i]) set.add(t.id);
+      if (favFlags[i]) set.add(trackSelectionKey(t));
     });
     return set;
   }, [tracks, favFlags]);
   const allLiked = useMemo(() => {
     const probe = count > 0 ? targets : tracks;
-    return probe.length > 0 && probe.every((t) => likedIds.has(t.id));
+    return probe.length > 0 && probe.every((t) => likedIds.has(trackSelectionKey(t)));
   }, [count, targets, tracks, likedIds]);
 
   useEffect(() => {
@@ -159,7 +177,7 @@ export function BatchBar(props: {
   }, [count]);
 
   /** 「平台:id」口径与 Rust `db_track_id()` / 列表 key 一致 */
-  const keyOf = (t: Pick<Track, "platform" | "id">): string => `${t.platform}:${t.id}`;
+  const keyOf = trackSelectionKey;
 
   /** 这个歌单里已经躺着哪些选中曲目（`getPlaylistTracks` 返回的是库里的曲目行） */
   const computeMembers = async (
@@ -184,28 +202,41 @@ export function BatchBar(props: {
     return Object.fromEntries(entries);
   };
 
+  /**
+   * 撤销回调是「点了按钮之后」才跑的，闭包里直接读 `items` / `targets` 会读到
+   * 按下删除那一刻的旧值（用户中途改了勾选就写错勾）。这里始终指向最新一轮的重算。
+   */
+  const recomputeRef = useRef<() => Promise<Record<string, Set<string>>>>(() =>
+    Promise.resolve({}),
+  );
+  recomputeRef.current = () => computeMembers(items);
+
   const openMenu = async (): Promise<void> => {
     if (menuOpen) {
       closeMenu();
       return;
     }
+    const version = ++scopeVersion.current;
     setMenuOpen(true);
     setMenuError(null);
     setPending(null);
     setMembersLoading(true);
     try {
       const all = await ipc.listMyPlaylists();
+      if (version !== scopeVersion.current) return;
       // 可作为收藏目标：本地自建歌单 + 云端 local 卡片（「我喜欢的歌曲」等）。
       // 在线音源歌单的曲目归音源管，加不进去（与单曲收藏面板同口径）
       const list = (Array.isArray(all) ? all : []).filter(
         (p) => p.platform === ipc.LOCAL_PLATFORM,
       );
+      const nextMembers = await computeMembers(list);
+      if (version !== scopeVersion.current) return;
       setItems(list);
-      setMembers(await computeMembers(list));
+      setMembers(nextMembers);
     } catch (err) {
-      setMenuError(errMsg(err));
+      if (version === scopeVersion.current) setMenuError(errMsg(err));
     } finally {
-      setMembersLoading(false);
+      if (version === scopeVersion.current) setMembersLoading(false);
     }
   };
 
@@ -294,7 +325,16 @@ export function BatchBar(props: {
       setMembers(await computeMembers(items));
       // 摘的正是宿主页自己这个歌单 → 那几行必须从页面上消失
       if (hostPlaylistId !== undefined && p.pid === hostPlaylistId) onChanged?.();
-      report(`已从「${p.name}」取消收藏 ${list.length} 首`);
+      // 回执带「撤销」：取消收藏是高频低风险操作，弹二次确认太重，
+      // 改成先做完再给一次后悔的机会（撤销窗口与错误提示同档 6 秒）
+      toastUndo(`已从「${p.name}」取消收藏 ${list.length} 首`, async () => {
+        // 反向操作就是原样加回去。批量接口不接位置，这几首会排到歌单末尾 ——
+        // 归属对了，顺序变了，这点代价写在报告里（歌单顺序不是用户会依赖的强语义）
+        await ipc.addTracksToPlaylist(p.pid, list);
+        bump();
+        setMembers(await recomputeRef.current());
+        if (hostPlaylistId !== undefined && p.pid === hostPlaylistId) onChanged?.();
+      });
     } catch (err) {
       setMenuError(errMsg(err));
     } finally {
@@ -349,6 +389,7 @@ export function BatchBar(props: {
       setMembers(await computeMembers(items));
       return;
     }
+    const version = scopeVersion.current;
     // 加入前查重一次（只查真正要新增的那部分）：查重失败不拦收藏 ——
     // 重复顶多是两行，拦住是功能不可用（与单曲版同口径）
     let existing: Track[] = [];
@@ -357,6 +398,8 @@ export function BatchBar(props: {
     } catch {
       // 读不到就当作没重
     }
+    // 查重等待期间可能已筛掉这些曲目，不能再恢复旧确认或提交旧 adds。
+    if (version !== scopeVersion.current) return;
     const dups =
       existing.length > 0
         ? adds.flatMap((t) => findCrossSourceDup(t, Array.isArray(existing) ? existing : []))
@@ -416,11 +459,14 @@ export function BatchBar(props: {
         className="flex items-center gap-1.5 text-xs text-muted-foreground"
       >
         <input
+          ref={allCheckbox}
           type="checkbox"
           checked={allSelected}
+          disabled={tracks.length === 0}
+          aria-checked={count > 0 && !allSelected ? "mixed" : allSelected}
           aria-label={allSelected ? "取消全选" : "全选"}
           onChange={() =>
-            onSelectedChange(allSelected ? new Set() : new Set(tracks.map((t) => t.id)))
+            onSelectedChange(allSelected ? new Set() : new Set(tracks.map(selectionKey)))
           }
           className="h-3.5 w-3.5 accent-primary"
         />

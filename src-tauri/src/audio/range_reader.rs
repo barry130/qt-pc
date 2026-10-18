@@ -1,7 +1,7 @@
 //! HttpRangeReader（DESIGN §6.12）：HTTP Range + 磁盘缓冲 + 就绪区间位图。
 //!
 //! - 为 symphonia 解码器提供 `Read + Seek` 输入（HTTP 响应体只有 Read，无法直接喂解码器）
-//! - 后台下载线程顺序写入 `cache/audio/<sha1(url)>.part`，以**字节粒度区间集**记录就绪进度
+//! - 后台下载线程顺序写入 `cache/audio/<sha1(url)>-<nonce>.part`，以**字节粒度区间集**记录就绪进度
 //!   （读端可立即消费已落盘字节，不等整块；首包超时 8s 判不可播放）
 //! - read 落在未就绪区间 → 阻塞等待；seek 到未就绪区间 → 通知下载线程
 //!   发起新 Range 请求重定位下载点（含前向 seek；由此产生的空洞由读取触发时回填）
@@ -240,13 +240,6 @@ pub fn open(
 ) -> io::Result<(HttpRangeReader, Arc<RangeShared>)> {
     std::fs::create_dir_all(cache_dir)?;
 
-    let file_path = cache_dir.join(format!("{}.part", sha1_hex(url)));
-
-    // M0：不处理 .part 续传，残留直接删除重建
-    if file_path.exists() {
-        let _ = std::fs::remove_file(&file_path);
-    }
-
     // 首个 Range 请求：bytes=0- 同时探测 Accept-Ranges 与总长。
     // 判活不用短总超时：per-request .timeout() 覆盖到响应体读完，8s 会把慢源
     // 大文件掐死在半路（spool 模式更是必失败）。这里只挂 HTTP_TOTAL_GUARD
@@ -294,12 +287,7 @@ pub fn open(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
 
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(&file_path)?;
+    let (file_path, file) = create_buffer_file(cache_dir, url)?;
 
     let shared = Arc::new(RangeShared {
         url: url.to_string(),
@@ -748,6 +736,31 @@ impl HttpRangeReader {
     }
 }
 
+/// Each decoder needs its own bytes and readiness map. Gapless OneLoop can
+/// prepare the same URL while the current decoder is still reading it.
+fn create_buffer_file(cache_dir: &Path, url: &str) -> io::Result<(PathBuf, File)> {
+    let hash = sha1_hex(url);
+    loop {
+        let path = cache_dir.join(format!("{hash}-{:016x}.part", fastrand::u64(..)));
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        // Cache pruning also runs while a successor is queued. Keep both active
+        // buffers undeletable until their readers drop, while allowing the
+        // downloader's second read/write handle.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ_WRITE: u32 = 0x1 | 0x2;
+            options.share_mode(FILE_SHARE_READ_WRITE);
+        }
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn sha1_hex(s: &str) -> String {
     let mut h = Sha1::new();
     h.update(s.as_bytes());
@@ -758,6 +771,35 @@ fn sha1_hex(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_url_buffers_preserve_independent_bytes() {
+        let dir = std::env::temp_dir().join(format!("quietmusic-audio-{:016x}", fastrand::u64(..)));
+        std::fs::create_dir(&dir).unwrap();
+        let (first_path, mut first) = create_buffer_file(&dir, "https://audio.test/same.flac").unwrap();
+        first.write_all(b"current audio bytes").unwrap();
+        let (next_path, mut next) = create_buffer_file(&dir, "https://audio.test/same.flac").unwrap();
+        next.write_all(b"preloaded audio").unwrap();
+        assert_ne!(first_path, next_path);
+        first.seek(SeekFrom::Start(0)).unwrap();
+        next.seek(SeekFrom::Start(0)).unwrap();
+        let mut current_bytes = Vec::new();
+        let mut next_bytes = Vec::new();
+        first.read_to_end(&mut current_bytes).unwrap();
+        next.read_to_end(&mut next_bytes).unwrap();
+        assert_eq!(current_bytes, b"current audio bytes");
+        assert_eq!(next_bytes, b"preloaded audio");
+        #[cfg(windows)]
+        {
+            assert!(std::fs::remove_file(&first_path).is_err());
+            assert!(std::fs::remove_file(&next_path).is_err());
+        }
+        drop(first);
+        drop(next);
+        std::fs::remove_file(first_path).unwrap();
+        std::fs::remove_file(next_path).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn ready_spans_merge_and_cover() {

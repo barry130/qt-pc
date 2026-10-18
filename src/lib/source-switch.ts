@@ -89,8 +89,10 @@ function cacheSet(key: string, items: Candidate[]): void {
 }
 
 /** 清空换源缓存（切账号/换包/手动刷新时用；测试里也要用它隔离） */
-export function clearSourceSwitchCache(): void {
+export function clearSourceSwitchCache(): number {
+  const count = cache.size;
   cache.clear();
+  return count;
 }
 
 /**

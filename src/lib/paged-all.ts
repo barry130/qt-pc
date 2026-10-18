@@ -136,10 +136,12 @@ export function clearPagedAllJob(key: string): void {
   jobs.delete(key);
 }
 
-/** 清空全部缓存任务（测试用 / 切账号等场景） */
-export function clearPagedAllJobs(): void {
+/** 清空全部缓存任务（测试用 / 设置页可选清理） */
+export function clearPagedAllJobs(): number {
+  const count = jobs.size;
   for (const job of jobs.values()) job.cancelled = true;
   jobs.clear();
+  return count;
 }
 
 let jobSeq = 0;

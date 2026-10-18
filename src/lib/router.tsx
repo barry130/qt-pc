@@ -58,6 +58,15 @@ const OnboardingPage = lazyPage(
 );
 const ArtistPage = lazyPage(() => import("@/components/discovery/ArtistPage"), "ArtistPage");
 const AlbumPage = lazyPage(() => import("@/components/discovery/AlbumPage"), "AlbumPage");
+const AudioChartPage = lazyPage<{ platform: string; id: string }>(
+  () => import("@/components/discovery/AudioChartPage"),
+  "AudioChartPage",
+);
+const AudioProgramPage = lazyPage<{ platform: string; id: string }>(
+  () => import("@/components/discovery/AudioProgramPage"),
+  "AudioProgramPage",
+);
+const LocalMixPage = lazyPage<{ mixKey: string }>(() => import("@/components/mine/LocalMixPage"), "LocalMixPage");
 
 const rootRoute = createRootRoute({ component: AppShell });
 
@@ -128,9 +137,25 @@ const chartDetailRoute = createRoute({
       platform: string;
       id: string;
     };
-    // 榜单详情与歌单详情共用同一页面组件（骨架一致：封面 + 标题 + 共 N 首
-    // + 播放全部 + 批量条），靠 kind 分叉取数来源与「取消收藏」的语义
     return <PlaylistDetailPage platform={platform} id={id} kind="chart" />;
+  },
+});
+
+const audioChartRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/audio-chart/$platform/$id",
+  component: function AudioChartRoutePage() {
+    const { platform, id } = useParams({ strict: false }) as { platform: string; id: string };
+    return <AudioChartPage platform={platform} id={id} />;
+  },
+});
+
+const audioProgramRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/audio-program/$platform/$id",
+  component: function AudioProgramRoutePage() {
+    const { platform, id } = useParams({ strict: false }) as { platform: string; id: string };
+    return <AudioProgramPage platform={platform} id={id} />;
   },
 });
 
@@ -181,6 +206,15 @@ const myPlaylistDetailRoute = createRoute({
   },
 });
 
+const localMixRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/mix/$key",
+  component: function LocalMixRoutePage() {
+    const { key } = useParams({ strict: false }) as { key: string };
+    return <LocalMixPage mixKey={key} />;
+  },
+});
+
 const historyRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/history",
@@ -208,6 +242,13 @@ const statsRoute = createRoute({
   path: "/stats",
   // 一级页面由 AppShell 的 KeepAliveOutlet 常驻渲染（切 tab 不重载），
   // 这里只保留路由用于匹配与导航，组件渲染 null。
+  component: () => null,
+});
+
+const aiAssistantRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/ai-assistant",
+  // 音乐助手也走常驻：用户问完歌常常要切去别的页听，切回来会话还在。
   component: () => null,
 });
 
@@ -289,16 +330,20 @@ const routeTree = rootRoute.addChildren([
   playlistDetailRoute,
   chartsRoute,
   chartDetailRoute,
+  audioChartRoute,
+  audioProgramRoute,
   artistRoute,
   albumRoute,
   libraryRoute,
   libraryFoldersRoute,
   myPlaylistsRoute,
   myPlaylistDetailRoute,
+  localMixRoute,
   historyRoute,
   downloadsRoute,
   playingRoute,
   statsRoute,
+  aiAssistantRoute,
   feedbackRoute,
   feedbackSubmitRoute,
   feedbackDetailRoute,

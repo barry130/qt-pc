@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from "vitest";
-import { act, render } from "@testing-library/react";
+import { act, render, waitFor } from "@testing-library/react";
 
 // jsdom 下无 Tauri internals，mock 掉 @tauri-apps/api 的窗口与事件入口
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn(async () => ({})),
+  invoke: vi.fn(async (command: string) => command === "take_db_notice" ? null : ({})),
 }));
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
@@ -38,19 +38,22 @@ if (typeof window.matchMedia !== "function") {
   });
 }
 
+// jsdom 不提供原生页面滚动；路由恢复滚动只需验证调用不阻挡挂载。
+window.scrollTo = vi.fn();
+
 describe("App 冒烟", () => {
   it("RouterProvider 挂载后渲染出布局（标题栏 + 侧边栏 + 播放条）", async () => {
     const { default: App } = await import("@/App");
     const { container, unmount } = render(<App />);
-    // 等待 router 就绪后的首次渲染。
+    // 等待窗口入口懒加载及 router 就绪后的首次渲染。
     // 必须用 act 包住等待：React 19.2 的调度任务首行会读 window.event，若这次异步更新
     // 被留给真实调度器、而测试先结束时 jsdom 环境已拆除，就会抛
     // `ReferenceError: window is not defined`，让 vitest 记一个 unhandled error 并以退出码 1 结束。
     await act(async () => {
-      await new Promise((r) => setTimeout(r, 50));
+      await vi.dynamicImportSettled();
     });
+    await waitFor(() => expect(container.textContent).toContain("轻听"));
     expect(container.innerHTML.length).toBeGreaterThan(0);
-    expect(container.textContent).toContain("轻听");
     // 卸载并把残余任务在 act 里排空，不给环境留挂起的 React 工作
     unmount();
     await act(async () => {

@@ -1,7 +1,8 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Heart, Play } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Heart, Play, Search, Share2, X } from "lucide-react";
 import { useNavigate } from "@tanstack/react-router";
 import { errMsg } from "@/lib/utils";
+import { filterTracks, retainTrackSelection, trackSelectionKey } from "@/lib/track-selection";
 import type { Chart, MyPlaylistSummary, SourceId, Track } from "@/types";
 import * as ipc from "@/services/ipc";
 import * as sourceApi from "@/source-scripts";
@@ -14,6 +15,7 @@ import { ErrorRetry, TrackRowsSkeleton } from "./Skeletons";
 import { BackButton } from "@/components/layout/BackButton";
 import { IconButton } from "@/components/common/IconButton";
 import { useDismissOnOutside } from "@/hooks/useDismissOnOutside";
+import { toastSuccess } from "@/stores/toast";
 
 /**
  * 单首曲目的封面地址。在线曲目直接算 qtres:// 地址；本地曲目读音频内嵌封面
@@ -74,12 +76,19 @@ export type DetailKind = "playlist" | "chart";
  * 转的 data URL（歌单封面 getPlaylistCover(pid)、曲目内嵌封面 getLocalCover(id)）。
  * 两者都是异步的，因此统一解析成一个 `cover` 字符串再喂给 hero 与模糊铺底。
  */
-export function PlaylistDetailPage(props: {
+interface PlaylistDetailPageProps {
   platform: string;
   id: string;
   /** 默认 playlist；`/chart/...` 传 "chart" */
   kind?: DetailKind;
-}): React.JSX.Element {
+}
+
+export function PlaylistDetailPage(props: PlaylistDetailPageProps): React.JSX.Element {
+  // 同一组件可被路由复用；页面身份变化时所有检索 / 选择 / 确认 / 异步加载状态一起复位。
+  return <PlaylistDetailContent key={JSON.stringify([props.kind ?? "playlist", props.platform, props.id])} {...props} />;
+}
+
+function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Element {
   const { platform, id, kind = "playlist" } = props;
   const isChart = kind === "chart";
   const isLocal = !isChart && platform === ipc.LOCAL_PLATFORM;
@@ -106,6 +115,14 @@ export function PlaylistDetailPage(props: {
   const [actionError, setActionError] = useState<string | null>(null);
   /** 批量管理的已勾选曲目 id 集合（三个分支共用，见 BatchBar） */
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [query, setQuery] = useState("");
+  const visibleTracks = useMemo(() => filterTracks(tracks, query), [tracks, query]);
+  const visibleSelected = useMemo(() => retainTrackSelection(visibleTracks, selected), [visibleTracks, selected]);
+  const changeQuery = (value: string): void => {
+    setQuery(value);
+    // 缩小视图就丢弃隐藏选择；清空搜索也不会悄悄恢复曾隐藏的勾选。
+    setSelected((prev) => retainTrackSelection(filterTracks(tracks, value), prev));
+  };
   const [favorited, setFavorited] = useState(false);
   const [favoriteBusy, setFavoriteBusy] = useState(false);
   /** 本地歌单删单的二次确认态（红心第一下只换文案，第二下才真删） */
@@ -188,12 +205,7 @@ export function PlaylistDetailPage(props: {
         setTracks(list);
         // 曲目可能是在别处（行尾红心里取消勾选本歌单）被摘掉的，勾选集里
         // 若还留着这些 id，「已选 N 首」就虚高了 —— 以新列表为准收一遍
-        setSelected((prev) => {
-          if (prev.size === 0) return prev;
-          const ids = new Set(list.map((t) => t.id));
-          const next = new Set([...prev].filter((x) => ids.has(x)));
-          return next.size === prev.size ? prev : next;
-        });
+        setSelected((prev) => retainTrackSelection(list, prev));
       } catch (err) {
         if (cancelled) return;
         // 静默重载失败别把已经显示的列表换成错误页：报在列表上方的提示条里，
@@ -209,12 +221,9 @@ export function PlaylistDetailPage(props: {
     };
   }, [platform, id, kind, isLocal, isChart, reload]);
 
-  // 切换页面后清掉勾选，避免残留已不属于这个页面的曲目 id；
-  // 删单确认也一起复位，别把上一个歌单的确认态带到下一个
   useEffect(() => {
-    setSelected(new Set());
-    setConfirmDelete(false);
-  }, [platform, id, kind]);
+    setSelected((prev) => retainTrackSelection(visibleTracks, prev));
+  }, [visibleTracks]);
 
   // 歌单级收藏：在线歌单查音源；本地歌单**恒为已收藏态**（见模块头），
   // 不用查也不用改收藏位，红心常亮（显示处直接 `isLocal || favorited`）。
@@ -305,6 +314,57 @@ export function PlaylistDetailPage(props: {
   };
 
   /**
+   * 右键菜单的「从歌单移除」（只在本地自建歌单里出现）。
+   *
+   * 与行尾红心「取消勾选本歌单」写的是同一条数据（`playlist_tracks` 的一行），
+   * 但不是重复入口：本地歌单里的曲目必然是收藏态，红心常年实心，用户看不出
+   * 它还能点；右键菜单给的是显式的、有文字的移除入口（REQUIREMENTS §3.21.7.1）。
+   */
+  const removeTrack = async (t: Track): Promise<void> => {
+    setActionError(null);
+    try {
+      await ipc.removeTrackFromPlaylist(id, t);
+      refresh();
+    } catch (err) {
+      setActionError(`移除失败：${errMsg(err)}`);
+    }
+  };
+
+  /**
+   * 导出歌单（REQUIREMENTS §3.21.5）：先选目录，再由 Rust 写 `.json` + `.m3u8`。
+   *
+   * 只给本地自建歌单：在线歌单/榜单的曲目归属在音源，导出成文件只是一份会过期的
+   * 快照；本地歌单才是用户真正攒下来的东西。`.m3u8` 只装本地文件条目，在线曲目
+   * 按需求原文跳过 —— 所以提示里必须把"跳过了几首"说出来，不然用户会以为丢歌了。
+   */
+  const exportBusy = useRef(false);
+  const exportPlaylist = async (): Promise<void> => {
+    if (exportBusy.current) return;
+    exportBusy.current = true;
+    setActionError(null);
+    try {
+      const dir = await ipc.pickDirectory("选择歌单导出目录");
+      if (!dir) return; // 用户取消：不是错误，什么都不说
+      const res = await ipc.exportPlaylist(id, dir);
+      if (res.m3u8Path) {
+        const skipped =
+          res.skipped > 0 ? `，${res.skipped} 首在线曲目未写入 .m3u8` : "";
+        toastSuccess(
+          `已导出「${res.name}」${res.total} 首（.json + .m3u8，本地 ${res.local} 首${skipped}）`,
+        );
+      } else {
+        toastSuccess(
+          `已导出「${res.name}」${res.total} 首到 .json（没有本地文件，未生成 .m3u8）`,
+        );
+      }
+    } catch (err) {
+      setActionError(`导出失败：${errMsg(err)}`);
+    } finally {
+      exportBusy.current = false;
+    }
+  };
+
+  /**
    * 收藏态版本号。行尾红心里「取消勾选当前歌单」就是把这首从**本歌单**移除
    * （本地歌单里的曲目必然是收藏态），可面板并不知道自己长在哪个页面上，
    * 只会 `bump()` 一下版本号。这里据此静默重载，让被摘掉的那行当场消失。
@@ -368,7 +428,9 @@ export function PlaylistDetailPage(props: {
             {/* 只报「共 N 首歌」：各音源 playCount 口径不一（有的算累计播放、
                 有的直接给歌数），拿不到一致含义就不摆出来 */}
             {!loading ? (
-              <p className="mt-1 text-xs text-muted-foreground">共 {tracks.length} 首歌</p>
+              <p role="status" className="mt-1 text-xs text-muted-foreground">
+                {query.trim() ? `显示 ${visibleTracks.length} / ${tracks.length} 首` : `共 ${tracks.length} 首歌`}
+              </p>
             ) : null}
             {/* 榜单不带简介：它是榜单，简介位留给歌单（在线歌单的简介本来就长，
                 这里 line-clamp-3 兜住） */}
@@ -380,9 +442,9 @@ export function PlaylistDetailPage(props: {
                 label="播放全部"
                 variant="primary"
                 size="lg"
-                disabled={tracks.length === 0}
+                disabled={loading || visibleTracks.length === 0}
                 className="h-9 w-9 rounded-lg shadow-lg shadow-primary/25"
-                onClick={() => void playQueue(tracks, 0)}
+                onClick={() => void playQueue(visibleTracks, 0)}
               >
                 <Play className="h-4 w-4 fill-current" />
               </IconButton>
@@ -424,21 +486,62 @@ export function PlaylistDetailPage(props: {
                   ) : null}
                 </span>
               ) : null}
+              {/* 导出只给本地自建歌单（见 exportPlaylist 的注释）：选目录 →
+                  .json（完整元数据）+ .m3u8（仅本地文件条目） */}
+              {isLocal ? (
+                <IconButton
+                  label="导出歌单（.json + .m3u8）"
+                  variant="outline"
+                  size="lg"
+                  hover="secondary"
+                  disabled={!name || tracks.length === 0}
+                  className="h-9 w-9 rounded-lg"
+                  onClick={() => void exportPlaylist()}
+                >
+                  <Share2 className="h-4 w-4" />
+                </IconButton>
+              ) : null}
             </div>
           </div>
 
-          {/* 批量条摆在页头右侧，与左边那颗「播放全部」同一行（用户口径：
-              批量操作属于页头，不该在列表上方再占一行）。各页同一根条子：
-              收藏 / 取消收藏在面板里选歌单（与单曲红心同逻辑）。本地歌单把
-              自己的 pid 传下去，从本歌单取消收藏后重拉列表。
-              `items-end` + `pb-1` 让它与信息列的底线对齐：批量按钮和
-              「播放全部」等高，底线一对齐，看着就是同一行。 */}
+          {/* 搜索框放在页头右侧批量条上方，复用封面区域高度，不另占列表行。
+              批量按钮仍与左侧「播放全部」底线对齐；本地歌单改动后重拉列表。 */}
           {!loading && !error && tracks.length > 0 ? (
-            <div className="relative flex shrink-0 items-end pb-1">
+            <div className="relative flex shrink-0 flex-col items-end justify-end gap-2 pb-1">
+              <div className="flex h-8 w-44 items-center gap-2 rounded-lg border border-input bg-background/80 px-2 focus-within:ring-1 focus-within:ring-ring">
+                <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden />
+                <input
+                  type="search"
+                  aria-label={isChart ? "榜单内搜索" : "歌单内搜索"}
+                  placeholder={isChart ? "榜单内搜索" : "歌单内搜索"}
+                  title="搜索标题、歌手、专辑"
+                  value={query}
+                  onChange={(e) => changeQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") {
+                      e.preventDefault();
+                      changeQuery("");
+                    }
+                  }}
+                  className="h-full min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground [&::-webkit-search-cancel-button]:hidden"
+                />
+                {query ? (
+                  <button
+                    type="button"
+                    title="清空搜索"
+                    onClick={() => changeQuery("")}
+                    className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-secondary hover:text-foreground"
+                  >
+                    <X className="h-3.5 w-3.5" aria-hidden />
+                    <span className="sr-only">清空搜索</span>
+                  </button>
+                ) : null}
+              </div>
               <BatchBar
                 embedded
-                tracks={tracks}
-                selected={selected}
+                tracks={visibleTracks}
+                selected={visibleSelected}
+                selectionKey={trackSelectionKey}
                 onSelectedChange={setSelected}
                 hostPlaylistId={isLocal ? id : undefined}
                 onChanged={isLocal ? refresh : undefined}
@@ -467,13 +570,18 @@ export function PlaylistDetailPage(props: {
                 ? "这个榜单还没有歌曲"
                 : "这个歌单还没有歌曲"}
           </div>
+        ) : visibleTracks.length === 0 ? (
+          <div role="status" className="py-10 text-center text-sm text-muted-foreground">
+            没有匹配的歌曲，试试其它标题、歌手或专辑
+          </div>
         ) : (
           <TrackList
-            tracks={tracks}
+            tracks={visibleTracks}
             showIndex={isChart}
             showCollect
             showDownload
-            selection={{ ids: selected, onToggle: toggleSelect }}
+            onRemove={isLocal ? (t) => void removeTrack(t) : undefined}
+            selection={{ ids: visibleSelected, onToggle: toggleSelect, onChange: setSelected }}
           />
         )}
       </div>

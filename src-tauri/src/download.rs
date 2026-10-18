@@ -3,17 +3,19 @@
 //! - 落盘先写 `<最终名>.part`，全部写完并校验后才重命名为成品：中断不会留下
 //!   看起来正常的半截文件，也不会被本地扫描器误收。
 //! - HTTP 状态 / Content-Type / 字节数三重校验，错误页不会被当作音频存下来。
-//! - 断点续传：暂停后保留 `.part`，继续时带 `Range` 从已有字节接着写。
-//! - 网络类错误自动退避重试（最多 3 次）；HTTP 4xx 属于确定性失败，直接报错。
+//! - 断点续传：暂停后保留 `.part`，回读最多 64 KiB 尾部核对后才追加新字节。
+//! - 网络类错误自动退避重试（最多 3 次）；416 安全重下，其他确定性 4xx 直接报错。
 //! - 并发闸门：同时最多跑 N 个任务（N 默认 3，可选 1–6，见 `DEFAULT_CONCURRENCY`）。
 //!   批量下载不限流会被音源/CDN 判成爬虫封 IP —— LX Music 就栽过（issue #1992），
 //!   之后把默认并发压到 3 并在设置页限制 1–6。本项目封面代取（`qtres.rs` 的
 //!   `COVER_FETCH_CONCURRENCY`）也走同一套思路，这里补齐下载侧。
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tauri::Emitter;
 use tokio::sync::Notify;
@@ -33,6 +35,14 @@ pub mod status {
 /// 退避重试的最大尝试次数（含首次）。注意：这是**单个任务**的重试次数，
 /// 与下面的并发上限是两回事，别混。
 const MAX_ATTEMPTS: u32 = 3;
+
+/// 只回读已有文件的尾部，限制内存 / 重复流量；确认一致后才允许追加新字节。
+const RESUME_OVERLAP: u64 = 64 * 1024;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const CHUNK_TIMEOUT: Duration = Duration::from_secs(30);
+// 暂停旗标仍沿用 AtomicBool；网络静默时也必须及时响应，而不是等下一个 chunk。
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// 同时下载数的默认值。3 是 LX Music 的默认值（它曾因批量下载被封 IP）。
 pub const DEFAULT_CONCURRENCY: usize = 3;
@@ -194,7 +204,10 @@ impl DownloadManager {
     }
 
     fn unregister(&self, id: &str) {
-        self.active.lock().unwrap_or_else(|e| e.into_inner()).remove(id);
+        self.active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
     }
 
     /// 请求停止（暂停 / 取消）。返回该任务当前是否真的在下载（或正在排队）。
@@ -221,7 +234,10 @@ impl DownloadManager {
     /// 任务是否已登记（在下载**或**在排队）。排队中也算 —— 否则连点两次
     /// 「继续」会往闸门里排两个重复任务，白白占一个并发位。
     pub fn is_active(&self, id: &str) -> bool {
-        self.active.lock().unwrap_or_else(|e| e.into_inner()).contains_key(id)
+        self.active
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(id)
     }
 
     /// 排队等一个并发位。返回 `None` = 任务在排队期间被暂停 / 取消，
@@ -367,6 +383,7 @@ pub fn is_disk_full(err: &std::io::Error) -> bool {
 }
 
 /// 单次尝试的失败分类，决定重试还是直接放弃。
+#[derive(Debug)]
 enum AttemptError {
     Stopped,
     Retryable(String),
@@ -387,43 +404,7 @@ pub async fn run_job_with_slot(
     slot: Slot,
 ) -> DownloadOutcome {
     let cancel = Arc::clone(&slot.cancel);
-    let mut last_err = String::from("下载失败");
-    let mut outcome = DownloadOutcome::Failed(last_err.clone());
-
-    for attempt in 1..=MAX_ATTEMPTS {
-        if cancel.load(Ordering::SeqCst) {
-            outcome = DownloadOutcome::Stopped;
-            break;
-        }
-        match attempt_once(&db, &job, &cancel).await {
-            Ok(size) => {
-                outcome = DownloadOutcome::Done(size);
-                break;
-            }
-            Err(AttemptError::Stopped) => {
-                outcome = DownloadOutcome::Stopped;
-                break;
-            }
-            Err(AttemptError::Fatal(msg)) => {
-                outcome = DownloadOutcome::Failed(msg);
-                break;
-            }
-            Err(AttemptError::Retryable(msg)) => {
-                last_err = msg;
-                if attempt < MAX_ATTEMPTS {
-                    log::warn!(
-                        "[download] {} 第 {attempt} 次失败，退避重试：{last_err}",
-                        job.task_id
-                    );
-                    tokio::time::sleep(std::time::Duration::from_millis(400 * attempt as u64))
-                        .await;
-                }
-            }
-        }
-    }
-    if let DownloadOutcome::Failed(_) = &outcome {
-        outcome = DownloadOutcome::Failed(last_err);
-    }
+    let outcome = run_attempts(&db, &job, &cancel).await;
 
     // 终态落库：Done / Failed 由这里写；Stopped 的 paused / canceled 由
     // 发起暂停 / 取消的命令先写（含 `.part` 去留），此处不覆盖。
@@ -455,170 +436,435 @@ pub async fn run_job_with_slot(
     outcome
 }
 
-/// 单次下载尝试：续传探测 → 校验 → 流式写入 → 原子重命名。
+async fn run_attempts(
+    db: &Arc<Database>,
+    job: &DownloadJob,
+    cancel: &Arc<AtomicBool>,
+) -> DownloadOutcome {
+    let mut last_err = String::from("下载失败");
+    for attempt in 1..=MAX_ATTEMPTS {
+        if cancel.load(Ordering::SeqCst) {
+            return DownloadOutcome::Stopped;
+        }
+        match attempt_once(db, job, cancel).await {
+            Ok(size) => return DownloadOutcome::Done(size),
+            Err(AttemptError::Stopped) => return DownloadOutcome::Stopped,
+            // 确定性错误必须原样返回，不能被上一轮（或初始）的 last_err 覆盖。
+            Err(AttemptError::Fatal(msg)) => return DownloadOutcome::Failed(msg),
+            Err(AttemptError::Retryable(msg)) => {
+                last_err = msg;
+                if attempt < MAX_ATTEMPTS {
+                    log::warn!(
+                        "[download] {} 第 {attempt} 次失败，退避重试：{last_err}",
+                        job.task_id
+                    );
+                    if until_stopped(
+                        cancel,
+                        tokio::time::sleep(Duration::from_millis(400 * attempt as u64)),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return DownloadOutcome::Stopped;
+                    }
+                }
+            }
+        }
+    }
+    DownloadOutcome::Failed(last_err)
+}
+
+async fn until_stopped<T>(
+    cancel: &AtomicBool,
+    future: impl Future<Output = T>,
+) -> Result<T, AttemptError> {
+    tokio::select! {
+        biased;
+        _ = async {
+            while !cancel.load(Ordering::SeqCst) {
+                tokio::time::sleep(CANCEL_POLL_INTERVAL).await;
+            }
+        } => Err(AttemptError::Stopped),
+        value = future => Ok(value),
+    }
+}
+
+async fn network_wait<T>(
+    cancel: &AtomicBool,
+    timeout: Duration,
+    operation: &str,
+    future: impl Future<Output = Result<T, reqwest::Error>>,
+) -> Result<T, AttemptError> {
+    until_stopped(cancel, tokio::time::timeout(timeout, future))
+        .await?
+        .map_err(|_| AttemptError::Retryable(format!("{operation}超时，请稍后重试")))?
+        .map_err(|e| {
+            AttemptError::Retryable(format!(
+                "{operation}失败: {}",
+                crate::astral::sanitize_err(e.without_url())
+            ))
+        })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ByteRange {
+    start: u64,
+    end: u64,
+    total: u64,
+}
+
+fn parse_byte_range(value: &str) -> Option<ByteRange> {
+    let (unit, value) = value.split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    let (range, total) = value.split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let number = |s: &str| {
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<u64>().ok())
+            .flatten()
+    };
+    let range = ByteRange {
+        start: number(start)?,
+        end: number(end)?,
+        total: number(total)?,
+    };
+    (range.start <= range.end && range.end < range.total && range.total <= i64::MAX as u64)
+        .then_some(range)
+}
+
+struct ResponseLayout {
+    body_length: Option<u64>,
+    total: Option<u64>,
+}
+
+/// 开区间请求必须覆盖到对象末尾；Content-Length 与 Content-Range 必须互相吻合。
+/// declared_size 故意不进入这里：取链时量到的大小只影响进度显示。
+fn response_layout(
+    resp: &reqwest::Response,
+    requested_start: Option<u64>,
+    existing: u64,
+) -> Result<ResponseLayout, String> {
+    let invalid = || "服务器返回的下载范围或长度无效".to_string();
+    let mut lengths = resp
+        .headers()
+        .get_all(reqwest::header::CONTENT_LENGTH)
+        .iter();
+    let length = lengths
+        .next()
+        .map(|v| {
+            let text = v.to_str().map_err(|_| invalid())?;
+            if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(invalid());
+            }
+            text.parse::<u64>()
+                .ok()
+                .filter(|n| *n <= i64::MAX as u64)
+                .ok_or_else(invalid)
+        })
+        .transpose()?;
+    if lengths.next().is_some() {
+        return Err(invalid());
+    }
+    if resp
+        .headers()
+        .get_all(reqwest::header::CONTENT_ENCODING)
+        .iter()
+        .any(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"))
+    {
+        return Err("服务器返回了不支持的下载编码".to_string());
+    }
+    if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+        let mut values = resp
+            .headers()
+            .get_all(reqwest::header::CONTENT_RANGE)
+            .iter();
+        let range = values
+            .next()
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_byte_range)
+            .ok_or_else(invalid)?;
+        let body_length = range.end - range.start + 1;
+        if values.next().is_some()
+            || range.start != requested_start.unwrap_or(0)
+            || range.end != range.total - 1
+            || range.total < existing
+            || length.is_some_and(|n| n != body_length)
+        {
+            return Err(invalid());
+        }
+        Ok(ResponseLayout {
+            body_length: Some(body_length),
+            total: Some(range.total),
+        })
+    } else {
+        if resp.headers().contains_key(reqwest::header::CONTENT_RANGE) {
+            return Err(invalid());
+        }
+        Ok(ResponseLayout {
+            body_length: length,
+            total: length,
+        })
+    }
+}
+
+/// 重下先写独立文件。失败 / 暂停时只清理该文件，已有 .part 的字节不受影响。
+struct RestartFile(PathBuf);
+
+impl Drop for RestartFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn open_output(
+    job: &DownloadJob,
+    append: bool,
+    existing: u64,
+) -> Result<(std::fs::File, Option<RestartFile>), AttemptError> {
+    let error = |e| AttemptError::Fatal(format!("打开临时文件失败: {e}"));
+    if append {
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&job.part_path)
+            .map_err(error)?;
+        if file.metadata().map_err(error)?.len() != existing {
+            return Err(AttemptError::Fatal(
+                "临时文件已改变，请重试下载".to_string(),
+            ));
+        }
+        Ok((file, None))
+    } else if existing > 0 {
+        let mut path = job.part_path.as_os_str().to_os_string();
+        path.push(format!(".restart-{}.part", fastrand::u64(..)));
+        let path = PathBuf::from(path);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(error)?;
+        Ok((file, Some(RestartFile(path))))
+    } else {
+        Ok((std::fs::File::create(&job.part_path).map_err(error)?, None))
+    }
+}
+
+/// 单次下载尝试：最多一次安全重下 → 重叠字节校验 → 流式写入 → 完整校验后重命名。
 async fn attempt_once(
     db: &Arc<Database>,
     job: &DownloadJob,
     cancel: &Arc<AtomicBool>,
 ) -> Result<i64, AttemptError> {
-    use std::io::Write;
+    use std::io::{Read, Seek, SeekFrom, Write};
 
+    if cancel.load(Ordering::SeqCst) {
+        return Err(AttemptError::Stopped);
+    }
     if let Some(parent) = job.part_path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| AttemptError::Fatal(format!("创建下载目录失败: {e}")))?;
     }
 
-    // 已有临时文件的字节数 = 本次续传起点
-    let mut offset = std::fs::metadata(&job.part_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
-
-    let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0")
-        .pool_max_idle_per_host(0)
-        .build()
-        .map_err(|e| AttemptError::Fatal(format!("初始化下载客户端失败: {e}")))?;
-    let mut req = client.get(&job.url);
-    // Referer 由音源包下发（空串 = 该源没声明，不发这个头）。
-    // B 站部分 CDN 节点无它直接 403，403 不在 status_retryable 里 → 会被判 Fatal。
-    if !job.referer.is_empty() {
-        req = req.header("Referer", &job.referer);
-    }
-    if offset > 0 {
-        req = req.header("Range", format!("bytes={offset}-"));
-    }
-    let resp = req.send().await.map_err(|e| {
-        AttemptError::Retryable(format!("请求失败: {}", crate::astral::sanitize_err(e)))
-    })?;
-
-    let code = resp.status().as_u16();
-    if offset > 0 && resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-        // 服务端支持续传：总长 = 已下载 + 本次剩余
-    } else if offset > 0 && resp.status().is_success() {
-        // 服务端忽略 Range，整包重来
-        log::warn!("[download] {} 服务端不支持续传，从头下载", job.task_id);
-        offset = 0;
-    } else if !resp.status().is_success() {
-        let msg = format!("服务器返回 HTTP {code}");
-        return Err(if status_retryable(code) {
-            AttemptError::Retryable(msg)
-        } else {
-            AttemptError::Fatal(msg)
-        });
-    }
-
-    let ctype = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
-    if !content_type_acceptable(ctype.as_deref()) {
-        return Err(AttemptError::Fatal(format!(
-            "返回的不是音频文件（{}），已中止",
-            ctype.as_deref().unwrap_or("未知类型")
-        )));
-    }
-
-    let remaining = resp.content_length().unwrap_or(0);
-    let total = if remaining > 0 {
-        offset + remaining
-    } else {
-        // 服务端没给 Content-Length（分块传输 / 省头）时用取链预检量到的总长兜底，
-        // 好让下载页仍有进度条；量不到就还是 0（未知，只显示已下载字节）。
-        job.declared_size.unwrap_or(0)
-    };
-    if total > 0 {
-        let task_id = job.task_id.clone();
-        let _ = with_db(db, move |c| {
-            crate::db::store::set_download_total_bytes(c, &task_id, total as i64)
-        })
-        .await;
-    }
-
-    let mut file = if offset > 0 && job.part_path.exists() {
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&job.part_path)
-            .map_err(|e| AttemptError::Fatal(format!("打开临时文件失败: {e}")))?
-    } else {
-        offset = 0;
-        std::fs::File::create(&job.part_path)
-            .map_err(|e| AttemptError::Fatal(format!("创建临时文件失败: {e}")))?
-    };
-
-    let mut resp = resp;
-    let mut written: u64 = offset;
-    let mut last_pct = -1.0f64;
-    let mut last_write = std::time::Instant::now();
-    loop {
-        if cancel.load(Ordering::SeqCst) {
-            let _ = file.flush();
-            return Err(AttemptError::Stopped);
+    let (existing, overlap) = match std::fs::File::open(&job.part_path) {
+        Ok(mut file) => {
+            let read_error = |e| AttemptError::Fatal(format!("读取临时文件失败: {e}"));
+            let size = file.metadata().map_err(read_error)?.len();
+            if size > i64::MAX as u64 {
+                return Err(AttemptError::Fatal(
+                    "临时文件过大，无法继续下载".to_string(),
+                ));
+            }
+            let mut tail = vec![0; size.min(RESUME_OVERLAP) as usize];
+            file.seek(SeekFrom::Start(size - tail.len() as u64))
+                .map_err(read_error)?;
+            file.read_exact(&mut tail).map_err(read_error)?;
+            (size, tail)
         }
-        let chunk = match resp.chunk().await {
-            Ok(Some(c)) => c,
-            Ok(None) => break,
-            Err(e) => {
-                let _ = file.flush();
-                return Err(AttemptError::Retryable(format!(
-                    "下载中断: {}",
-                    crate::astral::sanitize_err(e)
-                )));
-            }
-        };
-        file.write_all(&chunk).map_err(|e| {
-            if is_disk_full(&e) {
-                AttemptError::Fatal("磁盘空间不足，请清理后重试".to_string())
-            } else {
-                AttemptError::Fatal(format!("写入文件失败: {e}"))
-            }
-        })?;
-        written += chunk.len() as u64;
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, Vec::new()),
+        Err(e) => return Err(AttemptError::Fatal(format!("读取临时文件失败: {e}"))),
+    };
 
-        // 进度按 2% 或 1s 节流写库，别让高频写库拖慢下载
-        let pct = if total > 0 {
-            written as f64 / total as f64
-        } else {
-            0.0
+    // 第二波（代理）：下载走的也是音源网络，构建时应用全局代理配置。
+    // 请求头等待、连接、每段数据分别限时，避免给整首大文件设置过短的总时限。
+    let client = crate::net_config::configure(
+        reqwest::Client::builder()
+            .user_agent("Mozilla/5.0")
+            // 即使将来其他依赖合并开启解压 feature，也不能让字节范围被透明解码。
+            .no_gzip()
+            .no_brotli()
+            .no_deflate()
+            .no_zstd()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(CHUNK_TIMEOUT)
+            .pool_max_idle_per_host(0),
+    )
+    .build()
+    .map_err(|e| {
+        AttemptError::Fatal(format!(
+            "初始化下载客户端失败: {}",
+            crate::astral::sanitize_err(e)
+        ))
+    })?;
+    let mut resume = existing > 0;
+    'request: loop {
+        let requested_start = resume.then_some(existing - overlap.len() as u64);
+        let mut req = client
+            .get(&job.url)
+            .header(reqwest::header::ACCEPT_ENCODING, "identity");
+        if !job.referer.is_empty() {
+            req = req.header(reqwest::header::REFERER, &job.referer);
+        }
+        if let Some(start) = requested_start {
+            req = req.header(reqwest::header::RANGE, format!("bytes={start}-"));
+        }
+        let mut resp = network_wait(cancel, REQUEST_TIMEOUT, "下载请求", req.send()).await?;
+        let code = resp.status().as_u16();
+        if code == 416 && resume {
+            // 即使 */total 恰好等于 .part 长度也不能认定完整：旧文件可能已换版本。
+            resume = false;
+            continue;
+        }
+        if code != 200 && code != 206 {
+            let msg = format!("服务器返回 HTTP {code}");
+            return Err(if status_retryable(code) {
+                AttemptError::Retryable(msg)
+            } else {
+                AttemptError::Fatal(msg)
+            });
+        }
+        // 忽略 Range 的 200 是整包响应，必须写入独立临时文件，不能直接截断旧断点。
+        let append = resume && code == 206;
+        let layout = match response_layout(
+            &resp,
+            requested_start.filter(|_| append),
+            if append { existing } else { 0 },
+        ) {
+            Ok(layout) => layout,
+            Err(_) if append => {
+                resume = false;
+                continue;
+            }
+            Err(msg) => return Err(AttemptError::Fatal(msg)),
         };
-        if total > 0 && (pct - last_pct >= 0.02 || last_write.elapsed().as_secs() >= 1) {
-            last_pct = pct;
-            last_write = std::time::Instant::now();
-            let progress = pct.clamp(0.0, 1.0);
+        let ctype = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok());
+        if !content_type_acceptable(ctype) {
+            return Err(AttemptError::Fatal(
+                "返回的不是音频文件，已中止".to_string(),
+            ));
+        }
+
+        let total = layout.total.or(job.declared_size).unwrap_or(0);
+        if total > 0 {
             let task_id = job.task_id.clone();
+            let progress_total = total.min(i64::MAX as u64) as i64;
             let _ = with_db(db, move |c| {
-                crate::db::store::update_download_progress(c, &task_id, progress)
+                crate::db::store::set_download_total_bytes(c, &task_id, progress_total)
             })
             .await;
         }
-    }
+        if cancel.load(Ordering::SeqCst) {
+            return Err(AttemptError::Stopped);
+        }
+        let (output, staged) = open_output(job, append, existing)?;
+        // file 后声明先析构，Windows 上清理 staged 时文件句柄已关闭。
+        let mut file = output;
+        let mut written = if append { existing } else { 0 };
+        let mut received = 0u64;
+        let mut verified = 0usize;
+        let tail = if append { overlap.as_slice() } else { &[] };
+        let mut last_pct = -1.0f64;
+        let mut last_write = std::time::Instant::now();
+        loop {
+            let Some(chunk) =
+                network_wait(cancel, CHUNK_TIMEOUT, "读取下载数据", resp.chunk()).await?
+            else {
+                break;
+            };
+            if cancel.load(Ordering::SeqCst) {
+                return Err(AttemptError::Stopped);
+            }
+            received = received
+                .checked_add(chunk.len() as u64)
+                .filter(|n| *n <= i64::MAX as u64)
+                .ok_or_else(|| AttemptError::Fatal("下载文件过大".to_string()))?;
+            if layout.body_length.is_some_and(|n| received > n) {
+                return Err(AttemptError::Retryable(
+                    "下载数据超出服务器声明的长度".to_string(),
+                ));
+            }
+            let check = (tail.len() - verified).min(chunk.len());
+            if chunk[..check] != tail[verified..verified + check] {
+                // 尚未核完重叠段时一个新字节也没有追加；只允许这一次从零重下。
+                drop(file);
+                resume = false;
+                continue 'request;
+            }
+            verified += check;
+            let data = &chunk[check..];
+            file.write_all(data).map_err(|e| {
+                if is_disk_full(&e) {
+                    AttemptError::Fatal("磁盘空间不足，请清理后重试".to_string())
+                } else {
+                    AttemptError::Fatal(format!("写入文件失败: {e}"))
+                }
+            })?;
+            written += data.len() as u64;
 
-    file.flush()
-        .map_err(|e| AttemptError::Fatal(format!("写入文件失败: {e}")))?;
-    file.sync_all()
-        .map_err(|e| AttemptError::Fatal(format!("刷新磁盘失败: {e}")))?;
-    drop(file);
+            // 进度按 2% 或 1s 节流写库，declared_size 只作分母，不参与收尾校验。
+            let pct = if total > 0 {
+                written as f64 / total as f64
+            } else {
+                0.0
+            };
+            if total > 0 && (pct - last_pct >= 0.02 || last_write.elapsed().as_secs() >= 1) {
+                last_pct = pct;
+                last_write = std::time::Instant::now();
+                let progress = pct.clamp(0.0, 1.0);
+                let task_id = job.task_id.clone();
+                let _ = with_db(db, move |c| {
+                    crate::db::store::update_download_progress(c, &task_id, progress)
+                })
+                .await;
+            }
+        }
 
-    if total > 0 && written != total {
-        return Err(AttemptError::Retryable(format!(
-            "下载不完整（{written}/{total} 字节）"
-        )));
-    }
-    if written == 0 {
-        return Err(AttemptError::Fatal("下载内容为空".to_string()));
-    }
+        if verified != tail.len()
+            || layout.body_length.is_some_and(|n| received != n)
+            || layout.total.is_some_and(|n| written != n)
+        {
+            return Err(AttemptError::Retryable(
+                "下载不完整，请稍后重试".to_string(),
+            ));
+        }
+        if written == 0 {
+            return Err(AttemptError::Fatal("下载内容为空".to_string()));
+        }
+        file.flush()
+            .map_err(|e| AttemptError::Fatal(format!("写入文件失败: {e}")))?;
+        file.sync_all()
+            .map_err(|e| AttemptError::Fatal(format!("刷新磁盘失败: {e}")))?;
+        drop(file);
+        if cancel.load(Ordering::SeqCst) {
+            return Err(AttemptError::Stopped);
+        }
 
-    // 原子收尾：临时文件 → 成品。Windows 下 rename 不覆盖已存在的目标，
-    // 先删掉可能残留的旧同名文件（正常不会出现，重试路径才可能）。
-    if job.final_path.exists() {
-        let _ = std::fs::remove_file(&job.final_path);
+        let source = staged.as_ref().map_or(&job.part_path, |f| &f.0);
+        if let Some(parent) = job.final_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| AttemptError::Fatal(format!("创建下载目录失败: {e}")))?;
+        }
+        // std::fs::rename 会替换已有目标；失败时保留旧成品与断点，不先删文件。
+        std::fs::rename(source, &job.final_path)
+            .map_err(|e| AttemptError::Fatal(format!("保存文件失败: {e}")))?;
+        if staged.is_some() {
+            let _ = std::fs::remove_file(&job.part_path);
+        }
+        return Ok(written as i64);
     }
-    if let Some(parent) = job.final_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    std::fs::rename(&job.part_path, &job.final_path)
-        .map_err(|e| AttemptError::Fatal(format!("保存文件失败: {e}")))?;
-    Ok(written as i64)
 }
 
 /// 在阻塞线程池里跑一段数据库操作（写库失败不影响下载主流程）。
@@ -728,8 +974,603 @@ pub async fn save_download_extras(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::sync::atomic::AtomicUsize;
-    use std::time::Duration;
+    use std::thread;
+
+    struct HttpReply {
+        bytes: Vec<u8>,
+        hold_headers: bool,
+        hold_body: bool,
+    }
+
+    impl HttpReply {
+        fn new(code: u16, headers: &str, body: &[u8]) -> Self {
+            let mut bytes = format!(
+                "HTTP/1.1 {code} Test\r\nContent-Type: audio/mpeg\r\nConnection: close\r\n{headers}\r\n"
+            )
+            .into_bytes();
+            bytes.extend_from_slice(body);
+            Self {
+                bytes,
+                hold_headers: false,
+                hold_body: false,
+            }
+        }
+
+        fn full(body: &[u8]) -> Self {
+            Self::new(200, &format!("Content-Length: {}\r\n", body.len()), body)
+        }
+
+        fn range(start: u64, total: u64, body: &[u8]) -> Self {
+            Self::new(
+                206,
+                &format!(
+                    "Content-Range: bytes {start}-{}/{total}\r\nContent-Length: {}\r\n",
+                    total - 1,
+                    body.len()
+                ),
+                body,
+            )
+        }
+    }
+
+    /// 真实 TCP / reqwest 链路，不改全局代理配置；停止旗标保证失败断言也能收线程。
+    struct MockHttp {
+        url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+        stop: Arc<AtomicBool>,
+        thread: Option<thread::JoinHandle<()>>,
+    }
+
+    impl MockHttp {
+        fn new(replies: Vec<HttpReply>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!(
+                "http://{}/audio?signature=private",
+                listener.local_addr().unwrap()
+            );
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&requests);
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopped = Arc::clone(&stop);
+            let thread = thread::spawn(move || {
+                for reply in replies {
+                    let mut stream = loop {
+                        if stopped.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                thread::sleep(Duration::from_millis(2));
+                            }
+                            Err(e) => panic!("mock accept: {e}"),
+                        }
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_millis(100)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        if stopped.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        let mut buf = [0; 1024];
+                        match stream.read(&mut buf) {
+                            Ok(0) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                            Err(e)
+                                if matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                                ) =>
+                            {
+                                continue
+                            }
+                            Err(_) => return,
+                        }
+                        assert!(request.len() < 16 * 1024);
+                    }
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8(request).unwrap());
+                    if !reply.hold_headers {
+                        let _ = stream.write_all(&reply.bytes);
+                        let _ = stream.flush();
+                    }
+                    while (reply.hold_headers || reply.hold_body) && !stopped.load(Ordering::SeqCst)
+                    {
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                }
+            });
+            Self {
+                url,
+                requests,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn ranges(&self) -> Vec<Option<String>> {
+            self.requests
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| {
+                    r.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("range")
+                            .then(|| value.trim().to_string())
+                    })
+                })
+                .collect()
+        }
+    }
+
+    impl Drop for MockHttp {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            self.thread.take().unwrap().join().unwrap();
+        }
+    }
+
+    struct TestDir(PathBuf);
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct DownloadFixture {
+        db: Arc<Database>,
+        job: DownloadJob,
+        _dir: TestDir,
+    }
+
+    impl DownloadFixture {
+        fn new(server: &MockHttp, existing: &[u8]) -> Self {
+            let dir = TestDir(std::env::temp_dir().join(format!(
+                "quietmusic-download-{}-{}",
+                std::process::id(),
+                fastrand::u64(..)
+            )));
+            std::fs::create_dir_all(&dir.0).unwrap();
+            let db = Arc::new(Database::open(&dir.0.join("test.db")).unwrap());
+            let final_path = dir.0.join("track.mp3");
+            let part_path = part_path_for(&final_path);
+            std::fs::write(&part_path, existing).unwrap();
+            let job = DownloadJob {
+                task_id: "test-download".to_string(),
+                url: server.url.clone(),
+                referer: "https://example.test/player".to_string(),
+                declared_size: None,
+                final_path,
+                part_path,
+            };
+            Self { db, job, _dir: dir }
+        }
+
+        async fn attempt(&self) -> Result<i64, AttemptError> {
+            attempt_once(&self.db, &self.job, &Arc::new(AtomicBool::new(false))).await
+        }
+
+        fn assert_done(&self, bytes: &[u8]) {
+            assert_eq!(std::fs::read(&self.job.final_path).unwrap(), bytes);
+            assert!(!self.job.part_path.exists());
+        }
+
+        fn assert_retained(&self, bytes: &[u8]) {
+            assert!(!self.job.final_path.exists(), "无效响应不得提升成品");
+            assert_eq!(std::fs::read(&self.job.part_path).unwrap(), bytes);
+            assert!(
+                !std::fs::read_dir(&self._dir.0).unwrap().any(|entry| {
+                    entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .contains(".restart-")
+                }),
+                "重下临时文件必须在退出时清理"
+            );
+        }
+    }
+
+    #[test]
+    fn content_range_parser_rejects_invalid_or_unknown_bounds() {
+        assert_eq!(
+            parse_byte_range("bytes 2-9/10"),
+            Some(ByteRange {
+                start: 2,
+                end: 9,
+                total: 10
+            })
+        );
+        for value in [
+            "",
+            "items 0-9/10",
+            "bytes 0-9/*",
+            "bytes */10",
+            "bytes 9-2/10",
+            "bytes 0-10/10",
+            "bytes 0-0/0",
+            "bytes +0-9/10",
+            "bytes 0-9/10, bytes 0-9/10",
+            "bytes 0-9/18446744073709551616",
+        ] {
+            assert!(parse_byte_range(value).is_none(), "{value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn http_resume_verifies_bounded_tail_before_appending() {
+        let body: Vec<u8> = (0..150_000).map(|i| (i % 251) as u8).collect();
+        let existing = 100_000;
+        let start = existing - RESUME_OVERLAP as usize;
+        let server = MockHttp::new(vec![HttpReply::range(
+            start as u64,
+            body.len() as u64,
+            &body[start..],
+        )]);
+        let fixture = DownloadFixture::new(&server, &body[..existing]);
+        assert_eq!(fixture.attempt().await.unwrap(), body.len() as i64);
+        fixture.assert_done(&body);
+        assert_eq!(server.ranges(), vec![Some(format!("bytes={start}-"))]);
+        assert!(server.requests.lock().unwrap()[0]
+            .to_ascii_lowercase()
+            .contains("referer: https://example.test/player"));
+    }
+
+    #[tokio::test]
+    async fn http_changed_overlap_restarts_once_without_combining_versions() {
+        let server = MockHttp::new(vec![
+            HttpReply::range(0, 8, b"new-data"),
+            HttpReply::full(b"new-data"),
+        ]);
+        let fixture = DownloadFixture::new(&server, b"old-");
+        assert_eq!(fixture.attempt().await.unwrap(), 8);
+        fixture.assert_done(b"new-data");
+        assert_eq!(server.ranges(), vec![Some("bytes=0-".into()), None]);
+    }
+
+    #[tokio::test]
+    async fn http_ignored_range_uses_full_body_without_old_prefix() {
+        let server = MockHttp::new(vec![HttpReply::full(b"new-data")]);
+        let fixture = DownloadFixture::new(&server, b"old-");
+        assert_eq!(fixture.attempt().await.unwrap(), 8);
+        fixture.assert_done(b"new-data");
+        assert_eq!(server.ranges().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn http_invalid_ranges_restart_safely_once() {
+        for header in [
+            "",
+            "Content-Range: bytes 1-7/8\r\n",
+            "Content-Range: bytes 0-8/8\r\n",
+            "Content-Range: bytes 0-3/8\r\n",
+            "Content-Range: bytes 0-7/*\r\n",
+            "Content-Range: bytes 0-7/8\r\nContent-Length: 7\r\n",
+            "Content-Range: bytes 0-7/8\r\nContent-Range: bytes 0-7/8\r\n",
+        ] {
+            let server = MockHttp::new(vec![
+                HttpReply::new(206, header, b"old-data"),
+                HttpReply::full(b"new-data"),
+            ]);
+            let fixture = DownloadFixture::new(&server, b"old-");
+            assert_eq!(fixture.attempt().await.unwrap(), 8, "{header}");
+            fixture.assert_done(b"new-data");
+            assert_eq!(server.ranges(), vec![Some("bytes=0-".into()), None]);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_repeated_bad_range_stops_after_one_restart() {
+        let server = MockHttp::new(vec![
+            HttpReply::new(206, "", b"data"),
+            HttpReply::new(206, "", b"data"),
+        ]);
+        let fixture = DownloadFixture::new(&server, b"old-");
+        assert!(matches!(
+            fixture.attempt().await,
+            Err(AttemptError::Fatal(_))
+        ));
+        fixture.assert_retained(b"old-");
+        assert_eq!(server.ranges(), vec![Some("bytes=0-".into()), None]);
+    }
+
+    #[tokio::test]
+    async fn http_416_never_promotes_existing_bytes_without_verification() {
+        for total in [4, 99] {
+            let server = MockHttp::new(vec![
+                HttpReply::new(
+                    416,
+                    &format!("Content-Range: bytes */{total}\r\nContent-Length: 0\r\n"),
+                    b"",
+                ),
+                HttpReply::full(b"new-data"),
+            ]);
+            let fixture = DownloadFixture::new(&server, b"old-");
+            assert_eq!(fixture.attempt().await.unwrap(), 8);
+            fixture.assert_done(b"new-data");
+            assert_eq!(server.ranges(), vec![Some("bytes=0-".into()), None]);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_truncated_restart_preserves_existing_partial() {
+        let server = MockHttp::new(vec![HttpReply::new(
+            200,
+            "Content-Length: 100\r\n",
+            b"short",
+        )]);
+        let fixture = DownloadFixture::new(&server, b"old-partial");
+        assert!(matches!(
+            fixture.attempt().await,
+            Err(AttemptError::Retryable(_))
+        ));
+        fixture.assert_retained(b"old-partial");
+    }
+
+    #[tokio::test]
+    async fn http_truncated_resume_keeps_only_verified_new_bytes() {
+        let server = MockHttp::new(vec![HttpReply::new(
+            206,
+            "Content-Range: bytes 0-9/10\r\nContent-Length: 10\r\n",
+            b"abcdef",
+        )]);
+        let fixture = DownloadFixture::new(&server, b"abc");
+        assert!(matches!(
+            fixture.attempt().await,
+            Err(AttemptError::Retryable(_))
+        ));
+        let partial = std::fs::read(&fixture.job.part_path).unwrap();
+        assert!(b"abcdef".starts_with(&partial));
+        assert!(partial.starts_with(b"abc"));
+        assert!(!fixture.job.final_path.exists());
+    }
+
+    #[tokio::test]
+    async fn http_empty_full_response_is_rejected_and_retains_partial() {
+        let server = MockHttp::new(vec![HttpReply::full(b"")]);
+        let fixture = DownloadFixture::new(&server, b"old-partial");
+        assert!(
+            matches!(fixture.attempt().await, Err(AttemptError::Fatal(msg)) if msg == "下载内容为空")
+        );
+        fixture.assert_retained(b"old-partial");
+    }
+
+    #[tokio::test]
+    async fn http_declared_size_is_progress_only_without_content_length() {
+        let server = MockHttp::new(vec![HttpReply::new(
+            200,
+            "Transfer-Encoding: chunked\r\n",
+            b"3\r\nabc\r\n3\r\ndef\r\n0\r\n\r\n",
+        )]);
+        let mut fixture = DownloadFixture::new(&server, b"");
+        fixture.job.declared_size = Some(99);
+        assert_eq!(fixture.attempt().await.unwrap(), 6);
+        fixture.assert_done(b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn http_chunked_resume_checks_overlap_across_chunks() {
+        let server = MockHttp::new(vec![HttpReply::new(
+            206,
+            "Content-Range: bytes 0-7/8\r\nTransfer-Encoding: chunked\r\n",
+            b"2\r\nab\r\n2\r\ncd\r\n4\r\nefgh\r\n0\r\n\r\n",
+        )]);
+        let fixture = DownloadFixture::new(&server, b"abcd");
+        assert_eq!(fixture.attempt().await.unwrap(), 8);
+        fixture.assert_done(b"abcdefgh");
+    }
+
+    #[tokio::test]
+    async fn http_chunked_range_rejects_short_and_oversized_bodies() {
+        for body in [
+            b"3\r\nabc\r\n0\r\n\r\n".as_slice(),
+            b"9\r\nabcdefghi\r\n0\r\n\r\n".as_slice(),
+        ] {
+            let server = MockHttp::new(vec![HttpReply::new(
+                206,
+                "Content-Range: bytes 0-7/8\r\nTransfer-Encoding: chunked\r\n",
+                body,
+            )]);
+            let fixture = DownloadFixture::new(&server, b"abcd");
+            assert!(matches!(
+                fixture.attempt().await,
+                Err(AttemptError::Retryable(_))
+            ));
+            fixture.assert_retained(b"abcd");
+        }
+    }
+
+    #[tokio::test]
+    async fn http_unsolicited_partial_must_cover_the_complete_object() {
+        let server = MockHttp::new(vec![HttpReply::range(2, 8, b"cdefgh")]);
+        let fixture = DownloadFixture::new(&server, b"");
+        assert!(matches!(
+            fixture.attempt().await,
+            Err(AttemptError::Fatal(_))
+        ));
+        fixture.assert_retained(b"");
+    }
+
+    #[tokio::test]
+    async fn http_fatal_error_keeps_specific_message_in_retry_runner() {
+        let server = MockHttp::new(vec![HttpReply::new(403, "Content-Length: 0\r\n", b"")]);
+        let fixture = DownloadFixture::new(&server, b"old-partial");
+        assert!(
+            matches!(run_attempts(&fixture.db, &fixture.job, &Arc::new(AtomicBool::new(false))).await, DownloadOutcome::Failed(msg) if msg == "服务器返回 HTTP 403")
+        );
+        fixture.assert_retained(b"old-partial");
+        assert_eq!(server.ranges().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn http_cancel_interrupts_header_and_body_waits_preserving_partial() {
+        for headers in [true, false] {
+            let mut reply = HttpReply::new(200, "Content-Length: 100\r\n", b"some-data");
+            reply.hold_headers = headers;
+            reply.hold_body = !headers;
+            let server = MockHttp::new(vec![reply]);
+            let fixture = DownloadFixture::new(&server, b"old-partial");
+            let cancel = Arc::new(AtomicBool::new(false));
+            let stopper = Arc::clone(&cancel);
+            let requests = Arc::clone(&server.requests);
+            let stop_task = tokio::spawn(async move {
+                while requests.lock().unwrap().is_empty() {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                stopper.store(true, Ordering::SeqCst);
+            });
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                attempt_once(&fixture.db, &fixture.job, &cancel),
+            )
+            .await
+            .expect("暂停必须及时打断静默网络");
+            stop_task.abort();
+            assert!(matches!(result, Err(AttemptError::Stopped)));
+            fixture.assert_retained(b"old-partial");
+        }
+    }
+
+    #[tokio::test]
+    async fn http_verified_restart_replaces_existing_final_file() {
+        let server = MockHttp::new(vec![HttpReply::full(b"new-data")]);
+        let fixture = DownloadFixture::new(&server, b"old-partial");
+        std::fs::write(&fixture.job.final_path, b"previous-complete").unwrap();
+        assert_eq!(fixture.attempt().await.unwrap(), 8);
+        fixture.assert_done(b"new-data");
+    }
+
+    #[tokio::test]
+    async fn http_failed_fallback_preserves_partial_after_mismatch_and_416() {
+        for first in [
+            HttpReply::range(0, 8, b"new-data"),
+            HttpReply::new(416, "Content-Length: 0\r\n", b""),
+        ] {
+            let server = MockHttp::new(vec![
+                first,
+                HttpReply::new(503, "Content-Length: 0\r\n", b""),
+            ]);
+            let fixture = DownloadFixture::new(&server, b"old-");
+            assert!(matches!(
+                fixture.attempt().await,
+                Err(AttemptError::Retryable(_))
+            ));
+            fixture.assert_retained(b"old-");
+            assert_eq!(server.ranges(), vec![Some("bytes=0-".into()), None]);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_full_headers_override_stale_declared_size() {
+        let server = MockHttp::new(vec![HttpReply::full(b"abcdef")]);
+        let mut fixture = DownloadFixture::new(&server, b"");
+        fixture.job.declared_size = Some(99);
+        assert_eq!(fixture.attempt().await.unwrap(), 6);
+        fixture.assert_done(b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn http_encoded_or_non_audio_full_response_preserves_partial() {
+        for headers in [
+            "Content-Encoding: gzip\r\nContent-Length: 3\r\n",
+            "Content-Encoding: identity\r\nContent-Encoding: gzip\r\nContent-Length: 3\r\n",
+            "Content-Range: bytes 0-2/3\r\nContent-Length: 3\r\n",
+        ] {
+            let server = MockHttp::new(vec![HttpReply::new(200, headers, b"abc")]);
+            let fixture = DownloadFixture::new(&server, b"old-partial");
+            assert!(matches!(
+                fixture.attempt().await,
+                Err(AttemptError::Fatal(_))
+            ));
+            fixture.assert_retained(b"old-partial");
+        }
+        let mut reply = HttpReply::full(b"bad");
+        reply.bytes = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 3\r\nConnection: close\r\n\r\nbad".to_vec();
+        let server = MockHttp::new(vec![reply]);
+        let fixture = DownloadFixture::new(&server, b"old-partial");
+        assert!(
+            matches!(fixture.attempt().await, Err(AttemptError::Fatal(msg)) if msg.contains("不是音频"))
+        );
+        fixture.assert_retained(b"old-partial");
+    }
+
+    #[tokio::test]
+    async fn http_fatal_after_retryable_keeps_last_specific_error() {
+        let server = MockHttp::new(vec![
+            HttpReply::new(503, "Content-Length: 0\r\n", b""),
+            HttpReply::new(403, "Content-Length: 0\r\n", b""),
+        ]);
+        let fixture = DownloadFixture::new(&server, b"old-partial");
+        assert!(
+            matches!(run_attempts(&fixture.db, &fixture.job, &Arc::new(AtomicBool::new(false))).await, DownloadOutcome::Failed(msg) if msg == "服务器返回 HTTP 403")
+        );
+        fixture.assert_retained(b"old-partial");
+        assert_eq!(server.ranges().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn http_complete_partial_still_requires_overlap_verification() {
+        let server = MockHttp::new(vec![HttpReply::range(0, 8, b"abcdefgh")]);
+        let fixture = DownloadFixture::new(&server, b"abcdefgh");
+        assert_eq!(fixture.attempt().await.unwrap(), 8);
+        fixture.assert_done(b"abcdefgh");
+    }
+
+    #[tokio::test]
+    async fn http_fresh_truncation_and_empty_body_never_promote() {
+        for response in [
+            HttpReply::new(200, "Content-Length: 8\r\n", b"abc"),
+            HttpReply::full(b""),
+        ] {
+            let server = MockHttp::new(vec![response]);
+            let fixture = DownloadFixture::new(&server, b"");
+            assert!(fixture.attempt().await.is_err());
+            assert!(!fixture.job.final_path.exists());
+            assert!(fixture.job.part_path.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn network_timeout_and_retry_backoff_are_cancelable() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = network_wait(
+            &cancel,
+            Duration::from_millis(20),
+            "下载请求",
+            std::future::pending::<Result<(), reqwest::Error>>(),
+        )
+        .await;
+        assert!(matches!(result, Err(AttemptError::Retryable(msg)) if msg.contains("超时")));
+        let flag = Arc::clone(&cancel);
+        let stopper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+        assert!(matches!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                until_stopped(&cancel, tokio::time::sleep(Duration::from_secs(30)))
+            )
+            .await
+            .unwrap(),
+            Err(AttemptError::Stopped)
+        ));
+        stopper.await.unwrap();
+    }
 
     #[test]
     fn part_path_is_suffixed_next_to_target() {
@@ -847,7 +1688,11 @@ mod tests {
         for h in handles {
             assert!(h.await.unwrap().is_some(), "三个任务最终都该拿到并发位");
         }
-        assert_eq!(peak.load(Ordering::SeqCst), 2, "第 3 个必须等前两个之一结束");
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            2,
+            "第 3 个必须等前两个之一结束"
+        );
         assert_eq!(m.running(), 0, "全部结束后并发位必须归还");
     }
 
@@ -914,10 +1759,7 @@ mod tests {
         assert_eq!(m.running(), 1, "上限 1 时第 2 个只能排队");
 
         m.set_concurrency(2);
-        let slot = queued
-            .await
-            .unwrap()
-            .expect("提高上限后排队任务应立刻开工");
+        let slot = queued.await.unwrap().expect("提高上限后排队任务应立刻开工");
         assert_eq!(m.running(), 2);
         drop(slot);
         drop(held);
@@ -948,10 +1790,7 @@ mod tests {
         assert_eq!(m.running(), 1);
 
         drop(c);
-        let slot = queued
-            .await
-            .unwrap()
-            .expect("腾出位子后排队任务应开工");
+        let slot = queued.await.unwrap().expect("腾出位子后排队任务应开工");
         assert_eq!(m.running(), 1);
         drop(slot);
         assert_eq!(m.running(), 0);

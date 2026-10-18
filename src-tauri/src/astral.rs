@@ -333,7 +333,7 @@ pub(crate) fn sanitize_err(e: impl std::fmt::Display) -> String {
 
 /// HEAD 探测用独立小函数（无 satoken 依赖，失败返回 None）
 async fn self_http_get_head(url: &str) -> Option<reqwest::Response> {
-    let client = reqwest::Client::builder()
+    let client = crate::net_config::configure(reqwest::Client::builder())
         .timeout(std::time::Duration::from_secs(5))
         .pool_max_idle_per_host(0)
         .build()
@@ -381,8 +381,10 @@ fn is_definitive_refresh_rejection(err: &str) -> bool {
         || err.starts_with("登录响应里没有 token")
 }
 
+static ASTRAL_HTTP: std::sync::OnceLock<RwLock<(u64, reqwest::Client)>> =
+    std::sync::OnceLock::new();
+
 pub struct AstralClient {
-    http: reqwest::Client,
     base_url: String,
     /// 登录后装入；请求时出现则附 satoken 头
     satoken: RwLock<Option<String>>,
@@ -409,11 +411,6 @@ pub struct UploadTicket {
 impl AstralClient {
     pub fn new(base_url: &str) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(15))
-                .pool_max_idle_per_host(0)
-                .build()
-                .expect("reqwest client"),
             base_url: base_url.trim_end_matches('/').to_string(),
             satoken: RwLock::new(None),
             expires_at: RwLock::new(0),
@@ -454,7 +451,13 @@ impl AstralClient {
 
     /// 共享的 HTTP 客户端（大文件下载等场景复用连接池）
     pub fn http(&self) -> reqwest::Client {
-        self.http.clone()
+        crate::net_config::shared_async_client(&ASTRAL_HTTP, || {
+            crate::net_config::configure(reqwest::Client::builder())
+                .timeout(std::time::Duration::from_secs(15))
+                .pool_max_idle_per_host(0)
+                .build()
+                .expect("reqwest client")
+        })
     }
 
     /// 当前生效的后端基地址（音源包 manifest 直拼 URL 用）
@@ -590,7 +593,7 @@ impl AstralClient {
         auth: bool,
     ) -> Result<Value, String> {
         let url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
-        let mut req = self.http.request(method, &url).query(query);
+        let mut req = self.http().request(method, &url).query(query);
         if auth {
             if let Some(token) = self.token() {
                 req = req.header("satoken", token);
@@ -965,7 +968,7 @@ impl AstralClient {
         content_type: &str,
         bytes: Vec<u8>,
     ) -> Result<(), String> {
-        let client = reqwest::Client::builder()
+        let client = crate::net_config::configure(reqwest::Client::builder())
             .timeout(std::time::Duration::from_secs(60))
             .pool_max_idle_per_host(0)
             .build()
@@ -1318,7 +1321,7 @@ impl AstralClient {
         use tauri::Emitter;
 
         // 专用下载 client（理由见方法注释）；参数保留以兼容现有调用方
-        let http = reqwest::Client::builder()
+        let http = crate::net_config::configure(reqwest::Client::builder())
             .connect_timeout(std::time::Duration::from_secs(10))
             .pool_max_idle_per_host(0)
             .build()
@@ -1602,7 +1605,190 @@ impl AstralClient {
         )
         .await
     }
+
+    // ---------- AI 助手（/api/v1/app/ai/**，与 qt-uniappx 同一套契约） ----------
+    //
+    // 每处都显式带 `clientType=QT_PC`：后端 AiAppController.resolveClient 的兜底值
+    // 是 QT_UNIAPPX，不传就会被当成手机端，智能体按客户端过滤后可能压根不返回。
+
+    pub async fn ai_agents(&self) -> Result<Value, String> {
+        self.get(
+            "app/ai/agents",
+            &[("clientType", AI_CLIENT_TYPE)],
+            true,
+        )
+        .await
+    }
+
+    pub async fn ai_capabilities(&self, agent_code: &str) -> Result<Value, String> {
+        self.get(
+            "app/ai/capabilities",
+            &[("agentCode", agent_code), ("clientType", AI_CLIENT_TYPE)],
+            true,
+        )
+        .await
+    }
+
+    pub async fn ai_conversations(&self, agent_code: &str) -> Result<Value, String> {
+        self.get(
+            "app/ai/conversations",
+            &[("agentCode", agent_code), ("clientType", AI_CLIENT_TYPE)],
+            true,
+        )
+        .await
+    }
+
+    pub async fn ai_create_conversation(
+        &self,
+        agent_code: &str,
+        title: &str,
+    ) -> Result<Value, String> {
+        self.post_json(
+            "app/ai/conversations",
+            serde_json::json!({ "agentCode": agent_code, "title": title }),
+            &[(AI_CLIENT_HEADER, AI_CLIENT_TYPE.to_string())],
+            true,
+        )
+        .await
+    }
+
+    pub async fn ai_conversation(&self, id: i64) -> Result<Value, String> {
+        self.get(&format!("app/ai/conversations/{id}"), &[], true)
+            .await
+    }
+
+    pub async fn ai_delete_conversation(&self, id: i64) -> Result<Value, String> {
+        self.request(
+            reqwest::Method::DELETE,
+            &format!("app/ai/conversations/{id}"),
+            &[],
+            None,
+            &[],
+            true,
+        )
+        .await
+    }
+
+    pub async fn ai_messages(
+        &self,
+        conversation_id: i64,
+        before_id: Option<i64>,
+        limit: Option<i64>,
+    ) -> Result<Value, String> {
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if let Some(b) = before_id {
+            query.push(("beforeId", b.to_string()));
+        }
+        if let Some(l) = limit {
+            query.push(("limit", l.to_string()));
+        }
+        let refs: Vec<(&str, &str)> = query.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        self.get(
+            &format!("app/ai/conversations/{conversation_id}/messages"),
+            &refs,
+            true,
+        )
+        .await
+    }
+
+    /// 发消息。`context` 是客户端上下文（当前歌曲/队列/已装音源/候选歌…），
+    /// 后端按智能体版本的 contextPolicy 白名单裁剪后才给模型看。
+    pub async fn ai_send_message(
+        &self,
+        conversation_id: i64,
+        content: &str,
+        context: Value,
+        idempotency_key: &str,
+    ) -> Result<Value, String> {
+        let mut body = serde_json::json!({ "content": content, "context": context });
+        if !idempotency_key.is_empty() {
+            body["idempotencyKey"] = Value::String(idempotency_key.to_string());
+        }
+        self.post_json(
+            &format!("app/ai/conversations/{conversation_id}/messages"),
+            body,
+            &[(AI_CLIENT_HEADER, AI_CLIENT_TYPE.to_string())],
+            true,
+        )
+        .await
+    }
+
+    pub async fn ai_events(
+        &self,
+        request_id: i64,
+        after: i64,
+        limit: i64,
+    ) -> Result<Value, String> {
+        self.get(
+            &format!("app/ai/requests/{request_id}/events"),
+            &[("after", &after.to_string()), ("limit", &limit.to_string())],
+            true,
+        )
+        .await
+    }
+
+    pub async fn ai_cancel_request(&self, request_id: i64, reason: &str) -> Result<Value, String> {
+        let body = if reason.is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::json!({ "reason": reason })
+        };
+        self.post_json(
+            &format!("app/ai/requests/{request_id}/cancel"),
+            body,
+            &[],
+            true,
+        )
+        .await
+    }
+
+    pub async fn ai_feedback(
+        &self,
+        message_id: i64,
+        feedback_type: &str,
+        reason_code: &str,
+        comment: &str,
+    ) -> Result<Value, String> {
+        let mut body = serde_json::json!({ "feedbackType": feedback_type });
+        if !reason_code.is_empty() {
+            body["reasonCode"] = Value::String(reason_code.to_string());
+        }
+        if !comment.is_empty() {
+            body["comment"] = Value::String(comment.to_string());
+        }
+        self.post_json(
+            &format!("app/ai/messages/{message_id}/feedback"),
+            body,
+            &[],
+            true,
+        )
+        .await
+    }
+
+    pub async fn ai_execute_action(
+        &self,
+        action_id: &str,
+        action_type: &str,
+        success: bool,
+        message: &str,
+    ) -> Result<Value, String> {
+        let mut body = serde_json::json!({
+            "actionId": action_id,
+            "actionType": action_type,
+            "success": success,
+        });
+        if !message.is_empty() {
+            body["message"] = Value::String(message.to_string());
+        }
+        self.post_json("app/ai/actions/execute", body, &[], true)
+            .await
+    }
 }
+
+/// 本端在智能体客户端列表里的标识（后端 `AiConstants.ClientType.QT_PC`）
+const AI_CLIENT_TYPE: &str = "QT_PC";
+/// 后端也认 `X-Ai-Client` 头，两条路都带上，避免某天 query 被代理吃掉
+const AI_CLIENT_HEADER: &str = "X-Ai-Client";
 
 /// versionName：Cargo 包版本（Cargo.toml 由 app.config.json 同步，单一真值 §15.7）
 pub fn version_name() -> &'static str {

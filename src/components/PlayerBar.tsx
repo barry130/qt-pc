@@ -5,6 +5,7 @@ import {
   Check,
   Link2,
   ListMusic,
+  Minimize2,
   Music,
   Pause,
   Play,
@@ -38,7 +39,7 @@ import {
   SourceSwitchPanel,
 } from "@/components/player/SourceSwitchPanel";
 import { ShareCardPanel } from "@/components/player/ShareCardPanel";
-import { qualityOptionsFromRegistry } from "@/lib/quality";
+import { qualityOptionsFromRegistry, qualityShortLabel } from "@/lib/quality";
 import { PLAYER_BAR_BUTTONS, splitPlayerBarButtons } from "@/lib/player-bar";
 import { useSourceQualities } from "@/stores/sourceRegistry";
 import { usePlayerBarStore } from "@/stores/playerBar";
@@ -62,6 +63,7 @@ import {
   setSpeed,
   setTrackQuality,
   showDesktopLyric,
+  toggleMiniPlayer,
 } from "@/services/ipc";
 import { toastSuccess } from "@/stores/toast";
 
@@ -115,6 +117,9 @@ export function PlayerBar(): React.JSX.Element {
   useEffect(() => {
     void loadBarButtons();
   }, [loadBarButtons]);
+  // 本地曲目那条禁用的音质占位按钮也要按注册表档位取短标（"母带 24bit" →
+  // "24bit"），否则同一档位在音质菜单里叫 24bit、在本地占位里叫 FLAC24BIT。
+  const barQualities = useSourceQualities(track?.platform ?? null);
   const visibleBarIds = useMemo(() => {
     return PLAYER_BAR_BUTTONS.filter((meta) => {
       if (meta.adminOnly && !showPlayUrl) return false;
@@ -134,6 +139,36 @@ export function PlayerBar(): React.JSX.Element {
    * 条件渲染与 lib/player-bar.ts 里 visibleBarIds 的判断保持一致。
    */
   const renderBarButton = (id: string): React.ReactNode => {
+    // 本地曲目：音质 / 歌手 / 换源这三个按钮没有可查的音源端点，点了也不会有
+    // 结果（音质菜单会给本地曲目"请求某档"的错觉，歌手页要打 getArtistSongs，
+    // 换源要在别的音源里搜同一首）。以前是直接不渲染，导致播放条左右按钮数量
+    // 随本地/在线来回变、位置跳动；现在照样占位渲染，只是禁用置灰（用户口径：
+    // "禁用本地音乐之前不展示的那些"）。
+    if (track?.platform === "local") {
+      if (id === "quality") {
+        return (
+          <ControlButton key="quality" label="音质（本地音乐不可选）" disabled>
+            <span className="flex h-full min-w-12 items-center justify-center px-2.5 text-xs font-medium tabular-nums">
+              {qualityShortLabel(state?.quality ?? "320", barQualities)}
+            </span>
+          </ControlButton>
+        );
+      }
+      if (id === "artist") {
+        return (
+          <ControlButton key="artist" label="歌手（本地音乐没有歌手页）" disabled>
+            <User className="h-4 w-4" />
+          </ControlButton>
+        );
+      }
+      if (id === "source") {
+        return (
+          <ControlButton key="source" label="换源（本地音乐无需换源）" disabled>
+            <RefreshCw className="h-4 w-4" />
+          </ControlButton>
+        );
+      }
+    }
     switch (id) {
       case "playUrl":
         return (
@@ -169,6 +204,8 @@ export function PlayerBar(): React.JSX.Element {
         );
       case "desktopLyric":
         return <DesktopLyricButton key="desktopLyric" />;
+      case "mini":
+        return <MiniModeButton key="mini" />;
       case "queue":
         // emphasis：展开态和「桌面歌词」开启态同一套点亮（用户 m04741 口径：
         // 「我要和左边桌面歌词打开后效果一样就行」）。队列面板本身在右侧，
@@ -669,6 +706,26 @@ function DesktopLyricButton(): React.JSX.Element {
       }
     >
       <Captions className="h-4 w-4" />
+    </ControlButton>
+  );
+}
+
+/**
+ * 迷你模式入口（REQUIREMENTS §3.21.7.2）：切到迷你播放器小窗，主窗随即收起。
+ * 这里**不维护开启态**——点下去主窗就没了，按钮的「点亮」永远看不到；
+ * 迷你窗里回主窗是那条窗口自己的按钮，两边共用同一个命令。
+ */
+function MiniModeButton(): React.JSX.Element {
+  return (
+    <ControlButton
+      label="迷你模式（切到迷你播放器小窗）"
+      onClick={() =>
+        void toggleMiniPlayer()
+          // 切窗失败不值得弹全局「致命错误」浮层（与相邻按钮的 .catch 口径一致）
+          .catch(() => {})
+      }
+    >
+      <Minimize2 className="h-4 w-4" />
     </ControlButton>
   );
 }

@@ -96,6 +96,10 @@ export function ChartsPage(): React.JSX.Element {
       const key = `${chart.platform}:${chart.id}`;
       if (requested.current.has(key)) return;
       requested.current.add(key);
+      if (chart.contentType === "programs") {
+        setChartTracks((prev) => ({ ...prev, [key]: [] }));
+        return;
+      }
       void loadChartDetail(chart)
         .catch(() => [] as Track[])
         .then((list) => {
@@ -127,12 +131,27 @@ export function ChartsPage(): React.JSX.Element {
     // cols 不是读值、只当重排信号：列数一变卡片位置全变，视口里是谁要重算一遍
   }, [charts, cols, gridRef]);
 
-  /** 整张榜入队：用已经拿回来的详情，没拿过就现拉（缓存会接住第二次） */
+  /** 整张榜入队：节目型榜单只浏览节目，不请求或播放容器。 */
   const playChart = async (chart: Chart): Promise<void> => {
+    if (chart.contentType === "programs") return;
     const list =
       chartTracks[`${chart.platform}:${chart.id}`] ??
       (await loadChartDetail(chart).catch(() => [] as Track[]));
     if (list.length > 0) await playQueue(list, 0);
+  };
+
+  const openChart = (chart: Chart): void => {
+    if (chart.contentType === "programs") {
+      void navigate({
+        to: "/audio-chart/$platform/$id",
+        params: { platform: chart.platform, id: chart.id },
+      });
+      return;
+    }
+    void navigate({
+      to: "/chart/$platform/$id",
+      params: { platform: chart.platform, id: chart.id },
+    });
   };
 
   return (
@@ -168,12 +187,7 @@ export function ChartsPage(): React.JSX.Element {
                 chart={c}
                 tracks={chartTracks[`${c.platform}:${c.id}`]?.slice(0, SPOTLIGHT_TRACKS)}
                 total={chartTracks[`${c.platform}:${c.id}`]?.length}
-                onOpen={() =>
-                  void navigate({
-                    to: "/chart/$platform/$id",
-                    params: { platform: c.platform, id: c.id },
-                  })
-                }
+                onOpen={() => openChart(c)}
                 onPlayAll={() => void playChart(c)}
                 onPlayTrack={(t) => void play(t)}
               />

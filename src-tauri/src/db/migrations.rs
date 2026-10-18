@@ -246,6 +246,9 @@ pub(crate) const MIGRATIONS: &[(i64, &str)] = &[
     (13, V13),
     (14, V14),
     (15, V15),
+    (16, V16),
+    (17, V17),
+    (18, V18),
 ];
 
 const V1: &str = r#"
@@ -528,8 +531,97 @@ const V15: &str = r#"
 ALTER TABLE play_stats ADD COLUMN finished_count INTEGER NOT NULL DEFAULT 0;
 "#;
 
+/// V16：清掉「建了却从来没写过」的死列与死表。
+///
+/// 1) `liked_playlists.play_count`：V1 建表时没有这一列，是后来按老库补上的
+///    （见 `ensure_liked_playlists_columns`），而 Rust 侧**从来没有写过它** ——
+///    `add_liked_playlist` 明确不落播放数，`list_liked_playlists` 干脆把它
+///    硬编码成空串。留着只会让「歌单播放数」看起来像已经实现的功能。
+///
+///    没有用 `ALTER TABLE ... DROP COLUMN`：SQLite 不支持条件删列，而只跑到
+///    v1 的老库上这列可能根本不存在（补列在 `run()` 末尾、晚于迁移执行），
+///    删一个不存在的列会直接把启动打挂。改成按 V1 的列清单**整表重建**，
+///    老库有没有 play_count 都能跑通。
+///    `UNIQUE(uid, platform, pid)` 必须原样保留 —— `add_liked_playlist` 的
+///    `ON CONFLICT(uid, platform, pid)` 依赖它，丢了会在收藏歌单时直接报
+///    "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"。
+///
+/// 2) 四张 V1 建了就没人用过的空表：`providers`（音源统一走设置里的 source
+///    配置）、`themes`（外观跟随 config）、`search_history`（搜索历史没做）、
+///    `stat_queue`（统计直接落 play_stats）。它们只会让人误以为有数据可查。
+const V16: &str = r#"
+CREATE TABLE liked_playlists_v16 (
+  id          TEXT PRIMARY KEY,
+  uid         INTEGER NOT NULL,
+  pid         TEXT NOT NULL,
+  platform    TEXT NOT NULL,
+  name        TEXT NOT NULL,
+  pic_url     TEXT,
+  is_import   INTEGER DEFAULT 0,
+  deleted_at  INTEGER,
+  updated_seq INTEGER NOT NULL DEFAULT 0,
+  updated_at  INTEGER,
+  created_at  INTEGER NOT NULL,
+  UNIQUE(uid, platform, pid)
+);
+INSERT INTO liked_playlists_v16
+  (id, uid, pid, platform, name, pic_url, is_import, deleted_at, updated_seq, updated_at, created_at)
+SELECT id, uid, pid, platform, name, pic_url, is_import, deleted_at, updated_seq, updated_at, created_at
+  FROM liked_playlists;
+DROP TABLE liked_playlists;
+ALTER TABLE liked_playlists_v16 RENAME TO liked_playlists;
+CREATE INDEX IF NOT EXISTS idx_liked_playlists_uid_seq ON liked_playlists(uid, updated_seq);
+CREATE INDEX IF NOT EXISTS idx_liked_playlists_time ON liked_playlists(created_at DESC);
+
+DROP TABLE IF EXISTS providers;
+DROP TABLE IF EXISTS themes;
+DROP TABLE IF EXISTS search_history;
+DROP TABLE IF EXISTS stat_queue;
+"#;
+
+/// CUE children share a physical file; identity remains the tracks primary key.
+/// Intervals are nullable so existing whole-file and online tracks are unchanged.
+const V17: &str = r#"
+ALTER TABLE tracks ADD COLUMN start_ms INTEGER CHECK (start_ms IS NULL OR start_ms >= 0);
+ALTER TABLE tracks ADD COLUMN end_ms INTEGER CHECK (end_ms IS NULL OR (start_ms IS NOT NULL AND end_ms > start_ms));
+ALTER TABLE tracks ADD COLUMN cue_path TEXT;
+DROP INDEX IF EXISTS uk_tracks_local_path;
+CREATE INDEX IF NOT EXISTS idx_tracks_local_path ON tracks(local_path) WHERE local_path IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tracks_cue_path ON tracks(cue_path) WHERE cue_path IS NOT NULL;
+"#;
+
+/// V18：听歌统计的「按天明细」（对齐 qt-uniappx `stores/listen-stats.ts` 的按天存档）。
+///
+/// 背景：`play_stats` 只有每首歌的**累计值**，`last_played_at` 只留最后一次的时刻，
+/// 历史分布无从还原 —— 报告页因此只能给累计榜，做不出「今天 / 近 7 天 / 近 30 天」
+/// 这个口径（移动端 `pages/stats` 有，桌面端一直缺，见 DESIGN §5.3）。
+/// 这里另开一张按 `(track_id, day)` 聚合的表，每次结算顺带累加一行，
+/// 与 `play_stats` 同一时刻、同一份入参写入，两个口径不会漂移。
+///
+/// `day` 用 **SQLite 的本地日期**（`date(ts / 1000, 'unixepoch', 'localtime')`）：
+/// 时区换算交给 SQLite，Rust 侧不引 chrono，也不用自己处理跨时区 / 夏令时。
+/// 「近 N 天」窗口的下界在查询侧用**同一个表达式**推出，读写两侧必然同口径
+/// （见 `listen_report.rs` 的 `SOURCE_CTE`）。
+///
+/// 迁移本身不回填历史：老数据的按天分布没有任何依据（`play_stats` 连每次播放的时刻
+/// 都没存），在迁移里编一个分布比留空更不诚实。存量播放改由**报告页首次打开时**
+/// 调用 `db::store::seed_play_days` 统一归到「今天」—— 一个诚实的近似值，
+/// 且只补差额、天然幂等，不需要额外的持久化标记。设置页的统计说明已写明这个口径。
+const V18: &str = r#"
+CREATE TABLE play_days (
+  track_id        TEXT NOT NULL,
+  day             TEXT NOT NULL,
+  play_count      INTEGER NOT NULL DEFAULT 0,
+  total_played_ms INTEGER NOT NULL DEFAULT 0,
+  last_played_at  INTEGER NOT NULL,
+  PRIMARY KEY (track_id, day),
+  FOREIGN KEY (track_id) REFERENCES tracks(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_play_days_day ON play_days(day DESC);
+"#;
+
 /// 当前程序支持的最新 schema 版本。
-pub(crate) const CURRENT_VERSION: i64 = 15;
+pub(crate) const CURRENT_VERSION: i64 = 18;
 
 /// 建表 schema_migrations 并把所有未应用版本按序执行。
 pub(crate) fn run(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -785,8 +877,11 @@ fn ensure_liked_songs_columns(conn: &Connection) -> Result<(), rusqlite::Error> 
 /// 补齐 liked_playlists 后加的列。
 ///
 /// `CREATE TABLE IF NOT EXISTS` 对**已经存在**的表什么都不做，
-/// 而这张表在建表之后又加过 play_count —— 老库跑 v2 时表已存在、列却没有，
-/// 插入就会报 "no column named play_count"。只能按实际列清单补。
+/// 而这张表在建表之后又加过列 —— 老库跑 v2 时表已存在、列却没有，
+/// 插入就会报 "no column named ..."。只能按实际列清单补。
+///
+/// v16 起 `play_count` 不再是这张表的列（它从来没被写过，见 `V16`），
+/// **不要往里加回来**：那样每次启动都会把刚删掉的列又补上。
 fn ensure_liked_playlists_columns(conn: &Connection) -> Result<(), rusqlite::Error> {
     let exists: bool = conn
         .query_row(
@@ -805,7 +900,7 @@ fn ensure_liked_playlists_columns(conn: &Connection) -> Result<(), rusqlite::Err
         .query_map([], |r| r.get::<_, String>(1))?
         .collect::<Result<_, _>>()?;
 
-    for (column, ddl) in [("play_count", "TEXT"), ("pic_url", "TEXT")] {
+    for (column, ddl) in [("pic_url", "TEXT")] {
         if !names.iter().any(|n| n == column) {
             conn.execute_batch(&format!(
                 "ALTER TABLE liked_playlists ADD COLUMN {column} {ddl};"
@@ -832,6 +927,53 @@ mod tests {
             })
             .unwrap();
         assert_eq!(v, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn cue_v17_upgrades_existing_local_rows_and_allows_shared_audio_paths() {
+        let conn = Connection::open_in_memory().unwrap();
+        for &(version, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 16) {
+            conn.execute_batch(sql)
+                .unwrap_or_else(|e| panic!("v{version}: {e}"));
+        }
+        conn.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+            INSERT INTO schema_migrations VALUES (16, 0);
+            INSERT INTO tracks (id,platform,title,singer,album,local_path,created_at,updated_at)
+            VALUES ('local:/music/album.wav','local','Album','','','/music/album.wav',0,0);").unwrap();
+        run(&conn).unwrap();
+        run(&conn).unwrap();
+        let original: (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT start_ms,end_ms FROM tracks WHERE id='local:/music/album.wav'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(original, (None, None));
+        conn.execute_batch("INSERT INTO tracks
+            (id,platform,title,singer,album,local_path,start_ms,end_ms,cue_path,created_at,updated_at)
+            VALUES ('local:/music/album.wav#cue:1','local','One','','','/music/album.wav',0,5000,'/music/album.cue',0,0),
+                   ('local:/music/album.wav#cue:2','local','Two','','','/music/album.wav',5000,12000,'/music/album.cue',0,0);").unwrap();
+        let shared: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tracks WHERE local_path='/music/album.wav'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(shared, 3);
+        assert!(conn
+            .execute(
+                "UPDATE tracks SET end_ms=0 WHERE id='local:/music/album.wav#cue:1'",
+                []
+            )
+            .is_err());
+        assert!(conn
+            .execute(
+                "UPDATE tracks SET start_ms=-1 WHERE id='local:/music/album.wav#cue:1'",
+                []
+            )
+            .is_err());
     }
 
     /// V11：酷狗 hash 大小写重复行的合并（含引用重定向与主键冲突场景）
@@ -970,6 +1112,8 @@ COMMIT;"
         assert_eq!(stat, upper);
     }
 
+    /// 跑完全部迁移后，程序用到的表都得在。
+    /// （v16 删掉的那四张空表不在清单里，它们的「不存在」由 v16 那个测试断言。）
     #[test]
     fn v1_contains_all_tables() {
         let conn = Connection::open_in_memory().unwrap();
@@ -990,22 +1134,150 @@ COMMIT;"
             "liked_playlists",
             "play_history",
             "play_stats",
+            "play_days",
             "download_tasks",
             "scan_dirs",
-            "providers",
             "pending_like_ops",
             "like_sync_state",
-            "themes",
             "settings",
             "schema_migrations",
             "lyrics",
             "lyric_settings",
             "play_queue",
-            "search_history",
-            "stat_queue",
             "dislike_rules",
         ] {
             assert!(names.iter().any(|n| n == table), "缺少表 {table}");
+        }
+    }
+
+    /// v16：删掉从来没写过的 `liked_playlists.play_count`（整表重建）＋ 四张零引用空表。
+    ///
+    /// 重建表最容易踩的坑是把 `UNIQUE(uid, platform, pid)` 一起丢掉 —— 丢了以后
+    /// `add_liked_playlist` 的 `ON CONFLICT(uid, platform, pid)` 会在运行时直接报
+    /// "ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint"，
+    /// 表现是收藏歌单整个失效。所以这里真的收藏两次验一下。
+    #[test]
+    fn v16_drops_dead_column_and_tables_without_losing_conflict_target() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        let cols: Vec<String> = conn
+            .prepare("PRAGMA table_info(liked_playlists)")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        assert!(
+            !cols.iter().any(|c| c == "play_count"),
+            "play_count 应被删掉：{cols:?}"
+        );
+        for kept in [
+            "id",
+            "uid",
+            "pid",
+            "platform",
+            "name",
+            "pic_url",
+            "is_import",
+            "deleted_at",
+            "updated_seq",
+            "updated_at",
+            "created_at",
+        ] {
+            assert!(
+                cols.iter().any(|c| c == kept),
+                "重建后丢了列 {kept}：{cols:?}"
+            );
+        }
+
+        let tables: Vec<String> = conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for dead in ["providers", "themes", "search_history", "stat_queue"] {
+            assert!(!tables.iter().any(|t| t == dead), "死表 {dead} 应被清掉");
+        }
+
+        // v1 建的 uid_seq 与 v2 建的 time 都要重建（DROP TABLE 会连索引一起带走）
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN
+                   ('idx_liked_playlists_uid_seq', 'idx_liked_playlists_time')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 2, "重建后两个索引都应在");
+
+        // UNIQUE 冲突目标还在：同一歌单收藏两次 → 走 UPDATE，只留一行
+        crate::db::store::add_liked_playlist(&conn, "wyy", "p1", "第一次", "", "").unwrap();
+        crate::db::store::add_liked_playlist(&conn, "wyy", "p1", "改名了", "http://c", "").unwrap();
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM liked_playlists", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 1, "重复收藏应命中 UNIQUE 冲突走 UPDATE");
+        let (name, pic): (String, String) = conn
+            .query_row("SELECT name, pic_url FROM liked_playlists", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((name.as_str(), pic.as_str()), ("改名了", "http://c"));
+
+        // 重建是搬数据不是清库，而且「老库有没有 play_count」两种形态都得能升上来：
+        // 只跑到 v1 的库没有这列（补列在 run() 末尾、晚于迁移），升级过的库有。
+        for with_dead_column in [false, true] {
+            let old = Connection::open_in_memory().unwrap();
+            for &(version, sql) in MIGRATIONS {
+                if version <= 15 {
+                    old.execute_batch(sql).unwrap();
+                }
+            }
+            if with_dead_column {
+                old.execute_batch("ALTER TABLE liked_playlists ADD COLUMN play_count TEXT;")
+                    .unwrap();
+            }
+            old.execute(
+                "INSERT INTO liked_playlists
+                   (id, uid, pid, platform, name, pic_url, is_import, deleted_at,
+                    updated_seq, updated_at, created_at)
+                 VALUES ('wyy:p9', 0, 'p9', 'wyy', '旧收藏', 'http://old', 0, NULL, 0, ?1, ?1)",
+                rusqlite::params![1_700_000_000_000i64],
+            )
+            .unwrap();
+
+            old.execute_batch(V16).unwrap();
+
+            let kept: (String, String) = old
+                .query_row(
+                    "SELECT name, pic_url FROM liked_playlists WHERE id='wyy:p9'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                (kept.0.as_str(), kept.1.as_str()),
+                ("旧收藏", "http://old"),
+                "play_count 存在={with_dead_column}：重建把老数据搬丢了"
+            );
+            let total: i64 = old
+                .query_row("SELECT COUNT(*) FROM liked_playlists", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(total, 1);
+            let left: Vec<String> = old
+                .prepare("PRAGMA table_info(liked_playlists)")
+                .unwrap()
+                .query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            assert!(
+                !left.iter().any(|c| c == "play_count"),
+                "play_count 存在={with_dead_column}：升级后这列应该没了"
+            );
         }
     }
 }

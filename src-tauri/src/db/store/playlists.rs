@@ -365,7 +365,7 @@ pub(crate) fn get_playlist_tracks(
     {
         let mut stmt = conn.prepare(
             "SELECT l.sid, l.platform, l.name, l.singer, l.album, t.pic_url,
-                    t.duration_ms, t.music_id
+                    t.duration_ms, t.music_id, t.start_ms, t.end_ms
                FROM liked_songs l
                LEFT JOIN tracks t ON t.id = l.id
               WHERE l.deleted_at IS NULL
@@ -382,7 +382,7 @@ pub(crate) fn get_playlist_tracks(
     {
         let mut stmt = conn.prepare(
             "SELECT substr(pt.track_id, instr(pt.track_id, ':') + 1), t.platform,
-                    t.title, t.singer, t.album, t.pic_url, t.duration_ms, t.music_id
+                    t.title, t.singer, t.album, t.pic_url, t.duration_ms, t.music_id, t.start_ms, t.end_ms
                FROM playlist_tracks pt
                JOIN tracks t ON t.id = pt.track_id
                JOIN playlists p ON p.id = pt.playlist_id

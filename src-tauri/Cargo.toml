@@ -39,13 +39,20 @@ serde_json = "1"
 thiserror = "2.0.21"
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
-reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "blocking", "multipart", "query"] }
+# socks = SOCKS5 代理（设置页「网络」分区的代理模式之一）；system-proxy =
+# 「跟随系统」模式读取 Windows 的 WinHTTP/WinINET 代理设置。两者都不引新依赖，
+# reqwest 的同一份源码按特性裁剪。
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream", "blocking", "multipart", "query", "socks", "system-proxy"] }
 # 0.22 起 Decoder::builder().with_byte_len() 会把总字节数透传给 symphonia 的
 # MediaSource，FLAC 的二分定位不再因 byte_len 缺失而报 Unseekable（进度条拖拽修复）
 rodio = { version = "0.22.2", features = ["symphonia-all"] }
 # 音频输出设备枚举 / 默认设备变化检测（与 rodio 0.22.2 内置的 cpal 0.17 对齐，不引入新副本）
 cpal = "0.17"
 # 本地音乐库元数据读取（DESIGN §13）：与 rodio 0.22.2 内置的 symphonia 0.5.5 同版本，不引入新副本
+# 这里列的不是「实际能解码的全部格式」：rodio 那边开了 `symphonia-all`
+# （= symphonia/all-formats + all-codecs），Cargo 的特性合并让同一个 symphonia 实例
+# 拿到全部编解码器（含 alac / aiff / caf / mkv / pcm / adpcm / mp1 / mp2）。
+# 真正决定「哪些本地文件能进库」的是 local.rs 的 SUPPORTED_EXTS。
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "flac", "wav", "ogg", "aac", "isomp4", "vorbis"] }
 sha1 = "0.11"
 md-5 = "0.11"
@@ -53,6 +60,9 @@ md-5 = "0.11"
 # 复用同一份源码不引入新副本
 ring = "0.17"
 base64 = "0.23"
+# 同名 .lrc 的文本解码（UTF-8 失败按 GB18030 兜底，中文曲库里大量 GBK 歌词）：
+# reqwest 已把同一版本带进依赖树，不引入新副本
+encoding_rs = "0.8"
 fastrand = "2"
 # std/alloc：set_boxed_logger（file_logger 自定义 Logger 用）默认特性集下被裁掉
 log = { version = "0.4", features = ["std", "alloc"] }

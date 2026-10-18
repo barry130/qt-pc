@@ -6,9 +6,21 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: vi.fn(async () => ({})),
 }));
 
-// preResolvePlayUrl 会走共享脚本包取链，测试里不需要真取（且会拖慢/发网络）
-vi.mock("@/source-scripts", () => ({
-  resolvePlayUrl: vi.fn(async () => ""),
+// preResolvePlayUrl 会按降档阶梯走共享脚本包取链，测试里不需要真取（且会拖慢/发网络）。
+// 阶梯本身在 @/lib/quality-fallback 里，连同它的重试循环一起 mock 掉，
+// 才能精确控制「取链挂住多久」这个弱网窗口。
+vi.mock("@/lib/quality-fallback", () => ({
+  // preResolvePlayUrl 会先查这张专辑的档位上限决定要不要弹降档提示；
+  // 这里返回 null（没有结论）＝每次都按「首次降档」走提示分支。
+  peekQualityCeiling: vi.fn(() => null),
+  resolvePlayUrlWithFallback: vi.fn(async () => ({
+    url: "",
+    stalled: false,
+    referer: "",
+    size: null,
+    actualQuality: "",
+    quality: "",
+  })),
 }));
 
 import { invoke } from "@tauri-apps/api/core";
@@ -78,10 +90,21 @@ describe("单曲播放（play）", () => {
 
   it("被更晚的播放动作超越时不发 IPC（最后一次点击获胜）", async () => {
     // 挂住第一次取链，模拟弱网下点歌 A 的 8s 窗口
-    const scripts = await import("@/source-scripts");
+    const fallback = await import("@/lib/quality-fallback");
     let release: () => void = () => {};
-    vi.mocked(scripts.resolvePlayUrl).mockImplementationOnce(
-      () => new Promise((resolve) => (release = () => resolve(""))),
+    vi.mocked(fallback.resolvePlayUrlWithFallback).mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = () =>
+            resolve({
+              url: "",
+              stalled: false,
+              referer: "",
+              size: null,
+              actualQuality: "",
+              quality: "",
+            });
+        }),
     );
 
     const slow = usePlayerStore.getState().play(track);

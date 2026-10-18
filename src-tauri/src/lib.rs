@@ -4,24 +4,41 @@ pub mod app_config;
 pub mod app_paths;
 pub mod astral;
 pub mod audio;
+pub mod backup;
 pub mod cache;
 pub mod commands;
+pub mod cue;
 pub mod db;
 pub mod download;
+/// 「外部打开」的待取队列与命令行解析（拖拽入窗 / 命令行参数 / 第二实例转发）
+pub mod external_open;
+/// 文件关联与「设为默认播放器」（第二波）
+pub mod file_assoc;
 pub mod file_logger;
 pub mod ipc_guard;
 pub mod local;
 pub mod library_scan;
+/// 听歌报告只读分页查询
+pub mod listen_report;
+/// 重复文件检测与只读整理预览
+pub mod library_maintenance;
 pub mod lyric_window;
+/// 迷你播放器悬浮窗（第二波）
+pub mod mini_window;
 pub mod media;
+/// 全局网络配置：代理与单源超时（第二波）
+pub mod net_config;
 pub mod net_guard;
 pub mod pack_safety;
 pub mod pack_signature;
+pub mod playlist_io;
 pub mod playurl_bridge;
 /// 私有配置的编译期常量（由 scripts/sync-config.mjs 生成；缺失时 build.rs 补空壳）
 pub mod private_config;
 pub mod provider;
 pub mod qtres;
+/// 本地化推荐合辑（第二波）
+pub mod recommend;
 /// 运行期私有配置（自有域名 / 生产后端 / 官网地址，启动时按顺序找本地文件）
 pub mod runtime_config;
 pub mod settings_keys;
@@ -136,12 +153,19 @@ pub fn run() {
     tauri::Builder::default()
         // 单实例必须最先注册（插件内部靠启动竞态判定谁是主实例）：
         // 第二个实例拉起时把已有主窗口带到前台然后立刻退出
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(win) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                let _ = win.unminimize();
-                let _ = win.show();
-                let _ = win.set_focus();
+        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            // 第二实例可能是被「打开方式 / 拖到图标上」拉起来的，它带的文件参数
+            // 要由**已经在运行的**我们打开（第二个实例本身马上就退出了）。
+            // 参数先入待取队列再叫前端来取：前端此刻可能还没注册监听。
+            let paths = crate::external_open::paths_from_args(
+                &args,
+                Some(std::path::Path::new(&cwd)),
+            );
+            if !paths.is_empty() {
+                crate::external_open::push(paths);
+                crate::external_open::notify(app);
             }
+            let _ = crate::mini_window::hide(app);
         }))
         .register_asynchronous_uri_scheme_protocol("qtres", qtres::handle_qtres)
         // 开机自启（设置页「通用」分区读写；Windows 实现为注册表 Run 键）
@@ -168,21 +192,65 @@ pub fn run() {
                     let _ = window.emit("stat_window_hidden", ());
                     api.prevent_close();
                     let _ = window.hide();
+                } else if window.label() == crate::mini_window::MINI_WINDOW_LABEL {
+                    // 迷你窗的「关闭」（Alt+F4 / 系统菜单）= 回主窗，不销毁、
+                    // 不退出应用：用户按关闭想的是「退出迷你模式」。
+                    api.prevent_close();
+                    let _ = crate::mini_window::hide(window.app_handle());
                 }
             }
         })
         .setup(|app| {
             let handle = app.handle().clone();
+
+            // 首个实例自己的命令行参数（「打开方式」/终端 `QuietMusic.exe 歌.flac`）：
+            // 这里只入队，不 emit —— 此刻前端还没起来，挂载时会主动来取
+            // （见 crate::external_open 模块注释）。
+            let startup_paths = crate::external_open::paths_from_args(
+                &crate::external_open::argv_from_env(),
+                std::env::current_dir().ok().as_deref(),
+            );
+            if !startup_paths.is_empty() {
+                log::info!("[open] 命令行待打开 {} 个条目", startup_paths.len());
+                crate::external_open::push(startup_paths);
+            }
             // 数据库：DESIGN §8.1 %APPDATA%/QuietMusic/data/music.db
             // 口径集中在 app_paths::data_root（含 LightListen 旧目录迁移）
             let db_root = crate::app_paths::data_root(&handle);
-            let db = match Database::open(&db_root.join("data").join("music.db")) {
-                Ok(db) => Some(Arc::new(db)),
+            // 走 open_checked 而不是 open：坏库要隔离重建（并给用户回执），
+            // 好库则顺手做一份滚动备份（详见 db::health）
+            let db = match Database::open_checked(&db_root.join("data").join("music.db")) {
+                Ok((db, _notice)) => Some(Arc::new(db)),
                 Err(e) => {
                     log::error!("{e}；本次运行无持久化，播放不受影响");
                     None
                 }
             };
+
+            // 命令行导出（`QuietMusic.exe --export-backup <目录>`）：给自动备份/换机迁移用。
+            // 主窗口在配置里是 `visible: false`（由前端就绪后再 show），所以这里导完直接
+            // 退出不会闪一个空窗口；失败用非 0 退出码，方便任务计划/脚本判断。
+            if let Some(dir) =
+                crate::backup::export_dir_from_args(&crate::external_open::argv_from_env())
+            {
+                let code = match db.as_ref() {
+                    Some(db) => match crate::backup::export(db, &dir) {
+                        Ok(info) => {
+                            log::info!("[backup] 命令行导出完成：{}", info.path);
+                            0
+                        }
+                        Err(e) => {
+                            log::error!("[backup] 命令行导出失败：{e}");
+                            1
+                        }
+                    },
+                    None => {
+                        log::error!("[backup] 数据库不可用，命令行导出中止");
+                        1
+                    }
+                };
+                std::process::exit(code);
+            }
 
             // 日志参数（级别 / 单文件大小 / 保留份数 / 目录）：必须等数据库打开后
             // 才能读到用户配置。这里只做一次「盖上去」——运行期改配置走设置命令。
@@ -326,6 +394,14 @@ pub fn run() {
                 }
             }
 
+            // 网络配置（第二波：代理与单源超时）装载必须赶在任何 HTTP 客户端
+            // 首次构建前 —— 常驻客户端按代际缓存重建（net_config::shared_*_client），
+            // 这里先装好全局，客户端首建即吃到用户配置。失败不影响启动
+            //（回退默认：跟随系统 + 10s）。
+            if let Some(db) = &app.state::<AppState>().db {
+                let _ = db.with(|conn| Ok(crate::net_config::init_from_db(conn)));
+            }
+
             // 托盘注册：失败（Linux GNOME 无托盘扩展、无 StatusNotifier 宿主等）
             // 不能只记日志——「点关闭 = 收进托盘」的关闭语义在没有托盘时等于
             // 用户没有任何退出入口（主窗口藏起来后只能 kill）。因此托盘没建成
@@ -403,6 +479,7 @@ pub fn run() {
             cmd_stop,
             cmd_seek,
             cmd_set_speed,
+            cmd_set_gapless,
             cmd_set_sleep_timer,
             cmd_get_fx_state,
             cmd_set_eq,
@@ -412,6 +489,7 @@ pub fn run() {
             cmd_audio_cache_stats,
             cmd_clear_audio_cache,
             cmd_clear_web_cache,
+            cmd_clear_play_url_cache,
             cmd_set_audio_cache_limit,
             cmd_autostart_state,
             cmd_set_autostart,
@@ -465,6 +543,19 @@ pub fn run() {
             cmd_astral_feedback_detail,
             cmd_astral_feedback_replies,
             cmd_astral_reply_feedback,
+            // AI 助手（契约同 qt-uniappx services/ai.ts；clientType 固定 QT_PC）
+            cmd_astral_ai_agents,
+            cmd_astral_ai_capabilities,
+            cmd_astral_ai_conversations,
+            cmd_astral_ai_create_conversation,
+            cmd_astral_ai_conversation,
+            cmd_astral_ai_delete_conversation,
+            cmd_astral_ai_messages,
+            cmd_astral_ai_send_message,
+            cmd_astral_ai_events,
+            cmd_astral_ai_cancel_request,
+            cmd_astral_ai_feedback,
+            cmd_astral_ai_execute_action,
             // 账号（DESIGN §2.3.4；契约同 qt-uniappx AccountApi）
             cmd_astral_login,
             cmd_astral_register,
@@ -483,6 +574,12 @@ pub fn run() {
             cmd_get_play_overview,
             cmd_get_top_tracks,
             cmd_get_top_singers,
+            listen_report::cmd_get_listen_report,
+            listen_report::cmd_get_listen_day_report,
+            cmd_seed_listen_days,
+            cmd_clear_listen_stats,
+            recommend::cmd_list_local_mixes,
+            recommend::cmd_get_local_mix_tracks,
             // 通用设置项
             cmd_get_setting,
             cmd_set_setting,
@@ -509,7 +606,18 @@ pub fn run() {
             cmd_delete_local_tracks,
             cmd_get_missing_local_tracks,
             cmd_purge_missing_local_tracks,
+            library_maintenance::cmd_find_library_duplicates,
+            library_maintenance::cmd_cancel_library_duplicate_scan,
+            library_maintenance::cmd_preview_library_organization,
             cmd_get_local_cover,
+            cmd_read_local_lyric,
+            cmd_open_local_paths,
+            cmd_take_pending_open_paths,
+            cmd_take_db_notice,
+            cmd_export_backup,
+            cmd_import_backup,
+            cmd_export_playlist,
+            cmd_parse_playlist_json,
             // 收藏 / 播放历史（DESIGN §5.3）
             cmd_add_favorite,
             cmd_remove_favorite,
@@ -523,6 +631,10 @@ pub fn run() {
             cmd_is_playlist_favorited,
             cmd_list_history,
             cmd_clear_history,
+            cmd_remove_history,
+            cmd_remove_history_many,
+            cmd_count_missing_history,
+            cmd_purge_missing_history,
             // 我的歌单（DESIGN §5.3）
             cmd_create_playlist,
             cmd_rename_playlist,
@@ -564,7 +676,22 @@ pub fn run() {
             cmd_get_cache_dir,
             cmd_choose_cache_dir,
             cmd_reset_cache_dir,
+            // 网络设置（第二波：代理与单源超时）
+            cmd_get_net_config,
+            cmd_set_net_config,
+            cmd_test_net_config,
+            // 迷你播放器窗口（第二波 §3.21.7.2）
+            cmd_toggle_mini_player,
+            cmd_get_file_association_state,
+            cmd_register_file_associations,
+            cmd_unregister_file_associations,
+            cmd_open_default_apps_settings,
         ]))
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
+                crate::mini_window::remember_position(app);
+            }
+        });
 }

@@ -19,6 +19,7 @@ import {
 } from "./ChartSpotlight";
 import { HorizontalScroller } from "./HorizontalScroller";
 import { TrackCard } from "./TrackCard";
+import { LocalMixSection } from "@/components/mine/LocalMixSection";
 
 /**
  * 首页 / 发现（路由 /，DESIGN §5.2 / §5.3）。
@@ -202,7 +203,9 @@ export function DiscoverPage(): React.JSX.Element {
       const rows = await Promise.all(
         picked.map(async (c) => {
           const key = `${c.platform}:${c.id}`;
-          const list = await loadChartDetail(c).catch(() => [] as Track[]);
+          const list = c.contentType === "programs"
+             ? []
+             : await loadChartDetail(c).catch(() => [] as Track[]);
           return [key, list] as const;
         }),
       );
@@ -230,7 +233,9 @@ export function DiscoverPage(): React.JSX.Element {
       const picked = (Array.isArray(c) ? c : []).slice(0, spotlightCount);
       const rows = await Promise.all(
         picked.map(async (chart) => {
-          const list = await loadChartDetail(chart, true).catch(() => [] as Track[]);
+          const list = chart.contentType === "programs"
+             ? []
+             : await loadChartDetail(chart, true).catch(() => [] as Track[]);
           return [`${chart.platform}:${chart.id}`, list] as const;
         }),
       );
@@ -244,8 +249,24 @@ export function DiscoverPage(): React.JSX.Element {
     }
   };
 
-  /** 整张榜入队播放：用已经拉回来的详情，不再打一次源站 */
+  /** 榜单卡片打开：节目型榜单走节目列表，普通榜单走歌曲榜单详情。 */
+  const openChart = (chart: Chart): void => {
+    if (chart.contentType === "programs") {
+      void navigate({
+        to: "/audio-chart/$platform/$id",
+        params: { platform: chart.platform, id: chart.id },
+      });
+      return;
+    }
+    void navigate({
+      to: "/chart/$platform/$id",
+      params: { platform: chart.platform, id: chart.id },
+    });
+  };
+
+  /** 整张榜入队播放；节目型榜单只浏览节目，不播放容器。 */
   const playChart = async (chart: Chart): Promise<void> => {
+    if (chart.contentType === "programs") return;
     const list =
       chartTracks[`${chart.platform}:${chart.id}`] ??
       (await loadChartDetail(chart).catch(() => [] as Track[]));
@@ -315,6 +336,8 @@ export function DiscoverPage(): React.JSX.Element {
         </section>
       )}
 
+      <LocalMixSection />
+
       {/* 榜单精选（跟随当前音源；当前源没声明榜单时整块隐藏）。
           列数随内容区实测宽度浮动（见 useSpotlightColumns）：左封面 + 右前三首。
           比原来的横向封面行多给了一层信息，所以原来那条「热门榜单」行已经删掉，
@@ -362,12 +385,7 @@ export function DiscoverPage(): React.JSX.Element {
                 chart={c}
                 tracks={chartTracks[`${c.platform}:${c.id}`]?.slice(0, SPOTLIGHT_TRACKS)}
                 total={chartTracks[`${c.platform}:${c.id}`]?.length}
-                onOpen={() =>
-                  void navigate({
-                    to: "/chart/$platform/$id",
-                    params: { platform: c.platform, id: c.id },
-                  })
-                }
+                onOpen={() => openChart(c)}
                 onPlayAll={() => void playChart(c)}
                 onPlayTrack={(t) => void play(t)}
               />

@@ -682,12 +682,20 @@ Section Install
     File /a "/oname={{this}}" "{{no-escape @key}}"
   {{/each}}
 
-  ; Create file associations
+  ; QuietMusic custom patch: register candidates only; never replace an extension's
+  ; default value or Windows UserChoice (REQUIREMENTS 3.21.4.3).
   {{#each file_associations as |association| ~}}
+    WriteRegStr SHCTX "Software\Classes\{{or association.name ext}}" "" "{{association-description association.description ext}}"
+    WriteRegStr SHCTX "Software\Classes\{{or association.name ext}}\DefaultIcon" "" "$\"$INSTDIR\${MAINBINARYNAME}.exe$\",0"
+    WriteRegStr SHCTX "Software\Classes\{{or association.name ext}}\shell\open\command" "" "$\"$INSTDIR\${MAINBINARYNAME}.exe$\" --play $\"%1$\""
     {{#each association.ext as |ext| ~}}
-       !insertmacro APP_ASSOCIATE "{{ext}}" "{{or association.name ext}}" "{{association-description association.description ext}}" "$INSTDIR\${MAINBINARYNAME}.exe,0" "Open with ${PRODUCTNAME}" "$INSTDIR\${MAINBINARYNAME}.exe $\"%1$\""
+      WriteRegStr SHCTX "Software\Classes\.{{ext}}\OpenWithProgids" "{{association.name}}" ""
+      WriteRegStr SHCTX "Software\QuietMusic\Capabilities\FileAssociations" ".{{ext}}" "{{association.name}}"
     {{/each}}
   {{/each}}
+  WriteRegStr SHCTX "Software\QuietMusic\Capabilities" "ApplicationName" "轻听"
+  WriteRegStr SHCTX "Software\QuietMusic\Capabilities" "ApplicationDescription" "轻听本地音乐播放器"
+  WriteRegStr SHCTX "Software\RegisteredApplications" "QuietMusic" "Software\QuietMusic\Capabilities"
 
   ; Register deep links
   {{#each deep_link_protocols as |protocol| ~}}
@@ -817,12 +825,15 @@ Section Uninstall
     Delete "$INSTDIR\\{{this}}"
   {{/each}}
 
-  ; Delete app associations
+  ; QuietMusic custom patch: remove only our registration, preserving other players.
   {{#each file_associations as |association| ~}}
     {{#each association.ext as |ext| ~}}
-      !insertmacro APP_UNASSOCIATE "{{ext}}" "{{or association.name ext}}"
+      DeleteRegValue SHCTX "Software\Classes\.{{ext}}\OpenWithProgids" "{{association.name}}"
     {{/each}}
+    DeleteRegKey SHCTX "Software\Classes\{{or association.name ext}}"
   {{/each}}
+  DeleteRegValue SHCTX "Software\RegisteredApplications" "QuietMusic"
+  DeleteRegKey SHCTX "Software\QuietMusic\Capabilities"
 
   ; Delete deep links
   {{#each deep_link_protocols as |protocol| ~}}

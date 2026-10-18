@@ -32,6 +32,8 @@ pub(crate) fn sample_track_with(title: &str, singer: &str) -> Track {
         pic_url: String::new(),
         duration: 210.0,
         music_id: None,
+        start_ms: None,
+        end_ms: None,
     }
 }
 
@@ -45,7 +47,42 @@ fn track(id: &str, title: &str) -> Track {
         pic_url: String::new(),
         duration: 210.0,
         music_id: None,
+        start_ms: None,
+        end_ms: None,
     }
+}
+
+/// CUE 子轨从扫描行进入各域后，不能退化成整张专辑。
+#[test]
+fn cue_intervals_survive_playlist_like_history_session_and_download() {
+    let conn = test_conn();
+    let mut t = track("C:\\album.flac#cue:2", "第二乐章");
+    t.platform = SourceId::local();
+    t.start_ms = Some(61_000);
+    t.end_ms = Some(121_500);
+    t.duration = 60.5;
+    conn.execute(
+        "INSERT INTO tracks (id, platform, title, singer, album, duration_ms, start_ms, end_ms, missing, created_at, updated_at)
+         VALUES (?1, 'local', ?2, ?3, ?4, 60500, 61000, 121500, 0, 1, 1)",
+        rusqlite::params![db_track_id(&t), t.title, t.singer, t.album],
+    ).unwrap();
+    let pid = create_playlist(&conn, "分轨测试").unwrap();
+    add_tracks_to_playlist(&conn, &pid, std::slice::from_ref(&t)).unwrap();
+    add_liked_song(&conn, &t, &pid).unwrap();
+    record_play_history(&conn, &t).unwrap();
+    save_queue(&conn, std::slice::from_ref(&t)).unwrap();
+    create_download_task(&conn, &t, "flac", None, None).unwrap();
+    let assert_interval = |got: &Track| {
+        assert_eq!(got.id, t.id);
+        assert_eq!(got.start_ms, Some(61_000));
+        assert_eq!(got.end_ms, Some(121_500));
+        assert_eq!(got.duration, 60.5);
+    };
+    assert_interval(&get_playlist_tracks(&conn, &pid).unwrap()[0]);
+    assert_interval(&list_liked_songs(&conn, Some(&pid)).unwrap()[0]);
+    assert_interval(&list_play_history(&conn, 10).unwrap()[0].track);
+    assert_interval(&load_session(&conn).unwrap().unwrap().tracks[0]);
+    assert_interval(&list_download_tasks(&conn).unwrap()[0].track);
 }
 
 /// 离线队列：入队去重（同目标键新操作覆盖旧操作）、ack、退避、计数。
@@ -759,6 +796,8 @@ fn play_stats_skips_local_track_missing_from_library() {
         pic_url: String::new(),
         duration: 180.0,
         music_id: None,
+        start_ms: None,
+        end_ms: None,
     };
     record_listen(&conn, &local, 1000, 1, 1).expect("本地曲目统计不该报错");
     assert_eq!(play_overview(&conn).expect("overview").total_plays, 0);
@@ -779,6 +818,8 @@ fn lists_keep_track_cover_url() {
         pic_url: COVER.to_string(),
         duration: 210.0,
         music_id: None,
+        start_ms: None,
+        end_ms: None,
     };
 
     let pid = create_playlist(&conn, "测试歌单").expect("建歌单");
@@ -833,6 +874,8 @@ fn foreign_local_song_lands_in_liked_playlist() {
         pic_url: String::new(),
         duration: 0.0,
         music_id: None,
+        start_ms: None,
+        end_ms: None,
     };
 
     add_liked_song(&conn, &phone_local, LOCAL_PLATFORM).expect("落库不应报错");
@@ -1012,5 +1055,130 @@ fn lyric_record_serializes_word_by_word_and_romaji() {
     assert!(
         json.get("word_lrc").is_none() && json.get("wordLrc").is_none(),
         "不该把库里的列名漏到前端契约里：{json}"
+    );
+}
+
+/// 本地文件自带的词（2026-10-18）：落库带 `local-*` 来源、`manual` 恒为 0、
+/// 且**不覆盖非本地来源的既有行**（用户手动挑过的词优先级更高）。
+///
+/// 这里钉三件事：
+/// 1. `upsert_local_lyric` 写得进、来源与 `manual` 都对；
+/// 2. 用户手动挑的词（source = 音源名）不会被下一次扫描冲掉，返回 false；
+/// 3. `lyric_path`（V1 就建好、此前零读写的列）真的记下来了。
+#[test]
+fn local_file_lyric_roundtrip_and_keeps_picked_source() {
+    let conn = test_conn();
+    let t = track("2001", "本地自带词");
+    upsert_tracks(&conn, &[&t]).expect("upsert track");
+    let id = db_track_id(&t);
+
+    // 1. 同名 .lrc 落库：来源 local-lrc、manual = 0、路径记进 lyric_settings
+    assert!(
+        upsert_local_lyric(&conn, &id, "[00:01.00]文件里的词", "local-lrc", Some("D:/m/a.lrc"))
+            .expect("upsert local lyric"),
+        "本地歌词应写入成功"
+    );
+    let got = get_lyric(&conn, &id).expect("read").expect("应有歌词");
+    assert_eq!(got.lrc, "[00:01.00]文件里的词");
+    assert_eq!(got.source, "local-lrc");
+    assert!(!got.manual, "文件自带的词不是用户挑的，manual 必须为 0");
+    let path: String = conn
+        .query_row(
+            "SELECT lyric_path FROM lyric_settings WHERE track_id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .expect("lyric_path 应已写入");
+    assert_eq!(path, "D:/m/a.lrc");
+
+    // 内嵌标签来源覆盖同一条本地行（同一首歌的文件里自带词换了）
+    assert!(
+        upsert_local_lyric(&conn, &id, "[00:02.00]内嵌的词", "local-tag", None)
+            .expect("upsert embedded"),
+        "本地来源之间可以互相覆盖"
+    );
+    let got2 = get_lyric(&conn, &id).expect("read").expect("应有歌词");
+    assert_eq!(got2.source, "local-tag");
+    assert_eq!(got2.lrc, "[00:02.00]内嵌的词");
+
+    // 2. 用户手动挑过的词：本地扫描不得覆盖它
+    upsert_lyric(&conn, &id, "[00:03.00]手动挑的", "", "", "", "kg", true).expect("manual upsert");
+    assert!(
+        !upsert_local_lyric(&conn, &id, "[00:04.00]扫描到的", "local-lrc", None)
+            .expect("upsert after manual"),
+        "既有行不是本地来源时必须原样不动"
+    );
+    let got3 = get_lyric(&conn, &id).expect("read").expect("应有歌词");
+    assert_eq!(got3.lrc, "[00:03.00]手动挑的", "用户挑的词不该被扫描冲掉");
+    assert_eq!(got3.source, "kg");
+    assert!(got3.manual, "手动标记也不该被动");
+
+    // 空正文 / 未入库曲目都静默跳过
+    assert!(!upsert_local_lyric(&conn, &id, "   ", "local-lrc", None).expect("blank"));
+    assert!(
+        !upsert_local_lyric(&conn, "local:/ghost.mp3", "x", "local-lrc", None).expect("ghost")
+    );
+    assert!(get_lyric(&conn, "local:/ghost.mp3")
+        .expect("read")
+        .is_none());
+}
+
+/// 历史的单条 / 批量删除，以及「指向丢失文件」那部分记录的计数与清理。
+///
+/// 背景：历史页原来只能「清空」，而 `list_play_history` 又把 `missing = 1` 的行
+/// 悄悄滤掉 —— 丢失文件的记录既删不掉、也在界面上看不见。
+#[test]
+fn history_remove_purge_and_missing_count() {
+    let conn = test_conn();
+    let a = track("5001", "A");
+    let b = track("5002", "B");
+    let c = track("5003", "C");
+    for t in [&a, &b, &c] {
+        record_play_history(&conn, t).expect("record");
+    }
+
+    // 单条删除：按 tracks 主键口径 `platform:id`
+    assert!(remove_play_history(&conn, &db_track_id(&a)).expect("remove a"));
+    let left: Vec<String> = list_play_history(&conn, 0)
+        .expect("list")
+        .iter()
+        .map(|i| i.track.title.clone())
+        .collect();
+    assert_eq!(left, vec!["C".to_string(), "B".to_string()]);
+    // 再删一次：不报错，也不谎报删到了
+    assert!(!remove_play_history(&conn, &db_track_id(&a)).expect("remove a again"));
+
+    // 空批量不能拼出 `IN ()` 这种非法 SQL
+    assert_eq!(remove_play_history_many(&conn, &[]).expect("empty batch"), 0);
+
+    let ids = vec![db_track_id(&b), db_track_id(&c), db_track_id(&a)];
+    assert_eq!(
+        remove_play_history_many(&conn, &ids).expect("batch"),
+        2,
+        "只有还在列表里的两条被删"
+    );
+    assert!(list_play_history(&conn, 0)
+        .expect("list after batch")
+        .is_empty());
+
+    // 指向丢失文件的记录：列表里看不见，但计数查得到、也能一键清掉
+    let gone = track("5004", "文件没了");
+    record_play_history(&conn, &gone).expect("record gone");
+    conn.execute(
+        "UPDATE tracks SET missing = 1 WHERE id = ?1",
+        rusqlite::params![db_track_id(&gone)],
+    )
+    .expect("mark missing");
+    assert!(
+        list_play_history(&conn, 0)
+            .expect("list hides missing")
+            .is_empty(),
+        "丢失文件的记录本来就不出现在列表里"
+    );
+    assert_eq!(count_missing_play_history(&conn).expect("count"), 1);
+    assert_eq!(purge_missing_play_history(&conn).expect("purge"), 1);
+    assert_eq!(
+        count_missing_play_history(&conn).expect("count after purge"),
+        0
     );
 }

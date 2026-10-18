@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "mini-capability",
+  "description": "迷你播放器窗口能力：订阅播放事件 + 拖动 + 队列展开时改自身高度（§3.21.7.2）",
+  "windows": ["mini"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-size",
+    "core:window:allow-show",
+    "core:window:allow-set-focus"
+  ]
+}

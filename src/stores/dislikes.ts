@@ -84,7 +84,8 @@ export const useDislikesStore = create<DislikesStore>((set, get) => ({
         version: s.version + 1,
       }));
     } catch {
-      set({ loaded: true });
+      // 写操作可能已成功，规则列表重载失败也要让行状态重新判定。
+      set((s) => ({ loaded: true, version: s.version + 1 }));
     }
   },
 

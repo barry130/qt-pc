@@ -30,6 +30,7 @@ use tauri::Emitter;
 
 use super::fx::{AudioFx, DspSource, EqParams, FadeParams, FxState};
 use super::queue::Queue;
+use super::source::{IntervalSource, SourceProgress, TrackedSource};
 use super::range_reader::{self, RangeShared};
 use super::state::{PlayMode, PlaybackStateSnapshot, PlaybackStatus, Quality};
 
@@ -74,6 +75,9 @@ pub enum AudioCmd {
         size_bytes: Option<u64>,
         /// 加载代次：与引擎当前代次不一致说明等待期间用户又切了歌，结果丢弃
         gen: u64,
+        /// gapless 预载回执（true = 这是预载的「下一首」，就绪后存进预载槽，
+        /// **不**直接挂载播放；gen 与发起时一致且开关仍开才会被接收）
+        preload: bool,
     },
     Play,
     Pause,
@@ -153,6 +157,8 @@ pub enum AudioCmd {
     SetFade(FadeParams),
     /// 播放条频谱背景开关：开 = DspSource 采样做 FFT 推 `spectrum` 事件。
     SetSpectrum(bool),
+    /// Append the prepared next source to the current Player without a stop/restart.
+    SetGapless(bool),
     /// 播放缓存体积上限（MB，0 = 不限）。引擎落 settings 并立即后台修剪一遍。
     SetCacheLimit(u64),
     /// 切换播放缓存目录（设置页「通用 → 缓存位置」）。之后的取流按新目录落盘；
@@ -196,6 +202,8 @@ pub enum AudioCmd {
     /// 不喜欢列表变了（加/删/清空）：重新装载内存镜像。
     /// 屏蔽规则一改就把自动切歌立刻对齐，不用等下一轮播完。
     ReloadDislikes,
+    /// A failed speculative load must never change the current playback state.
+    PreloadFailed { gen: u64 },
     Shutdown,
 }
 
@@ -306,6 +314,10 @@ impl AudioEngine {
         }
     }
 
+    pub fn set_gapless(&self, enabled: bool) {
+        self.send(AudioCmd::SetGapless(enabled));
+    }
+
     pub fn snapshot(&self) -> PlaybackStateSnapshot {
         self.state.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -331,14 +343,35 @@ impl AudioEngine {
     }
 }
 
+struct PreloadSlot {
+    gen: u64,
+    index: usize,
+    track: Track,
+    ready: Option<PreparedTrack>,
+    failed: bool,
+}
+
+struct PreparedTrack {
+    progress: Arc<SourceProgress>,
+    shared: Option<Arc<RangeShared>>,
+    duration_ms: u64,
+    is_local: bool,
+    url_fetched_at: Option<u64>,
+    play_url: Option<String>,
+    bitrate_kbps: Option<u32>,
+}
+
 struct EngineInner {
     app: tauri::AppHandle,
     tx: Sender<AudioCmd>,
     state: Arc<RwLock<PlaybackStateSnapshot>>,
     queue: Arc<Mutex<Queue>>,
     cache_dir: PathBuf,
-    http: reqwest::blocking::Client,
     url_cache: Arc<PlayUrlCache>,
+    gapless: bool,
+    preload_gen: u64,
+    preload: Option<PreloadSlot>,
+    current_progress: Option<Arc<SourceProgress>>,
     sink: Player,
     /// 持有输出流（丢掉它会立即关闭音频端点）
     _stream: rodio::MixerDeviceSink,
@@ -483,6 +516,7 @@ impl EngineInner {
     /// 用于「用户主动切设备」「看门狗重建」「掉设备后兜底」三条路径；按重建前
     /// 的播放态续播，所以掉设备那条必须**先** `finish_pause`（见 pause_for_device_loss）。
     fn rebuild_output(&mut self, choice: Option<&str>) -> Result<(), String> {
+        invalidate_preload(self);
         // 重建出来的流同样要挂错误回调：否则「看门狗重建过的流」又变成哑巴
         let new_stream = match choice {
             Some(name) => {
@@ -513,7 +547,7 @@ impl EngineInner {
             // （新流要等 mount_decoder 才 clear），get_pos() 取到的是上一首的位置，
             // 会把新曲定位到错误的地方；暂停/错误态两者等价，快照更权威。
             let pos = if st.status == PlaybackStatus::Playing {
-                self.sink.get_pos().as_millis() as u64
+                content_pos_ms(self)
             } else {
                 st.position_ms
             };
@@ -536,6 +570,7 @@ impl EngineInner {
         // 新 Player 的速度控制是全新的（controls 随实例创建），倍速必须重挂
         self.sink.set_speed(self.speed);
         self.current_shared = None;
+        self.current_progress = None;
         self.tick_anchor = None;
 
         {
@@ -609,6 +644,7 @@ fn mode_key(m: PlayMode) -> String {
 
 // ---------- 倍速 / 音效的 settings 键（读写都只在引擎线程） ----------
 
+pub const SETTING_GAPLESS: &str = "playback.gapless";
 const SETTING_SPEED: &str = "playback.speed";
 const SETTING_FX_EQ: &str = "fx.eq";
 const SETTING_FX_LOUDNORM: &str = "fx.loudnorm";
@@ -624,13 +660,14 @@ fn epoch_ms(inner: &EngineInner) -> u64 {
     inner.epoch.elapsed().as_millis() as u64
 }
 
-/// 当前播放位置，换算回**内容时间域**（歌曲本体的进度，与倍速无关）。
-///
-/// rodio 的 `get_pos()` 在 Player 的速度控制链下走「真实时间」口径
-/// （TrackPosition 包在 Speed 外层，除以 rate×factor）：倍速 f 下
-/// 内容位置 = get_pos × f。f=1 时恒等，存量语义不变。
+/// Track-relative content position, measured at the decoder before Player's
+/// speed control. A queued successor has a separate receipt, so concatenation
+/// never carries the previous track's position into its snapshot.
 fn content_pos_ms(inner: &EngineInner) -> u64 {
-    inner.sink.get_pos().mul_f32(inner.speed).as_millis() as u64
+    inner.current_progress.as_ref().map_or_else(
+        || inner.sink.get_pos().mul_f32(inner.speed).as_millis() as u64,
+        |progress| progress.position_ms(),
+    )
 }
 
 /// 按内容时间域 seek：rodio 的 try_seek 会被外层 Speed 再乘一次倍速，
@@ -643,6 +680,7 @@ fn sink_seek_content(inner: &EngineInner, pos_ms: u64) -> Result<(), rodio::sour
 
 /// 真正执行暂停（淡出到期 / 无淡出的 Pause 共用）。
 fn finish_pause(inner: &mut EngineInner) {
+    invalidate_preload(inner);
     // 暂停是天然的落库时机：先把这段收听结算掉（会话不结束，继续播还能接着记）
     inner.settle_listen(false, false);
     inner.sink.pause();
@@ -745,25 +783,17 @@ fn run_engine(deps: EngineDeps) {
     let sink = rodio::Player::connect_new(_stream.mixer());
     sink.pause();
 
-    let http = reqwest::blocking::Client::builder()
-        .user_agent("Mozilla/5.0")
-        // 禁用连接池：休眠唤醒后池里的 keep-alive 连接是半死的（进程冻结期间
-        // pool_idle_timeout 计时器不走，醒来后池仍认为连接"新鲜"），新请求复用
-        // 它们就挂满超时才报错。pool_max_idle_per_host(0) 让每个请求建新连接，
-        // 醒来后要么立刻连成功、要么 connect_timeout 快速失败 —— 不再复用死连接。
-        .pool_max_idle_per_host(0)
-        .connect_timeout(Duration::from_secs(8))
-        .build()
-        .expect("blocking http client init");
-
     let inner = EngineInner {
         app,
         tx,
         state,
         queue,
         cache_dir,
-        http,
         url_cache,
+        gapless: false,
+        preload_gen: 0,
+        preload: None,
+        current_progress: None,
         sink,
         _stream,
         // None = 跟随系统默认；启动时从 settings 恢复用户上次的选择
@@ -838,6 +868,11 @@ fn run_engine(deps: EngineDeps) {
         let load = |key: &str| -> Option<String> {
             db.with(|c| store::get_setting(c, key)).ok().flatten()
         };
+        inner.gapless = load(SETTING_GAPLESS).is_some_and(|raw| raw.trim() == "true");
+        // Materialize the default as well, so settings readers observe false.
+        if load(SETTING_GAPLESS).is_none() {
+            let _ = db.with(|c| store::set_setting(c, SETTING_GAPLESS, "false"));
+        }
         if let Some(raw) = load(SETTING_SPEED) {
             if let Ok(v) = raw.parse::<f32>() {
                 let v = v.clamp(SPEED_MIN, SPEED_MAX);
@@ -1183,6 +1218,8 @@ fn pause_playback_for_device(
 /// 不改变 run_engine 的单线程模型 —— 三段都只借这一处调用，时序语义与
 /// 原地展开完全一致（last_publish 由调用方持有，圈与圈之间延续）。
 fn playing_cycle(inner: &mut EngineInner, last_publish: &mut std::time::Instant) {
+    sync_gapless_transition(inner);
+    maybe_preload(inner);
     // 自然播完检测：只认**实时**的 Playing 状态 + sink 已空。
     // 设备切换重建后 sink 暂时是空的、状态是 Loading（等待异步取址
     // 回发 Load 续播原曲）—— 若按循环开头的旧 playing 判定，
@@ -1210,6 +1247,24 @@ fn playing_cycle(inner: &mut EngineInner, last_publish: &mut std::time::Instant)
 }
 
 fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
+    sync_gapless_transition(inner);
+    if matches!(&cmd,
+        AudioCmd::Play | AudioCmd::Pause | AudioCmd::Stop | AudioCmd::Seek(_)
+        | AudioCmd::SetQueue { .. } | AudioCmd::PlayTrack(_) | AudioCmd::PlayAt(_)
+        | AudioCmd::Next | AudioCmd::Previous | AudioCmd::SetPlayMode(_)
+        | AudioCmd::ClearQueue | AudioCmd::AddNext(_) | AudioCmd::Append(_)
+        | AudioCmd::RemoveAt(_) | AudioCmd::RemoveIndices(_) | AudioCmd::MoveItem { .. }
+        | AudioCmd::ClearAfter | AudioCmd::RestoreSession { .. }
+        | AudioCmd::SetOutputDevice { .. } | AudioCmd::SetDefaultQuality { .. }
+        | AudioCmd::SetTrackQuality { .. } | AudioCmd::SetSpeed(_)
+        | AudioCmd::SetSleepTimer { .. } | AudioCmd::SetGapless(_)
+        | AudioCmd::ReloadDislikes | AudioCmd::SetCacheDir(_) | AudioCmd::Shutdown
+    ) {
+        invalidate_preload(inner);
+    }
+    if matches!(&cmd, AudioCmd::Stop | AudioCmd::ClearQueue | AudioCmd::SetQueue { .. }) {
+        inner.load_gen = inner.load_gen.wrapping_add(1);
+    }
     match cmd {
         AudioCmd::LoadReady {
             track,
@@ -1223,7 +1278,13 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             play_url,
             size_bytes,
             gen,
+            preload,
         } => {
+            if preload {
+                append_preloaded(inner, *track, decoder, shared, duration_ms, is_local,
+                    url_fetched_at, play_url, size_bytes, gen);
+                return false;
+            }
             // 过期结果丢弃：等待取址/构建期间用户又切了歌，这条是旧歌的
             if gen != inner.load_gen {
                 log::debug!(
@@ -1305,6 +1366,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             inner.settle_listen(false, true);
             inner.sink.clear();
             inner.current_shared = None;
+            inner.current_progress = None;
             inner.pause_deadline = None;
             inner.fx.clear_fade();
             *inner.cache_file.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -1443,6 +1505,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
         AudioCmd::ClearQueue => {
             inner.sink.clear();
             inner.current_shared = None;
+            inner.current_progress = None;
             inner.pause_deadline = None;
             inner.fx.clear_fade();
             *inner.cache_file.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -1660,6 +1723,23 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                 }
             }
         }
+        AudioCmd::SetGapless(enabled) => {
+            inner.gapless = enabled;
+            if let Some(db) = &inner.db {
+                let value = if enabled { "true" } else { "false" };
+                if let Err(error) = db.with(|c| store::set_setting(c, SETTING_GAPLESS, value)) {
+                    log::warn!("[db] gapless setting failed: {error}");
+                }
+            }
+            maybe_preload(inner);
+        }
+        AudioCmd::PreloadFailed { gen } => {
+            if let Some(slot) = inner.preload.as_mut().filter(|slot| slot.gen == gen) {
+                // Keep the failed slot until the next boundary/invalidation, rather
+                // than retrying a failed speculative request every 25ms.
+                slot.failed = true;
+            }
+        }
         AudioCmd::SetFade(params) => {
             // 正在淡出时改参数：直接收尾暂停，避免 deadline 与新时长不一致
             if inner.pause_deadline.is_some() {
@@ -1836,6 +1916,7 @@ fn play_queue_track(inner: &mut EngineInner, track: Track) {
 
 /// 暂停态变体：恢复现场用（autoplay=false，start_ms>0 时加载后定位）。
 fn load_queue_track(inner: &mut EngineInner, track: Track, autoplay: bool, start_ms: u64) {
+    invalidate_preload(inner);
     // 切换到别的曲目 = 这次收听结束，先结算（同曲**重载**不结算：弱网原地重试 /
     // 恢复现场 / 换音质续播都还是同一次收听，见 begin_listen）
     let switched = inner
@@ -1851,7 +1932,7 @@ fn load_queue_track(inner: &mut EngineInner, track: Track, autoplay: bool, start
         _ => inner.default_quality.clone(),
     };
     // 每次新加载推进代次：在途的旧加载结果回来时据此丢弃
-    inner.load_gen += 1;
+    inner.load_gen = inner.load_gen.wrapping_add(1);
     let gen = inner.load_gen;
     inner.mutate(|st| {
         st.quality = quality;
@@ -1881,6 +1962,7 @@ fn advance(inner: &mut EngineInner, auto: bool) {
         inner.sleep_deadline = None;
         inner.sink.clear();
         inner.current_shared = None;
+        inner.current_progress = None;
         *inner.cache_file.lock().unwrap_or_else(|e| e.into_inner()) = None;
         inner.mutate(|st| {
             st.status = PlaybackStatus::Stopped;
@@ -1918,6 +2000,7 @@ fn advance(inner: &mut EngineInner, auto: bool) {
                 // 永远能绕回开头，不会走到这里）。停下并保留最后一曲信息。
                 inner.sink.clear();
                 inner.current_shared = None;
+                inner.current_progress = None;
                 *inner.cache_file.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 inner.mutate(|st| {
                     st.status = PlaybackStatus::Stopped;
@@ -2508,7 +2591,6 @@ fn spawn_resolve_and_load(
         app: inner.app.clone(),
         tx: inner.tx.clone(),
         cache: Arc::clone(&inner.url_cache),
-        http: inner.http.clone(),
         cache_dir: inner.cache_dir.clone(),
         history_db: inner.db.clone(),
         quality: inner.state.read().unwrap_or_else(|e| e.into_inner()).quality.clone(),
@@ -2516,6 +2598,7 @@ fn spawn_resolve_and_load(
         autoplay,
         start_ms,
         gen,
+        preload: false,
     };
     tauri::async_runtime::spawn(job.run());
 }
@@ -2525,7 +2608,6 @@ struct LoadJob {
     app: tauri::AppHandle,
     tx: Sender<AudioCmd>,
     cache: Arc<PlayUrlCache>,
-    http: reqwest::blocking::Client,
     cache_dir: PathBuf,
     history_db: Option<Arc<Database>>,
     quality: types::Quality,
@@ -2533,6 +2615,7 @@ struct LoadJob {
     autoplay: bool,
     start_ms: u64,
     gen: u64,
+    preload: bool,
 }
 
 impl LoadJob {
@@ -2540,7 +2623,7 @@ impl LoadJob {
         // 本地曲目：Track.id 即文件绝对路径，无需 Provider 取址（DESIGN §13）
         if self.track.platform.is_local() {
             log::debug!("[queue] local track path={}", self.track.id);
-            let path = self.track.id.clone();
+            let path = crate::cue::strip_cue_suffix(&self.track.id).to_string();
             self.build_and_dispatch(PlaySource::Local { path }, true, None)
                 .await;
             return;
@@ -2694,12 +2777,19 @@ impl LoadJob {
 
     /// 在 blocking 线程池里构建解码器（HTTP open + 首包探测都是阻塞 IO）。
     async fn try_build(&self, source: &PlaySource) -> Result<BuiltDecoder, String> {
-        let http = self.http.clone();
         let cache_dir = self.cache_dir.clone();
         let track = self.track.clone();
         let source = source.clone();
+        let start_ms = self.start_ms;
         tauri::async_runtime::spawn_blocking(move || {
-            build_decoder(&source, &http, &cache_dir, &track)
+            let http = audio_http_client();
+            let mut built = build_decoder(&source, &http, &cache_dir, &track)?;
+            if start_ms > 0 {
+                let position = if built.duration_ms > 0 { start_ms.min(built.duration_ms) } else { start_ms };
+                built.source.try_seek(Duration::from_millis(position))
+                    .map_err(|error| format!("恢复进度失败: {error}"))?;
+            }
+            Ok(built)
         })
         .await
         .map_err(|e| format!("构建任务异常: {e}"))?
@@ -2729,25 +2819,32 @@ impl LoadJob {
         play_url: Option<String>,
         size_bytes: Option<u64>,
     ) {
-        let (decoder, shared, duration_ms) = built;
+        let BuiltDecoder { source: decoder, shared, duration_ms, physical_duration_ms } = built;
+        // A CUE track covers part of the physical file. Scale its byte count as
+        // well, so dividing by the interval duration preserves the file bitrate.
+        let size_bytes = size_bytes.or_else(|| shared.as_ref().and_then(|shared| shared.total_len()));
+        let size_bytes = if self.track.start_ms.is_some() || self.track.end_ms.is_some() {
+            size_bytes.and_then(|size| (physical_duration_ms > 0).then(|| {
+                (u128::from(size) * u128::from(duration_ms) / u128::from(physical_duration_ms)) as u64
+            }))
+        } else {
+            size_bytes
+        };
+        let start_at = if duration_ms > 0 { self.start_ms.min(duration_ms) } else { self.start_ms };
         let _ = self.tx.send(AudioCmd::LoadReady {
             track: Box::new(self.track.clone()),
             decoder,
             shared,
             duration_ms,
-            start_at: if self.start_ms > 0 {
-                Some(self.start_ms)
-            } else {
-                None
-            },
+            start_at: (start_at > 0).then_some(start_at),
             autoplay: self.autoplay,
             is_local,
             url_fetched_at: fetched_at,
             play_url,
             size_bytes,
             gen: self.gen,
+            preload: self.preload,
         });
-        record_play_start(self.history_db.clone(), self.track.clone());
     }
 
     /// 回发失败：广播 audio-error + LoadFailed，由引擎统一置错误态并决定跳过。
@@ -2771,6 +2868,11 @@ impl LoadJob {
     /// 文件长度，套那个壳只会让用户反复重试。`stalled` 仍然照传，引擎侧
     /// 据此决定是否拉黑、是否计入连续失败熔断。
     fn dispatch_failed_message(self, kind: &'static str, message: String, stalled: bool) {
+        if self.preload {
+            log::debug!("[gapless] speculative load failed for {}: {message}", self.track.id);
+            let _ = self.tx.send(AudioCmd::PreloadFailed { gen: self.gen });
+            return;
+        }
         let _ = self.app.emit(
             "audio-error",
             serde_json::json!({
@@ -2831,6 +2933,143 @@ fn spawn_cache_prune(inner: &EngineInner) {
         });
 }
 
+/// Cancel only the pending source; current audio remains on the same Player.
+/// The activation CAS closes the race between a manual command and render pull.
+fn invalidate_preload(inner: &mut EngineInner) {
+    let progress = inner.preload.as_ref()
+        .and_then(|slot| slot.ready.as_ref()).map(|ready| Arc::clone(&ready.progress));
+    if let Some(progress) = progress {
+        if !progress.cancel_pending() {
+            sync_gapless_transition(inner);
+        }
+    }
+    inner.preload = None;
+    inner.preload_gen = inner.preload_gen.wrapping_add(1);
+}
+
+fn maybe_preload(inner: &mut EngineInner) {
+    if !inner.gapless || inner.sleep_after_track || !inner.auto_next || inner.preload.is_some()
+        || inner.pause_deadline.is_some()
+    {
+        return;
+    }
+    let mode = {
+        let state = inner.state.read().unwrap_or_else(|e| e.into_inner());
+        if state.status != PlaybackStatus::Playing || inner.current_progress.is_none() {
+            return;
+        }
+        state.play_mode
+    };
+    let candidate = {
+        let queue = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
+        queue.next_index_skipping(mode, true, |track| inner.dislikes.matches(track))
+            .and_then(|index| queue.tracks.get(index).cloned().map(|track| (index, track)))
+    };
+    let Some((index, track)) = candidate else { return; };
+    inner.preload_gen = inner.preload_gen.wrapping_add(1);
+    let gen = inner.preload_gen;
+    // Choose Random exactly once; the retained index is committed on activation.
+    inner.preload = Some(PreloadSlot { gen, index, track: track.clone(), ready: None, failed: false });
+    let quality = match &inner.track_quality {
+        Some((id, quality)) if *id == track.id => quality.clone(),
+        _ => inner.default_quality.clone(),
+    };
+    let job = LoadJob {
+        app: inner.app.clone(), tx: inner.tx.clone(), cache: Arc::clone(&inner.url_cache),
+        cache_dir: inner.cache_dir.clone(), history_db: inner.db.clone(), quality,
+        track, autoplay: true, start_ms: 0, gen, preload: true,
+    };
+    tauri::async_runtime::spawn(job.run());
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_preloaded(
+    inner: &mut EngineInner,
+    track: Track,
+    decoder: Box<dyn Source + Send>,
+    shared: Option<Arc<RangeShared>>,
+    duration_ms: u64,
+    is_local: bool,
+    url_fetched_at: Option<u64>,
+    play_url: Option<String>,
+    size_bytes: Option<u64>,
+    gen: u64,
+) {
+    if !inner.gapless || inner.sleep_after_track || !inner.auto_next {
+        return;
+    }
+    let Some(slot) = inner.preload.as_ref() else { return; };
+    if slot.gen != gen || slot.track.id != track.id || slot.track.platform != track.platform
+        || slot.ready.is_some() || slot.failed
+    {
+        return;
+    }
+    let valid = inner.queue.lock().unwrap_or_else(|e| e.into_inner()).tracks.get(slot.index)
+        .is_some_and(|item| item.id == track.id && item.platform == track.platform);
+    if !valid { return; }
+    let bitrate_kbps = measured_bitrate_kbps(
+        size_bytes.or_else(|| shared.as_ref().and_then(|shared| shared.total_len())), duration_ms,
+    );
+    let progress = Arc::new(SourceProgress::default());
+    inner.preload.as_mut().unwrap().ready = Some(PreparedTrack {
+        progress: Arc::clone(&progress), shared, duration_ms, is_local,
+        url_fetched_at, play_url, bitrate_kbps,
+    });
+    // No clear(), new Player, fade or second output stream at this boundary.
+    inner.sink.append(DspSource::new(
+        Box::new(TrackedSource::new(decoder, progress)), Arc::clone(&inner.fx), inner.epoch,
+        Some(crate::audio::SpectrumTap::new(Some(inner.app.clone()))),
+    ));
+}
+
+fn sync_gapless_transition(inner: &mut EngineInner) {
+    let started = inner.preload.as_ref().and_then(|slot| slot.ready.as_ref())
+        .is_some_and(|ready| ready.progress.started());
+    if !started { return; }
+    let slot = inner.preload.take().unwrap();
+    let ready = slot.ready.unwrap();
+    // The old progress handle still points at the old source's final position.
+    inner.accrue_listen(content_pos_ms(inner));
+    inner.settle_listen(true, true);
+    {
+        let mut queue = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
+        queue.index = Some(slot.index);
+    }
+    inner.current_progress = Some(ready.progress);
+    inner.current_shared = ready.shared;
+    *inner.cache_file.lock().unwrap_or_else(|e| e.into_inner()) =
+        inner.current_shared.as_ref().map(|shared| shared.path().to_path_buf());
+    inner.failed_tracks.remove(&slot.track.id);
+    inner.fail_streak = 0;
+    inner.stall_retry = 0;
+    inner.watch.clear();
+    inner.sync_queue_to_snapshot();
+    inner.queue_emit();
+    let position_ms = content_pos_ms(inner);
+    let quality = match &inner.track_quality {
+        Some((id, quality)) if *id == slot.track.id => quality.clone(),
+        _ => inner.default_quality.clone(),
+    };
+    inner.mutate(|state| {
+        state.track_id = Some(slot.track.id.clone());
+        state.track = Some(slot.track.clone());
+        state.quality = quality;
+        state.duration_ms = ready.duration_ms;
+        state.position_ms = position_ms;
+        state.buffered_ms = 0;
+        state.is_local = ready.is_local;
+        state.url_fetched_at = ready.url_fetched_at;
+        state.play_url = ready.play_url;
+        state.bitrate_kbps = ready.bitrate_kbps;
+        state.error = None;
+    });
+    inner.begin_listen(&slot.track, ready.duration_ms);
+    record_play_start(inner.db.clone(), slot.track);
+    inner.tick_anchor = None;
+    inner.persist_state();
+    spawn_cache_prune(inner);
+}
+
 /// 挂载已构建好的解码器（LoadReady 到达时调用）。
 /// 网络 IO（打开流 + 首包探测）已在 blocking 线程池完成，这里只剩纯内存
 /// 操作 —— 引擎线程绝不能阻塞，否则休眠唤醒后的死连接会卡死整个控制面。
@@ -2860,8 +3099,10 @@ fn mount_decoder(
     // 倍速挂在 rodio Player 的控制链上（对 append 进来的源全局生效）；
     // DspSource 包在解码器外提供 EQ / 响度归一化 / 淡入淡出
     inner.sink.set_speed(inner.speed);
+    let progress = Arc::new(SourceProgress::default());
     inner.sink.append(DspSource::new(
-        decoder,
+        Box::new(TrackedSource::new(decoder, Arc::clone(&progress))
+            .with_position(start_at.unwrap_or(0))),
         Arc::clone(&inner.fx),
         inner.epoch,
         Some(crate::audio::SpectrumTap::new(Some(inner.app.clone()))),
@@ -2879,12 +3120,8 @@ fn mount_decoder(
     *inner.cache_file.lock().unwrap_or_else(|e| e.into_inner()) = shared.as_ref().map(|s| s.path().to_path_buf());
     // 新流落盘后顺手修剪缓存（超上限时清最旧的；后台线程）
     spawn_cache_prune(inner);
-    // 恢复现场：加载后先定位到上次进度（暂停态下 try_seek 同样有效）
-    if let Some(start) = start_at.filter(|s| *s > 0) {
-        if let Err(e) = sink_seek_content(inner, start) {
-            log::warn!("[queue] 恢复定位到 {start}ms 失败: {e:?}，从头播放");
-        }
-    }
+    // Initial CUE/restore seeks were performed on the blocking loader worker.
+    inner.current_progress = Some(progress);
     if autoplay {
         inner.sink.play();
     } else {
@@ -2917,13 +3154,36 @@ fn mount_decoder(
     // 收听会话从挂载成功这一刻开始（同曲重载不重开：那还是同一次收听）。
     // duration_ms 用解码器报的时长，有效播放的「听满一半」按它算。
     inner.begin_listen(track, duration_ms);
+    record_play_start(inner.db.clone(), track.clone());
     inner.tick_anchor = None;
     emit_position_tick(inner);
     inner.persist_state();
 }
 
-/// 构建好的解码器三元组：(boxed source, range 共享态, 时长 ms)。
-type BuiltDecoder = (Box<dyn Source + Send>, Option<Arc<RangeShared>>, u64);
+static AUDIO_HTTP: std::sync::OnceLock<RwLock<(u64, reqwest::blocking::Client)>> =
+    std::sync::OnceLock::new();
+
+/// Called on blocking loader workers: proxy changes take effect for each new load.
+fn audio_http_client() -> reqwest::blocking::Client {
+    crate::net_config::shared_blocking_client(&AUDIO_HTTP, || {
+        crate::net_config::configure_blocking(
+            reqwest::blocking::Client::builder()
+                .user_agent("Mozilla/5.0")
+                .pool_max_idle_per_host(0)
+                .connect_timeout(Duration::from_secs(8)),
+        )
+        .build()
+        .expect("blocking audio http client init")
+    })
+}
+
+/// A prepared decoder keeps physical duration for interval bitrate calculation.
+struct BuiltDecoder {
+    source: Box<dyn Source + Send>,
+    shared: Option<Arc<RangeShared>>,
+    duration_ms: u64,
+    physical_duration_ms: u64,
+}
 
 /// 构建 Decoder：在线走 HttpRangeReader（磁盘缓冲 + Range 下载线程），
 /// 播放总时长（毫秒）：以解码器为准 —— 它才是真正在播的那条流。
@@ -2941,7 +3201,8 @@ fn resolve_duration_ms<R: std::io::Read + std::io::Seek>(
     if decoded > 0 {
         return decoded;
     }
-    meta_duration_ms(track)
+    // CUE metadata duration is relative to the interval, not the physical file.
+    if track.start_ms.is_some() || track.end_ms.is_some() { 0 } else { meta_duration_ms(track) }
 }
 
 /// 元数据兜底时长（毫秒）。曲目元数据的单位在部分平台不可靠
@@ -2991,7 +3252,7 @@ fn build_decoder(
             // TryFrom<File> 会用文件长度自动填 byte_len，FLAC 的二分定位才可用
             let decoder = Decoder::try_from(file).map_err(|e| format!("解码失败: {e}"))?;
             let duration = resolve_duration_ms(&decoder, track);
-            Ok((Box::new(decoder), None, duration))
+            track_interval(Box::new(decoder), None, duration, track)
         }
         PlaySource::Online { url, referer, .. } => {
             let (reader, shared) =
@@ -3006,9 +3267,25 @@ fn build_decoder(
             };
             let decoder = builder.build().map_err(|e| format!("解码失败: {e}"))?;
             let duration = resolve_duration_ms(&decoder, track);
-            Ok((Box::new(decoder), Some(shared), duration))
+            track_interval(Box::new(decoder), Some(shared), duration, track)
         }
     }
+}
+
+fn track_interval(
+    decoder: Box<dyn Source + Send>,
+    shared: Option<Arc<RangeShared>>,
+    physical_duration_ms: u64,
+    track: &Track,
+) -> Result<BuiltDecoder, String> {
+    if track.start_ms.is_none() && track.end_ms.is_none() {
+        return Ok(BuiltDecoder { source: decoder, shared, duration_ms: physical_duration_ms, physical_duration_ms });
+    }
+    let source = IntervalSource::new(
+        decoder, track.start_ms.unwrap_or(0), track.end_ms, physical_duration_ms,
+    )?;
+    let duration_ms = source.total_duration().map_or(0, |duration| duration.as_millis() as u64);
+    Ok(BuiltDecoder { source: Box::new(source), shared, duration_ms, physical_duration_ms })
 }
 
 /// 250ms 节流 tick：position-changed { positionMs, durationMs, bufferedMs, monotonicMs }（§7.11）
@@ -3084,6 +3361,8 @@ mod duration_tests {
             pic_url: String::new(),
             duration: seconds,
             music_id: None,
+            start_ms: None,
+            end_ms: None,
         }
     }
 

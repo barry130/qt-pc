@@ -20,7 +20,8 @@ vi.mock("@/services/ipc", () => ({
 }));
 
 import * as ipc from "@/services/ipc";
-import { useAuthStore, isAdmin } from "@/stores/auth";
+import { useAuthStore, isAdmin, canUseMusicAssistant, MUSIC_ASSISTANT_PERM, pullLikes } from "@/stores/auth";
+import { useFavoritesStore } from "@/stores/favorites";
 import type { AuthSession } from "@/types";
 
 const ipcMock = vi.mocked(ipc);
@@ -78,6 +79,48 @@ describe("auth store 启动恢复", () => {
   });
 });
 
+describe("云端收藏同步使列表状态缓存失效", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    useFavoritesStore.setState({ version: 0 });
+    ipcMock.getSetting.mockResolvedValue("1");
+    ipcMock.likeApply.mockResolvedValue(0);
+    ipcMock.likePull.mockResolvedValue({ changes: [], maxSeq: 1 });
+  });
+
+  it("增量落库成功后刷新收藏版本，无变化不刷新", async () => {
+    ipcMock.likePull.mockResolvedValueOnce({ changes: [
+      { type: "song", id: "a", platform: "qq", name: "A", singer: "S", album: "", hash: "", picUrl: "", deleted: false, updatedSeq: 2 },
+    ], maxSeq: 2 });
+    await pullLikes();
+    expect(useFavoritesStore.getState().version).toBe(1);
+    expect(ipcMock.likeApply).toHaveBeenCalledTimes(1);
+    await pullLikes();
+    expect(useFavoritesStore.getState().version).toBe(1);
+  });
+
+  it("全量分批落库后刷新，包括歌单成功但歌曲失败的情况", async () => {
+    ipcMock.getSetting.mockResolvedValueOnce(null);
+    ipcMock.likePullAll.mockResolvedValueOnce({
+      playlists: [{ pid: "p1", platform: "local", name: "P" }],
+      songs: [{ sid: "a", platform: "qq", name: "A", pid: "p1" }],
+      maxSeq: 2,
+    }).mockResolvedValueOnce({ playlists: [], songs: [], maxSeq: 2 });
+    ipcMock.likeApply.mockResolvedValueOnce(0).mockRejectedValueOnce(new Error("db failed"));
+    await expect(pullLikes()).rejects.toThrow("db failed");
+    expect(useFavoritesStore.getState().version).toBe(1);
+  });
+
+  it("落库失败不把未生效的数据当作新版本", async () => {
+    ipcMock.likePull.mockResolvedValueOnce({ changes: [
+      { type: "song", id: "a", platform: "qq", name: "A", singer: "S", album: "", hash: "", picUrl: "", deleted: false, updatedSeq: 2 },
+    ], maxSeq: 2 });
+    ipcMock.likeApply.mockRejectedValueOnce(new Error("db failed"));
+    await expect(pullLikes()).rejects.toThrow("db failed");
+    expect(useFavoritesStore.getState().version).toBe(0);
+  });
+});
+
 // 权限判定回归：2026-09-30 权限模型重构（V20260930001）后，roles 回的是角色名
 // （TESTER/APP_USER），权限码在顶层 permissions（分层码），超管合成 *:*:* 不落库。
 // 判定对齐后端 PermissionChecker：新码精确匹配 + 超管/层级通配 + 旧扁平码兜底。
@@ -120,5 +163,45 @@ describe("isAdmin（轻听管理权限判定）", () => {
     expect(isAdmin({ roles: [] })).toBe(false);
     expect(isAdmin({ roles: "qt_admin" })).toBe(false);
     expect(isAdmin({ roles: ["TESTER"] })).toBe(false);
+  });
+});
+
+// 音乐助手入口显隐：后端 /api/v1/app/ai/agents 已按 accessService.permitted() 过滤
+// 智能体，没有 user:ai:music:use 的账号请求回来就是空列表。前端用同一个码提前
+// 决定侧边栏入口是否渲染，规则与 isAdmin 完全一致（同一个 hasPermission）。
+describe("canUseMusicAssistant（音乐助手入口显隐）", () => {
+  it("持有 user:ai:music:use → true", () => {
+    expect(canUseMusicAssistant({ permissions: ["user:like:view", MUSIC_ASSISTANT_PERM] })).toBe(
+      true,
+    );
+  });
+
+  it("层级通配与超管照样认", () => {
+    expect(canUseMusicAssistant({ permissions: ["user:ai:music:*"] })).toBe(true);
+    expect(canUseMusicAssistant({ permissions: ["user:ai:*"] })).toBe(true);
+    expect(canUseMusicAssistant({ permissions: ["user:*"] })).toBe(true);
+    expect(canUseMusicAssistant({ permissions: ["*:*:*"] })).toBe(true);
+  });
+
+  it("只有同前缀的兄弟码 → false（通配不跨段误判）", () => {
+    // 会话/收藏/歌单权限不含「使用助手」本身
+    expect(
+      canUseMusicAssistant({
+        permissions: ["user:ai:conversation:view", "user:ai:music:favorite"],
+      }),
+    ).toBe(false);
+    expect(canUseMusicAssistant({ permissions: ["admin:ai:config:view"] })).toBe(false);
+    expect(canUseMusicAssistant({ permissions: ["user:ai:musicx:use"] })).toBe(false);
+  });
+
+  it("未登录 / 无权限数据 → false（未登录不展示入口）", () => {
+    expect(canUseMusicAssistant(null)).toBe(false);
+    expect(canUseMusicAssistant({})).toBe(false);
+    expect(canUseMusicAssistant({ permissions: [] })).toBe(false);
+    expect(canUseMusicAssistant({ permissions: "user:ai:music:use" })).toBe(false);
+  });
+
+  it("管理员码不隐含音乐助手权限（两者独立授权）", () => {
+    expect(canUseMusicAssistant({ permissions: ["admin:qt:admin"] })).toBe(false);
   });
 });

@@ -182,3 +182,71 @@ fn track_exists(conn: &Connection, track_id: &str) -> Result<bool, rusqlite::Err
     .optional()
     .map(|v| v.is_some())
 }
+
+/// 本地歌词落库（本地扫描 / 播放时兜底取词调用，2026-10-18）。
+///
+/// 与 [`upsert_lyric`] 的区别在**谁说了算**：
+/// - `source` 写本地来源（`local-lrc` / `local-tag`，见 `crate::local` 的两个常量）；
+/// - 已经存在一行、且它的 `source` **不是**本地来源时，这里一个字都不改 —— 那一行要么
+///   是用户「搜索歌词」手动挑的，要么是在线自动取的词；下次扫描拿文件里的词把它冲掉，
+///   等于把用户的选择抹了。想换回文件里的词，重新选一次即可（手动挑的词本来就优先）。
+/// - 空正文不写。
+///
+/// `manual` 恒写 0：这份词不是用户挑的，是文件里带的。前端的优先级靠 `source` 前缀判断
+/// （本地来源 > 在线自动取词），不靠 `manual`——`manual` 只表示「用户在搜索歌词里选的」。
+///
+/// `lyric_path`：同名 `.lrc` 的路径，一并记进 `lyric_settings.lyric_path`（V1 就建好的列，
+/// 此前全库零读写；记下来是为了将来能显示「这份词来自哪个文件」）。返回是否真写入了。
+pub(crate) fn upsert_local_lyric(
+    conn: &Connection,
+    track_id: &str,
+    lrc: &str,
+    source: &str,
+    lyric_path: Option<&str>,
+) -> Result<bool, rusqlite::Error> {
+    if lrc.trim().is_empty() || !track_exists(conn, track_id)? {
+        return Ok(false);
+    }
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT source FROM lyrics WHERE track_id = ?1",
+            params![track_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if existing.is_some_and(|src| !src.starts_with("local")) {
+        return Ok(false);
+    }
+    conn.execute(
+        "INSERT INTO lyrics (track_id, lrc, word_lrc, translation, romaji, source, manual, fetched_at)
+         VALUES (?1, ?2, '', '', '', ?3, 0, ?4)
+         ON CONFLICT(track_id) DO UPDATE SET lrc = excluded.lrc,
+                                             source = excluded.source,
+                                             fetched_at = excluded.fetched_at",
+        params![track_id, lrc, source, now_ms()],
+    )?;
+    if let Some(path) = lyric_path {
+        set_lyric_path(conn, track_id, path)?;
+    }
+    Ok(true)
+}
+
+/// 记下这首歌的本地歌词文件路径（`lyric_settings.lyric_path`）。
+/// 曲目不在 tracks 里直接跳过（撞外键会炸整条链路）。
+pub(crate) fn set_lyric_path(
+    conn: &Connection,
+    track_id: &str,
+    path: &str,
+) -> Result<(), rusqlite::Error> {
+    if !track_exists(conn, track_id)? {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT INTO lyric_settings (track_id, lyric_path, updated_at)
+         VALUES (?1, ?2, ?3)
+         ON CONFLICT(track_id) DO UPDATE SET lyric_path = excluded.lyric_path,
+                                             updated_at = excluded.updated_at",
+        params![track_id, path, now_ms()],
+    )?;
+    Ok(())
+}

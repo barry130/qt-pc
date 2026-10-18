@@ -91,13 +91,14 @@ describe("dislikes store", () => {
     expect(useDislikesStore.getState().version).toBe(2);
   });
 
-  it("refresh 失败时只是标记 loaded，不丢既有规则", async () => {
+  it("refresh 失败不丢既有规则，仍使行标记失效以反映已成功的写操作", async () => {
     listDislikes.mockResolvedValue([rule(1, "稻香", "周杰伦")]);
     await useDislikesStore.getState().refresh();
     listDislikes.mockRejectedValue(new Error("db down"));
     await expect(useDislikesStore.getState().refresh()).resolves.toBeUndefined();
     expect(useDislikesStore.getState().loaded).toBe(true);
     expect(useDislikesStore.getState().rules).toHaveLength(1);
+    expect(useDislikesStore.getState().version).toBe(2);
   });
 
   it("banSong 记住规则 id 并刷新；id=0 视为没生效", async () => {

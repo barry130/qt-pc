@@ -10,7 +10,10 @@
 //!   发行包只留 `Warn`（Info 里绝大多数是启动流程，真要看的是 Warn/Error）；
 //!   `RUST_LOG` 与设置页里的 `log.level` 都能覆盖；
 //! - debug 构建同时保留 stderr 输出（dev 终端照常可见）；
-//! - 不引入新依赖：时间戳 Windows 用 GetLocalTime，其他平台退化 UTC。
+//! - 不引入新依赖：时间戳 Windows 用 GetLocalTime，其他平台退化 UTC；
+//! - 域名脱敏：报障时日志是往外发的东西，接口域名属于隐私 —— 消息里的域名
+//!   段一律打码成 `***`，scheme/端口/路径（即「对接了哪个接口」）保留
+//!   （见 [`mask_hosts`]；纯数字 IP 与 localhost 不打，本地取流日志还靠它们）。
 //!
 //! 用法：`run()` 最开头 `init()` + `install_panic_hook()`，其余代码照常用
 //! `log::` 宏，无感知；数据库打开后再 `apply_settings()` 把用户配置（级别 /
@@ -250,7 +253,10 @@ pub fn install_panic_hook() {
             .copied()
             .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
             .unwrap_or("未知 panic 载荷");
-        let line = format!("{} PANIC [{name}] {msg} at {location}", local_ts());
+        let line = mask_hosts(&format!(
+            "{} PANIC [{name}] {msg} at {location}",
+            local_ts()
+        ));
         append_line(&line);
         if cfg!(debug_assertions) {
             eprintln!("{line}");
@@ -276,12 +282,14 @@ impl log::Log for FileLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
+        // 先脱敏再格式化：落盘与 dev 终端看到的都没有域名，只有接口路径
+        let args = mask_hosts(&record.args().to_string());
         let line = format!(
             "{} {:<5} [{}] {}",
             local_ts(),
             record.level(),
             record.target(),
-            record.args()
+            args
         );
         append_line(&line);
         if cfg!(debug_assertions) {
@@ -301,6 +309,8 @@ impl log::Log for FileLogger {
 /// 全冲走了（诊断日志里翻不到任何有用信息）。
 ///
 /// 只按 target 前缀静音，且 Error 一律放行（真解码失败还是要看得见）。
+/// `reqwest::connect` 的 DEBUG 是单独的一条：除 trace 外一律静音（见
+/// [`suppressed_at`]），因为它的消息里只有域名、连打码后都没有信息量。
 /// 想连这些一起看时用 `RUST_LOG=debug` 或 `trace`（此时不过滤，见下）。
 fn suppressed(target: &str, level: log::Level) -> bool {
     suppressed_at(target, level, log::max_level())
@@ -310,6 +320,16 @@ fn suppressed(target: &str, level: log::Level) -> bool {
 fn suppressed_at(target: &str, level: log::Level, max: log::LevelFilter) -> bool {
     /// 静音名单：这些 target 只放 Error 过去
     const NOISY_TARGETS: [&str; 2] = ["symphonia_bundle_mp3", "symphonia_format_isomp4"];
+    // reqwest 的建连日志只有一句「starting new connection: Some("域名")」——
+    // 没有接口路径（域名也被 mask_hosts 打成 ***），任何档位里都是零信息刷屏，
+    // 默认 debug 档的 dev 构建一小时能写几千行。规则：Error 一律放行，
+    // RUST_LOG=trace（明确要看连接层）放行，其余档位静音。
+    if target.starts_with("reqwest::connect") {
+        if level <= log::Level::Error {
+            return false;
+        }
+        return max < log::LevelFilter::Trace;
+    }
     // 显式调高到 debug/trace 时是「我要看细节」，过滤让位
     if max >= log::LevelFilter::Debug {
         return false;
@@ -321,6 +341,101 @@ fn suppressed_at(target: &str, level: log::Level, max: log::LevelFilter) -> bool
     NOISY_TARGETS
         .iter()
         .any(|prefix| target.starts_with(prefix))
+}
+
+/// 诊断日志脱敏：域名不打进日志，只留「对接的接口」。
+///
+/// 诊断日志是报障时要往外发的东西，后端/用户自定义接口的域名属于隐私；
+/// 但「调了哪个接口」对排查有用。两条规则：
+/// - URL 里的主机段打码成 `***`，scheme/端口/路径原样保留：
+///   `https://astral.canace.cn/api/v1/app/x` → `https://***/api/v1/app/x`；
+/// - `Some("host[:port]")` 形态（reqwest 建连日志只给裸域名）整体打码：
+///   `Some("example.com")` → `Some("***")`。
+/// 判据是「主机段带字母」：域名必有字母，IPv4 纯数字段与 `localhost` 这类
+/// 无点裸名不打 —— 没有隐私，本地取流日志（127.0.0.1 端口）还靠它们定位。
+fn mask_hosts(msg: &str) -> String {
+    mask_url_hosts(&mask_quoted_hosts(msg))
+}
+
+/// 带点且含字母的主机段才打码；空段 / IPv4 / localhost 原样保留。
+fn host_maskable(host: &str) -> bool {
+    host.contains('.') && host.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// `host[:port]` → (主机段, 保留尾段)。尾段仅当端口是纯数字时保留（`:443`）。
+fn split_host_port(s: &str) -> (&str, &str) {
+    match s.rfind(':') {
+        Some(i) if s[i + 1..].chars().all(|c| c.is_ascii_digit()) => (&s[..i], &s[i..]),
+        _ => (s, ""),
+    }
+}
+
+/// `Some("...")` 裸值形态：reqwest 的建连日志是 `Some("domain")`。打主机，
+/// 保端口；没有收尾引号的不完整行不硬猜、原样拷贝。
+fn mask_quoted_hosts(msg: &str) -> String {
+    const HEAD: &str = "Some(\"";
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while let Some(idx) = rest.find(HEAD) {
+        out.push_str(&rest[..idx + HEAD.len()]);
+        rest = &rest[idx + HEAD.len()..];
+        match rest.find('"') {
+            Some(close) => {
+                let (host, port) = split_host_port(&rest[..close]);
+                // 只认「裸主机」形状：主机段里混进路径分隔符/空白这类非域名
+                // 字符（Windows 路径 Some("C:\\x.log"）就长这样）不算主机，
+                // 原样保留，避免把路径误打成 ***
+                let hostish = host
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+                if hostish && host_maskable(host) {
+                    out.push_str("***");
+                    out.push_str(port);
+                } else {
+                    out.push_str(&rest[..close]);
+                }
+                out.push('"');
+                rest = &rest[close + 1..];
+            }
+            None => {
+                out.push_str(rest);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `scheme://host[:port]` 形态：紧跟 `://` 的 [alnum.-] 串视为主机段；
+/// IPv6 以 `[` 开头读不进字符集，天然不打码。主机打码、端口与路径保留。
+fn mask_url_hosts(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while let Some(idx) = rest.find("://") {
+        let after_scheme = &rest[idx + 3..];
+        let host_len = after_scheme
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '.' || *c == '-')
+            .count();
+        let (host, tail) = after_scheme.split_at(host_len);
+        // 紧随的 ":port" 保留（后面不是数字就不算端口）
+        let port_len = tail
+            .strip_prefix(':')
+            .map(|p| 1 + p.chars().take_while(|c| c.is_ascii_digit()).count())
+            .filter(|n| *n > 1)
+            .unwrap_or(0);
+        out.push_str(&rest[..idx + 3]);
+        if host_maskable(host) {
+            out.push_str("***");
+        } else {
+            out.push_str(host);
+        }
+        out.push_str(&tail[..port_len]);
+        rest = &tail[port_len..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// 追加一行到当前日志（写满自动轮转；文件不可用时静默丢弃）。
@@ -419,7 +534,7 @@ pub fn default_level() -> log::LevelFilter {
 /// 本地时间戳 "YYYY-MM-DD HH:MM:SS.mmm"。Windows 用 GetLocalTime 拿本地时区；
 /// 其他平台退化成 UTC（只影响日志可读性，不影响排查所需的事件顺序）。
 #[cfg(target_os = "windows")]
-fn local_ts() -> String {
+pub(crate) fn local_ts() -> String {
     use windows::Win32::Foundation::SYSTEMTIME;
     use windows::Win32::System::SystemInformation::GetLocalTime;
     // windows 0.62 的 GetLocalTime 直接返回 SYSTEMTIME（Foundation 里定义）
@@ -431,7 +546,7 @@ fn local_ts() -> String {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn local_ts() -> String {
+pub(crate) fn local_ts() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -664,5 +779,76 @@ mod tests {
             inner.max_backups = DEFAULT_BACKUPS;
         }
         log::set_max_level(level_before);
+    }
+
+    /// 域名脱敏：只留接口路径，域名一律 `***`；纯数字 IP 与 localhost 不动。
+    #[test]
+    fn domains_masked_but_paths_kept() {
+        // URL：scheme / 端口 / 路径保留，主机打码
+        assert_eq!(
+            mask_hosts("在 https://astral.canace.cn/api/v1/app/x?a=1 查询"),
+            "在 https://***/api/v1/app/x?a=1 查询"
+        );
+        assert_eq!(
+            mask_hosts("GET https://a.aa.cab:443/qq.music"),
+            "GET https://***:443/qq.music"
+        );
+        // reqwest 建连日志的裸域名形态
+        assert_eq!(
+            mask_hosts("starting new connection: Some(\"astral.canace.cn\")"),
+            "starting new connection: Some(\"***\")"
+        );
+        assert_eq!(
+            mask_hosts("connecting to Some(\"api.example.com:8443\")"),
+            "connecting to Some(\"***:8443\")"
+        );
+        // 同行多个域名各自打码
+        assert_eq!(
+            mask_hosts("https://a.aa.cab/x then https://astral.canace.cn/y"),
+            "https://***/x then https://***/y"
+        );
+        // IPv4 与 localhost：本地取流日志靠它们定位，不打
+        assert_eq!(
+            mask_hosts("open http://127.0.0.1:8000/static/?path=x, retrying localhost:5173"),
+            "open http://127.0.0.1:8000/static/?path=x, retrying localhost:5173"
+        );
+        // 版本号 / Windows 路径这类「带点带冒号的非域名」不受误伤
+        assert_eq!(
+            mask_hosts("version Some(\"1.2.3\"), file Some(\"C:\\\\x.log\")"),
+            "version Some(\"1.2.3\"), file Some(\"C:\\\\x.log\")"
+        );
+        // 无域名普通文本原样
+        assert_eq!(mask_hosts("缓存清理完成，释放 12 MB"), "缓存清理完成，释放 12 MB");
+    }
+
+    /// reqwest::connect 的 DEBUG 只有域名（打码后零信息）：Error 与 trace 放行，
+    /// 其余档位静音；其它的 reqwest target 与本项目 target 不受牵连。
+    #[test]
+    fn reqwest_connect_debug_is_noise() {
+        let dbg = log::LevelFilter::Debug;
+        // dev 构建默认的 Debug 档：静音
+        assert!(suppressed_at("reqwest::connect", log::Level::Debug, dbg));
+        assert!(suppressed_at("reqwest::connect", log::Level::Info, dbg));
+        // release 默认的 Warn 档 / 全局 Error 档同样静音
+        assert!(suppressed_at(
+            "reqwest::connect",
+            log::Level::Debug,
+            log::LevelFilter::Warn
+        ));
+        // RUST_LOG=trace 是「明确要看连接层」：放行
+        assert!(!suppressed_at(
+            "reqwest::connect",
+            log::Level::Debug,
+            log::LevelFilter::Trace
+        ));
+        // Error 任何档位都放行（连不上该看见了）
+        assert!(!suppressed_at(
+            "reqwest::connect",
+            log::Level::Error,
+            dbg
+        ));
+        // 别的 reqwest target（带真正故障信息的）不牵连
+        assert!(!suppressed_at("reqwest::blocking", log::Level::Warn, dbg));
+        assert!(!suppressed_at("reqwest", log::Level::Debug, dbg));
     }
 }

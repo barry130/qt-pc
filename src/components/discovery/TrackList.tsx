@@ -1,6 +1,6 @@
-import { memo, useCallback, useEffect, useRef } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
-import { Ban, ListEnd, Play, X } from "lucide-react";
+import { Ban, Copy, Disc3, Download, Heart, ListEnd, Play, RefreshCw, User, X } from "lucide-react";
 import type { Track } from "@/types";
 import { qtresCoverUrl, formatTime } from "@/lib/lrc";
 import { usePlayerStore } from "@/stores/player";
@@ -9,15 +9,21 @@ import { useDislikesStore } from "@/stores/dislikes";
 import { useDislikeFlags } from "@/hooks/useDislikeFlags";
 import { useFavoritesStore } from "@/stores/favorites";
 import { useFavoriteFlags } from "@/hooks/useFavoriteFlags";
+import { useTrackSelection } from "@/hooks/useTrackSelection";
+import type { TrackSelection } from "@/lib/track-selection";
 import { toastError, toastSuccess } from "@/stores/toast";
+import { clampQualityForPlatform } from "@/stores/sourceRegistry";
 import * as ipc from "@/services/ipc";
 import { errMsg } from "@/lib/utils";
 import { CollectButton } from "../mine/CollectButton";
+import { CollectMenu } from "../mine/CollectMenu";
 import { DownloadButton } from "../mine/DownloadButton";
+import { SourceSwitchPanel } from "../player/SourceSwitchPanel";
 import { LocalCover } from "../library/LocalCover";
 import { RowActions } from "../common/RowActions";
 import { IconButton } from "../common/IconButton";
 import { PlayNextIcon } from "../common/PlayNextIcon";
+import { ContextMenu, FloatingPanel, type ContextMenuItem } from "../common/ContextMenu";
 
 /**
  * 曲目列表（发现类页面共用：榜单详情 / 歌单详情 / 新歌速递 / 收藏 / 历史 / 本地）。
@@ -25,11 +31,13 @@ import { PlayNextIcon } from "../common/PlayNextIcon";
  * 否则追加到队尾；**不清空**正在排队的整张列表。整体入队（替换队列）只在页面顶部的
  * 「播放全部」按钮上（`playQueue(tracks, 0)`，DESIGN §11.2 的列表播放语义）。
  *
- * 传了 `onRemove` 时每行右侧出现「移除」按钮（可编辑列表用）；
- * 为此行容器用 `div[role=button]` 而非 `button`，避免按钮嵌套。
- * **目前没有调用方**：本地歌单详情页的曲目必然是收藏态，「从歌单移除」与
- * 「取消收藏」是同一件事，所以那里只留了收藏红心。这个入口留给规划中的
- * 列表右键菜单（REQUIREMENTS §右键菜单的「从歌单移除」）。
+ * 传了 `onRemove` 时每行右侧出现「移除」按钮（可编辑列表用，如播放记录的
+ * 「从播放记录移除」）；为此行容器用 `div[role=button]` 而非 `button`，避免按钮嵌套。
+ * 行上右键另出上下文菜单（REQUIREMENTS §3.21.7.1 的十项动作）：播放 / 下一首播放 /
+ * 加入队列 / 收藏到歌单 / 下载 / 换源 / 复制歌曲信息 / 查看歌手·专辑 / 从歌单移除。
+ * 低频动作收进右键菜单而不是全摊成行内图标 —— 一行已经要塞序号、封面、歌名、
+ * 歌手、专辑、时长、队列、屏蔽、下载、收藏，再摊开就是一片认不出的图标。
+ * 菜单里的「从歌单移除」只在调用方传了 `onRemove` 时出现。
  *
  * 队列 2.0：悬停行会露出「下一首播放」「加入队列」；已下载的曲目带「已下载」标。
  * 本地曲库页传 `local` 进入本地模式：悬停按钮用「播放」代替「下一首播放」，
@@ -52,10 +60,7 @@ export interface LocalListOptions {
   /** 操作失败提示 */
   onError: (msg: string) => void;
   /** 批量选择状态；省略则不显示行首复选框 */
-  selection?: {
-    ids: Set<string>;
-    onToggle: (trackId: string) => void;
-  };
+  selection?: TrackSelection;
   /**
    * 行模板对齐「下载管理」：不显示行首封面缩略图，也不显示「已下载 / 下载中」标记。
    * 本地曲库页专用 —— 本地行本身就是磁盘上的文件，「已下载」恒为真、纯噪声，
@@ -70,6 +75,11 @@ export function TrackList(props: {
   showIndex?: boolean;
   /** 传入后每行右侧出现「移除」按钮 */
   onRemove?: (track: Track) => void;
+  /**
+   * 移除按钮的提示文案。默认「从歌单移除」；历史页传「从播放记录移除」——
+   * 同一个 × 按钮在不同页面含义不同，悬停提示必须是当前页面的那个动作。
+   */
+  removeLabel?: string;
   /** 为 true 时每行右侧出现「收藏」（点开是本地歌单清单，与播放条红心同逻辑） */
   showCollect?: boolean;
   /** 为 true 时每行右侧出现「下载」 */
@@ -78,10 +88,7 @@ export function TrackList(props: {
    * 批量选择（对**所有行**生效）：传入后每行行首出现复选框，
    * 歌单详情等混合列表的批量管理用。`local.selection` 是旧入口，仅本地曲库页继续沿用。
    */
-  selection?: {
-    ids: Set<string>;
-    onToggle: (trackId: string) => void;
-  };
+  selection?: TrackSelection;
   /**
    * 本地行专属配置（plainRow / onChanged / onError 只对 `platform === "local"` 的行生效）。
    */
@@ -91,12 +98,14 @@ export function TrackList(props: {
     tracks,
     showIndex = false,
     onRemove,
+    removeLabel = "从歌单移除",
     showCollect = false,
     showDownload = false,
     selection: selectionProp,
     local,
   } = props;
   const selection = selectionProp ?? local?.selection;
+  const { keyOf, select, selectAll, clear } = useTrackSelection(tracks, selection);
   // 本地曲库页的朴素行：无封面、无下载标记（对齐下载管理的行模板）
   const plainRow = local?.plainRow === true;
   const play = usePlayerStore((s) => s.play);
@@ -118,20 +127,17 @@ export function TrackList(props: {
    */
   const latest = useRef({
     onRemove,
-    onToggle: selection?.onToggle,
     onChanged: local?.onChanged,
     onError: local?.onError,
   });
   useEffect(() => {
     latest.current = {
       onRemove,
-      onToggle: selection?.onToggle,
       onChanged: local?.onChanged,
       onError: local?.onError,
     };
   });
   const handleRemove = useCallback((t: Track) => latest.current.onRemove?.(t), []);
-  const handleToggle = useCallback((id: string) => latest.current.onToggle?.(id), []);
   const handleChanged = useCallback(() => latest.current.onChanged?.(), []);
   const handleError = useCallback((msg: string) => latest.current.onError?.(msg), []);
   // 行Hover 一屏通常没有几条不同的 suspicion, 但 Hover 回调必须落到 set-ipc 上
@@ -176,13 +182,28 @@ export function TrackList(props: {
   }
 
   return (
-    <div>
+    <div
+      role="group"
+      aria-label="歌曲列表"
+      onKeyDown={(e) => {
+        // 输入框和行内动作保留自身键盘语义；快捷键只在行本身获得焦点时生效。
+        if (e.target instanceof HTMLElement && e.target.dataset.trackRow === "true") {
+          if (selection && (e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+            e.preventDefault();
+            selectAll();
+          } else if (selection && e.key === "Escape") {
+            e.preventDefault();
+            clear();
+          }
+        }
+      }}
+    >
       {tracks.map((t, i) => {
         const dbId = trackDbId(t);
         const isDownloaded = downloaded.has(dbId);
         return (
           <TrackRow
-            key={`${t.id}-${i}`}
+            key={`${trackDbId(t)}-${i}`}
             track={t}
             index={i}
             active={currentTrackId === t.id}
@@ -199,12 +220,14 @@ export function TrackList(props: {
             onUnban={handleUnban}
             showCollect={showCollect}
             showDownload={showDownload}
-            selectionIds={selection?.ids}
-            onToggleSelect={handleToggle}
+            selectable={selection !== undefined}
+            selected={selection?.ids.has(keyOf(t)) === true}
+            onSelect={select}
             // 注意：onRemove 传下去的是**稳定化的包装函数**（恒为函数），
             // 是否需要「移除」按钮必须由这个布尔决定，不能判 onRemove 是否存在
             showRemove={onRemove !== undefined}
             onRemove={handleRemove}
+            removeLabel={removeLabel}
             onChanged={handleChanged}
             onError={handleError}
             play={play}
@@ -240,11 +263,14 @@ interface TrackRowProps {
   onUnban: (track: Track) => void;
   showCollect: boolean;
   showDownload: boolean;
-  /** 批量选择集合；省略则不显示复选框 */
-  selectionIds?: Set<string>;
-  onToggleSelect: (trackId: string) => void;
+  /** 选择状态按行传标量，切换一项不重绘整张列表。 */
+  selectable: boolean;
+  selected: boolean;
+  onSelect: ReturnType<typeof useTrackSelection>["select"];
   showRemove: boolean;
   onRemove: (track: Track) => void;
+  /** 移除按钮的悬停提示（历史页与歌单页含义不同，文案由调用方给） */
+  removeLabel: string;
   onChanged: () => void;
   onError: (msg: string) => void;
   play: (track: Track) => Promise<void>;
@@ -267,29 +293,191 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
     onUnban,
     showCollect,
     showDownload,
-    selectionIds,
-    onToggleSelect,
+    selectable,
+    selected,
+    onSelect,
     showRemove,
     onRemove,
+    removeLabel,
     onChanged,
     onError,
     play,
   } = props;
   const navigate = useNavigate();
   const cover = qtresCoverUrl(t.picUrl);
+  /** 右键菜单的位置（鼠标坐标）；`null` = 没开 */
+  const [ctx, setCtx] = useState<{ x: number; y: number } | null>(null);
+  /**
+   * 菜单里「收藏到歌单…」「换源…」要就地换成面板，位置沿用刚才那个坐标。
+   * 面板状态挂在**行**上而不是菜单组件里：菜单点完就卸载，若面板由菜单自己渲染，
+   * 它随菜单一起消失，面板永远开不出来。
+   */
+  const [panel, setPanel] = useState<{
+    kind: "collect" | "switch";
+    x: number;
+    y: number;
+  } | null>(null);
+
+  /** 歌手 / 专辑跳转（行内文字按钮与右键菜单共用一份，避免两处口径漂移） */
+  const openArtist = (): void => {
+    void navigate({
+      to: "/artist/$platform/$id",
+      params: { platform: t.platform, id: encodeURIComponent(t.singer) },
+    });
+  };
+  const openAlbum = (): void => {
+    void navigate({
+      to: "/album/$platform/$id",
+      params: { platform: t.platform, id: encodeURIComponent(t.album) },
+    });
+  };
+  /** 复制「歌名 - 歌手 - 专辑」到剪贴板：分享/报错时最常要的就是这一行 */
+  const copyInfo = (): void => {
+    const text = [t.title, t.singer, t.album].filter((s) => s !== "").join(" - ");
+    navigator.clipboard.writeText(text).then(
+      () => toastSuccess("已复制歌曲信息"),
+      (err) => toastError(`复制失败：${errMsg(err)}`),
+    );
+  };
+  /** 下载：与行尾 DownloadButton 同一套「用户偏好质量 → 按平台收敛」 */
+  const download = (): void => {
+    void (async () => {
+      try {
+        const wanted = await ipc.getDownloadQuality();
+        await ipc.startDownload(t, clampQualityForPlatform(t.platform, wanted));
+        toastSuccess("加入下载队列成功");
+      } catch (err) {
+        toastError(`下载发起失败：${errMsg(err)}`);
+      }
+    })();
+  };
+
+  /**
+   * 右键菜单项。按需求口径是十项动作，落地时有两条合并/取舍：
+   *  - 「加入歌单」与「收藏」在本应用是同一件事：收藏必须挂在某个歌单下
+   *    （`cmd_add_favorite` 没有默认歌单，不给 pid 直接报错），所以合并成
+   *    一项「收藏到歌单…」，点开就是既有的 `CollectMenu`（勾选 / 取消多个歌单、
+   *    新建歌单、同名不同源查重都在里面）—— 与播放条红心共用同一份逻辑。
+   *  - 「换源」开既有的 `SourceSwitchPanel`，选中即播放：行上没有「当前曲目」的
+   *    概念（右键的是列表里某一首，未必是正在播的那首），所以这里是「换源播放」，
+   *    而不是播放条那种「就地替换正在播的这首」。
+   * 本地曲目没有在线音源，下载 / 换源 / 查看歌手专辑都不适用，直接不出现在菜单里。
+   */
+  const buildMenu = (x: number, y: number): ContextMenuItem[] => {
+    const items: ContextMenuItem[] = [
+      { key: "play", label: "播放", icon: Play, onSelect: () => void play(t) },
+      {
+        key: "next",
+        label: "下一首播放",
+        icon: PlayNextIcon,
+        onSelect: () => {
+          void ipc.queueAddNext(t).then(
+            () => toastSuccess(`已将「${t.title}」设为下一首播放`),
+            (err) => toastError(`加入下一首播放失败：${errMsg(err)}`),
+          );
+        },
+      },
+      {
+        key: "queue",
+        label: "加入播放队列",
+        icon: ListEnd,
+        onSelect: () => {
+          void ipc.queueAppend([t]).then(
+            () => toastSuccess(`已将「${t.title}」加入播放队列`),
+            (err) => toastError(`加入播放队列失败：${errMsg(err)}`),
+          );
+        },
+      },
+      {
+        key: "collect",
+        label: "收藏到歌单…",
+        icon: Heart,
+        separatorBefore: true,
+        onSelect: () => setPanel({ kind: "collect", x, y }),
+      },
+      {
+        key: "download",
+        label: "下载",
+        icon: Download,
+        disabled: localRow,
+        onSelect: download,
+      },
+      {
+        key: "switch",
+        label: "换源…",
+        icon: RefreshCw,
+        disabled: localRow,
+        onSelect: () => setPanel({ kind: "switch", x, y }),
+      },
+      { key: "copy", label: "复制歌曲信息", icon: Copy, onSelect: copyInfo },
+      {
+        key: "artist",
+        label: "查看歌手",
+        icon: User,
+        disabled: localRow || t.singer === "",
+        onSelect: openArtist,
+      },
+      {
+        key: "album",
+        label: "查看专辑",
+        icon: Disc3,
+        disabled: localRow || t.album === "",
+        onSelect: openAlbum,
+      },
+    ];
+    // 「从歌单移除」只在可编辑列表里出现，且与上面那组动作分开一格
+    if (showRemove) {
+      items.push({
+        key: "remove",
+        label: removeLabel,
+        icon: X,
+        danger: true,
+        separatorBefore: true,
+        onSelect: () => onRemove(t),
+      });
+    }
+    return items;
+  };
+
   return (
     <div
       role="button"
+      data-track-row="true"
       tabIndex={0}
-      onClick={() => void play(t)}
+      aria-pressed={selectable ? selected : undefined}
+      aria-keyshortcuts={selectable ? "Control+Space Meta+Space Shift+Space Control+A Meta+A Escape" : undefined}
+      onClick={(e) => {
+        if (!onSelect(i, e)) void play(t);
+      }}
       onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
+        // 子按钮 / 复选框的 Enter 和 Space 不能冒泡成整行播放。
+        if (e.target !== e.currentTarget) return;
+        if (e.key === "ArrowDown" || e.key === "ArrowUp" || e.key === "Home" || e.key === "End") {
           e.preventDefault();
-          void play(t);
+          const rows = Array.from(e.currentTarget.parentElement?.querySelectorAll<HTMLElement>("[data-track-row='true']") ?? []);
+          const nextIndex = e.key === "Home" ? 0 : e.key === "End" ? rows.length - 1 : i + (e.key === "ArrowDown" ? 1 : -1);
+          const next = rows[nextIndex];
+          if (next) {
+            // 先记住出发点：第一次 Shift+方向键也能包含原先聚焦的那行。
+            if (e.shiftKey) {
+              onSelect(i, e, "anchor");
+              onSelect(nextIndex, e);
+            }
+            next.focus();
+          }
+        } else if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          if (!onSelect(i, e)) void play(t);
         }
       }}
+      // 右键出上下文菜单（低频动作的收纳处）。必须 preventDefault：默认菜单会
+      // 顶掉它，且 WebView 里不拦的话整个应用像"没接住"这一下。
+      onContextMenu={(e) => {
+        e.preventDefault();
+        setCtx({ x: e.clientX, y: e.clientY });
+      }}
       className={`cv-row group flex w-full cursor-pointer items-center gap-3 px-4 py-2 text-left transition-colors hover:bg-secondary ${
-        activeRow ? "bg-secondary/60" : ""
+        selected ? "bg-primary/10 ring-1 ring-inset ring-primary/25" : activeRow ? "bg-secondary/60" : ""
         // 被屏蔽的行压暗：还能点、还能播（规则只是「别自动出现」），
         // 但要让人一眼看出它不在常规轮换里
       } ${disliked ? "opacity-40" : ""}`}
@@ -302,22 +490,33 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
           而不是让复选框把名次顶掉。 */}
       <span
         className={`flex h-5 shrink-0 items-center justify-center gap-1.5 text-xs tabular-nums text-muted-foreground ${
-          selectionIds && showIndex ? "w-12" : "w-6"
+          selectable && showIndex ? "w-12" : "w-6"
         }`}
       >
-        {selectionIds ? (
+        {selectable ? (
           <input
             type="checkbox"
-            checked={selectionIds.has(t.id)}
+            checked={selected}
             aria-label={`选择 ${t.title}`}
-            onClick={(e) => e.stopPropagation()}
-            onChange={() => onToggleSelect(t.id)}
+            onClick={(e) => {
+              e.stopPropagation();
+              onSelect(i, e, true);
+            }}
+            onKeyDown={(e) => {
+              e.stopPropagation();
+              if (e.key === " " || e.key === "Enter") {
+                e.preventDefault();
+                onSelect(i, e, true);
+              }
+            }}
+            // 选择在 click / keydown 提交，保留受控输入的 change 接口。
+            onChange={() => {}}
             className="h-3.5 w-3.5 accent-primary"
           />
         ) : null}
         {showIndex ? (
           i + 1
-        ) : selectionIds ? null : activeRow ? (
+        ) : selectable ? null : activeRow ? (
           // 正在播放：三根跳动的均衡条（样式见 index.css .eq-bar）
           <span className="flex h-3 items-end gap-[2px]" aria-label="正在播放">
             <span className="eq-bar" />
@@ -363,13 +562,7 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
                 type="button"
                 onClick={(e) => {
                   e.stopPropagation();
-                  void navigate({
-                    to: "/artist/$platform/$id",
-                    params: {
-                      platform: t.platform,
-                      id: encodeURIComponent(t.singer),
-                    },
-                  });
+                  openArtist();
                 }}
                 className="truncate transition-colors hover:text-foreground hover:underline"
               >
@@ -387,13 +580,7 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
                   type="button"
                   onClick={(e) => {
                     e.stopPropagation();
-                    void navigate({
-                      to: "/album/$platform/$id",
-                      params: {
-                        platform: t.platform,
-                        id: encodeURIComponent(t.album),
-                      },
-                    });
+                    openAlbum();
                   }}
                   className="truncate transition-colors hover:text-foreground hover:underline"
                 >
@@ -490,7 +677,7 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
       {showCollect && <CollectButton track={t} favorited={favorited} />}
       {showRemove ? (
         <IconButton
-          label="从歌单移除"
+          label={removeLabel}
           danger
           onClick={(e) => {
             e.stopPropagation();
@@ -499,6 +686,38 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
         >
           <X />
         </IconButton>
+      ) : null}
+      {/* 菜单 / 面板都 portal 到 body（见 common/ContextMenu）：列表滚动容器是
+          overflow-y-auto，挂在行里会被裁掉 */}
+      {ctx ? (
+        <ContextMenu
+          x={ctx.x}
+          y={ctx.y}
+          items={buildMenu(ctx.x, ctx.y)}
+          onClose={() => setCtx(null)}
+        />
+      ) : null}
+      {panel?.kind === "collect" ? (
+        <FloatingPanel x={panel.x} y={panel.y} width={240} onClose={() => setPanel(null)}>
+          <CollectMenu
+            track={t}
+            onClose={() => setPanel(null)}
+            className="rounded-md border border-border bg-popover p-1 shadow-md"
+          />
+        </FloatingPanel>
+      ) : null}
+      {panel?.kind === "switch" ? (
+        <FloatingPanel x={panel.x} y={panel.y} width={404} onClose={() => setPanel(null)}>
+          <div className="rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-lg">
+            <SourceSwitchPanel
+              track={t}
+              onPick={(candidate) => {
+                setPanel(null);
+                void play(candidate);
+              }}
+            />
+          </div>
+        </FloatingPanel>
       ) : null}
     </div>
   );

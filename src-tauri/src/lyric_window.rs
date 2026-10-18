@@ -576,11 +576,7 @@ pub fn reset(app: &AppHandle) -> Result<LyricWindowState, String> {
 /// 从歌词窗口工具条打开主窗口的「设置 · 桌面歌词」页：
 /// 唤起主窗口并发事件，由主窗口前端负责导航
 pub fn open_main_settings(app: &AppHandle) {
-    if let Some(win) = app.get_webview_window(crate::MAIN_WINDOW_LABEL) {
-        let _ = win.show();
-        let _ = win.unminimize();
-        let _ = win.set_focus();
-    }
+    let _ = crate::mini_window::hide(app);
     let _ = app.emit_to(crate::MAIN_WINDOW_LABEL, "lyric-open-settings", ());
 }
 

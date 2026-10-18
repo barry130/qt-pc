@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Check, CircleAlert, Info } from "lucide-react";
-import { cn } from "@/lib/utils";
-import { useToastStore, type ToastItem } from "@/stores/toast";
+import { cn, errMsg } from "@/lib/utils";
+import { toastError, useToastStore, type ToastItem } from "@/stores/toast";
 
 /**
  * 停留与退场时长。成功/普通 3 秒（用户 m09470 的口径），出错给 6 秒 ——
@@ -13,6 +13,12 @@ const STAY_MS: Record<ToastItem["kind"], number> = {
   info: 3000,
   error: 6000,
 };
+
+/**
+ * 带撤销按钮的提示停留更久：3 秒里「看到文案 → 意识到点错了 → 把鼠标移过去」
+ * 根本不够，撤销窗口等于没有。给 6 秒，与错误提示同档。
+ */
+const UNDO_STAY_MS = 6000;
 const EXIT_MS = 200;
 
 /** 三种 kind 的图标 + 图标底色 + 进度条颜色（正文都用前景色，红字整段太吵） */
@@ -36,7 +42,14 @@ const KIND_STYLE: Record<
 function Toast({ item }: { item: ToastItem }): React.JSX.Element {
   const dismiss = useToastStore((s) => s.dismiss);
   const [leaving, setLeaving] = useState(false);
-  const stay = STAY_MS[item.kind];
+  /** 撤销按钮点过了：一次操作只能撤一次，置灰防连点 */
+  const [acted, setActed] = useState(false);
+  /**
+   * 防连点的真判据用 ref：`acted` 是渲染期快照，同一 tick 里连点两下读到的
+   * 都还是 false（React 批处理），只有 ref 能同步拦住第二次。
+   */
+  const actedRef = useRef(false);
+  const stay = item.action ? UNDO_STAY_MS : STAY_MS[item.kind];
   const kind = KIND_STYLE[item.kind];
   const Icon = kind.icon;
 
@@ -48,6 +61,23 @@ function Toast({ item }: { item: ToastItem }): React.JSX.Element {
       window.clearTimeout(gone);
     };
   }, [dismiss, item.id, stay]);
+
+  /**
+   * 撤销：先跑反向操作再收掉这条提示。反向操作失败不能静默 ——
+   * 用户以为撤回了，实际库里还少着，所以换成红字错误提示（内容由调用方给）。
+   */
+  const onAction = async (): Promise<void> => {
+    if (actedRef.current || !item.action) return;
+    actedRef.current = true;
+    setActed(true);
+    try {
+      await item.action.run();
+      dismiss(item.id);
+    } catch (err) {
+      toastError(`撤销失败：${errMsg(err)}`);
+      dismiss(item.id);
+    }
+  };
 
   return (
     <div
@@ -76,6 +106,17 @@ function Toast({ item }: { item: ToastItem }): React.JSX.Element {
       <p className="min-w-0 flex-1 py-px text-xs leading-relaxed break-words text-foreground line-clamp-3">
         {item.text}
       </p>
+      {item.action && (
+        // 整层是 pointer-events-none（不挡下面的控件），按钮必须自己收回来
+        <button
+          type="button"
+          disabled={acted}
+          onClick={() => void onAction()}
+          className="pointer-events-auto -my-0.5 shrink-0 rounded-md px-1.5 py-0.5 text-xs font-medium text-primary transition-colors hover:bg-primary/10 disabled:cursor-default disabled:text-muted-foreground disabled:hover:bg-transparent"
+        >
+          {item.action.label}
+        </button>
+      )}
       {/* 剩余时长进度条：从满宽线性收到零（时长随 kind），压在卡片底边 */}
       <span
         aria-hidden="true"

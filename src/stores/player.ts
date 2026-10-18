@@ -6,10 +6,12 @@ import type {
   Track,
 } from "@/types";
 import * as ipc from "@/services/ipc";
-import { resolvePlayUrl as scriptResolvePlayUrl } from "@/source-scripts";
+import { peekQualityCeiling, resolvePlayUrlWithFallback } from "@/lib/quality-fallback";
+import { qualityShortLabel } from "@/lib/quality";
+import { toast } from "@/stores/toast";
 
 /**
- * 播放状态store（DESIGN §12.1）。
+ * 播放状态 store（DESIGN §12.1）。
  * - state：Rust 全量快照（语义变化才推送），前端不持有播放真值
  * - queue / queueIndex：queue-changed 事件镜像，供队列面板渲染
  * - position：250ms tick + rAF 插值得到的展示位置（不触发 Rust 往返）
@@ -19,14 +21,25 @@ import { resolvePlayUrl as scriptResolvePlayUrl } from "@/source-scripts";
  * 取链脚本化：播放动作发起前用共享脚本包预解析目标曲目并回填 Rust 引擎的
  * PlayUrl 缓存，引擎随后命中缓存直接播放。
  * local 曲目 / 预解析失败时静默跳过（引擎侧本次取链失败，不再有原生兜底）。
+ *
+ * 降档回退阶梯在 `@/lib/quality-fallback`（引擎取链桥共用同一份实现，
+ * 否则「点一下能放、自动播下一集就报无法播放」）。
  */
 async function preResolvePlayUrl(
   track: Track | undefined,
   state: PlaybackState | null,
 ): Promise<void> {
   if (!track || track.platform === "local") return;
+  const wanted = state?.quality ?? "320";
+  // 同专辑已知上限时不再提示「只能提供 X」：那不是本次降档，而是这张专辑的既定
+  // 事实（有声书一本几百集，逐集弹同一句提示等于噪声）。
+  const known = peekQualityCeiling(track.platform, track.album);
   try {
-    await scriptResolvePlayUrl(track, state?.quality ?? "320");
+    const res = await resolvePlayUrlWithFallback(track, wanted);
+    if (res.url.length > 0 && res.quality !== wanted && known === null) {
+      // 回执让用户知道「听到的是 128K 而不是请求的 320K」，不静默降档
+      toast(`当前音源只能提供 ${qualityShortLabel(res.quality)}：${track.title}`);
+    }
   } catch {
     // 静默：引擎侧会再问一次脚本桥（playurl_bridge）
   }

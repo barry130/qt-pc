@@ -186,6 +186,19 @@ impl PlayUrlCache {
         }
     }
 
+    /// 清空全部播放地址缓存，返回实际移除的条目数。
+    ///
+    /// 该缓存只存在进程内，清空后下一次播放会重新走前端音源脚本取链。
+    pub fn clear(&self) -> usize {
+        let Ok(mut inner) = self.inner.lock() else {
+            return 0;
+        };
+        let count = inner.map.len();
+        inner.map.clear();
+        inner.inserts_since_sweep = 0;
+        count
+    }
+
     /// 播放失败时作废缓存
     pub fn invalidate(&self, key: &str) {
         if let Ok(mut inner) = self.inner.lock() {
@@ -231,7 +244,18 @@ mod tests {
         assert!(cache.get(&key).is_none());
     }
 
-    /// 实测体积与实测档位必须跟着地址一起进缓存：下载靠它们决定命名与进度
+    #[test]
+    fn clear_removes_all_entries_and_is_idempotent() {
+        let cache = PlayUrlCache::new();
+        cache.set("one".into(), hit("https://example.com/one.mp3", ""));
+        cache.set("two".into(), hit("https://example.com/two.mp3", ""));
+
+        assert_eq!(cache.clear(), 2);
+        assert!(cache.get("one").is_none());
+        assert!(cache.get("two").is_none());
+        assert_eq!(cache.clear(), 0);
+    }
+
     #[test]
     fn measured_size_and_actual_quality_roundtrip() {
         let cache = PlayUrlCache::new();

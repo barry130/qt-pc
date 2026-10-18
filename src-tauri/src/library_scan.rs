@@ -68,17 +68,21 @@ pub fn scan_and_persist(
     validate_dirs(&request.dirs)?;
 
     let mut last_emit: Option<Instant> = None;
-    let rows = local::scan_dirs_with_progress(&request.dirs, request.filter(), |visited, found, current| {
-        if last_emit.is_none_or(|at| at.elapsed() >= PROGRESS_INTERVAL) {
-            last_emit = Some(Instant::now());
-            on_progress(ScanProgress {
-                visited,
-                found,
-                current: current.to_string_lossy().into_owned(),
-            });
-        }
-    });
-    let present = rows.iter().map(|row| row.path.clone()).collect();
+    let rows = local::scan_dirs_with_progress(
+        &request.dirs,
+        request.filter(),
+        |visited, found, current| {
+            if last_emit.is_none_or(|at| at.elapsed() >= PROGRESS_INTERVAL) {
+                last_emit = Some(Instant::now());
+                on_progress(ScanProgress {
+                    visited,
+                    found,
+                    current: current.to_string_lossy().into_owned(),
+                });
+            }
+        },
+    );
+    let present = rows.iter().map(|row| row.id.clone()).collect();
 
     for chunk in rows.chunks(UPSERT_CHUNK) {
         if let Err(err) = db.with(|conn| crate::db::store::upsert_local_tracks(conn, chunk)) {
@@ -88,13 +92,59 @@ pub fn scan_and_persist(
     }
 
     db.with(|conn| {
+        crate::db::store::reconcile_local_cue_tracks(conn, &rows)?;
         crate::db::store::touch_scan_dirs(conn, &request.dirs)?;
         let missing = crate::db::store::mark_missing_local_tracks(conn, &request.dirs, &present)?;
         if missing > 0 {
             log::info!("[local] 标记缺失曲目 {missing} 条");
         }
+        let lyrics = persist_local_lyrics(conn, &rows);
+        if lyrics > 0 {
+            log::info!("[local] 本地歌词入库 {lyrics} 条");
+        }
         crate::db::store::query_local_tracks(conn)
     })
+}
+
+/// 把扫描时读到的本地歌词写进 `lyrics` 表（2026-10-18），返回写入条数。
+///
+/// 词源优先级：同名 `.lrc` 旁挂文件 > 音频文件的内嵌标签（`row.embedded_lyric` 是
+/// 扫描读标签时顺手带出来的，这里不重开容器）。非本地来源的既有行不会被覆盖，见
+/// `db::store::upsert_local_lyric`。
+///
+/// 单条失败只记日志、继续下一条：歌词是旁路数据，不该让整次扫描失败（与统计同取舍）。
+///
+/// `pub(crate)`：拖拽入窗 / 命令行打开的曲目也走这一份（见 `cmd_open_local_paths`），
+/// 否则「拖进来那首」会没有歌词，而它在库里明明有词。
+pub(crate) fn persist_local_lyrics(
+    conn: &rusqlite::Connection,
+    rows: &[crate::db::store::LocalTrackRow],
+) -> usize {
+    let mut written = 0usize;
+    for row in rows {
+        // CUE children must never inherit an album's unshifted LRC or USLT.
+        if row.start_ms.is_some() || row.cue_path.is_some() {
+            continue;
+        }
+        let Some(found) =
+            local::resolve_local_lyric(Path::new(&row.path), row.embedded_lyric.as_deref())
+        else {
+            continue;
+        };
+        let track_id = format!("local:{}", row.id);
+        match crate::db::store::upsert_local_lyric(
+            conn,
+            &track_id,
+            &found.text,
+            found.source,
+            found.path.as_deref(),
+        ) {
+            Ok(true) => written += 1,
+            Ok(false) => {}
+            Err(err) => log::warn!("[local] 歌词入库失败 {}: {err}", row.path),
+        }
+    }
+    written
 }
 
 #[cfg(test)]
@@ -114,7 +164,8 @@ mod tests {
 
     #[test]
     fn validate_dirs_rejects_missing_root_before_scan() {
-        let missing = std::env::temp_dir().join(format!("quietmusic-missing-{}", fastrand::u64(..)));
+        let missing =
+            std::env::temp_dir().join(format!("quietmusic-missing-{}", fastrand::u64(..)));
         let error = validate_dirs(&[missing.to_string_lossy().into_owned()]).unwrap_err();
         assert!(error.contains("目录不存在"));
     }

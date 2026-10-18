@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   GripVertical,
   ListChecks,
   ListMusic,
   ListX,
+  LocateFixed,
   Square,
   SquareCheckBig,
   Trash2,
@@ -18,6 +19,38 @@ import { toastError } from "@/stores/toast";
 import { LocalCover } from "@/components/library/LocalCover";
 import { IconButton } from "@/components/common/IconButton";
 import { PlayNextIcon } from "@/components/common/PlayNextIcon";
+import type { Track } from "@/types";
+
+type QueueSnapshot = {
+  queue: Track[];
+  keys: string[];
+  hasDuplicates: boolean;
+};
+
+function trackKey(track: Track): string {
+  return JSON.stringify([
+    track.platform,
+    track.id,
+    track.startMs ?? null,
+    track.endMs ?? null,
+  ]);
+}
+
+function snapshotQueue(queue: Track[]): QueueSnapshot {
+  const keys = queue.map(trackKey);
+  return { queue, keys, hasDuplicates: new Set(keys).size !== keys.length };
+}
+
+function matchesQueue(snapshot: QueueSnapshot, queue: Track[]): boolean {
+  return (
+    snapshot.keys.length === queue.length &&
+    // 重复身份没有队列条目 ID，新快照无法确认条目顺序，保守作废。
+    (!snapshot.hasDuplicates || snapshot.queue === queue) &&
+    snapshot.keys.every((key, i) => key === trackKey(queue[i]))
+  );
+}
+
+const EMPTY_SELECTION = new Set<number>();
 
 /**
  * 播放队列面板（DESIGN §5.5 QueueButton / §11.5 队列 2.0）。
@@ -36,14 +69,26 @@ export function QueuePanel(): React.JSX.Element | null {
   const queue = usePlayerStore((s) => s.queue);
   const queueIndex = usePlayerStore((s) => s.queueIndex);
   const currentTrackId = usePlayerStore((s) => s.state?.trackId ?? null);
+  const currentPlatform = usePlayerStore(
+    (s) => s.state?.track?.platform ?? s.state?.sourceId ?? null,
+  );
   const playAt = usePlayerStore((s) => s.playAt);
   const open = usePlayerStore((s) => s.queueOpen);
   const setQueueOpen = usePlayerStore((s) => s.setQueueOpen);
 
-  // 当前曲下标：优先用 Rust 给的 queueIndex；它为 null 时（队列事件还没同步、
-  // 或播的是没走队列的曲子）按当前曲目 id 在队列里回退查找，保证高亮与定位都能命中
-  const fallbackIndex = queue.findIndex((t) => t.id === currentTrackId);
-  const activeIndex = queueIndex ?? (fallbackIndex >= 0 ? fallbackIndex : null);
+  // 优先使用有效的引擎下标；镜像尚未同步时以 platform + id 回退，避免跨源同 ID 误命中。
+  const fallbackIndex = queue.findIndex(
+    (t) => t.id === currentTrackId && t.platform === currentPlatform,
+  );
+  const activeIndex =
+    queueIndex !== null &&
+    Number.isInteger(queueIndex) &&
+    queueIndex >= 0 &&
+    queueIndex < queue.length
+      ? queueIndex
+      : fallbackIndex >= 0
+        ? fallbackIndex
+        : null;
   const currentRef = useRef<HTMLDivElement | null>(null);
   const listRef = useRef<HTMLDivElement | null>(null);
 
@@ -57,21 +102,88 @@ export function QueuePanel(): React.JSX.Element | null {
     index: number;
     startY: number;
     active: boolean;
+    overIndex: number;
+    element: HTMLElement;
+    snapshot: QueueSnapshot;
   } | null>(null);
   // 刚拖完立即抬手时浏览器仍会补一个 click，用它吃掉（否则拖完会顺手切歌）
   const justDraggedRef = useRef(false);
   // 批量管理：选择模式下的已选下标集合（按移除前位置发给引擎）
   const [selecting, setSelecting] = useState(false);
-  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [selection, setSelection] = useState<{
+    snapshot: QueueSnapshot;
+    indices: Set<number>;
+  } | null>(null);
+  const selected =
+    selection && matchesQueue(selection.snapshot, queue)
+      ? selection.indices
+      : EMPTY_SELECTION;
   const [deleting, setDeleting] = useState(false);
 
-  // 退出选择模式 / 队列变化后清掉选择，避免残留失效下标
+  const resetPointerDrag = useCallback((suppressClick: boolean): void => {
+    const drag = dragRef.current;
+    dragRef.current = null;
+    if (suppressClick) justDraggedRef.current = true;
+    setDragIndex(null);
+    setOverIndex(null);
+    // 先清 ref：releasePointerCapture 同步触发 lostpointercapture 时不能再提交或取消一次。
+    if (drag?.element.hasPointerCapture(drag.pointerId)) {
+      drag.element.releasePointerCapture(drag.pointerId);
+    }
+  }, []);
+
+  const cancelPointerDrag = useCallback((): void => {
+    if (dragRef.current) resetPointerDrag(true);
+  }, [resetPointerDrag]);
+
+  // 行位置一旦变化，原下标不再可信；唯一身份且顺序相同的元数据刷新保留选择。
   useEffect(() => {
-    if (!selecting) setSelected(new Set());
-  }, [selecting]);
+    setSelection((prev) =>
+      prev && (!open || !selecting || !matchesQueue(prev.snapshot, queue))
+        ? null
+        : prev,
+    );
+    if (!open) setSelecting(false);
+    const drag = dragRef.current;
+    if (!open || (drag && !matchesQueue(drag.snapshot, queue))) {
+      cancelPointerDrag();
+    }
+  }, [open, queue, selecting, cancelPointerDrag]);
+
   useEffect(() => {
-    setSelected(new Set());
-  }, [queue.length]);
+    if (!open) return;
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key !== "Escape" || !dragRef.current) return;
+      event.preventDefault();
+      cancelPointerDrag();
+    };
+    const onVisibilityChange = (): void => {
+      if (document.hidden) cancelPointerDrag();
+    };
+    window.addEventListener("blur", cancelPointerDrag);
+    window.addEventListener("keydown", onKeyDown);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => {
+      window.removeEventListener("blur", cancelPointerDrag);
+      window.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      cancelPointerDrag();
+    };
+  }, [open, cancelPointerDrag]);
+
+  const scrollToCurrent = useCallback((): void => {
+    const box = listRef.current;
+    const el = currentRef.current;
+    if (!box) return;
+    if (!el) {
+      box.scrollTop = 0;
+      return;
+    }
+    const boxRect = box.getBoundingClientRect();
+    const elRect = el.getBoundingClientRect();
+    box.scrollTop +=
+      elRect.top - boxRect.top - (box.clientHeight - el.clientHeight) / 2;
+  }, []);
 
   // 打开面板时把当前曲目滚到列表可视区中央（队列长的时候不定位就得手动翻找）。
   // 这里直接算 scrollTop，而不用 scrollIntoView —— 后者会连带滚动所有可滚动祖先，
@@ -79,19 +191,6 @@ export function QueuePanel(): React.JSX.Element | null {
   // 只在 open 变化时触发：面板已打开时用户可能在自己浏览，切歌就别抢滚动条了。
   useEffect(() => {
     if (!open) return;
-    const scrollToCurrent = (): void => {
-      const box = listRef.current;
-      const el = currentRef.current;
-      if (!box) return;
-      if (!el) {
-        box.scrollTop = 0; // 没有当前曲（未播放）就回到顶部
-        return;
-      }
-      const boxRect = box.getBoundingClientRect();
-      const elRect = el.getBoundingClientRect();
-      box.scrollTop +=
-        elRect.top - boxRect.top - (box.clientHeight - el.clientHeight) / 2;
-    };
     // 两帧：第一帧等列表 DOM 插入并完成布局，第二帧等行高（封面占位）稳定
     let raf2 = 0;
     const raf1 = window.requestAnimationFrame(() => {
@@ -101,7 +200,7 @@ export function QueuePanel(): React.JSX.Element | null {
       window.cancelAnimationFrame(raf1);
       window.cancelAnimationFrame(raf2);
     };
-  }, [open]);
+  }, [open, scrollToCurrent]);
 
   if (!open) return null;
 
@@ -112,21 +211,26 @@ export function QueuePanel(): React.JSX.Element | null {
    * 的 OLE IDropTarget 注册到窗口的每个子 HWND 上（`wry` 的 drag_drop.rs 用
    * EnumChildWindows 逐个 RevokeDragDrop + RegisterDragDrop），而这个 target 只认
    * CF_HDROP（外部文件拖入），页面内的 dragstart/dragover/drop 全被它压掉 ——
-   * 表现就是「拖了没反应」。本项目也没有任何文件拖入消费方，所以改成 pointer
-   * 事件自绘（与播放条的进度条 / 音量条同一套写法），彻底绕开那套机制。
+   * 表现就是「拖了没反应」。队列内部排序改成 pointer 事件自绘（与播放条的
+   * 进度条 / 音量条同一套写法），与窗口接收外部文件拖入的处理互不干扰。
    */
   const dropAt = (to: number): void => {
-    const from = dragRef.current?.index ?? dragIndex;
-    if (from !== null && to >= 0 && to < queue.length && from !== to) {
-      void ipc.queueMove(from, to).catch((err) => {
-        // 拖拽排序失败不上浮全局错误浮层，留排查日志即可
+    const drag = dragRef.current;
+    const latest = usePlayerStore.getState();
+    if (
+      drag &&
+      latest.queueOpen &&
+      matchesQueue(drag.snapshot, latest.queue) &&
+      to >= 0 &&
+      to < latest.queue.length &&
+      drag.index !== to
+    ) {
+      void ipc.queueMove(drag.index, to).catch((err) => {
         log.warn("[queue] 拖拽排序失败", err);
       });
-      justDraggedRef.current = true;
     }
-    dragRef.current = null;
-    setDragIndex(null);
-    setOverIndex(null);
+    // 越过阈值的拖动即使回到原位，也必须吃掉浏览器补发的 click。
+    resetPointerDrag(true);
   };
 
   /**
@@ -135,15 +239,25 @@ export function QueuePanel(): React.JSX.Element | null {
    *
    * 按下点落在行内按钮上（「下一首」/「移除」）不启动拖拽，让按钮自己处理点击。
    */
-  const startPointerDrag = (e: React.PointerEvent, i: number): void => {
-    if (selecting || e.button !== 0) return;
+  const startPointerDrag = (
+    e: React.PointerEvent<HTMLDivElement>,
+    i: number,
+  ): void => {
+    if (e.button !== 0) return;
+    // 新一轮真实按下不属于上次拖动的尾随 click，选择模式和行内按钮也一样。
+    justDraggedRef.current = false;
+    if (selecting) return;
     const el = e.target as HTMLElement | null;
     if (el?.closest("button")) return;
+    cancelPointerDrag();
     dragRef.current = {
       pointerId: e.pointerId,
       index: i,
       startY: e.clientY,
       active: false,
+      overIndex: i,
+      element: e.currentTarget,
+      snapshot: snapshotQueue(queue),
     };
     justDraggedRef.current = false;
     e.currentTarget.setPointerCapture(e.pointerId);
@@ -159,52 +273,76 @@ export function QueuePanel(): React.JSX.Element | null {
   const indexAtPoint = (x: number, y: number): number | null => {
     const el = document.elementFromPoint(x, y) as HTMLElement | null;
     const row = el?.closest("[data-queue-index]") as HTMLElement | null;
-    if (!row) return null;
+    if (!row || !listRef.current?.contains(row)) return null;
     const raw = Number(row.dataset.queueIndex);
-    return Number.isInteger(raw) ? raw : null;
+    return Number.isInteger(raw) && raw >= 0 && raw < queue.length ? raw : null;
   };
 
   const movePointerDrag = (e: React.PointerEvent): void => {
     const d = dragRef.current;
     if (!d || d.pointerId !== e.pointerId) return;
+    const latest = usePlayerStore.getState();
+    if (!latest.queueOpen || !matchesQueue(d.snapshot, latest.queue)) {
+      cancelPointerDrag();
+      return;
+    }
     // 越过阈值才点亮拖动态：避免手抖把点击吃掉，也避免误触就整行变淡
     if (!d.active) {
       if (Math.abs(e.clientY - d.startY) < 4) return;
       d.active = true;
     }
     if (dragIndex !== d.index) setDragIndex(d.index);
-    const over = indexAtPoint(e.clientX, e.clientY) ?? overIndex;
-    if (over !== null && over !== overIndex) setOverIndex(over);
+    const over = indexAtPoint(e.clientX, e.clientY) ?? d.overIndex;
+    d.overIndex = over;
+    setOverIndex(over);
   };
 
   const endPointerDrag = (e: React.PointerEvent): void => {
     const d = dragRef.current;
     if (!d || d.pointerId !== e.pointerId) return;
-    if (d.active) {
-      const over = indexAtPoint(e.clientX, e.clientY) ?? overIndex ?? d.index;
+    const latest = usePlayerStore.getState();
+    if (!latest.queueOpen || !matchesQueue(d.snapshot, latest.queue)) {
+      cancelPointerDrag();
+    } else if (d.active) {
+      const over = indexAtPoint(e.clientX, e.clientY) ?? d.overIndex;
       dropAt(over);
     } else {
-      // 没越过阈值＝这是一次点击，交给 onClick 走切歌
-      dragRef.current = null;
-      setDragIndex(null);
-      setOverIndex(null);
-    }
-    if (e.currentTarget.hasPointerCapture(e.pointerId)) {
-      e.currentTarget.releasePointerCapture(e.pointerId);
+      // 没越过阈值＝这是一次点击，交给 onClick 走切歌。
+      resetPointerDrag(false);
     }
   };
 
+  const cancelPointerEvent = (e: React.PointerEvent): void => {
+    if (dragRef.current?.pointerId === e.pointerId) cancelPointerDrag();
+  };
+
   const toggleOne = (i: number): void => {
-    setSelected((prev) => {
-      const next = new Set(prev);
+    setSelection((prev) => {
+      const next = new Set(
+        prev && matchesQueue(prev.snapshot, queue) ? prev.indices : [],
+      );
       if (next.has(i)) next.delete(i);
       else next.add(i);
-      return next;
+      return { snapshot: snapshotQueue(queue), indices: next };
+    });
+  };
+
+  const selectAll = (): void => {
+    cancelPointerDrag();
+    setSelecting(true);
+    setSelection({
+      snapshot: snapshotQueue(queue),
+      indices: new Set(queue.map((_, i) => i)),
     });
   };
 
   const deleteSelected = async (): Promise<void> => {
-    if (selected.size === 0) return;
+    if (
+      deleting ||
+      !selection ||
+      selected.size === 0 ||
+      !matchesQueue(selection.snapshot, usePlayerStore.getState().queue)
+    ) return;
     setDeleting(true);
     try {
       await ipc.queueRemoveIndices([...selected]);
@@ -229,15 +367,22 @@ export function QueuePanel(): React.JSX.Element | null {
             </div>
             <div className="flex items-center gap-1">
               <IconButton
+                label="定位当前播放"
+                size="md"
+                hover="secondary"
+                disabled={activeIndex === null}
+                onClick={scrollToCurrent}
+              >
+                <LocateFixed />
+              </IconButton>
+              <IconButton
                 label={selected.size === queue.length ? "全不选" : "全选"}
                 size="lg"
                 hover="secondary"
                 onClick={() =>
-                  setSelected(
-                    selected.size === queue.length
-                      ? new Set()
-                      : new Set(queue.map((_, i) => i)),
-                  )
+                  selected.size === queue.length
+                    ? setSelection(null)
+                    : selectAll()
                 }
               >
                 {selected.size === queue.length ? <Square /> : <SquareCheckBig />}
@@ -269,12 +414,24 @@ export function QueuePanel(): React.JSX.Element | null {
               播放队列（{queue.length}）
             </div>
             <div className="flex items-center gap-1">
+              <IconButton
+                label="定位当前播放"
+                size="md"
+                hover="secondary"
+                disabled={activeIndex === null}
+                onClick={scrollToCurrent}
+              >
+                <LocateFixed />
+              </IconButton>
               {queue.length > 1 && (
                 <IconButton
                   label="批量管理"
                   size="lg"
                   hover="secondary"
-                  onClick={() => setSelecting(true)}
+                  onClick={() => {
+                    cancelPointerDrag();
+                    setSelecting(true);
+                  }}
                 >
                   <ListChecks />
                 </IconButton>
@@ -330,10 +487,12 @@ export function QueuePanel(): React.JSX.Element | null {
         ) : (
           queue.map((t, i) => (
             <div
-              key={`${t.id}-${i}`}
+              key={`${trackKey(t)}-${i}`}
               ref={i === activeIndex ? currentRef : null}
               role="button"
               tabIndex={0}
+              aria-current={i === activeIndex ? "true" : undefined}
+              aria-pressed={selecting ? selected.has(i) : undefined}
               // 拖动排序走 pointer 自绘（见 startPointerDrag）：行上挂下标供命中测试
               data-queue-index={i}
               draggable={false}
@@ -341,8 +500,10 @@ export function QueuePanel(): React.JSX.Element | null {
               onPointerDown={(e) => startPointerDrag(e, i)}
               onPointerMove={(e) => movePointerDrag(e)}
               onPointerUp={(e) => endPointerDrag(e)}
-              onPointerCancel={(e) => endPointerDrag(e)}
-              onClick={() => {
+              onPointerCancel={cancelPointerEvent}
+              onLostPointerCapture={cancelPointerEvent}
+              onClick={(e) => {
+                if ((e.target as HTMLElement).closest("button")) return;
                 // 刚拖完的那一下 click 是浏览器补的，不当作切歌
                 if (justDraggedRef.current) {
                   justDraggedRef.current = false;
@@ -352,7 +513,17 @@ export function QueuePanel(): React.JSX.Element | null {
                 else void playAt(i);
               }}
               onKeyDown={(e) => {
-                if (e.key === "Enter" || e.key === " ") {
+                // 行内原生按钮保留 Enter / Space 等默认语义，不把冒泡当成行快捷键。
+                if (e.target !== e.currentTarget) return;
+                if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+                  e.preventDefault();
+                  selectAll();
+                } else if (e.key === "Escape") {
+                  e.preventDefault();
+                  cancelPointerDrag();
+                  setSelecting(false);
+                  setSelection(null);
+                } else if (e.key === "Enter" || e.key === " ") {
                   e.preventDefault();
                   if (selecting) toggleOne(i);
                   else void playAt(i);
@@ -433,11 +604,20 @@ export function QueuePanel(): React.JSX.Element | null {
                 <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
                   <IconButton
                     label="下一首播放"
+                    disabled={i === activeIndex}
                     onClick={(e) => {
                       e.stopPropagation();
-                      const target =
-                        activeIndex === null ? 0 : Math.min(activeIndex + 1, queue.length - 1);
-                      void ipc.queueMove(i, target);
+                      if (i === activeIndex) return;
+                      // 引擎先移除再插入；来自当前曲之前的行会让当前下标减一。
+                      const target = activeIndex === null
+                        ? 0
+                        : i < activeIndex
+                          ? activeIndex
+                          : Math.min(activeIndex + 1, queue.length - 1);
+                      void ipc.queueMove(i, target).catch((err) => {
+                        log.warn("[queue] 下一首播放失败", err);
+                        toastError(`下一首播放失败：${errMsg(err)}`);
+                      });
                     }}
                   >
                     <PlayNextIcon />
@@ -447,7 +627,10 @@ export function QueuePanel(): React.JSX.Element | null {
                     danger
                     onClick={(e) => {
                       e.stopPropagation();
-                      void ipc.queueRemoveAt(i);
+                      void ipc.queueRemoveAt(i).catch((err) => {
+                        log.warn("[queue] 移除失败", err);
+                        toastError(`从队列移除失败：${errMsg(err)}`);
+                      });
                     }}
                   >
                     <X />

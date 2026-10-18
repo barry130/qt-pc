@@ -17,3 +17,6 @@ export const QUALITY_KEY = "quality";
 
 /** 音频缓存上限 MB（与 Rust cache.rs 的 SETTING_AUDIO_CACHE_LIMIT_MB 同值，契约见 tests/settings-keys-contract.test.ts） */
 export const CACHE_AUDIO_LIMIT_MB_KEY = "cache.audioLimitMb";
+
+/** 无缝播放（Rust audio/engine.rs SETTING_GAPLESS；"true" / "false"） */
+export const GAPLESS_KEY = "playback.gapless";

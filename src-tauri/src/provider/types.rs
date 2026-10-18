@@ -127,6 +127,15 @@ pub struct Track {
     pub duration: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub music_id: Option<String>,
+    /// 本地 CUE 分轨（第二波）：子轨在所属音频文件内的**起始**偏移（毫秒）。
+    /// None = 普通曲目（在线 / 本地整轨），序列化省略，老前端与老库无感。
+    /// 播放侧语义：引擎从 start_ms 起播、到 end_ms 自然切下一首（区间接入
+    /// 见 audio/engine.rs 的播放区间支持）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_ms: Option<u64>,
+    /// 本地 CUE 分轨：子轨**结束**偏移（毫秒，所属文件内的时间点）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_ms: Option<u64>,
 }
 
 /// Provider 错误分类（DESIGN §6.4 / §6.10）：serde tag=kind 供前端区分展示。
@@ -241,6 +250,8 @@ mod tests {
             pic_url: String::new(),
             duration: 1.0,
             music_id: None,
+            start_ms: None,
+            end_ms: None,
         };
         let json = serde_json::to_value(&track).expect("序列化");
         assert_eq!(json["platform"], "ximalaya");

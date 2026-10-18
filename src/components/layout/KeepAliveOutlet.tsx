@@ -49,6 +49,10 @@ const MyPlaylistsPage = lazyPage(
   () => import("@/components/mine/MyPlaylistsPage"),
   "MyPlaylistsPage",
 );
+const AiAssistantPage = lazyPage(
+  () => import("@/components/ai-assistant/AiAssistantPage"),
+  "AiAssistantPage",
+);
 
 /** 一级页面清单：pathname → 页面元素工厂（新增一级页时在此登记） */
 export const KEEP_ALIVE_PAGES: Record<string, () => React.JSX.Element> = {
@@ -62,6 +66,7 @@ export const KEEP_ALIVE_PAGES: Record<string, () => React.JSX.Element> = {
   "/history": () => <HistoryPage />,
   "/stats": () => <StatsPage />,
   "/my/playlists": () => <MyPlaylistsPage />,
+  "/ai-assistant": () => <AiAssistantPage />,
 };
 
 /** 当前路径是否为常驻缓存页（AppShell 据此决定是否再渲染 <Outlet />） */

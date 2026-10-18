@@ -3,6 +3,7 @@ import { errMsg } from "@/lib/utils";
 import { log } from "@/lib/logger";
 import type { AuthSession } from "@/types";
 import * as ipc from "@/services/ipc";
+import { useFavoritesStore } from "@/stores/favorites";
 
 /**
  * Astral 登录态（DESIGN §2.3.4）。
@@ -148,20 +149,41 @@ function grantedCodes(profile: Record<string, unknown> | null): string[] {
 }
 
 /**
- * 是否轻听管理员（权限控件用，如播放地址调试框）。
- * 对齐后端 PermissionChecker 的匹配规则：
- * - 精确持有新码 `admin:qt:admin`；
- * - 超管 `*:*:*`，或层级通配（`admin:*` / `admin:qt:*`）按段前缀覆盖；
- * - 旧扁平码 `qt_admin` 兜底（未跑迁移的线上库，后端同名别名过渡期）。
+ * 是否持有某个权限码。对齐后端 PermissionChecker 的匹配规则：
+ * - 精确持有；
+ * - 超管 `*:*:*`，或层级通配（`user:ai:*` / `user:ai:music:*`）按段前缀覆盖；
+ * - `aliases` 兜底旧扁平码（未跑迁移的线上库，后端同名别名过渡期）。
  * 注意不能只看 roles：重构后 roles 回的是角色名，权限码在 permissions 里。
  */
-export function isAdmin(profile: Record<string, unknown> | null): boolean {
-  const required = "admin:qt:admin";
+export function hasPermission(
+  profile: Record<string, unknown> | null,
+  required: string,
+  aliases: readonly string[] = [],
+): boolean {
   for (const g of grantedCodes(profile)) {
-    if (g === required || g === "qt_admin" || g === "*:*:*") return true;
+    if (g === required || g === "*:*:*" || aliases.includes(g)) return true;
     if (g.endsWith(":*") && required.startsWith(g.slice(0, -1))) return true;
   }
   return false;
+}
+
+/** 是否轻听管理员（权限控件用，如播放地址调试框） */
+export function isAdmin(profile: Record<string, unknown> | null): boolean {
+  return hasPermission(profile, "admin:qt:admin", ["qt_admin"]);
+}
+
+/**
+ * 音乐助手权限码，与后端 `AiPlugin.PERM_MUSIC_USE` 同一个字符串。
+ *
+ * 后端 `/api/v1/app/ai/agents` 已经按 `accessService.permitted()` 过滤过智能体，
+ * 没有这个码的账号请求回来就是空列表；前端提前用同一个码做显隐，避免
+ * 「点进去只看到一句没有可用助手」。
+ */
+export const MUSIC_ASSISTANT_PERM = "user:ai:music:use";
+
+/** 当前账号能否使用音乐助手（侧边栏入口显隐用；未登录 = 无权限） */
+export function canUseMusicAssistant(profile: Record<string, unknown> | null): boolean {
+  return hasPermission(profile, MUSIC_ASSISTANT_PERM);
 }
 
 const LIKE_PAGE_SIZE = 200;
@@ -210,6 +232,7 @@ export async function pullLikes(): Promise<void> {
     }
     if (changes.length > 0) {
       await ipc.likeApply(changes);
+      useFavoritesStore.getState().bump();
     }
     if (maxSeq <= since) return;
     since = maxSeq;
@@ -238,8 +261,14 @@ async function importAllLikes(): Promise<void> {
     page += 1;
   }
   // 先歌单后歌曲：歌单卡片全部就位，歌曲的 pid 准入检查才都能过
-  if (allPlaylists.length > 0) await ipc.likeApply(allPlaylists);
-  if (allSongs.length > 0) await ipc.likeApply(allSongs);
+  if (allPlaylists.length > 0) {
+    await ipc.likeApply(allPlaylists);
+    useFavoritesStore.getState().bump();
+  }
+  if (allSongs.length > 0) {
+    await ipc.likeApply(allSongs);
+    useFavoritesStore.getState().bump();
+  }
   if (maxSeq > 0) {
     await ipc.setSetting("like.sync.seq", String(maxSeq)).catch(() => {});
   }
@@ -282,7 +311,7 @@ async function handleLikeOwnerSwitch(
   if (!uid) return;
   const prev = await ipc.getSetting(LIKE_OWNER_KEY).catch(() => null);
   if (prev && prev !== uid) {
-    await ipc.likeClearLocal().catch(() => {});
+    await ipc.likeClearLocal().then(() => useFavoritesStore.getState().bump()).catch(() => {});
   }
   await ipc.setSetting(LIKE_OWNER_KEY, uid).catch(() => {});
 }

@@ -70,7 +70,7 @@ pub(crate) fn upsert_tracks(conn: &Connection, tracks: &[&Track]) -> Result<(), 
 }
 
 /// 把查询行还原成 Track：列序固定为
-/// (sid, platform, name, singer, album, pic_url, duration_ms, music_id)。
+/// (sid, platform, name, singer, album, pic_url, duration_ms, music_id, start_ms, end_ms)。
 ///
 /// 音源包全面开放后宿主不再认识平台清单，所以这里几乎不再丢弃任何行 ——
 /// 只有「空平台」或「含 `:` 的平台」会被跳过（后者会拆坏 `platform:id` 主键，
@@ -90,5 +90,7 @@ pub(crate) fn track_from_row(row: &rusqlite::Row<'_>) -> Result<Option<Track>, r
         pic_url: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
         duration: row.get::<_, Option<i64>>(6)?.unwrap_or(0) as f64 / 1000.0,
         music_id: row.get(7)?,
+        start_ms: row.get::<_, Option<i64>>(8)?.and_then(|v| u64::try_from(v).ok()),
+        end_ms: row.get::<_, Option<i64>>(9)?.and_then(|v| u64::try_from(v).ok()),
     }))
 }

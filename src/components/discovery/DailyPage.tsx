@@ -10,6 +10,7 @@ import {
   useSourceRegistryStore,
 } from "@/stores/sourceRegistry";
 import { qtresCoverUrl } from "@/lib/lrc";
+import { retainTrackSelection, trackSelectionKey } from "@/lib/track-selection";
 import { usePagedList, type PageResult } from "@/hooks/usePagedList";
 import { TrackList } from "./TrackList";
 import { BatchBar } from "./BatchBar";
@@ -172,12 +173,7 @@ export function DailyPage(): React.JSX.Element {
   // 换源 / 重载后列表整体作废，勾选集里若还留着这些 id，「已选 N 首」就虚高；
   // 往下翻页时列表是**追加**的，已勾选的不会消失，所以这里只做收窄、不清空。
   useEffect(() => {
-    setSelected((prev) => {
-      if (prev.size === 0) return prev;
-      const ids = new Set(songs.map((t) => t.id));
-      const next = new Set([...prev].filter((x) => ids.has(x)));
-      return next.size === prev.size ? prev : next;
-    });
+    setSelected((prev) => retainTrackSelection(songs, prev));
   }, [songs]);
 
   return (
@@ -257,6 +253,7 @@ export function DailyPage(): React.JSX.Element {
                 embedded
                 tracks={songs}
                 selected={selected}
+                selectionKey={trackSelectionKey}
                 onSelectedChange={setSelected}
                 onError={setActionError}
               />
@@ -284,7 +281,7 @@ export function DailyPage(): React.JSX.Element {
               showIndex
               showCollect
               showDownload
-              selection={{ ids: selected, onToggle: toggleSelect }}
+              selection={{ ids: selected, onToggle: toggleSelect, onChange: setSelected }}
             />
             {/* 哨兵：进入视口就拉下一页。不支持翻页的源没有下一页，不挂哨兵 */}
             {hasMore ? <div ref={sentinelRef} className="h-1" /> : null}

@@ -221,7 +221,7 @@ pub(crate) fn list_liked_songs(
 ) -> Result<Vec<Track>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT l.sid, l.platform, l.name, l.singer, l.album, t.pic_url,
-                t.duration_ms, t.music_id
+                t.duration_ms, t.music_id, t.start_ms, t.end_ms
            FROM liked_songs l
            LEFT JOIN tracks t ON t.id = l.id
           WHERE l.deleted_at IS NULL

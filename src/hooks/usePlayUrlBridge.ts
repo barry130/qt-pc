@@ -2,7 +2,9 @@ import { useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, emit, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { resolvePlayUrlDetailed } from "@/source-scripts";
+import { peekQualityCeiling, resolvePlayUrlWithFallback } from "@/lib/quality-fallback";
+import { qualityShortLabel } from "@/lib/quality";
+import { toast } from "@/stores/toast";
 import { playUrlHitLine } from "@/source-scripts/playurl-line";
 import type { Quality, Track } from "@/types";
 import { MAIN_WINDOW_LABEL } from "@/lib/window-labels";
@@ -39,14 +41,27 @@ async function answer(req: PlayUrlRequest): Promise<void> {
   // 「实测字节 ÷ 时长」重标后的档位（只降不升）。null / 空串 = 没测出来。
   let size: number | null;
   let actualQuality: string;
+  // 实际出链档位：降档时线路记忆是按**实际档位**记的（rememberPlayUrlLine 的键
+  // 就是真正请求成功的那一档），广播线路给歌词窗口时必须用同一口径，否则读到空串。
+  let hitQuality = req.quality;
+  // 同专辑已知上限时不弹「只能提供 X」：有声书一本几百集，逐集弹同一句等于噪声
+  const known = peekQualityCeiling(req.track.platform, req.track.album);
   try {
-    // resolvePlayUrl 内部已做源门禁（local 直接报错）并回填引擎缓存
-    const res = await resolvePlayUrlDetailed(req.track, req.quality);
+    // 降档回退与播放动作预解析共用同一份阶梯（@/lib/quality-fallback）：
+    // 引擎主导的换歌（自然播完自动切歌 / 随机下一首 / 打开流失败重取）走的
+    // 就是这条路径，不回退的话 QQ 有声书章节这类「只有 128k 一档文件」的曲目
+    // 会表现成「点一下能放、自动播下一集就报无法播放」。
+    const res = await resolvePlayUrlWithFallback(req.track, req.quality);
     url = res.url;
     stalled = res.stalled;
     referer = res.referer;
     size = res.size;
     actualQuality = res.actualQuality;
+    if (res.quality.length > 0) hitQuality = res.quality;
+    if (url.length > 0 && res.quality !== req.quality && known === null) {
+      // 不静默降档：让用户知道听到的是 128K 而不是请求的档位
+      toast(`当前音源只能提供 ${qualityShortLabel(res.quality)}：${req.track.title}`);
+    }
   } catch {
     url = "";
     stalled = true;
@@ -68,7 +83,7 @@ async function answer(req: PlayUrlRequest): Promise<void> {
   void emit("play-url-line", {
     platform: req.track.platform,
     id: req.track.id,
-    line: playUrlHitLine(req.track, req.quality),
+    line: playUrlHitLine(req.track, hitQuality),
   }).catch(() => {});
 }
 

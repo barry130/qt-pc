@@ -43,6 +43,17 @@ export interface Track {
   mtime?: number | null;
   /** 本地曲目：Rust 扫描器记录的小写容器扩展名；在线曲目无。 */
   format?: string | null;
+  /** CUE 分轨在原始文件中的起点/终点（毫秒）；普通歌曲为空。 */
+  startMs?: number | null;
+  endMs?: number | null;
+}
+
+/** 由本机收藏和收听记录生成，不依赖在线推荐服务。 */
+export interface LocalMixSummary {
+  key: string;
+  title: string;
+  subtitle: string;
+  coverUrls: string[];
 }
 
 /** 播放历史条目，对齐 Rust `HistoryItem`（serde rename_all = "camelCase"，DESIGN §5.3） */
@@ -97,6 +108,11 @@ export interface PlayOverview {
   /** 其中完整听完的次数（≤ totalPlays） */
   finishedPlays: number;
   lastPlayedAt: number | null;
+  /**
+   * 有记录的本地自然日天数（去重，全零的一天不算）。
+   * 只统计 V18 起写入 `play_days` 的播放，老库升级前的历史次数不反推。
+   */
+  activeDays: number;
 }
 
 /** 单曲统计，对齐 Rust `PlayStatItem` */
@@ -113,6 +129,76 @@ export interface SingerStat {
   /** 该歌手统计里出现过的一个音源（分组只按歌手名，音源取其一） */
   platform: string;
   playCount: number;
+}
+
+/** 听歌报告明细查询的分组维度 */
+export type ListenReportKind = "tracks" | "singers" | "sources";
+/** 听歌报告明细排序方式 */
+export type ListenReportOrder = "count" | "duration";
+
+export interface ListenReportQuery {
+  kind: ListenReportKind;
+  order: ListenReportOrder;
+  offset: number;
+  limit: number;
+  singer?: string | null;
+  platform?: string | null;
+  /**
+   * 只看最近 N 天（1 = 今天、7、30）；省略 = 全部累计。
+   * 带上它时明细读按天明细表，分组与排序口径和累计榜一致。
+   */
+  days?: number | null;
+}
+
+/** 日榜查询：窗口天数 + 分组维度 + 排行条数（一次只取前 N 条，不分页） */
+export interface ListenDayReportQuery {
+  kind: ListenReportKind;
+  order: ListenReportOrder;
+  /** 窗口天数：1 = 今天、7 = 近 7 天、30 = 近 30 天 */
+  days: number;
+  /** 排行条数 */
+  limit: number;
+}
+
+/** 窗口内某一天的汇总；没有记录的日子也会出现，值为 0（趋势轴因此不会缺格） */
+export interface ListenDayPoint {
+  /** 本地自然日 `YYYY-MM-DD` */
+  day: string;
+  playCount: number;
+  totalPlayedMs: number;
+}
+
+/** 日榜一次性汇总：逐日趋势 + 窗口总量 + 前 N 条排行 */
+export interface ListenDayReport {
+  /** 窗口内逐日汇总，升序 */
+  daily: ListenDayPoint[];
+  /** 窗口内有记录的天数 */
+  activeDays: number;
+  /** 窗口内总有效播放次数（不受 limit 截断） */
+  totalPlays: number;
+  /** 窗口内总实际收听时长（毫秒） */
+  totalPlayedMs: number;
+  /** 窗口内去重曲目数 */
+  trackCount: number;
+  /** 排行前 limit 条，口径与 `days` 窗口下的 listenReport 明细一致 */
+  items: ListenReportEntry[];
+}
+
+/** 听歌报告的聚合明细；歌手/音源分组没有单一曲目，因此 track 为 null */
+export interface ListenReportEntry {
+  id: string;
+  name: string;
+  platform: string;
+  playCount: number;
+  totalPlayedMs: number;
+  trackCount: number;
+  lastPlayedAt: number;
+  track: Track | null;
+}
+
+export interface ListenReportPage {
+  items: ListenReportEntry[];
+  total: number;
 }
 
 /** 我的歌单摘要，对齐 Rust `PlaylistSummary`（DESIGN §5.3） */
@@ -248,6 +334,18 @@ export interface Chart {
   name: string;
   picUrl: string;
   description: string | null;
+  contentType?: "music" | "programs";
+}
+
+/** QQ 有声榜中的节目容器 */
+export interface AudioProgram {
+  id: string;
+  platform: SourceId;
+  name: string;
+  artist: string;
+  picUrl: string;
+  description: string | null;
+  chapterCount: number;
 }
 
 /** 对齐 Rust `PlaybackState`（DESIGN §7.2 全量快照） */
@@ -525,4 +623,39 @@ export interface AudioCacheStats {
 export interface AudioCacheClearResult {
   freedBytes: number;
   failedCount: number;
+}
+
+/** 进程内可再生缓存清理结果（不涉及磁盘用户数据）。 */
+export interface RuntimeCacheClearResult {
+  clearedCount: number;
+}
+
+/** 网络配置（设置页「网络」分区回读/保存；Rust commands.rs NetConfigView 的 camelCase 投影） */
+export interface NetConfigView {
+  /** "system" 跟随系统 / "none" 直连 / "custom" 自定义（Rust 侧是自由字符串，以字面量对齐） */
+  proxyMode: string;
+  /** 仅 custom 模式生效；http/https/socks5/socks5h */
+  proxyUrl: string;
+  /** 单源兜底超时毫秒（Rust 侧钳制 2000–60000） */
+  sourceTimeoutMs: number;
+}
+
+/** 代理试连结果（设置页「测试连接」按钮；按表单值临时构建客户端，不动全局配置） */
+export interface NetTestResult {
+  ok: boolean;
+  status: number | null;
+  elapsedMs: number;
+  error: string | null;
+}
+
+/** 迷你播放器状态（toggle_mini_player 的回执；true = 迷你窗当前可见） */
+export interface MiniPlayerState {
+  visible: boolean;
+}
+
+export interface FileAssociationState {
+  supported: boolean;
+  registered: boolean;
+  extensions: string[];
+  defaultExtensions: string[];
 }

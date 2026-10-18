@@ -47,10 +47,8 @@ export default defineConfig({
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
     outDir: "dist",
     // 刻意不设 chunkSizeWarningLimit：默认 500 kB 的警告是**有用的信号**。
-    // 之前把它抬到 1024 只是把「单个 577 kB 大 chunk」的警告藏起来；现在路由已按页
-    // 懒加载（src/lib/router.tsx + KeepAliveOutlet），主包回到 500 kB 以下，
-    // 保留默认值可以继续盯着它——哪天又超了，说明有人把大模块重新塞进了首屏路径。
-    // 若将来确实出现合理的超大 chunk（例如必须整体加载的音源包），再针对它设
-    // manualChunks 或单独提升阈值，而不是全局放宽。
+    // 路由按页懒加载（src/lib/router.tsx + KeepAliveOutlet），根入口也按窗口 label
+    // 分别加载主窗口、桌面歌词和迷你播放器（src/App.tsx）。
+    // 保留默认阈值，继续监控各模块体积。
   },
 });

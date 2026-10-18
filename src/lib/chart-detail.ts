@@ -15,6 +15,13 @@ import * as sourceApi from "@/source-scripts";
  */
 const chartDetailCache = new Map<string, Track[]>();
 
+/** 清空进程内榜单详情缓存，返回被清理的榜单数。 */
+export function clearChartDetailCache(): number {
+  const count = chartDetailCache.size;
+  chartDetailCache.clear();
+  return count;
+}
+
 /** 榜单详情（带进程内缓存）；`force` 绕过缓存重打源站 */
 export async function loadChartDetail(chart: Chart, force = false): Promise<Track[]> {
   const key = `${chart.platform}:${chart.id}`;

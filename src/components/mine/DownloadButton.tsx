@@ -71,9 +71,19 @@ export function DownloadButton(props: {
   };
 
   if (track.platform === "local") {
-    // 播放条上直接不显示；列表里保留「本地」占位，说明为什么没有下载入口
+    // 本地文件本来就在磁盘上，没有下载入口。两种形态都保留占位（而不是直接
+    // 不渲染）：播放条上按钮是左右分列排的，少一个会让其余按钮整体位移，
+    // 在线/本地来回切时看得见跳动（用户口径：「本地音乐播放控制栏也正常
+    // 展示，不过不允许点击」）。图标沿用下载同形，只是置灰。
     return variant === "icon" ? (
-      <></>
+      <span
+        title="本地文件（已在磁盘上，无需下载）"
+        aria-label="本地文件（已在磁盘上，无需下载）"
+        aria-disabled="true"
+        className="flex h-9 w-9 shrink-0 cursor-default items-center justify-center rounded-full text-muted-foreground/40"
+      >
+        <Download className="h-4 w-4" />
+      </span>
     ) : (
       <StatusIcon label="本地文件" className="text-muted-foreground">
         <HardDrive />

@@ -55,3 +55,22 @@ export function qualityOptionsFromRegistry(qualities: RegistryQuality[]): Qualit
   }
   return fromPack.length > 0 ? fromPack : QUALITY_OPTIONS;
 }
+
+/** 档位的短标（"320"→"320K"）；未知档位回退原样大写，与音质菜单同一套口径。
+ *  播放条上本地曲目禁用态的占位按钮也用它，避免那条按钮宽窄来回跳。
+ *
+ *  `qualities` 传数据包注册表声明的档位时优先按包内名称取短标：包里的
+ *  "无损 24bit" 会被拆成 short="24bit"，比内置三档兜底算出来的
+ *  "FLAC24BIT" 更贴近音质菜单里的写法（同一档位在两处显示成两个词最容易被
+ *  当成两个不同的档）。省略 = 只用内置三档兜底。 */
+export function qualityShortLabel(
+  value: Quality,
+  qualities: RegistryQuality[] = [],
+): string {
+  const declared = qualities.find((q) => q.id === value);
+  if (declared !== undefined) {
+    const sp = declared.name.indexOf(" ");
+    return sp > 0 ? declared.name.slice(sp + 1) : declared.name || value.toUpperCase();
+  }
+  return QUALITY_OPTIONS.find((o) => o.value === value)?.short ?? value.toUpperCase();
+}

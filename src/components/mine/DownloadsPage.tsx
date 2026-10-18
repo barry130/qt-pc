@@ -1,12 +1,17 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Eraser, Pause, Play, RotateCcw, X } from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Eraser, ListEnd, Pause, Play, RotateCcw, X } from "lucide-react";
 import { errMsg } from "@/lib/utils";
-import type { DownloadTask } from "@/types";
+import type { DownloadTask, Track } from "@/types";
 import * as ipc from "@/services/ipc";
 import { useDownloadsStore } from "@/stores/downloads";
-import { toastError } from "@/stores/toast";
+import { usePlayerStore } from "@/stores/player";
+import { toastError, toastSuccess } from "@/stores/toast";
 import { BatchDeleteButton, RowActions } from "@/components/common/RowActions";
 import { IconButton } from "@/components/common/IconButton";
+import { PlayNextIcon } from "@/components/common/PlayNextIcon";
+import { CollectButton } from "@/components/mine/CollectButton";
+import { useFavoriteFlags } from "@/hooks/useFavoriteFlags";
+import { useFavoritesStore } from "@/stores/favorites";
 import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 
 const STATUS_LABEL: Record<DownloadTask["status"], string> = {
@@ -29,6 +34,28 @@ function formatBytes(n: number | null | undefined): string {
     i += 1;
   }
   return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
+}
+
+/**
+ * 已完成的任务 → 可直接播放的本地曲目。
+ *
+ * 引擎的本地分支认的是 `platform === "local"` + `Track.id = 文件绝对路径`
+ * （见 audio/engine.rs 的 LoadJob::run 与 services/ipc.ts 的本地音乐约定），
+ * 所以下载完的文件本质上就是一首本地曲目，不需要另开一条「播下载文件」的通路。
+ * 元数据（歌名/歌手/专辑/封面/时长）沿用原在线曲目那份，比从文件名反解准。
+ *
+ * 未完成 / 没有落盘路径（历史任务、失败任务）返回 null，调用方据此不给播放入口。
+ */
+function playableLocalTrack(t: DownloadTask): Track | null {
+  if (t.status !== "done" || !t.filePath) return null;
+  return {
+    ...t.track,
+    id: t.filePath,
+    platform: "local",
+    // 下载文件是整首，CUE 分轨的区间对本地文件没有意义
+    startMs: null,
+    endMs: null,
+  };
 }
 
 /**
@@ -175,12 +202,86 @@ export function DownloadsPage(): React.JSX.Element {
   const activeCount = inflightIds.length;
   const pausedCount = pausedIds.length;
 
+  // 可播放的已完成任务（按列表顺序）：播放入口只给真正落盘的那些。
+  // 用 task.filePath 当 Track.id 走本地曲目通路，元数据沿用原在线曲目。
+  const playable = useMemo(
+    () =>
+      tasks
+        .map((t) => ({ task: t, track: playableLocalTrack(t) }))
+        .filter((x): x is { task: DownloadTask; track: Track } => x.track !== null),
+    [tasks],
+  );
+  /** 任务 id → 可播放曲目（行内按钮按 id 查，不必在渲染里重复构造） */
+  const playableById = useMemo(
+    () => new Map(playable.map((x) => [x.task.id, x.track])),
+    [playable],
+  );
+  /** 行内「加入播放队列」：与本地曲库行内同语义（不打断当前播放） */
+  const queueAppend = (track: Track): void => {
+    void ipc.queueAppend([track]).then(
+      () => toastSuccess(`已将「${track.title}」加入播放队列`),
+      (err) => toastError(`加入播放队列失败：${errMsg(err)}`),
+    );
+  };
+  /** 行内「下一首播放」：插到当前曲目后面，同样不打断现在这首 */
+  const queueNext = (track: Track): void => {
+    void ipc.queueAddNext(track).then(
+      () => toastSuccess(`已将「${track.title}」设为下一首播放`),
+      (err) => toastError(`加入下一首播放失败：${errMsg(err)}`),
+    );
+  };
+
+  // 收藏判定按**原在线曲目**（`qq:003abc`）而不是转换后的本地曲目：
+  // 歌单里存的就是在线曲目，收藏它才和别的列表口径一致；而且引擎对
+  // 「已下载的在线曲目」有离线优先分支，从歌单点它照样播磁盘文件。
+  const favoritesVersion = useFavoritesStore((s) => s.version);
+  const favoriteFlags = useFavoriteFlags(
+    useMemo(() => tasks.map((t) => t.track), [tasks]),
+    favoritesVersion,
+  );
+  /** 任务 id → 是否已收藏（行尾红心点亮用） */
+  const favoritedById = useMemo(
+    () => new Map(tasks.map((t, i) => [t.id, favoriteFlags[i] === true])),
+    [tasks, favoriteFlags],
+  );
+
+  const playTrack = (track: Track): void => {
+    void usePlayerStore
+      .getState()
+      .play(track)
+      .catch((err) => toastError(`播放失败：${errMsg(err)}`));
+  };
+
+  /** 播放全部：整批入队（顺序与列表一致），从第一首起播 */
+  const playAll = (): void => {
+    if (playable.length === 0) return;
+    void usePlayerStore
+      .getState()
+      .playQueue(
+        playable.map((x) => x.track),
+        0,
+      )
+      .catch((err) => toastError(`播放失败：${errMsg(err)}`));
+  };
+
   return (
     <div className="flex h-full min-w-0 flex-col">
       <div className="border-b border-border px-4 py-3">
         <div className="flex items-center justify-between gap-3">
           <h1 className="text-base font-medium">下载管理</h1>
           <div className="flex items-center gap-1">
+            {playable.length > 0 && (
+              <IconButton
+                label={`播放全部已完成（${playable.length}）`}
+                variant="outline"
+                size="md"
+                hover="secondary"
+                disabled={batchBusy}
+                onClick={playAll}
+              >
+                <Play />
+              </IconButton>
+            )}
             {pausedCount > 0 && (
               <IconButton
                 label="全部继续"
@@ -223,6 +324,11 @@ export function DownloadsPage(): React.JSX.Element {
         <p className="mt-1 truncate text-xs text-muted-foreground">
           {dir ? `保存位置：${dir}（在 设置 · 下载 中修改）` : "在歌曲列表里点「下载」即可加入队列"}
         </p>
+        {playable.length > 0 && (
+          <p className="mt-0.5 truncate text-xs text-muted-foreground">
+            已完成的可以直接点标题播放（本地文件播放，不联网取址）
+          </p>
+        )}
 
         {/* 多选 / 批量删除：与本地曲库同一套交互 */}
         {tasks.length > 0 && (
@@ -326,6 +432,22 @@ export function DownloadsPage(): React.JSX.Element {
                 onResume={() => void act(t.id, () => ipc.resumeDownload(t.id))}
                 onRetry={() => void act(t.id, () => ipc.retryDownload(t.id))}
                 onCancel={() => void act(t.id, () => ipc.cancelDownload(t.id))}
+                onPlay={
+                  playableById.has(t.id)
+                    ? () => playTrack(playableById.get(t.id) as Track)
+                    : undefined
+                }
+                onQueue={
+                  playableById.has(t.id)
+                    ? () => queueAppend(playableById.get(t.id) as Track)
+                    : undefined
+                }
+                onPlayNext={
+                  playableById.has(t.id)
+                    ? () => queueNext(playableById.get(t.id) as Track)
+                    : undefined
+                }
+                favorited={favoritedById.get(t.id) === true}
                 onReveal={() => ipc.revealDownload(t.id)}
                 onDelete={async (deleteFile) => {
                   await ipc.deleteDownload(t.id, deleteFile);
@@ -350,6 +472,14 @@ function TaskRow(props: {
   onResume: () => void;
   onRetry: () => void;
   onCancel: () => void;
+  /** 已完成且文件落盘时提供：点标题 / 播放按钮播这首（本地文件，不联网） */
+  onPlay?: () => void;
+  /** 同条件下提供：加入播放队列（不打断当前播放） */
+  onQueue?: () => void;
+  /** 同条件下提供：设为下一首播放（插到当前曲目后面） */
+  onPlayNext?: () => void;
+  /** 这一行的原在线曲目是否已收藏（行尾红心点亮用） */
+  favorited: boolean;
   onReveal: () => Promise<void>;
   onDelete: (deleteFile: boolean) => Promise<void>;
   onError: (msg: string) => void;
@@ -361,7 +491,19 @@ function TaskRow(props: {
   const canRetry = t.status === "failed" || t.status === "canceled";
 
   return (
-    <li className="border-b border-border/50 px-4 py-2.5">
+    <li
+      // 整行可点播放（与本地曲库的行同手感）：只对已落盘的任务开放。
+      // 行内有复选框 / 各种按钮，它们的点击不能顺手把这首播了 —— 用 closest
+      // 拦掉交互控件，剩下的空白区（状态文字、进度条旁）才当「点这一行」。
+      onClick={(e) => {
+        if (!props.onPlay) return;
+        if ((e.target as HTMLElement).closest("button, input, [role='menu']")) return;
+        props.onPlay();
+      }}
+      className={`border-b border-border/50 px-4 py-2.5 ${
+        props.onPlay ? "cursor-pointer hover:bg-secondary/40" : ""
+      }`}
+    >
       {/* 一行展示：选择 / 标题 / 状态 / 操作按钮同排 */}
       <div className="flex items-center gap-3">
         <input
@@ -372,7 +514,20 @@ function TaskRow(props: {
           className="h-3.5 w-3.5 shrink-0 accent-primary"
         />
         <div className="min-w-0 flex-1">
-          <div className="truncate text-sm">{t.track.title}</div>
+          {/* 已完成的点标题直接播（本地文件，不走在线取址）。
+              未完成的行保持纯文本：点了也没有文件可放。 */}
+          {props.onPlay ? (
+            <button
+              type="button"
+              onClick={props.onPlay}
+              title={`播放「${t.track.title}」（本地文件）`}
+              className="block max-w-full truncate text-left text-sm transition-colors hover:text-primary hover:underline"
+            >
+              {t.track.title}
+            </button>
+          ) : (
+            <div className="truncate text-sm">{t.track.title}</div>
+          )}
           <div className="truncate text-xs text-muted-foreground">
             {/* 显示**实测**档位：请求 flac 而线路只给 320k 时，标请求档就是虚标。
                 没测出来（历史任务 / 取址没给结果）时退回请求档。 */}
@@ -409,6 +564,34 @@ function TaskRow(props: {
               <X />
             </IconButton>
           )}
+          {/* 已完成：给一个显式播放入口（和本地曲库行内的「播放」同形）。
+              未完成 / 无落盘路径不渲染 —— 点了也没文件可放。 */}
+          {props.onPlay && (
+            <IconButton label="播放" onClick={props.onPlay} disabled={busy}>
+              <Play />
+            </IconButton>
+          )}
+          {props.onPlayNext && (
+            <IconButton
+              label="下一首播放"
+              onClick={props.onPlayNext}
+              disabled={busy}
+            >
+              <PlayNextIcon className="h-3.5 w-3.5" />
+            </IconButton>
+          )}
+          {props.onQueue && (
+            <IconButton
+              label="加入播放队列"
+              onClick={props.onQueue}
+              disabled={busy}
+            >
+              <ListEnd />
+            </IconButton>
+          )}
+          {/* 收藏用**原在线曲目**（歌单里存的就是它），不是行内转换出的本地
+              曲目；红心高亮由列表层批量查得后以标量传入，避免行组件 memo 失效 */}
+          <CollectButton track={t.track} favorited={props.favorited} />
           {/* 定位只在文件已落盘（已完成）时提供；删除菜单对所有状态可用 */}
           <RowActions
             onReveal={t.status === "done" ? props.onReveal : undefined}

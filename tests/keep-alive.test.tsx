@@ -5,7 +5,7 @@
  * （如歌单广场的分类筛选）都保留，切回来不重新拉接口。
  */
 import { describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 
 const api = vi.hoisted(() => ({
   categories: 0,
@@ -128,6 +128,9 @@ describe("一级页面 keep-alive", () => {
     const { container, rerender } = render(<KeepAliveOutlet pathname="/playlists" />);
     // 一级页面本身是懒加载的（lib/lazyPage）：首帧先是 Suspense 占位，
     // 对应 chunk 到位后才是真实页面。这里必须等它出现，不能只等固定时长。
+    await act(async () => {
+      await vi.dynamicImportSettled();
+    });
     await waitFor(() => expect(container.textContent).toContain("歌单广场"));
     await flush();
 
@@ -146,6 +149,9 @@ describe("一级页面 keep-alive", () => {
     rerender(<KeepAliveOutlet pathname="/" />);
     // 首页同样懒加载：先等它真的渲染出来，再取推荐次数基线，
     // 否则它的加载会在下面的断言之间完成、把计数改掉
+    await act(async () => {
+      await vi.dynamicImportSettled();
+    });
     await waitFor(() => expect(container.textContent).toContain("发现音乐"));
     await flush();
     expect(container.textContent).toContain("歌单广场");
@@ -198,6 +204,9 @@ describe("一级页面 keep-alive", () => {
       useMusicSourceStore.setState({ activeSourceId: "wyy" });
 
       const { container, rerender } = render(<KeepAliveOutlet pathname="/playlists" />);
+      await act(async () => {
+        await vi.dynamicImportSettled();
+      });
       await waitFor(() => expect(container.textContent).toContain("歌单广场"));
       await flush();
       // 可见状态下首次测量：一行放不下 3 个分类 → 出现「更多」
@@ -205,6 +214,9 @@ describe("一级页面 keep-alive", () => {
 
       // 切到首页（歌单广场只被隐藏，组件实例与 DOM 都还在）
       rerender(<KeepAliveOutlet pathname="/" />);
+      await act(async () => {
+        await vi.dynamicImportSettled();
+      });
       await waitFor(() => expect(container.textContent).toContain("发现音乐"));
       await flush();
 

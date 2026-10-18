@@ -22,8 +22,13 @@ use super::*;
 /// 本地曲目入库行（`local::scan_dirs` 的产物）。
 #[derive(Debug, Clone)]
 pub struct LocalTrackRow {
-    /// 文件绝对路径，同时作为 `Track.id`
+    /// Stable local Track.id: physical path, or `<path>#cue:<number>`.
+    pub id: String,
+    /// Physical audio path (shared by all CUE subtracks).
     pub path: String,
+    pub cue_path: Option<String>,
+    pub start_ms: Option<u64>,
+    pub end_ms: Option<u64>,
     pub title: String,
     pub singer: String,
     pub album: String,
@@ -33,6 +38,9 @@ pub struct LocalTrackRow {
     pub mtime: i64,
     /// 小写扩展名，如 "mp3"
     pub format: String,
+    /// 内嵌歌词（ID3v2 USLT / Vorbis LYRICS）。**不是 tracks 表的列**：扫描器读标签时
+    /// 顺手带出来的中间产物，由 `library_scan` 落进 `lyrics` 表，写完即弃。
+    pub embedded_lyric: Option<String>,
 }
 
 /// 本地曲目入库/更新（§13.2 要点 4「新文件插入」/ 要点 5「老文件恢复，取消缺失标记」）。
@@ -44,11 +52,19 @@ pub fn upsert_local_tracks(
     let now = now_ms();
     let tx = conn.unchecked_transaction()?;
     for r in rows {
+        if r.cue_path.is_some() {
+            // Keep references/history intact while retiring the duplicate album.
+            tx.execute(
+                "UPDATE tracks SET missing = 1, updated_at = ?1
+                 WHERE id = ?2 AND platform = 'local' AND start_ms IS NULL",
+                params![now, format!("local:{}", r.path)],
+            )?;
+        }
         tx.execute(
             "INSERT INTO tracks (id, platform, title, singer, album, pic_url, duration_ms,
                                  music_id, local_path, file_size, format, mtime, missing,
-                                 created_at, updated_at)
-             VALUES (?1, 'local', ?2, ?3, ?4, NULL, ?5, NULL, ?6, ?7, ?8, ?9, 0, ?10, ?10)
+                                 created_at, updated_at, start_ms, end_ms, cue_path)
+             VALUES (?1, 'local', ?2, ?3, ?4, NULL, ?5, NULL, ?6, ?7, ?8, ?9, 0, ?10, ?10, ?11, ?12, ?13)
              ON CONFLICT(id) DO UPDATE SET
                title       = excluded.title,
                singer      = excluded.singer,
@@ -58,10 +74,13 @@ pub fn upsert_local_tracks(
                file_size   = excluded.file_size,
                format      = excluded.format,
                mtime       = excluded.mtime,
+               start_ms    = excluded.start_ms,
+               end_ms      = excluded.end_ms,
+               cue_path    = excluded.cue_path,
                missing     = 0,
                updated_at  = excluded.updated_at",
             params![
-                format!("local:{}", r.path),
+                format!("local:{}", r.id),
                 r.title,
                 r.singer,
                 r.album,
@@ -71,10 +90,43 @@ pub fn upsert_local_tracks(
                 r.format,
                 r.mtime,
                 now,
+                r.start_ms.and_then(|v| i64::try_from(v).ok()),
+                r.end_ms.and_then(|v| i64::try_from(v).ok()),
+                r.cue_path,
             ],
         )?;
     }
     tx.commit()
+}
+
+/// Retire old children after a complete CUE sheet was rescanned/opened. Call once
+/// after all upsert chunks; a chunk alone cannot prove a sibling is absent.
+pub fn reconcile_local_cue_tracks(
+    conn: &Connection,
+    rows: &[LocalTrackRow],
+) -> Result<usize, rusqlite::Error> {
+    let present: HashSet<String> = rows.iter().map(|r| format!("local:{}", r.id)).collect();
+    let sheets: HashSet<&str> = rows.iter().filter_map(|r| r.cue_path.as_deref()).collect();
+    let now = now_ms();
+    let mut marked = 0;
+    for cue in sheets {
+        let stale = {
+            let mut statement = conn.prepare(
+                "SELECT id FROM tracks WHERE platform = 'local' AND cue_path = ?1 AND missing = 0",
+            )?;
+            let ids = statement
+                .query_map(params![cue], |r| r.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?;
+            ids
+        };
+        for id in stale.into_iter().filter(|id| !present.contains(id)) {
+            marked += conn.execute(
+                "UPDATE tracks SET missing = 1, updated_at = ?1 WHERE id = ?2",
+                params![now, id],
+            )?;
+        }
+    }
+    Ok(marked)
 }
 
 /// 标记缺失（§13.2 要点 1）：扫描目录范围内、本次未命中的本地记录置 `missing = 1`。
@@ -86,21 +138,33 @@ pub fn mark_missing_local_tracks(
 ) -> Result<usize, rusqlite::Error> {
     let now = now_ms();
     let mut stmt = conn.prepare(
-        "SELECT local_path FROM tracks
+        "SELECT id, local_path, cue_path FROM tracks
          WHERE platform = 'local' AND local_path IS NOT NULL AND missing = 0",
     )?;
     let stale: Vec<String> = stmt
-        .query_map([], |row| row.get(0))?
-        .filter_map(|r| r.ok())
-        .filter(|path: &String| !present.contains(path) && under_any_dir(path, dirs))
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|(id, path, cue)| {
+            !present.contains(&strip_local_prefix(id))
+                && (under_any_dir(path, dirs)
+                    || cue.as_ref().is_some_and(|p| under_any_dir(p, dirs)))
+        })
+        .map(|(id, _, _)| id)
         .collect();
     drop(stmt);
 
     let mut marked = 0usize;
-    for path in &stale {
+    for id in &stale {
         marked += conn.execute(
-            "UPDATE tracks SET missing = 1, updated_at = ?1 WHERE local_path = ?2",
-            params![now, path],
+            "UPDATE tracks SET missing = 1, updated_at = ?1 WHERE id = ?2",
+            params![now, id],
         )?;
     }
     Ok(marked)
@@ -109,7 +173,7 @@ pub fn mark_missing_local_tracks(
 /// 读库内本地曲目（不扫磁盘）；`missing = 1` 的记录不返回。
 pub fn query_local_tracks(conn: &Connection) -> Result<Vec<Track>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, singer, album, duration_ms, music_id
+        "SELECT id, title, singer, album, duration_ms, music_id, start_ms, end_ms
          FROM tracks
          WHERE platform = 'local' AND missing = 0
          ORDER BY title COLLATE NOCASE, singer COLLATE NOCASE",
@@ -127,6 +191,12 @@ pub fn query_local_tracks(conn: &Connection) -> Result<Vec<Track>, rusqlite::Err
             pic_url: String::new(),
             duration: row.get::<_, Option<i64>>(4)?.unwrap_or(0) as f64 / 1000.0,
             music_id: row.get(5)?,
+            start_ms: row
+                .get::<_, Option<i64>>(6)?
+                .and_then(|v| u64::try_from(v).ok()),
+            end_ms: row
+                .get::<_, Option<i64>>(7)?
+                .and_then(|v| u64::try_from(v).ok()),
         });
     }
     Ok(out)
@@ -174,7 +244,7 @@ pub fn query_local_track_files(
 /// `Track.id` 仍是原文件路径，前端可直接展示。
 pub fn query_missing_local_tracks(conn: &Connection) -> Result<Vec<Track>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, singer, album, duration_ms, music_id
+        "SELECT id, title, singer, album, duration_ms, music_id, start_ms, end_ms
          FROM tracks
          WHERE platform = 'local' AND missing = 1
          ORDER BY title COLLATE NOCASE, singer COLLATE NOCASE",
@@ -192,6 +262,12 @@ pub fn query_missing_local_tracks(conn: &Connection) -> Result<Vec<Track>, rusql
             pic_url: String::new(),
             duration: row.get::<_, Option<i64>>(4)?.unwrap_or(0) as f64 / 1000.0,
             music_id: row.get(5)?,
+            start_ms: row
+                .get::<_, Option<i64>>(6)?
+                .and_then(|v| u64::try_from(v).ok()),
+            end_ms: row
+                .get::<_, Option<i64>>(7)?
+                .and_then(|v| u64::try_from(v).ok()),
         });
     }
     Ok(out)
@@ -208,7 +284,7 @@ pub fn purge_missing_local_tracks(conn: &Connection) -> Result<usize, rusqlite::
 /// 删本地记录的 SQL：优先按 `local_path` 匹配，老数据没写 `local_path` 时回退到主键
 /// `local:<path>`。本地曲目的 `local_path` 与 `id` 都唯一，不会误伤其它行。
 const DELETE_LOCAL_TRACK_SQL: &str =
-    "DELETE FROM tracks WHERE platform = 'local' AND (local_path = ?1 OR id = ?2)";
+    "DELETE FROM tracks WHERE platform = 'local' AND (id = ?2 OR (local_path = ?1 AND start_ms IS NULL))";
 
 /// 删除一条本地曲目记录（连带级联删除歌单归属 / 收藏 / 历史等关联行）。
 /// 返回删除条数（0 表示该路径不在库里）。**不动磁盘文件**。
@@ -284,6 +360,9 @@ fn under_any_dir(path: &str, dirs: &[String]) -> bool {
 }
 
 fn is_under_dir(path: &str, dir: &str) -> bool {
+    if dir == "/" {
+        return path.starts_with('/');
+    }
     let dir = dir.trim_end_matches(['/', '\\']);
     if dir.is_empty() {
         return false;
@@ -291,6 +370,8 @@ fn is_under_dir(path: &str, dir: &str) -> bool {
     let path = path.replace('\\', "/");
     let dir = dir.replace('\\', "/");
     let (path, dir) = (path.to_lowercase(), dir.to_lowercase());
-    path.strip_prefix(&dir)
-        .is_some_and(|rest| rest.starts_with('/'))
+    path == dir
+        || path
+            .strip_prefix(&dir)
+            .is_some_and(|rest| rest.starts_with('/'))
 }

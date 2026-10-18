@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams, useSearch } from "@tanstack/react-router";
-import { Play } from "lucide-react";
+import { Play, Search, X } from "lucide-react";
 import type { SourceId, Track } from "@/types";
 import * as sourceApi from "@/source-scripts";
 import { usePlayerStore } from "@/stores/player";
@@ -8,6 +8,7 @@ import { useSearchPageMax } from "@/stores/sourceRegistry";
 import { usePagedList, type PageResult } from "@/hooks/usePagedList";
 import { resolveArtistId } from "@/lib/artist-id";
 import { qtresCoverUrl } from "@/lib/lrc";
+import { filterTracks, retainTrackSelection, trackSelectionKey } from "@/lib/track-selection";
 import { TrackList } from "./TrackList";
 import { BatchBar } from "./BatchBar";
 import { ErrorRetry, TrackRowsSkeleton } from "./Skeletons";
@@ -59,6 +60,15 @@ export function ArtistPage(): React.JSX.Element {
   const artistId = typeof search.id === "string" && search.id.length > 0 ? search.id : "";
   // 没有 ?name= 说明是老链接：$id 位置放的是名字，解码后当名字用，且没有真 id。
   const name = rawName.length > 0 ? rawName : safeDecode(id);
+  // 路由复用组件时，检索与勾选随歌手身份一起复位。
+  return <ArtistPageContent key={JSON.stringify([platform, id, name, artistId])} platform={platform} name={name} artistId={artistId} />;
+}
+
+function ArtistPageContent({ platform, name, artistId }: {
+  platform: SourceId;
+  name: string;
+  artistId: string;
+}): React.JSX.Element {
   const playQueue = usePlayerStore((s) => s.playQueue);
   const [avatar, setAvatar] = useState("");
   const pageSize = useSearchPageMax(platform);
@@ -110,6 +120,14 @@ export function ArtistPage(): React.JSX.Element {
 
   // 批量管理的已勾选曲目 id 集合（见 BatchBar）
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [query, setQuery] = useState("");
+  const visibleSongs = useMemo(() => filterTracks(songs, query), [songs, query]);
+  const visibleSelected = useMemo(() => retainTrackSelection(visibleSongs, selected), [visibleSongs, selected]);
+  const changeQuery = (value: string): void => {
+    setQuery(value);
+    // 隐藏的歌曲退出批量范围，清空搜索也不恢复它们的勾选。
+    setSelected((prev) => retainTrackSelection(filterTracks(songs, value), prev));
+  };
   /** 批量操作的失败提示：与整页加载失败分开，别把已加载的列表顶掉 */
   const [actionError, setActionError] = useState<string | null>(null);
 
@@ -122,17 +140,10 @@ export function ArtistPage(): React.JSX.Element {
     });
   }, []);
 
-  // 换歌手 / 重载后列表整体作废，勾选集里若还留着这些 id，「已选 N 首」就虚高；
-  // 全量模式下一页页落进列表是**追加**的，已勾选的不会消失，
-  // 所以这里只做收窄、不清空。
+  // 重载 / 筛选后只保留可见选择；追加页不会自动勾上新来的歌曲。
   useEffect(() => {
-    setSelected((prev) => {
-      if (prev.size === 0) return prev;
-      const ids = new Set(songs.map((t) => t.id));
-      const next = new Set([...prev].filter((x) => ids.has(x)));
-      return next.size === prev.size ? prev : next;
-    });
-  }, [songs]);
+    setSelected((prev) => retainTrackSelection(visibleSongs, prev));
+  }, [visibleSongs]);
 
   const cover = avatar || songs.find((t) => t.picUrl)?.picUrl || "";
   const coverUrl = cover ? qtresCoverUrl(cover) : null;
@@ -184,37 +195,67 @@ export function ArtistPage(): React.JSX.Element {
             </p>
             <h1 className="mt-1 truncate text-2xl font-bold tracking-tight">{name}</h1>
             {/* 全量拉取时如实报进度，拉完才说「共 N 首歌」（与详情页同口径） */}
-            <p className="mt-1 text-xs text-muted-foreground">
+            <p role="status" className="mt-1 text-xs text-muted-foreground">
               {loading
                 ? "加载中…"
-                : loadingAll
-                  ? `已加载 ${songs.length} 首，正在取完其余…`
-                  : `共 ${songs.length} 首歌`}
+                : query.trim()
+                  ? `显示 ${visibleSongs.length} / ${songs.length} 首${loadingAll ? "，正在取完其余…" : ""}`
+                  : loadingAll
+                    ? `已加载 ${songs.length} 首，正在取完其余…`
+                    : `共 ${songs.length} 首歌`}
             </p>
             <div className="mt-3 flex flex-wrap items-center gap-2">
               <IconButton
                 label="播放全部"
                 variant="primary"
                 size="lg"
-                disabled={songs.length === 0}
+                disabled={loading || visibleSongs.length === 0}
                 className="h-9 w-9 rounded-lg shadow-lg shadow-primary/25"
-                onClick={() => void playQueue(songs, 0)}
+                onClick={() => void playQueue(visibleSongs, 0)}
               >
                 <Play className="h-4 w-4 fill-current" />
               </IconButton>
             </div>
           </div>
 
-          {/* 批量条摆在页头右侧，与左边那颗「播放全部」同一行（与歌单 / 榜单详情页
-              同位置，用户口径：批量操作属于页头）。歌手页没有宿主歌单，
-              不传 hostPlaylistId；收藏 / 下载只作用于当前已加载的 songs。
-              `items-end` + `pb-1` 与信息列底线对齐（同详情页）。 */}
+          {/* 搜索框沿用歌单详情页的位置，放在右侧批量条上方，不另占列表行。
+              歌手页没有宿主歌单；播放与批量操作共用当前可见歌曲。 */}
           {!loading && !error && songs.length > 0 ? (
-            <div className="relative flex shrink-0 items-end pb-1">
+            <div className="relative flex shrink-0 flex-col items-end justify-end gap-2 pb-1">
+              <div className="flex h-8 w-44 items-center gap-2 rounded-lg border border-input bg-background/80 px-2 focus-within:ring-1 focus-within:ring-ring">
+                <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden />
+                <input
+                  type="search"
+                  aria-label="歌手歌曲内搜索"
+                  placeholder="歌手歌曲内搜索"
+                  title="搜索标题、歌手、专辑"
+                  value={query}
+                  onChange={(e) => changeQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") {
+                      e.preventDefault();
+                      changeQuery("");
+                    }
+                  }}
+                  className="h-full min-w-0 flex-1 bg-transparent text-xs outline-none placeholder:text-muted-foreground [&::-webkit-search-cancel-button]:hidden"
+                />
+                {query ? (
+                  <button
+                    type="button"
+                    title="清空搜索"
+                    onClick={() => changeQuery("")}
+                    className="flex h-5 w-5 shrink-0 items-center justify-center rounded text-muted-foreground hover:bg-secondary hover:text-foreground"
+                  >
+                    <X className="h-3.5 w-3.5" aria-hidden />
+                    <span className="sr-only">清空搜索</span>
+                  </button>
+                ) : null}
+              </div>
               <BatchBar
                 embedded
-                tracks={songs}
-                selected={selected}
+                tracks={visibleSongs}
+                selected={visibleSelected}
+                selectionKey={trackSelectionKey}
                 onSelectedChange={setSelected}
                 onError={setActionError}
               />
@@ -240,13 +281,19 @@ export function ArtistPage(): React.JSX.Element {
           </div>
         ) : (
           <>
-            <TrackList
-              tracks={songs}
-              showIndex
-              showCollect
-              showDownload
-              selection={{ ids: selected, onToggle: toggleSelect }}
-            />
+            {visibleSongs.length === 0 ? (
+              <div role="status" className="py-10 text-center text-sm text-muted-foreground">
+                没有匹配的歌曲，试试其它标题、歌手或专辑
+              </div>
+            ) : (
+              <TrackList
+                tracks={visibleSongs}
+                showIndex
+                showCollect
+                showDownload
+                selection={{ ids: visibleSelected, onToggle: toggleSelect, onChange: setSelected }}
+              />
+            )}
             {loadingAll ? (
               <div className="py-4 text-center text-xs text-muted-foreground">
                 正在加载其余歌曲… 已加载 {songs.length} 首

@@ -4,7 +4,7 @@ import { errMsg } from "@/lib/utils";
 import { findCrossSourceDup } from "@/lib/collect-dup";
 import { useSourceLabelFn } from "@/stores/sourceRegistry";
 import { useFavoritesStore } from "@/stores/favorites";
-import { toastSuccess } from "@/stores/toast";
+import { toastSuccess, toastUndo } from "@/stores/toast";
 import type { MyPlaylistSummary, Track } from "@/types";
 import * as ipc from "@/services/ipc";
 
@@ -113,6 +113,14 @@ export function CollectMenu(props: {
         await ipc.removeFavorite(track, p.pid);
         await reload();
         await syncLiked();
+        // 取消收藏是高频低风险动作，不给二次确认，改成「先做完再给一次后悔的机会」。
+        // 撤销就是加回这个歌单：`syncLiked` 会把宿主的红心与所有列表的判定改回来
+        // （面板此时可能已经收起，`reload` 打空也无害）
+        toastUndo(`已从「${p.name}」取消收藏`, async () => {
+          await ipc.addFavorite(track, p.pid);
+          await reload();
+          await syncLiked();
+        });
       } catch (err) {
         setError(errMsg(err));
       } finally {

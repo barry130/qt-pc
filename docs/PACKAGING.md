@@ -1,9 +1,11 @@
 # 打包文档（Windows / Linux / macOS）
 
-> 本项目的 `pnpm tauri build` 在**本机 Windows 上**不可用（CLI 会把 `process.argv[0]` 解析成
-> `DSH Desktop.exe`，报 `unrecognized subcommand`），所以本地打包按下面的
-> **手动分步**流程执行，效果与 `tauri build` 完全一致。Linux / macOS 与 CI 里
-> `pnpm exec tauri build --runner cargo` 正常可用（发版流水线就是这么调的）。
+> Windows 本地统一使用 `pnpm exec tauri build --runner cargo --bundles nsis --ci`。
+> `pnpm tauri build` 曾因 CLI 将 `process.argv[0]` 解析为 `DSH Desktop.exe`
+> 报 `unrecognized subcommand`，显式使用 `exec` 与 `--runner cargo` 可绕过。
+> Tauri CLI 会先执行配置同步、TypeScript 检查与 Vite 构建，再编译并打包；
+> 手动 Cargo 构建只产出主程序，不能替代安装包构建。Linux / macOS 与 CI 也使用
+> `pnpm exec tauri build --runner cargo`（按平台选择 `--bundles`）。
 >
 > 三平台共用同一份代码：平台差异集中在 `src-tauri/src` 的 `cfg(target_os)` 门控
 > 与 `app.config.json` 的 platform 字典，打包只需换 `--bundles`。
@@ -29,10 +31,13 @@
 
 ## 前置检查
 
-1. **关掉正在运行的 QuietMusic**（含托盘），否则链接报 `os error 5 拒绝访问`：
+1. **确认构建输出没有被运行中的进程占用**。先检查可执行文件路径：
    ```powershell
-   Get-Process quietmusic -ErrorAction SilentlyContinue | Stop-Process -Force
+   Get-Process quietmusic -ErrorAction SilentlyContinue | Select-Object Id, Path
    ```
+   如果运行的是本次构建目标 `src-tauri/target/release/quietmusic.exe`，先从界面退出
+   （含托盘），否则链接可能报 `os error 5 拒绝访问`。已安装在其他目录的程序
+   不占用本次输出，无需为了打包将它关闭；不要按进程名强制终止所有实例。
 2. **配置已同步**：`pnpm config:check`（版本号等只在仓库根 `app.config.json` 改一处，
    见《配置文档》）。发版前确认 `version.name` 与 `version.code` 已一起改。
 3. **启动 crates 镜像代理**（仅当 cargo 需要联网拉索引/tarball 时必需）：
@@ -41,8 +46,10 @@
    ```
    `src-tauri/.cargo/config.toml` 把 crates.io 替换为 `127.0.0.1:8650` 的本地 HTTP
    镜像（本机 schannel TLS 损坏，cargo 的 HTTPS 下载栈不可用）。代理没起时
-   构建报 `local-mirror … 连接失败 (os error 10061)`。依赖已全部缓存时
-   `cargo check` 可离线通过，但 release 构建通常触发索引更新，务必先起代理。
+   构建报 `local-mirror … 连接失败 (os error 10061)`。依赖全部缓存后，
+   也可在打包前设置 `$env:CARGO_NET_OFFLINE = 'true'`，
+   让 release 构建只使用缓存；缺依赖时关闭离线模式并启动代理。
+   不要把 `--offline` 追加到 Tauri CLI 的 `--` 后面，该参数会被拒绝。
 4. 验证基线全绿（可选但建议；本机 `pnpm <script>` 可能被 pnpm 拦，直接调 node 入口，见《配置文档》§7.2）：
    ```powershell
    node node_modules/typescript/bin/tsc --noEmit
@@ -191,32 +198,37 @@ $r.assets | ForEach-Object { "$($_.name)`t$($_.size)`t$($_.browser_download_url)
 > Intel 的 `_x64.dmg` 需要在 Intel Mac 上本地 `pnpm tauri build --target x86_64-apple-darwin --bundles dmg`
 > 打出后手动上传。deb 是 glibc 构建，装在较老的发行版上可能报缺 `GLIBC_2.32` 一类的错。
 
-## 步骤 1：构建前端
+## 步骤 1：构建前端（仅手动构建需要单独执行）
+
+方式 A 的 Tauri CLI 会自动执行 `beforeBuildCommand: pnpm build`，无需重复跑本节。
+只有使用方式 B 手动 Cargo 构建，或要单独排查前端构建时，才执行：
 
 ```powershell
 Set-Location F:\qtMusic\qt-pc
-node scripts/sync-config.mjs    # 配置同步（pnpm build 也会先跑；本机 pnpm 可能被拦，直接调 node）
-node node_modules/typescript/bin/tsc --noEmit          # 类型检查
-node node_modules/vite/bin/vite.js build               # 产出 dist/
+node scripts/sync-config.mjs
+node node_modules/typescript/bin/tsc --noEmit
+node node_modules/vite/bin/vite.js build
 ```
 
 > 若 `pnpm build` 出现 `Terminate batch job (Y/N)?` 挂起，就是组合命令的
 > 交互问题；分两条命令执行即可。
 
-## 步骤 2：用 Tauri CLI 构建（绕过 argv[0] 的两种方式）
+## 步骤 2：构建 Windows 安装包或主程序
 
-**方式 A（推荐）**：直接调 CLI 的 node 入口，显式传 cargo 路径：
+**方式 A（推荐，产出 NSIS 安装包）**：显式使用 `exec` 与 Cargo runner：
 
 ```powershell
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 Set-Location F:\qtMusic\qt-pc
-pnpm exec tauri build --runner cargo
+# 可选：依赖已全部缓存时设置；首次拉取依赖时省略
+$env:CARGO_NET_OFFLINE = 'true'
+pnpm exec tauri build --runner cargo --bundles nsis --ci
 ```
 
 > 镜像配置在 `src-tauri/.cargo/config.toml`，`CARGO_HOME` 用默认 `~/.cargo` 即可
 > （仓库根的 `.cargo-home` 已废弃不用）。
 
-**方式 B**：完全手动（等价于 tauri build 的核心动作）：
+**方式 B（仅产出主程序）**：完成步骤 1 后手动调用 Cargo：
 
 ```powershell
 $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
@@ -231,7 +243,7 @@ cargo build --release --features tauri/custom-protocol
 > 所以写裸名 `--features custom-protocol` 会直接报
 > `the package 'quietmusic' does not contain this feature: custom-protocol`。
 > 方式 B 只出主程序，不出 NSIS 安装包；需要安装包时用方式 A
-> （NSIS 由 tauri-build 驱动 makensis 完成）。
+> （Tauri CLI 的打包流程会调用 makensis 生成 NSIS 安装包）。
 
 ## 步骤 3：验证
 

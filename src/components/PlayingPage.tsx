@@ -21,10 +21,10 @@ import {
   parseWordByWordLrc,
   qtresCoverUrl,
   type LyricLine,
-  type LyricWord,
 } from "@/lib/lrc";
 import { WindowControls } from "@/components/WindowControls";
-import { cn , errMsg } from "@/lib/utils";
+import { errMsg } from "@/lib/utils";
+import { LyricScroller } from "@/components/player/LyricScroller";
 
 /**
  * 播放页（全屏歌词 + 旋转封面）：
@@ -212,10 +212,12 @@ export function PlayingPage(): React.JSX.Element {
               </div>
             ) : (
               <LyricScroller
+                key={key}
                 lines={lines}
                 activeIndex={activeIndex}
                 onSeekMs={(ms) => void seekTo(ms + lyricOffset.offsetMs)}
                 positionMs={position - lyricOffset.offsetMs}
+                seekOffsetMs={lyricOffset.offsetMs}
               />
             )}
           </div>
@@ -347,153 +349,6 @@ function CenterText(props: { text: string }): React.JSX.Element {
   return (
     <div className="flex h-full items-center justify-center text-sm text-muted-foreground">
       {props.text}
-    </div>
-  );
-}
-
-/**
- * 单个词的卡拉 OK 染色：按「该词已唱过的比例」用横向渐变填充。
- *
- * 为什么用渐变而不是切 color：词内进度是连续的（一个字唱 270ms，中途就该
- * 是半边染色），切 color 只能整词跳色，观感与主流播放器的逐字不一样。
- * `background-clip:text` + 透明字色是这里唯一能实现「文字被渐变填充」的写法。
- *
- * 高亮侧必须写 `var(--lyric-highlight)`，绝不能用 `currentColor`：本元素已经
- * `color: transparent`（background-clip 的前提），`currentColor` 会解析成同一
- * 元素自己的 color（= 透明）——「已唱过」的半边会整段隐形，字边唱边消失、
- * 唱完整词跳回高亮，2026-10-06 修的就是这个 bug。
- * 渐变统一覆盖 0%~100%，不再按 pct 分支：pct=0 整词 inactive（未开唱的词
- * 不该亮——老实现 pct<=0 时不给样式，继承了整行高亮色，整行看起来全亮）、
- * pct=100 整词高亮、中间半边填充，一条公式三个状态全对。
- */
-function KaraokeWord(props: { word: LyricWord; elapsedMs: number }): React.JSX.Element {
-  const { word, elapsedMs } = props;
-  // 词的起点相对行首，所以要减掉再比时长
-  const passed = elapsedMs - word.startMs;
-  const raw = word.durationMs > 0 ? passed / word.durationMs : passed >= 0 ? 1 : 0;
-  const ratio = raw < 0 ? 0 : raw > 1 ? 1 : raw;
-  const pct = Math.round(ratio * 100);
-  return (
-    <span
-      style={{
-        backgroundImage: `linear-gradient(90deg, var(--lyric-highlight) ${pct}%, var(--lyric-inactive) ${pct}%)`,
-        WebkitBackgroundClip: "text",
-        backgroundClip: "text",
-        color: "transparent",
-      }}
-    >
-      {word.text}
-    </span>
-  );
-}
-
-/**
- * 歌词滚动区：当前行高亮居中。整行可点击 —— 点击任意歌词行跳转到该行
- * 对应的进度（主流播放器标配；无时间戳的行不响应）。
- *
- * 2026-10-06：有逐字数据（音源包 `wordByWord`）时当前行按词染色（卡拉 OK），
- * 没有就照旧整行高亮 —— 逐字是装饰面，取不到必须完全不影响原来的显示。
- */
-function LyricScroller(props: {
-  lines: LyricLine[];
-  activeIndex: number;
-  onSeekMs: (ms: number) => void;
-  /** 当前播放位置（毫秒，已减去歌词偏移）；逐字染色按它推进（暂停时它自然冻结） */
-  positionMs: number;
-}): React.JSX.Element {
-  const { lines, activeIndex, onSeekMs, positionMs } = props;
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const itemRefs = useRef<Array<HTMLDivElement | null>>([]);
-
-  useEffect(() => {
-    const el = itemRefs.current[activeIndex];
-    const container = containerRef.current;
-    if (!el || !container) return;
-    // offsetTop 量的是相对最近定位祖先（容器已设 relative）的距离；
-    // 容器不定位的话会把上方曲目信息区的高度也计入，滚动过头、当前行偏上。
-    const target =
-      el.offsetTop - container.clientHeight / 2 + el.clientHeight / 2;
-    container.scrollTo({ top: target, behavior: "smooth" });
-  }, [activeIndex]);
-
-  return (
-    <div
-      ref={containerRef}
-      className="relative h-full overflow-y-auto scroll-smooth px-8 [mask-image:linear-gradient(to_bottom,transparent,black_15%,black_85%,transparent)]"
-    >
-      <div className="mx-auto flex max-w-xl flex-col gap-5 py-[40%]">
-        {lines.map((line, i) => (
-          <div
-            key={i}
-            ref={(el) => {
-              itemRefs.current[i] = el;
-            }}
-            role={line.timeMs >= 0 ? "button" : undefined}
-            tabIndex={line.timeMs >= 0 ? 0 : undefined}
-            onClick={line.timeMs >= 0 ? () => onSeekMs(line.timeMs) : undefined}
-            onKeyDown={
-              line.timeMs >= 0
-                ? (e) => {
-                    if (e.key === "Enter" || e.key === " ") {
-                      e.preventDefault();
-                      onSeekMs(line.timeMs);
-                    }
-                  }
-                : undefined
-            }
-            className={cn(
-              "text-center transition-all duration-300",
-              line.timeMs >= 0
-                ? "cursor-pointer hover:text-lyric-highlight/70 focus-visible:outline-none"
-                : "",
-              i === activeIndex
-                ? "scale-105 text-xl font-semibold text-lyric-highlight"
-                : "text-base text-lyric-inactive",
-            )}
-          >
-            {i === activeIndex && line.words !== undefined && line.words.length > 0 ? (
-              // 逐字（卡拉 OK）：当前行按「已唱到的比例」逐词染色。
-              // 用 background-clip:text 的横向渐变做「填充」而不是改 color，
-              // 才能让**单个字**唱到一半时半边染色（整词跳色的观感不对）。
-              <div>
-                {line.words.map((w, wi) => (
-                  <KaraokeWord
-                    key={wi}
-                    word={w}
-                    elapsedMs={positionMs - line.timeMs}
-                  />
-                ))}
-              </div>
-            ) : (
-              <div>{line.text || "…"}</div>
-            )}
-            {line.romanization && (
-              <div
-                className={cn(
-                  "mt-0.5 text-xs",
-                  i === activeIndex
-                    ? "text-lyric-highlight/60"
-                    : "text-lyric-inactive/50",
-                )}
-              >
-                {line.romanization}
-              </div>
-            )}
-            {line.translation && (
-              <div
-                className={cn(
-                  "mt-1 text-sm",
-                  i === activeIndex
-                    ? "text-lyric-highlight/80"
-                    : "text-lyric-inactive/70",
-                )}
-              >
-                {line.translation}
-              </div>
-            )}
-          </div>
-        ))}
-      </div>
     </div>
   );
 }

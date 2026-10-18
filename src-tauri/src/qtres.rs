@@ -69,18 +69,25 @@ const COVER_THUMB_PX: u32 = 300;
 /// 原实现**每个请求新建一个 client** 且 `pool_max_idle_per_host(0)`，等于每次
 /// 都重做 TCP + TLS 握手，连接复用率为零；弱网下握手本身就占掉可观时间。
 /// 复用同一客户端后，同一图床的后续请求直接走已建立的连接。
-fn cover_client() -> &'static reqwest::blocking::Client {
-    static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
-    CLIENT.get_or_init(|| {
-        reqwest::blocking::Client::builder()
-            .user_agent("Mozilla/5.0")
-            .timeout(COVER_FETCH_TIMEOUT)
-            .connect_timeout(COVER_CONNECT_TIMEOUT)
-            .pool_max_idle_per_host(4)
-            .pool_idle_timeout(Duration::from_secs(90))
-            .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new())
-    })
+fn cover_client() -> Option<reqwest::blocking::Client> {
+    // 配置失效时给占位图；不能因构建失败偷偷绕过用户选择的代理。
+    type CachedClient = (u64, Option<reqwest::blocking::Client>);
+    static CLIENT_CACHE: OnceLock<Mutex<CachedClient>> = OnceLock::new();
+    let generation = crate::net_config::generation();
+    let mut cached = CLIENT_CACHE.get_or_init(|| Mutex::new((0, None)))
+        .lock().unwrap_or_else(|p| p.into_inner());
+    if cached.0 != generation {
+        let client = crate::net_config::configure_blocking(
+            reqwest::blocking::Client::builder()
+                .user_agent("Mozilla/5.0")
+                .timeout(COVER_FETCH_TIMEOUT)
+                .connect_timeout(COVER_CONNECT_TIMEOUT)
+                .pool_max_idle_per_host(4)
+                .pool_idle_timeout(Duration::from_secs(90)),
+        ).build().map_err(|_| log::warn!("[qtres] 封面网络客户端构建失败")).ok();
+        *cached = (generation, client);
+    }
+    cached.1.clone()
 }
 
 /// 封面并发闸门（见 `COVER_FETCH_CONCURRENCY`）。
@@ -659,11 +666,11 @@ pub(crate) fn fetch_cover_original_bytes(url: &str) -> Option<Vec<u8>> {
         log::warn!("[qtres] 封面 URL 主机不可信，跳过存盘: {url}");
         return None;
     }
-    let client = cover_client();
+    let client = cover_client()?;
     let https = upgrade_to_https(url);
-    let mut out = fetch_cover_bytes(client, &https);
+    let mut out = fetch_cover_bytes(&client, &https);
     if out.is_none() && https != url {
-        out = fetch_cover_bytes(client, url);
+        out = fetch_cover_bytes(&client, url);
     }
     // 封面正常不过几 MB；网易云见过 12MB 的大图。再大的多半不是封面图，
     // 稳妥起见不落盘。
@@ -705,10 +712,10 @@ fn handle_cover(original_url: String, target_px: u32) -> Response<Vec<u8>> {
     let bytes = cover_bytes_shared(&cache_key, move || {
         // 先试升级后的 https；失败（酷我 img1.kwcdn.kuwo.cn 等图床不支持 https，
         // TLS 直接握手失败）再回退原始 URL，避免封面整片空白。
-        let client = cover_client();
-        let mut out = fetch_cover_bytes(client, &fetch_url);
+        let client = cover_client()?;
+        let mut out = fetch_cover_bytes(&client, &fetch_url);
         if out.is_none() && fetch_url != sized_for_log {
-            out = fetch_cover_bytes(client, &sized_for_log);
+            out = fetch_cover_bytes(&client, &sized_for_log);
         }
         if out.is_none() {
             log::warn!(

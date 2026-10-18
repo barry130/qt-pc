@@ -83,6 +83,17 @@ export interface ContractAlbum {
   picUrl: string;
 }
 
+/** 音频节目/有声专辑 */
+export interface ContractAudioProgram {
+  id: string;
+  platform: Source;
+  name: string;
+  artist: string;
+  picUrl: string;
+  description: string | null;
+  chapterCount: number;
+}
+
 /** 榜单 */
 export interface ContractChart {
   id: string;
@@ -90,6 +101,13 @@ export interface ContractChart {
   name: string;
   picUrl: string;
   description: string | null;
+  contentType?: "music" | "programs";
+}
+
+/** 音频节目详情与章节分页 */
+export interface ContractAudioProgramDetail extends ContractAudioProgram {
+  tracks: MusicInfo[];
+  hasMore: boolean;
 }
 
 /** 歌词（原文 + 翻译；qt-pc Lyric 同构） */

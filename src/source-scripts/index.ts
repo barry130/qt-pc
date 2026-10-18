@@ -21,6 +21,7 @@ import * as ipc from "@/services/ipc";
 import type {
   Album,
   Artist,
+  AudioProgram,
   Chart,
   Lyric,
   Playlist,
@@ -32,6 +33,8 @@ import type {
 } from "@/types";
 import type {
   ContractChart,
+  ContractAudioProgram,
+  ContractAudioProgramDetail,
   ContractPlaylistCategory,
   MusicInfo,
   Source,
@@ -147,6 +150,7 @@ function toAppChart(item: ContractChart): Chart {
     name: item.name,
     picUrl: item.picUrl,
     description: item.description,
+    contentType: item.contentType,
   };
 }
 
@@ -157,6 +161,7 @@ function fromAppChart(chart: Chart): ContractChart {
     name: chart.name,
     picUrl: chart.picUrl,
     description: chart.description,
+    contentType: chart.contentType,
   };
 }
 
@@ -639,6 +644,52 @@ export async function getChartDetail(chart: Chart): Promise<Track[]> {
     (p) => p.list as MusicInfo[] | undefined,
   );
   return list.map((m) => toAppTrack(m, chart.platform));
+}
+
+export async function getAudioChartPrograms(chart: Chart): Promise<AudioProgram[]> {
+  ensureScript(chart.platform);
+  const list = await sourceCall<ContractAudioProgram[]>(
+    "audioChartPrograms",
+    { source: chart.platform, chart: fromAppChart(chart) },
+    (p) => p.list as ContractAudioProgram[] | undefined,
+  );
+  return list.map((item) => ({
+    id: item.id,
+    platform: item.platform as SourceId,
+    name: item.name,
+    artist: item.artist,
+    picUrl: item.picUrl,
+    description: item.description ?? null,
+    chapterCount: item.chapterCount ?? 0,
+  }));
+}
+
+export async function getAudioProgramDetail(
+  platform: SourceId,
+  id: string,
+  page: number,
+  size: number,
+): Promise<{ program: AudioProgram; tracks: Track[]; hasMore: boolean }> {
+  ensureScript(platform);
+  const detail = await sourceCall<ContractAudioProgramDetail>(
+    "audioProgramDetail",
+    { source: platform, id, page, size },
+    (p) => p.detail as ContractAudioProgramDetail | undefined,
+  );
+  const program: AudioProgram = {
+    id: detail.id,
+    platform: detail.platform as SourceId,
+    name: detail.name,
+    artist: detail.artist,
+    picUrl: detail.picUrl,
+    description: detail.description ?? null,
+    chapterCount: detail.chapterCount ?? 0,
+  };
+  return {
+    program,
+    tracks: (detail.tracks ?? []).map((m) => toAppTrack(m, platform)),
+    hasMore: detail.hasMore === true,
+  };
 }
 
 export async function getLatestSongs(

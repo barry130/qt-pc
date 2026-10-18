@@ -5,6 +5,7 @@
 //! - WAL + busy_timeout，避免偶发 SQLITE_BUSY。
 //! - R1：播放地址只进进程内存缓存，任何表都不落播放 URL。
 
+pub(crate) mod health;
 pub(crate) mod migrations;
 pub(crate) mod store;
 
@@ -45,8 +46,37 @@ impl Database {
         })
     }
 
-    /// 取连接锁，**容忍互斥锁毒化**。
+    /// 带自愈的打开：先体检，坏了就隔离 + 重建空库；健康则做一份滚动备份。
     ///
+    /// 为什么把体检放在 `open` 之外单开一个入口：`Database::open` 的语义是"打开并迁移"，
+    /// 测试与 `shortcuts.rs` 都在用它，不该被自愈逻辑污染；只有**应用启动**这一条路径
+    /// 需要"坏库也要能起来"的保证，所以只在 `lib.rs` 的启动处改调它。
+    ///
+    /// 返回值里的 `Some(说明)` 表示本次启动发生过自愈 —— 调用方可以据此提醒用户；
+    /// 说明同时被 `health::set_notice` 记成一次性回执（前端挂载时取走）。
+    pub fn open_checked(path: &Path) -> Result<(Self, Option<String>), String> {
+        if path.exists() && !health::is_healthy(path) {
+            let quarantined = health::quarantine(path);
+            let notice = match quarantined {
+                Some(p) => format!(
+                    "数据库文件已损坏，已隔离为「{}」并重建了空库；歌单/播放记录/设置需要重新导入（旧文件保留未删）",
+                    p.display()
+                ),
+                None => "数据库文件已损坏且隔离失败，已重建空库；歌单/播放记录/设置需要重新导入".to_string(),
+            };
+            health::set_notice(notice.clone());
+            let db = Self::open(path)?;
+            return Ok((db, Some(notice)));
+        }
+        let db = Self::open(path)?;
+        if let Some(dir) = path.parent() {
+            // 备份失败不该影响启动（只记日志），所以这里忽略结果
+            let _ = db.with(|conn| Ok(health::rolling_backup(conn, dir)));
+        }
+        Ok((db, None))
+    }
+
+    /// 取连接锁，**容忍互斥锁毒化**。
     /// 为什么不能用 `lock().unwrap()`：`Cargo.toml` 已恢复默认的 panic=unwind
     /// （见其注释），于是任何一次在持锁期间 panic 都会把 `Mutex` 标记为中毒，
     /// 之后**所有**取锁点都会 `unwrap()` 失败 —— 一次偶发 panic 会让整个数据层
@@ -96,6 +126,8 @@ mod tests {
             pic_url: String::new(),
             duration: 210.0,
             music_id: None,
+            start_ms: None,
+            end_ms: None,
         }
     }
 
@@ -222,5 +254,45 @@ mod tests {
             .with(|c| c.query_row("SELECT COUNT(*) FROM tracks", [], |r| r.get(0)))
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn open_checked_quarantines_a_corrupt_db_and_rebuilds_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "quietmusic-recover-{}-{}",
+            std::process::id(),
+            fastrand::u64(..)
+        ));
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let path = dir.join("music.db");
+        std::fs::write(&path, b"not a sqlite database").expect("写坏库");
+
+        // 坏库也必须能起来：旧文件隔离保留 + 重建空库 + 迁移到位 + 如实回传说明
+        let (db, notice) = Database::open_checked(&path).expect("坏库不该让应用起不来");
+        let notice = notice.expect("应回传自愈说明");
+        assert!(notice.contains("损坏"), "说明该讲清发生了什么: {notice}");
+
+        let quarantined: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".corrupt-"))
+            .collect();
+        assert_eq!(quarantined.len(), 1, "旧文件应改名保留（不删）: {quarantined:?}");
+        assert!(path.exists(), "应重建出新库");
+
+        let version: i64 = db
+            .with(|c| {
+                c.query_row("SELECT COALESCE(MAX(version), 0) FROM schema_migrations", [], |r| {
+                    r.get(0)
+                })
+            })
+            .unwrap();
+        assert_eq!(
+            version, migrations::CURRENT_VERSION as i64,
+            "重建的库应完成全部迁移"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

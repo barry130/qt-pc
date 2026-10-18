@@ -287,6 +287,8 @@ mod tests {
                 pic_url: String::new(),
                 duration: 0.0,
                 music_id: None,
+                start_ms: None,
+                end_ms: None,
             })
             .collect();
         Queue {
@@ -458,6 +460,8 @@ mod tests {
             pic_url: String::new(),
             duration: 0.0,
             music_id: None,
+            start_ms: None,
+            end_ms: None,
         }
     }
 

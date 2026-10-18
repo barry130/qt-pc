@@ -71,6 +71,13 @@ export const PLAYER_BAR_BUTTONS: PlayerBarButtonMeta[] = [
     slot: "inline",
   },
   {
+    id: "mini",
+    label: "迷你模式",
+    hint: "切到迷你播放器小窗（与主窗口互切）",
+    adminOnly: false,
+    slot: "inline",
+  },
+  {
     id: "queue",
     label: "播放队列",
     hint: "展开 / 收起播放队列面板",

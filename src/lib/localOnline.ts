@@ -1,6 +1,6 @@
 import * as sourceApi from "@/source-scripts";
 import { playUrlHitLine } from "@/source-scripts/playurl-line";
-import { getLyric, notifyLyricManuallyPicked, saveLyric } from "@/services/ipc";
+import { getLyric, notifyLyricManuallyPicked, readLocalLyric, saveLyric } from "@/services/ipc";
 import { registryHasSource } from "@/stores/sourceRegistry";
 import type { PlayUrlLine } from "@/source-engine/client";
 import type { Lyric, Quality, SourceId, Track } from "@/types";
@@ -65,6 +65,20 @@ export function resolveLocalOnlineMeta(
   return task;
 }
 
+/** 清空本地曲目在线元数据缓存（封面/在线歌词候选，进程内可再生）。 */
+export function clearLocalOnlineMetaCache(): number {
+  const count = cache.size;
+  cache.clear();
+  return count;
+}
+
+/** 清空播放页歌词缓存（不删除 SQLite 中已保存的歌词）。 */
+export function clearPlaybackLyricCache(): number {
+  const count = lyricCache.size;
+  lyricCache.clear();
+  return count;
+}
+
 /** 跨源兜底命中信息：target = 实际在播的源；song = 线路上精确命中的那首歌（旧引擎页为 null） */
 export interface CrossSourceHit {
   target: SourceId;
@@ -113,9 +127,14 @@ async function fetchCrossSourceLyric(
 }
 
 /**
- * 播放用歌词：本地曲目走酷我匹配（匹配不到返回空歌词，由页面显示「没有歌词」），
- * 在线曲目仍走原音源；换源兜底在播（cross 非空）时优先取目标源的词——线路带精确
- * 命中歌（targetSong）就按它取，否则在目标源按歌名搜；目标源取不到词才退回原源。
+ * 播放用歌词。优先级从高到低：
+ * 1. **用户手动挑的词**（库里 `manual`）—— 直接回读，连源站都不打；
+ * 2. **本地文件自带的词**（库里 `source` 是 `local-lrc` / `local-tag`，或现读文件）——
+ *    本地曲目优先用它，离线也有词；
+ * 3. 在线词：换源兜底在播（cross 非空）时优先取目标源的词——线路带精确命中歌
+ *    （targetSong）就按它取，否则在目标源按歌名搜；目标源取不到词才退回原源；
+ *    本地曲目没有平台 id，按歌名 + 歌手走酷我匹配（匹配不到返回空歌词，
+ *    由页面显示「没有歌词」）。
  */
 async function fetchPlaybackLyric(
   track: Track,
@@ -131,10 +150,13 @@ async function fetchPlaybackLyric(
   // 换了一份，可下一次取词照旧打源站、拿回那份错词，用户的选择被静默覆盖。桌面歌词
   // 窗口是独立 WebView、自己走一遍这条链路，表现就是「播放页换了、桌面歌词没换」。
   // 手动标记由 `applyPickedLyric` 落库时写入，自动取词落库会把它交回 false。
+  //
+  // 本地文件自带的词（source = local-lrc / local-tag）同样直接回读：文件旁边的 .lrc
+  // 或文件里内嵌的那份，就是这首歌的词，没必要再去酷我猜一个版本来盖它。
   const saved = await readSavedLyric(track);
-  // 手动标记只对正文生效，剥掉再往外传 —— Lyric 是四个面的契约，多带字段会让
+  // 标记与来源只在这里用于决策，不往外传 —— Lyric 是四个面的契约，多带字段会让
   // 上层「是不是同一份词」的判断（toEqual 之类）莫名其妙失配。
-  if (saved !== null && saved.manual) {
+  if (saved !== null && (saved.manual || isLocalFileLyric(saved.source))) {
     fromSaved = true;
     return { lyric: saved.lyric, fromSaved };
   }
@@ -157,13 +179,22 @@ async function fetchPlaybackLyric(
     if (track.platform !== "local") {
       return { lyric: await sourceApi.getLyric(track), fromSaved };
     }
+    // 本地曲目：先看音频文件自带的词（同名 .lrc / 内嵌标签）。扫描时已落过库，这里是
+    // 扫描之外的情况——拖进来还没入库的文件、扫描后才放的 .lrc、用户改了 .lrc 内容。
+    const fromFile = await readLocalFileLyric(track);
+    if (fromFile !== null) {
+      // 这份词在 readLocalFileLyric 里已经按文件来源落库了，这里置 fromSaved = true
+      // 让调用方那条通用回写闭麦：否则会用 source = "local" 盖掉 "local-lrc"/"local-tag"。
+      fromSaved = true;
+      return { lyric: fromFile, fromSaved };
+    }
     const meta = await resolveLocalOnlineMeta(track.id, track.title, track.singer);
     // 本地曲目的在线元数据走酷我搜索匹配，酷我没有逐字/罗马音面（包里恒空串），
     // 这里也就没有多余字段可带（Lyric 的两个新字段是可选的）。
     return { lyric: { lrc: meta.lrc, translation: meta.translation }, fromSaved };
   } catch (err) {
     // 网络取词失败 → 回读上一次成功落库的正文：断网 / 源站抽风时不至于整页空白，
-    // 宁可显示旧词。（本地曲目不写 tracks 表，没有这条兜底，原样抛出。）
+    // 宁可显示旧词。本地曲目同样有这条兜底（`local:<路径>` 就是它的主键）。
     // 上面读过的那一份直接复用，不重复打一次 IPC。
     if (saved !== null) {
       fromSaved = true;
@@ -173,16 +204,52 @@ async function fetchPlaybackLyric(
   }
 }
 
+/** 本地文件自带歌词的两个来源标记（后端 `local.rs` 的 LYRIC_SOURCE_SIDECAR / _EMBEDDED） */
+const LOCAL_FILE_LYRIC_SOURCES = ["local-lrc", "local-tag"];
+
+/** 这份落库的词是不是「本地文件自带的」（同名 .lrc / 内嵌标签） */
+function isLocalFileLyric(source: string): boolean {
+  return LOCAL_FILE_LYRIC_SOURCES.includes(source);
+}
+
+/**
+ * 本地曲目：读音频文件自带的歌词（同名 `.lrc` 优先，其次内嵌标签）。
+ *
+ * 取到就顺手按文件来源落库（`source` 记 `local-lrc` / `local-tag`，后端只覆盖同样来自
+ * 本地文件的行），下次断网也能从库里回读到，不必再解析一遍容器。
+ * 非本地曲目 / 文件里没有任何自带歌词 → null。
+ */
+async function readLocalFileLyric(track: Track): Promise<Lyric | null> {
+  if (track.platform !== "local") return null;
+  try {
+    const found = await readLocalLyric(track.id);
+    if (found === null || found.lrc.trim().length === 0) return null;
+    try {
+      void saveLyric(`local:${track.id}`, found.lrc, "", "", "", found.source, false).catch(
+        () => undefined,
+      );
+    } catch {
+      /* 无 IPC 环境（单测）：跳过落库 */
+    }
+    return { lrc: found.lrc, translation: "" };
+  } catch {
+    // 非 Tauri 环境 / 文件已不在：当它没有自带歌词，继续走在线匹配
+    return null;
+  }
+}
+
 /**
  * 回读落库歌词。非 Tauri 环境（单测）里 invoke 会同步抛，故整体 try/catch 兜住。
  *
- * 多带一个 `manual`（库里 V13 起的标记）：调用方要靠它决定「直接回读」还是「去源站重取」，
- * 所以它与正文分开返回，正文仍是干净的 `Lyric`。
+ * 多带 `manual`（库里 V13 起的标记）与 `source`：调用方要靠它们决定「直接回读」还是
+ * 「去源站重取」，所以两者与正文分开返回，正文仍是干净的 `Lyric`。
+ *
+ * 本地曲目也读库（`local:<路径>` 就是它在 tracks 表里的主键）：扫描时已经把文件自带的
+ * 词落进去了，`source` 是 `local-lrc` / `local-tag`。
  */
 async function readSavedLyric(
   track: Track,
-): Promise<{ lyric: Lyric; manual: boolean } | null> {
-  if (track.platform === "local") return null;
+): Promise<{ lyric: Lyric; manual: boolean; source: string } | null> {
   try {
     const rec = await getLyric(`${track.platform}:${track.id}`);
     if (rec === null || rec.lrc.trim().length === 0) return null;
@@ -196,6 +263,7 @@ async function readSavedLyric(
         romanization: rec.romanization ?? "",
       },
       manual: rec.manual === true,
+      source: rec.source,
     };
   } catch {
     return null;
@@ -352,9 +420,11 @@ function lyricCandidateKey(source: SourceId, keyword: string, size: number): str
   return `${source}:${size}:${keyword.trim().toLowerCase()}`;
 }
 
-/** 清空歌词候选缓存（测试隔离 / 手动刷新用） */
-export function clearLyricCandidateCache(): void {
+/** 清空歌词候选缓存（测试隔离 / 手动刷新用 / 设置页可选清理） */
+export function clearLyricCandidateCache(): number {
+  const count = lyricCandidateCache.size;
   lyricCandidateCache.clear();
+  return count;
 }
 
 /**

@@ -20,11 +20,26 @@ export interface ToastItem {
   text: string;
   /** success = 动作成功回执（绿）；info = 普通提示；error = 出错（红，停留更久） */
   kind: "success" | "info" | "error";
+  /**
+   * 可撤销动作（「已从歌单移除 · 撤销」）。挂在**已经做完的动作**上：
+   * 用户来得及点就退回原状，不点就随提示一起消失（不做延时执行 —— 见 `toastUndo`）。
+   */
+  action?: ToastAction;
+}
+
+/**
+ * 提示上的动作按钮。`run` 里做的事应该与「反向操作」等价
+ * （取消收藏 → 加回去）；抛错由宿主兜底提示，调用方不用自己 catch。
+ */
+export interface ToastAction {
+  /** 按钮文案，如「撤销」 */
+  label: string;
+  run: () => void | Promise<void>;
 }
 
 interface ToastStore {
   items: ToastItem[];
-  push: (text: string, kind?: ToastItem["kind"]) => void;
+  push: (text: string, kind?: ToastItem["kind"], action?: ToastAction) => void;
   dismiss: (id: number) => void;
 }
 
@@ -35,8 +50,10 @@ let seq = 0;
 
 const useToastStore = create<ToastStore>((set) => ({
   items: [],
-  push: (text, kind = "info") =>
-    set((s) => ({ items: [...s.items, { id: (seq += 1), text, kind }].slice(-MAX_ITEMS) })),
+  push: (text, kind = "info", action) =>
+    set((s) => ({
+      items: [...s.items, { id: (seq += 1), text, kind, action }].slice(-MAX_ITEMS),
+    })),
   dismiss: (id) => set((s) => ({ items: s.items.filter((t) => t.id !== id) })),
 }));
 
@@ -59,6 +76,19 @@ export function toastSuccess(text: string): void {
  */
 export function toastError(text: string): void {
   useToastStore.getState().push(text, "error");
+}
+
+/**
+ * 带回退按钮的成功回执：`toastUndo("已从「歌单」取消收藏 3 首", async () => …)`。
+ *
+ * 做法是**先把事做完**再给撤销入口（不是先弹确认再执行）：删除类操作在音乐库
+ * 里都是低风险高频率的，弹二次确认会把「移出一首」变成两下点击；而"先做，反悔
+ * 再补"只多占一个提示位。`run` 里直接调反向接口即可，抛错由 `ToastHost` 兜底。
+ *
+ * 停留时长在 `ToastHost` 里按「有没有 action」放宽（撤销窗口 3 秒不够用）。
+ */
+export function toastUndo(text: string, run: () => void | Promise<void>): void {
+  useToastStore.getState().push(text, "success", { label: "撤销", run });
 }
 
 export { useToastStore };

@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { errMsg } from "@/lib/utils";
-import type { Playlist } from "@/types";
+import type { Playlist, Track } from "@/types";
 import {
   useSourceRegistryStore,
   useSourceLabelFn,
@@ -42,6 +42,17 @@ export function ImportPlaylistDialog(props: {
     { id: string; name: string }[]
   >([]);
   const [result, setResult] = useState<string | null>(null);
+  /**
+   * 从本应用导出的 `.json` 歌单文件导入（REQUIREMENTS §3.21.5.3）。
+   * 与链接导入的区别只在"曲目从哪来"：这里 Rust 已经读好并校验过，
+   * 后续选目标歌单、落库完全复用同一条路（`addTracksToPlaylist`）。
+   */
+  const [fileSource, setFileSource] = useState<{
+    path: string;
+    name: string;
+    skipped: number;
+    tracks: Track[];
+  } | null>(null);
 
   const forced = platform === "" ? undefined : platform;
 
@@ -94,6 +105,28 @@ export function ImportPlaylistDialog(props: {
     setBusy(true);
     setError(null);
     try {
+      if (fileSource) {
+        // 文件导入：曲目已在解析时读好（Rust 已剔除本机不存在的本地条目），
+        // 这里只负责"建/选歌单 + 落库"，与链接导入共用同一套目标选择 UI
+        const targetName =
+          targetChoice === 0
+            ? newName.trim() || fileSource.name
+            : myPlaylists[targetChoice - 1].name;
+        const targetId =
+          targetChoice === 0
+            ? await ipc.createPlaylist(targetName)
+            : myPlaylists[targetChoice - 1].id;
+        const added = await ipc.addTracksToPlaylist(targetId, fileSource.tracks);
+        const skippedNote =
+          fileSource.skipped > 0
+            ? `（${fileSource.skipped} 首本机不存在的本地曲目已跳过）`
+            : "";
+        setResult(
+          `已从文件导入 ${added} / ${fileSource.tracks.length} 首到「${targetName}」${skippedNote}`,
+        );
+        props.onSongsImported?.(targetId);
+        return;
+      }
       const res = await importPlaylistSongs(text.trim(), forced, (() => {
         if (targetChoice === 0) return { kind: "new" as const, name: newName };
         const pl = myPlaylists[targetChoice - 1];
@@ -101,6 +134,59 @@ export function ImportPlaylistDialog(props: {
       })());
       setResult(`已导入 ${res.added} / ${res.total} 首到「${res.targetName}」`);
       props.onSongsImported?.(res.targetId);
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /**
+   * 选 `.json` 歌单文件 → 解析（Rust 侧校验 + 剔除本机不存在的本地条目）
+   * → 直接摆出"目标歌单"选择，与链接导入的下半段完全一致。
+   */
+  const loadFile = async (): Promise<void> => {
+    if (busy) return;
+    setBusy(true);
+    setError(null);
+    setResult(null);
+    setFileSource(null);
+    setPreview(null);
+    try {
+      const path = await ipc.pickPlaylistJsonFile();
+      if (!path) return; // 用户取消
+      const parsed = await ipc.parsePlaylistJson(path);
+      if (parsed.tracks.length === 0) {
+        throw new Error(
+          parsed.skipped > 0
+            ? `文件里 ${parsed.skipped} 首曲目在本机都不存在，没有可导入的内容`
+            : "这个歌单文件里没有曲目",
+        );
+      }
+      setFileSource({
+        path,
+        name: parsed.name,
+        skipped: parsed.skipped,
+        tracks: parsed.tracks,
+      });
+      // 借 `preview` 撑起同一块预览卡（曲目已经拿全，不再需要网络）
+      setPreview({
+        id: "",
+        platform: ipc.LOCAL_PLATFORM,
+        name: parsed.name,
+        picUrl: "",
+        playCount: "",
+        description: null,
+        tracks: parsed.tracks,
+      });
+      const all = await ipc.listMyPlaylists();
+      setMyPlaylists(
+        all
+          .filter((p) => p.platform === ipc.LOCAL_PLATFORM)
+          .map((p) => ({ id: p.pid, name: p.name })),
+      );
+      setTargetChoice(0);
+      setNewName("");
     } catch (err) {
       setError(errMsg(err));
     } finally {
@@ -152,6 +238,7 @@ export function ImportPlaylistDialog(props: {
                 setPreview(null);
                 setResult(null);
                 setError(null);
+                setFileSource(null);
               }}
               className={
                 mode === key
@@ -202,6 +289,18 @@ export function ImportPlaylistDialog(props: {
             {busy && mode === "songs" ? "解析中…" : "解析"}
           </button>
         </div>
+
+        {/* 文件导入入口只给「导入歌曲」：收藏歌单是引用在线歌单，没有文件形态 */}
+        {mode === "songs" ? (
+          <button
+            type="button"
+            onClick={() => void loadFile()}
+            disabled={busy}
+            className="mt-2 text-xs text-muted-foreground underline-offset-2 hover:text-foreground hover:underline disabled:opacity-50"
+          >
+            或从本应用导出的 .json 歌单文件导入…
+          </button>
+        ) : null}
 
         {mode === "songs" && preview && (
           <div className="mt-3 rounded-md border border-border p-3">

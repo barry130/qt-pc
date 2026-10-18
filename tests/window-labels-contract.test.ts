@@ -13,6 +13,7 @@ import { describe, expect, it } from "vitest";
 import {
   LYRICS_WINDOW_LABEL,
   MAIN_WINDOW_LABEL,
+  MINI_WINDOW_LABEL,
   SOURCE_ENGINE_WINDOW_LABEL,
 } from "@/lib/window-labels";
 
@@ -44,6 +45,9 @@ describe("窗口 label 跨端契约", () => {
     expect(read("src-tauri/src/source_window.rs")).toContain(
       `pub const SOURCE_ENGINE_LABEL: &str = "${SOURCE_ENGINE_WINDOW_LABEL}";`,
     );
+    expect(read("src-tauri/src/mini_window.rs")).toContain(
+      `pub const MINI_WINDOW_LABEL: &str = "${MINI_WINDOW_LABEL}";`,
+    );
   });
 
   it("主窗口 label 与 tauri.conf.json 声明一致（歌词窗/引擎窗动态创建，不进 conf）", () => {
@@ -60,6 +64,8 @@ describe("窗口 label 跨端契约", () => {
       /\.label\s*!==\s*"main"/,
       /\.label\s*===\s*"lyrics"/,
       /\.label\s*!==\s*"lyrics"/,
+      /\.label\s*===\s*"mini"/,
+      /\.label\s*!==\s*"mini"/,
       /emitTo\(\s*"source-engine"/,
     ];
     for (const file of collectSources(join(process.cwd(), "src"))) {

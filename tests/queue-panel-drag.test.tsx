@@ -12,7 +12,7 @@
  * 回归测试文件：tests/queue-panel-drag.test.tsx。
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 
 /**
  * jsdom 没有 PointerEvent（截至 jsdom 24 仍只实现了 MouseEvent），也没有
@@ -48,17 +48,10 @@ vi.mock("@tauri-apps/api/event", () => ({
 import * as ipc from "@/services/ipc";
 import { QueuePanel } from "@/components/player/QueuePanel";
 import { usePlayerStore } from "@/stores/player";
+import type { Track } from "@/types";
 
 /** 队列里的假曲目：只要 id / title 不同即可，面板不校验其余字段 */
-function track(id: string, title: string): {
-  id: string;
-  title: string;
-  singer: string;
-  album: string;
-  platform: string;
-  duration: number;
-  picUrl: string;
-} {
+function track(id: string, title: string): Track {
   return {
     id,
     title,
@@ -104,46 +97,52 @@ function stubLayout(): void {
   document.elementFromPoint = ((_x: number, y: number) => {
     const i = Math.floor(y / 20);
     const found = document.querySelector(`[data-queue-index="${i}"]`);
-    return i >= 0 && i < QUEUE.length ? found : null;
+    return i >= 0 ? found : null;
   }) as typeof document.elementFromPoint;
+}
+
+function pointer(
+  element: HTMLElement,
+  type: string,
+  clientY: number,
+  pointerId = 1,
+): void {
+  fireEvent(element, new PointerEvent(type, {
+    bubbles: true,
+    clientY,
+    clientX: 10,
+    button: 0,
+    pointerId,
+  }));
+}
+
+function startDrag(title: string, toY = 50): HTMLElement {
+  const from = row(title);
+  const startY = Number(from.dataset.queueIndex) * 20 + 10;
+  let captured = false;
+  from.setPointerCapture = vi.fn(() => { captured = true; });
+  from.hasPointerCapture = vi.fn(() => captured);
+  from.releasePointerCapture = vi.fn(() => {
+    captured = false;
+    // 浏览器释放 capture 会再发 lostpointercapture，不能误伤已完成的拖动。
+    from.dispatchEvent(new PointerEvent("lostpointercapture", {
+      bubbles: true,
+      pointerId: 1,
+    }));
+  });
+  pointer(from, "pointerdown", startY);
+  pointer(from, "pointermove", toY);
+  return from;
 }
 
 /** 一次完整的拖拽：按下 → 移到目标行 → 抬手 */
 function drag(fromTitle: string, toY: number): void {
-  const from = row(fromTitle);
-  const startY = Number(from.dataset.queueIndex) * 20 + 10;
-  from.setPointerCapture = vi.fn();
-  from.releasePointerCapture = vi.fn();
-  from.hasPointerCapture = () => true;
-
-  const down = new PointerEvent("pointerdown", {
-    bubbles: true,
-    clientY: startY,
-    clientX: 10,
-    button: 0,
-  });
-  Object.defineProperty(down, "pointerId", { value: 1 });
-  from.dispatchEvent(down);
-
-  const move = new PointerEvent("pointermove", {
-    bubbles: true,
-    clientY: toY,
-    clientX: 10,
-  });
-  Object.defineProperty(move, "pointerId", { value: 1 });
-  from.dispatchEvent(move);
-
-  const up = new PointerEvent("pointerup", {
-    bubbles: true,
-    clientY: toY,
-    clientX: 10,
-  });
-  Object.defineProperty(up, "pointerId", { value: 1 });
-  from.dispatchEvent(up);
+  pointer(startDrag(fromTitle, toY), "pointerup", toY);
 }
 
 beforeEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   vi.clearAllMocks();
   stubLayout();
   usePlayerStore.setState({
@@ -151,6 +150,7 @@ beforeEach(() => {
     queueIndex: 0,
     queueOpen: true,
     state: null,
+    playAt: vi.fn(async () => {}),
   });
 });
 
@@ -214,5 +214,157 @@ describe("播放队列：拖动排序（pointer 自绘，绕开 Tauri 的 OLE �
     row("A").dispatchEvent(new MouseEvent("click", { bubbles: true }));
 
     expect(playAt).not.toHaveBeenCalled();
+  });
+
+  it.each(["pointercancel", "lostpointercapture"])("%s 只清理拖动，不提交排序或播放", (event) => {
+    const move = vi.spyOn(ipc, "queueMove");
+    render(<QueuePanel />);
+    const from = startDrag("A");
+    expect(from.classList.contains("opacity-50")).toBe(true);
+
+    pointer(from, event, 50);
+    pointer(from, "pointerup", 50);
+    fireEvent.click(from);
+    expect(move).not.toHaveBeenCalled();
+    expect(usePlayerStore.getState().playAt).not.toHaveBeenCalled();
+    expect(from.classList.contains("opacity-50")).toBe(false);
+    expect(from.releasePointerCapture).toHaveBeenCalledWith(1);
+    expect(row("C").classList.contains("border-primary")).toBe(false);
+  });
+
+  it.each(["blur", "Escape"])("窗口 %s 取消拖动，不提交排序", (event) => {
+    const move = vi.spyOn(ipc, "queueMove");
+    render(<QueuePanel />);
+    const from = startDrag("A");
+    if (event === "blur") fireEvent(window, new Event("blur"));
+    else fireEvent.keyDown(window, { key: "Escape" });
+    pointer(from, "pointerup", 50);
+    fireEvent.click(from);
+    expect(move).not.toHaveBeenCalled();
+    expect(usePlayerStore.getState().playAt).not.toHaveBeenCalled();
+    expect(from.classList.contains("opacity-50")).toBe(false);
+    expect(from.releasePointerCapture).toHaveBeenCalledWith(1);
+  });
+
+  it("隐藏窗口取消拖动，重新显示后可开始新拖动", () => {
+    const move = vi.spyOn(ipc, "queueMove");
+    const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(false);
+    render(<QueuePanel />);
+    const from = startDrag("A");
+    fireEvent(document, new Event("visibilitychange"));
+    expect(from.classList.contains("opacity-50")).toBe(true);
+    hidden.mockReturnValue(true);
+    fireEvent(document, new Event("visibilitychange"));
+    pointer(from, "pointerup", 50);
+    expect(move).not.toHaveBeenCalled();
+    expect(from.classList.contains("opacity-50")).toBe(false);
+    hidden.mockReturnValue(false);
+    drag("A", 50);
+    expect(move).toHaveBeenCalledWith(0, 2);
+  });
+
+  it("关闭面板释放 capture，再打开和抬手不提交旧拖动", () => {
+    const move = vi.spyOn(ipc, "queueMove");
+    render(<QueuePanel />);
+    const from = startDrag("A");
+    act(() => usePlayerStore.setState({ queueOpen: false }));
+    expect(from.releasePointerCapture).toHaveBeenCalledWith(1);
+    act(() => usePlayerStore.setState({ queueOpen: true }));
+    pointer(row("A"), "pointerup", 50);
+    expect(move).not.toHaveBeenCalled();
+    expect(row("A").classList.contains("opacity-50")).toBe(false);
+  });
+
+  it("卸载组件释放 capture", () => {
+    render(<QueuePanel />);
+    const from = startDrag("A");
+    cleanup();
+    expect(from.releasePointerCapture).toHaveBeenCalledWith(1);
+  });
+
+  it.each([
+    ["同长度重排", [QUEUE[1], QUEUE[0], QUEUE[2]]],
+    ["同长度替换", [{ ...QUEUE[0], id: "new" }, QUEUE[1], QUEUE[2]]],
+    ["同 ID 换源", [{ ...QUEUE[0], platform: "qq" }, QUEUE[1], QUEUE[2]]],
+    ["缩短", [QUEUE[0], QUEUE[1]]],
+  ])("队列%s 时取消拖动和落点样式", (_name, queue) => {
+    const move = vi.spyOn(ipc, "queueMove");
+    render(<QueuePanel />);
+    const from = startDrag("A");
+    act(() => usePlayerStore.setState({ queue }));
+    pointer(row("A"), "pointerup", 50);
+    expect(move).not.toHaveBeenCalled();
+    expect(from.releasePointerCapture).toHaveBeenCalledWith(1);
+    expect(document.querySelector(".opacity-50")).toBeNull();
+    expect(document.querySelector(".border-primary")).toBeNull();
+  });
+
+  it("React 重渲染前收到 pointerup 也检查 live queue，不能提交陈旧下标", () => {
+    const move = vi.spyOn(ipc, "queueMove");
+    render(<QueuePanel />);
+    const from = startDrag("A");
+    act(() => {
+      usePlayerStore.setState({ queue: [QUEUE[1], QUEUE[0], QUEUE[2]] });
+      pointer(from, "pointerup", 50);
+    });
+    expect(move).not.toHaveBeenCalled();
+  });
+
+  it("唯一身份顺序相同的元数据刷新保留拖动", () => {
+    const move = vi.spyOn(ipc, "queueMove");
+    render(<QueuePanel />);
+    const from = startDrag("A");
+    act(() => usePlayerStore.setState({
+      queue: QUEUE.map((track) => ({ ...track, album: "updated" })),
+    }));
+    pointer(from, "pointerup", 50);
+    expect(move).toHaveBeenCalledWith(0, 2);
+  });
+
+  it("重复身份的新快照保守取消拖动", () => {
+    const duplicates = [QUEUE[0], { ...QUEUE[0], title: "A duplicate" }, QUEUE[2]];
+    usePlayerStore.setState({ queue: duplicates });
+    const move = vi.spyOn(ipc, "queueMove");
+    render(<QueuePanel />);
+    const from = startDrag("A");
+    act(() => usePlayerStore.setState({ queue: [...duplicates] }));
+    pointer(from, "pointerup", 50);
+    expect(move).not.toHaveBeenCalled();
+    expect(from.classList.contains("opacity-50")).toBe(false);
+  });
+
+  it.each([16, 50])("激活后落回原行（曾移到 %spx）不排序，也不播放尾随 click", (toY) => {
+    const move = vi.spyOn(ipc, "queueMove");
+    render(<QueuePanel />);
+    const from = startDrag("A", toY);
+    pointer(from, "pointerup", 10);
+    fireEvent.click(from);
+    expect(move).not.toHaveBeenCalled();
+    expect(usePlayerStore.getState().playAt).not.toHaveBeenCalled();
+    // 下一次真实按下仍是普通点击，不被上次取消/拖动吃掉。
+    pointer(from, "pointerdown", 10);
+    pointer(from, "pointerup", 10);
+    fireEvent.click(from);
+    expect(usePlayerStore.getState().playAt).toHaveBeenCalledWith(0);
+  });
+
+  it("指针离开列表后抬手使用最后有效落点", () => {
+    const move = vi.spyOn(ipc, "queueMove");
+    render(<QueuePanel />);
+    const from = startDrag("A", 50);
+    pointer(from, "pointermove", 500);
+    pointer(from, "pointerup", 500);
+    expect(move).toHaveBeenCalledWith(0, 2);
+  });
+
+  it("其他 pointer 的取消和抬手不结束当前拖动", () => {
+    const move = vi.spyOn(ipc, "queueMove");
+    render(<QueuePanel />);
+    const from = startDrag("A");
+    pointer(from, "pointercancel", 50, 2);
+    pointer(from, "pointerup", 50, 2);
+    expect(move).not.toHaveBeenCalled();
+    pointer(from, "pointerup", 50);
+    expect(move).toHaveBeenCalledWith(0, 2);
   });
 });

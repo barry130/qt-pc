@@ -14,8 +14,8 @@ pub const SETTING_AUDIO_CACHE_LIMIT_MB: &str = "cache.audioLimitMb";
 /// settings 键：缓存根目录（空串 = 用默认，即安装目录下的 `cache`）。
 /// 与 `download.dir` 一样走点号风格；值落在根目录上，音频缓存是它下面的 `audio`。
 pub const SETTING_CACHE_DIR: &str = "cache.dir";
-/// settings 里没有这条时的默认上限：512MB
-pub const DEFAULT_AUDIO_CACHE_LIMIT_MB: u64 = 512;
+/// settings 里没有这条时的默认上限：1GB（与设置页 CACHE_LIMIT_DEFAULT 档一致）
+pub const DEFAULT_AUDIO_CACHE_LIMIT_MB: u64 = 1024;
 
 /// 解析 settings 里的上限值：缺项 / 空串 / 脏数据都回落默认值
 pub fn parse_cache_limit_mb(raw: Option<&str>) -> u64 {

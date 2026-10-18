@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Ban, ExternalLink, X } from "lucide-react";
 import { errMsg, stripErrorUrls } from "@/lib/utils";
+import { clearRuntimeCache, type RuntimeCacheKind } from "@/lib/runtime-cache";
 import {
   OFFICIAL_AGREEMENT_PATH,
   OFFICIAL_FEEDBACK_PATH,
@@ -11,7 +12,7 @@ import {
 import { useNavigate } from "@tanstack/react-router";
 import { getAllWindows } from "@tauri-apps/api/window";
 import { LYRICS_WINDOW_LABEL } from "@/lib/window-labels";
-import { CACHE_AUDIO_LIMIT_MB_KEY, QUALITY_KEY } from "@/lib/storageKeys";
+import { CACHE_AUDIO_LIMIT_MB_KEY, GAPLESS_KEY, QUALITY_KEY } from "@/lib/storageKeys";
 import { PageContainer } from "@/components/layout/PageContainer";
 import * as ipc from "@/services/ipc";
 import {
@@ -58,6 +59,7 @@ import { isQuality, qualityOptionsFromRegistry } from "@/lib/quality";
 import { useSourceQualities, useSourceRegistryStore } from "@/stores/sourceRegistry";
 import { useMusicSourceStore } from "@/stores/musicSource";
 import { useDislikesStore } from "@/stores/dislikes";
+import { useFavoritesStore } from "@/stores/favorites";
 import { usePlayerBarStore } from "@/stores/playerBar";
 import { useAuthStore, isAdmin } from "@/stores/auth";
 import { toast, toastError, toastSuccess } from "@/stores/toast";
@@ -85,6 +87,8 @@ import type {
   DesktopLyricStylePatch,
   EqParams,
   FxState,
+  NetConfigView,
+  NetTestResult,
   Quality,
 } from "@/types";
 
@@ -708,16 +712,19 @@ function PlaybackSection(): React.JSX.Element {
   const [current, setCurrent] = useState<string>("");
   const [quality, setQuality] = useState<Quality>("320");
   const [speed, setSpeedState] = useState(1);
+  const [gapless, setGaplessState] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async (): Promise<void> => {
     try {
-      const [list, snap, savedQuality] = await Promise.all([
+      const [list, snap, savedQuality, savedGapless] = await Promise.all([
         ipc.listOutputDevices(),
         ipc.getPlaybackState(),
         ipc.getSetting(QUALITY_KEY),
+        ipc.getSetting(GAPLESS_KEY),
       ]);
+      setGaplessState(savedGapless === "true");
       setDevices(list);
       setCurrent(snap?.outputDevice ?? "");
       if (snap?.speed) setSpeedState(snap.speed);
@@ -753,6 +760,19 @@ function PlaybackSection(): React.JSX.Element {
     try {
       await ipc.setDefaultQuality(q);
       setQuality(q);
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const chooseGapless = async (): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    try {
+      await ipc.setGapless(!gapless);
+      setGaplessState(!gapless);
     } catch (err) {
       setError(errMsg(err));
     } finally {
@@ -803,6 +823,12 @@ function PlaybackSection(): React.JSX.Element {
           disabled={busy}
           onChange={(q) => void chooseQuality(q)}
         />
+      </SettingRow>
+      <SettingRow
+        title="无缝播放"
+        description="提前加载下一首，缩短连续播放时的间隔。默认关闭；在线歌曲的衔接效果取决于网络和音源响应。"
+      >
+        <Switch checked={gapless} disabled={busy} onToggle={() => void chooseGapless()} />
       </SettingRow>
       <SettingRow
         title="默认倍速"
@@ -1076,19 +1102,25 @@ function SoundSection(): React.JSX.Element {
 /** 播放缓存上限档位（MB；"0" = 不限）。与 cache.rs 的语义一致；
  *  "custom" = 手工输入档（非数字值，点它出输入框，实际值存 settings 的数字串） */
 const CACHE_LIMIT_OPTIONS: { value: string; label: string }[] = [
-  { value: "256", label: "256M" },
-  { value: "512", label: "512M" },
   { value: "1024", label: "1G" },
   { value: "2048", label: "2G" },
+  { value: "4096", label: "4G" },
   { value: "0", label: "不限" },
   { value: "custom", label: "自定义" },
 ];
 /** settings 里没有上限记录时的默认档（cache.rs DEFAULT_AUDIO_CACHE_LIMIT_MB） */
-const CACHE_LIMIT_DEFAULT = "512";
+const CACHE_LIMIT_DEFAULT = "1024";
 /** 手工输入档的取值范围：非负整数 MB（0 = 不限），上界 1TB 够任何磁盘用 */
 const CACHE_LIMIT_CUSTOM_MAX_MB = 1048576;
 
-/** 日志级别选项（顺序由宽到严，与 file_logger 的四级一致；trace 不对外暴露） */
+const RUNTIME_CACHE_OPTIONS: { kind: RuntimeCacheKind; label: string; description: string }[] = [
+  { kind: "playUrl", label: "播放地址", description: "各平台解析出的播放链接与「某张专辑只能出到哪一档」的记录，清除后下次播放重新取链" },
+  { kind: "sourceCandidates", label: "换源候选", description: "换源弹层中的临时搜索结果" },
+  { kind: "lyricCandidates", label: "歌词候选", description: "歌词搜索候选与当前播放页歌词缓存；不删除已保存歌词" },
+  { kind: "chartDetails", label: "榜单详情", description: "首页与榜单页的临时榜单曲目列表" },
+  { kind: "pageResults", label: "列表结果", description: "歌手 ID、歌手头像、全量分页与本地曲目在线元数据缓存" },
+];
+
 const LOG_LEVEL_OPTIONS: { value: ipc.LogLevel; label: string }[] = [
   { value: "debug", label: "调试" },
   { value: "info", label: "信息" },
@@ -1178,6 +1210,67 @@ function NumberField(props: {
   );
 }
 
+function FileAssociationSetting(): React.JSX.Element | null {
+  const [state, setState] = useState<import("@/types").FileAssociationState | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const refresh = useCallback((): void => {
+    void ipc.getFileAssociationState().then(setState).catch((e: unknown) => setError(errMsg(e)));
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
+  }, [refresh]);
+
+  const change = async (enable: boolean): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    try {
+      if (enable) {
+        setState(await ipc.registerFileAssociations());
+        await ipc.openDefaultAppsSettings();
+      } else {
+        setState(await ipc.unregisterFileAssociations());
+      }
+    } catch (e) {
+      setError(errMsg(e));
+      refresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  if (state?.supported === false) return null;
+  return (
+    <SettingRow
+      title="默认播放器"
+      description="关联 MP3、FLAC、WAV、OGG、M4A。点击「设为默认」后，在 Windows 默认应用中选择轻听；取消关联前请先改选其他播放器。"
+    >
+      <div className="flex max-w-sm flex-col items-end gap-2">
+        <span className="text-xs text-muted-foreground">
+          {state === null ? "正在读取关联状态…" : state.defaultExtensions.length > 0
+            ? `当前默认：${state.defaultExtensions.map((ext) => ext.toUpperCase()).join("、")}`
+            : state.registered ? "已注册为可选播放器" : "尚未注册"}
+        </span>
+        <div className="flex gap-2">
+          <button type="button" disabled={busy || state === null} onClick={() => void change(true)}
+            className="rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground disabled:opacity-50">
+            设为默认
+          </button>
+          <button type="button" disabled={busy || state === null || (!state.registered && state.defaultExtensions.length === 0)}
+            onClick={() => void change(false)}
+            className="rounded-md border border-input px-3 py-1.5 text-xs hover:bg-secondary disabled:opacity-50">
+            取消关联
+          </button>
+        </div>
+        {error && <p role="alert" className="text-xs text-destructive">{error}</p>}
+      </div>
+    </SettingRow>
+  );
+}
+
 function GeneralSection(): React.JSX.Element {
   const [autostart, setAutostartState] = useState<boolean | null>(null);
   const [cache, setCache] = useState<AudioCacheStats | null>(null);
@@ -1185,16 +1278,26 @@ function GeneralSection(): React.JSX.Element {
   // 手工输入档：true 时「自定义」段选中并显示输入框（当前值不在档位里也进入此态）
   const [customMode, setCustomMode] = useState(false);
   const [customDraft, setCustomDraft] = useState("");
-  // 分项清理：勾选要清的内容（默认两项都清）
+  // 清理默认只勾选可再生缓存：播放/网页缓存 + 进程内临时结果；不包含下载、登录、设置或数据库。
   const [clearAudio, setClearAudio] = useState(true);
   const [clearWeb, setClearWeb] = useState(true);
+  const [clearRuntime, setClearRuntime] = useState<RuntimeCacheKind[]>(
+    RUNTIME_CACHE_OPTIONS.map((option) => option.kind),
+  );
   const [clearing, setClearing] = useState(false);
+  // 「清除听歌统计」不可撤销，走两击确认：第一击武装，3 秒内再点才真删
+  const [armedStats, setArmedStats] = useState(false);
+  const [clearingStats, setClearingStats] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // 日志配置（级别 / 单文件上限 / 保留份数 / 目录）。null = 还没读到
   const [logCfg, setLogCfg] = useState<ipc.LogConfig | null>(null);
   // 缓存根目录（音频缓存是它下面的 audio）
   const [cacheDir, setCacheDir] = useState("");
   const [dirBusy, setDirBusy] = useState(false);
+  // 数据备份/恢复：busy = 导出或导入进行中；pendingImport = 已选好备份文件、等用户挑合并还是覆盖
+  const [backupDir, setBackupDir] = useState("");
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [pendingImport, setPendingImport] = useState("");
   // 日志级别只对 qt_admin 开放（与「播放链接」同一口径：前端显隐，后端不设权限）
   const profile = useAuthStore((s) => s.profile);
   const admin = isAdmin(profile);
@@ -1278,21 +1381,33 @@ function GeneralSection(): React.JSX.Element {
     setClearing(true);
     setError(null);
     try {
-      const tasks: Promise<AudioCacheClearResult>[] = [];
+      const tasks: Promise<AudioCacheClearResult | number>[] = [];
       if (clearAudio) tasks.push(ipc.clearAudioCache());
       if (clearWeb) tasks.push(ipc.clearWebCache());
+      tasks.push(...clearRuntime.map((kind) => clearRuntimeCache(kind)));
       const results = await Promise.all(tasks);
-      const freed = results.reduce((sum, r) => sum + r.freedBytes, 0);
-      const failed = results.reduce((sum, r) => sum + r.failedCount, 0);
+      const freed = results.reduce(
+        (sum: number, result) => sum + (typeof result === "number" ? 0 : result.freedBytes),
+        0,
+      );
+      const failed = results.reduce(
+        (sum: number, result) => sum + (typeof result === "number" ? 0 : result.failedCount),
+        0,
+      );
+      const runtimeCount = results.reduce(
+        (sum: number, result) => sum + (typeof result === "number" ? result : 0),
+        0,
+      );
+      const summary = runtimeCount > 0 ? `，进程内缓存 ${runtimeCount} 项` : "";
       // 清理结果是一次性回执（表单校验那种要停留的错误走上面的 error 行内提示）
-      if (freed === 0 && failed === 0) {
+      if (freed === 0 && failed === 0 && runtimeCount === 0) {
         toast("没有可清理的内容");
       } else if (failed > 0) {
         toastSuccess(
-          `已清理 ${formatBytes(freed)}；${failed} 个文件被占用跳过（正在播放的不会删）`,
+          `已清理 ${formatBytes(freed)}${summary}；${failed} 个文件被占用跳过（正在播放的不会删）`,
         );
       } else {
-        toastSuccess(`已清理 ${formatBytes(freed)}`);
+        toastSuccess(`已清理 ${formatBytes(freed)}${summary}`);
       }
       await refreshCache();
     } catch (err) {
@@ -1302,7 +1417,34 @@ function GeneralSection(): React.JSX.Element {
     }
   };
 
-  const nothingSelected = !clearAudio && !clearWeb;
+  const nothingSelected = !clearAudio && !clearWeb && clearRuntime.length === 0;
+
+  /**
+   * 两击确认的「清除听歌统计」：第一击武装（3 秒内再点确认），第二击才真删。
+   *
+   * 刻意不放进上面「清理缓存」那组勾选：那边默认全选、一次「清理」就执行，
+   * 而听歌统计**不可再生**（累计时长、趋势、活跃天数删了就没了），
+   * 与「只清可再生缓存」的语义和风险都不该混在一起。
+   */
+  const clearListenStats = async (): Promise<void> => {
+    if (!armedStats) {
+      setArmedStats(true);
+      window.setTimeout(() => setArmedStats(false), 3000);
+      return;
+    }
+    setArmedStats(false);
+    setClearingStats(true);
+    setError(null);
+    try {
+      const removed = await ipc.clearListenStats();
+      if (removed === 0) toast("没有可清除的听歌统计");
+      else toastSuccess(`已清除听歌统计（${removed} 首歌曲的累计与按天明细）`);
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setClearingStats(false);
+    }
+  };
 
   const openLogs = async (): Promise<void> => {
     setError(null);
@@ -1390,8 +1532,60 @@ function GeneralSection(): React.JSX.Element {
     }
   };
 
+  /** 导出备份：先让用户选目录（系统对话框），再落一份快照 + JSON 清单 */
+  const exportBackup = async (): Promise<void> => {
+    setError(null);
+    const dir = await ipc.pickFolder("选择备份保存目录");
+    if (!dir) return; // 用户取消
+    setBackupBusy(true);
+    try {
+      const info = await ipc.exportBackup(dir);
+      setBackupDir(dir);
+      toastSuccess(
+        `已导出备份：曲目 ${info.tracks} / 歌单 ${info.playlists} / 记录 ${info.history}`,
+      );
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
+  /** 选备份文件：选完不立即导入 —— 覆盖是不可逆的，得让用户明确点一次 */
+  const chooseBackupFile = async (): Promise<void> => {
+    setError(null);
+    const path = await ipc.pickBackupFile();
+    if (path) setPendingImport(path);
+  };
+
+  const runImport = async (mode: "replace" | "merge"): Promise<void> => {
+    if (!pendingImport) return;
+    setBackupBusy(true);
+    setError(null);
+    try {
+      const summary = await ipc.importBackup(pendingImport, mode);
+      useFavoritesStore.getState().bump();
+      useDislikesStore.setState((s) => ({
+        version: s.version + 1, rules: [], loaded: false, songRuleIds: {}, singerRuleIds: {},
+      }));
+      void useDislikesStore.getState().refresh();
+      setPendingImport("");
+      toastSuccess(
+        `已${mode === "replace" ? "覆盖" : "合并"}导入：写入 ${summary.rows} 行（曲目 ${summary.tracks} / 歌单 ${summary.playlists}）`,
+      );
+      // 覆盖模式会自动留一份"导入前"快照，路径必须告诉用户，否则等于没留退路
+      if (summary.safetyCopy) toast(`导入前的数据已快照到 ${summary.safetyCopy}`);
+      toast("界面数据会在切换页面后刷新");
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setBackupBusy(false);
+    }
+  };
+
   return (
     <div className="max-w-4xl divide-y divide-border">
+      <FileAssociationSetting />
       <SettingRow title="开机自启" description="登录系统后自动启动轻听（收起在托盘）">
         {autostart === null ? (
           <span className="text-xs text-muted-foreground">…</span>
@@ -1431,7 +1625,7 @@ function GeneralSection(): React.JSX.Element {
                   type="number"
                   inputMode="numeric"
                   value={customDraft}
-                  placeholder="512"
+                  placeholder="1024"
                   onChange={(e) => {
                     setCustomDraft(e.target.value);
                     setError(null);
@@ -1464,11 +1658,11 @@ function GeneralSection(): React.JSX.Element {
         title="清理缓存"
         description={
           cache
-            ? `勾选要清理的内容：播放缓存 ${formatBytes(cache.totalBytes)} / 图片缓存 ${formatBytes(cache.webBytes)}（封面等图片，清了会自动重新加载）。不影响已下载的音乐、登录状态与界面设置`
-            : "勾选要清理的内容。不影响已下载的音乐、登录状态与界面设置"
+            ? `默认只清理可再生缓存：播放 ${formatBytes(cache.totalBytes)} / 图片 ${formatBytes(cache.webBytes)}；不删除下载、登录、设置或已保存歌词`
+            : "默认只清理可再生缓存；不删除已下载音乐、登录状态、应用设置或已保存歌词"
         }
       >
-        <div className="flex items-center gap-3">
+        <div className="flex max-w-md flex-wrap items-center justify-end gap-x-3 gap-y-2">
           <label className="flex items-center gap-1 text-xs text-muted-foreground">
             <input
               type="checkbox"
@@ -1487,6 +1681,41 @@ function GeneralSection(): React.JSX.Element {
             />
             图片
           </label>
+          {RUNTIME_CACHE_OPTIONS.map((option) => (
+            <label
+              key={option.kind}
+              className="flex items-center gap-1 text-xs text-muted-foreground"
+              title={option.description}
+            >
+              <input
+                type="checkbox"
+                checked={clearRuntime.includes(option.kind)}
+                onChange={(e) => {
+                  setClearRuntime((current) =>
+                    e.target.checked
+                      ? [...current, option.kind]
+                      : current.filter((kind) => kind !== option.kind),
+                  );
+                }}
+                className="h-3.5 w-3.5 accent-primary"
+              />
+              {option.label}
+            </label>
+          ))}
+          <button
+            type="button"
+            onClick={() => {
+              // 「全选 / 全不选」必须从当前合计判断，不能各自取反：
+              // 分项里取消过一个，全选再点一次应当补回全部而不是反向清掉。
+              const allOn = clearAudio && clearWeb && clearRuntime.length === RUNTIME_CACHE_OPTIONS.length;
+              setClearAudio(!allOn);
+              setClearWeb(!allOn);
+              setClearRuntime(allOn ? [] : RUNTIME_CACHE_OPTIONS.map((option) => option.kind));
+            }}
+            className="rounded-md px-1.5 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+          >
+            {clearAudio && clearWeb && clearRuntime.length === RUNTIME_CACHE_OPTIONS.length ? "全不选" : "全选"}
+          </button>
           <button
             type="button"
             onClick={() => void clearCache()}
@@ -1495,6 +1724,99 @@ function GeneralSection(): React.JSX.Element {
           >
             {clearing ? "清理中…" : "清理"}
           </button>
+          <p className="basis-full text-right text-[11px] text-muted-foreground">
+            进程内缓存可重新获取；清理歌词只清内存候选与当前歌词，不删除已保存歌词。
+          </p>
+        </div>
+      </SettingRow>
+      <SettingRow
+        title="清除听歌统计"
+        description="把累计时长、有效播放、听过歌曲、活跃天数与听歌趋势全部归零，之后从零重新累计；不影响收藏、歌单、下载与播放记录。"
+      >
+        <div className="flex max-w-md flex-wrap items-center justify-end gap-x-3 gap-y-2">
+          <p className="basis-full text-right text-[11px] text-muted-foreground">
+            不可再生数据，删除后无法恢复；想留个底可以先「导出备份」。
+          </p>
+          <button
+            type="button"
+            onClick={() => void clearListenStats()}
+            disabled={clearingStats}
+            className={`rounded-md border px-3 py-1.5 text-xs transition-colors disabled:opacity-50 ${
+              armedStats
+                ? "border-destructive/60 bg-destructive/10 text-destructive hover:bg-destructive/20"
+                : "border-border text-destructive/80 hover:bg-accent"
+            }`}
+          >
+            {clearingStats ? "清除中…" : armedStats ? "再点一次确认清除" : "清除"}
+          </button>
+        </div>
+      </SettingRow>
+      <SettingRow
+        title="数据备份"
+        description={
+          backupDir
+            ? `歌单、收藏、播放记录、设置与歌词可以导出成一个备份文件（不含已下载的音乐文件本体，它支持几十 GB）。上次导出到 ${backupDir}`
+            : "歌单、收藏、播放记录、设置与歌词可以导出成一个备份文件（不含已下载的音乐文件本体）。换机器或重装前导出一份，之后导入回来即可。"
+        }
+      >
+        <div className="flex flex-col items-end gap-2">
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void exportBackup()}
+              disabled={backupBusy}
+              className="rounded-md border border-border px-3 py-1.5 text-xs transition-colors hover:bg-accent disabled:opacity-50"
+            >
+              {backupBusy ? "处理中…" : "导出备份"}
+            </button>
+            <button
+              type="button"
+              onClick={() => void chooseBackupFile()}
+              disabled={backupBusy}
+              className="rounded-md border border-border px-3 py-1.5 text-xs transition-colors hover:bg-accent disabled:opacity-50"
+            >
+              从备份导入
+            </button>
+          </div>
+          {pendingImport && (
+            <div className="flex flex-col items-end gap-1">
+              <span
+                className="max-w-72 truncate text-xs text-muted-foreground"
+                title={pendingImport}
+              >
+                已选：{pendingImport}
+              </span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => void runImport("merge")}
+                  disabled={backupBusy}
+                  className="rounded-md border border-border px-3 py-1.5 text-xs transition-colors hover:bg-accent disabled:opacity-50"
+                >
+                  合并导入
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void runImport("replace")}
+                  disabled={backupBusy}
+                  className="rounded-md border border-destructive px-3 py-1.5 text-xs text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
+                >
+                  覆盖导入
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPendingImport("")}
+                  disabled={backupBusy}
+                  className="rounded-md px-2 py-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:opacity-50"
+                >
+                  取消
+                </button>
+              </div>
+              <span className="max-w-72 text-right text-[11px] text-muted-foreground">
+                合并＝只补进缺的记录，现有数据不动；覆盖＝用备份整体替换当前数据（会先自动快照一份）
+              </span>
+            </div>
+          )}
         </div>
       </SettingRow>
       <SettingRow
@@ -2952,6 +3274,7 @@ const SECTION_TITLES: Record<string, string> = {
   "player-bar": "播放条",
   sound: "音效",
   download: "下载",
+  network: "网络",
   dislike: "不喜欢列表",
   "source-package": "音源包",
   shortcut: "快捷键",
@@ -3014,6 +3337,8 @@ export function SettingsPage(props: { section: string }): React.JSX.Element {
         <SoundSection />
       ) : props.section === "download" ? (
         <DownloadSection />
+      ) : props.section === "network" ? (
+        <NetworkSection />
       ) : props.section === "dislike" ? (
         <DislikeSection />
       ) : props.section === "source-package" ? (
@@ -3026,5 +3351,249 @@ export function SettingsPage(props: { section: string }): React.JSX.Element {
         <GenericSection hint={title} />
       )}
     </PageContainer>
+  );
+}
+
+// ---------- 网络设置（第二波：代理与单源超时） ----------
+
+const PROXY_MODE_OPTIONS: { value: string; label: string }[] = [
+  { value: "system", label: "跟随系统" },
+  { value: "none", label: "直连" },
+  { value: "custom", label: "自定义" },
+];
+
+/** 单源超时预设（秒）；不在预设里的存量值走自定义输入 */
+const SOURCE_TIMEOUT_PRESETS = [5, 10, 15, 30, 60];
+
+function NetworkSection(): React.JSX.Element {
+  const [cfg, setCfg] = useState<NetConfigView | null>(null);
+  const [urlDraft, setUrlDraft] = useState("");
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [timeoutCustom, setTimeoutCustom] = useState(false);
+  const [timeoutDraft, setTimeoutDraft] = useState("");
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<NetTestResult | null>(null);
+  const cfgRef = useRef<NetConfigView | null>(null);
+  const saveChain = useRef<Promise<void>>(Promise.resolve());
+  const saveVersion = useRef(0);
+
+  useEffect(() => {
+    let alive = true;
+    void ipc
+      .getNetConfig()
+      .then((c) => {
+        if (!alive) return;
+        cfgRef.current = c;
+        setCfg(c);
+        setUrlDraft(c.proxyUrl);
+      })
+      .catch((e: unknown) => {
+        if (alive) setSaveError(`读取网络设置失败：${errMsg(e)}`);
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const save = useCallback(
+    async (patch: Partial<NetConfigView>): Promise<void> => {
+      if (!cfgRef.current) return;
+      const next = { ...cfgRef.current, ...patch };
+      const version = ++saveVersion.current;
+      cfgRef.current = next;
+      setCfg(next);
+      setSaveError(null);
+      // 首次选择自定义时先露出地址框，填好后再应用，避免空地址被拒后入口消失。
+      if (next.proxyMode === "custom" && !next.proxyUrl.trim()) {
+        setSaveError("填入代理地址后应用自定义代理");
+        return;
+      }
+      // 顺序发送，且仅最后一次响应回写表单，避免失焦保存覆盖紧接着的模式/超时选择。
+      const pending = saveChain.current.then(async () => {
+        try {
+          const saved = await ipc.setNetConfig(next.proxyMode, next.proxyUrl, next.sourceTimeoutMs);
+          if (version !== saveVersion.current) return;
+          cfgRef.current = saved;
+          setCfg(saved);
+          setSaveError(null);
+        } catch (e) {
+          if (version !== saveVersion.current) return;
+          setSaveError(errMsg(e));
+          try {
+            const saved = await ipc.getNetConfig();
+            if (version !== saveVersion.current) return;
+            cfgRef.current = saved;
+            setCfg(saved);
+          } catch {
+            // 回读失败仍保留草稿，错误行可见。
+          }
+        }
+      });
+      saveChain.current = pending;
+      await pending;
+    },
+    [],
+  );
+
+  const applyUrlDraft = useCallback(async (): Promise<void> => {
+    if (!cfg) return;
+    const trimmed = urlDraft.trim();
+    if (trimmed === cfg.proxyUrl) return;
+    await save({ proxyUrl: trimmed });
+  }, [cfg, save, urlDraft]);
+
+  const applyTimeoutDraft = useCallback(async (): Promise<void> => {
+    if (!cfg) return;
+    const seconds = Number(timeoutDraft);
+    if (!Number.isFinite(seconds)) {
+      setSaveError("超时秒数需要是数字");
+      return;
+    }
+    // 与 Rust 侧 net_config 的钳制范围一致（2–60 秒），前端先钳省一次来回
+    const clamped = Math.min(60, Math.max(2, Math.round(seconds)));
+    setTimeoutCustom(false);
+    await save({ sourceTimeoutMs: clamped * 1000 });
+  }, [cfg, save, timeoutDraft]);
+
+  const runTest = useCallback(async (): Promise<void> => {
+    if (testing) return;
+    setTesting(true);
+    setTestResult(null);
+    try {
+      // 试连用「表单值」：自定义模式下用输入框草稿，可以先试再存
+      const mode = cfg?.proxyMode ?? "system";
+      const url = mode === "custom" ? urlDraft.trim() : (cfg?.proxyUrl ?? "");
+      setTestResult(await ipc.testNetConfig(mode, url));
+    } catch (e) {
+      setTestResult({ ok: false, status: null, elapsedMs: 0, error: errMsg(e) });
+    } finally {
+      setTesting(false);
+    }
+  }, [cfg, testing, urlDraft]);
+
+  const timeoutSeconds = cfg ? cfg.sourceTimeoutMs / 1000 : null;
+  const isPreset =
+    timeoutSeconds !== null && SOURCE_TIMEOUT_PRESETS.includes(timeoutSeconds);
+  const showTimeoutInput = timeoutCustom || !isPreset;
+
+  return (
+    <div className="max-w-4xl divide-y divide-border">
+      <SettingRow
+        title="代理模式"
+        description="音源、在线播放、封面、下载及账号与更新请求都使用此代理。改动对下一次请求生效，不打断正在播放的歌。"
+      >
+        {cfg ? (
+          <Segmented
+            value={cfg.proxyMode}
+            options={PROXY_MODE_OPTIONS}
+            onChange={(v) => void save({ proxyMode: v })}
+          />
+        ) : (
+          <span className="text-xs text-muted-foreground">…</span>
+        )}
+      </SettingRow>
+      {cfg?.proxyMode === "custom" && (
+        <SettingRow
+          title="代理地址"
+          description="支持 http://、https://、socks5://、socks5h://，可带用户名密码（回车或失焦保存）"
+        >
+          <span className="flex w-full flex-col items-end gap-1">
+            <input
+              type="text"
+              value={urlDraft}
+              placeholder="http://127.0.0.1:7890"
+              onChange={(e) => {
+                setUrlDraft(e.target.value);
+                setSaveError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void applyUrlDraft();
+              }}
+              onBlur={() => void applyUrlDraft()}
+              spellCheck={false}
+              className="w-full rounded-md border border-border bg-transparent px-2 py-1 text-xs outline-none focus:border-primary"
+            />
+          </span>
+        </SettingRow>
+      )}
+      <SettingRow
+        title="单源超时"
+        description="单个音源 HTTP 请求的默认超时；音源脚本显式声明的超时优先。网络差时调大可减少「音源不可用」。"
+      >
+        {cfg && timeoutSeconds !== null ? (
+          <div className="flex items-center gap-2">
+            <Segmented
+              value={isPreset && !timeoutCustom ? String(timeoutSeconds) : "custom"}
+              options={[
+                ...SOURCE_TIMEOUT_PRESETS.map((s) => ({ value: String(s), label: `${s} 秒` })),
+                { value: "custom", label: "自定义" },
+              ]}
+              onChange={(v) => {
+                if (v === "custom") {
+                  setTimeoutCustom(true);
+                  setTimeoutDraft(String(timeoutSeconds));
+                  return;
+                }
+                setTimeoutCustom(false);
+                void save({ sourceTimeoutMs: Number(v) * 1000 });
+              }}
+            />
+            {showTimeoutInput && (
+              <span className="flex items-center gap-1">
+                <input
+                  type="number"
+                  inputMode="numeric"
+                  min={2}
+                  max={60}
+                  value={timeoutDraft}
+                  placeholder="10"
+                  onChange={(e) => {
+                    setTimeoutDraft(e.target.value);
+                    setSaveError(null);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void applyTimeoutDraft();
+                  }}
+                  onBlur={() => void applyTimeoutDraft()}
+                  className="w-16 rounded-md border border-border bg-transparent px-2 py-1 text-xs outline-none focus:border-primary"
+                />
+                <span className="text-xs text-muted-foreground">秒</span>
+              </span>
+            )}
+          </div>
+        ) : (
+          <span className="text-xs text-muted-foreground">…</span>
+        )}
+      </SettingRow>
+      {saveError && <p role="alert" className="py-3 text-xs text-destructive">{saveError}</p>}
+      <SettingRow
+        title="测试连接"
+        description="按当前表单里的代理设置试连一次（不修改已保存的配置）"
+      >
+        <span className="flex w-full flex-col items-end gap-1">
+          <button
+            type="button"
+            disabled={testing || !cfg}
+            onClick={() => void runTest()}
+            className="rounded-md border border-border px-3 py-1 text-xs transition-colors hover:border-primary disabled:opacity-40"
+          >
+            {testing ? "测试中…" : "测试"}
+          </button>
+          {testResult && (
+            <p
+              className={`text-xs ${
+                testResult.ok ? "text-muted-foreground" : "text-destructive"
+              }`}
+            >
+              {testResult.ok
+                ? `连通 · ${
+                    testResult.status !== null ? `HTTP ${testResult.status} · ` : ""
+                  }${testResult.elapsedMs} ms`
+                : `失败 · ${testResult.error ?? "未知错误"}`}
+            </p>
+          )}
+        </span>
+      </SettingRow>
+    </div>
   );
 }

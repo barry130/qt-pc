@@ -1,5 +1,5 @@
 import { useLayoutEffect, useRef, useState } from "react";
-import { Play } from "lucide-react";
+import { Headphones, Play } from "lucide-react";
 import type { Chart, Track } from "@/types";
 import { qtresCoverUrl } from "@/lib/lrc";
 
@@ -103,7 +103,10 @@ export function ChartSpotlightCard(props: {
    * （酷狗恒空串、QQ 恒 null）。与其编一个时间，不如用真实拿得到的曲目数 ——
    * 形状一致（都读作「这个榜有多少东西」），且不会随时间撒谎。
    */
-  const hint = total !== undefined && total > 0 ? `共 ${total} 首` : null;
+  const hint = total !== undefined && total > 0
+    ? `共 ${total} ${chart.contentType === "programs" ? "个节目" : "首"}`
+    : null;
+  const isPrograms = chart.contentType === "programs";
 
   return (
     <div className="group flex flex-col rounded-xl border border-border bg-card/60 p-4 transition-shadow duration-200 hover:shadow-lg">
@@ -164,42 +167,48 @@ export function ChartSpotlightCard(props: {
             {/* 整张榜入队：详情是懒加载的（列表只取前 3 首），这里按需再拉一次全量 */}
             <button
               type="button"
-              onClick={onPlayAll}
-              aria-label={`播放榜单 ${chart.name}`}
+              onClick={isPrograms ? onOpen : onPlayAll}
+              aria-label={isPrograms ? `浏览榜单节目 ${chart.name}` : `播放榜单 ${chart.name}`}
               className="absolute inset-0 flex items-center justify-center bg-black/40 opacity-0 transition-opacity duration-200 group-hover/cover:opacity-100"
             >
               <span className="flex h-8 w-8 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg">
-                <Play className="h-4 w-4 fill-current" />
+                {isPrograms ? <Headphones className="h-4 w-4" /> : <Play className="h-4 w-4 fill-current" />}
               </span>
             </button>
           </div>
         </div>
 
         <ol className="min-w-0 flex-1">
-          {tracks === undefined
-            ? Array.from({ length: 3 }, (_, i) => (
-                <li key={i} className="px-1 py-1.5">
-                  <div className="h-3 w-full animate-pulse rounded bg-muted" />
-                </li>
-              ))
-            : tracks.map((t, i) => (
-                <li key={`${t.id}-${i}`}>
-                  <button
-                    type="button"
-                    onClick={() => onPlayTrack(t)}
-                    title={`${t.title} - ${t.singer}`}
-                    className="flex w-full items-center gap-2 rounded px-1 py-1 text-left transition-colors hover:bg-accent hover:text-accent-foreground"
-                  >
-                    <span className="w-3 shrink-0 text-xs tabular-nums text-muted-foreground">
-                      {i + 1}
-                    </span>
-                    <span className="min-w-0 flex-1 truncate text-xs">
-                      {t.title} - {t.singer}
-                    </span>
-                  </button>
-                </li>
-              ))}
-          {tracks !== undefined && tracks.length === 0 ? (
+          {isPrograms ? (
+            <li className="px-1 py-1 text-xs text-muted-foreground">
+              点击查看节目列表
+            </li>
+          ) : tracks === undefined ? (
+            Array.from({ length: 3 }, (_, i) => (
+              <li key={i} className="px-1 py-1.5">
+                <div className="h-3 w-full animate-pulse rounded bg-muted" />
+              </li>
+            ))
+          ) : (
+            tracks.map((t, i) => (
+              <li key={`${t.id}-${i}`}>
+                <button
+                  type="button"
+                  onClick={() => onPlayTrack(t)}
+                  title={`${t.title} - ${t.singer}`}
+                  className="flex w-full items-center gap-2 rounded px-1 py-1 text-left transition-colors hover:bg-accent hover:text-accent-foreground"
+                >
+                  <span className="w-3 shrink-0 text-xs tabular-nums text-muted-foreground">
+                    {i + 1}
+                  </span>
+                  <span className="min-w-0 flex-1 truncate text-xs">
+                    {t.title} - {t.singer}
+                  </span>
+                </button>
+              </li>
+            ))
+          )}
+          {!isPrograms && tracks !== undefined && tracks.length === 0 ? (
             <li className="px-1 py-1 text-xs text-muted-foreground">暂无曲目</li>
           ) : null}
         </ol>

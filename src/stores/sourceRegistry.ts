@@ -286,7 +286,12 @@ export function useAnySourceSupports(feature: SourceFeature): boolean {
  * **任何**平台的下载都从「母带 24bit」掉到「标准 128k」（下载按钮调用它，
  * 播放路径不经过，故只有下载坏）。
  */
-function qualityRanksOf(qualities: RegistryQuality[]): string[] {
+/**
+ * 档位高低序的公开版本（**高→低**）：播放取链回退阶梯
+ * （lib/quality-fallback.ts 的 `qualityFallbackLadder`）要按同一套顺序逐档重试，
+ * 不能自己另排一份（两处口径分叉会让降档顺序与音质菜单相反）。
+ */
+export function qualityRanksOf(qualities: RegistryQuality[]): string[] {
   return qualities.map((q) => q.id).reverse();
 }
 

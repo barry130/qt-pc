@@ -77,9 +77,11 @@ export function playUrlMiss(track: Track | null, quality: Quality | null): strin
   return misses.get(playUrlLineKey(track, quality)) ?? "";
 }
 
-/** 清空（测试用；生产靠 key 覆盖，规模是「播过的歌 × 音质」） */
-export function clearPlayUrlLines(): void {
+/** 清空（测试用 / 设置页可选清理）并返回清理条目数。 */
+export function clearPlayUrlLines(): number {
+  const count = new Set([...lines.keys(), ...rawLines.keys(), ...misses.keys()]).size;
   lines.clear();
   rawLines.clear();
   misses.clear();
+  return count;
 }

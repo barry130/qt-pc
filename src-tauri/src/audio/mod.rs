@@ -9,6 +9,7 @@ pub mod fx;
 pub mod queue;
 pub mod range_reader;
 pub mod state;
+mod source;
 
 pub use engine::{AudioCmd, AudioEngine, PlaySource};
 pub use fx::{AudioFx, DspSource, EqParams, FadeParams, FxState, SpectrumTap, EQ_BAND_HZ};

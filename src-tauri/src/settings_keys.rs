@@ -31,6 +31,8 @@ pub const SETTING_LIKE_SYNC_SEQ: &str = "like.sync.seq";
 pub const SETTING_LIKE_IMPORTED: &str = "like.imported";
 /// 桌面歌词窗位置与样式（§10，不与主窗口状态混存）
 pub const SETTING_LYRIC_WINDOW: &str = "lyric.window";
+/// 迷你播放器窗位置（第二波 §3.21.7.2；visible 仅记录、启动一律按不可见恢复）
+pub const SETTING_MINI_WINDOW: &str = "mini.window";
 /// 自定义快捷键表（动作 ID → { key, enabled }）
 pub const SETTING_SHORTCUTS: &str = "shortcuts";
 /// 下载文件名格式（artist = 歌手-歌名（默认），song = 歌名-歌手）

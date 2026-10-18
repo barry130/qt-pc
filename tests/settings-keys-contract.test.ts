@@ -13,7 +13,7 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { CACHE_AUDIO_LIMIT_MB_KEY, QUALITY_KEY } from "@/lib/storageKeys";
+import { CACHE_AUDIO_LIMIT_MB_KEY, GAPLESS_KEY, QUALITY_KEY } from "@/lib/storageKeys";
 
 const read = (rel: string): string =>
   readFileSync(join(process.cwd(), rel), "utf8");
@@ -72,6 +72,8 @@ describe("settings 键名跨端契约", () => {
     expect(keys.SETTING_QUALITY).toBe(QUALITY_KEY);
     const cache = rustConsts("src-tauri/src/cache.rs");
     expect(cache.SETTING_AUDIO_CACHE_LIMIT_MB).toBe(CACHE_AUDIO_LIMIT_MB_KEY);
+    const engine = rustConsts("src-tauri/src/audio/engine.rs");
+    expect(engine.SETTING_GAPLESS).toBe(GAPLESS_KEY);
   });
 
   it("auth.ts 的 like.* 字面量与 Rust 常量一致（该处刻意用字面量，只对值）", () => {
@@ -109,5 +111,17 @@ describe("settings 键名跨端契约", () => {
         ).toBe(false);
       }
     }
+  });
+
+  it("网络设置键名与代理模式值稳定（DB 持久化格式护栏，键不进前端常量表）", () => {
+    // 网络设置走专用命令（get/set_net_config），前端不直接用 getSetting 传键，
+    // 但键值与模式枚举是 settings 表里的持久化格式，改了会静默丢用户配置 —— 钉住。
+    const net = rustConsts("src-tauri/src/net_config.rs");
+    expect(net.SETTING_PROXY_MODE).toBe("network.proxyMode");
+    expect(net.SETTING_PROXY_URL).toBe("network.proxyUrl");
+    expect(net.SETTING_SOURCE_TIMEOUT_MS).toBe("network.sourceTimeoutMs");
+    expect(net.PROXY_MODE_SYSTEM).toBe("system");
+    expect(net.PROXY_MODE_NONE).toBe("none");
+    expect(net.PROXY_MODE_CUSTOM).toBe("custom");
   });
 });

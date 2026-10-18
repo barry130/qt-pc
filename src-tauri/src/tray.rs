@@ -16,6 +16,7 @@ const ID_PREVIOUS: &str = "tray-previous";
 const ID_NEXT: &str = "tray-next";
 const ID_DESKTOP_LYRIC: &str = "tray-desktop-lyric";
 const ID_LOCK_LYRIC: &str = "tray-lock-lyric";
+const ID_MINI: &str = "tray-mini";
 const ID_SHOW_MAIN: &str = "tray-show-main";
 const ID_QUIT: &str = "tray-quit";
 
@@ -53,15 +54,19 @@ fn build_menu(
         None::<&str>,
     )?;
     let show_main = MenuItem::with_id(app, ID_SHOW_MAIN, "显示主窗口", true, None::<&str>)?;
+    // 迷你模式（§3.21.7.2）：托盘是主窗收起时唯一的总入口，这里必须留着——
+    // 用迷你窗期间主窗是隐藏状态，没有托盘菜单就只能在迷你窗里点回主窗。
+    let mini = MenuItem::with_id(app, ID_MINI, "迷你模式", true, None::<&str>)?;
     let quit = MenuItem::with_id(app, ID_QUIT, "退出", true, None::<&str>)?;
     // MenuItem 与 CheckMenuItem 是不同类型，统一成 trait object 才能放进同一个菜单
-    let items: [&dyn IsMenuItem<Wry>; 7] = [
+    let items: [&dyn IsMenuItem<Wry>; 8] = [
         &play_pause,
         &previous,
         &next,
         &desktop_lyric,
         &lock_lyric,
         &show_main,
+        &mini,
         &quit,
     ];
     let menu = Menu::with_items(app, &items)?;
@@ -92,6 +97,12 @@ fn sync_lock_checked(app: &AppHandle) {
 
 /// 显示并聚焦主窗口（托盘左键单击 / 菜单「显示主窗口」）
 fn show_main_window(app: &AppHandle) {
+    if app.get_webview_window(crate::mini_window::MINI_WINDOW_LABEL).is_some() {
+        if let Err(e) = crate::mini_window::hide(app) {
+            log::warn!("[tray] 返回主窗口失败: {e}");
+        }
+        return;
+    }
     if let Some(win) = app.get_webview_window(crate::MAIN_WINDOW_LABEL) {
         // 只有「本来不可见」才算一轮新的 show：左键可以连点，若每次都发事件，
         // 前端停留计时会被反复重置，统计出的时长永远接近 0。
@@ -164,6 +175,12 @@ pub fn create_tray(app: &AppHandle) -> bool {
                 sync_lock_checked(app);
             }
             ID_SHOW_MAIN => show_main_window(app),
+            ID_MINI => {
+                // 与播放条按钮同一条命令：进迷你收主窗、退迷你唤回主窗
+                if let Err(e) = crate::mini_window::toggle(app) {
+                    log::error!("[tray] 迷你模式切换失败: {e}");
+                }
+            }
             ID_QUIT => {
                 log::info!("[tray] 退出");
                 // 统计：先给前端一个 hide 事件的机会（结算停留时长 + 冲队列，

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Trash2,
   ChevronDown,
@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { isLosslessAudioFormat } from "@/lib/audio-format";
 import { errMsg } from "@/lib/utils";
+import { legacyTrackSelectionKey, retainTrackSelection } from "@/lib/track-selection";
 import type { Track } from "@/types";
 import * as ipc from "@/services/ipc";
 import { useTauriEvent } from "@/hooks/useTauriEvent";
@@ -32,6 +33,8 @@ import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
  * 缺失文件体检与清理。
  */
 
+const LibraryMaintenance = lazy(() => import("./LibraryMaintenance"));
+
 type ViewMode = "songs" | "artists" | "albums" | "folders";
 type SortKey = "title" | "singer" | "album" | "duration" | "size" | "mtime";
 
@@ -50,6 +53,16 @@ const SORT_OPTIONS: { value: SortKey; label: string }[] = [
   { value: "size", label: "按大小" },
   { value: "mtime", label: "按修改时间" },
 ];
+
+function filterLocalTracks(tracks: Track[], query: string): Track[] {
+  const q = query.trim().toLowerCase();
+  if (!q) return tracks;
+  return tracks.filter((t) =>
+    t.title.toLowerCase().includes(q) ||
+    t.singer.toLowerCase().includes(q) ||
+    t.album.toLowerCase().includes(q),
+  );
+}
 
 function dirOf(path: string): string {
   const idx = Math.max(path.lastIndexOf("\\"), path.lastIndexOf("/"));
@@ -99,6 +112,7 @@ export function LibraryPage(): React.JSX.Element {
   const [missingOpen, setMissingOpen] = useState(false);
   /** 扫描设置面板默认收起：扫描按钮左侧的「扫描设置」下拉展开后才显示 */
   const [scanOpen, setScanOpen] = useState(false);
+  const [maintenanceOpen, setMaintenanceOpen] = useState(false);
 
   const load = useCallback(async (): Promise<void> => {
     setLoading(true);
@@ -256,31 +270,9 @@ export function LibraryPage(): React.JSX.Element {
     });
   }, []);
 
-  // 行内操作（在文件夹中显示 / 删除）与批量选择共用的回调：删除成功后整库重载
-  const local = useMemo(
-    () => ({
-      onChanged: () => void load(),
-      onError: (msg: string) => setError(msg),
-      selection: { ids: selected, onToggle: toggleSelect },
-      // 行模板对齐下载管理：本地行不带封面缩略图，也不显示「已下载」标记
-      plainRow: true,
-    }),
-    [load, selected, toggleSelect],
-  );
-
   // 搜索 + 排序（本地曲库通常几千首，前端处理足够且无往返延迟）
   const visible = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    let list = tracks;
-    if (q) {
-      list = list.filter(
-        (t) =>
-          t.title.toLowerCase().includes(q) ||
-          t.singer.toLowerCase().includes(q) ||
-          t.album.toLowerCase().includes(q),
-      );
-    }
-    const sorted = [...list];
+    const sorted = [...filterLocalTracks(tracks, query)];
     const dir = sortDesc ? -1 : 1;
     sorted.sort((a, b) => {
       // switch 每个 case（含 default）都先赋值再 break，声明处初值是死赋值
@@ -313,13 +305,37 @@ export function LibraryPage(): React.JSX.Element {
     return sorted;
   }, [tracks, query, sortKey, sortDesc]);
 
-  // 批量选择：以「当前可见列表」为范围，全选 / 取消全选都只影响可见项
-  const allSelected = visible.length > 0 && visible.every((t) => selected.has(t.id));
+  // 搜索收窄后立即丢弃隐藏选择；清空检索也不会恢复这些裸文件路径。
+  const changeQuery = (value: string): void => {
+    setQuery(value);
+    setSelected((prev) => retainTrackSelection(filterLocalTracks(tracks, value), prev, legacyTrackSelectionKey));
+  };
+  const visibleSelected = useMemo(
+    () => retainTrackSelection(visible, selected, legacyTrackSelectionKey),
+    [visible, selected],
+  );
   useEffect(() => {
-    if (allRef.current) {
-      allRef.current.indeterminate = !allSelected && selected.size > 0;
-    }
-  }, [allSelected, selected]);
+    setSelected((prev) => retainTrackSelection(visible, prev, legacyTrackSelectionKey));
+  }, [visible]);
+
+  // 行内操作（在文件夹中显示 / 删除）与批量选择共用的回调：删除成功后整库重载
+  const local = useMemo(
+    () => ({
+      onChanged: () => void load(),
+      onError: (msg: string) => setError(msg),
+      selection: { ids: visibleSelected, onToggle: toggleSelect, onChange: setSelected, keyOf: legacyTrackSelectionKey },
+      // 行模板对齐下载管理：本地行不带封面缩略图，也不显示「已下载」标记
+      plainRow: true,
+    }),
+    [load, visibleSelected, toggleSelect],
+  );
+
+  // 批量选择 / 删除共享当前可见范围，确保计数与真正提交给 IPC 的文件一致。
+  const allSelected = visible.length > 0 && visible.every((t) => visibleSelected.has(t.id));
+  const partiallySelected = !allSelected && visibleSelected.size > 0;
+  useEffect(() => {
+    if (allRef.current) allRef.current.indeterminate = partiallySelected;
+  }, [partiallySelected]);
 
   // 分组视图：歌手 / 专辑 / 文件夹
   const groups = useMemo(() => {
@@ -363,6 +379,8 @@ export function LibraryPage(): React.JSX.Element {
             )}
           </h1>
           <div className="flex items-center gap-1.5">
+            <button type="button" aria-expanded={maintenanceOpen} onClick={() => setMaintenanceOpen((value) => !value)}
+              className="rounded-md px-2.5 py-1.5 text-xs text-muted-foreground hover:bg-secondary hover:text-foreground">曲库维护</button>
             {/* 扫描设置：下拉展开后显示添加目录 / 过滤规则 / 目录列表（默认收起） */}
             <button
               type="button"
@@ -511,7 +529,7 @@ export function LibraryPage(): React.JSX.Element {
           <div className="mt-3 flex flex-wrap items-center gap-2">
             <input
               value={query}
-              onChange={(e) => setQuery(e.target.value)}
+              onChange={(e) => changeQuery(e.target.value)}
               placeholder="搜索标题 / 歌手 / 专辑"
               aria-label="搜索本地歌曲"
               className="h-7 w-48 rounded-md border border-input bg-background px-2 text-xs outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
@@ -572,6 +590,8 @@ export function LibraryPage(): React.JSX.Element {
                 ref={allRef}
                 type="checkbox"
                 checked={allSelected}
+                disabled={visible.length === 0}
+                aria-checked={partiallySelected ? "mixed" : allSelected}
                 aria-label={allSelected ? "取消全选" : "全选"}
                 onChange={() =>
                   setSelected(
@@ -582,17 +602,18 @@ export function LibraryPage(): React.JSX.Element {
               />
             </label>
             <BatchDeleteButton
-              count={selected.size}
+              count={visibleSelected.size}
               onDelete={async (deleteFile) => {
-                await ipc.deleteLocalTracks([...selected], deleteFile);
+                if (visibleSelected.size === 0) return;
+                await ipc.deleteLocalTracks([...visibleSelected], deleteFile);
               }}
               onDeleted={() => void load()}
               onError={(msg) => setError(msg)}
             />
-            {selected.size > 0 && (
+            {visibleSelected.size > 0 && (
               <>
                 <span className="text-xs text-muted-foreground">
-                  已选 {selected.size} 首
+                  已选 {visibleSelected.size} 首
                 </span>
                 <IconButton label="取消选择" onClick={() => setSelected(new Set())}>
                   <X />
@@ -646,6 +667,7 @@ export function LibraryPage(): React.JSX.Element {
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
+        {maintenanceOpen && <Suspense fallback={<p className="p-4 text-xs text-muted-foreground">加载维护工具…</p>}><LibraryMaintenance /></Suspense>}
         {error && (
           <div className="p-6 text-center text-sm text-destructive">
             操作失败：{error}
