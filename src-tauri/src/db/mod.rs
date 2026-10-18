@@ -289,7 +289,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            version, migrations::CURRENT_VERSION as i64,
+            version, migrations::CURRENT_VERSION,
             "重建的库应完成全部迁移"
         );
 

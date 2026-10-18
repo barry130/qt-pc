@@ -348,9 +348,10 @@ fn suppressed_at(target: &str, level: log::Level, max: log::LevelFilter) -> bool
 /// 诊断日志是报障时要往外发的东西，后端/用户自定义接口的域名属于隐私；
 /// 但「调了哪个接口」对排查有用。两条规则：
 /// - URL 里的主机段打码成 `***`，scheme/端口/路径原样保留：
-///   `https://astral.canace.cn/api/v1/app/x` → `https://***/api/v1/app/x`；
+///   `https://astral.example.com/api/v1/app/x` → `https://***/api/v1/app/x`；
 /// - `Some("host[:port]")` 形态（reqwest 建连日志只给裸域名）整体打码：
 ///   `Some("example.com")` → `Some("***")`。
+///
 /// 判据是「主机段带字母」：域名必有字母，IPv4 纯数字段与 `localhost` 这类
 /// 无点裸名不打 —— 没有隐私，本地取流日志（127.0.0.1 端口）还靠它们定位。
 fn mask_hosts(msg: &str) -> String {
@@ -786,7 +787,7 @@ mod tests {
     fn domains_masked_but_paths_kept() {
         // URL：scheme / 端口 / 路径保留，主机打码
         assert_eq!(
-            mask_hosts("在 https://astral.canace.cn/api/v1/app/x?a=1 查询"),
+            mask_hosts("在 https://astral.example.com/api/v1/app/x?a=1 查询"),
             "在 https://***/api/v1/app/x?a=1 查询"
         );
         assert_eq!(
@@ -795,7 +796,7 @@ mod tests {
         );
         // reqwest 建连日志的裸域名形态
         assert_eq!(
-            mask_hosts("starting new connection: Some(\"astral.canace.cn\")"),
+            mask_hosts("starting new connection: Some(\"astral.example.com\")"),
             "starting new connection: Some(\"***\")"
         );
         assert_eq!(
@@ -804,7 +805,7 @@ mod tests {
         );
         // 同行多个域名各自打码
         assert_eq!(
-            mask_hosts("https://a.aa.cab/x then https://astral.canace.cn/y"),
+            mask_hosts("https://a.aa.cab/x then https://astral.example.com/y"),
             "https://***/x then https://***/y"
         );
         // IPv4 与 localhost：本地取流日志靠它们定位，不打

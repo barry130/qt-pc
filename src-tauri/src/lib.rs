@@ -399,7 +399,10 @@ pub fn run() {
             // 这里先装好全局，客户端首建即吃到用户配置。失败不影响启动
             //（回退默认：跟随系统 + 10s）。
             if let Some(db) = &app.state::<AppState>().db {
-                let _ = db.with(|conn| Ok(crate::net_config::init_from_db(conn)));
+                let _ = db.with(|conn| {
+                    crate::net_config::init_from_db(conn);
+                    Ok(())
+                });
             }
 
             // 托盘注册：失败（Linux GNOME 无托盘扩展、无 StatusNotifier 宿主等）

@@ -667,7 +667,7 @@ mod tests {
         let paged = query_report(&conn, &paged).expect("clamped page");
         assert_eq!(
             paged.items.len(),
-            1.min(100),
+            1,
             "negative limit clamps to one"
         );
         let offset = query(ListenReportKind::Tracks, ListenReportOrder::Count, 2, 1);
