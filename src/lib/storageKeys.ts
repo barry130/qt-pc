@@ -20,3 +20,10 @@ export const CACHE_AUDIO_LIMIT_MB_KEY = "cache.audioLimitMb";
 
 /** 无缝播放（Rust audio/engine.rs SETTING_GAPLESS；"true" / "false"） */
 export const GAPLESS_KEY = "playback.gapless";
+
+/**
+ * 首次启动免责声明的接受时刻（ISO 字符串）。
+ * 缺失或空串 = 还没接受过 → 装完第一次启动弹一次，读完 3 秒才能确认。
+ * 存在 SQLite settings 表里：卸载重装 = 新库 = 重新弹一次，这正是「安装后首次」的语义。
+ */
+export const DISCLAIMER_KEY = "disclaimer.acceptedAt";

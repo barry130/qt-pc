@@ -4,6 +4,7 @@ import { Database, Settings2 } from "lucide-react";
 import { getSourceState } from "@/source-scripts/source-update";
 import { useTauriEvent } from "@/hooks/useTauriEvent";
 import { SOURCE_META_CHANGED_EVENT, SOURCE_PACK_CHANGED_EVENT } from "@/services/ipc";
+import { useDisclaimerStore } from "@/stores/disclaimer";
 
 /**
  * 「未安装数据包」首页全屏引导（数据包不内置模型）。
@@ -28,6 +29,8 @@ export function MetaPackGuide(): React.JSX.Element | null {
   const [activeMetaId, setActiveMetaId] = useState<string | null | undefined>(undefined);
   /** 本会话已主动关闭（重启应用后重新引导） */
   const [dismissed, setDismissed] = useState(false);
+  /** 首次启动的免责声明正在展示时，本引导让位 */
+  const disclaimerOpen = useDisclaimerStore((s) => s.pending === true || s.reopened);
 
   const refresh = useCallback(async () => {
     try {
@@ -57,6 +60,9 @@ export function MetaPackGuide(): React.JSX.Element | null {
 
   // 首次启动引导（/onboarding）进行中不弹，避免两场引导叠在一起
   if (pathname === "/onboarding") return null;
+  // 首次启动的免责声明也在这层浮层里（同一个 z-[60]/z-50 家族）：
+  // 全新安装必然没装数据包，两边一起弹就是两份「先读这个」，等声明读完再谈装包
+  if (disclaimerOpen) return null;
   if (dismissed || activeMetaId === undefined || activeMetaId !== null) return null;
 
   return (

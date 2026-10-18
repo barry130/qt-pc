@@ -28,6 +28,7 @@ import { usePlayerStore } from "@/stores/player";
 import { useSourceRegistryStore } from "@/stores/sourceRegistry";
 import { useDownloadsStore } from "@/stores/downloads";
 import { useDislikesStore } from "@/stores/dislikes";
+import { useDisclaimerStore } from "@/stores/disclaimer";
 import { syncDownloadLyricSidecars } from "@/lib/downloadSidecars";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { initStat, trackStatPage } from "@/lib/stat";
@@ -36,6 +37,7 @@ import { UpdateDialog } from "@/components/update/UpdateDialog";
 import { QtNoticeDialog } from "@/components/notice/qt-NoticeDialog";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { ToastHost } from "@/components/common/ToastHost";
+import { FirstRunDisclaimer } from "@/components/common/FirstRunDisclaimer";
 import { PageFallback } from "@/lib/lazyPage";
 
 /**
@@ -82,15 +84,23 @@ export function AppShell(): React.JSX.Element {
   const pathname = useLocation().pathname;
   const isPlayingPage = pathname === "/playing";
 
-  // 首次启动引导：没完成过就先走引导流程（DESIGN §12）
+  // 首次启动免责声明（装完第一次启动弹一次，读完 3 秒才能确认）：只读一次库
   useEffect(() => {
+    void useDisclaimerStore.getState().init();
+  }, []);
+
+  // 首次启动引导：没完成过就先走引导流程（DESIGN §12）。
+  // 等免责声明这一关结清再进：两场首启动流程叠在一起，用户既读不完声明也跳不出引导
+  const disclaimerSettled = useDisclaimerStore((s) => s.pending === false);
+  useEffect(() => {
+    if (!disclaimerSettled) return;
     void (async () => {
       const done = await ipc.getSetting(ONBOARDING_KEY).catch(() => null);
       if (!done) {
         await navigate({ to: "/onboarding" });
       }
     })();
-  }, [navigate]);
+  }, [disclaimerSettled, navigate]);
 
   // 启动恢复登录态（读 Rust 侧保存的会话并拉用户信息）
   const initAuth = useAuthStore((s) => s.init);
@@ -269,6 +279,9 @@ export function AppShell(): React.JSX.Element {
       </ErrorBoundary>
 
       <ErrorBoundary label="对话框">
+        {/* 首次启动的免责声明 / 开源通知（装完第一次启动弹一次）。
+            层内最先挂，且自身用 z-[60] 高过其他 z-50 弹窗，两重保险都留着 */}
+        <FirstRunDisclaimer />
         {/* 更新弹窗（启动自动检查发现新版本时弹出，§15.3） */}
         <UpdateDialog />
         <QtNoticeDialog />

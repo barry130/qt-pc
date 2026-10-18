@@ -32,6 +32,7 @@ import { useUpdateStore } from "@/stores/update";
 import { useSourceUpdateStore } from "@/stores/source-update";
 import { runCheck } from "@/hooks/useUpdateCheck";
 import { useOfficialSiteUrl } from "@/hooks/useOfficialSiteUrl";
+import { useDisclaimerStore } from "@/stores/disclaimer";
 import { useTauriEvent } from "@/hooks/useTauriEvent";
 import {
   activateSourcePack,
@@ -2556,6 +2557,8 @@ function AboutSection(): React.JSX.Element {
   const setUpdate = useUpdateStore((s) => s.setUpdate);
   /** 官网根地址（未配置时为空串 → 下面四行整块不渲染） */
   const siteUrl = useOfficialSiteUrl();
+  /** 重新打开首次启动的免责声明（只展示，不改已记录的接受时刻） */
+  const reopenDisclaimer = useDisclaimerStore((s) => s.reopen);
 
   useEffect(() => {
     void getAppVersion().then(setVersion).catch(() => {});
@@ -2631,6 +2634,17 @@ function AboutSection(): React.JSX.Element {
           </SettingRow>
         </>
       ) : null}
+      {/* 免责声明本身不依赖官网地址（地址只在文案里出现，未配置时降级为纯文字），
+          所以这一行不受 siteUrl 约束 */}
+      <SettingRow title="重新查看免责声明" description="安装后首次启动时的那份声明">
+        <button
+          type="button"
+          onClick={reopenDisclaimer}
+          className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent"
+        >
+          查看
+        </button>
+      </SettingRow>
     </div>
   );
 }
