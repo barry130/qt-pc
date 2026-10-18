@@ -18,6 +18,9 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 #[test]
+// 依赖外网与本机私有配置（连不上时第 68 行 expect 直接 panic），CI 上必然红 ——
+// 必须挂 ignore，否则每次推送都挂一条与代码无关的失败。手动跑见文件头说明。
+#[ignore = "需要外网 + 本机私有配置，不进 CI"]
 fn live_update_check_version_and_messages() {
     let rt = runtime();
     rt.block_on(async {

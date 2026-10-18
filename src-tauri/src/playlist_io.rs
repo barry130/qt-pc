@@ -591,7 +591,22 @@ mod tests {
         assert_eq!(preview.name, "回环歌单");
         assert_eq!(preview.tracks.len(), 2, "本机存在的本地条目要保留");
         assert_eq!(preview.skipped, 0);
-        assert_eq!(preview.tracks[1].platform, SourceId::local());
+        // 不按索引断言：读回的顺序取决于 SQLite 选查询计划，跨平台不保证
+        // （Ubuntu runner 上本地曲会排到 qq 曲前面，这里曾因此红过）。按属性找。
+        let local = preview
+            .tracks
+            .iter()
+            .find(|t| t.platform.is_local())
+            .expect("本机存在的本地条目要保留");
+        assert!(
+            Path::new(&local.id).is_file(),
+            "本地条目应指向真实文件：{}",
+            local.id
+        );
+        assert!(
+            preview.tracks.iter().any(|t| t.title == "晴天"),
+            "在线条目也要原样带回"
+        );
     }
 
     #[test]
