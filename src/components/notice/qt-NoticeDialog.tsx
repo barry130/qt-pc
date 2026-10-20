@@ -134,6 +134,9 @@ function normalizeSplashNotices(data: unknown, loggedIn: boolean): NoticeItem[] 
     .filter((item) => {
       const o = (item ?? {}) as Record<string, unknown>;
       if ((numberValue(o.display) & DISPLAY_SPLASH) === 0) return false;
+      // 首次启动免责声明（termsVersion 非空）由 FirstRunDisclaimer 单独渲染：
+      // 它有读秒和「改了条款重新确认」的语义，混进这个通用公告弹窗会两个弹窗叠着弹
+      if (stringValue(o.termsVersion).trim().length > 0) return false;
       const audience = stringValue(o.audience || "ALL");
       if (audience === "LOGGED_IN" && !loggedIn) return false;
       if (audience === "NOT_LOGGED_IN" && loggedIn) return false;

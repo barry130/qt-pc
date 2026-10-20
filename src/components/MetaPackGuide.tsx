@@ -4,7 +4,7 @@ import { Database, Settings2 } from "lucide-react";
 import { getSourceState } from "@/source-scripts/source-update";
 import { useTauriEvent } from "@/hooks/useTauriEvent";
 import { SOURCE_META_CHANGED_EVENT, SOURCE_PACK_CHANGED_EVENT } from "@/services/ipc";
-import { useDisclaimerStore } from "@/stores/disclaimer";
+import { disclaimerVisible, useDisclaimerStore } from "@/stores/disclaimer";
 
 /**
  * 「未安装数据包」首页全屏引导（数据包不内置模型）。
@@ -30,7 +30,7 @@ export function MetaPackGuide(): React.JSX.Element | null {
   /** 本会话已主动关闭（重启应用后重新引导） */
   const [dismissed, setDismissed] = useState(false);
   /** 首次启动的免责声明正在展示时，本引导让位 */
-  const disclaimerOpen = useDisclaimerStore((s) => s.pending === true || s.reopened);
+  const disclaimerOpen = useDisclaimerStore(disclaimerVisible);
 
   const refresh = useCallback(async () => {
     try {

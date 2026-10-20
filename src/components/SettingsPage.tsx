@@ -2560,6 +2560,15 @@ function AboutSection(): React.JSX.Element {
   /** 重新打开首次启动的免责声明（只展示，不改已记录的接受时刻） */
   const reopenDisclaimer = useDisclaimerStore((s) => s.reopen);
 
+  /**
+   * 声明正文由后端下发，离线 / 后台还没发布时点「查看」不会有任何反应。
+   * 那种情况下必须给一句话，否则用户只会觉得按钮坏了。
+   */
+  const handleReopenDisclaimer = async (): Promise<void> => {
+    const shown = await reopenDisclaimer();
+    if (!shown) toast("暂时取不到声明内容，请检查网络后重试");
+  };
+
   useEffect(() => {
     void getAppVersion().then(setVersion).catch(() => {});
   }, []);
@@ -2634,12 +2643,11 @@ function AboutSection(): React.JSX.Element {
           </SettingRow>
         </>
       ) : null}
-      {/* 免责声明本身不依赖官网地址（地址只在文案里出现，未配置时降级为纯文字），
-          所以这一行不受 siteUrl 约束 */}
+      {/* 免责声明正文由后端下发（后台「消息管理」的开屏公告），所以这一行不受 siteUrl 约束 */}
       <SettingRow title="重新查看免责声明" description="安装后首次启动时的那份声明">
         <button
           type="button"
-          onClick={reopenDisclaimer}
+          onClick={() => void handleReopenDisclaimer()}
           className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent"
         >
           查看

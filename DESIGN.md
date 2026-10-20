@@ -735,19 +735,51 @@ Apache-2.0 + 补充条款，**见到以本项目名义收费的版本即不是�
 文案与官网《用户协议》《隐私政策》同源，不要各写一份；此处**不写服务端保留期**
 ——那属于隐私政策的口径，写在客户端就成了承诺。
 
+**文案由后端下发，代码里不存正文。** 改一句话不用发版、不用等审核；代价是离线时
+拿不到声明就不弹（见下表「读不到」一行）。下发通道**复用现有公告系统** `sys_notice`，
+不建新表也不新增端点：后台「消息管理」里发一条开屏公告，额外填两个字段
+`read_seconds`（读秒）与 `terms_version`（条款版本号）即可。
+
+| 字段 | 作用 |
+|---|---|
+| `display` 含 1 | 走开屏位；客户端只从开屏公告里挑声明 |
+| `terms_version` 非空 | **判定「这条是免责声明」的唯一依据**。客户端记住已接受的版本，值一变就再弹一次 |
+| `read_seconds` | 确认键读满多少秒才可点；NULL 或 0 = 立即可点。客户端夹在 **0..60**：这个弹窗全屏无关闭键，读秒就是唯一能锁住用户的开关 |
+| `channel` | **服务端强制改写为桌面三端**（`app-windows,app-linux,app-macos`），后台选什么都无效。两个原因：① 本机 `X-App-Ut` 跟着编译目标走，只勾 Windows 会让 Linux/macOS 版永远收不到声明；② 投到手机端会被 uniappx 当成不可关闭开屏公告，那个弹窗点「我知道了」执行的是 `exitApp()`（uniappx 不认识 `terms_version`，每次启动都弹） |
+| `title` / `content` | 标题与正文；`content` 是富文本，客户端用 `lib/richText` 白名单渲染（**不走 `innerHTML`**），`script`/`iframe`/`style` 与行内事件会被过滤，外链只放行 `http(s)` 并走 `ipc.openExternalUrl` |
+
+为什么不新增 `scene` 常量来标记：`scene` 被服务端 `NotifyEventRegistry.isFeedbackReply()`
+等规则强约束，塞自家枚举会牵连反馈回复通知的全平台投放逻辑。用「开屏位 + 版本号非空」
+这个组合判定，对后端零侵入。
+
 | 环节 | 实现 |
 |---|---|
-| 是否弹 | `settings.disclaimer.acceptedAt`（`lib/storageKeys.ts` 的 `DISCLAIMER_KEY`）有值就不再弹；卸载重装 = 新库 = 重新弹 |
-| 状态 | `stores/disclaimer.ts`：`pending`（null 还没读库 / true 要弹 / false 不弹）+ `reopened`（设置页主动重看） |
-| 读秒 | 「我知道了」**读满 3 秒**才可点，按钮文案「请阅读（3s）」→「我知道了」；每次打开都重新读满 |
-| 落库 | 确认后写 ISO 时刻；**写失败也照样放行** —— 最多下次再弹一次，不把人拦在弹窗里出不去 |
+| 是否弹 | `settings.disclaimer.acceptedAt` 存 `{termsVersion, acceptedAt}`；版本号一致就不再弹；卸载重装 = 新库 = 重新弹 |
+| 状态 | `stores/disclaimer.ts`：`pending`（null 还没读库 / true 要弹 / false 不弹）+ `reopened`（设置页主动重看）+ `notice`（后端下发的那条） |
+| 读秒 | 时长取 `readSeconds`，**客户端夹在 0..60**（后台表单 `max=60` 也拦一道）；「请阅读（3s）」→「我知道了」；每次打开都重新读满 |
+| 落库 | 确认后写 `{termsVersion, acceptedAt}`；**写失败也照样放行** —— 最多下次再弹一次，不把人拦在弹窗里出不去 |
+| 老用户 | 升级前写入的裸 ISO 字符串（`"2026-10-18T03:00:00Z"` 这种）当作**已接受**，新增版本号机制不打扰他们 |
+| 没下发 | 后端没给声明就**不弹**。**不留硬编码兜底文案** —— 「后台改了文案却还弹旧的」正是本设计要消灭的坑 |
 | 官网地址 | 走 `useOfficialSiteUrl()`（私有配置，源码与文档里都不能出现自有域名）；未配置时降级为「见官网」纯文字，不给死链接 |
 | 入口 | `AppShell` 的「对话框」层**最先挂**，盖住更新弹窗等；引导跳转等 `pending === false` 才走，避免两场首启动流程叠在一起 |
-| 复查 | 设置「关于」里的「重新查看免责声明」：`reopen()` 只展示，**不改**已记录的接受时刻 |
+| 与公告弹窗互斥 | `qt-NoticeDialog` 的 `normalizeSplashNotices` 把「`termsVersion` 非空」的公告过滤掉，否则两个开屏弹窗会叠着弹 |
+| 复查 | 设置「关于」里的「重新查看免责声明」：`reopen()` 只展示，**不改**已记录的接受时刻；取不到声明时返回 false，设置页据此提示一句，不留下「点了没反应」的死按钮 |
 
-读不到库时按「不需要展示」处理：宁可这次不弹，也不让用户卡在弹窗前出不去。
-回归测试 `tests/first-run-disclaimer.test.tsx`（5 条：首次拦截 / 读满 3 秒 / 接受后
-不再出现 / 重看要重新读秒且不写标记 / 官网地址有无两态）。
+读不到库、接口挂了都按「不需要展示」处理：宁可这次不弹，也不让用户卡在弹窗前出不去。
+回归测试 `tests/first-run-disclaimer.test.tsx`（17 条：文案来自后端 / 读满才可点 /
+读秒为 0 立即可点 / 读秒被夹在 0..60 / 同版本不弹 / 版本变了重新弹 / 老裸 ISO 记录不弹 /
+没下发不弹 / 接口挂了不弹 / 重看要重新读秒且不写标记 / 重看取不到声明返回 false /
+外链走系统浏览器 / 公告弹窗排除声明 / `pickDisclaimer` 筛选与兜底 /
+`disclaimerVisible` 三条）。
+后端口径由 `astral-plugin` 的 `FeedbackNoticeDisclaimerFieldsTest`（9 条）守着：
+编辑时两列必须写进白名单、清空要真的落 NULL 而不是被 `updateStrategy=NOT_NULL` 跳过、
+读秒在新增与编辑两条路径上都被夹进 0..60、免责声明的渠道被强制改成桌面三端
+（普通公告的渠道原样保留）。
+
+后端要发的这条声明怎么填，见后台「消息管理」页的**「免责声明」按钮**：它会把
+标题、开屏位、桌面三端渠道、`dialogClosable=0`、`readSeconds=3`、`termsVersion`
+与三段正文一次填好，运营改完再点发布。模板正文写在 `astral-front` 的
+`NoticeManagement.tsx` 的 `DISCLAIMER_TEMPLATE`，与本节口径同源。
 
 ---
 
