@@ -745,7 +745,8 @@ Apache-2.0 + 补充条款，**见到以本项目名义收费的版本即不是�
 | `display` 含 1 | 走开屏位；客户端只从开屏公告里挑声明 |
 | `terms_version` 非空 | **判定「这条是免责声明」的唯一依据**。客户端记住已接受的版本，值一变就再弹一次 |
 | `read_seconds` | 确认键读满多少秒才可点；NULL 或 0 = 立即可点。客户端夹在 **0..60**：这个弹窗全屏无关闭键，读秒就是唯一能锁住用户的开关 |
-| `channel` | **服务端强制改写为桌面三端**（`app-windows,app-linux,app-macos`），后台选什么都无效。两个原因：① 本机 `X-App-Ut` 跟着编译目标走，只勾 Windows 会让 Linux/macOS 版永远收不到声明；② 投到手机端会被 uniappx 当成不可关闭开屏公告，那个弹窗点「我知道了」执行的是 `exitApp()`（uniappx 不认识 `terms_version`，每次启动都弹） |
+| `channel` | **服务端强制改写为 App 六端**（`app-android,app-ios,app-windows,app-linux,app-macos,app-harmony`，不含 `web`），后台选什么都无效。原因：各端 `X-App-Ut` 跟着编译目标走，少勾一个平台那个平台的用户就永远收不到声明。qt-uniappx 也已支持这套字段（判定逻辑与本端同构），所以手机端同样由它认领 |
+| `dialog_closable` | **服务端强制改写为 1（可关闭）**。3.0.7 及以前的老 APK 不认识 `terms_version`，会把声明当普通开屏公告；若不可关闭，那个弹窗点「我知道了」执行的是 `exitApp()`，用户点一下 App 直接退出。新版客户端（PC / uniappx）本来就不走那条路，对这个值是零依赖 |
 | `title` / `content` | 标题与正文；`content` 是富文本，客户端用 `lib/richText` 白名单渲染（**不走 `innerHTML`**），`script`/`iframe`/`style` 与行内事件会被过滤，外链只放行 `http(s)` 并走 `ipc.openExternalUrl` |
 
 为什么不新增 `scene` 常量来标记：`scene` 被服务端 `NotifyEventRegistry.isFeedbackReply()`
@@ -771,15 +772,21 @@ Apache-2.0 + 补充条款，**见到以本项目名义收费的版本即不是�
 没下发不弹 / 接口挂了不弹 / 重看要重新读秒且不写标记 / 重看取不到声明返回 false /
 外链走系统浏览器 / 公告弹窗排除声明 / `pickDisclaimer` 筛选与兜底 /
 `disclaimerVisible` 三条）。
-后端口径由 `astral-plugin` 的 `FeedbackNoticeDisclaimerFieldsTest`（9 条）守着：
+后端口径由 `astral-plugin` 的 `FeedbackNoticeDisclaimerFieldsTest`（12 条）守着：
 编辑时两列必须写进白名单、清空要真的落 NULL 而不是被 `updateStrategy=NOT_NULL` 跳过、
-读秒在新增与编辑两条路径上都被夹进 0..60、免责声明的渠道被强制改成桌面三端
-（普通公告的渠道原样保留）。
+读秒在新增与编辑两条路径上都被夹进 0..60、免责声明的渠道被强制改成 App 六端、
+声明的 `dialog_closable` 被强制顶回 1（这两条新增与编辑两条路径都验；普通公告的
+渠道与 `dialog_closable` 都原样保留）。
 
 后端要发的这条声明怎么填，见后台「消息管理」页的**「免责声明」按钮**：它会把
-标题、开屏位、桌面三端渠道、`dialogClosable=0`、`readSeconds=3`、`termsVersion`
+标题、开屏位、App 六端渠道、`dialogClosable=1`、`readSeconds=3`、`termsVersion`
 与三段正文一次填好，运营改完再点发布。模板正文写在 `astral-front` 的
 `NoticeManagement.tsx` 的 `DISCLAIMER_TEMPLATE`，与本节口径同源。
+
+移动端（`qt-uniappx`）的实现见其 `stores/disclaimer.ts` 与
+`uni_modules/qt-ui/components/qt-first-run-disclaimer/`：判定判据与本端同构
+（开屏位 + `termsVersion` 非空），存储介质是 uni storage 而不是 SQLite，
+接受记录键为 `qt-disclaimer-accepted`。两侧共用同一套后端口径，改任一侧都要回头看另一侧。
 
 ---
 
