@@ -1080,10 +1080,12 @@ export interface SourceQrSession {
   expiresInSec: number;
 }
 
-/** 扫码轮询状态机（confirmed 时带凭据与账号信息，其余状态只有 status） */
+/** 扫码轮询状态机（confirmed 时带凭据与账号信息，其余状态只有 status；
+ *  v17 起 bili 扫码确认会随 credential 下发 refresh_token——官方 cookie
+ *  刷新协议的凭据副键，调用方落库时并入 extras 持久化） */
 export type SourceQrPoll =
   | { status: "waiting" | "scanned" | "expired" }
-  | { status: "confirmed"; cookie: string; user: SourceAuthUser };
+  | { status: "confirmed"; cookie: string; user: SourceAuthUser; refreshToken?: string };
 
 /** 凭据注入的面：meta = 数据请求（搜索/歌词等），play = 播放/取链请求 */
 export type SourceAuthScope = "meta" | "play";
@@ -1188,7 +1190,7 @@ export async function authQrCreate(source: SourceId): Promise<SourceQrSession> {
 /** 扫码轮询（宿主 2s 一次；confirmed 后由调用方落存储并注入） */
 export async function authQrPoll(source: SourceId, key: string): Promise<SourceQrPoll> {
   return authCall("authQrPoll", async () => {
-    const raw = await sourceCall<{ status?: string; credential?: { cookie?: unknown }; user?: Record<string, unknown> }>(
+    const raw = await sourceCall<{ status?: string; credential?: { cookie?: unknown; refresh_token?: unknown }; user?: Record<string, unknown> }>(
       "authQrPoll",
       { source, key },
       (p) => (typeof p.status === "string" ? p : undefined),
@@ -1201,11 +1203,15 @@ export async function authQrPoll(source: SourceId, key: string): Promise<SourceQ
       return { status: "expired" };
     }
     const cookie = typeof raw.credential?.cookie === "string" ? raw.credential.cookie : "";
+    const refreshToken =
+      typeof raw.credential?.refresh_token === "string" && raw.credential.refresh_token.length > 0
+        ? raw.credential.refresh_token
+        : undefined;
     const user = normalizeAuthUser(raw.user);
     if (cookie.length === 0 || user === null) {
       return { status: "expired" };
     }
-    return { status: "confirmed", cookie, user };
+    return { status: "confirmed", cookie, user, ...(refreshToken !== undefined ? { refreshToken } : {}) };
   });
 }
 
@@ -1225,15 +1231,29 @@ export async function authImportCookie(
 
 /** 用 Cookie 查登录态（启动时验证已存凭据是否仍有效）。
  * credential 非空 = 包侧已用 refresh_key 轮换出新 cookie（QQ 短期
- * musickey 保活），调用方必须持久化新 cookie（saveSourceAuthAccount）。 */
+ * musickey 保活），调用方必须持久化新 cookie（saveSourceAuthAccount）。
+ * extras 是账号记录随登录保存的凭据副键（如 bili 的 refresh_token），
+ * 原样透传给包入口供 refreshCredential 使用；credential 里随行下发的
+ * refresh_token 提取为 refreshToken，调用方落库时一并持久化。 */
 export async function authCheckUser(
   source: SourceId,
   cookie: string,
-): Promise<{ ok: boolean; user: SourceAuthUser | null; credential: string | null }> {
+  extras?: Record<string, string>,
+): Promise<{
+  ok: boolean;
+  user: SourceAuthUser | null;
+  credential: string | null;
+  refreshToken?: string;
+}> {
   return authCall("authUser", () =>
-    sourceCall<{ ok: boolean; user: SourceAuthUser | null; credential: string | null }>(
+    sourceCall<{
+      ok: boolean;
+      user: SourceAuthUser | null;
+      credential: string | null;
+      refreshToken?: string;
+    }>(
       "authUser",
-      { source, cookie },
+      extras === undefined ? { source, cookie } : { source, cookie, extras },
       (p) => {
         if (typeof p.ok !== "boolean") return undefined;
         const credentialCookie = p.credential;
@@ -1244,10 +1264,18 @@ export async function authCheckUser(
           (credentialCookie as { cookie: string }).cookie.length > 0
             ? (credentialCookie as { cookie: string }).cookie
             : null;
+        const refreshToken =
+          credentialCookie != null &&
+          typeof credentialCookie === "object" &&
+          typeof (credentialCookie as { refresh_token?: unknown }).refresh_token === "string" &&
+          (credentialCookie as { refresh_token: string }).refresh_token.length > 0
+            ? (credentialCookie as { refresh_token: string }).refresh_token
+            : undefined;
         return {
           ok: p.ok,
           user: normalizeAuthUser(p.user),
           credential,
+          ...(refreshToken !== undefined ? { refreshToken } : {}),
         };
       },
     ),

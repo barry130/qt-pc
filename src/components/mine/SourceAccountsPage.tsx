@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { stripErrorUrls } from "@/lib/utils";
 import {
+  mergeCredentialExtras,
   readSourceAuthAccounts,
   readSourceAuthAccountsSync,
   readSourceAuthTogglesFor,
@@ -20,6 +21,7 @@ import {
   authSendSms,
   type SourceAuthUser,
 } from "@/source-scripts";
+import { runWebLoginFlow } from "@/lib/source-web-login";
 import { toast, toastError } from "@/stores/toast";
 import { sourceQualityOptionsOf, useSourceRegistryStore } from "@/stores/sourceRegistry";
 import { qualityOptionsFromRegistry } from "@/lib/quality";
@@ -57,8 +59,17 @@ import type { Quality } from "@/types";
  */
 
 /** 一张卡片要展示的源：methods 空数组 = 当前数据包不再声明该源可登录
- *  （只剩已存账号的展示与退出，不给登录入口） */
-type SourceCard = { id: string; name: string; methods: string[] };
+ *  （只剩已存账号的展示与退出，不给登录入口）；例外是 webLogin（v17 契约）：
+ *  数据包声明了网页登录时，methods 为空也显示「网页登录」入口 */
+type SourceCard = {
+  id: string;
+  name: string;
+  methods: string[];
+  /** 数据包 auth.webLogin 声明（存在 = 显示网页登录按钮；note 作悬浮提示） */
+  webLogin?: { url: string; cookieMarkers: string[]; note?: string; captureUrls?: string[] };
+  /** 该源 auth.domains：旧包未下发 captureUrls 时回退拼接捕获地址用 */
+  domains: string[];
+};
 
 function Switch(props: { checked: boolean; onToggle: () => void; disabled?: boolean }): React.JSX.Element {
   return (
@@ -126,6 +137,8 @@ export function SourceAccountsPage(): React.JSX.Element {
   const [pwdBusy, setPwdBusy] = useState(false);
   /** 退出两击确认（与卸载音源包同款，防误点掉凭据） */
   const [armedLogout, setArmedLogout] = useState<string | null>(null);
+  /** 网页登录进行中的源（v17 契约）：期间禁用全部网页登录按钮（登录窗互斥） */
+  const [webLoginBusy, setWebLoginBusy] = useState<string | null>(null);
 
   /** 卡片清单（2026-10-25 用户需求「全平台写入音源账号」）：注册表全部源按展示
    *  顺序——登录行仍按 auth.methods 门控（kg/migu 无登录接口不渲染登录区），
@@ -136,10 +149,12 @@ export function SourceAccountsPage(): React.JSX.Element {
       id: s.id,
       name: s.name,
       methods: s.auth?.methods ?? [],
+      webLogin: s.auth?.webLogin,
+      domains: s.auth?.domains ?? [],
     })),
     ...Object.keys(accounts)
       .filter((id) => !sources.some((s) => s.id === id))
-      .map((id) => ({ id, name: id, methods: [] })),
+      .map((id) => ({ id, name: id, methods: [], domains: [] })),
   ];
 
   useEffect(() => {
@@ -158,12 +173,16 @@ export function SourceAccountsPage(): React.JSX.Element {
       setQualityTick((t) => t + 1);
       // 已存凭据有效性：失效只标记不打扰（凭据保留，用户可选择重新登录）。
       // credential 非空 = 包侧已用 refresh_key 轮换出新 cookie（QQ 短期
-      // musickey 保活），落库更新让官方线路/后续校验拿到新 keyst。
+      // musickey 保活），落库更新让官方线路/后续校验拿到新 keyst；轮换应答
+      // 随行下发的 refresh_token（bili 等源）并入 extras 一并落库。
       for (const [source, account] of Object.entries(acc)) {
-        authCheckUser(source, account.cookie)
+        authCheckUser(source, account.cookie, account.extras)
           .then((r) => {
             if (r.credential !== null && r.user !== null) {
-              void saveSourceAuthAccount(source, r.credential, r.user).catch(() => undefined);
+              const extras = mergeCredentialExtras(account.extras, r.refreshToken);
+              void saveSourceAuthAccount(source, r.credential, r.user, extras).catch(
+                () => undefined,
+              );
             }
             setStale((prev) => ({ ...prev, [source]: !r.ok }));
           })
@@ -215,6 +234,40 @@ export function SourceAccountsPage(): React.JSX.Element {
       .finally(() => setQrBusy(false));
   };
 
+  /** 网页登录（v17 契约 auth.webLogin）：打开官方登录窗，宿主按节奏轮询读
+   *  Cookie（含 httpOnly，走 Rust source_web_login_capture），命中 marker 后
+   *  authImportCookie 校验并 saveSourceAuthAccount 入库、自动关窗——全部在
+   *  runWebLoginFlow 内完成；这里按三态结果用既有 toast 模式反馈。 */
+  const startWebLogin = (item: SourceCard): void => {
+    if (!item.webLogin || webLoginBusy !== null) return;
+    setWebLoginBusy(item.id);
+    runWebLoginFlow({ source: item.id, webLogin: item.webLogin, domains: item.domains })
+      .then(async (outcome) => {
+        if (outcome === "timeout") {
+          toast("网页登录超时，请重试");
+          return;
+        }
+        if (outcome === "cancelled") {
+          toast("网页登录已取消");
+          return;
+        }
+        // ok：与扫码/短信/密码登录同款提示（用户信息从已入库账号取）
+        const acc = readSourceAuthAccountsSync()[item.id];
+        const tg = await readSourceAuthTogglesFor(item.id);
+        setToggles((prev) => ({ ...prev, [item.id]: tg }));
+        if (acc) {
+          toast(`已登录${acc.user.nickname}（${acc.user.vip ? acc.user.vipLabel || "会员" : "非会员"}）`);
+        }
+      })
+      .catch((e) => {
+        toastError(`网页登录失败：${stripErrorUrls(String(e))}`);
+      })
+      .finally(() => {
+        setWebLoginBusy(null);
+        refreshAccounts();
+      });
+  };
+
   // 轮询按「会话 key」起停：状态更新不改依赖，只有换二维码/关弹窗才重置间隔
   const qrKey = qr?.key;
   const qrSource = qr?.source;
@@ -226,7 +279,15 @@ export function SourceAccountsPage(): React.JSX.Element {
         .then((r) => {
           if (cancelled) return;
           if (r.status === "confirmed") {
-            void saveSourceAuthAccount(qrSource, r.cookie, r.user)
+            // v17 起 bili 扫码确认会随 credential 下发 refresh_token（官方
+            // cookie 刷新协议的凭据副键）：落库时并入 extras；其他源无此键
+            // 合并结果为空，记录形状与旧版一致
+            void saveSourceAuthAccount(
+              qrSource,
+              r.cookie,
+              r.user,
+              mergeCredentialExtras(undefined, r.refreshToken),
+            )
               .then(async () => {
                 const tg = await readSourceAuthTogglesFor(qrSource);
                 setToggles((prev) => ({ ...prev, [qrSource]: tg }));
@@ -271,7 +332,8 @@ export function SourceAccountsPage(): React.JSX.Element {
           toast("Cookie 无效或已过期，请检查后重试");
           return;
         }
-        return saveSourceAuthAccount(source, text, user).then(async () => {
+        // 导入的是用户手贴的 Cookie：无凭据副键，extras 留空由后台保活补齐
+        return saveSourceAuthAccount(source, text, user, undefined).then(async () => {
           const tg = await readSourceAuthTogglesFor(source);
           setToggles((prev) => ({ ...prev, [source]: tg }));
           refreshAccounts();
@@ -287,9 +349,10 @@ export function SourceAccountsPage(): React.JSX.Element {
       .finally(() => setImporting(false));
   };
 
-  /** 短信/密码登录成功的公共落库路径（与扫码 confirmed 同流程） */
+  /** 短信/密码登录成功的公共落库路径（与扫码 confirmed 同流程）。
+   *  短信/密码应答同样暂无凭据副键，extras 留空由后台保活轮换时补齐。 */
   const finishLogin = (source: string, cookie: string, user: SourceAuthUser): Promise<void> =>
-    saveSourceAuthAccount(source, cookie, user).then(async () => {
+    saveSourceAuthAccount(source, cookie, user, undefined).then(async () => {
       const tg = await readSourceAuthTogglesFor(source);
       setToggles((prev) => ({ ...prev, [source]: tg }));
       refreshAccounts();
@@ -455,7 +518,7 @@ export function SourceAccountsPage(): React.JSX.Element {
                           </button>
                         )}
                       </span>
-                    ) : item.methods.length > 0 ? (
+                    ) : item.methods.length > 0 || item.webLogin ? (
                       <span className="flex shrink-0 items-center gap-1.5">
                         {item.methods.includes("qrcode") ? (
                           <button
@@ -503,6 +566,17 @@ export function SourceAccountsPage(): React.JSX.Element {
                             className="rounded-md border border-border px-2 py-1 text-xs hover:bg-accent"
                           >
                             密码登录
+                          </button>
+                        ) : null}
+                        {item.webLogin ? (
+                          <button
+                            type="button"
+                            title={item.webLogin.note || "打开官方登录页完成登录，宿主自动读取登录态"}
+                            onClick={() => startWebLogin(item)}
+                            disabled={webLoginBusy !== null}
+                            className="rounded-md border border-border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
+                          >
+                            {webLoginBusy === item.id ? "登录中…" : "网页登录"}
                           </button>
                         ) : null}
                       </span>

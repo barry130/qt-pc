@@ -476,6 +476,15 @@ export interface RegistrySource {
      * 缺省 = 通用文案。
      */
     qrHint?: string;
+    /**
+     * 网页登录（v17 契约；数据包 auth 自述下发）：宿主内嵌 WebView 打开
+     * url（官方登录页），用户走官方方式登录，宿主轮询 captureUrls（缺省回退
+     * 按 domains 拼 https://{domain}/）读 Cookie（含 httpOnly，走 Rust
+     * source_web_login_capture），命中任一 cookieMarkers 就走
+     * authImportCookie 校验并入库（校验才是权威，marker 只决定何时开始试）。
+     * 未声明（旧包）= 不显示网页登录入口。
+     */
+    webLogin?: { url: string; cookieMarkers: string[]; note?: string; captureUrls?: string[] };
   };
 }
 

@@ -24,6 +24,7 @@ import {
   SOURCE_AUTH_USE_PLAY_KEY,
 } from "@/lib/storageKeys";
 import {
+  authCheckUser,
   authClearCredential,
   authSetCredential,
   type SourceAuthScope,
@@ -38,6 +39,10 @@ export interface SourceAuthAccount {
   user: SourceAuthUser;
   /** ISO 时间：排障用（「我什么时候登的」），不参与任何逻辑判断 */
   savedAt: string;
+  /** 登录/轮换时随 credential 下发的凭据副键（键名沿用包侧应答字段，
+   * 如 bili 的 refresh_token）。校验时原样透传回包入口供 refreshCredential
+   * 使用。缺省 = 旧记录或该源无副键，向后兼容。 */
+  extras?: Record<string, string>;
 }
 
 type SourceAuthAccounts = Record<string, SourceAuthAccount>;
@@ -65,7 +70,7 @@ export function parseSourceAuthAccounts(raw: string | null | undefined): SourceA
     if (account.user === null || typeof account.user !== "object") continue;
     const user = account.user as Record<string, unknown>;
     if (typeof user.nickname !== "string" || user.nickname.length === 0) continue;
-    out[source] = {
+    const record: SourceAuthAccount = {
       cookie: account.cookie,
       user: {
         id: typeof user.id === "string" ? user.id : String(user.id ?? ""),
@@ -76,6 +81,15 @@ export function parseSourceAuthAccounts(raw: string | null | undefined): SourceA
       },
       savedAt: typeof account.savedAt === "string" ? account.savedAt : new Date().toISOString(),
     };
+    // extras（凭据副键）：只收字符串值，一条坏键不拖垮整条记录；全空视为无
+    if (account.extras !== null && typeof account.extras === "object" && !Array.isArray(account.extras)) {
+      const extras: Record<string, string> = {};
+      for (const [key, value] of Object.entries(account.extras as Record<string, unknown>)) {
+        if (typeof value === "string" && value.length > 0) extras[key] = value;
+      }
+      if (Object.keys(extras).length > 0) record.extras = extras;
+    }
+    out[source] = record;
   }
   return out;
 }
@@ -189,14 +203,22 @@ export async function readSourceAuthTogglesFor(source: string): Promise<SourceAu
 }
 
 /** 保存/覆盖一个源的登录：落库 + 该源开关未物化时按解析链初始化（旧全局值
- * 优先继承，避免升级后新登录的源绕过用户已调过的全局关闭）+ 立即注入该源。 */
+ * 优先继承，避免升级后新登录的源绕过用户已调过的全局关闭）+ 立即注入该源。
+ * extras 为登录/轮换时随 credential 下发的凭据副键（如 bili refresh_token）；
+ * 缺省/空表不写 extras 键，账号记录形状与旧版本保持一致。 */
 export async function saveSourceAuthAccount(
   source: string,
   cookie: string,
   user: SourceAuthUser,
+  extras?: Record<string, string>,
 ): Promise<void> {
   const accounts = { ...(await readSourceAuthAccounts()) };
-  accounts[source] = { cookie, user, savedAt: new Date().toISOString() };
+  accounts[source] = {
+    cookie,
+    user,
+    savedAt: new Date().toISOString(),
+    ...(extras !== undefined && Object.keys(extras).length > 0 ? { extras } : {}),
+  };
   const map = { ...(await readTogglesMap()) };
   if (map[source] === undefined) {
     // 刚登录成功：该源必有账号，走登录态缺省（旧全局继承→双开）
@@ -221,6 +243,72 @@ export async function removeSourceAuthAccount(source: string): Promise<void> {
     // 引擎未就绪/旧包没有入口：内存副本随下次注入自然对齐（库里已删）
   }
   emitPlayLoginChanged();
+}
+
+// ---------- 后台保活（定时校验 + 凭据轮换） ----------
+
+/** 轮换落库时的 extras 合并：旧键保留（包侧可能还带别的副键），refresh_token
+ * 有新值则覆盖；空值键一律剔除、全空 → undefined（与账号解析侧口径一致：
+ * 记录形状与旧版本一致，不写空对象/空值键）。 */
+export function mergeCredentialExtras(
+  prev: Record<string, string> | undefined,
+  refreshToken?: string,
+): Record<string, string> | undefined {
+  const next: Record<string, string> = {};
+  for (const [key, value] of Object.entries(prev ?? {})) {
+    if (value.length > 0) next[key] = value;
+  }
+  if (refreshToken !== undefined && refreshToken.length > 0) {
+    next.refresh_token = refreshToken;
+  }
+  return Object.keys(next).length > 0 ? next : undefined;
+}
+
+/** 进行中的全量保活（模块级锁：后台定时器与音源账号页同时触发只跑一轮，
+ * 进行中的调用复用同一个 Promise，拿到同一份统计结果） */
+let keepaliveInFlight: Promise<{ checked: number; rotated: number }> | null = null;
+
+/**
+ * 全量校验 + 凭据轮换（后台保活主流程，useSourceAuthKeepalive 触发）：
+ * 逐源用已存凭据（连同 extras 副键，如 bili 的 refresh_token）查登录态；
+ * 包侧轮换出新 cookie 时经 saveSourceAuthAccount 落库（引擎内存副本随保存
+ * 同步注入），其余情况跳过不动：
+ * - 未轮换（credential 为空）：凭据仍有效，不写库；
+ * - ok:false（凭据失效）：跳过且**不删账号**——绝不自动退出，账号页会标
+ *   「凭据已过期」引导用户自行重新登录；
+ * - 单源失败（网络/旧包缺入口）只记 warn，不影响其余源。
+ * 返回 { checked, rotated } 简单统计（checked = 尝试的源数）。
+ */
+export function refreshAllSourceAccounts(
+  reason?: string,
+): Promise<{ checked: number; rotated: number }> {
+  if (keepaliveInFlight !== null) return keepaliveInFlight;
+  const round = (async () => {
+    const accounts = await readSourceAuthAccounts();
+    const sources = Object.keys(accounts);
+    let rotated = 0;
+    for (const source of sources) {
+      const account = accounts[source];
+      try {
+        const r = await authCheckUser(source, account.cookie, account.extras);
+        if (!r.ok || r.credential === null) continue; // 失效跳过不删 / 未轮换跳过不写
+        const extras = mergeCredentialExtras(account.extras, r.refreshToken);
+        await saveSourceAuthAccount(source, r.credential, r.user ?? account.user, extras);
+        rotated += 1;
+      } catch (err) {
+        console.warn(
+          `[source-auth] 后台保活校验失败${reason ? `（${reason}）` : ""}：${source}`,
+          err,
+        );
+      }
+    }
+    return { checked: sources.length, rotated };
+  })();
+  void round.catch(() => undefined); // 拒绝由调用方消化，锁自身不告警
+  keepaliveInFlight = round.finally(() => {
+    keepaliveInFlight = null;
+  });
+  return keepaliveInFlight;
 }
 
 /** 切换一个源的一面开关并立即生效：先把该源在解析链上的生效值物化进表

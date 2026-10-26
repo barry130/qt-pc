@@ -1120,6 +1120,27 @@ export async function sourceUninstallPack(packId: string): Promise<unknown> {
   return invoke("source_uninstall_pack", { packId });
 }
 
+// ---------- 音源账号网页登录（v17 契约 auth.webLogin；Rust 侧 web_login.rs） ----------
+
+/** 打开（或重建）音源官方登录窗口（label = qt-source-web-login，480×640 居中） */
+export async function sourceWebLoginOpen(url: string): Promise<void> {
+  return invoke("source_web_login_open", { url });
+}
+
+/**
+ * 逐 URL 读取登录窗口 Cookie（含 httpOnly/secure）：每个 URL 拼
+ * `name=value; name2=v2` 字符串；窗口不存在返回 []。
+ * 注意：Rust 侧必须 async command（Windows 上同步调用 cookies_for_url 会死锁）。
+ */
+export async function sourceWebLoginCapture(urls: string[]): Promise<string[]> {
+  return invoke("source_web_login_capture", { urls });
+}
+
+/** 关闭并销毁登录窗口（不存在则忽略） */
+export async function sourceWebLoginClose(): Promise<void> {
+  return invoke("source_web_login_close");
+}
+
 /**
  * 发邮箱验证码。
  *

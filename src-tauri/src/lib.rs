@@ -53,6 +53,8 @@ pub mod source_pack_header;
 pub mod source_window;
 pub mod taskbar;
 pub mod tray;
+/// 音源账号网页登录（v17 契约 auth.webLogin：官方登录页 + Cookie 捕获）
+pub mod web_login;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -463,6 +465,9 @@ pub fn run() {
             source_install::cmd_source_meta_load_failed,
             source_install::cmd_source_report,
             source_install::cmd_source_engine_log,
+            web_login::source_web_login_open,
+            web_login::source_web_login_capture,
+            web_login::source_web_login_close,
             cmd_play_track,
             cmd_play_queue,
             cmd_set_default_quality,

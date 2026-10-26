@@ -19,6 +19,7 @@ import { useLocalTrackOnlineMeta } from "@/hooks/useLocalTrackOnlineMeta";
 import { useExternalOpen } from "@/hooks/useExternalOpen";
 import { useUpdateCheck } from "@/hooks/useUpdateCheck";
 import { useSourceUpdateCheck } from "@/hooks/useSourceUpdateCheck";
+import { useSourceAuthKeepalive } from "@/hooks/useSourceAuthKeepalive";
 import { PlayPackPrompt } from "@/components/PlayPackPrompt";
 import { SourceUpdatePrompt } from "@/components/SourceUpdatePrompt";
 import { MetaPackGuide } from "@/components/MetaPackGuide";
@@ -70,6 +71,8 @@ export function AppShell(): React.JSX.Element {
   useUpdateCheck();
   // 播放音源包启动静默检查（只更新已装的官方包；未安装时不打扰）
   useSourceUpdateCheck();
+  // 音源账号后台保活：启动 20s 后首检 + 每 6h 校验/轮换已登录凭据（静默）
+  useSourceAuthKeepalive();
   // 音源/音质注册表：数据包声明的清单是所有音源选项的唯一来源，启动拉一次
   // （幂等；引擎未就绪时保持未加载，后续 ensure/refresh 会再试）
   const ensureRegistry = useSourceRegistryStore((s) => s.ensure);
