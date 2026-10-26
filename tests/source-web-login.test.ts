@@ -5,7 +5,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // 顶层 import 的三个依赖模块按仓库测试惯例 mock 掉（全注入时不触默认实现）
-vi.mock("@/services/ipc", () => ({ sourceWebLoginOpen: vi.fn(), sourceWebLoginCapture: vi.fn(), sourceWebLoginClose: vi.fn() }));
+vi.mock("@/services/ipc", () => ({ sourceWebLoginOpen: vi.fn(), sourceWebLoginCapture: vi.fn(), sourceWebLoginClose: vi.fn(), sourceWebLoginDebugDump: vi.fn().mockResolvedValue("C:/temp/qt-weblogin-debug.txt") }));
 vi.mock("@/source-scripts", () => ({ authImportCookie: vi.fn() }));
 vi.mock("@/lib/source-auth", () => ({ saveSourceAuthAccount: vi.fn() }));
 
@@ -25,6 +25,7 @@ function makeDeps() {
     validateImport: vi.fn().mockResolvedValue({ ok: false, user: null }),
     save: vi.fn().mockResolvedValue(undefined),
     closeWindow: vi.fn().mockResolvedValue(undefined),
+    debugDump: vi.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -141,9 +142,8 @@ describe("runWebLoginFlow", () => {
     expect(outcome).toBe("timeout");
     const retry = onProgress.mock.calls.filter(([m]) => String(m).includes("校验未通过，继续重试"));
     expect(retry.length).toBe(1); // 重试提示只发一次，不刷屏
-    // 诊断名单只含 Cookie 名（不含值），能看出登录态主体在不在 jar 里
-    expect(String(retry[0]![0])).toContain("qm_keyst");
-    expect(String(retry[0]![0])).not.toContain("AAA");
+    // 诊断两件套：Cookie 原文落本地调试文件（只落本机）+ toast 报名摘要
+    expect(deps.debugDump).toHaveBeenCalledWith("qm_keyst=AAA");
     const last = String(onProgress.mock.calls.at(-1)![0]);
     expect(last).toContain("已捕获官方 Cookie"); // 超时原因区分「抓到了」
   });

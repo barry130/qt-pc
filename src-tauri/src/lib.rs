@@ -468,6 +468,7 @@ pub fn run() {
             web_login::source_web_login_open,
             web_login::source_web_login_capture,
             web_login::source_web_login_close,
+            web_login::source_web_login_debug_dump,
             cmd_play_track,
             cmd_play_queue,
             cmd_set_default_quality,

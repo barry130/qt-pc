@@ -46,6 +46,12 @@ export interface WebLoginDeps {
    * ② 超时收摊前的具体原因（捕获到 Cookie 校验不过 / 压根没捕获到）。
    */
   onProgress?(msg: string): void;
+  /**
+   * 诊断（可选）：校验失败时把捕获 Cookie 原文落到本地临时文件
+   * （%TEMP%/qt-weblogin-debug.txt，只落本机不上传），供开发者用真实
+   * 凭据离线复现官方校验失败原因。
+   */
+  debugDump?(cookie: string): Promise<void>;
 }
 
 /** runWebLoginFlow 的入参：源 id + 数据包下发的 webLogin 声明 */
@@ -105,7 +111,7 @@ function captureUrlsOf(args: WebLoginArgs): string[] {
 /** 默认依赖：接 ipc 与现有校验/入库入口 */
 function defaultDeps(): Pick<
   WebLoginDeps,
-  "openWindow" | "capture" | "validateImport" | "save" | "closeWindow"
+  "openWindow" | "capture" | "validateImport" | "save" | "closeWindow" | "debugDump"
 > {
   return {
     openWindow: (url) => ipc.sourceWebLoginOpen(url),
@@ -113,6 +119,7 @@ function defaultDeps(): Pick<
     validateImport: (source, cookie) => authImportCookie(source, cookie),
     save: (source, cookie, user) => saveSourceAuthAccount(source, cookie, user),
     closeWindow: () => ipc.sourceWebLoginClose(),
+    debugDump: (cookie) => ipc.sourceWebLoginDebugDump(cookie).then(() => undefined),
   };
 }
 
@@ -164,11 +171,14 @@ export async function runWebLoginFlow(
         }
         if (!failNotified) {
           failNotified = true;
-          // 诊断信息只带 Cookie 名单（绝不带值），全量展示不截断：帮助区分
-          // 「jar 里缺登录态主体」还是「主体在但官方校验拒识」
+          // 诊断两件套：① Cookie 原文落本地临时文件（%TEMP%/qt-weblogin-debug.txt，
+          // 只落本机），开发者可拿真实凭据离线复现官方拒识原因；② toast 报名
+          // 单摘要（toast 面积有限，只报前几项，完整名单在调试文件里）
+          void deps.debugDump?.(cookie).catch(() => undefined);
           const names = [...new Set(cookie.split(";").map((p) => p.trim().split("=")[0] ?? "").filter((n) => n.length > 0))];
+          const shown = names.slice(0, 6).join(", ") + (names.length > 6 ? ` 等 ${names.length} 项` : "");
           deps.onProgress?.(
-            `已捕获官方登录 Cookie（${names.length} 项：${names.join(", ")}），但校验未通过，继续重试…（若一直失败请改用扫码登录或导入 Cookie）`,
+            `已捕获官方登录 Cookie（${shown}）但校验未通过，继续重试…完整名单已存 %TEMP%\\qt-weblogin-debug.txt（若一直失败请改用扫码登录或导入 Cookie）`,
           );
         }
       }

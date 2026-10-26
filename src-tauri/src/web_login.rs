@@ -98,6 +98,17 @@ pub async fn source_web_login_close(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// 诊断用：把校验失败时的捕获 Cookie 原文写到本地临时文件（只落本机磁盘，
+/// 不上传），供开发者在同一台机器上用真实凭据离线复现官方校验失败原因。
+/// 返回写入的文件路径。
+#[tauri::command]
+pub async fn source_web_login_debug_dump(cookie: String) -> Result<String, String> {
+    let path = std::env::temp_dir().join("qt-weblogin-debug.txt");
+    std::fs::write(&path, cookie.as_bytes())
+        .map_err(|e| format!("写调试文件失败 {}: {e}", path.display()))?;
+    Ok(path.display().to_string())
+}
+
 /// 建登录窗（只在主线程调用）：约 480×640、居中、可缩放的常规窗口。
 fn build_login_window(app: &AppHandle, url: tauri::Url) -> Result<(), String> {
     WebviewWindowBuilder::new(app, WEB_LOGIN_LABEL, WebviewUrl::External(url))

@@ -1145,6 +1145,14 @@ export async function sourceWebLoginClose(): Promise<void> {
 }
 
 /**
+ * 诊断用：把校验失败时的捕获 Cookie 写到本地临时文件
+ * （%TEMP%/qt-weblogin-debug.txt），只落本机，供开发者离线复现校验失败原因。
+ */
+export async function sourceWebLoginDebugDump(cookie: string): Promise<string> {
+  return invoke("source_web_login_debug_dump", { cookie });
+}
+
+/**
  * 发邮箱验证码。
  *
  * 邮件模板业务标识（scene）由 Rust 侧持有，前端不传：后端把它**同时**当模板编码
