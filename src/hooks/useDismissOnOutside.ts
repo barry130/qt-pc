@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 
 /**
  * 弹出层通用收起逻辑：点外面 / Esc 收起。
@@ -15,13 +15,20 @@ export function useDismissOnOutside(
   open: boolean,
   onClose: () => void,
 ): void {
+  // onClose 走 ref：调用方普遍传内联箭头，若进 deps，弹层打开期间父组件每次
+  // 渲染都会重挂 window 监听（清理虽正确，但纯属无谓开销）。
+  const onCloseRef = useRef(onClose);
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
   useEffect(() => {
     if (!open) return;
     const onDown = (e: MouseEvent): void => {
-      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
+      if (ref.current && !ref.current.contains(e.target as Node)) onCloseRef.current();
     };
     const onKey = (e: KeyboardEvent): void => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") onCloseRef.current();
     };
     window.addEventListener("mousedown", onDown);
     window.addEventListener("keydown", onKey);
@@ -29,5 +36,5 @@ export function useDismissOnOutside(
       window.removeEventListener("mousedown", onDown);
       window.removeEventListener("keydown", onKey);
     };
-  }, [ref, open, onClose]);
+  }, [ref, open]);
 }

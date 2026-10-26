@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowUp,
   Check,
+  Info,
   Loader2,
   MessageSquarePlus,
   PanelLeftClose,
@@ -13,12 +14,27 @@ import {
 import { useAiChat } from "@/hooks/useAiChat";
 import type { AiAction } from "@/lib/ai";
 import { statusText } from "@/lib/ai";
+import type { AiEngineMode } from "@/lib/ai-mode";
 import { errMsg, cn } from "@/lib/utils";
 import { toastError, toastSuccess } from "@/stores/toast";
 import { usePlayerStore } from "@/stores/player";
 import * as ipc from "@/services/ipc";
 import type { Track } from "@/types";
 import { MessageBubble } from "./MessageBubble";
+
+/** 顶栏副标题：说清这一轮的歌是怎么挑出来的（三种全局模式各一句） */
+const MODE_SUBTITLE: Record<AiEngineMode, string> = {
+  rule: "按关键词规则选歌，不联网、不调模型",
+  local: "本机模型在已搜好的候选里挑歌，歌单与播放都在本机完成",
+  server: "说一句想听什么，我来找歌并介绍；歌单与播放都在本机完成",
+};
+
+/** 底部脚注：说清回答是谁生成的，免得把规则输出当成模型输出 */
+const MODE_FOOTNOTE: Record<AiEngineMode, string> = {
+  rule: "回答由本地规则生成，推荐结果请以自己的听感为准。",
+  local: "回答由本机模型生成，推荐结果请以自己的听感为准。",
+  server: "回答由后台配置的智能体生成，推荐结果请以自己的听感为准。",
+};
 
 /**
  * 音乐助手页（路由 `/ai-assistant`，侧边栏「音乐助手」）。
@@ -30,6 +46,16 @@ import { MessageBubble } from "./MessageBubble";
  * 没有自己实现任何「理解」逻辑：意图、排序、推荐理由全在后端智能体里，
  * 本页只负责三件事 —— 把用户的话送上去、把事件折成气泡、把动作变成播放。
  * 这样后台换 Prompt / 换模型 / 换工具，这一页一行都不用改。
+ *
+ * ---------------------------------------------------------------------------
+ * 三种全局 AI 模式（设置 → AI，存储键 `dailyRecommend.mode`）
+ * ---------------------------------------------------------------------------
+ * 这个页面以前固定走 astral 服务端，现在跟着全局模式走（`chat.mode`）：
+ * - `server`：原样，会话列表 + agentCode 徽标 + 可切换会话；
+ * - 会话列表三种模式都渲染：server 走服务端会话，`rule` / `local` 走本地历史
+ *   （`@/lib/ai-assistant-history`，同一个 localStorage 键，切换模式后历史还在）。
+ *   只有 agentCode 徽标是 server 专属；顶栏副标题、底部脚注按模式换文案，并在错误条
+ *   下面挂一条模式横幅（只说明「现在是什么模式、去哪改」，不做按钮）。
  */
 export function AiAssistantPage(): React.JSX.Element {
   const chat = useAiChat({ agentCode: "music_assistant" });
@@ -38,6 +64,8 @@ export function AiAssistantPage(): React.JSX.Element {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const { init } = chat;
+  // server 模式才有服务端智能体：三个模式里只有它显示 agentCode 徽标
+  const serverMode = chat.mode === "server";
 
   useEffect(() => {
     void init();
@@ -93,54 +121,56 @@ export function AiAssistantPage(): React.JSX.Element {
 
   return (
     <div className="flex h-full min-w-0">
-      {/* 会话列表：桌面宽屏常驻，窄屏折叠 */}
-      <aside
-        className={cn(
-          "flex shrink-0 flex-col border-r border-border bg-card/30 transition-[width]",
-          historyOpen ? "w-[200px]" : "w-0 overflow-hidden border-r-0",
-        )}
-      >
-        <div className="flex items-center gap-1.5 px-2.5 py-2.5">
-          <span className="text-xs font-medium">会话</span>
-          <button
-            type="button"
-            title="新建对话"
-            aria-label="新建对话"
-            onClick={() => {
-              chat.newConversation();
-              setDraft("");
-            }}
-            className="ml-auto rounded p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
-          >
-            <MessageSquarePlus className="h-3.5 w-3.5" />
-          </button>
-        </div>
-        <div className="min-h-0 flex-1 overflow-y-auto px-1.5 pb-2">
-          {chat.conversations.length === 0 ? (
-            <div className="px-2 py-6 text-center text-[11px] text-muted-foreground">
-              还没有会话
-            </div>
-          ) : (
-            chat.conversations.map((item) => (
-              <ConversationRow
-                key={item.id}
-                active={item.id === chat.activeConversationId}
-                title={item.title.length > 0 ? item.title : "未命名会话"}
-                count={item.messageCount}
-                onSelect={() => void chat.selectConversation(item.id)}
-                onRemove={() => void chat.removeConversation(item.id)}
-              />
-            ))
+      {/* 历史对话：server 读服务端会话，rule / local 读本地历史；桌面宽屏常驻，窄屏折叠 */}
+      {(
+        <aside
+          className={cn(
+            "flex shrink-0 flex-col border-r border-border bg-card/30 transition-[width]",
+            historyOpen ? "w-[200px]" : "w-0 overflow-hidden border-r-0",
           )}
-        </div>
-      </aside>
+        >
+          <div className="flex items-center gap-1.5 px-2.5 py-2.5">
+            <span className="text-xs font-medium">历史对话</span>
+            <button
+              type="button"
+              title="新建对话"
+              aria-label="新建对话"
+              onClick={() => {
+                chat.newConversation();
+                setDraft("");
+              }}
+              className="ml-auto rounded p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+            >
+              <MessageSquarePlus className="h-3.5 w-3.5" />
+            </button>
+          </div>
+          <div className="min-h-0 flex-1 overflow-y-auto px-1.5 pb-2">
+            {chat.conversations.length === 0 ? (
+              <div className="px-2 py-6 text-center text-[11px] text-muted-foreground">
+                还没有对话
+              </div>
+            ) : (
+              chat.conversations.map((item) => (
+                <ConversationRow
+                  key={item.id}
+                  active={item.id === chat.activeConversationId}
+                  title={item.title.length > 0 ? item.title : "未命名会话"}
+                  count={item.messageCount}
+                  onSelect={() => void chat.selectConversation(item.id)}
+                  onRemove={() => void chat.removeConversation(item.id)}
+                />
+              ))
+            )}
+          </div>
+        </aside>
+      )}
 
       <div className="flex min-w-0 flex-1 flex-col">
         <div className="flex items-center gap-2 border-b border-border px-4 py-2.5">
           <button
             type="button"
-            title={historyOpen ? "收起会话列表" : "展开会话列表"}
-            aria-label={historyOpen ? "收起会话列表" : "展开会话列表"}
+            title={historyOpen ? "收起历史对话" : "展开历史对话"}
+            aria-label={historyOpen ? "收起历史对话" : "展开历史对话"}
             onClick={() => setHistoryOpen((v) => !v)}
             className="rounded p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
           >
@@ -156,12 +186,14 @@ export function AiAssistantPage(): React.JSX.Element {
               <span className="truncate text-sm font-semibold">{chat.agentName}</span>
             </div>
             <div className="truncate text-[11px] text-muted-foreground">
-              说一句想听什么，我来找歌并介绍；歌单与播放都在本机完成
+              {MODE_SUBTITLE[chat.mode]}
             </div>
           </div>
-          <span className="ml-auto shrink-0 rounded-full bg-secondary px-2 py-0.5 text-[10px] text-muted-foreground">
-            {chat.agent?.agentCode ?? "music_assistant"}
-          </span>
+          {serverMode ? (
+            <span className="ml-auto shrink-0 rounded-full bg-secondary px-2 py-0.5 text-[10px] text-muted-foreground">
+              {chat.agent?.agentCode ?? "music_assistant"}
+            </span>
+          ) : null}
         </div>
 
         {chat.error.length > 0 ? (
@@ -169,6 +201,17 @@ export function AiAssistantPage(): React.JSX.Element {
             {chat.error}
           </div>
         ) : null}
+
+        {serverMode ? null : (
+          <div
+            role="status"
+            className="mx-4 mt-2 flex items-center gap-1.5 rounded-lg border border-border bg-secondary/40 px-3 py-2 text-xs text-muted-foreground"
+          >
+            <Info className="h-3.5 w-3.5 shrink-0" />
+            <span className="min-w-0 flex-1">{chat.modeHint}</span>
+            <span className="shrink-0 text-[11px] opacity-70">设置 → AI 可切换</span>
+          </div>
+        )}
 
         <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
           <div className="mx-auto flex w-full max-w-3xl flex-col gap-4">
@@ -255,7 +298,7 @@ export function AiAssistantPage(): React.JSX.Element {
             )}
           </div>
           <div className="mx-auto mt-1.5 w-full max-w-3xl text-[10px] text-muted-foreground">
-            回答由后台配置的智能体生成，推荐结果请以自己的听感为准。
+            {MODE_FOOTNOTE[chat.mode]}
           </div>
         </div>
       </div>

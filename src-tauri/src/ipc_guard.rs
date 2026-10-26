@@ -56,6 +56,8 @@ pub(crate) const ENGINE_ALLOWED_COMMANDS: &[&str] = &[
     "source_meta_load_failed",
     // 上报取链结果（官方播放包健康度统计）
     "source_report",
+    // 包内诊断日志（QtHost.log → 本地文件日志；不上报）
+    "source_engine_log",
 ];
 
 /// 该窗口是否允许调用该命令。

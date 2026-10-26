@@ -1,6 +1,5 @@
-import { useState } from "react";
-import { ArrowLeft, Settings } from "lucide-react";
-import { Link, useRouter, useNavigate, useSearch } from "@tanstack/react-router";
+import { ArrowLeft, Search, Settings } from "lucide-react";
+import { Link, useRouter, useNavigate } from "@tanstack/react-router";
 import { useTitleBarDrag } from "@/hooks/useFramelessWindow";
 import { WindowControls } from "@/components/WindowControls";
 import { MusicSourceSwitcher } from "@/components/music-source/MusicSourceSwitcher";
@@ -8,23 +7,18 @@ import { MessagesPopover } from "@/components/mine/MessagesPopover";
 import { avatarUrl, displayName, useAuthStore } from "@/stores/auth";
 import { useAppearanceStore } from "@/stores/appearance";
 import { qtresCoverUrl } from "@/lib/lrc";
-import { parseSearchType } from "@/lib/search-params";
 import { cn } from "@/lib/utils";
 
 /**
  * 自定义标题栏（DESIGN §5.3）：
  * - 拖动区（按下即 startDragging）+ 双击最大化
- * - 返回 / Logo / 全局搜索框 / 音源切换器 / 消息中心·设置·账号 / 窗口控制
+ * - 返回 / Logo / 搜索入口（点击打开独立的搜索页）/ 音源切换器 / 消息中心·设置·账号 / 窗口控制
  * - 按钮区 stopPropagation 防止误触发拖动
  */
 export function TitleBar(): React.JSX.Element {
   const { ref, onDoubleClick } = useTitleBarDrag();
-  const [keyword, setKeyword] = useState("");
   const navigate = useNavigate();
   const router = useRouter();
-  // 已经在搜索页时保持当前页签：标题栏的搜索框是全局入口，不该把正停在
-  // 「歌单」页签的用户踢回歌曲列表（type 在 URL 里，见 lib/search-params.ts）
-  const currentType = useSearch({ strict: false }) as { type?: string };
   const session = useAuthStore((s) => s.session);
   const profile = useAuthStore((s) => s.profile);
   // 有背景图时标题栏底色半透明（见 --sidebar-surface），此时去掉 backdrop-blur-sm：
@@ -34,13 +28,16 @@ export function TitleBar(): React.JSX.Element {
   const avatar = avatarUrl(profile);
   const avatarSrc = avatar ? qtresCoverUrl(avatar) : null;
 
+  /**
+   * 标题栏不再自己收关键词：搜索是一个**独立页面**（/search，含搜索历史 /
+   * 热门搜索 / 热门歌单 / 结果页签），标题栏只做「打开它」的入口。
+   *
+   * 为什么不做成「标题栏输入 + 回车跳结果页」：那样输入框要重复实现一遍联想、
+   * 清空、防抖，而落地页（历史 + 热搜）只有整页才有地方摆 —— 用户点开搜索
+   * 却看到一张空列表，等于每次都在盲搜。
+   */
   const goSearch = (): void => {
-    const kw = keyword.trim();
-    if (!kw) return;
-    void navigate({
-      to: "/search",
-      search: { q: kw, type: parseSearchType(currentType.type) },
-    });
+    void navigate({ to: "/search", search: { q: "", type: "song" } });
   };
 
   return (
@@ -76,15 +73,18 @@ export function TitleBar(): React.JSX.Element {
         >
           <ArrowLeft className="h-4 w-4" />
         </button>
-        <input
-          value={keyword}
-          onChange={(e) => setKeyword(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") goSearch();
-          }}
-          placeholder="搜索歌曲 / 歌手 / 专辑 / 歌单"
-          className="h-7 w-full max-w-72 rounded-full border border-input bg-background px-3 text-xs outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
-        />
+        <button
+          type="button"
+          onClick={goSearch}
+          title="打开搜索页：搜索历史 · 热门搜索 · 热门歌单"
+          aria-label="搜索"
+          onMouseDown={(e) => e.stopPropagation()}
+          onDoubleClick={(e) => e.stopPropagation()}
+          className="flex h-7 w-full max-w-72 items-center gap-1.5 rounded-full border border-input bg-background px-3 text-xs text-muted-foreground transition-colors hover:border-ring/60 hover:text-foreground"
+        >
+          <Search className="h-3.5 w-3.5 shrink-0" aria-hidden />
+          <span className="truncate">搜索歌曲 / 歌手 / 专辑 / 歌单</span>
+        </button>
         <MusicSourceSwitcher />
       </div>
 

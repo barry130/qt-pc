@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, emit, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { peekQualityCeiling, resolvePlayUrlWithFallback } from "@/lib/quality-fallback";
+import { peekQualityCeiling, normalizeQualityForSource, resolvePlayUrlWithFallback } from "@/lib/quality-fallback";
 import { qualityShortLabel } from "@/lib/quality";
 import { toast } from "@/stores/toast";
 import { playUrlHitLine } from "@/source-scripts/playurl-line";
@@ -45,20 +45,23 @@ async function answer(req: PlayUrlRequest): Promise<void> {
   // 就是真正请求成功的那一档），广播线路给歌词窗口时必须用同一口径，否则读到空串。
   let hitQuality = req.quality;
   // 同专辑已知上限时不弹「只能提供 X」：有声书一本几百集，逐集弹同一句等于噪声
+  // 存量请求档可能是旧第三方档名（v11 官方清单生效时）：先归一再取链与比对，
+  // 否则「实际出链档 ≠ 请求档」的降档提示每首都误弹（官方 level 名对不上旧档名）
+  const wanted = normalizeQualityForSource(req.track.platform, req.quality);
   const known = peekQualityCeiling(req.track.platform, req.track.album);
   try {
     // 降档回退与播放动作预解析共用同一份阶梯（@/lib/quality-fallback）：
     // 引擎主导的换歌（自然播完自动切歌 / 随机下一首 / 打开流失败重取）走的
     // 就是这条路径，不回退的话 QQ 有声书章节这类「只有 128k 一档文件」的曲目
     // 会表现成「点一下能放、自动播下一集就报无法播放」。
-    const res = await resolvePlayUrlWithFallback(req.track, req.quality);
+    const res = await resolvePlayUrlWithFallback(req.track, wanted);
     url = res.url;
     stalled = res.stalled;
     referer = res.referer;
     size = res.size;
     actualQuality = res.actualQuality;
     if (res.quality.length > 0) hitQuality = res.quality;
-    if (url.length > 0 && res.quality !== req.quality && known === null) {
+    if (url.length > 0 && res.quality !== wanted && known === null) {
       // 不静默降档：让用户知道听到的是 128K 而不是请求的档位
       toast(`当前音源只能提供 ${qualityShortLabel(res.quality)}：${req.track.title}`);
     }

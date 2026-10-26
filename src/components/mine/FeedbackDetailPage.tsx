@@ -43,8 +43,12 @@ export function FeedbackDetailPage(): React.JSX.Element {
     setNotFound(false);
     void (async () => {
       try {
-        const detail = normalizeFeedback(await ipc.astralFeedbackDetail(feedbackId));
-        const reps = await ipc.astralFeedbackReplies(feedbackId);
+        // 详情与回复互不依赖，并行取（少付一个 IPC 往返）
+        const [detailRaw, reps] = await Promise.all([
+          ipc.astralFeedbackDetail(feedbackId),
+          ipc.astralFeedbackReplies(feedbackId),
+        ]);
+        const detail = normalizeFeedback(detailRaw);
         if (cancelled) return;
         setFb(detail);
         setReplies(Array.isArray(reps) ? reps.map((r) => normalizeReply(r)) : []);

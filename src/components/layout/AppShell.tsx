@@ -26,6 +26,8 @@ import { useAppearanceStore } from "@/stores/appearance";
 import { toastError } from "@/stores/toast";
 import { usePlayerStore } from "@/stores/player";
 import { useSourceRegistryStore } from "@/stores/sourceRegistry";
+import { ensureSourceAuthInjected } from "@/lib/source-auth";
+import { loadSourceQualities } from "@/lib/source-quality";
 import { useDownloadsStore } from "@/stores/downloads";
 import { useDislikesStore } from "@/stores/dislikes";
 import { useDisclaimerStore } from "@/stores/disclaimer";
@@ -74,6 +76,18 @@ export function AppShell(): React.JSX.Element {
   useEffect(() => {
     void ensureRegistry();
   }, [ensureRegistry]);
+
+  // 音源账号登录态注入：数据包引擎（重）装载后要把已存凭据重灌给引擎内存副本
+  // （引擎每次热切换/换包都从零开始）；引擎未就绪时静默，phase 转 ready 会重放
+  useEffect(() => {
+    void ensureSourceAuthInjected();
+  }, []);
+
+  // 各平台独立音质（音源账号页）：启动读表进缓存并全量推给引擎
+  //（engine 的队列播放/无缝预加载按这张表取每首歌的请求音质）
+  useEffect(() => {
+    void loadSourceQualities();
+  }, []);
 
   const bgImage = useAppearanceStore((s) => s.preference.bgImage);
   // 无封面 URL 的曲目（部分 wyy 曲 picUrl 为空）不渲染背景，避免退化成固定 --primary 色
@@ -158,9 +172,11 @@ export function AppShell(): React.JSX.Element {
     };
   }, [refreshDownloads]);
 
-  // 歌词 sidecar 补写（2026-11「下载歌曲同时下载封面和歌词」）：任务翻到
-  // 「已完成」的那一次串行补取词并写 `<音频文件名>.lrc`（封面与已缓存词由
-  // Rust 侧在下载成功时就地落盘，见 download.rs 的 save_download_extras）。
+  // 歌词补写（2026-11「下载歌曲同时下载封面和歌词」；2026-10 增加存储方式）：
+  // 任务翻到「已完成」的那一次串行补取词，经 write_download_lyric 落盘——
+  // 「音乐内嵌」时写进音频文件标签，「同目录文件」时写 `<音频文件名>.lrc`
+  // （封面与已缓存词由 Rust 侧在下载成功时就地处理，见 download.rs 的
+  // save_download_extras）。
   // 订阅 store 而不是 downloads-changed 事件：事件只驱动 refresh，词要等
   // refresh 把新状态写进 store 后才有得看。
   useEffect(() => {

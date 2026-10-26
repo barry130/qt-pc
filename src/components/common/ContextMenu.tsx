@@ -58,11 +58,12 @@ function useCloseOnViewportChange(
       if (ref.current && e.target instanceof Node && ref.current.contains(e.target)) return;
       onClose();
     };
-    // capture：滚动事件不冒泡到 window，只有捕获阶段能收到滚动容器的滚动
-    window.addEventListener("scroll", close, true);
+    // capture：滚动事件不冒泡到 window，只有捕获阶段能收到滚动容器的滚动；
+    // passive：close 不调 preventDefault，别让浏览器白等一次主线程（滚动会更跟手）
+    window.addEventListener("scroll", close, { capture: true, passive: true });
     window.addEventListener("resize", close);
     return () => {
-      window.removeEventListener("scroll", close, true);
+      window.removeEventListener("scroll", close, { capture: true });
       window.removeEventListener("resize", close);
     };
   }, [ref, onClose]);

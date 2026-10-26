@@ -26,6 +26,16 @@ const DEVICE_KEY = "qt-stat-device-id";
 const MAX_BATCH = 200;
 /** 队列上限，超出丢最旧（§7.1） */
 const MAX_QUEUE = 500;
+/**
+ * 队列持久化**字符**上限（≈4MB UTF-16 存储，localStorage 配额通常 5MB/域）。
+ *
+ * 为什么按字符而不只按条数：error 事件的 stack 最长 16KB，500 条错误事件序列化
+ * 能到 8MB —— 一旦超配额，`setItem` 会抛 QuotaExceededError，队列从此再也存不下，
+ * 冷启动丢批。所以条数与字节双限，先到先裁（丢最旧，与 §7.1 一致）。
+ */
+const MAX_QUEUE_CHARS = 2 * 1024 * 1024;
+/** 持久化 schema 版本：v1 是裸数组，v2 起带版本号，便于将来迁移而不丢历史事件 */
+const QUEUE_SCHEMA_VERSION = 2;
 /** 定时冲队列间隔（§7.1 默认 10s） */
 const FLUSH_INTERVAL_MS = 10_000;
 /** 失败重试次数上限，超过丢掉当前批 */
@@ -112,23 +122,43 @@ function baseEvent(evt: StatEvent["evt"]): StatEvent {
   };
 }
 
+function isStatEvent(e: unknown): e is StatEvent {
+  return !!e && typeof e === "object" && "evt" in e;
+}
+
 function loadQueue(): void {
   const raw = storageGet(QUEUE_KEY);
   if (!raw) return;
   try {
     const parsed: unknown = JSON.parse(raw);
-    if (Array.isArray(parsed)) {
-      queue = parsed.filter(
-        (e): e is StatEvent => !!e && typeof e === "object" && "evt" in e,
-      );
-    }
+    // v1 存的是裸数组，v2 起是 { v, queue }：两种都认，老用户的待发队列不丢
+    const list: unknown = Array.isArray(parsed)
+      ? parsed
+      : parsed && typeof parsed === "object" && "queue" in parsed
+        ? (parsed as { queue: unknown }).queue
+        : null;
+    queue = Array.isArray(list) ? list.filter(isStatEvent).slice(-MAX_QUEUE) : [];
   } catch {
     queue = [];
   }
 }
 
+/**
+ * 序列化队列并落盘。超字符上限时丢最旧的一批（每次 10%）再重试，
+ * 保证写进 localStorage 的一定不超配额 —— 否则 setItem 抛错等于整队丢失。
+ */
 function persistQueue(): void {
-  storageSet(QUEUE_KEY, JSON.stringify(queue));
+  let payload = serializeQueue();
+  while (payload.length > MAX_QUEUE_CHARS && queue.length > 1) {
+    const drop = Math.max(1, Math.ceil(queue.length * 0.1));
+    queue = queue.slice(drop);
+    payload = serializeQueue();
+  }
+  storageSet(QUEUE_KEY, payload);
+}
+
+function serializeQueue(): string {
+  return JSON.stringify({ v: QUEUE_SCHEMA_VERSION, queue });
 }
 
 function enqueue(event: StatEvent): void {

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Ban, ExternalLink, X } from "lucide-react";
+import { formatBytes } from "@/lib/format";
 import { errMsg, stripErrorUrls } from "@/lib/utils";
 import { clearRuntimeCache, type RuntimeCacheKind } from "@/lib/runtime-cache";
 import {
@@ -12,8 +13,9 @@ import {
 import { useNavigate } from "@tanstack/react-router";
 import { getAllWindows } from "@tauri-apps/api/window";
 import { LYRICS_WINDOW_LABEL } from "@/lib/window-labels";
-import { CACHE_AUDIO_LIMIT_MB_KEY, GAPLESS_KEY, QUALITY_KEY } from "@/lib/storageKeys";
+import { CACHE_AUDIO_LIMIT_MB_KEY, GAPLESS_KEY } from "@/lib/storageKeys";
 import { PageContainer } from "@/components/layout/PageContainer";
+import { AiProvidersDialog } from "@/components/settings/AiProvidersPanel";
 import * as ipc from "@/services/ipc";
 import {
   getAppVersion,
@@ -56,13 +58,14 @@ import {
 } from "@/source-scripts/source-update";
 import { SKINS, getSkin } from "@/lib/skins";
 import { setLogLevel } from "@/lib/logger";
-import { isQuality, qualityOptionsFromRegistry } from "@/lib/quality";
-import { useSourceQualities, useSourceRegistryStore } from "@/stores/sourceRegistry";
-import { useMusicSourceStore } from "@/stores/musicSource";
+
+import { readAggregateSources, saveAggregateSources } from "@/lib/aggregate-sources";
+import { useSourceRegistryStore } from "@/stores/sourceRegistry";
+
 import { useDislikesStore } from "@/stores/dislikes";
 import { useFavoritesStore } from "@/stores/favorites";
 import { usePlayerBarStore } from "@/stores/playerBar";
-import { useAuthStore, isAdmin } from "@/stores/auth";
+import { useAuthStore, isAdmin, isSessionValid } from "@/stores/auth";
 import { toast, toastError, toastSuccess } from "@/stores/toast";
 import {
   countPlayerBarVisible,
@@ -90,8 +93,23 @@ import type {
   FxState,
   NetConfigView,
   NetTestResult,
-  Quality,
 } from "@/types";
+import {
+  DAILY_TASTE_LABEL,
+  DAILY_TASTE_ORDER,
+  readTaste,
+  saveMode,
+  saveTaste,
+  type DailyTaste,
+} from "@/lib/daily-recommend";
+import {
+  AI_MODE_HINT,
+  AI_MODE_LABEL,
+  aiModeOptionsFor,
+  readAiMode,
+  resolveAiMode,
+  type AiEngineMode,
+} from "@/lib/ai-mode";
 
 /**
  * 设置页（DESIGN §9）。外观区为真实实现（§9.2 AppearancePreference），
@@ -711,7 +729,6 @@ function GenericSection(props: { hint: string }): React.JSX.Element {
 function PlaybackSection(): React.JSX.Element {
   const [devices, setDevices] = useState<string[]>([]);
   const [current, setCurrent] = useState<string>("");
-  const [quality, setQuality] = useState<Quality>("320");
   const [speed, setSpeedState] = useState(1);
   const [gapless, setGaplessState] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -719,19 +736,15 @@ function PlaybackSection(): React.JSX.Element {
 
   const load = useCallback(async (): Promise<void> => {
     try {
-      const [list, snap, savedQuality, savedGapless] = await Promise.all([
+      const [list, snap, savedGapless] = await Promise.all([
         ipc.listOutputDevices(),
         ipc.getPlaybackState(),
-        ipc.getSetting(QUALITY_KEY),
         ipc.getSetting(GAPLESS_KEY),
       ]);
       setGaplessState(savedGapless === "true");
       setDevices(list);
       setCurrent(snap?.outputDevice ?? "");
       if (snap?.speed) setSpeedState(snap.speed);
-      if (savedQuality !== null && savedQuality !== undefined && isQuality(savedQuality)) {
-        setQuality(savedQuality);
-      }
     } catch (err) {
       setError(errMsg(err));
     }
@@ -748,19 +761,6 @@ function PlaybackSection(): React.JSX.Element {
       // 空串 = 跟随系统默认
       await ipc.setOutputDevice(name || undefined);
       await load();
-    } catch (err) {
-      setError(errMsg(err));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const chooseQuality = async (q: Quality): Promise<void> => {
-    setBusy(true);
-    setError(null);
-    try {
-      await ipc.setDefaultQuality(q);
-      setQuality(q);
     } catch (err) {
       setError(errMsg(err));
     } finally {
@@ -815,16 +815,7 @@ function PlaybackSection(): React.JSX.Element {
           ))}
         </select>
       </SettingRow>
-      <SettingRow
-        title="默认播放音质"
-        description="新播放的歌曲按这个音质取址。播放条上的音质按钮只改当前那一首，不会动这里的默认值。"
-      >
-        <QualitySelect
-          value={quality}
-          disabled={busy}
-          onChange={(q) => void chooseQuality(q)}
-        />
-      </SettingRow>
+      {/* 默认播放音质已改为按平台独立设置（音源账号页），此处不再有全局入口 */}
       <SettingRow
         title="无缝播放"
         description="提前加载下一首，缩短连续播放时的间隔。默认关闭；在线歌曲的衔接效果取决于网络和音源响应。"
@@ -1888,52 +1879,7 @@ function GeneralSection(): React.JSX.Element {
   );
 }
 
-/** 字节量人话显示（缓存统计用） */
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
-}
-
-/** 音质下拉（设置页两处共用：默认播放 / 默认下载） */
-function QualitySelect(props: {
-  value: Quality;
-  disabled?: boolean;
-  onChange: (q: Quality) => void;
-}): React.JSX.Element {
-  // 档位清单来自数据包注册表，并按**当前选中的音源**收敛（v5 契约：包侧
-  // 声明了该源可用档位，如 B 站无真无损就不显示 flac；未声明 = 全部档位。
-  // 未就绪时 qualityOptionsFromRegistry 兜底三档）
-  const activeId = useMusicSourceStore((s) => s.activeSourceId);
-  const globalQualities = useSourceRegistryStore((s) => s.qualities);
-  const options = qualityOptionsFromRegistry(useSourceQualities(activeId));
-  let shown = options;
-  if (!options.some((o) => o.value === props.value)) {
-    // 换源后残留的旧默认值可能不在该源档位里：仍保留显示（用全局注册表名），
-    // 避免 select 显示出与实际存储不符的假值；播放/下载发起时会按源钳到可用档
-    const declared = globalQualities.filter((q) => q.id === props.value);
-    const fallback =
-      qualityOptionsFromRegistry(declared).find((o) => o.value === props.value) ??
-      { value: props.value, label: props.value, short: props.value.toUpperCase() };
-    shown = [fallback, ...options];
-  }
-  return (
-    <select
-      value={props.value}
-      disabled={props.disabled}
-      aria-label="音质"
-      onChange={(e) => props.onChange(e.target.value as Quality)}
-      className="rounded-md border border-input bg-background px-2 py-1.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
-    >
-      {shown.map((o) => (
-        <option key={o.value} value={o.value}>
-          {o.label}（{o.short}）
-        </option>
-      ))}
-    </select>
-  );
-}
+// formatBytes 合并到 `@/lib/format`（与下载页同一实现：自动单位 + 空值给空串）。
 
 /** 包列表单行文案：包名 · 版本 · code */
 function packLabel(p: SourcePackVo): string {
@@ -1945,6 +1891,119 @@ type ArmedUninstall = { packId: string; timer: number };
 
 /** 本会话已提示过的剪贴板链接（同一链接只提示一次，忽略/安装都算） */
 const PROMPTED_CLIPBOARD_LINKS = new Set<string>();
+
+/**
+ * 聚合搜索音源（设置 → 音源包）：勾哪几个源，聚合类搜索就只查这几个。
+ *
+ * 「聚合」= 一次搜索同时打多个源：搜索页「全部音源」分组、AI 找歌的候选池、手动换源、
+ * 每日推荐的跨源补充。**单源搜索不受影响**（搜索页某个源的页签、榜单、歌单、歌手页
+ * 用的都是用户当前选中的那个源，与这里无关）。
+ *
+ * 关掉的源在数据包侧就**不发请求**（`searchAll`/`searchMany` 的可选 `sources` 入参），
+ * 不是搜完再把结果丢掉 —— 少一个源就真的少一份往返、少一条超时线，聚合搜索结果也
+ * 不会被用户不想用的源污染。
+ *
+ * 存的是源 id 数组；「全选」写成空值（= 全部），这样以后数据包新增音源时会自动参与，
+ * 而不是被一份旧的白名单永久排除在外。
+ *
+ * 导出只为单测能直接挂这一个设置行（整页要有音源包/更新/剪贴板一堆依赖）。
+ */
+export function AggregateSourcesRow(): React.JSX.Element {
+  const sources = useSourceRegistryStore((s) => s.sources);
+  const ensure = useSourceRegistryStore((s) => s.ensure);
+  /** null = 全部音源（还没配置过，或用户点回了全选） */
+  const [selected, setSelected] = useState<string[] | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  /** 写入串行队列：连点时按钮立刻响应，但落库顺序不会乱（后写的必须是后点的那次） */
+  const saveQueue = useRef<Promise<void>>(Promise.resolve());
+
+  useEffect(() => {
+    void ensure();
+    void (async () => {
+      setSelected(await readAggregateSources());
+      setLoaded(true);
+    })();
+  }, [ensure]);
+
+  const allIds = sources.map((item) => item.id);
+  // 只有注册表里真实存在的源可勾选；设置里残留的已卸载源 id 原样留在配置里
+  // （重新装包后自动恢复），但不参与这里的开关显示
+  const enabledIds =
+    selected === null ? allIds : allIds.filter((id) => selected.includes(id));
+  const enabledCount = enabledIds.length;
+
+  const toggle = (id: string): void => {
+    if (!loaded) return;
+    const next = enabledIds.includes(id)
+      ? enabledIds.filter((item) => item !== id)
+      : allIds.filter((item) => enabledIds.includes(item) || item === id);
+    if (next.length === 0) {
+      // 一个都不选 = 聚合搜索永远空结果，直接拦在 UI 上（数据侧也把空数组当「全部」）
+      toast("至少留一个音源，否则聚合搜索不会有结果");
+      return;
+    }
+    const allSelected = next.length === allIds.length;
+    // 先乐观更新：连点两个开关不该丢第二个点击（落库是串行的，写失败再提示）
+    setSelected(allSelected ? null : next);
+    saveQueue.current = saveQueue.current
+      .then(() => saveAggregateSources(allSelected ? [] : next))
+      .catch((e) => {
+        toastError(`保存失败：${stripErrorUrls(String(e))}`);
+      });
+  };
+
+  return (
+    <SettingRow
+      title="聚合搜索音源"
+      description={
+        allIds.length === 0
+          ? "搜索页「全部音源」、AI 找歌、手动换源、每日推荐跨源共用这份选择；单源搜索（某个源的页签、榜单、歌单、歌手页）不受影响。"
+          : `搜索页「全部音源」、AI 找歌、手动换源、每日推荐跨源只查勾选的源（已选 ${enabledCount}/${allIds.length}）；关掉的源不再被请求。单源搜索不受影响；新装的音源默认不参与，需要在这里打开。`
+      }
+    >
+      <div className="flex w-full flex-col gap-1.5">
+        {allIds.length === 0 && (
+          <span className="text-xs text-muted-foreground">
+            {loaded ? "音源引擎未就绪，暂时读不到音源清单" : "正在读取音源清单…"}
+          </span>
+        )}
+        {sources.map((item) => (
+          <div key={item.id} className="flex w-full items-center justify-end gap-2">
+            <span className="flex-1 text-right text-xs text-muted-foreground">
+              {item.name}
+            </span>
+            <Switch
+              checked={enabledIds.includes(item.id)}
+              onToggle={() => toggle(item.id)}
+            />
+          </div>
+        ))}
+      </div>
+    </SettingRow>
+  );
+}
+
+/** 音源账号（v9 数据包）：扫码登录 B 站/网易等音源账号；凭据只存本机，
+ *  「数据请求/播放请求是否使用登录态」两面开关**按源独立**。管理界面已
+ *  独立成「音源账号」页（侧边栏「我的」组、我的歌单下方，/source-accounts），
+ *  设置页只留跳转入口。 */
+function SourceAccountSection(): React.JSX.Element {
+  const navigate = useNavigate();
+  return (
+    <SettingRow
+      title="音源账号"
+      description="扫码登录音源官方账号（凭据只存本机）；每个音源单独管理数据/播放请求是否使用登录态。"
+    >
+      <button
+        type="button"
+        onClick={() => void navigate({ to: "/source-accounts" })}
+        className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent"
+      >
+        前往管理
+      </button>
+    </SettingRow>
+  );
+}
 
 /** 音源包设置（v3 统一包模型，与 uniappx 设置面板同口径）：
  *  - 数据包/播放包同构：单文件 js、首行 __QT_PACK__ 包头自描述身份；
@@ -2209,6 +2268,7 @@ function SourcePackageSection(): React.JSX.Element {
       >
         <span className="font-mono text-xs text-muted-foreground">{playStatus}</span>
       </SettingRow>
+      <SourceAccountSection />
       <SettingRow
         title="已安装的音源包"
         description={`共 ${packs.length} 个（数据 ${metaPacks.length} / 播放 ${playPacks.length}）。启用即热切换；卸载两击确认。`}
@@ -2268,6 +2328,7 @@ function SourcePackageSection(): React.JSX.Element {
           ))}
         </div>
       </SettingRow>
+      <AggregateSourcesRow />
       <SettingRow
         title="可用更新"
         description="更新只提示不自动安装；应用失败会自动回滚到原版本并跳过该版本。"
@@ -2892,7 +2953,6 @@ const CONCURRENCY_CHOICES = [1, 2, 3, 4, 5, 6];
 /** 下载设置：保存位置（默认安装目录/Download，可选任意位置） */
 function DownloadSection(): React.JSX.Element {
   const [dir, setDir] = useState("");
-  const [quality, setQuality] = useState<Quality>("320");
   const [nameFormat, setNameFormat] = useState<"artist" | "song">("artist");
   const [concurrency, setConcurrency] = useState(ipc.DEFAULT_DOWNLOAD_CONCURRENCY);
   // 选了 >3 时先挂在这里等用户确认。沿用全项目唯一的二次确认手法：原地换文案再点第二下
@@ -2900,25 +2960,27 @@ function DownloadSection(): React.JSX.Element {
   // 下载成功的就地附件（封面原图 / 歌词），Rust 侧默认开，这里只做镜像
   const [saveCover, setSaveCover] = useState(true);
   const [saveLyric, setSaveLyric] = useState(true);
+  // 封面 / 歌词的存储方式：内嵌进音频标签（默认）/ 同目录 sidecar 文件
+  const [storage, setStorage] = useState<ipc.DownloadStorageMode>("embed");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async (): Promise<void> => {
     try {
-      const [d, q, f, c, sc, sl] = await Promise.all([
+      const [d, f, c, sc, sl, st] = await Promise.all([
         ipc.getDownloadDir(),
-        ipc.getDownloadQuality(),
         ipc.getDownloadNameFormat(),
         ipc.getDownloadConcurrency(),
         ipc.getDownloadSaveCover(),
         ipc.getDownloadSaveLyric(),
+        ipc.getDownloadStorage(),
       ]);
       setDir(d);
-      setQuality(q);
       setNameFormat(f);
       setConcurrency(c);
       setSaveCover(sc);
       setSaveLyric(sl);
+      setStorage(st);
     } catch (err) {
       setError(errMsg(err));
     }
@@ -2946,19 +3008,6 @@ function DownloadSection(): React.JSX.Element {
     setError(null);
     try {
       setDir(await ipc.resetDownloadDir());
-    } catch (err) {
-      setError(errMsg(err));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const chooseQuality = async (q: Quality): Promise<void> => {
-    setBusy(true);
-    setError(null);
-    try {
-      await ipc.setDownloadQuality(q);
-      setQuality(q);
     } catch (err) {
       setError(errMsg(err));
     } finally {
@@ -3000,6 +3049,21 @@ function DownloadSection(): React.JSX.Element {
     try {
       await ipc.setDownloadSaveLyric(v);
       setSaveLyric(v);
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // 存储方式同样是「只影响之后完成的任务」：切到内嵌不会回头重写已落盘的
+  // sidecar，反之亦然。描述里说清楚了，不弹确认
+  const chooseStorage = async (mode: ipc.DownloadStorageMode): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    try {
+      await ipc.setDownloadStorage(mode);
+      setStorage(mode);
     } catch (err) {
       setError(errMsg(err));
     } finally {
@@ -3068,16 +3132,7 @@ function DownloadSection(): React.JSX.Element {
           </button>
         </div>
       </SettingRow>
-      <SettingRow
-        title="默认下载音质"
-        description="列表里和播放条上的下载按钮都按这个音质下载，与播放音质互不影响。"
-      >
-        <QualitySelect
-          value={quality}
-          disabled={busy}
-          onChange={(q) => void chooseQuality(q)}
-        />
-      </SettingRow>
+      {/* 默认下载音质已改为按平台独立设置（音源账号页），此处不再有全局入口 */}
       <SettingRow
         title="下载文件名格式"
         description="下载歌曲的存盘文件名顺序：歌手-歌名 或 歌名-歌手。仅影响设置变更后新开始的下载。"
@@ -3095,15 +3150,38 @@ function DownloadSection(): React.JSX.Element {
       </SettingRow>
       <SettingRow
         title="同时下载封面"
-        description="下载完成后把封面原图存到歌曲旁边（文件名与歌曲相同）。仅影响之后完成的任务。"
+        description={
+          storage === "embed"
+            ? "下载完成后把封面写进歌曲文件标签（MP3/FLAC/M4A/WAV 等；原文件已有封面则保留，不支持的格式自动存为同目录图片）。仅影响之后完成的任务。"
+            : "下载完成后把封面原图存到歌曲旁边（文件名与歌曲相同）。仅影响之后完成的任务。"
+        }
       >
         <Switch checked={saveCover} onToggle={() => void chooseSaveCover(!saveCover)} />
       </SettingRow>
       <SettingRow
         title="同时下载歌词"
-        description="下载完成后把歌词存为同名 .lrc 文件（优先用已缓存的词，没有才联网补取）。仅影响之后完成的任务。"
+        description={
+          storage === "embed"
+            ? "下载完成后把歌词写进歌曲文件标签（优先用已缓存的词，没有才联网补取；不支持的格式自动存为同名 .lrc）。仅影响之后完成的任务。"
+            : "下载完成后把歌词存为同名 .lrc 文件（优先用已缓存的词，没有才联网补取）。仅影响之后完成的任务。"
+        }
       >
         <Switch checked={saveLyric} onToggle={() => void chooseSaveLyric(!saveLyric)} />
+      </SettingRow>
+      <SettingRow
+        title="下载存储方式"
+        description="封面 / 歌词跟歌走的形式：内嵌进音频文件标签（部分播放器可直接读出），或存为歌曲旁边的独立文件。仅影响之后完成的任务，已落盘的不来回改。"
+      >
+        <select
+          value={storage}
+          disabled={busy}
+          aria-label="下载存储方式"
+          onChange={(e) => void chooseStorage(e.target.value as ipc.DownloadStorageMode)}
+          className="rounded-md border border-input bg-background px-2 py-1.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
+        >
+          <option value="embed">音乐内嵌</option>
+          <option value="sidecar">同目录文件</option>
+        </select>
       </SettingRow>
       <SettingRow
         title="同时下载数"
@@ -3292,6 +3370,7 @@ const SECTION_TITLES: Record<string, string> = {
   sound: "音效",
   download: "下载",
   network: "网络",
+  ai: "AI",
   dislike: "不喜欢列表",
   "source-package": "音源包",
   shortcut: "快捷键",
@@ -3356,6 +3435,9 @@ export function SettingsPage(props: { section: string }): React.JSX.Element {
         <DownloadSection />
       ) : props.section === "network" ? (
         <NetworkSection />
+      ) : props.section === "ai" ? (
+        // 全局 AI 模式 + 客户端直连模型的接口配置（详见文件末尾 AiSection）
+        <AiSection />
       ) : props.section === "dislike" ? (
         <DislikeSection />
       ) : props.section === "source-package" ? (
@@ -3611,6 +3693,202 @@ function NetworkSection(): React.JSX.Element {
           )}
         </span>
       </SettingRow>
+    </div>
+  );
+}
+// ---------- AI 设置（全局 AI 模式 + 客户端直连模型） ----------
+
+/** 推荐口味（推荐策略）：与上面的「AI 模式」（要不要叫模型）互相独立 */
+const DAILY_TASTE_OPTIONS: { value: DailyTaste; label: string }[] = DAILY_TASTE_ORDER.map(
+  (value) => ({ value, label: DAILY_TASTE_LABEL[value] }),
+);
+
+
+/**
+ * AI 设置（`/settings/ai`）。
+ *
+ * 这个分区分成两块：上面那行「AI 模式」是**全局 AI 模式**（存储键沿用
+ * `dailyRecommend.mode`），「音乐助手」（`/ai-assistant`）与「每日推荐」
+ * （`/daily-recommend`）都按它执行；下面的「接口配置」只服务本地模型精选 ——
+ * 只有模式选「本地模型精选」时那套地址/Key 才用得到。
+ *
+ * ---------------------------------------------------------------------------
+ * 多套配置档，任选其一生效
+ * ---------------------------------------------------------------------------
+ * 用户往往不止一个可用接口：官方 API 一个、中转网关一个、本机 Ollama 一个。
+ * 所以这里存的是**列表**（`ai.profiles` JSON + `ai.activeProfile`），而不是一组
+ * baseUrl/model/key。列表里点哪套就哪套生效（`activeId`），调用方（`ai_local.rs`）
+ * 只认生效的那一套 —— 换接口不用重填、也不会把上一套的 Key 丢掉。
+ *
+ * 模型名支持两种填法：手输，或点「获取」拉 `GET /models` 出来选。
+ * 有些网关不实现 /models，所以拉失败只提示、不阻断手输。
+ *
+ * ---------------------------------------------------------------------------
+ * 为什么 Key 是「保存后前端再也拿不到」
+ * ---------------------------------------------------------------------------
+ * 调用模型走的是 Rust 侧命令（`ai_local.rs`），前端只传 baseUrl/model/messages。
+ * 读配置的 `aiLocalConfig()` **只回 `hasKey` 布尔**，不回明文，所以 Key 不会
+ * 出现在 WebView 的 JS 堆里，也不会被 DevTools / 崩溃转储带出来。
+ * 代价：本机 SQLite 的 settings 表里存的是明文（项目没有 keyring 依赖，
+ * 不为这一项新增原生依赖），所以下面必须明说这一点。
+ *
+ * 地址支持三种填法，Rust 侧会归一：`https://api.openai.com`、
+ * `https://api.openai.com/v1`、以及完整端点 `.../v1/chat/completions`。
+ * 本机模型（Ollama / LM Studio）填 `http://localhost:11434/v1` 也可以 ——
+ * 这条通道**不复用**音源脚本的请求通道（那条被 `net_guard` 拦内网防跳板），
+ * 只认这里填的地址，Key 留空即不发 Authorization 头。
+ *
+ * ---------------------------------------------------------------------------
+ * 提示一律走右上角 toast
+ * ---------------------------------------------------------------------------
+ * 这个分区里没有一行「已保存 / 保存失败 / 测试结果」的内联文字：全部走
+ * `toast*`（右上角浮层）。设置页表单是逐字段回车/失焦保存的，内联提示会把
+ * 行高顶起来、按钮跟着上下跳；浮层几秒自己走，页面布局不动。
+ */
+function AiSection(): React.JSX.Element {
+  /**
+   * 当前显示的模式 / 口味。
+   *
+   * `null` = 还没从库里读回来。旧实现把初值直接写成 "rule" / "heart" 就渲染，
+   * 选了「本地模型精选」的用户每次进设置页都先看到「纯规则」再跳过去 ——
+   * 读回来之前先渲染「载入中」，不让错误值闪一下。
+   */
+  const [mode, setMode] = useState<AiEngineMode | null>(null);
+  const [taste, setTaste] = useState<DailyTaste | null>(null);
+  /**
+   * 库里存的原始值是不是「服务端 AI」。
+   *
+   * 单独记一份：非管理员的按钮组里根本没有这一项，若只留「有效模式」，
+   * 就分不清「本来就选的是规则」和「选了服务端但被降级」，
+   * 下面那句说明也就没法只在该说的时候说。
+   */
+  const [storedServer, setStoredServer] = useState(false);
+  /**
+   * 是否登录了 astral（会话有效）。
+   *
+   * 「服务端 AI」要登录才生效：没登录时后端会退回规则，提示里必须当场说清楚，
+   * 否则用户选了服务端却拿到规则结果，会以为是坏了。登录态在 AppShell 启动时
+   * 已由 `useAuthStore.init()` 从本机会话恢复，这里直接读，不再单独发一次 IPC。
+   */
+  const session = useAuthStore((s) => s.session);
+  const loggedIn = isSessionValid(session);
+  /**
+   * 「服务端 AI」是管理员专属（2026-10-24，与移动端 `isQtAdmin()` 同口径）。
+   *
+   * 后端登录响应/profile 里已经带 `permissions`（管理员是 `admin:qt:admin`），
+   * 前端据此隐藏这一项并降级执行 —— 后端仍按智能体权限码校验，前端隐藏不是安全边界。
+   * 订阅 profile 而不是只在挂载时取快照：AppShell 恢复登录态是异步的，
+   * 只在挂载时取的话，管理员刷新页面后会一直看不到「服务端 AI」。
+   */
+  const profile = useAuthStore((s) => s.profile);
+  const canUseServer = isAdmin(profile);
+  /** 供应商配置弹窗：设置页只留一行入口，点开是一个弹窗（用户 2026-10-24 要求）。 */
+  const [providersOpen, setProvidersOpen] = useState(false);
+
+  useEffect(() => {
+    let disposed = false;
+    // 读库里的**原值**（ai-mode 的 readAiMode），不用 daily-recommend 的 readMode：
+    // 后者已经按管理员身份收敛过，非管理员永远读不到 server，`storedServer` 就永远
+    // 是 false、下面那句「仅管理员可用」的说明也永远出不来。降级在这里自己做。
+    void Promise.all([readAiMode(), readTaste()])
+      .then(([storedMode, storedTaste]) => {
+        if (disposed) return;
+        setStoredServer(storedMode === "server");
+        // 非管理员即使库里存过服务端模式也按规则显示：按钮组里没有 server，
+        // 还挂着选中态会让人以为选中了一个不存在的选项。
+        setMode(resolveAiMode(storedMode, canUseServer));
+        setTaste(storedTaste);
+      })
+      .catch(() => {
+        // 设置库读坏了也不能让整页空着：按默认值收敛（与 readMode/readTaste 的兜底一致）
+        if (!disposed) {
+          setMode("rule");
+          setTaste("heart");
+        }
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [canUseServer]);
+
+  const pickMode = useCallback(
+    (next: AiEngineMode): void => {
+      // 按钮组已经过滤掉 server，这里再收一次是兜底：非管理员任何路径都存不进 server
+      const chosen = resolveAiMode(next, canUseServer);
+      setMode(chosen);
+      setStoredServer(chosen === "server");
+      void saveMode(chosen).catch((e: unknown) => {
+        toastError(`保存 AI 模式失败：${errMsg(e)}`);
+      });
+    },
+    [canUseServer],
+  );
+
+  const pickTaste = useCallback((next: DailyTaste): void => {
+    setTaste(next);
+    void saveTaste(next).catch((e: unknown) => {
+      toastError(`保存推荐口味失败：${errMsg(e)}`);
+    });
+  }, []);
+
+
+  return (
+    <div className="max-w-4xl divide-y divide-border">
+      <SettingRow
+        title="AI 模式"
+        description="音乐助手和每日推荐共用这一个模式。纯规则不联网、永远可用；本地模型精选调用下面配置的接口，只让模型在已搜好的候选里挑，挂了自动退回规则；服务端 AI 走登录后的 astral 音乐助手，每日推荐与助手都用服务端生成，需要登录、且仅管理员可选，失败同样退回规则。"
+      >
+        {mode === null ? (
+          <span className="text-xs text-muted-foreground">载入中…</span>
+        ) : (
+          // 非管理员只看到 rule/local：服务端 AI 的入口从设置页就藏掉，
+          // 执行层再各自降级一次（见 lib/ai-mode.ts 的 resolveAiMode）
+          <Segmented value={mode} options={aiModeOptionsFor(canUseServer)} onChange={pickMode} />
+        )}
+      </SettingRow>
+
+      <SettingRow
+        title="推荐口味"
+        description="决定候选怎么搜、怎么排序，和上面「AI 模式」互不影响（三种模式都能配三种口味）。心动＝从收藏（喜欢的单曲 + 在线收藏歌单 + 本地自建歌单）和最近在听出发；常听＝以常听歌手为主轴；探索＝尽量推你没听过的歌手。三种口味都会把同一歌手的歌摊开，不会连着排。"
+      >
+        {taste === null ? (
+          <span className="text-xs text-muted-foreground">载入中…</span>
+        ) : (
+          <Segmented value={taste} options={DAILY_TASTE_OPTIONS} onChange={pickTaste} />
+        )}
+      </SettingRow>
+
+      {mode !== null && (
+        <p className="py-3 text-xs text-muted-foreground">
+          {AI_MODE_HINT[mode]}
+          {mode === "server" && !loggedIn ? " 当前未登录服务端，实际会退回规则。" : ""}
+          {/* 库里存过服务端、但当前账号不是管理员：说清楚为什么实际按规则跑，
+              否则用户会发现「设置里没这个选项，结果却和以前不一样」 */}
+          {storedServer && !canUseServer ? " 服务端 AI 仅管理员可用，当前按纯规则运行。" : ""}
+        </p>
+      )}
+
+      <SettingRow
+        title="接口配置"
+        description="AI 供应商按「列表 → 详情」管理：Base URL、协议（OpenAI / OpenAI Responses / Anthropic / Gemini）、多把密钥（第一把生效）、模型多选、图标与证书校验都在弹窗里改。密钥保存后前端不再回显明文，只显示掩码。"
+      >
+        <button
+          type="button"
+          onClick={() => setProvidersOpen(true)}
+          className="rounded-lg border border-border bg-background px-3 py-1.5 text-xs text-foreground transition-colors hover:bg-secondary"
+        >
+          管理供应商…
+        </button>
+      </SettingRow>
+
+      {providersOpen ? <AiProvidersDialog onClose={() => setProvidersOpen(false)} /> : null}
+
+      <p className="py-3 text-xs text-muted-foreground">
+        每日推荐默认每天第一次进页面时生成一次，当天再进直接读缓存；「换一批」会立刻重算。
+        候选来自全部已装音源的搜索，近 7 天推过的歌会排到后面（不再硬排除，池子不够时也能兜底）。
+        {mode !== null ? `当前 AI 模式：${AI_MODE_LABEL[mode]}。` : ""}
+        {taste !== null ? `当前口味：${DAILY_TASTE_LABEL[taste]}。` : ""}
+      </p>
     </div>
   );
 }

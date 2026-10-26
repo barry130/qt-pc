@@ -5,6 +5,12 @@ export function cn(...inputs: ClassValue[]): string {
   return twMerge(clsx(inputs));
 }
 
+/** 收敛到 [0,1]：NaN/Infinity 按 0 处理（占比、归一化打分都靠它） */
+export function clamp01(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  return value < 0 ? 0 : value > 1 ? 1 : value;
+}
+
 /**
  * 报错文案统一剥掉 http(s) 链接：网络层错误串会带上请求地址
  * （含自家后端域名），面向用户展示时不泄露。

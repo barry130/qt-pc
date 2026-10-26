@@ -1,4 +1,6 @@
 import * as sourceApi from "@/source-scripts";
+import { createPendingStringCache } from "@/lib/pending-cache";
+import { compactText } from "@/lib/text";
 import type { SourceId } from "@/types";
 
 /**
@@ -12,14 +14,12 @@ import type { SourceId } from "@/types";
  *
  * 缓存粒度是 `平台:名字`：同一个歌手在不同音源下的头像是各自的，不能串。
  * 失败也落缓存（空串），避免每次进报告页都对同一个查不到的歌手重发请求。
+ * 缓存管理本体在 `@/lib/pending-cache`（与 artist-id.ts 共用，不再各写一份）。
  */
 
 const CACHE_CAP = 64;
 
-/** 在飞的（含已完成的）解析 */
-const pending = new Map<string, Promise<string>>();
-/** 已落定的结果，同步可读（组件首帧就能拿到，不用等一次 await） */
-const settled = new Map<string, string>();
+const cache = createPendingStringCache(CACHE_CAP);
 
 function keyOf(platform: string, name: string): string {
   return `${platform}:${name}`;
@@ -39,59 +39,23 @@ export function isUsablePicUrl(url: string): boolean {
 export async function resolveArtistPic(platform: string, name: string): Promise<string> {
   const trimmed = name.trim();
   if (platform === "local" || trimmed.length === 0) return "";
-  const key = keyOf(platform, trimmed);
-  const hit = pending.get(key);
-  if (hit !== undefined) return hit;
-
-  const task = (async (): Promise<string> => {
-    try {
-      const result = await sourceApi.getArtistSongs(platform as SourceId, trimmed, 1, 5);
-      if (isUsablePicUrl(result.picUrl)) {
-        settled.set(key, result.picUrl);
-        return result.picUrl;
-      }
-      const artists = await sourceApi.searchArtists(platform as SourceId, trimmed, 1, 5);
-      const want = trimmed.toLowerCase().replace(/\s+/g, "");
-      const exact = artists.find((a) => a.name.trim().toLowerCase().replace(/\s+/g, "") === want);
-      const url = exact?.picUrl ?? "";
-      const picked = isUsablePicUrl(url) ? url : "";
-      settled.set(key, picked);
-      return picked;
-    } catch {
-      settled.set(key, "");
-      return "";
-    }
-  })();
-
-  pending.set(key, task);
-  trim();
-  return task;
+  return cache.resolve(keyOf(platform, trimmed), async () => {
+    const result = await sourceApi.getArtistSongs(platform as SourceId, trimmed, 1, 5);
+    if (isUsablePicUrl(result.picUrl)) return result.picUrl;
+    const artists = await sourceApi.searchArtists(platform as SourceId, trimmed, 1, 5);
+    const want = compactText(trimmed);
+    const exact = artists.find((a) => compactText(a.name) === want);
+    const url = exact?.picUrl ?? "";
+    return isUsablePicUrl(url) ? url : "";
+  });
 }
 
 /** 已解析过的头像（同步）；没解析过返回 null */
 export function peekArtistPic(platform: string, name: string): string | null {
-  const value = settled.get(keyOf(platform, name.trim()));
-  return value === undefined ? null : value;
+  return cache.peek(keyOf(platform, name.trim()));
 }
 
 /** 清空缓存（设置页「列表结果」清理 / 测试用） */
 export function clearArtistPicCache(): number {
-  const count = new Set([...pending.keys(), ...settled.keys()]).size;
-  pending.clear();
-  settled.clear();
-  return count;
-}
-
-function trim(): void {
-  while (pending.size > CACHE_CAP) {
-    const oldest = pending.keys().next().value;
-    if (oldest === undefined) break;
-    pending.delete(oldest);
-    settled.delete(oldest);
-  }
-  while (settled.size > CACHE_CAP) {
-    const oldest = settled.keys().next().value;
-    if (oldest === undefined) break;
-    settled.delete(oldest);
-  }
+  return cache.clear();
 }

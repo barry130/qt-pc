@@ -41,7 +41,7 @@ import {
 import { ShareCardPanel } from "@/components/player/ShareCardPanel";
 import { qualityOptionsFromRegistry, qualityShortLabel } from "@/lib/quality";
 import { PLAYER_BAR_BUTTONS, splitPlayerBarButtons } from "@/lib/player-bar";
-import { useSourceQualities } from "@/stores/sourceRegistry";
+import { normalizeQualityForSource, useSourceQualities } from "@/stores/sourceRegistry";
 import { usePlayerBarStore } from "@/stores/playerBar";
 import { useTauriEvent } from "@/hooks/useTauriEvent";
 import { Popover } from "@/components/common/Popover";
@@ -65,6 +65,7 @@ import {
   showDesktopLyric,
   toggleMiniPlayer,
 } from "@/services/ipc";
+import { setSourcePlayQuality } from "@/lib/source-quality";
 import { toastSuccess } from "@/stores/toast";
 
 /**
@@ -731,10 +732,10 @@ function MiniModeButton(): React.JSX.Element {
 }
 
 /**
- * 音质入口（播放条）：只改**当前这首**，不写设置里的默认音质
- * —— 默认值在设置页改，换歌后自动回到默认。
- * 选项按当前歌曲的源收敛（v5 契约：包侧声明了该源可用档位，如 B 站无真
- * 无损就不显示 flac；未声明 = 全部档位）。菜单向上弹（播放条贴在窗口底部）。
+ * 音质入口（播放条）：写入**当前歌曲所在平台**的独立音质（音源账号页按平台
+ * 管理），并对当前这首立即生效（setTrackQuality）。
+ * 选项按当前歌曲的源收敛（v5 契约 + 登录态切官方清单，见 useSourceQualities）。
+ * 菜单向上弹（播放条贴在窗口底部）。
  */
 function QualityMenu(props: { current: Quality; platform: string }): React.JSX.Element {
   const [busy, setBusy] = useState(false);
@@ -742,6 +743,10 @@ function QualityMenu(props: { current: Quality; platform: string }): React.JSX.E
   const options = qualityOptionsFromRegistry(
     useSourceQualities(props.platform),
   );
+  // 当前档先过包侧别名归一（v12：官方清单生效时 flac24bit→hires 这类旧档名
+  // 映射随包下发）——正在播的歌可能是清单翻面前起的，原始档名不在新清单里，
+  // 直接拿原始值比对会「角标显示旧档名、菜单没有高亮项」。
+  const current = normalizeQualityForSource(props.platform, props.current);
   const shortOf = (q: Quality): string =>
     options.find((o) => o.value === q)?.short ?? q;
 
@@ -750,30 +755,35 @@ function QualityMenu(props: { current: Quality; platform: string }): React.JSX.E
       trigger={(t) => (
         <button
           type="button"
-          aria-label={`音质：${shortOf(props.current)}（只对当前这首歌生效）`}
-          title="音质（只对当前这首歌生效，默认音质在设置里改）"
+          aria-label={`音质：${shortOf(current)}`}
+          title="音质（各平台独立默认值在音源账号页设置）"
           aria-haspopup="menu"
           aria-expanded={t.open}
           disabled={busy}
           onClick={t.toggle}
           className="flex h-9 min-w-12 items-center justify-center rounded-full px-2.5 text-xs font-medium tabular-nums transition-all disabled:opacity-50 text-foreground/80 hover:bg-secondary/50 hover:text-foreground"
         >
-          {shortOf(props.current)}
+          {shortOf(current)}
         </button>
       )}
     >
       {(close) => {
         const pick = (q: Quality): void => {
           close();
-          if (q === props.current) return;
+          if (q === current) return;
           setBusy(true);
-          // 取址失败不会抛到这里，走 audio-error 事件 → 播放条自己提示
-          void setTrackQuality(q).finally(() => setBusy(false));
+          // 平台独立默认值落库（换歌/队列播放都按它取），当前这首立即重取
+          void setSourcePlayQuality(props.platform, q)
+            .catch(() => {})
+            .finally(() => {
+              // 取址失败不会抛到这里，走 audio-error 事件 → 播放条自己提示
+              void setTrackQuality(q).finally(() => setBusy(false));
+            });
         };
         return (
         <div
           role="menu"
-          className="absolute bottom-full right-0 z-30 mb-2 w-32 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg"
+          className="absolute bottom-full right-0 z-30 mb-2 w-44 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg"
         >
           {options.map((o) => (
             <button
@@ -782,13 +792,13 @@ function QualityMenu(props: { current: Quality; platform: string }): React.JSX.E
               role="menuitem"
               onClick={() => pick(o.value)}
               className={cn(
-                "flex w-full items-center justify-between rounded-md px-2.5 py-1.5 text-xs transition-colors hover:bg-secondary",
-                o.value === props.current ? "bg-primary/10 text-primary" : "",
+                "flex w-full items-center justify-between gap-2 whitespace-nowrap rounded-md px-2.5 py-1.5 text-xs transition-colors hover:bg-secondary",
+                o.value === current ? "bg-primary/10 text-primary" : "",
               )}
             >
               {/* 选中项同时给出勾选图标：颜色之外多一个形状信号 */}
               <span className="flex items-center gap-1.5">
-                {o.value === props.current ? <Check className="h-3 w-3" /> : null}
+                {o.value === current ? <Check className="h-3 w-3" /> : null}
                 {o.label}
               </span>
               <span className="text-[10px] text-muted-foreground">{o.short}</span>

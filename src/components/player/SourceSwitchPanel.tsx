@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { RefreshCw } from "lucide-react";
 import { usePlayerStore } from "@/stores/player";
-import { useSourceLabelFn } from "@/stores/sourceRegistry";
+import { SourceTag } from "@/components/common/SourceTag";
 import { findSourceCandidates, peekSourceCandidates } from "@/lib/source-switch";
 import { cn } from "@/lib/utils";
 import type { Track } from "@/types";
@@ -28,7 +28,6 @@ export function SourceSwitchPanel(props: {
   /** 重试计数：搜索失败后手动重跑（effect 依赖里参与触发） */
   const [attempt, setAttempt] = useState(0);
   const [refreshing, setRefreshing] = useState(false);
-  const sourceLabel = useSourceLabelFn();
   // 搜索入参用最新 track（字段有更新时翻页也用新的），但**不进 effect 依赖**
   const trackRef = useRef(props.track);
   trackRef.current = props.track;
@@ -143,11 +142,9 @@ export function SourceSwitchPanel(props: {
                 onClick={() => props.onPick(it.track)}
                 className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-secondary/60"
               >
-                <span className="shrink-0 rounded bg-secondary/70 px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                  {sourceLabel(it.track.platform)}
-                </span>
-                <span className="min-w-0 flex-1 truncate text-xs text-foreground/90">
-                  {it.track.title}
+                <span className="flex min-w-0 flex-1 items-center gap-1.5">
+                  <span className="truncate text-xs text-foreground/90">{it.track.title}</span>
+                  <SourceTag platform={it.track.platform} size="xs" />
                 </span>
                 <span className="min-w-0 shrink truncate text-[11px] text-muted-foreground">
                   {it.track.singer}

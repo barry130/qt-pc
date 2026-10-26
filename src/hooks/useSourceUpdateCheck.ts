@@ -23,10 +23,14 @@ export function useSourceUpdateCheck(): void {
     const timer = setTimeout(() => {
       void (async () => {
         try {
-          const result = await discoverSourceUpdates(false);
+          // 发现与本地状态互不依赖，并行取；任一失败仍走下面静默分支
+          const [result, local] = await Promise.all([
+            discoverSourceUpdates(false),
+            getSourceState(),
+          ]);
           const store = useSourceUpdateStore.getState();
           store.setOffers(result.offers);
-          store.setLocal(await getSourceState());
+          store.setLocal(local);
         } catch {
           // 发现失败完全静默（后端没起/离线都正常）
         }

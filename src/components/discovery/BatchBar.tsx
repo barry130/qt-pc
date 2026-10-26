@@ -4,6 +4,7 @@ import { cn, errMsg } from "@/lib/utils";
 import { findCrossSourceDup } from "@/lib/collect-dup";
 import { legacyTrackSelectionKey, trackSelectionKey, type TrackSelectionKey } from "@/lib/track-selection";
 import { clampQualityForPlatform, useSourceLabelFn } from "@/stores/sourceRegistry";
+import { sourceDownloadQualityOf } from "@/lib/source-quality";
 import { useFavoritesStore } from "@/stores/favorites";
 import { toastSuccess, toastUndo } from "@/stores/toast";
 import { useFavoriteFlags } from "@/hooks/useFavoriteFlags";
@@ -277,7 +278,6 @@ export function BatchBar(props: {
     let done = 0;
     setProgress(`0/${list.length}`);
     try {
-      const wanted = await ipc.getDownloadQuality();
       // 固定的 N 个 worker 从同一游标取任务：比 Promise.all 一次性放出去温和，
       // 也比纯串行快（取址是网络往返，串行下 50 首要等 50 个来回）
       let cursor = 0;
@@ -285,8 +285,12 @@ export function BatchBar(props: {
         while (cursor < list.length) {
           const t = list[cursor++]!;
           try {
-            // 与 DownloadButton.start() 同款：默认音质按该曲目所在的源收敛
-            await ipc.startDownload(t, clampQualityForPlatform(t.platform, wanted));
+            // 与 DownloadButton.start() 同款：下载音质按曲目所在平台独立取值
+            //（音源账号页配置），再按源收敛到可用档
+            await ipc.startDownload(
+              t,
+              clampQualityForPlatform(t.platform, sourceDownloadQualityOf(t.platform)),
+            );
           } catch {
             // 单首失败不中断整批，最后统一报条数（逐首弹错会把页面刷满）
             failed += 1;

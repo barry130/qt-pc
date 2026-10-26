@@ -37,3 +37,24 @@ pub const SETTING_MINI_WINDOW: &str = "mini.window";
 pub const SETTING_SHORTCUTS: &str = "shortcuts";
 /// 下载文件名格式（artist = 歌手-歌名（默认），song = 歌名-歌手）
 pub const SETTING_DOWNLOAD_NAME_FORMAT: &str = "downloadNameFormat";
+
+/// 客户端直连模型的接口配置档列表（JSON 数组：id / name / baseUrl / model / apiKey）。
+/// 支持多套地址任选其一；老版本的 `ai.baseUrl` / `ai.model` / `ai.apiKey`
+/// 在首次读取时自动迁移成一档，旧键保留不删（回退老版本仍可用）。
+pub const SETTING_AI_PROFILES: &str = "ai.profiles";
+/// 当前生效的配置档 id（对应 [`SETTING_AI_PROFILES`] 里的一项）
+pub const SETTING_AI_ACTIVE_PROFILE: &str = "ai.activeProfile";
+/// 老版本的单一接口地址（仅迁移用，新代码不再写）
+pub const SETTING_AI_BASE_URL: &str = "ai.baseUrl";
+/// 老版本的单一模型名（仅迁移用，新代码不再写）
+pub const SETTING_AI_MODEL: &str = "ai.model";
+/// 老版本的单一 API Key（仅迁移用，新代码不再写）。**明文存 settings 表**
+/// （无 keyring 依赖），设置页有明确提示；前端只能读到「有没有配」，读不到明文。
+pub const SETTING_AI_KEY: &str = "ai.apiKey";
+/// 每日推荐生成方式：`rule`（纯规则）/ `local`（本地模型精选）/ `server`（走 astral 音乐助手）
+pub const SETTING_DAILY_RECOMMEND_MODE: &str = "dailyRecommend.mode";
+/// 每日推荐当日缓存（JSON：日期 + 曲目 + 规则版本 + 最近若干天已推荐 key）
+pub const SETTING_DAILY_RECOMMEND_CACHE: &str = "dailyRecommend.cache";
+/// 每日推荐口味（推荐策略）：`heart` 心动 / `familiar` 常听 / `explore` 探索。
+/// 与 [`SETTING_DAILY_RECOMMEND_MODE`] 正交：mode 决定要不要叫模型，taste 决定怎么搜怎么排。
+pub const SETTING_DAILY_RECOMMEND_TASTE: &str = "dailyRecommend.taste";

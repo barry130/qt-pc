@@ -12,6 +12,7 @@
  *   同时尝试调一次 read-ack，后端不认也不影响。
  */
 import { useCallback, useEffect, useRef, useState } from "react";
+import { coerceBool as bool, coerceNumber as num, coerceString as str } from "@/lib/coerce";
 import { errMsg } from "@/lib/utils";
 import { migrateLegacyStorageKey } from "@/lib/legacy-storage";
 import * as ipc from "@/services/ipc";
@@ -149,19 +150,7 @@ function pickList(data: unknown): unknown[] {
   return [];
 }
 
-function str(v: unknown): string {
-  return typeof v === "string" ? v : v == null ? "" : String(v);
-}
-
-function num(v: unknown): number {
-  if (typeof v === "number") return v;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : 0;
-}
-
-function bool(v: unknown): boolean {
-  return v === true || v === "true" || v === 1 || v === "1";
-}
+// str/num/bool 的实现合并到 `@/lib/coerce`（coerce 族：外部 JSON 用，尽力转）。
 
 function formatTime(v: unknown): string {
   if (v == null || v === "") return "";

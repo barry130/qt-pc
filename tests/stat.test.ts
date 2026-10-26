@@ -163,3 +163,76 @@ describe("统计采集", () => {
     expect(__queueSizeForTest()).toBeLessThanOrEqual(500);
   });
 });
+
+// 队列持久化 schema（#30）：v2 起带版本号，且按**字符**封顶而不只按条数——
+// error 事件的 stack 最长 16KB，500 条能到 8MB，超 localStorage 配额后 setItem
+// 抛错、队列再也存不下，冷启动丢批。
+describe("统计队列持久化", () => {
+  /** 读回落盘内容（持久化只在 flush / hide 结算时发生） */
+  function storedQueue(): { v?: number; queue: Array<Record<string, unknown>> } {
+    const raw = window.localStorage.getItem("qt-stat-queue");
+    expect(raw).toBeTruthy();
+    return JSON.parse(raw as string) as {
+      v?: number;
+      queue: Array<Record<string, unknown>>;
+    };
+  }
+
+  it("落盘格式带 schema 版本号（v2），不再是裸数组", async () => {
+    await boot();
+    await flushStat();
+    const stored = storedQueue();
+    expect(stored.v).toBe(2);
+    expect(Array.isArray(stored.queue)).toBe(true);
+  });
+
+  it("能读回老版本（v1 裸数组）的待发队列，不丢历史事件", async () => {
+    window.localStorage.setItem(
+      "qt-stat-queue",
+      JSON.stringify([
+        {
+          evt: "page",
+          ts: 1,
+          deviceId: "legacy",
+          appVersion: "1.0.0",
+          model: "PC",
+          os: "Windows 10/11",
+          ch: "official",
+          release: "1.0.0",
+          page: "/legacy",
+        },
+      ]),
+    );
+    // 让上报永远挂起，队列才能留在内存里被检查
+    await boot();
+    const legacy = sentEvents().find((e) => e.page === "/legacy");
+    expect(legacy).toBeTruthy();
+    expect(legacy?.deviceId).toBe("legacy");
+  });
+
+  it("序列化超过字符上限时丢最旧，落盘不超配额", async () => {
+    await boot();
+    // 首条上报挂起占住 inFlight，后续事件全部堆在队列里
+    reportMock.mockImplementation(() => new Promise(() => {}));
+    trackStatError("js", "hang");
+    const bigStack = "s".repeat(16 * 1024);
+    for (let i = 0; i < 200; i += 1) {
+      trackStatError("js", `big${i}`, bigStack);
+    }
+    await settle();
+    // 1 条 hang + 200 条 16KB 错误 ≈ 3.3MB，已越过 2MB 字符上限
+    expect(__queueSizeForTest()).toBe(201);
+
+    // hide 结算会 persistQueue：超限部分应被裁掉
+    listenHandlers["stat_window_hidden"]?.();
+    const raw = window.localStorage.getItem("qt-stat-queue") as string;
+    expect(raw.length).toBeLessThanOrEqual(2 * 1024 * 1024);
+    const stored = storedQueue();
+    expect(stored.v).toBe(2);
+    expect(stored.queue.length).toBeLessThan(200);
+    // 丢的是最旧那批：最后一条（big199）必须还在
+    expect(
+      stored.queue.some((e) => String(e.message).startsWith("big19")),
+    ).toBe(true);
+  });
+});

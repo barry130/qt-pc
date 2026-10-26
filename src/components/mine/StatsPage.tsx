@@ -11,6 +11,7 @@ import { useSourceLabelFn } from "@/stores/sourceRegistry";
 import { IconButton } from "@/components/common/IconButton";
 import { ArtistAvatar } from "@/components/common/ArtistAvatar";
 import { SourceLogo } from "@/components/common/SourceLogo";
+import { SourceTag } from "@/components/common/SourceTag";
 import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 import { ListenReportDetail } from "./ListenReportDetail";
 import { ListenTrendSection } from "./ListenTrendSection";
@@ -132,7 +133,7 @@ export function StatsPage(): React.JSX.Element {
                 {data.tracks.slice(4).map((item, index) => <li key={`${item.track.platform}:${item.track.id}`} className="flex items-center gap-3 border-b border-border/50 py-2">
                   <span className="w-5 text-center text-xs tabular-nums text-muted-foreground">{index + 5}</span>
                   <button type="button" className="min-w-0 flex-1 text-left" onClick={() => playTrack(item.track)}>
-                    <span className="block truncate text-sm">{item.track.title}</span><span className="block truncate text-xs text-muted-foreground">{item.track.singer}</span>
+                    <span className="flex min-w-0 items-center gap-1.5 text-sm"><span className="truncate">{item.track.title}</span><SourceTag platform={item.track.platform} size="xs" /></span><span className="block truncate text-xs text-muted-foreground">{item.track.singer}</span>
                   </button>
                   <span className="shrink-0 text-right text-xs tabular-nums text-muted-foreground">{item.playCount} 次<span className="mt-0.5 block text-[11px]">{formatReportDuration(item.totalPlayedMs)}</span></span>
                   <IconButton label={`查看 ${item.track.title} 的统计`} onClick={() => setDetail({ kind: "tracks", entry: trackEntry(item) })}><ChevronRight /></IconButton>
@@ -182,7 +183,7 @@ function TrackStatCard(props: { item: PlayStatItem; rank: number; onPlay: () => 
         {cover ? <img src={cover} alt="" loading="lazy" className="h-full w-full object-cover transition-transform duration-150 group-hover:scale-[1.03]" /> : <span className="flex h-full w-full items-center justify-center text-2xl text-muted-foreground">{Array.from(item.track.title)[0] || "?"}</span>}
         <span className="absolute left-1.5 top-1.5 rounded-md bg-background/80 px-1.5 py-0.5 text-[11px] font-semibold tabular-nums backdrop-blur-sm">{props.rank}</span>
       </div>
-      <div className="mt-2 truncate text-sm font-medium">{item.track.title}</div>
+      <div className="mt-2 flex min-w-0 items-center gap-1.5 text-sm font-medium"><span className="truncate">{item.track.title}</span><SourceTag platform={item.track.platform} size="xs" /></div>
       <div className="mt-0.5 truncate text-xs text-muted-foreground">{item.track.singer}</div>
     </button>
     <div className="mt-1 flex items-center justify-between gap-1 text-[11px] tabular-nums text-muted-foreground"><span className="truncate">{item.playCount} 次 · {formatReportDuration(item.totalPlayedMs)}</span><IconButton label={`查看 ${item.track.title} 的统计`} onClick={props.onDetail}><ChevronRight /></IconButton></div>

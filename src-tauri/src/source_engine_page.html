@@ -435,6 +435,11 @@
           request: (url, options) =>
             invoke("builtin_request", { url, options: options || null }),
           platform: 1103,
+          // 包内诊断日志（如扫码 803 凭据提取失败的定位短语）→ 本地文件日志；
+          // 只写短语不落凭据值（包侧 AuthLog 契约），且绝不上报后端
+          log: (message) => {
+            void invoke("source_engine_log", { message: String(message) }).catch(() => {});
+          },
         };
         // 2) meta 槽：未装 = 数据面下线（干净态）；装载失败 → 上报 + 下线
         const state = await readState();
@@ -512,6 +517,10 @@
         // actualQuality 此时等于请求档 —— 上层按请求档处理，不许自己猜一个。
         let size = null;
         let actualQuality = "";
+        // officialNote：官方前置线路的尝试结论（诊断用；空串 = 官方命中或未参与）。
+        // 官方失败会静默落回第三方链，宿主只看得到命中的线路名——把「为什么没
+        // 走官方」透给 UI（2026-10-25 用户排查 QQ 官方线路未生效时没法自查）。
+        let officialNote = "";
         if (!entries) {
           error = "未安装数据包，在线播放不可用（首页可安装）";
         }
@@ -527,6 +536,8 @@
                 album: song.album,
                 quality: payload.quality,
                 duration: song.interval,
+                // kg 各档 hash 载体（v15 官方线路按档取 hash 匹配）
+                musicId: song.musicId,
               }),
             );
             url = parsed.url || "";
@@ -534,6 +545,7 @@
             referer = typeof parsed.referer === "string" ? parsed.referer : "";
             size = typeof parsed.size === "number" && isFinite(parsed.size) ? parsed.size : null;
             actualQuality = typeof parsed.actualQuality === "string" ? parsed.actualQuality : "";
+            officialNote = typeof parsed.officialNote === "string" ? parsed.officialNote : "";
           }
         } catch (err) {
           url = "";
@@ -541,6 +553,7 @@
           referer = "";
           size = null;
           actualQuality = "";
+          officialNote = "";
           error = String((err && err.message) || err);
         }
         await emitToMain("source-engine-response", {
@@ -551,6 +564,7 @@
           referer,
           size,
           actualQuality,
+          officialNote,
         });
       }
 

@@ -20,7 +20,7 @@ vi.mock("@/services/ipc", () => ({
 }));
 
 import * as ipc from "@/services/ipc";
-import { useAuthStore, isAdmin, canUseMusicAssistant, MUSIC_ASSISTANT_PERM, pullLikes } from "@/stores/auth";
+import { useAuthStore, isAdmin, pullLikes } from "@/stores/auth";
 import { useFavoritesStore } from "@/stores/favorites";
 import type { AuthSession } from "@/types";
 
@@ -163,45 +163,5 @@ describe("isAdmin（轻听管理权限判定）", () => {
     expect(isAdmin({ roles: [] })).toBe(false);
     expect(isAdmin({ roles: "qt_admin" })).toBe(false);
     expect(isAdmin({ roles: ["TESTER"] })).toBe(false);
-  });
-});
-
-// 音乐助手入口显隐：后端 /api/v1/app/ai/agents 已按 accessService.permitted() 过滤
-// 智能体，没有 user:ai:music:use 的账号请求回来就是空列表。前端用同一个码提前
-// 决定侧边栏入口是否渲染，规则与 isAdmin 完全一致（同一个 hasPermission）。
-describe("canUseMusicAssistant（音乐助手入口显隐）", () => {
-  it("持有 user:ai:music:use → true", () => {
-    expect(canUseMusicAssistant({ permissions: ["user:like:view", MUSIC_ASSISTANT_PERM] })).toBe(
-      true,
-    );
-  });
-
-  it("层级通配与超管照样认", () => {
-    expect(canUseMusicAssistant({ permissions: ["user:ai:music:*"] })).toBe(true);
-    expect(canUseMusicAssistant({ permissions: ["user:ai:*"] })).toBe(true);
-    expect(canUseMusicAssistant({ permissions: ["user:*"] })).toBe(true);
-    expect(canUseMusicAssistant({ permissions: ["*:*:*"] })).toBe(true);
-  });
-
-  it("只有同前缀的兄弟码 → false（通配不跨段误判）", () => {
-    // 会话/收藏/歌单权限不含「使用助手」本身
-    expect(
-      canUseMusicAssistant({
-        permissions: ["user:ai:conversation:view", "user:ai:music:favorite"],
-      }),
-    ).toBe(false);
-    expect(canUseMusicAssistant({ permissions: ["admin:ai:config:view"] })).toBe(false);
-    expect(canUseMusicAssistant({ permissions: ["user:ai:musicx:use"] })).toBe(false);
-  });
-
-  it("未登录 / 无权限数据 → false（未登录不展示入口）", () => {
-    expect(canUseMusicAssistant(null)).toBe(false);
-    expect(canUseMusicAssistant({})).toBe(false);
-    expect(canUseMusicAssistant({ permissions: [] })).toBe(false);
-    expect(canUseMusicAssistant({ permissions: "user:ai:music:use" })).toBe(false);
-  });
-
-  it("管理员码不隐含音乐助手权限（两者独立授权）", () => {
-    expect(canUseMusicAssistant({ permissions: ["admin:qt:admin"] })).toBe(false);
   });
 });

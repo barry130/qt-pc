@@ -1,11 +1,29 @@
 import { create } from "zustand";
 import { useMemo } from "react";
 import { listen } from "@tauri-apps/api/event";
-import type { RegistryQuality, RegistrySource } from "@/types";
-import { DEFAULT_SEARCH_PAGE_MAX, getSourceRegistry } from "@/source-scripts";
+import type {
+  RegistryQuality,
+  RegistrySource,
+  SourceQualityProfile,
+} from "@/types";
+import {
+  DEFAULT_SEARCH_PAGE_MAX,
+  fetchSourceQualityProfile,
+  getSourceRegistry,
+} from "@/source-scripts";
 import { onEnginePhaseChange } from "@/source-engine/client";
 import { useMusicSourceStore } from "@/stores/musicSource";
-import { SOURCE_META_CHANGED_EVENT, SOURCE_PACK_CHANGED_EVENT } from "@/services/ipc";
+import {
+  SOURCE_META_CHANGED_EVENT,
+  SOURCE_PACK_CHANGED_EVENT,
+} from "@/services/ipc";
+import { SOURCE_PLAY_LOGIN_CHANGED_EVENT, sourceVipTierOf } from "@/lib/source-auth";
+import {
+  setSourceDownloadQuality,
+  setSourcePlayQuality,
+  sourceDownloadQualityOf,
+  sourcePlayQualityOf,
+} from "@/lib/source-quality";
 
 /**
  * 音源/音质注册表（数据包声明，宿主不内置清单）——DESIGN §6.2/§6.4。
@@ -39,10 +57,17 @@ interface SourceRegistryStore {
    *  用户卸载全部音源包后首页仍残留旧榜单/歌单/新歌，根因就是这些页面的
    *  effect 只依赖 activeSourceId，卸载包不改变它）。 */
   generation: number;
+  /** 各源当前生效的音质档位清单（v12 契约，包侧 getSourceQualities 的缓存）：
+   *  「登录态 → 官方档位」的判定在数据包内（它持有播放面凭据与 officialQualities
+   *  自述），宿主只把账号会员档作为数据传入并缓存结果。注册表装载/登录态变化
+   *  后重查。 */
+  profiles: Record<string, SourceQualityProfile>;
   /** 幂等拉取：成功过就直接返回，未成功则发起/搭车同一次加载 */
   ensure: () => Promise<void>;
   /** 强制重取（失败静默——注册表不是页面主数据，维持原清单） */
   refresh: () => Promise<void>;
+  /** 重查各源生效音质清单（逐源调包侧 getSourceQualities，单源失败静默跳过） */
+  refreshQualityProfiles: () => Promise<void>;
 }
 
 let inflight: Promise<void> | null = null;
@@ -102,6 +127,7 @@ async function load(set: (partial: Partial<SourceRegistryStore>) => void): Promi
   bindPackListener();
   bindMetaListener();
   bindPhaseHook();
+  bindProfileListeners();
   try {
     const registry = await getSourceRegistry();
     const before = useSourceRegistryStore.getState();
@@ -113,6 +139,7 @@ async function load(set: (partial: Partial<SourceRegistryStore>) => void): Promi
       set({
         sources: [],
         qualities: [],
+        profiles: {},
         ready: false,
         ...(hadContent ? { generation: before.generation + 1 } : {}),
       });
@@ -131,6 +158,8 @@ async function load(set: (partial: Partial<SourceRegistryStore>) => void): Promi
       ...(changed ? { generation: before.generation + 1 } : {}),
     });
     validateActiveSource(registry.sources);
+    // 注册表落地后重查各源生效音质清单（换包可能换官方档位自述）
+    void useSourceRegistryStore.getState().refreshQualityProfiles();
   } finally {
     inflight = null;
   }
@@ -152,6 +181,7 @@ export const useSourceRegistryStore = create<SourceRegistryStore>()((set, get) =
   qualities: [],
   ready: false,
   generation: 0,
+  profiles: {},
   ensure: () => {
     if (get().ready) return Promise.resolve();
     if (inflight) return inflight;
@@ -163,7 +193,75 @@ export const useSourceRegistryStore = create<SourceRegistryStore>()((set, get) =
     inflight = load(set);
     return inflight;
   },
+  refreshQualityProfiles: async () => {
+    const sources = get().sources;
+    if (sources.length === 0) return;
+    const entries = await Promise.all(
+      sources.map(async (s): Promise<[string, SourceQualityProfile] | null> => {
+        try {
+          // 会员档是账号数据（宿主持有），判定逻辑在包内：官方清单按它过滤 min 档位
+          const profile = await fetchSourceQualityProfile(s.id, sourceVipTierOf(s.id));
+          return [s.id, profile];
+        } catch {
+          // 单源失败（引擎忙/旧包）不拖垮其它源；profile 缺失 = 回落普通子集
+          return null;
+        }
+      }),
+    );
+    const profiles: Record<string, SourceQualityProfile> = {};
+    for (const entry of entries) {
+      if (entry !== null) profiles[entry[0]] = entry[1];
+    }
+    set({ profiles });
+    migrateStaleQualities(profiles);
+  },
 }));
+
+/**
+ * 清单翻面后的存量档位迁移（2026-10-25 用户需求：切开关后没有之前那个音质，
+ * 直接默认最高）：官方清单和平台清单**双向**生效——原存档位（官方档名或第三
+ * 方档名）不在当前生效清单里 → 该平台播放/下载档位自动改存清单最高档。官方
+ * 清单来自包侧 profile（已按会员档过滤）；平台清单回落数据包声明的 qualities
+ * 子集。写入走 setSource*Quality（落库+推引擎+广播），展示与取链下一次读到
+ * 的就是迁移后的值；setSource*Quality 内部值没变会短路，不会循环。
+ */
+function migrateStaleQualities(profiles: Record<string, SourceQualityProfile>): void {
+  const sources = useSourceRegistryStore.getState().sources;
+  for (const [source, profile] of Object.entries(profiles)) {
+    const ids =
+      profile.mode === "official" && profile.qualities.length > 0
+        ? profile.qualities.map((q) => q.id)
+        : (sources.find((s) => s.id === source)?.qualities ?? []);
+    if (ids.length === 0) continue;
+    const highest = ids[ids.length - 1];
+    if (!ids.includes(sourcePlayQualityOf(source))) {
+      void setSourcePlayQuality(source, highest).catch(() => undefined);
+    }
+    if (!ids.includes(sourceDownloadQualityOf(source))) {
+      void setSourceDownloadQuality(source, highest).catch(() => undefined);
+    }
+  }
+}
+
+/**
+ * 生效音质清单的刷新时机（模块内只绑一次）：播放面登录态变化（账号写入/
+ * 开关切换/退出）时清单必然翻面——250ms 去抖等 setAuth 对包的灌入落地后再
+ * 重查，避免读到旧凭据状态。
+ */
+let profileListenersBound = false;
+let profileRefreshTimer: number | null = null;
+function bindProfileListeners(): void {
+  if (profileListenersBound) return;
+  profileListenersBound = true;
+  const debouncedRefresh = (): void => {
+    if (profileRefreshTimer !== null) window.clearTimeout(profileRefreshTimer);
+    profileRefreshTimer = window.setTimeout(() => {
+      profileRefreshTimer = null;
+      void useSourceRegistryStore.getState().refreshQualityProfiles();
+    }, 250);
+  };
+  window.addEventListener(SOURCE_PLAY_LOGIN_CHANGED_EVENT, debouncedRefresh);
+}
 
 // ---------- 非响应式读取（事件/工具层用；组件请用下面的 hook 版本） ----------
 
@@ -182,6 +280,19 @@ export function useSourceLabel(id: string): string {
   return useSourceRegistryStore((s) => {
     if (id === "local") return "本地";
     return s.sources.find((item) => item.id === id)?.name ?? "未知";
+  });
+}
+
+/**
+ * 音源**简称**（`sourceRegistry` 的 `short`，如「网易云」「QQ」）：歌名旁的小徽标用。
+ * 列表里歌名本来就长，全名（「网易云音乐」）会把歌名挤掉一截；旧版数据包没有
+ * `short` 字段时退回全名，再不行退回「未知」——徽标宁可长一点，也不能是空的。
+ */
+export function useSourceShort(id: string): string {
+  return useSourceRegistryStore((s) => {
+    if (id === "local") return "本地";
+    const found = s.sources.find((item) => item.id === id);
+    return found?.short || found?.name || "未知";
   });
 }
 
@@ -272,6 +383,21 @@ export function useAnySourceSupports(feature: SourceFeature): boolean {
   });
 }
 
+/**
+ * 官方档位清单 → 展示模型（v12）：包侧 getSourceQualities 已经完成「登录态
+ * 判定 + 会员档过滤」（判定逻辑在数据包内，宿主不写死平台知识），这里只把
+ * profile 缓存映射成展示模型。profile 缺失/官方清单未生效返回 []（调用方
+ * 回落注册表普通子集）。
+ */
+function officialQualitiesFromProfile(
+  profile: SourceQualityProfile | undefined,
+): RegistryQuality[] {
+  if (profile?.mode !== "official") return [];
+  return profile.qualities
+    .filter((q) => typeof q?.id === "string" && q.id.length > 0 && typeof q?.name === "string")
+    .map((q) => ({ id: q.id, name: q.name }));
+}
+
 /** ---------- 音质/排序门控（v5 契约） ---------- */
 
 /**
@@ -303,6 +429,11 @@ export function qualityRanksOf(qualities: RegistryQuality[]): string[] {
  * 档位（如 B 站无真无损，flac 不再出现在音质选项里）。声明的 id 与全局档位
  * 对不上时退回全部，宁可多展示也不把选项清空。
  *
+ * v12 生效档位清单（包侧判定）：数据包 getSourceQualities 已按「播放面登录
+ * 态 + officialQualities 自述 + 会员档」算好该源当前生效的清单，宿主只缓存
+ * （store.profiles）并展示——登录后看到的就是官方那几档（官方名），未登录
+ * 或包侧判定未生效时回落注册表普通子集。profile 未拉到/为空再回普通子集。
+ *
  * 实现注意：zustand v5 的 selector 就是 useSyncExternalStore 的 getSnapshot，
  * 每次调用返回新数组（filter/`?? []`）会让快照不稳定并陷入无限重渲染——
  * 先取稳定的 store 字段，再用 useMemo 派生。
@@ -310,17 +441,36 @@ export function qualityRanksOf(qualities: RegistryQuality[]): string[] {
 export function useSourceQualities(id: string | null): RegistryQuality[] {
   const sources = useSourceRegistryStore((s) => s.sources);
   const qualities = useSourceRegistryStore((s) => s.qualities);
+  const profiles = useSourceRegistryStore((s) => s.profiles);
   return useMemo(() => {
-    const declared =
-      id === null ? undefined : sources.find((item) => item.id === id)?.qualities;
+    const source = id === null ? undefined : sources.find((item) => item.id === id);
+    const official = officialQualitiesFromProfile(id === null ? undefined : profiles[id]);
+    if (official.length > 0) return official;
+    const declared = source?.qualities;
     if (declared === undefined || declared.length === 0) return qualities;
     const out = qualities.filter((q) => declared.includes(q.id));
     return out.length > 0 ? out : qualities;
-  }, [sources, qualities, id]);
+  }, [sources, qualities, profiles, id]);
 }
 
 /** 稳定的空排序数组（快照稳定，见 useSourceQualities 的实现注意） */
 const EMPTY_SORTS: { id: string; name: string }[] = [];
+
+/**
+ * 某源当前生效的音质档位清单（**非响应式**函数版，与 useSourceQualities 同
+ * 口径）：store.profiles 里包侧判定的官方清单优先，否则包侧 qualities 子集，
+ * 再退全局档位。音源账号页每张卡片的音质下拉用它（.map 里不能调 hook）。
+ */
+export function sourceQualityOptionsOf(id: string): RegistryQuality[] {
+  const state = useSourceRegistryStore.getState();
+  const source = state.sources.find((item) => item.id === id);
+  const official = officialQualitiesFromProfile(state.profiles[id]);
+  if (official.length > 0) return official;
+  const declared = source?.qualities;
+  if (declared === undefined || declared.length === 0) return state.qualities;
+  const out = state.qualities.filter((q) => declared.includes(q.id));
+  return out.length > 0 ? out : state.qualities;
+}
 
 /**
  * 某源的歌单广场排序选项（v5 契约）。未声明 / 空数组（qq/kw/bili）→ []，
@@ -335,21 +485,62 @@ export function usePlaylistSorts(id: string | null): { id: string; name: string 
   }, [sources, id]);
 }
 
+/** 该源当前生效的官方档位 id 清单（profile 缓存，非响应式；未生效返回 []） */
+function officialProfileIds(platform: string | null | undefined): string[] {
+  if (platform == null) return [];
+  return officialQualitiesFromProfile(useSourceRegistryStore.getState().profiles[platform]).map(
+    (q) => q.id,
+  );
+}
+
+/**
+ * 把请求档归一到该源当前生效的档位面（v12）：官方清单生效时旧档名经包侧下发
+ * 的 aliases 映射到官方 level id（映射表随包，宿主不再内置平台知识）；清单
+ * 未生效或映射后仍不在清单里 = 原样返回。播放预解析、引擎取链桥与钳位共用，
+ * 保证「用户请求的档」和「阶梯/比对用的档」同一口径。放在本模块（而非
+ * quality-fallback）：它要读注册表状态，而 quality-fallback 已反向依赖本模块，
+ * 放那边会成环。
+ */
+export function normalizeQualityForSource(platform: string, wanted: string): string {
+  const state = useSourceRegistryStore.getState();
+  const official = officialProfileIds(platform);
+  if (official.length === 0 || official.includes(wanted)) return wanted;
+  const alias = state.profiles[platform]?.aliases[wanted];
+  return alias !== undefined && official.includes(alias) ? alias : wanted;
+}
+
 /**
  * 把期望音质钳到该源声明可用的档位（v5 契约；非响应式函数版，事件/下载
  * 发起层用）。不可用时取「最接近的一档」：先向下降（想要 flac 但该源只声明
  * 320/128 → 320），降不到再取最接近的更高一档。未声明（旧包）原样返回。
+ *
+ * v12：包侧判定官方清单生效时，可用档整体换成官方清单（与 useSourceQualities
+ * 同口径——下载发起的钳位也要跟展示一致）。
  */
 export function clampQualityForPlatform(
   platform: string | null | undefined,
-  wanted: string,
+  rawWanted: string,
 ): string {
   const state = useSourceRegistryStore.getState();
-  const declared =
-    platform == null ? undefined : state.sources.find((item) => item.id === platform)?.qualities;
+  const source = platform == null ? undefined : state.sources.find((item) => item.id === platform);
+  const official = officialProfileIds(platform);
+  // 存量请求档可能是旧第三方档名（官方清单生效时）：经包侧 aliases 归一到
+  // 官方 level，否则旧档名不在官方清单里、被钳到清单最高档（jymaster）
+  const wanted =
+    official.length > 0 && platform != null
+      ? normalizeQualityForSource(platform, rawWanted)
+      : rawWanted;
+  const declared = official.length > 0 ? official : source?.qualities;
   if (declared === undefined || declared.length === 0) return wanted;
   if (declared.includes(wanted)) return wanted;
   const ranks = qualityRanksOf(state.qualities);
+  if (official.length > 0) {
+    // 官方档 id（standard…jymaster）不在全局档位表里：把官方清单（低→高）
+    // 反转后插到高位，官方档之间才有正确的高低关系（jymaster→jyeffect→
+    // hires→…逐级降档），否则下面 indexOf 全是 -1、想要官方档会被错误钳到
+    // 清单最低档。
+    ranks.unshift(...[...official].reverse());
+  }
   // 档位序为空（注册表还没装好/旧包没给）＝对高低一无所知，此时不动请求值：
   // 与「未声明就不动」同一保守口径，宁可原样发出去让包侧按线路能力兜底。
   if (ranks.length === 0) return wanted;

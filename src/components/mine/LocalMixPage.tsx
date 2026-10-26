@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { ArrowLeft, Loader2, Play, RefreshCw } from "lucide-react";
 import type { LocalMixSummary, Track } from "@/types";
@@ -6,6 +6,8 @@ import * as ipc from "@/services/ipc";
 import { errMsg } from "@/lib/utils";
 import { usePlayerStore } from "@/stores/player";
 import { TrackList } from "@/components/discovery/TrackList";
+import { TrackSortSelect } from "@/components/TrackSortSelect";
+import { DEFAULT_TRACK_SORT, parseTrackSort, sortTracks } from "@/lib/track-sort";
 
 /** 合辑详情实时重算，不把动态规则合辑保存成静态歌单。 */
 export function LocalMixPage({ mixKey }: { mixKey: string }): React.JSX.Element {
@@ -13,6 +15,11 @@ export function LocalMixPage({ mixKey }: { mixKey: string }): React.JSX.Element 
   const playQueue = usePlayerStore((s) => s.playQueue);
   const [mix, setMix] = useState<LocalMixSummary | null>(null);
   const [tracks, setTracks] = useState<Track[]>([]);
+  /** 排序（默认顺序）：只改显示顺序，不改数据本身；下拉选项与 uniappx 一致 */
+  const [sortValue, setSortValue] = useState(DEFAULT_TRACK_SORT);
+  /** 排序作用在「可见列表」上，所以播放全部 / 批量管理 / TrackList 拿的都是这个顺序 */
+  const { key: sortKey, desc: sortDesc } = parseTrackSort(sortValue);
+  const sortedTracks = useMemo(() => sortTracks(tracks, sortKey, sortDesc), [tracks, sortKey, sortDesc]);
   const [loading, setLoading] = useState(true);
   const [playing, setPlaying] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -41,7 +48,7 @@ export function LocalMixPage({ mixKey }: { mixKey: string }): React.JSX.Element 
     setPlaying(true);
     setError(null);
     try {
-      await playQueue(tracks, 0);
+      await playQueue(sortedTracks, 0);
     } catch (err) {
       setError(errMsg(err));
     } finally {
@@ -83,11 +90,15 @@ export function LocalMixPage({ mixKey }: { mixKey: string }): React.JSX.Element 
         </button>
       </header>
       {error && <p role="alert" className="px-5 pt-4 text-sm text-destructive">{error}</p>}
+      <div className="flex shrink-0 items-center justify-end px-6 pb-2">
+        <TrackSortSelect value={sortValue} onChange={setSortValue} />
+      </div>
+
       <div className="min-h-0 flex-1 overflow-y-auto p-5">
         {loading ? (
           <p className="py-12 text-center text-sm text-muted-foreground">正在整理合辑…</p>
         ) : tracks.length > 0 ? (
-          <TrackList tracks={tracks} showIndex showCollect showDownload />
+          <TrackList tracks={sortedTracks} showIndex showCollect showDownload />
         ) : !error ? (
           <p className="py-12 text-center text-sm text-muted-foreground">暂时没有足够的曲目，听听歌后再来看看。</p>
         ) : null}

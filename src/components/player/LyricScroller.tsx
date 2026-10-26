@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { formatTime, type LyricLine, type LyricWord } from "@/lib/lrc";
 import { cn } from "@/lib/utils";
 
@@ -15,6 +15,10 @@ interface LyricDrag {
   previousScrollBehavior: string;
   active: boolean;
   targetIndex: number;
+  /** 激活拖动时缓存的行几何量：move 里逐行读 offsetTop/clientHeight 会强制同步布局。 */
+  rowGeometry: Array<{ top: number; half: number } | null> | null;
+  /** 建缓存时的 active 行；换行会改行高布局（text-xl ↔ text-base），届时整组重建。 */
+  geometryAtIndex: number;
 }
 
 function releaseDrag(drag: LyricDrag | null): void {
@@ -51,6 +55,22 @@ export function LyricScroller(props: {
   const [holding, setHolding] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [targetIndex, setTargetIndex] = useState(-1);
+
+  // onSeekMs 的 latest-ref：调用方（PlayingPage）传的是内联箭头，每次渲染都换
+  // 身份；行组件靠 memo 挡住无关重渲染，必须喂给它身份稳定的提交函数。
+  // ref 在提交后同步，点击/键盘提交必然晚于当次提交，读到的必是最新回调。
+  const onSeekRef = useRef(onSeekMs);
+  useEffect(() => {
+    onSeekRef.current = onSeekMs;
+  });
+  const seekLine = useCallback((ms: number): void => {
+    onSeekRef.current(ms);
+  }, []);
+  // moveDrag 的几何缓存失效判定要用最新 active 行，不能拿渲染闭包里的旧值。
+  const activeIndexRef = useRef(activeIndex);
+  useEffect(() => {
+    activeIndexRef.current = activeIndex;
+  });
 
   const cancelDrag = useCallback((suppressClick = true): void => {
     const drag = dragRef.current;
@@ -130,6 +150,8 @@ export function LyricScroller(props: {
       previousScrollBehavior: container.style.scrollBehavior,
       active: false,
       targetIndex: -1,
+      rowGeometry: null,
+      geometryAtIndex: -1,
     };
     setHolding(true);
     container.style.userSelect = "none";
@@ -158,13 +180,25 @@ export function LyricScroller(props: {
     const maxScroll = Math.max(0, container.scrollHeight - container.clientHeight);
     container.scrollTop = Math.max(0, Math.min(maxScroll, drag.startScrollTop - deltaY));
     const center = container.scrollTop + container.clientHeight / 2;
+    // 行几何量读一遍缓存在拖动状态里：pointermove 高频触发，每帧全表读
+    // offsetTop/clientHeight 会强制同步布局，是拖动掉帧的主因之一。
+    // 换 active 行会改行高布局，发现后整组重建（罕见，代价可忽略）。
+    if (drag.rowGeometry === null || drag.geometryAtIndex !== activeIndexRef.current) {
+      drag.rowGeometry = lines.map((_line, index) => {
+        const item = itemRefs.current[index];
+        return item !== null && item !== undefined
+          ? { top: item.offsetTop, half: item.clientHeight / 2 }
+          : null;
+      });
+      drag.geometryAtIndex = activeIndexRef.current;
+    }
     let closest = -1;
     let distance = Infinity;
-    for (let index = 0; index < lines.length; index += 1) {
+    for (let index = 0; index < drag.rowGeometry.length; index += 1) {
       const line = lines[index];
-      const item = itemRefs.current[index];
-      if (!item || !Number.isFinite(line.timeMs) || line.timeMs < 0) continue;
-      const nextDistance = Math.abs(item.offsetTop + item.clientHeight / 2 - center);
+      const geometry = drag.rowGeometry[index];
+      if (geometry === null || !Number.isFinite(line.timeMs) || line.timeMs < 0) continue;
+      const nextDistance = Math.abs(geometry.top + geometry.half - center);
       if (nextDistance < distance) {
         closest = index;
         distance = nextDistance;
@@ -215,53 +249,20 @@ export function LyricScroller(props: {
       >
         <div className="mx-auto flex max-w-xl flex-col gap-5 py-[40%]">
           {lines.map((line, index) => (
-            <div
+            <LyricLineRow
               key={index}
-              ref={(el) => { itemRefs.current[index] = el; }}
-              data-lyric-index={index}
-              data-seek-target={dragging && targetIndex === index ? "true" : undefined}
-              role={line.timeMs >= 0 ? "button" : undefined}
-              tabIndex={line.timeMs >= 0 ? 0 : undefined}
-              onClick={line.timeMs >= 0 ? () => onSeekMs(line.timeMs) : undefined}
-              onKeyDown={line.timeMs >= 0 ? (event) => {
-                if (event.key !== "Enter" && event.key !== " ") return;
-                event.preventDefault();
-                cancelDrag();
-                onSeekMs(line.timeMs);
-              } : undefined}
-              className={cn(
-                "rounded-md text-center transition-all duration-300",
-                line.timeMs >= 0 && (dragging
-                  ? "cursor-grabbing"
-                  : "cursor-pointer hover:text-lyric-highlight/70 focus-visible:outline-none"),
-                index === activeIndex
-                  ? "scale-105 text-xl font-semibold text-lyric-highlight"
-                  : "text-base text-lyric-inactive",
-                dragging && targetIndex === index && "bg-primary/10 ring-1 ring-primary/30",
-              )}
-            >
-              {index === activeIndex && line.words !== undefined && line.words.length > 0 ? (
-                <div>
-                  {line.words.map((word, wordIndex) => (
-                    <KaraokeWord key={wordIndex} word={word} elapsedMs={positionMs - line.timeMs} />
-                  ))}
-                </div>
-              ) : (
-                <div>{line.text || "…"}</div>
-              )}
-              {line.romanization && (
-                <div className={cn("mt-0.5 text-xs", index === activeIndex
-                  ? "text-lyric-highlight/60" : "text-lyric-inactive/50")}>
-                  {line.romanization}
-                </div>
-              )}
-              {line.translation && (
-                <div className={cn("mt-1 text-sm", index === activeIndex
-                  ? "text-lyric-highlight/80" : "text-lyric-inactive/70")}>
-                  {line.translation}
-                </div>
-              )}
-            </div>
+              line={line}
+              index={index}
+              active={index === activeIndex}
+              dragging={dragging}
+              target={dragging && targetIndex === index}
+              // 逐字染色只发生在 active 行；其余行传 0（常量），播放中
+              // positionMs 变化才不会击穿整张列表的 memo。
+              positionMs={index === activeIndex ? positionMs : 0}
+              itemRefs={itemRefs}
+              onSeekMs={seekLine}
+              cancelDrag={cancelDrag}
+            />
           ))}
         </div>
       </div>
@@ -282,6 +283,78 @@ export function LyricScroller(props: {
     </div>
   );
 }
+
+/**
+ * 单行歌词。memo + 窄 props：播放期间 positionMs 高频变化，没有这层 memo 时
+ * 整张歌词列表跟着重渲染；现在只有 active 行收到新 positionMs，其余行 props
+ * 全等、跳过渲染（拖动起止与目标行切换时才个别行重渲染）。
+ */
+const LyricLineRow = memo(function LyricLineRow(props: {
+  line: LyricLine;
+  index: number;
+  active: boolean;
+  dragging: boolean;
+  target: boolean;
+  positionMs: number;
+  itemRefs: React.RefObject<Array<HTMLDivElement | null>>;
+  onSeekMs: (ms: number) => void;
+  cancelDrag: () => void;
+}): React.JSX.Element {
+  const { line, index, active, dragging, target, positionMs, itemRefs, onSeekMs, cancelDrag } = props;
+  // 行自己的 ref 回调：itemRefs 对象身份稳定、index 不变，回调身份随之稳定，
+  // memo 比较才会通过（写在父组件 map 里的内联 ref 每次渲染都是新函数）。
+  const setItemRef = useCallback((el: HTMLDivElement | null): void => {
+    itemRefs.current[index] = el;
+  }, [index, itemRefs]);
+  return (
+    <div
+      ref={setItemRef}
+      data-lyric-index={index}
+      data-seek-target={target ? "true" : undefined}
+      role={line.timeMs >= 0 ? "button" : undefined}
+      tabIndex={line.timeMs >= 0 ? 0 : undefined}
+      onClick={line.timeMs >= 0 ? () => onSeekMs(line.timeMs) : undefined}
+      onKeyDown={line.timeMs >= 0 ? (event) => {
+        if (event.key !== "Enter" && event.key !== " ") return;
+        event.preventDefault();
+        cancelDrag();
+        onSeekMs(line.timeMs);
+      } : undefined}
+      className={cn(
+        "rounded-md text-center transition-all duration-300",
+        line.timeMs >= 0 && (dragging
+          ? "cursor-grabbing"
+          : "cursor-pointer hover:text-lyric-highlight/70 focus-visible:outline-none"),
+        active
+          ? "scale-105 text-xl font-semibold text-lyric-highlight"
+          : "text-base text-lyric-inactive",
+        target && "bg-primary/10 ring-1 ring-primary/30",
+      )}
+    >
+      {active && line.words !== undefined && line.words.length > 0 ? (
+        <div>
+          {line.words.map((word, wordIndex) => (
+            <KaraokeWord key={wordIndex} word={word} elapsedMs={positionMs - line.timeMs} />
+          ))}
+        </div>
+      ) : (
+        <div>{line.text || "…"}</div>
+      )}
+      {line.romanization && (
+        <div className={cn("mt-0.5 text-xs", active
+          ? "text-lyric-highlight/60" : "text-lyric-inactive/50")}>
+          {line.romanization}
+        </div>
+      )}
+      {line.translation && (
+        <div className={cn("mt-1 text-sm", active
+          ? "text-lyric-highlight/80" : "text-lyric-inactive/70")}>
+          {line.translation}
+        </div>
+      )}
+    </div>
+  );
+});
 
 /** 逐字染色保留连续渐变：词唱到一半时只有半边高亮。 */
 function KaraokeWord(props: { word: LyricWord; elapsedMs: number }): React.JSX.Element {

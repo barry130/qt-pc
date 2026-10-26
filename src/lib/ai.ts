@@ -18,6 +18,14 @@
  *    所以客户端必须在**提交之前**自己搜索，把候选放进 `context.musicCandidates`。
  */
 import type { Track } from "@/types";
+import {
+  asArray as arr,
+  asBoolean as bool,
+  asNumber as num,
+  asRecord,
+  asRecordOrNull as objOrNull,
+  asString as str,
+} from "@/lib/coerce";
 
 /** 默认拉取的历史消息条数（后端 AiConversationService.DEFAULT_PAGE_SIZE = 30） */
 export const AI_MESSAGE_PAGE_SIZE = 30;
@@ -183,34 +191,8 @@ export interface AiChatMessage {
 }
 
 // ==================== 规整工具 ====================
-
-function asRecord(v: unknown): Record<string, unknown> {
-  return v !== null && typeof v === "object" && !Array.isArray(v)
-    ? (v as Record<string, unknown>)
-    : {};
-}
-
-function str(v: unknown, fallback = ""): string {
-  return typeof v === "string" ? v : fallback;
-}
-
-function num(v: unknown, fallback = 0): number {
-  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
-}
-
-function bool(v: unknown, fallback = false): boolean {
-  return typeof v === "boolean" ? v : fallback;
-}
-
-function objOrNull(v: unknown): Record<string, unknown> | null {
-  return v !== null && typeof v === "object" && !Array.isArray(v)
-    ? (v as Record<string, unknown>)
-    : null;
-}
-
-function arr(v: unknown): unknown[] {
-  return Array.isArray(v) ? v : [];
-}
+// str/num/bool/asRecord/objOrNull/arr 的实现已合并到 `@/lib/coerce`
+// （strict 族：只认 typeof，不认就给默认值）。这里只留别名，调用处不用改。
 
 /** 取对象里的字符串字段（事件 data 用） */
 export function strOf(source: Record<string, unknown> | null, key: string): string {
@@ -570,6 +552,41 @@ export function searchKeyword(content: string): string {
   text = text.replace(/\s+/g, " ").trim();
   if (text.length === 0) text = content.replace(/\s+/g, " ").trim();
   return text.length > 40 ? text.substring(0, 40) : text;
+}
+
+/**
+ * 追问检测：用户这轮话里有没有新的音乐主题词。
+ *
+ * 「再来点」「换一批」「还有吗」「多来几首」这类追问抽不出主题词
+ * （searchKeyword 后只剩「再/一批/更多」这种量词），继续用它们搜索只会
+ * 捞回与上一轮主题无关的垃圾结果。此时应复用上一轮的搜索词拉更多候选，
+ * 而不是用退化词重新搜。返回 true 表示该沿用上一轮主题。
+ */
+export function isFollowUpWithoutTopic(content: string, keyword: string): boolean {
+  const original = content.replace(/\s+/g, "");
+  if (original.length > 8) return false;
+  const followUps = [
+    "再来点",
+    "再来几首",
+    "再找点",
+    "再推荐",
+    "换一批",
+    "换一组",
+    "还有吗",
+    "多来点",
+    "多来几首",
+    "继续",
+    "更多",
+    "不够",
+    "就这些吗",
+    "还有别的吗",
+  ];
+  for (const phrase of followUps) {
+    if (original.includes(phrase)) return true;
+  }
+  // 抽出来的词只剩量词/数字（「来20首」→「20首」）也算追问
+  const stripped = keyword.replace(/[0-90-9０-９首fdsb]+/gi, "").trim();
+  return stripped.length === 0 && keyword.length > 0;
 }
 
 /** 工具编码 → 进行中的中文提示 */

@@ -10,8 +10,8 @@
  *    收尾只能靠「满页 = 可能还有下一页」；传超限值会在第 1 页就被判成到底
  *    （qq 要 100 返回 0 条、酷狗恒给 30），正是「只出一页」的来源之一。
  * 2. 聚合模式一次打四源、只能有一个 size ⇒ 取所有源的最小值；「还有下一页」
- *    看**任一源是否满页**，不能看合并后的总数（合并总数 = 源数 × 每页条数，
- *    会在最后一页把「四源各剩几条」误判成还满一页）。
+ *    由数据包 `searchMerged` 回的 `full`（**合并前**是否有任一源满页）决定，
+ *    不能看合并后的条数（合并去重后必然变少，会在第 1 页就误判到底）。
  * 3. 上游无视 page 反复返回同一页时必须收尾：否则 hasMore 恒真、哨兵一相交就
  *    无限续页，把上游打爆。
  * 4. 页签（`?type=`）由 URL 决定。搜索页不常驻，从歌单/歌手/专辑详情点返回是
@@ -38,7 +38,10 @@ const api = vi.hoisted(() => ({
   searchArtists: vi.fn(async (..._args: unknown[]) => [] as unknown[]),
   searchAlbums: vi.fn(async (..._args: unknown[]) => [] as unknown[]),
   searchAllBatches: vi.fn(async (..._args: unknown[]) => [] as unknown[]),
-  getHotWords: vi.fn(async () => [] as string[]),
+  // 聚合模式走「合并去重后的单列表」：数据包 `searchMerged` 负责合并/去重/排序，
+  // 并回 `full`（合并前是否有任一源满页）—— 宿主拿不到各源原始条数，只能信它。
+  searchMergedPage: vi.fn(async (..._args: unknown[]) => ({ tracks: [] as unknown[], full: false })),
+  getAllHotWords: vi.fn(async () => [] as string[]),
 }));
 vi.mock("@/source-scripts", () => ({
   ...api,
@@ -55,6 +58,11 @@ vi.mock("@/lib/search-history", () => ({
   addSearchHistory: vi.fn(async () => {}),
   removeSearchHistoryItem: vi.fn(async () => {}),
   clearSearchHistory: vi.fn(async () => {}),
+}));
+
+// 聚合搜索音源设置（设置 → 音源包）：本文件只关心翻页，按默认「全部音源」处理
+vi.mock("@/lib/aggregate-sources", () => ({
+  readAggregateSources: vi.fn(async () => null),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => ({})) }));
@@ -122,13 +130,17 @@ function track(id: string, platform = "qq"): Track {
   };
 }
 
-/** 只填 SearchPage 读得到的字段（id/name/searchPageMax） */
+/**
+ * 只填 SearchPage 读得到的字段（id/name/short/searchPageMax）。
+ * 行内的平台标显示的是 `short`（简称），所以这里让 short 带着「源」前缀、
+ * name 用另一份文案 —— 断言命中 `源qq` 就说明确实读的是简称。
+ */
 function seedRegistry(entries: { id: string; searchPageMax: number }[]): void {
   useSourceRegistryStore.setState({
     sources: entries.map((e) => ({
       id: e.id,
-      name: `源${e.id}`,
-      short: e.id,
+      name: `${e.id}音乐`,
+      short: `源${e.id}`,
       color: "#000000",
       searchPageMax: e.searchPageMax,
     })),
@@ -227,77 +239,90 @@ describe("搜索页翻页", () => {
     });
   });
 
-  it("聚合模式：size 取所有源的最小 searchPageMax，满页判定看任一源", async () => {
+  it("聚合模式：size 取所有源的最小 searchPageMax，满页依据由数据包给", async () => {
     seedRegistry([
       { id: "qq", searchPageMax: 50 },
       { id: "bili", searchPageMax: 20 },
     ]);
     useMusicSourceStore.setState({ activeSourceId: "qq", aggregateMode: true });
     router.search = { q: "稻香" };
-    // 两源各 12 条：合并 24 ≥ 20，但没有任何一源满页 → 到底（按合并总数判会白翻一轮）
-    api.searchAllBatches.mockImplementation(async () => [
-      { source: "qq", tracks: Array.from({ length: 12 }, (_, i) => track(`q${i}`, "qq")) },
-      { source: "bili", tracks: Array.from({ length: 12 }, (_, i) => track(`b${i}`, "bili")) },
-    ]);
+    // 两源各 12 条、数据包合并后仍报 full:false（没有任何一源满页）→ 到底
+    api.searchMergedPage.mockResolvedValue({
+      tracks: [
+        ...Array.from({ length: 12 }, (_, i) => track(`q${i}`, "qq")),
+        ...Array.from({ length: 12 }, (_, i) => track(`b${i}`, "bili")),
+      ],
+      full: false,
+    });
 
     const { container } = render(<SearchPage />);
     await act(settle);
 
-    expect(api.searchAllBatches).toHaveBeenCalledWith("稻香", 1, 20);
-    // 分组头用的是注册表展示名
+    expect(api.searchMergedPage).toHaveBeenCalledWith("稻香", 1, 20, {
+      sources: undefined,
+      preferSource: "qq",
+    });
+    // 合并成一条列表：每个源的行都在，但**没有**「源qq 12 首」这种分组头
     expect(container.textContent).toContain("源qq");
     expect(container.textContent).toContain("源bili");
+    expect(container.textContent).not.toContain("12 首");
     expect(container.textContent).toContain("已经到底了");
 
     await act(async () => {
       scrollToBottom();
       await settle();
     });
-    expect(api.searchAllBatches).toHaveBeenCalledTimes(1);
+    expect(api.searchMergedPage).toHaveBeenCalledTimes(1);
   });
 
-  it("聚合模式：有源满页时续页，续页结果并进同一分组", async () => {
+  it("聚合模式：数据包报满页时续页，续页结果并进同一条列表", async () => {
     seedRegistry([
       { id: "qq", searchPageMax: 50 },
       { id: "bili", searchPageMax: 2 },
     ]);
     useMusicSourceStore.setState({ activeSourceId: "qq", aggregateMode: true });
     router.search = { q: "稻香" };
-    api.searchAllBatches.mockImplementation(async (_kw: unknown, page: unknown) => {
+    api.searchMergedPage.mockImplementation(async (_kw: unknown, page: unknown) => {
       if (page === 1) {
-        return [
-          { source: "qq", tracks: [track("q1", "qq")] },
-          { source: "bili", tracks: [track("b1", "bili"), track("b2", "bili")] },
-        ];
+        return { tracks: [track("q1", "qq"), track("b1", "bili"), track("b2", "bili")], full: true };
       }
       if (page === 2) {
-        // b2 与第一页重复：去重后只剩 b3
-        return [{ source: "bili", tracks: [track("b2", "bili"), track("b3", "bili")] }];
+        // b2 与第一页重复：跨页按「同一首歌」去重后只剩 b3
+        return { tracks: [track("b2", "bili"), track("b3", "bili")], full: true };
       }
-      return [];
+      return { tracks: [], full: false };
     });
 
-    const { container, getByText } = render(<SearchPage />);
+    const { container } = render(<SearchPage />);
     await act(settle);
-    expect(api.searchAllBatches).toHaveBeenCalledWith("稻香", 1, 2);
+    expect(api.searchMergedPage).toHaveBeenCalledWith("稻香", 1, 2, {
+      sources: undefined,
+      preferSource: "qq",
+    });
 
     await act(async () => {
       scrollToBottom();
       await settle();
     });
 
-    expect(api.searchAllBatches).toHaveBeenLastCalledWith("稻香", 2, 2);
+    expect(api.searchMergedPage).toHaveBeenLastCalledWith("稻香", 2, 2, {
+      sources: undefined,
+      preferSource: "qq",
+    });
     expect(container.textContent).toContain("曲目b3");
-    // 分组头累计 3 首 = 同一源的两页并进了同一组（getByText 命中多个会抛）
-    expect(getByText("3 首")).toBeTruthy();
-    // bili 第二页仍是满页 → 还有下一页
+    // 没有分组头，也就没有「N 首」这种累计文案
+    expect(container.textContent).not.toContain("3 首");
+    // 数据包仍报满页 → 还有下一页
     expect(container.textContent).toContain("继续下拉加载更多");
 
     await act(async () => {
       scrollToBottom();
       await settle();
     });
-    expect(api.searchAllBatches).toHaveBeenLastCalledWith("稻香", 3, 2);
+    expect(api.searchMergedPage).toHaveBeenLastCalledWith("稻香", 3, 2, {
+      sources: undefined,
+      preferSource: "qq",
+    });
     expect(container.textContent).toContain("已经到底了");
   });
 

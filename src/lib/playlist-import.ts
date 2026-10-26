@@ -32,14 +32,14 @@ export async function importPlaylist(
   if (!parsed) {
     throw new Error("无法识别歌单链接或 ID，请检查输入或手动选择平台");
   }
-  // 先取详情：既校验歌单存在，也拿到收藏要用的名称/封面/播放量
-  const playlist = await sourceApi.getPlaylistDetail(parsed.platform, parsed.id);
+  // 取详情与查收藏状态互不依赖，并行发出（收藏状态查询失败按未收藏处理）
+  const [playlist, already] = await Promise.all([
+    sourceApi.getPlaylistDetail(parsed.platform, parsed.id),
+    ipc.isPlaylistFavorited(parsed.platform, parsed.id).catch(() => false),
+  ]);
   if (!playlist || !playlist.name) {
     throw new Error("该歌单不存在或暂时无法访问");
   }
-  const already = await ipc
-    .isPlaylistFavorited(parsed.platform, parsed.id)
-    .catch(() => false);
   if (!already) {
     await ipc.favoritePlaylist(
       parsed.platform,

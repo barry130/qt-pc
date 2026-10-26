@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { coerceNumber as numberValue, coerceString as stringValue } from "@/lib/coerce";
 import { RichText } from "@/lib/richText";
 import * as ipc from "@/services/ipc";
 import { useAuthStore } from "@/stores/auth";
@@ -165,14 +166,7 @@ function normalizeSplashNotices(data: unknown, loggedIn: boolean): NoticeItem[] 
     });
 }
 
-function stringValue(value: unknown): string {
-  return typeof value === "string" ? value : value == null ? "" : String(value);
-}
-
-function numberValue(value: unknown): number {
-  const result = Number(value);
-  return Number.isFinite(result) ? result : 0;
-}
+// stringValue/numberValue 的实现合并到 `@/lib/coerce`（coerceString/coerceNumber）。
 
 function todayStr(): string {
   const d = new Date();

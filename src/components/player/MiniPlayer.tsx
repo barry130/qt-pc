@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { memo, useCallback, useEffect, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import {
@@ -12,6 +12,7 @@ import {
   SkipForward,
 } from "lucide-react";
 import type { PointerEvent as ReactPointerEvent } from "react";
+import type { Track } from "@/types";
 import { usePlayerStore } from "@/stores/player";
 import { usePlaybackEvents } from "@/hooks/usePlaybackEvents";
 import { useInterpolatedPosition } from "@/hooks/useInterpolatedPosition";
@@ -122,6 +123,15 @@ export function MiniPlayer(): React.JSX.Element {
 
   const stop = (e: ReactPointerEvent): void => e.stopPropagation();
 
+  // 队列行点击：身份稳定回调（playAt 来自 store，本身恒定），配合行组件的
+  // memo——播放进度每 ~100ms 推一次重渲染，队列行不再跟着整批重画。
+  const handlePlayAt = useCallback(
+    (index: number): void => {
+      void playAt(index).catch(() => {});
+    },
+    [playAt],
+  );
+
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden rounded-xl border border-border/60 bg-card text-foreground shadow-lg">
       {/* 条状主区：封面 / 歌名歌手 / 基础控制 */}
@@ -204,26 +214,13 @@ export function MiniPlayer(): React.JSX.Element {
             </div>
           ) : (
             queue.map((t, i) => (
-              <button
+              <MiniQueueRow
                 key={`${t.platform}:${t.id}:${i}`}
-                type="button"
-                onClick={() => {
-                  void playAt(i).catch(() => {});
-                }}
-                className={cn(
-                  "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-xs transition-colors",
-                  i === queueIndex
-                    ? "bg-primary/15 text-foreground"
-                    : "text-foreground/70 hover:bg-secondary/50",
-                )}
-                title={`${t.title} - ${t.singer}`}
-              >
-                <span className="w-5 shrink-0 text-center tabular-nums text-muted-foreground">
-                  {i + 1}
-                </span>
-                <span className="min-w-0 flex-1 truncate">{t.title}</span>
-                <span className="shrink-0 truncate text-muted-foreground">{t.singer}</span>
-              </button>
+                track={t}
+                index={i}
+                current={i === queueIndex}
+                onPlayAt={handlePlayAt}
+              />
             ))
           )}
         </div>
@@ -231,6 +228,38 @@ export function MiniPlayer(): React.JSX.Element {
     </div>
   );
 }
+
+/**
+ * 迷你窗队列行。memo + 稳定 onPlayAt：迷你窗的进度条跟 position 每 ~100ms
+ * 重渲染一次，队列行只在「换歌（track 变）/ 播放行切换（current 变）」时重画。
+ */
+const MiniQueueRow = memo(function MiniQueueRow(props: {
+  track: Track;
+  index: number;
+  current: boolean;
+  onPlayAt: (index: number) => void;
+}): React.JSX.Element {
+  const { track, index, current, onPlayAt } = props;
+  return (
+    <button
+      type="button"
+      onClick={() => onPlayAt(index)}
+      className={cn(
+        "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-xs transition-colors",
+        current
+          ? "bg-primary/15 text-foreground"
+          : "text-foreground/70 hover:bg-secondary/50",
+      )}
+      title={`${track.title} - ${track.singer}`}
+    >
+      <span className="w-5 shrink-0 text-center tabular-nums text-muted-foreground">
+        {index + 1}
+      </span>
+      <span className="min-w-0 flex-1 truncate">{track.title}</span>
+      <span className="shrink-0 truncate text-muted-foreground">{track.singer}</span>
+    </button>
+  );
+});
 
 function MiniBtn(props: {
   label: string;

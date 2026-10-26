@@ -3,6 +3,7 @@ import { Heart, Play, Search, Share2, X } from "lucide-react";
 import { useNavigate } from "@tanstack/react-router";
 import { errMsg } from "@/lib/utils";
 import { filterTracks, retainTrackSelection, trackSelectionKey } from "@/lib/track-selection";
+import { DEFAULT_TRACK_SORT, parseTrackSort, sortTracks } from "@/lib/track-sort";
 import type { Chart, MyPlaylistSummary, SourceId, Track } from "@/types";
 import * as ipc from "@/services/ipc";
 import * as sourceApi from "@/source-scripts";
@@ -12,6 +13,7 @@ import { useFavoritesStore } from "@/stores/favorites";
 import { TrackList } from "./TrackList";
 import { BatchBar } from "./BatchBar";
 import { ErrorRetry, TrackRowsSkeleton } from "./Skeletons";
+import { TrackSortSelect } from "@/components/TrackSortSelect";
 import { BackButton } from "@/components/layout/BackButton";
 import { IconButton } from "@/components/common/IconButton";
 import { useDismissOnOutside } from "@/hooks/useDismissOnOutside";
@@ -116,7 +118,17 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
   /** 批量管理的已勾选曲目 id 集合（三个分支共用，见 BatchBar） */
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
+  /** 排序（默认顺序）：只改显示顺序，不改歌单本身，也不影响收藏/下载状态 */
+  const [sortValue, setSortValue] = useState(DEFAULT_TRACK_SORT);
   const visibleTracks = useMemo(() => filterTracks(tracks, query), [tracks, query]);
+  /**
+   * 排序只作用在「搜索过滤后的可见列表」上，所以下面喂给「播放全部」、
+   * BatchBar 与 TrackList 的都是同一个顺序 —— 和 uniappx 的排序口径一致。
+   */
+  const sortedTracks = useMemo(() => {
+    const { key, desc } = parseTrackSort(sortValue);
+    return sortTracks(visibleTracks, key, desc);
+  }, [visibleTracks, sortValue]);
   const visibleSelected = useMemo(() => retainTrackSelection(visibleTracks, selected), [visibleTracks, selected]);
   const changeQuery = (value: string): void => {
     setQuery(value);
@@ -409,7 +421,11 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
         </div>
 
         <div className="relative flex gap-5 px-6 pb-6 pt-4">
-          <div className="h-36 w-36 shrink-0 overflow-hidden rounded-2xl bg-secondary shadow-xl ring-1 ring-border">
+          {/* 封面高度 = 整块 hero 的高度：右侧内容（标题 / 计数 / 简介 / 按钮）全部
+              收在这个高度以内，不许把页头撑得比封面高（用户 2026-10-24：「左边图片，
+              右边内容，高度不要超过图片，内容全部往右边搭」）。与每日推荐页同尺寸，
+              两页 hero 模板保持一套；歌单/专辑页保持 144px 那套，不动。 */}
+          <div className="h-44 w-44 shrink-0 overflow-hidden rounded-2xl bg-secondary shadow-xl ring-1 ring-border">
             {cover ? (
               <img src={cover} alt="" className="h-full w-full object-cover" />
             ) : (
@@ -433,9 +449,9 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
               </p>
             ) : null}
             {/* 榜单不带简介：它是榜单，简介位留给歌单（在线歌单的简介本来就长，
-                这里 line-clamp-3 兜住） */}
+                这里 line-clamp-2 兜住 —— 多一行就会把 hero 撑得比封面高） */}
             {description ? (
-              <p className="mt-2 line-clamp-3 text-xs text-muted-foreground">{description}</p>
+              <p className="mt-2 line-clamp-2 text-xs text-muted-foreground">{description}</p>
             ) : null}
             <div className="mt-3 flex flex-wrap items-center gap-2">
               <IconButton
@@ -444,7 +460,7 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
                 size="lg"
                 disabled={loading || visibleTracks.length === 0}
                 className="h-9 w-9 rounded-lg shadow-lg shadow-primary/25"
-                onClick={() => void playQueue(visibleTracks, 0)}
+                onClick={() => void playQueue(sortedTracks, 0)}
               >
                 <Play className="h-4 w-4 fill-current" />
               </IconButton>
@@ -508,6 +524,7 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
               批量按钮仍与左侧「播放全部」底线对齐；本地歌单改动后重拉列表。 */}
           {!loading && !error && tracks.length > 0 ? (
             <div className="relative flex shrink-0 flex-col items-end justify-end gap-2 pb-1">
+              <TrackSortSelect value={sortValue} onChange={setSortValue} />
               <div className="flex h-8 w-44 items-center gap-2 rounded-lg border border-input bg-background/80 px-2 focus-within:ring-1 focus-within:ring-ring">
                 <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden />
                 <input
@@ -539,7 +556,7 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
               </div>
               <BatchBar
                 embedded
-                tracks={visibleTracks}
+                tracks={sortedTracks}
                 selected={visibleSelected}
                 selectionKey={trackSelectionKey}
                 onSelectedChange={setSelected}
@@ -576,7 +593,7 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
           </div>
         ) : (
           <TrackList
-            tracks={visibleTracks}
+            tracks={sortedTracks}
             showIndex={isChart}
             showCollect
             showDownload

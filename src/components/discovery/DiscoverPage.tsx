@@ -1,8 +1,9 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { BarChart3, ChevronRight, Disc3, FileMusic, Flame, PackageOpen, RefreshCw, Sparkles } from "lucide-react";
 import type { Chart, Playlist, Track } from "@/types";
 import { cn } from "@/lib/utils";
+import { formatPlayCount } from "@/lib/format";
 import { loadChartDetail } from "@/lib/chart-detail";
 import { useSourceLabel, useSourceRegistryStore, useSourceSupports } from "@/stores/sourceRegistry";
 import * as sourceApi from "@/source-scripts";
@@ -86,6 +87,17 @@ export function DiscoverPage(): React.JSX.Element {
   const activeSourceId = useMusicSourceStore((s) => s.activeSourceId);
   const play = usePlayerStore((s) => s.play);
   const playQueue = usePlayerStore((s) => s.playQueue);
+
+  /** 稳定回调：封面卡 memo 的前提（卡片只把数据项递回来） */
+  const openPlaylist = useCallback(
+    (p: Playlist): void => {
+      void navigate({
+        to: "/playlist/$platform/$id",
+        params: { platform: p.platform, id: p.id },
+      });
+    },
+    [navigate],
+  );
 
   // 功能面门控（v4 契约）：数据包声明当前源有没有新歌流/歌单载体、还有没有
   // 任何源有榜单。不支持的区块/快捷入口直接不渲染，也不发对应请求；
@@ -455,13 +467,9 @@ export function DiscoverPage(): React.JSX.Element {
                 layout="row"
                 name={p.name}
                 picUrl={p.picUrl}
-                subtitle={p.playCount ? `${p.playCount} 次播放` : undefined}
-                onClick={() =>
-                  void navigate({
-                    to: "/playlist/$platform/$id",
-                    params: { platform: p.platform, id: p.id },
-                  })
-                }
+                subtitle={p.playCount ? `${formatPlayCount(p.playCount)}次播放` : undefined}
+                item={p}
+                onPick={openPlaylist}
               />
             ))}
           </HorizontalScroller>

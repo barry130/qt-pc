@@ -2,6 +2,7 @@ import { useLayoutEffect, useRef, useState } from "react";
 import { Headphones, Play } from "lucide-react";
 import type { Chart, Track } from "@/types";
 import { qtresCoverUrl } from "@/lib/lrc";
+import { SourceTag } from "@/components/common/SourceTag";
 
 /**
  * 「榜单精选」版式的几何常量。
@@ -201,8 +202,10 @@ export function ChartSpotlightCard(props: {
                   <span className="w-3 shrink-0 text-xs tabular-nums text-muted-foreground">
                     {i + 1}
                   </span>
-                  <span className="min-w-0 flex-1 truncate text-xs">
-                    {t.title} - {t.singer}
+                  <span className="flex min-w-0 flex-1 items-center gap-1.5 text-xs">
+                    <span className="truncate">{t.title}</span>
+                    <SourceTag platform={t.platform} size="xs" />
+                    <span className="min-w-0 shrink truncate text-muted-foreground">- {t.singer}</span>
                   </span>
                 </button>
               </li>

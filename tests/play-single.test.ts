@@ -13,6 +13,8 @@ vi.mock("@/lib/quality-fallback", () => ({
   // preResolvePlayUrl 会先查这张专辑的档位上限决定要不要弹降档提示；
   // 这里返回 null（没有结论）＝每次都按「首次降档」走提示分支。
   peekQualityCeiling: vi.fn(() => null),
+  // v11 档位归一：本测试不涉及官方清单，恒原样返回
+  normalizeQualityForSource: vi.fn((_platform: string, wanted: string) => wanted),
   resolvePlayUrlWithFallback: vi.fn(async () => ({
     url: "",
     stalled: false,

@@ -80,6 +80,11 @@ tauri-plugin-autostart = "2"
 # 纯 Rust，不引入 libdbus-1 系统库依赖，容器/发行版适配面最广。
 souvlaki = { version = "0.8.3", default-features = false }
 
+# 下载成品内嵌封面 / 歌词（embed.rs，「下载存储方式 = 音乐内嵌」，用户 2026-10）：
+# MP3 / FLAC / M4A / WAV / OGG 等标签读写（APIC/USLT、VORBIS_COMMENT、ilst covr/©lyr）。
+# 0.25.x 需要 rustc 1.89，超出本项目 MSRV 1.87，钉 0.24。
+lofty = "0.24"
+
 [target.'cfg(target_os = "linux")'.dependencies]
 souvlaki = { version = "0.8.3", default-features = false, features = ["use_zbus"] }
 

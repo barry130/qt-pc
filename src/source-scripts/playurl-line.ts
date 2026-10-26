@@ -32,16 +32,20 @@ export function formatPlayUrlLine(line: PlayUrlLine): string {
   return segments.join(" · ");
 }
 
-/** 记下本次命中线路（line null = 未知，保持原值不动）；命中即清掉上一次的死因 */
+/** 记下本次命中线路（line null = 未知，保持原值不动）；命中即清掉上一次的死因。
+ *  missNote = 官方前置线路的尝试结论（诊断用；非空时随死因一起展示——官方失败
+ *  会静默落回第三方链，不记下来用户只看到命中线路名，看不出官方为什么没走）。 */
 export function rememberPlayUrlLine(
   track: Track,
   quality: Quality,
   line: PlayUrlLine | null,
+  missNote?: string,
 ): void {
   if (line === null) return;
   const key = playUrlLineKey(track, quality);
   lines.set(key, formatPlayUrlLine(line));
-  misses.delete(key);
+  if (missNote !== undefined && missNote.length > 0) misses.set(key, missNote);
+  else misses.delete(key);
 }
 
 /** 原始线路记忆（含跨源命中的 targetSong）：「歌词跟随换源」要按精确歌曲取词 */

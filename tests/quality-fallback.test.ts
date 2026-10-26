@@ -21,11 +21,15 @@ vi.mock("@/services/ipc", () => ({ setResolvedPlayUrl }));
 const registryState = {
   sources: [] as { id: string; qualities: string[] }[],
   qualities: [] as { id: string; name: string }[],
+  // v12 生效音质清单缓存：本测试不测官方档位，恒空（profile 缺失 = 回落普通子集）
+  profiles: {} as Record<string, unknown>,
 };
 vi.mock("@/stores/sourceRegistry", () => ({
   useSourceRegistryStore: { getState: () => registryState },
   qualityRanksOf: (qualities: { id: string }[]) =>
     qualities.map((q) => q.id).reverse(),
+  // 本测试的 registryState 没有官方清单，归一恒原样返回（实现读同一份 state）
+  normalizeQualityForSource: (_platform: string, wanted: string) => wanted,
 }));
 
 import {

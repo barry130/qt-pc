@@ -1,10 +1,9 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Play, Search, SearchX, Trash2, X } from "lucide-react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import type { Album, Artist, Playlist, Track } from "@/types";
 import {
   useSearchPageMax,
-  useSourceLabelFn,
   useSourceRegistryStore,
   useSourceSupports,
 } from "@/stores/sourceRegistry";
@@ -20,22 +19,28 @@ import {
   removeSearchHistoryItem,
 } from "@/lib/search-history";
 import { qtresCoverUrl, formatTime } from "@/lib/lrc";
+import { readAggregateSources } from "@/lib/aggregate-sources";
+import { songKey } from "@/lib/song-key";
+import { formatPlayCount } from "@/lib/format";
 import { CoverCard, CoverGrid } from "./discovery/CoverCard";
 import { TrackRowsSkeleton } from "./discovery/Skeletons";
 import { BackButton } from "@/components/layout/BackButton";
 import { IconButton } from "@/components/common/IconButton";
+import { SourceTag } from "@/components/common/SourceTag";
 
 /**
  * 搜索页（路由 /search?q=，DESIGN §5.2：关键字走 URL query，前进 / 后退可复现）。
  *
  * 四类结果对应脚本层四个动作（DESIGN §6.5）：
- * - 歌曲   searchMusic（或聚合模式 searchAllBatches：四源各一批，按源分组展示）
+ * - 歌曲   searchMusic（聚合模式走 data 包 searchMerged：包内打全部音源并合并成一条
+ *          去重、按相关性排序的列表；不按源分段，见 lib/song-key.ts 与 DESIGN §1.2）
  * - 歌单   searchPlaylists → 跳歌单详情
  * - 歌手   searchArtists   → 跳歌手详情
  * - 专辑   searchAlbums    → 跳专辑详情
  *
  * 输入区还有三件配套事：
- * - 落地页（无 q）：搜索历史（settings 持久化）+ 当前音源热搜榜
+ * - 落地页（无 q）= **搜索首页**：搜索历史（settings 持久化）+ 多源聚合热门搜索
+ *   （allHotWords，不跟随当前音源）；进来就把光标放进输入框，标题栏那个搜索入口点一下就落到这里
  * - 输入中：按历史 + 热搜词前缀/包含联想（音源包没有 suggest 接口，取自本地数据）
  * - 聚合开关只作用于「歌曲」页签（歌单/歌手/专辑保持当前源）
  *
@@ -61,7 +66,7 @@ const TABS: { key: Tab; label: string }[] = [
  * 分页命中的判别联合：**一个页签一种 kind**，而 resetKey 里带页签 ⇒ 列表里
  * 只会出现一种 kind。包一层是因为 usePagedList 只吃单一元素类型，而四个页签
  * 的结果模型不同（Track / Playlist / Artist / Album）——比堆四份分页状态干净，
- * 也让「聚合模式按源分组」能直接从 track.platform 还原（searchAllBatches 已把
+ * 也让「聚合模式的行内源标」能直接从 track.platform 还原（searchAllBatches 已把
  * platform 归属到每首曲目）。
  */
 type SearchHit =
@@ -93,7 +98,6 @@ export function SearchPage(): React.JSX.Element {
   const urlParams = useSearch({ strict: false }) as { q?: string; type?: string };
   const navigate = useNavigate();
   const activeSourceId = useMusicSourceStore((s) => s.activeSourceId);
-  const sourceLabel = useSourceLabelFn();
   const aggregateMode = useMusicSourceStore((s) => s.aggregateMode);
   const setAggregateMode = useMusicSourceStore((s) => s.setAggregateMode);
 
@@ -118,8 +122,18 @@ export function SearchPage(): React.JSX.Element {
   const [history, setHistory] = useState<string[]>([]);
   const [hotWords, setHotWords] = useState<string[]>([]);
   const [suggestOpen, setSuggestOpen] = useState(false);
+  const inputRef = useRef<HTMLInputElement | null>(null);
   const play = usePlayerStore((s) => s.play);
+  const playQueue = usePlayerStore((s) => s.playQueue);
   const currentTrackId = usePlayerStore((s) => s.state?.trackId ?? null);
+
+  /** 稳定回调：搜索结果行 memo 的前提（行内只把 track 递回来） */
+  const playTrack = useCallback(
+    (track: Track): void => {
+      void play(track);
+    },
+    [play],
+  );
 
   // URL 上的 q / type 是本次搜索的唯一真源（前进 / 后退 / 从详情页返回可复现，
   // DESIGN §5.2）。**页签不能用 useState**：本页不常驻，返回时会重新挂载，
@@ -158,7 +172,11 @@ export function SearchPage(): React.JSX.Element {
    * hasMore 按「满页 = 还有」恒为真 → 哨兵一相交就无限续页、把上游打爆。
    * 记一份本轮已见 id：一整页全是被去重掉的重复条目 ⇒ 立即收尾。
    */
-  const seenRef = useRef<{ key: string; ids: Set<string> }>({ key: "", ids: new Set() });
+  const seenRef = useRef<{ key: string; ids: Set<string>; songs: Set<string> }>({
+    key: "",
+    ids: new Set(),
+    songs: new Set(),
+  });
 
   /**
    * 取第 page 页。**显式回 `{ list, hasMore }`**（而不是让 usePagedList 按
@@ -170,17 +188,35 @@ export function SearchPage(): React.JSX.Element {
   const fetchPage = async (page: number): Promise<PageResult<SearchHit>> => {
     if (!q) return { list: [], hasMore: false };
     if (seenRef.current.key !== resetKey) {
-      seenRef.current = { key: resetKey, ids: new Set<string>() };
+      seenRef.current = { key: resetKey, ids: new Set<string>(), songs: new Set<string>() };
     }
     let hits: SearchHit[];
     let full: boolean;
     if (tab === "song" && aggregateMode) {
-      const batches = asArray(await sourceApi.searchAllBatches(q, page, pageSize));
-      hits = batches.flatMap((b) =>
-        asArray(b.tracks).map((track) => ({ kind: "song" as const, track })),
-      );
-      // 任一源满页 = 可能还有下一页（单源失败会被包侧跳过，不影响判定）
-      full = batches.some((b) => asArray(b.tracks).length >= pageSize);
+      // 聚合音源由设置决定（设置 → 音源包 → 聚合搜索音源；null = 全部）
+      const aggSources = (await readAggregateSources()) ?? undefined;
+      // **合并去重与相关性排序在数据包里做**（`searchMerged`，META_REVISION 7）：
+      // 多源的标题写法、版本后缀、元数据完整度都是音源层的知识，各端各写一份必然
+      // 漂移。宿主只负责「拿一条已经排好的列表」；旧数据包没有该入口时，门面会
+      // 自动退回「拉分批 + 本地合并」，结果形状一致。
+      const page1 = await sourceApi.searchMergedPage(q, page, pageSize, {
+        sources: aggSources,
+        preferSource: activeSourceId,
+      });
+      const merged = asArray(page1.tracks);
+      // 跨页去重按「同一首歌」而不是「同一源的同一个 id」：翻第 2 页时，第 1 页
+      // 已经出现过的歌往往会在**另一个源**再搜到一次，只比 platform:id 会漏掉它。
+      const songKeys = seenRef.current.songs;
+      const fresh = merged.filter((track) => {
+        const key = songKey(track);
+        if (songKeys.has(key)) return false;
+        songKeys.add(key);
+        return true;
+      });
+      hits = fresh.map((track) => ({ kind: "song" as const, track }));
+      // 「还有下一页」由数据包按**合并前的各源原始条数**判定（`full`）：合并去重
+      // 后的条数必然少于各源之和，拿它比 pageSize 会在第 1 页就误判到底。
+      full = page1.full;
     } else if (tab === "song") {
       const list = asArray(await sourceApi.searchMusic(q, activeSourceId, page, pageSize));
       hits = list.map((track) => ({ kind: "song" as const, track }));
@@ -234,15 +270,24 @@ export function SearchPage(): React.JSX.Element {
     void getSearchHistory().then(setHistory).catch(() => {});
   }, []);
 
-  // 热搜榜跟随当前音源；接口失败静默隐藏（热搜是锦上添花，不该打扰搜索）
+  /**
+   * 落地页（没有关键词）是**搜索的入口**而不是一张空列表：进来就把光标放进
+   * 输入框，用户从标题栏点「搜索」之后可以直接打字。
+   *
+   * 只在落地页抢焦点：带着 `?q=` 进来（前进 / 后退 / 从详情页返回）时焦点
+   * 不该跳走 —— 那时用户要看的是结果，而不是准备输入下一句。
+   */
+  useEffect(() => {
+    if (!searched) inputRef.current?.focus();
+  }, [searched]);
+
+  // 热搜榜是跨源聚合（allHotWords：多源并发合并去重），与当前音源无关，
+  // 挂载时拉一次即可；接口失败静默隐藏（热搜是锦上添花，不该打扰搜索）。
+  // sources 与聚合搜索共用同一份白名单勾选（readAggregateSources）。
   useEffect(() => {
     let cancelled = false;
-    if (activeSourceId === "local") {
-      setHotWords([]);
-      return;
-    }
-    void sourceApi
-      .getHotWords(activeSourceId)
+    void readAggregateSources()
+      .then((sources) => sourceApi.getAllHotWords(sources ?? undefined))
       .then((words) => {
         if (!cancelled) setHotWords(Array.isArray(words) ? words : []);
       })
@@ -252,7 +297,7 @@ export function SearchPage(): React.JSX.Element {
     return () => {
       cancelled = true;
     };
-  }, [activeSourceId]);
+  }, []);
 
   const submit = useCallback(
     (kw: string): void => {
@@ -320,20 +365,37 @@ export function SearchPage(): React.JSX.Element {
    * `$id` 位置仍放（encode 过的）名字 —— 详情页没有 `?name=` 时会把它当名字用，
    * 老书签和只有名字的跳转（TrackList）照样能进，见 ArtistPage 注释。
    */
-  const openArtist = (a: Artist): void => {
-    void navigate({
-      to: "/artist/$platform/$id",
-      params: { platform: a.platform, id: encodeURIComponent(a.name) },
-      search: { id: a.id, name: a.name },
-    });
-  };
+  const openArtist = useCallback(
+    (a: Artist): void => {
+      void navigate({
+        to: "/artist/$platform/$id",
+        params: { platform: a.platform, id: encodeURIComponent(a.name) },
+        search: { id: a.id, name: a.name },
+      });
+    },
+    [navigate],
+  );
 
-  const openAlbum = (a: Album): void => {
-    void navigate({
-      to: "/album/$platform/$id",
-      params: { platform: a.platform, id: encodeURIComponent(a.name) },
-    });
-  };
+  const openAlbum = useCallback(
+    (a: Album): void => {
+      void navigate({
+        to: "/album/$platform/$id",
+        params: { platform: a.platform, id: encodeURIComponent(a.name) },
+      });
+    },
+    [navigate],
+  );
+
+  /** 歌单卡片的稳定回调（封面卡 memo 的前提，见 CoverCard 注释） */
+  const pickPlaylist = useCallback(
+    (p: Playlist): void => {
+      void navigate({
+        to: "/playlist/$platform/$id",
+        params: { platform: p.platform, id: p.id },
+      });
+    },
+    [navigate],
+  );
 
   const empty = items.length === 0;
 
@@ -357,45 +419,52 @@ export function SearchPage(): React.JSX.Element {
   );
 
   /**
-   * 聚合模式按源分组：`searchAllBatches` 已把 platform 归属到每首曲目，所以
-   * 累积列表直接按 track.platform 归并即可。Map 的插入序 = 各源首次出现的顺序
-   * = 包侧 ALL_SOURCES 的顺序，续页只会往已有分组里追加，不会让分组跳动。
+   * 聚合模式也渲染**同一份** `songs` 列表（合并去重已在 fetchPage 里做完），
+   * 行尾只多一个源标告诉用户这首歌是从哪个源来的 —— 不再按源分段：同一首歌
+   * 在四个源各出现一次、还顶着「网易云音乐 60 首」这种分组头，比没有聚合还难用。
    */
-  const aggGroups = useMemo(() => {
-    if (!(tab === "song" && aggregateMode)) return [];
-    const byPlatform = new Map<string, Track[]>();
-    for (const hit of items) {
-      if (hit.kind !== "song") continue;
-      const list = byPlatform.get(hit.track.platform);
-      if (list) list.push(hit.track);
-      else byPlatform.set(hit.track.platform, [hit.track]);
-    }
-    return [...byPlatform.entries()].map(([source, tracks]) => ({ source, tracks }));
-  }, [items, tab, aggregateMode]);
 
   return (
     <div className="flex h-full min-w-0 flex-col">
       <div className="relative flex items-center gap-2 border-b border-border px-4 py-3">
         <BackButton />
         <Search className="h-4 w-4 text-muted-foreground" />
-        <input
-          value={keyword}
-          onChange={(e) => {
-            setKeyword(e.target.value);
-            setSuggestOpen(true);
-          }}
-          onFocus={() => setSuggestOpen(true)}
-          onBlur={() => {
-            // 延迟收起：给联想项的 mousedown 一拍时间先触发
-            window.setTimeout(() => setSuggestOpen(false), 120);
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") submit(keyword);
-            if (e.key === "Escape") setSuggestOpen(false);
-          }}
-          placeholder="搜索歌曲 / 歌单 / 歌手 / 专辑"
-          className="h-9 flex-1 rounded-md border border-input bg-background px-3 text-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
-        />
+        <div className="relative flex-1">
+          <input
+            ref={inputRef}
+            value={keyword}
+            onChange={(e) => {
+              setKeyword(e.target.value);
+              setSuggestOpen(true);
+            }}
+            onFocus={() => setSuggestOpen(true)}
+            onBlur={() => {
+              // 延迟收起：给联想项的 mousedown 一拍时间先触发
+              window.setTimeout(() => setSuggestOpen(false), 120);
+            }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") submit(keyword);
+              if (e.key === "Escape") setSuggestOpen(false);
+            }}
+            placeholder="搜索歌曲 / 歌单 / 歌手 / 专辑"
+            className="h-9 w-full rounded-md border border-input bg-background pl-3 pr-9 text-sm outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
+          />
+          {keyword && (
+            <button
+              type="button"
+              aria-label="清空输入"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={() => {
+                setKeyword("");
+                setSuggestOpen(false);
+                inputRef.current?.focus();
+              }}
+              className="absolute right-2 top-1/2 flex h-5 w-5 -translate-y-1/2 items-center justify-center rounded-full text-muted-foreground/70 transition-colors hover:bg-secondary hover:text-foreground"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </div>
         <button
           type="button"
           onClick={() => submit(keyword)}
@@ -426,6 +495,9 @@ export function SearchPage(): React.JSX.Element {
         )}
       </div>
 
+      {/* 页签栏只在**搜过之后**出现：落地页（历史 / 热搜）上没有结果可
+          切，摆一排灰按钮只会让人以为「搜索已经开始但没结果」。 */}
+      {searched && (
       <div className="flex items-center gap-1 border-b border-border px-4 py-2">
         {tabs.map((t) => (
           <button
@@ -446,7 +518,7 @@ export function SearchPage(): React.JSX.Element {
             type="button"
             onClick={() => setAggregateMode(!aggregateMode)}
             aria-pressed={aggregateMode}
-            title="同时搜索全部音源，结果按源分组"
+            title="同时搜索全部音源，自动去重后合并成一条列表"
             className={`ml-auto flex h-7 items-center gap-1.5 rounded-md px-3 text-xs transition-colors ${
               aggregateMode
                 ? "bg-primary text-primary-foreground"
@@ -456,7 +528,21 @@ export function SearchPage(): React.JSX.Element {
             聚合搜索
           </button>
         )}
+        {tab === "song" && songs.length > 0 && (
+          // 搜索是一页一页往下拉的（usePagedList），「全部」只能是**已加载**的这批；
+          // 文案与 title 都写清楚条数，避免用户以为只放了屏幕里那几首。
+          <button
+            type="button"
+            onClick={() => void playQueue(songs, 0)}
+            title={`把已加载的 ${songs.length} 首加入队列，从第一首开始播放`}
+            className="flex h-7 items-center gap-1.5 rounded-md px-3 text-xs text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+          >
+            <Play className="h-3.5 w-3.5 fill-current" />
+            播放全部
+          </button>
+        )}
       </div>
+      )}
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         {error && empty && (
@@ -476,7 +562,7 @@ export function SearchPage(): React.JSX.Element {
         )}
         {!error && searching && empty && <TrackRowsSkeleton rows={6} />}
 
-        {/* 落地页：搜索历史 + 热搜榜（只在还没搜过时展示） */}
+        {/* 落地页 = 搜索首页：历史 / 热门搜索（只在还没搜过时展示） */}
         {!searched && !searching && (
           <SearchLanding
             history={history}
@@ -487,42 +573,16 @@ export function SearchPage(): React.JSX.Element {
           />
         )}
 
-        {/* 聚合模式：按源分组，行上带源标 */}
-        {showResults && aggGroups.length > 0 &&
-          aggGroups.map((batch) => {
-            return (
-              <div key={batch.source}>
-                <div className="flex items-center gap-2 border-b border-border/60 bg-secondary/30 px-4 py-1.5">
-                  <span className="text-xs font-medium text-muted-foreground">
-                    {sourceLabel(batch.source)}
-                  </span>
-                  <span className="text-[10px] text-muted-foreground/70">
-                    {batch.tracks.length} 首
-                  </span>
-                </div>
-                {batch.tracks.map((t) => (
-                  <TrackRow
-                    key={`${t.platform}:${t.id}`}
-                    track={t}
-                    active={currentTrackId === t.id}
-                    badge={sourceLabel(batch.source)}
-                    onPlay={() => void play(t)}
-                  />
-                ))}
-              </div>
-            );
-          })}
-
-        {/* 单源模式 */}
+        {/* 歌曲页签：单源与聚合都是一条列表，每行歌名右侧标出平台简称
+            （聚合去重后「它来自哪个源」仍然是有用信息） */}
         {showResults &&
-          !aggregateMode &&
           tab === "song" &&
           songs.map((t) => (
             <TrackRow
               key={`${t.platform}:${t.id}`}
               track={t}
               active={currentTrackId === t.id}
-              onPlay={() => void play(t)}
+              onPlayTrack={playTrack}
             />
           ))}
 
@@ -534,13 +594,9 @@ export function SearchPage(): React.JSX.Element {
                   key={p.id}
                   name={p.name}
                   picUrl={p.picUrl}
-                  subtitle={p.playCount ? `${p.playCount} 次播放` : undefined}
-                  onClick={() =>
-                    void navigate({
-                      to: "/playlist/$platform/$id",
-                      params: { platform: p.platform, id: p.id },
-                    })
-                  }
+                  subtitle={p.playCount ? `${formatPlayCount(p.playCount)}次播放` : undefined}
+                  item={p}
+                  onPick={pickPlaylist}
                 />
               ))}
             </CoverGrid>
@@ -555,7 +611,8 @@ export function SearchPage(): React.JSX.Element {
                   key={a.id}
                   name={a.name}
                   picUrl={a.picUrl}
-                  onClick={() => openArtist(a)}
+                  item={a}
+                  onPick={openArtist}
                 />
               ))}
             </CoverGrid>
@@ -571,7 +628,8 @@ export function SearchPage(): React.JSX.Element {
                   name={a.name}
                   picUrl={a.picUrl}
                   subtitle={a.artist}
-                  onClick={() => openAlbum(a)}
+                  item={a}
+                  onPick={openAlbum}
                 />
               ))}
             </CoverGrid>
@@ -606,7 +664,14 @@ export function SearchPage(): React.JSX.Element {
   );
 }
 
-/** 落地页：搜索历史（可删可清空）+ 当前音源热搜榜 */
+/**
+ * 落地页 = 搜索的首页：**搜索历史 / 热门搜索**。
+ *
+ * 只在没有关键词时渲染（见上面的 `searched`）。用户口径是「历史搜索、热门搜索
+ * 等等」，热门搜索取跨源聚合的 `allHotWords`（多源合并去重，不跟随当前音源）。
+ * 这里不放「热门歌单」—— 用户明确说过要的是热门**搜索**；歌单推荐在「歌单广场」
+ * 里已经有整页，塞进搜索首页只会把用户真正要的入口挤下去。
+ */
 function SearchLanding(props: {
   history: string[];
   hotWords: string[];
@@ -614,21 +679,26 @@ function SearchLanding(props: {
   onRemoveHistory: (kw: string) => void;
   onClearHistory: () => void;
 }): React.JSX.Element {
+  const nothing = props.history.length === 0 && props.hotWords.length === 0;
+
   return (
-    <div className="mx-auto max-w-xl px-4 py-6">
+    <div className="mx-auto w-full max-w-3xl px-6 py-7">
+      {nothing && (
+        <p className="py-10 text-center text-sm text-muted-foreground">
+          输入歌名、歌手或专辑名开始搜索；搜过和听过的歌会自动出现在这里。
+        </p>
+      )}
+
       {props.history.length > 0 && (
-        <section>
-          <div className="flex items-center justify-between">
-            <h3 className="text-xs font-medium text-muted-foreground">搜索历史</h3>
-            <IconButton
-              label="清空搜索历史"
-              danger
-              onClick={props.onClearHistory}
-            >
+        <LandingSection
+          title="搜索历史"
+          action={
+            <IconButton label="清空搜索历史" danger onClick={props.onClearHistory}>
               <Trash2 />
             </IconButton>
-          </div>
-          <div className="mt-2 flex flex-wrap gap-2">
+          }
+        >
+          <div className="flex flex-wrap gap-2">
             {props.history.map((kw) => (
               <span
                 key={kw}
@@ -653,13 +723,16 @@ function SearchLanding(props: {
               </span>
             ))}
           </div>
-        </section>
+        </LandingSection>
       )}
 
       {props.hotWords.length > 0 && (
-        <section className="mt-6">
-          <h3 className="text-xs font-medium text-muted-foreground">热搜榜</h3>
-          <ol className="mt-2 grid grid-cols-2 gap-x-6">
+        <LandingSection
+          title="热门搜索"
+          hint="多源聚合"
+          className="mt-7"
+        >
+          <ol className="mt-1 grid grid-cols-2 gap-x-8">
             {props.hotWords.slice(0, 14).map((word, i) => (
               <li key={word}>
                 <button
@@ -679,26 +752,58 @@ function SearchLanding(props: {
               </li>
             ))}
           </ol>
-        </section>
+        </LandingSection>
       )}
     </div>
   );
 }
 
-function TrackRow(props: {
+/** 落地页的一个区块：标题 +（可选）右侧动作 / 说明 */
+function LandingSection(props: {
+  title: string;
+  hint?: string;
+  action?: React.ReactNode;
+  className?: string;
+  children: React.ReactNode;
+}): React.JSX.Element {
+  return (
+    <section className={props.className}>
+      <div className="flex items-center justify-between">
+        <h3 className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
+          {props.title}
+          {props.hint ? (
+            <span className="text-muted-foreground/60">· {props.hint}</span>
+          ) : null}
+        </h3>
+        {props.action}
+      </div>
+      <div className="mt-2">{props.children}</div>
+    </section>
+  );
+}
+
+/**
+ * 搜索结果里的单曲行（#11 / #34）。
+ *
+ * memo + 稳定回调：输入框每次击键都会重渲整个页面，若行内联 `onPlay={() => play(t)}`
+ * 则每行都是新 props，数百行结果跟着全量重渲。改为父级传稳定函数、行内自己把
+ * `track` 递回去，比较器就能挡住无关重渲（与 `TrackList` 同一套 latest-ref 写法）。
+ *
+ * `cv-row`：复用曲目列表的 `content-visibility: auto`（见 index.css），视口外的行
+ * 跳过布局与绘制，长结果列表滚动更稳。
+ */
+const TrackRow = memo(function TrackRow(props: {
   track: Track;
   active: boolean;
-  /** 聚合模式下显示的源标（音源一/二/…） */
-  badge?: string;
-  onPlay: () => void;
+  onPlayTrack: (track: Track) => void;
 }): React.JSX.Element {
-  const { track, active, badge, onPlay } = props;
+  const { track, active, onPlayTrack } = props;
   const cover = qtresCoverUrl(track.picUrl);
   return (
     <button
       type="button"
-      onClick={onPlay}
-      className={`flex w-full items-center gap-3 px-4 py-2 text-left transition-colors hover:bg-secondary ${
+      onClick={() => onPlayTrack(track)}
+      className={`cv-row flex w-full items-center gap-3 px-4 py-2 text-left transition-colors hover:bg-secondary ${
         active ? "bg-secondary/60" : ""
       }`}
     >
@@ -715,11 +820,7 @@ function TrackRow(props: {
       <div className="min-w-0 flex-1">
         <div className="flex min-w-0 items-center gap-2">
           <span className="truncate text-sm">{track.title}</span>
-          {badge && (
-            <span className="shrink-0 rounded bg-secondary px-1.5 py-0.5 text-[10px] text-muted-foreground">
-              {badge}
-            </span>
-          )}
+          <SourceTag platform={track.platform} size="xs" />
         </div>
         <div className="truncate text-xs text-muted-foreground">
           {track.singer}
@@ -731,4 +832,4 @@ function TrackRow(props: {
       </span>
     </button>
   );
-}
+});

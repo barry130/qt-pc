@@ -1,4 +1,6 @@
 import * as sourceApi from "@/source-scripts";
+import { createPendingStringCache } from "@/lib/pending-cache";
+import { compactText } from "@/lib/text";
 import type { SourceId } from "@/types";
 
 /**
@@ -13,22 +15,17 @@ import type { SourceId } from "@/types";
  * 这里在宿主侧先按名字查一次歌手（searchArtists），拿到真 id 再交给取作品接口，
  * 让所有入口都对准。一次额外请求，且结果按 `platform:name` 缓存到退出，
  * 第二次进同一个歌手页连这次请求都省了。
+ *
+ * 缓存管理（在飞去重 / 同步可读 / 超容量逐出 / 失败也落空串）在
+ * `@/lib/pending-cache` —— 与 artist-pic.ts 共用同一实现，不再各写一份。
  */
 
 const CACHE_CAP = 64;
 
-/** 在飞的（含已完成的）解析：`平台:名字` → Promise；同一歌手并发进页只查一次 */
-const pending = new Map<string, Promise<string>>();
-/** 已落定的结果，同步可读（测试与调试用） */
-const settled = new Map<string, string>();
+const cache = createPendingStringCache(CACHE_CAP);
 
 function keyOf(platform: SourceId, name: string): string {
   return `${platform}:${name}`;
-}
-
-/** 名字归一：比对该忽略大小写与空白（上游偶尔带全角空格/多余空格） */
-function normalize(s: string): string {
-  return s.trim().toLowerCase().replace(/\s+/g, "");
 }
 
 /**
@@ -38,9 +35,9 @@ function normalize(s: string): string {
  * 对不上就取第一条 —— 搜索接口本身已按相关度排，比返回空让整页退回模糊搜索强。
  */
 function pickBest(list: { id: string; name: string }[], name: string): string {
-  const want = normalize(name);
+  const want = compactText(name);
   for (const a of list) {
-    if (a.id.length > 0 && normalize(a.name) === want) return a.id;
+    if (a.id.length > 0 && compactText(a.name) === want) return a.id;
   }
   for (const a of list) {
     if (a.id.length > 0) return a.id;
@@ -54,52 +51,18 @@ function pickBest(list: { id: string; name: string }[], name: string): string {
  */
 export async function resolveArtistId(platform: SourceId, name: string): Promise<string> {
   if (platform === "local" || name.length === 0) return "";
-  const key = keyOf(platform, name);
-  const hit = pending.get(key);
-  if (hit !== undefined) return hit;
-
-  const task = (async (): Promise<string> => {
-    try {
-      const list = await sourceApi.searchArtists(platform, name, 1, 5);
-      const id = pickBest(list, name);
-      settled.set(key, id);
-      return id;
-    } catch {
-      // 查不到歌手就按老路走：不能因为一次查询失败让歌手页空掉
-      settled.set(key, "");
-      return "";
-    }
-  })();
-
-  pending.set(key, task);
-  trim();
-  return task;
+  return cache.resolve(keyOf(platform, name), async () => {
+    const list = await sourceApi.searchArtists(platform, name, 1, 5);
+    return pickBest(list, name);
+  });
 }
 
 /** 已解析过的 id（同步）；没解析过返回 null */
 export function peekArtistId(platform: SourceId, name: string): string | null {
-  const v = settled.get(keyOf(platform, name));
-  return v === undefined ? null : v;
+  return cache.peek(keyOf(platform, name));
 }
 
 /** 清空缓存（测试用 / 设置页可选清理） */
 export function clearArtistIdCache(): number {
-  const count = new Set([...pending.keys(), ...settled.keys()]).size;
-  pending.clear();
-  settled.clear();
-  return count;
-}
-
-function trim(): void {
-  while (pending.size > CACHE_CAP) {
-    const oldest = pending.keys().next().value;
-    if (oldest === undefined) break;
-    pending.delete(oldest);
-    settled.delete(oldest);
-  }
-  while (settled.size > CACHE_CAP) {
-    const oldest = settled.keys().next().value;
-    if (oldest === undefined) break;
-    settled.delete(oldest);
-  }
+  return cache.clear();
 }

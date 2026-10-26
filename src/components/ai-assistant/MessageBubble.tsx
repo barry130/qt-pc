@@ -8,6 +8,7 @@ import { useFavoriteFlags } from "@/hooks/useFavoriteFlags";
 import { CollectMenu } from "@/components/mine/CollectMenu";
 import { Popover } from "@/components/common/Popover";
 import { cn } from "@/lib/utils";
+import { SourceTag } from "@/components/common/SourceTag";
 import type { Track } from "@/types";
 import { AnswerText } from "./AnswerText";
 
@@ -278,7 +279,10 @@ function SongRow(props: {
         <span className="h-8 w-8 shrink-0 rounded bg-secondary" />
       )}
       <span className="min-w-0 flex-1">
-        <span className="block truncate text-xs font-medium">{track.title}</span>
+        <span className="flex min-w-0 items-center gap-1.5">
+          <span className="truncate text-xs font-medium">{track.title}</span>
+          <SourceTag platform={track.platform} size="xs" />
+        </span>
         <span className="block truncate text-[11px] text-muted-foreground">
           {track.singer}
           {track.album.length > 0 ? ` · ${track.album}` : ""}
@@ -328,7 +332,68 @@ function SongRow(props: {
           <ListPlus className="h-3.5 w-3.5" />
         </button>
       </span>
-      <MoreHorizontal className="h-3.5 w-3.5 shrink-0 text-muted-foreground/40 group-hover:hidden" />
+      {/* 行尾「更多」：点开是行内动作菜单。此前这里只是个纯图标（没有点击行为），
+          用户反馈"点了没反应"，所以换成真正能点的 Popover 菜单。 */}
+      <Popover
+        className="relative shrink-0"
+        trigger={(t) => (
+          <button
+            type="button"
+            title="更多操作"
+            aria-label="更多操作"
+            aria-haspopup="menu"
+            aria-expanded={t.open}
+            onClick={(e) => {
+              e.stopPropagation();
+              t.toggle();
+            }}
+            className="rounded p-1 text-muted-foreground/60 transition-colors hover:bg-background hover:text-foreground"
+          >
+            <MoreHorizontal className="h-3.5 w-3.5" />
+          </button>
+        )}
+      >
+        {(close) => (
+          <div className="absolute right-0 top-full z-20 mt-1 w-32 rounded-md border border-border bg-popover p-1 shadow-md">
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                close();
+                props.onPlay();
+              }}
+              className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-popover-foreground hover:bg-secondary"
+            >
+              <Play className="h-3.5 w-3.5" />
+              播放
+            </button>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                close();
+                props.onQueue();
+              }}
+              className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-popover-foreground hover:bg-secondary"
+            >
+              <ListPlus className="h-3.5 w-3.5" />
+              加入队列
+            </button>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                close();
+                setOpen(true);
+              }}
+              className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs text-popover-foreground hover:bg-secondary"
+            >
+              <Heart className="h-3.5 w-3.5" />
+              收藏到歌单…
+            </button>
+          </div>
+        )}
+      </Popover>
     </div>
   );
 }

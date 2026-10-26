@@ -922,6 +922,17 @@ pub struct SourceArtifact {
     #[allow(dead_code)]
     pub version: i64,
     pub url: String,
+    /// 产物包 id（如 meta-official）。服务端直发版本号时必填；空 = 服务端
+    /// 未下发（旧后端），meta 更新判断回退到产物头探测。
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub pack_id: String,
+    /// 产物真实版本号（包头 versionCode）。>0 时 meta 与 play 同口径直接
+    /// 比较，免 Range 探测；0 = 服务端未下发，回退探测。
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub pack_version_code: i64,
+    /// 产物版本名（包头 versionName）。可缺省，缺省回落 code N 显示。
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub pack_version_name: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1005,6 +1016,8 @@ async fn trusted_get(
             headers,
             body: None,
             timeout_ms: Some(timeout_ms),
+            redirect: None,
+            response_encoding: None,
         }),
     )
     .await?;
@@ -1076,6 +1089,8 @@ async fn fetch_manifest(astral: &astral::AstralClient) -> Result<Option<SourceRe
             .map(|t| HashMap::from([("satoken".to_string(), t)])),
         body: None,
         timeout_ms: None,
+        redirect: None,
+        response_encoding: None,
     };
     let res = source_builtin_request(&url, Some(&options)).await?;
     if res.status_code == 304 {
@@ -1202,36 +1217,57 @@ async fn discover_updates(
                     });
                 }
             }
-            // 数据包产物：manifest 只有产物清单，版本要探测包头才知道。
+            // 数据包产物：优先用 manifest 直发的 packId/packVersionCode（与 play
+            // 同口径，免 Range 探测；包头校验留在 apply 阶段，不符会拒绝安装）。
+            // 旧后端未直发 → 回退产物头探测。
             // 仅对已装的 meta-official 提示更新——未装不下发首装 offer
             // （首页引导只指路设置页，安装动作完全由用户发起）
             if let (Some(art), Some(installed)) = (
                 release.artifacts.iter().find(|a| a.path == ARTIFACT_META),
                 state.pack(OFFICIAL_META_ID),
             ) {
-                if let Ok(Some(header)) = probe_pack_header(&art.url).await {
-                    // 版本压制例外：同 play 通道（历史未验签官方包不压制）
-                    let unverified_official = !installed.sign_verified;
-                    if header.kind == PACK_KIND_META
-                        && header.id == OFFICIAL_META_ID
-                        && (header.version_code > installed.version_code || unverified_official)
-                        && !installed.skip_codes.contains(&header.version_code)
-                    {
-                        offers.push(PackUpdateOffer {
-                            kind: PACK_KIND_META.to_string(),
-                            target_id: OFFICIAL_META_ID.to_string(),
-                            current_code: installed.version_code,
-                            new_code: header.version_code,
-                            new_name: if header.version_name.is_empty() {
-                                format!("code {}", header.version_code)
+                let (remote_code, remote_name): (i64, String) =
+                    if art.pack_version_code > 0 && art.pack_id == OFFICIAL_META_ID {
+                        (
+                            art.pack_version_code,
+                            if art.pack_version_name.is_empty() {
+                                format!("code {}", art.pack_version_code)
                             } else {
-                                header.version_name
+                                art.pack_version_name.clone()
                             },
-                            notes: release.notes.clone(),
-                            channel: "manifest".to_string(),
-                            url: art.url.clone(),
-                        });
-                    }
+                        )
+                    } else if let Ok(Some(header)) = probe_pack_header(&art.url).await {
+                        if header.kind == PACK_KIND_META && header.id == OFFICIAL_META_ID {
+                            (
+                                header.version_code,
+                                if header.version_name.is_empty() {
+                                    format!("code {}", header.version_code)
+                                } else {
+                                    header.version_name
+                                },
+                            )
+                        } else {
+                            (0, String::new())
+                        }
+                    } else {
+                        (0, String::new())
+                    };
+                // 版本压制例外：同 play 通道（历史未验签官方包不压制）
+                let unverified_official = !installed.sign_verified;
+                if remote_code > 0
+                    && (remote_code > installed.version_code || unverified_official)
+                    && !installed.skip_codes.contains(&remote_code)
+                {
+                    offers.push(PackUpdateOffer {
+                        kind: PACK_KIND_META.to_string(),
+                        target_id: OFFICIAL_META_ID.to_string(),
+                        current_code: installed.version_code,
+                        new_code: remote_code,
+                        new_name: remote_name,
+                        notes: release.notes.clone(),
+                        channel: "manifest".to_string(),
+                        url: art.url.clone(),
+                    });
                 }
             }
         }
@@ -1939,6 +1975,16 @@ pub async fn cmd_source_report(
     detail: String,
 ) -> Result<(), String> {
     report_to_backend(&app, source_version_code, result, detail).await;
+    Ok(())
+}
+
+/// 音源包内诊断日志（QtHost.log：扫码 803 凭据提取失败等定位短语）。
+/// 只写本地文件日志、绝不上报后端；包侧 AuthLog 契约承诺不携带凭据值，
+/// 这里再做长度钳制防异常长文本撑爆日志。
+#[tauri::command(rename = "source_engine_log")]
+pub async fn cmd_source_engine_log(message: String) -> Result<(), String> {
+    let msg: String = message.chars().take(500).collect();
+    log::info!("[source-pack] {msg}");
     Ok(())
 }
 
@@ -2866,5 +2912,55 @@ mod tests {
             "一次性消费：重复确认自然失败"
         );
         assert!(take_staged("no-such-token").is_none());
+    }
+
+    /// manifest 产物直发字段（packId/packVersionCode/packVersionName）：
+    /// 新后端下发 → meta 与 play 同口径直接比较（免 Range 探测）；
+    /// 旧后端缺失/null → 空 id + 0 版本号，meta 分支回退产物头探测，
+    /// 且任何字段缺失都不允许让整条 release 反序列化失败。
+    #[test]
+    fn manifest_artifact_direct_pack_fields_parse_and_default() {
+        let with_direct: SourceRelease = serde_json::from_value(serde_json::json!({
+            "sourceVersionCode": 2026102601,
+            "sourceVersionName": "2026.10.26.1",
+            "platforms": [1103],
+            "hostApiVersion": 1,
+            "artifacts": [
+                {"path": "meta-bundle.js", "version": 5, "url": "https://example.com/meta.js",
+                 "packId": "meta-official", "packVersionCode": 2026102601, "packVersionName": "2026.10.26.meta"},
+                {"path": "play-bundle.js", "version": 5, "url": "https://example.com/play.js"}
+            ]
+        }))
+        .unwrap();
+        let meta = with_direct
+            .artifacts
+            .iter()
+            .find(|a| a.path == ARTIFACT_META)
+            .unwrap();
+        assert_eq!(meta.pack_id, "meta-official");
+        assert_eq!(meta.pack_version_code, 2026102601);
+        assert_eq!(meta.pack_version_name, "2026.10.26.meta");
+        // 旧后端不下发直发字段 → 空 id / 0 版本号（meta 分支回退产物头探测）
+        let play = with_direct
+            .artifacts
+            .iter()
+            .find(|a| a.path == ARTIFACT_PLAY)
+            .unwrap();
+        assert_eq!(play.pack_id, "");
+        assert_eq!(play.pack_version_code, 0);
+        assert_eq!(play.pack_version_name, "");
+        // 后端 VO 可空列会序列化成 null：null 不能让整条 release 解析失败
+        let with_null: SourceRelease = serde_json::from_value(serde_json::json!({
+            "sourceVersionCode": 1,
+            "sourceVersionName": "n",
+            "artifacts": [
+                {"path": "meta-bundle.js", "version": 5, "url": "https://example.com/m.js",
+                 "packId": null, "packVersionCode": null, "packVersionName": null}
+            ]
+        }))
+        .unwrap();
+        assert_eq!(with_null.artifacts[0].pack_id, "");
+        assert_eq!(with_null.artifacts[0].pack_version_code, 0);
+        assert_eq!(with_null.artifacts[0].pack_version_name, "");
     }
 }

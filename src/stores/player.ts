@@ -6,7 +6,8 @@ import type {
   Track,
 } from "@/types";
 import * as ipc from "@/services/ipc";
-import { peekQualityCeiling, resolvePlayUrlWithFallback } from "@/lib/quality-fallback";
+import { peekQualityCeiling, normalizeQualityForSource, resolvePlayUrlWithFallback } from "@/lib/quality-fallback";
+import { sourcePlayQualityOf } from "@/lib/source-quality";
 import { qualityShortLabel } from "@/lib/quality";
 import { toast } from "@/stores/toast";
 
@@ -25,12 +26,11 @@ import { toast } from "@/stores/toast";
  * 降档回退阶梯在 `@/lib/quality-fallback`（引擎取链桥共用同一份实现，
  * 否则「点一下能放、自动播下一集就报无法播放」）。
  */
-async function preResolvePlayUrl(
-  track: Track | undefined,
-  state: PlaybackState | null,
-): Promise<void> {
+async function preResolvePlayUrl(track: Track | undefined): Promise<void> {
   if (!track || track.platform === "local") return;
-  const wanted = state?.quality ?? "320";
+  // 音质按平台独立（lib/source-quality）：未配置的平台回落旧全局键/320。
+  // 存量默认档可能是旧第三方档名（v11 官方清单生效时）：先归一再取链与比对
+  const wanted = normalizeQualityForSource(track.platform, sourcePlayQualityOf(track.platform));
   // 同专辑已知上限时不再提示「只能提供 X」：那不是本次降档，而是这张专辑的既定
   // 事实（有声书一本几百集，逐集弹同一句提示等于噪声）。
   const known = peekQualityCeiling(track.platform, track.album);
@@ -54,6 +54,20 @@ async function preResolvePlayUrl(
  * 保证「最后一次点击获胜」。
  */
 let playActionSeq = 0;
+
+/**
+ * 后端报 0 的流内时长用**当前曲目声明的时长**兜底：B 站 DASH 音轨是分片 MP4
+ * （fMP4），mvhd 不带总时长，symphonia 拿不到 total_duration → duration_ms
+ * 恒 0，表现为结束时间恒 00:00、进度条与拖动 seek 一起失效。声明时长来自
+ * 包元数据（搜索结果解析，秒）；音乐榜条目源接口不下发时长，仍为 0（诚实未知）。
+ */
+function effectiveDurationMs(incoming: number): number {
+  if (incoming > 0) return incoming;
+  const { queue, queueIndex } = usePlayerStore.getState();
+  const track = queueIndex === null ? undefined : queue[queueIndex];
+  const declared = Math.round((track?.duration ?? 0) * 1000);
+  return declared > 0 ? declared : 0;
+}
 
 interface PlayerStore {
   state: PlaybackState | null;
@@ -212,7 +226,7 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
       positionAnchorMs: performance.now(),
       // 进度标量跟随快照：暂停/停止之后不再有 tick，进度条得靠它显示
       positionMs: anchorMs,
-      durationMs: incoming.durationMs,
+      durationMs: effectiveDurationMs(incoming.durationMs),
       bufferedMs: incoming.bufferedMs,
     });
   },
@@ -235,7 +249,7 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
       positionAnchorValue: t.positionMs,
       positionAnchorMs: performance.now(),
       positionMs: t.positionMs,
-      durationMs: t.durationMs,
+      durationMs: effectiveDurationMs(t.durationMs),
       bufferedMs: t.bufferedMs,
     });
   },
@@ -273,17 +287,17 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
 
   play: async (track) => {
     const gen = ++playActionSeq;
-    const st = get().state;
-    await preResolvePlayUrl(track, st);
+    await preResolvePlayUrl(track);
     if (gen !== playActionSeq) return;
     // 队列增删全在 Rust 引擎线程原子完成：前端只镜像 queue-changed，自己拼数组
     // 会产生「追加后下标算错」的竞态。
-    await ipc.playTrack(track, st?.quality ?? "320");
+    // 音质按平台独立取值（engine 侧队列播放/预加载也按同一张平台表解析）
+    await ipc.playTrack(track, sourcePlayQualityOf(track.platform));
   },
 
   playQueue: async (tracks, startIndex) => {
     const gen = ++playActionSeq;
-    await preResolvePlayUrl(tracks[startIndex], get().state);
+    await preResolvePlayUrl(tracks[startIndex]);
     if (gen !== playActionSeq) return;
     await ipc.playQueue(tracks, startIndex);
   },
@@ -291,7 +305,7 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
   playAt: async (index) => {
     const gen = ++playActionSeq;
     const { queue } = get();
-    await preResolvePlayUrl(queue[index], get().state);
+    await preResolvePlayUrl(queue[index]);
     if (gen !== playActionSeq) return;
     await ipc.playAt(index);
   },
@@ -303,7 +317,7 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
     const { queue, queueIndex } = get();
     if (st && queue.length > 0 && queueIndex !== null && st.playMode !== "random") {
       const nextIndex = (queueIndex + 1) % queue.length;
-      await preResolvePlayUrl(queue[nextIndex], st);
+      await preResolvePlayUrl(queue[nextIndex]);
       if (gen !== playActionSeq) return;
     }
     await ipc.next();
@@ -315,7 +329,7 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
     const { queue, queueIndex } = get();
     if (st && queue.length > 0 && queueIndex !== null) {
       const prevIndex = (queueIndex - 1 + queue.length) % queue.length;
-      await preResolvePlayUrl(queue[prevIndex], st);
+      await preResolvePlayUrl(queue[prevIndex]);
       if (gen !== playActionSeq) return;
     }
     await ipc.previous();

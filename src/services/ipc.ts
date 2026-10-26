@@ -37,6 +37,12 @@ import type {
   MiniPlayerState,
   FileAssociationState,
   LocalMixSummary,
+  AiLocalConfigView,
+  AiLocalMessage,
+  AiLocalReply,
+  AiLocalTestResult,
+  AiProfileInput,
+  AiProviderProtocol,
 } from "@/types";
 import { isQuality } from "@/lib/quality";
 
@@ -330,7 +336,8 @@ export function onLibraryScanProgress(
 
 // 收藏必须挂在歌单上：歌单由永久全局唯一的 pid 标识（创建后不变），
 // 歌单只来自云端同步的卡片或本地自建；无归属（pid 找不到歌单）的歌不加载。
-export const LOCAL_PLATFORM = "local";
+/** 定义在 `@/lib/platform`：展示组件只需这个常量时不必依赖整个 IPC 层。 */
+export { LOCAL_PLATFORM } from "@/lib/platform";
 
 /**
  * 收藏一首歌到某个歌单。`pid` 指定归属歌单，**实际必传**：Rust 侧
@@ -650,11 +657,15 @@ export async function setDownloadNameFormat(format: DownloadNameFormat): Promise
 // ---------- 下载 sidecar 开关（下载完成后同时存封面 / 歌词，2026-11） ----------
 // 键与 Rust 侧 download.rs 的 SETTING_DOWNLOAD_SAVE_COVER / SETTING_DOWNLOAD_SAVE_LYRIC
 // 一一对应；两边共用同一个默认口径：值 "0" = 关，其他 / 未设置 = 开（默认开）。
+// 2026-10 起新增「下载存储方式」（download.storage）：内嵌进音频标签（默认）/
+// 同目录 sidecar 文件，见下方 DownloadStorageMode。
 
 /** 「下载完成后同时保存封面」的设置键（Rust 侧同名常量） */
 const DOWNLOAD_SAVE_COVER_KEY = "download.saveCover";
 /** 「下载完成后同时保存歌词」的设置键（Rust 侧同名常量） */
 const DOWNLOAD_SAVE_LYRIC_KEY = "download.saveLyric";
+/** 「下载存储方式」的设置键（Rust 侧 download.rs SETTING_DOWNLOAD_STORAGE 同名） */
+const DOWNLOAD_STORAGE_KEY = "download.storage";
 
 /** 下载完成后是否同时保存封面（默认开） */
 export async function getDownloadSaveCover(): Promise<boolean> {
@@ -672,6 +683,29 @@ export async function getDownloadSaveLyric(): Promise<boolean> {
 
 export async function setDownloadSaveLyric(on: boolean): Promise<void> {
   await setSetting(DOWNLOAD_SAVE_LYRIC_KEY, on ? "1" : "0");
+}
+
+/** 封面 / 歌词的下载存储方式 */
+export type DownloadStorageMode = "embed" | "sidecar";
+
+/**
+ * 下载存储方式（用户 2026-10「下载歌曲时同时将封面和歌词内嵌到歌曲中」）：
+ * - `"embed"`（默认）：封面 / 歌词 / 标题 / 歌手 / 专辑内嵌进音频文件标签
+ *   （Rust 侧 embed.rs：MP3 APIC+USLT / FLAC METADATA_BLOCK_PICTURE+LYRICS /
+ *   M4A covr+©lyr / WAV ID3v2 chunk…）。白名单外格式与写入失败自动降级
+ *   sidecar，内容不丢；
+ * - `"sidecar"`：旧行为，同名图片 + `.lrc`。
+ *
+ * 未设置 / 非法值一律按 `"embed"`——新行为就是默认行为（与 Rust 侧
+ * `download_storage` 同口径）。
+ */
+export async function getDownloadStorage(): Promise<DownloadStorageMode> {
+  return (await getSetting(DOWNLOAD_STORAGE_KEY)) === "sidecar" ? "sidecar" : "embed";
+}
+
+/** 设置下载存储方式（Rust 侧归一非法值，前端只透传两个合法值） */
+export async function setDownloadStorage(mode: DownloadStorageMode): Promise<void> {
+  await setSetting(DOWNLOAD_STORAGE_KEY, mode);
 }
 
 /** 同时下载数的合法范围（与 Rust `download::MIN/MAX_CONCURRENCY`、设置页选项一致） */
@@ -712,6 +746,11 @@ export async function setDefaultQuality(quality: Quality): Promise<void> {
 /** 当前这首的音质（播放条）：不写 settings，换曲自动回到默认音质 */
 export async function setTrackQuality(quality: Quality): Promise<void> {
   return invoke("set_track_quality", { quality });
+}
+
+/** 各平台独立音质（音源账号页）：全量推送 {平台: 档位}，只更新引擎运行时副本 */
+export async function setSourceQualities(qualities: Record<string, string>): Promise<void> {
+  return invoke("set_source_qualities", { qualities });
 }
 
 // ---------- 倍速 / 睡眠定时 / 音效 / 缓存 / 自启 ----------
@@ -2031,5 +2070,82 @@ export async function astralAiExecuteAction(
     actionType,
     success,
     message,
+  });
+}
+
+// ---------- 客户端直连模型（每日推荐 AI 精选用，详见 Rust ai_local 模块注释） ----------
+
+/**
+ * 读配置。**永远拿不到 Key 明文**，只有 `hasKey`。
+ *
+ * 为什么不复用 `getSetting`：那会把 Key 明文带到前端 JS 里；这里由 Rust 侧读库、
+ * 只回布尔值，Key 从进入进程到发出去都不经过 WebView。
+ */
+export async function aiLocalConfig(): Promise<AiLocalConfigView> {
+  return invoke("ai_local_config");
+}
+
+/**
+ * 整体保存配置档列表 + 当前生效档。
+ *
+ * 配置档是整体结构（多套接口地址任选其一），改一档就整份覆盖；
+ * 每档的 `apiKey` 传 `undefined` = 不改动已存的 Key（设置页留空即此语义），
+ * 传空串 = 清空。地址会先在 Rust 侧归一校验，填错当场报错不落库。
+ */
+export async function aiLocalSaveConfig(
+  profiles: AiProfileInput[],
+  activeId: string,
+): Promise<AiLocalConfigView> {
+  return invoke("ai_local_save_config", { profiles, activeId });
+}
+
+/** 试连：发一句「你好」。用表单值，允许「先试再存」；失败时 error 带可读原因 */
+export async function aiLocalTest(
+  baseUrl: string,
+  model: string,
+  apiKey?: string,
+  protocol?: AiProviderProtocol,
+  skipCertVerify?: boolean,
+): Promise<AiLocalTestResult> {
+  return invoke("ai_local_test", {
+    baseUrl,
+    model,
+    apiKey: apiKey ?? null,
+    protocol: protocol ?? null,
+    skipCertVerify: skipCertVerify ?? null,
+  });
+}
+
+/**
+ * 拉该地址支持的模型列表（`GET /v1/models`）。模型名可下拉选、也可手输 ——
+ * 有些网关不实现 /models，所以这里失败不阻断，设置页照旧允许手填。
+ */
+export async function aiLocalListModels(
+  baseUrl: string,
+  apiKey?: string,
+  protocol?: AiProviderProtocol,
+  skipCertVerify?: boolean,
+): Promise<string[]> {
+  return invoke("ai_local_list_models", {
+    baseUrl,
+    apiKey: apiKey ?? null,
+    protocol: protocol ?? null,
+    skipCertVerify: skipCertVerify ?? null,
+  });
+}
+
+/**
+ * 生成。前端给完整 messages（系统提示 + 用户），Rust 只做转发与取回 content。
+ *
+ * 提示词组装、候选池注入、结果硬校验全在 `@/lib/daily-recommend`，
+ * 这里保持成一条「哑管道」，换模型服务商不用改 Rust。
+ */
+export async function aiLocalChat(
+  messages: AiLocalMessage[],
+  temperature?: number,
+): Promise<AiLocalReply> {
+  return invoke("ai_local_chat", {
+    messages,
+    temperature: temperature ?? null,
   });
 }

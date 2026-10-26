@@ -28,22 +28,26 @@ export function usePlaybackEvents(
     };
 
     const track = async (): Promise<void> => {
-      if (!await subscribe(ipc.onPlaybackStateChanged((s) => {
-        stateEventApplied = true;
-        if (!disposed) applySnapshot(s);
-      }))) return;
-      if (!await subscribe(ipc.onPositionChanged((t) => {
-        if (!disposed) applyTick(t);
-      }))) return;
-      if (!await subscribe(ipc.onQueueChanged((q) => {
-        queueEventApplied = true;
-        if (!disposed) applyQueue(q);
-      }))) return;
-      if (!await subscribe(ipc.onAudioError((e) => {
-        const detail = `[audio-error] ${e.kind} ${e.trackId ?? "-"}：${e.message}`;
-        if (e.stalled) log.warn(detail);
-        else log.error(detail);
-      }))) return;
+      // 四个监听互不依赖，一次并发注册（此前逐个 await，首帧多付三次 IPC 往返）
+      const registered = await Promise.all([
+        subscribe(ipc.onPlaybackStateChanged((s) => {
+          stateEventApplied = true;
+          if (!disposed) applySnapshot(s);
+        })),
+        subscribe(ipc.onPositionChanged((t) => {
+          if (!disposed) applyTick(t);
+        })),
+        subscribe(ipc.onQueueChanged((q) => {
+          queueEventApplied = true;
+          if (!disposed) applyQueue(q);
+        })),
+        subscribe(ipc.onAudioError((e) => {
+          const detail = `[audio-error] ${e.kind} ${e.trackId ?? "-"}：${e.message}`;
+          if (e.stalled) log.warn(detail);
+          else log.error(detail);
+        })),
+      ]);
+      if (disposed || registered.some((ok) => !ok)) return;
       try {
         const restored = restoreSession ? await ipc.restoreLastSession() : null;
         if (disposed) return;

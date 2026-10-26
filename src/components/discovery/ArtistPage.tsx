@@ -7,9 +7,12 @@ import { usePlayerStore } from "@/stores/player";
 import { useSearchPageMax } from "@/stores/sourceRegistry";
 import { usePagedList, type PageResult } from "@/hooks/usePagedList";
 import { resolveArtistId } from "@/lib/artist-id";
+import { safeDecodeURIComponent as safeDecode } from "@/lib/text";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { filterTracks, retainTrackSelection, trackSelectionKey } from "@/lib/track-selection";
 import { TrackList } from "./TrackList";
+import { TrackSortSelect } from "@/components/TrackSortSelect";
+import { DEFAULT_TRACK_SORT, parseTrackSort, sortTracks } from "@/lib/track-sort";
 import { BatchBar } from "./BatchBar";
 import { ErrorRetry, TrackRowsSkeleton } from "./Skeletons";
 import { BackButton } from "@/components/layout/BackButton";
@@ -122,6 +125,14 @@ function ArtistPageContent({ platform, name, artistId }: {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
   const visibleSongs = useMemo(() => filterTracks(songs, query), [songs, query]);
+  /** 排序（默认顺序）：只改显示顺序，不改数据本身；下拉选项与 uniappx 一致 */
+  const [sortValue, setSortValue] = useState(DEFAULT_TRACK_SORT);
+  const { key: sortKey, desc: sortDesc } = parseTrackSort(sortValue);
+  /** 排序作用在「可见列表」上，所以播放全部 / 批量管理 / TrackList 拿的都是这个顺序 */
+  const sortedSongs = useMemo(
+    () => sortTracks(visibleSongs, sortKey, sortDesc),
+    [visibleSongs, sortKey, sortDesc],
+  );
   const visibleSelected = useMemo(() => retainTrackSelection(visibleSongs, selected), [visibleSongs, selected]);
   const changeQuery = (value: string): void => {
     setQuery(value);
@@ -211,7 +222,7 @@ function ArtistPageContent({ platform, name, artistId }: {
                 size="lg"
                 disabled={loading || visibleSongs.length === 0}
                 className="h-9 w-9 rounded-lg shadow-lg shadow-primary/25"
-                onClick={() => void playQueue(visibleSongs, 0)}
+                onClick={() => void playQueue(sortedSongs, 0)}
               >
                 <Play className="h-4 w-4 fill-current" />
               </IconButton>
@@ -222,6 +233,7 @@ function ArtistPageContent({ platform, name, artistId }: {
               歌手页没有宿主歌单；播放与批量操作共用当前可见歌曲。 */}
           {!loading && !error && songs.length > 0 ? (
             <div className="relative flex shrink-0 flex-col items-end justify-end gap-2 pb-1">
+              <TrackSortSelect value={sortValue} onChange={setSortValue} />
               <div className="flex h-8 w-44 items-center gap-2 rounded-lg border border-input bg-background/80 px-2 focus-within:ring-1 focus-within:ring-ring">
                 <Search className="h-3.5 w-3.5 shrink-0 text-muted-foreground" aria-hidden />
                 <input
@@ -253,7 +265,7 @@ function ArtistPageContent({ platform, name, artistId }: {
               </div>
               <BatchBar
                 embedded
-                tracks={visibleSongs}
+                tracks={sortedSongs}
                 selected={visibleSelected}
                 selectionKey={trackSelectionKey}
                 onSelectedChange={setSelected}
@@ -287,7 +299,7 @@ function ArtistPageContent({ platform, name, artistId }: {
               </div>
             ) : (
               <TrackList
-                tracks={visibleSongs}
+                tracks={sortedSongs}
                 showIndex
                 showCollect
                 showDownload
@@ -340,11 +352,5 @@ function rememberAvatar(key: string, url: string): void {
   }
 }
 
-/** URL 里可能不是合法百分号编码，解码失败就按原样用 */
-function safeDecode(s: string): string {
-  try {
-    return decodeURIComponent(s);
-  } catch {
-    return s;
-  }
-}
+// safeDecode 合并到 `@/lib/text` 的 `safeDecodeURIComponent`（全仓唯一实现），这里只留别名。
+export { safeDecode };

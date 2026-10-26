@@ -63,12 +63,15 @@ describe("附属播放窗口的实时同步", () => {
   it("监听注册未完成时卸载，迟到的监听也会注销且不触发状态读取", async () => {
     const registration = deferred<() => void>();
     const unlisten = vi.fn();
+    const lateUnlisten = vi.fn();
     mocks.onPlaybackStateChanged.mockReturnValue(registration.promise);
+    // 其余三个监听立刻完成，用来验证「迟到的那个」被注销、已注册的也被注销。
+    mocks.onPositionChanged.mockResolvedValue(lateUnlisten);
     const { unmount } = renderHook(() => usePlaybackEvents({ restoreSession: false }));
     unmount();
     await act(async () => { registration.resolve(unlisten); });
     expect(unlisten).toHaveBeenCalledOnce();
-    expect(mocks.onPositionChanged).not.toHaveBeenCalled();
+    expect(lateUnlisten).toHaveBeenCalledOnce();
     expect(mocks.getPlaybackState).not.toHaveBeenCalled();
     expect(mocks.restoreLastSession).not.toHaveBeenCalled();
   });

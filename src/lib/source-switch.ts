@@ -1,4 +1,6 @@
 import { searchAllBatches } from "@/source-scripts";
+import { readAggregateSources } from "@/lib/aggregate-sources";
+import { compactText as normalizeMatchText } from "@/lib/text";
 import type { Track } from "@/types";
 
 /**
@@ -12,10 +14,10 @@ import type { Track } from "@/types";
  * 并保留全部正分候选供用户翻看。
  */
 
-/** 归一化匹配文本：小写 + 折叠空白 */
-export function normalizeMatchText(text: string): string {
-  return text.toLowerCase().replace(/\s+/g, "");
-}
+// 归一化匹配文本（小写 + 折叠空白）在 `@/lib/text` 的 `compactText`（全仓唯一实现，
+// 收藏查重 / 歌手名对齐用的也是它）。既有调用方与测试从本模块 import
+// `normalizeMatchText`，保留这个别名 re-export。
+export { normalizeMatchText };
 
 /**
  * 候选与目标歌的相似度：同名 +10 / 包含 +5；歌手同名 +6 / 包含 +3。
@@ -123,7 +125,8 @@ export async function findSourceCandidates(
     const cached = cacheGet(key);
     if (cached !== null) return cached;
   }
-  const batches = await searchAllBatches(keyword, page, size);
+  // 聚合搜索只查用户勾选的音源（设置 → 音源包 → 聚合搜索音源；null = 全部）
+  const batches = await searchAllBatches(keyword, page, size, (await readAggregateSources()) ?? undefined);
   const out: { track: Track; score: number }[] = [];
   const seen = new Set<string>();
   for (const batch of batches) {

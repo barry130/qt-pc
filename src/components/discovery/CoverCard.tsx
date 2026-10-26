@@ -1,13 +1,9 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { Play } from "lucide-react";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { cn } from "@/lib/utils";
 
-/**
- * 封面卡片（歌单广场 / 排行榜 / 首页推荐共用）。
- * 封面统一经 qtres:// 走 Rust 侧 Range 透传（DESIGN §6.13，带 Referer 防盗链）。
- */
-export function CoverCard(props: {
+type CoverCardProps<T> = {
   name: string;
   picUrl: string;
   /** 副标题：歌单显示播放量，榜单显示简介 */
@@ -19,16 +15,30 @@ export function CoverCard(props: {
    * 两者特异性相同，最终宽度取决于样式表里的先后顺序 —— 属于看运气的写法。
    */
   layout?: "grid" | "row";
-  onClick: () => void;
-}): React.JSX.Element {
-  const { name, picUrl, subtitle, layout = "grid", onClick } = props;
+  /**
+   * 卡片对应的数据项。与 `onPick` 一起传，而不是让调用方内联 `onClick={() => …}`：
+   * 网格里几十上百张卡片，内联箭头每次都换新引用会把 memo 打穿（#12）。
+   */
+  item: T;
+  onPick: (item: T) => void;
+};
+
+/**
+ * 封面卡片（歌单广场 / 排行榜 / 首页推荐 / 搜索结果共用）。
+ * 封面统一经 qtres:// 走 Rust 侧 Range 透传（DESIGN §6.13，带 Referer 防盗链）。
+ *
+ * memo：无限滚动会累积数百张卡，父级任何一次重渲（翻页 loading 翻转、排序切换）
+ * 都不该让已经渲染过的卡片重画。props 全是原始值 + 稳定回调，浅比较足够。
+ */
+function CoverCardInner<T>(props: CoverCardProps<T>): React.JSX.Element {
+  const { name, picUrl, subtitle, layout = "grid", item, onPick } = props;
   const cover = qtresCoverUrl(picUrl);
   // 上游 404 / 代取失败 → <img> error，退到首字兜底，不留空白卡
   const [loadFailed, setLoadFailed] = useState(false);
   return (
     <button
       type="button"
-      onClick={onClick}
+      onClick={() => onPick(item)}
       // grid：w-full 不能省 —— grid item 会 stretch 撑开，但放进横向滚动卡片行
       // （普通 flex/div 容器）时 button 是 inline-block，不写 w-full 会按内容收缩。
       // row：w-32 shrink-0 与「新歌速递」的 TrackCard 同宽，行内不参与压缩。
@@ -86,6 +96,12 @@ export function CoverCard(props: {
     </button>
   );
 }
+
+/**
+ * 泛型组件的 memo 包装：`memo()` 会擦掉泛型参数，这里用断言把签名找回来，
+ * 调用方仍按 `item` 的类型推断 `onPick`，不需要显式标注类型实参。
+ */
+export const CoverCard = memo(CoverCardInner) as typeof CoverCardInner;
 
 /**
  * 卡片网格容器（歌单广场 / 排行榜 / 搜索结果共用，一律整排铺满）。

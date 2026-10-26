@@ -10,6 +10,7 @@ import {
 } from "@/lib/localOnline";
 import { useMusicSourceStore } from "@/stores/musicSource";
 import { useSourceLabelFn, useSourceRegistryStore } from "@/stores/sourceRegistry";
+import { SourceTag } from "@/components/common/SourceTag";
 import { Popover } from "@/components/common/Popover";
 import { cn, errMsg } from "@/lib/utils";
 import type { Lyric, SourceId, Track } from "@/types";
@@ -308,11 +309,11 @@ function LyricSearchPanel(props: {
                     picking !== null ? "opacity-50" : "hover:bg-secondary/60",
                   )}
                 >
-                  <span className="shrink-0 rounded bg-secondary/70 px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                    {sourceLabel(item.source)}
-                  </span>
                   <span className="flex min-w-0 flex-1 flex-col">
-                    <span className="truncate text-xs text-foreground/90">{item.track.title}</span>
+                    <span className="flex min-w-0 items-center gap-1.5">
+                      <span className="truncate text-xs text-foreground/90">{item.track.title}</span>
+                      <SourceTag platform={item.track.platform} size="xs" />
+                    </span>
                     <span className="truncate text-[11px] text-muted-foreground">
                       {item.track.singer}
                       {item.track.album.length > 0 ? ` · ${item.track.album}` : ""}

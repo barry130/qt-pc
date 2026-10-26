@@ -450,6 +450,54 @@ export interface RegistrySource {
   qualities?: string[];
   /** 歌单广场排序选项（v5 契约；id 原样透传给 recommendations；空 = 不支持） */
   playlistSorts?: { id: string; name: string }[];
+  /**
+   * 账号登录能力自述（v9 契约）：该源支不支持登录、用什么方式
+   * （qrcode = 官方扫码；cookie = 手动导入 Cookie）。宿主据此显隐
+   * 「设置 → 音源包 → 音源账号」里该源的登录入口；未声明（旧包）= 不支持，
+   * 整个账号区块只显示已存账号的退出入口。domains 是凭据注入的域名范围，
+   * 纯展示用途（真正的注入表在数据包内）。
+   */
+  auth?: {
+    methods: string[];
+    domains: string[];
+    /**
+     * 官方前置线路支持的音质档（v11 契约；按低到高排）。id = 官方 level 同名
+     * （请求即发该 level），name = 官方展示名（标准/极高/无损/高解析度无损/
+     * 高清臻音/超清母带），min = 拿到该档的最低会员档（none/vip/svip）。
+     * 声明了 = 该源播放面登录态生效时，音质选择整体切换到这份官方清单并按
+     * 账号会员档过滤（useSourceQualities / clampQualityForPlatform /
+     * quality-fallback 三处消费点同步切换）；未声明（旧包/无官方线路的源）
+     * = 登录与否都按普通档位子集展示。
+     */
+    officialQualities?: SourceOfficialQuality[];
+    /**
+     * 扫码提示文案（v16 契约；数据包 auth 自述下发）：该源二维码用哪个 App
+     * 扫——QQ 的 ptlogin 通道只能用手机 QQ「扫一扫」（不是 QQ 音乐 App）。
+     * 缺省 = 通用文案。
+     */
+    qrHint?: string;
+  };
+}
+
+/** 官方线路的单个音质档（v11 契约；数据包 officialQualities 下发的条目） */
+export interface SourceOfficialQuality {
+  id: string;
+  name: string;
+  /** 拿到该档需要的最低会员档（2026-10-25 需求：VIP 展示到 VIP 级，SVIP 到 SVIP 级） */
+  min: "none" | "vip" | "svip";
+}
+
+/**
+ * 某源**当前生效**的音质档位清单（v12 契约；包侧 getSourceQualities 应答）。
+ * mode="official" = 播放面登录态生效且包声明了官方清单（qualities 为按会员档
+ * 过滤后的官方档，aliases 把存量第三方档名归一到官方 level id）；
+ * mode="platform" = 官方清单未生效（未登录/包未声明），宿主继续用注册表的
+ * 普通档位子集。判定逻辑在数据包内，宿主只缓存与展示。
+ */
+export interface SourceQualityProfile {
+  mode: "official" | "platform";
+  qualities: SourceOfficialQuality[];
+  aliases: Record<string, string>;
 }
 
 /** 数据包注册表声明的音质档位 */
@@ -658,4 +706,110 @@ export interface FileAssociationState {
   registered: boolean;
   extensions: string[];
   defaultExtensions: string[];
+}
+
+// ---------- 客户端直连模型（Rust ai_local.rs 的 camelCase 投影） ----------
+
+/**
+ * 一套接口配置档的展示视图：**永远不含 Key 明文**，只有 `hasKey`。
+ *
+ * 为什么要多档（用户 m01818）：「本地模型精选」可能同时有多套可用接口
+ * （官方 API、自建网关、本机 Ollama），每套的地址/模型/Key 都不同，
+ * 让用户每次改一遍不现实 —— 存成多档，选一套生效即可。
+ */
+/**
+ * 接口协议：直接决定 Rust 侧用哪种请求体与端点。
+ *
+ * - `openai`：OpenAI 兼容（`POST /chat/completions`），绝大多数中转站都走这个；
+ * - `openai-responses`：OpenAI Responses API（`POST /responses`），新版官方接口；
+ * - `anthropic`：Anthropic 兼容（`POST /v1/messages` + `x-api-key`）；
+ * - `gemini`：Gemini（`POST /models/{model}:generateContent` + `x-goog-api-key`）。
+ */
+export type AiProviderProtocol = "openai" | "openai-responses" | "anthropic" | "gemini";
+
+export interface AiProfileView {
+  id: string;
+  /** 展示名；留空时 Rust 侧用地址里的主机名顶上 */
+  name: string;
+  baseUrl: string;
+  protocol: AiProviderProtocol;
+  /** 当前生效模型 = `models[0]`（兼容旧字段） */
+  model: string;
+  /** 详情页里选中的模型（chips 多选；第一项生效） */
+  models: string[];
+  /** 是否至少存了一把 Key */
+  hasKey: boolean;
+  /**
+   * 每一把 Key 的掩码（第一项 = 使用中）。前端拿不到明文，
+   * 设置页只用来在列表/详情里展示「••••••ab」。
+   */
+  keyMasks: string[];
+  /** = `keyMasks[0]`，没有 Key 时为空串（列表行直接用它） */
+  keyMask: string;
+  /** 内置图标名 / data URL / 空串（首字母方块） */
+  icon: string;
+  /** 跳过 HTTPS 证书校验（自签证书的内网网关） */
+  skipCertVerify: boolean;
+}
+
+/** 设置页整体视图：全部配置档 + 当前生效档 id */
+export interface AiLocalConfigView {
+  profiles: AiProfileView[];
+  activeId: string;
+}
+
+/** 提交给 `aiLocalSaveConfig` 的一档配置 */
+export interface AiProfileInput {
+  /** 空串 = 新建（Rust 侧生成 id） */
+  id: string;
+  name: string;
+  baseUrl: string;
+  protocol: AiProviderProtocol;
+  /** 生效模型 = `models[0]`；models 为空时用这个 */
+  model: string;
+  /** 详情页选中的模型（第一项生效） */
+  models: string[];
+  icon: string;
+  skipCertVerify: boolean;
+  /**
+   * `undefined` = 沿用已存的 Key；`""` = 清空；非空 = 覆盖。
+   * 前端永远拿不到旧 Key 明文，所以「不改」只能靠不传表达。
+   */
+  apiKey?: string;
+  /**
+   * 整份覆盖 Key 列表（第一把使用中）。
+   * 只在前端确实拿到了全部明文时才用；否则优先用下面三个增量字段。
+   */
+  keys?: string[];
+  /** 追加若干把新 Key（追加到列表末尾） */
+  addKeys?: string[];
+  /** 按当前已存列表的下标删除若干把 Key */
+  removeKeyIndexes?: number[];
+  /** 把当前已存列表的第 i 把移到最前（= 设为使用中） */
+  activeKeyIndex?: number;
+}
+
+/** 一条对话消息（OpenAI 兼容格式） */
+export interface AiLocalMessage {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+/** 一次生成的回执 */
+export interface AiLocalReply {
+  content: string;
+  /** 服务端回传的实际模型名（部分网关会改写） */
+  model: string;
+  elapsedMs: number;
+  promptTokens: number | null;
+  completionTokens: number | null;
+}
+
+/** 「测试连接」结果：ok 时带 HTTP 状态与模型回的第一句话 */
+export interface AiLocalTestResult {
+  ok: boolean;
+  status: number | null;
+  elapsedMs: number;
+  reply: string | null;
+  error: string | null;
 }

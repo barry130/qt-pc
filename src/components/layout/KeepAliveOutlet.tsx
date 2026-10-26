@@ -53,11 +53,16 @@ const AiAssistantPage = lazyPage(
   () => import("@/components/ai-assistant/AiAssistantPage"),
   "AiAssistantPage",
 );
+const DailyRecommendPage = lazyPage(
+  () => import("@/components/discovery/DailyRecommendPage"),
+  "DailyRecommendPage",
+);
 
 /** 一级页面清单：pathname → 页面元素工厂（新增一级页时在此登记） */
 export const KEEP_ALIVE_PAGES: Record<string, () => React.JSX.Element> = {
   "/": () => <DiscoverPage />,
   "/daily": () => <DailyPage />,
+  "/daily-recommend": () => <DailyRecommendPage />,
   "/playlists": () => <PlaylistsPage />,
   "/charts": () => <ChartsPage />,
   "/library": () => <LibraryPage />,

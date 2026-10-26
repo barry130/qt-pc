@@ -1,5 +1,6 @@
 //! 轻听 PC 版 Tauri 入口（lib 形式，便于集成测试）。
 
+pub mod ai_local;
 pub mod app_config;
 pub mod app_paths;
 pub mod astral;
@@ -10,22 +11,24 @@ pub mod commands;
 pub mod cue;
 pub mod db;
 pub mod download;
+/// 下载成品内嵌封面 / 歌词（「下载存储方式 = 音乐内嵌」，lofty 读写标签）
+pub mod embed;
 /// 「外部打开」的待取队列与命令行解析（拖拽入窗 / 命令行参数 / 第二实例转发）
 pub mod external_open;
 /// 文件关联与「设为默认播放器」（第二波）
 pub mod file_assoc;
 pub mod file_logger;
 pub mod ipc_guard;
-pub mod local;
+/// 重复文件检测与只读整理预览
+pub mod library_maintenance;
 pub mod library_scan;
 /// 听歌报告只读分页查询
 pub mod listen_report;
-/// 重复文件检测与只读整理预览
-pub mod library_maintenance;
+pub mod local;
 pub mod lyric_window;
+pub mod media;
 /// 迷你播放器悬浮窗（第二波）
 pub mod mini_window;
-pub mod media;
 /// 全局网络配置：代理与单源超时（第二波）
 pub mod net_config;
 pub mod net_guard;
@@ -157,10 +160,8 @@ pub fn run() {
             // 第二实例可能是被「打开方式 / 拖到图标上」拉起来的，它带的文件参数
             // 要由**已经在运行的**我们打开（第二个实例本身马上就退出了）。
             // 参数先入待取队列再叫前端来取：前端此刻可能还没注册监听。
-            let paths = crate::external_open::paths_from_args(
-                &args,
-                Some(std::path::Path::new(&cwd)),
-            );
+            let paths =
+                crate::external_open::paths_from_args(&args, Some(std::path::Path::new(&cwd)));
             if !paths.is_empty() {
                 crate::external_open::push(paths);
                 crate::external_open::notify(app);
@@ -461,10 +462,12 @@ pub fn run() {
             source_install::cmd_source_meta_loaded,
             source_install::cmd_source_meta_load_failed,
             source_install::cmd_source_report,
+            source_install::cmd_source_engine_log,
             cmd_play_track,
             cmd_play_queue,
             cmd_set_default_quality,
             cmd_set_track_quality,
+            cmd_set_source_qualities,
             cmd_play_at,
             cmd_next,
             cmd_previous,
@@ -583,6 +586,12 @@ pub fn run() {
             cmd_clear_listen_stats,
             recommend::cmd_list_local_mixes,
             recommend::cmd_get_local_mix_tracks,
+            // 客户端直连模型（每日推荐 AI 精选；Key 只留在 Rust 侧）
+            ai_local::cmd_ai_local_config,
+            ai_local::cmd_ai_local_save_config,
+            ai_local::cmd_ai_local_test,
+            ai_local::cmd_ai_local_list_models,
+            ai_local::cmd_ai_local_chat,
             // 通用设置项
             cmd_get_setting,
             cmd_set_setting,

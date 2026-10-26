@@ -40,6 +40,8 @@ interface EngineReply {
   size?: number | null;
   /** 按实测码率重标后的档位（包侧 snapQualityToMeasured；空串/缺失 = 未重标） */
   actualQuality?: string;
+  /** 官方前置线路的尝试结论（诊断用；空串 = 官方命中或未参与） */
+  officialNote?: string;
   phase?: EnginePhase;
   code?: number | null;
   detail?: string | null;
@@ -114,6 +116,14 @@ export interface EngineResolved {
    * 以前会把文件名写成 `.flac`，是虚标。
    */
   actualQuality: string;
+  /**
+   * 官方前置线路的尝试结论（诊断用；空串 = 官方命中或未参与，或引擎页较旧）。
+   *
+   * 官方失败会静默落回第三方链，UI 只看得到命中的线路名——把「为什么没走
+   * 官方」（无 purl/需 VIP/播放面无凭据）随应答带出（2026-10-25 用户排查 QQ
+   * 官方线路未生效时没法自查）。
+   */
+  officialNote: string;
 }
 
 /**
@@ -453,6 +463,7 @@ export async function engineResolve(
   const referer = typeof answer.referer === "string" ? answer.referer : "";
   const size = typeof answer.size === "number" && Number.isFinite(answer.size) ? answer.size : null;
   const actualQuality = typeof answer.actualQuality === "string" ? answer.actualQuality : "";
+  const officialNote = typeof answer.officialNote === "string" ? answer.officialNote : "";
   // 音源包在 trace 前缀打 `[网络]` 表示「整链没有一条线路拿到过响应」，
   // 即本次全灭是弱网/引擎卡造成的环境问题，而不是这个音源没这首歌
   // （见 qt-sources/src/actions/play-url.ts 的 noteSourceMissFiltered）。
@@ -466,12 +477,12 @@ export async function engineResolve(
     if (stalled) log.warn(detail);
     else log.error(detail);
   }
-  return { url, line: normalizeLine(answer.line), error, stalled, referer, size, actualQuality };
+  return { url, line: normalizeLine(answer.line), error, stalled, referer, size, actualQuality, officialNote };
 }
 
 /** 取链失败/未就绪的统一应答（没有地址，也就没有体积与实测档位） */
 function failedResolve(): EngineResolved {
-  return { url: "", line: null, error: "", stalled: true, referer: "", size: null, actualQuality: "" };
+  return { url: "", line: null, error: "", stalled: true, referer: "", size: null, actualQuality: "", officialNote: "" };
 }
 
 /** 引擎当前状态快照（设置页展示用） */

@@ -172,20 +172,6 @@ export function isAdmin(profile: Record<string, unknown> | null): boolean {
   return hasPermission(profile, "admin:qt:admin", ["qt_admin"]);
 }
 
-/**
- * 音乐助手权限码，与后端 `AiPlugin.PERM_MUSIC_USE` 同一个字符串。
- *
- * 后端 `/api/v1/app/ai/agents` 已经按 `accessService.permitted()` 过滤过智能体，
- * 没有这个码的账号请求回来就是空列表；前端提前用同一个码做显隐，避免
- * 「点进去只看到一句没有可用助手」。
- */
-export const MUSIC_ASSISTANT_PERM = "user:ai:music:use";
-
-/** 当前账号能否使用音乐助手（侧边栏入口显隐用；未登录 = 无权限） */
-export function canUseMusicAssistant(profile: Record<string, unknown> | null): boolean {
-  return hasPermission(profile, MUSIC_ASSISTANT_PERM);
-}
-
 const LIKE_PAGE_SIZE = 200;
 
 /**

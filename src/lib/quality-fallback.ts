@@ -21,7 +21,7 @@
  */
 import * as ipc from "@/services/ipc";
 import { resolvePlayUrlDetailed } from "@/source-scripts";
-import { qualityRanksOf, useSourceRegistryStore } from "@/stores/sourceRegistry";
+import { normalizeQualityForSource, qualityRanksOf, useSourceRegistryStore } from "@/stores/sourceRegistry";
 import type { Track } from "@/types";
 
 /** 一次回退取链的完整结果（失败时 url 为空串，其余字段为「没测出来」） */
@@ -91,6 +91,11 @@ export function peekQualityCeiling(platform: string, album: string): string | nu
   return qualityCeiling.get(ceilingKeyOf(platform, name)) ?? null;
 }
 
+// normalizeQualityForSource（v11 旧档名→官方 level 归一）定义在
+// stores/sourceRegistry（要读注册表状态且本模块已依赖它，放这里会成环），
+// 这里转出口给播放预解析/引擎桥沿用同一份。
+export { normalizeQualityForSource } from "@/stores/sourceRegistry";
+
 /** 清空档位记忆（设置页「播放地址」清理 / 测试用） */
 export function clearQualityCeilingCache(): number {
   const count = qualityCeiling.size;
@@ -109,26 +114,42 @@ export function clearQualityCeilingCache(): number {
  * `album` 给了且这张专辑此前被观测到只能出更低档时，起点直接降到那一档
  * （见 qualityCeiling 的注释：有声书每集都会重付一次高档位的失败预算）。
  */
-export function qualityFallbackLadder(platform: string, wanted: string, album = ""): string[] {
+export function qualityFallbackLadder(platform: string, rawWanted: string, album = ""): string[] {
+  // 存量请求档可能是旧第三方档名（v11 前选的 flac/flac24bit）：官方清单生效时
+  // 先归一到官方 level，阶梯起点才落得到位
+  const wanted = normalizeQualityForSource(platform, rawWanted);
   const registry = useSourceRegistryStore.getState();
-  const declared = registry.sources.find((item) => item.id === platform)?.qualities;
+  const source = registry.sources.find((item) => item.id === platform);
+  // v12：包侧 getSourceQualities 判定官方清单生效（播放面登录态等，逻辑在包内）
+  // 时按官方清单起阶梯（与 useSourceQualities/clampQualityForPlatform 同口径）。
+  // 官方清单按「低→高」声明且 id 不在全局档位表里，阶梯直接用清单自身倒序；
+  // 未生效再回源声明子集。
+  const official = (registry.profiles[platform]?.mode === "official"
+    ? registry.profiles[platform]!.qualities
+    : []
+  )
+    .filter((q) => q !== null && typeof q === "object" && typeof q.id === "string" && q.id.length > 0)
+    .map((q) => q.id);
+  const declared = source?.qualities;
   // 全局档位表按「高→低」排（qualityRanksOf 内部取反，见其注释）
   const allRanks = qualityRanksOf(registry.qualities);
-  const ladder = (
-    declared === undefined || declared.length === 0
-      ? allRanks
-      : allRanks.filter((q) => declared.includes(q))
-  ).filter((q) => q.length > 0);
-  if (ladder.length === 0) return [wanted];
-  let start = ladder.indexOf(wanted);
+  const ladder =
+    official.length > 0
+      ? [...official].reverse()
+      : declared === undefined || declared.length === 0
+        ? allRanks
+        : allRanks.filter((q) => declared.includes(q));
+  const cleaned = ladder.filter((q) => q.length > 0);
+  if (cleaned.length === 0) return [wanted];
+  let start = cleaned.indexOf(wanted);
   const ceiling = peekQualityCeiling(platform, album);
   if (ceiling !== null) {
-    const ceilingRank = ladder.indexOf(ceiling);
+    const ceilingRank = cleaned.indexOf(ceiling);
     // 只在「记忆档比请求档低」时下调起点；请求档本来就更低（用户手动选了 128）
     // 或记忆档不在该源阶梯上时不动。
     if (ceilingRank >= 0 && (start < 0 || ceilingRank > start)) start = ceilingRank;
   }
-  return start >= 0 ? ladder.slice(start) : ladder;
+  return start >= 0 ? cleaned.slice(start) : cleaned;
 }
 
 /**

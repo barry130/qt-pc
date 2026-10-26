@@ -260,3 +260,28 @@ describe("播放队列：行内错误反馈", () => {
     expect(usePlayerStore.getState().playAt).not.toHaveBeenCalled();
   });
 });
+
+describe("播放队列：全选图标反映当前状态", () => {
+  function selectAllButton(): HTMLElement {
+    return screen.getByRole("button", { name: /^(全选|全不选)$/ });
+  }
+
+  it("没选是空方框、选一部分是半选、全选是勾选方框", () => {
+    render(<QueuePanel />);
+    fireEvent.click(screen.getByRole("button", { name: "批量管理" }));
+    // 刚进批量管理：0/3 → 空方框
+    expect(selectAllButton().querySelector(".lucide-square")).toBeTruthy();
+    expect(selectAllButton().querySelector(".lucide-square-check-big")).toBeNull();
+
+    // 全选 3/3 → 勾选方框（图标说的是当前状态，不是「点了会变成什么」）
+    fireEvent.click(selectAllButton());
+    expect(screen.getByRole("button", { name: "全不选" })).toBeTruthy();
+    expect(selectAllButton().querySelector(".lucide-square-check-big")).toBeTruthy();
+    expect(selectAllButton().querySelector(".lucide-square")).toBeNull();
+
+    // 取消一行 2/3 → 半选方框
+    fireEvent.click(row("A"));
+    expect(screen.getByRole("button", { name: "全选" })).toBeTruthy();
+    expect(selectAllButton().querySelector(".lucide-square-minus")).toBeTruthy();
+  });
+});

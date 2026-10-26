@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ChevronDown } from "lucide-react";
 import { errMsg } from "@/lib/utils";
+import { formatPlayCount } from "@/lib/format";
 import { useNavigate } from "@tanstack/react-router";
 import type { Playlist, PlaylistCategory } from "@/types";
 import * as sourceApi from "@/source-scripts";
@@ -57,10 +58,22 @@ export function PlaylistsPage(): React.JSX.Element {
     };
   }, [activeSourceId, metaGeneration]);
 
-  // 排序随源声明变化（切源/换包后）：当前排序不在声明里就回退到第一项
+  // 排序随源声明变化（切源/换包后）：当前排序不在声明里就回退到第一项。
+  // 回退本身也要重置分页与已加载列表（#36）：否则新排序的第一页会被
+  // append 到旧排序的列表后面，出现两种排序混排。
   useEffect(() => {
-    if (sorts.length > 0 && !sorts.some((s) => s.id === sort)) setSort(sorts[0]!.id);
-    if (sorts.length === 0 && sort !== "") setSort("");
+    if (sorts.length > 0 && !sorts.some((s) => s.id === sort)) {
+      setSort(sorts[0]!.id);
+      setPage(1);
+      setItems([]);
+      setHasMore(true);
+    }
+    if (sorts.length === 0 && sort !== "") {
+      setSort("");
+      setPage(1);
+      setItems([]);
+      setHasMore(true);
+    }
   }, [sorts, sort]);
 
   const load = useCallback(
@@ -131,6 +144,20 @@ export function PlaylistsPage(): React.JSX.Element {
     setHasMore(true);
   };
 
+  /**
+   * 稳定回调（#12）：封面卡是 memo 组件，内联箭头每次渲染都换新引用会把 memo 打穿；
+   * 无限滚动累积几百张卡时，翻页 loading 翻转都会让整网格重画。
+   */
+  const openPlaylist = useCallback(
+    (p: Playlist): void => {
+      void navigate({
+        to: "/playlist/$platform/$id",
+        params: { platform: p.platform, id: p.id },
+      });
+    },
+    [navigate],
+  );
+
   return (
     <div className="flex h-full min-w-0 flex-col">
       <div className="border-b border-border px-4 py-3">
@@ -169,13 +196,9 @@ export function PlaylistsPage(): React.JSX.Element {
                   key={`${p.platform}-${p.id}`}
                   name={p.name}
                   picUrl={p.picUrl}
-                  subtitle={p.playCount ? `${p.playCount} 次播放` : undefined}
-                  onClick={() =>
-                    void navigate({
-                      to: "/playlist/$platform/$id",
-                      params: { platform: p.platform, id: p.id },
-                    })
-                  }
+                  subtitle={p.playCount ? `${formatPlayCount(p.playCount)}次播放` : undefined}
+                  item={p}
+                  onPick={openPlaylist}
                 />
               ))}
             </CoverGrid>

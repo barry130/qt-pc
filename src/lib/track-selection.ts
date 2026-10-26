@@ -1,11 +1,11 @@
+import { trackKey as trackSelectionKey } from "@/lib/text";
 import type { Track } from "@/types";
 
 export type TrackSelectionKey = (track: Track) => string;
 
-/** 与曲目数据库身份一致；本地路径和不同平台的同名 id 不能互相选中。 */
-export function trackSelectionKey(track: Pick<Track, "platform" | "id">): string {
-  return `${track.platform}:${track.id}`;
-}
+// 选择键与曲目数据库身份一致（`平台:原始id`，见 `@/lib/text` 的 `trackKey`：
+// 全仓唯一实现；本地路径和不同平台的同名 id 不能互相选中）。
+export { trackSelectionKey };
 
 /** 仅为尚未迁移的调用方保留的旧选择口径。 */
 export const legacyTrackSelectionKey: TrackSelectionKey = (track) => track.id;

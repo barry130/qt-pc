@@ -145,6 +145,54 @@ function cacheSet<T>(cache: Map<string, T>, url: string, value: T): T {
 const coverColorCache = new Map<string, string | null>();
 
 /**
+ * 已解码封面的共享缓存 + 在飞去重。
+ *
+ * 主色与「醒目主色」都要同一张封面：原先两个函数各自 fetch + 解码一遍，播放页
+ * 一进就白付一次网络往返 + 一次解码。这里把「下载并解码成 Image」收成一份，
+ * 两个取色函数只负责各自的画布采样。
+ */
+const coverImageCache = new Map<string, HTMLImageElement | null>();
+const coverImageInflight = new Map<string, Promise<HTMLImageElement | null>>();
+
+async function loadCoverImage(url: string): Promise<HTMLImageElement | null> {
+  const hit = cacheGet(coverImageCache, url);
+  if (hit !== undefined) return hit;
+  const pending = coverImageInflight.get(url);
+  if (pending) return pending;
+
+  const task = (async (): Promise<HTMLImageElement | null> => {
+    try {
+      const response = await fetch(url);
+      if (!response.ok) return null;
+      const blob = await response.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const img = new Image();
+      try {
+        await new Promise<void>((resolve, reject) => {
+          img.onload = () => resolve();
+          img.onerror = () => reject(new Error("image load failed"));
+          img.src = blobUrl;
+        });
+      } finally {
+        // 解码完成即可释放 blob URL：Image 已持有位图，后续 drawImage 照常可用
+        URL.revokeObjectURL(blobUrl);
+      }
+      return img;
+    } catch {
+      return null;
+    }
+  })();
+
+  coverImageInflight.set(url, task);
+  try {
+    const img = await task;
+    return cacheSet(coverImageCache, url, img);
+  } finally {
+    coverImageInflight.delete(url);
+  }
+}
+
+/**
  * 从封面 URL 提取主色。
  * 通过 fetch → blob → canvas 采样，避免 CORS 问题。
  * 跳过灰度色（饱和度 < 15%）和全透明图。
@@ -155,19 +203,10 @@ export async function extractCoverColor(url: string): Promise<string | null> {
   if (hit !== undefined) return hit;
 
   try {
-    const response = await fetch(url);
-    if (!response.ok) {
+    const img = await loadCoverImage(url);
+    if (!img) {
       return cacheSet(coverColorCache, url, null);
     }
-    const blob = await response.blob();
-    const blobUrl = URL.createObjectURL(blob);
-
-    const img = new Image();
-    await new Promise<void>((resolve, reject) => {
-      img.onload = () => resolve();
-      img.onerror = () => reject(new Error("image load failed"));
-      img.src = blobUrl;
-    });
 
     const size = 40;
     const canvas = document.createElement("canvas");
@@ -175,12 +214,10 @@ export async function extractCoverColor(url: string): Promise<string | null> {
     canvas.height = size;
     const ctx = canvas.getContext("2d");
     if (!ctx) {
-      URL.revokeObjectURL(blobUrl);
       return cacheSet(coverColorCache, url, null);
     }
 
     ctx.drawImage(img, 0, 0, size, size);
-    URL.revokeObjectURL(blobUrl);
 
     let data: Uint8ClampedArray;
     try {
@@ -263,24 +300,14 @@ export async function extractCoverAccent(url: string): Promise<string | null> {
   };
 
   try {
-    const response = await fetch(url);
-    if (!response.ok) return record(null);
-    const blob = await response.blob();
-    const blobUrl = URL.createObjectURL(blob);
-
-    const img = new Image();
-    await new Promise<void>((resolve, reject) => {
-      img.onload = () => resolve();
-      img.onerror = () => reject(new Error("image load failed"));
-      img.src = blobUrl;
-    });
+    const img = await loadCoverImage(url);
+    if (!img) return record(null);
 
     const size = 48;
     const canvas = document.createElement("canvas");
     canvas.width = size;
     canvas.height = size;
     const ctx = canvas.getContext("2d");
-    URL.revokeObjectURL(blobUrl);
     if (!ctx) return record(null);
 
     ctx.drawImage(img, 0, 0, size, size);

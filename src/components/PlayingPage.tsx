@@ -10,7 +10,6 @@ import {
   type CrossSourceHit,
 } from "@/lib/localOnline";
 import { useLyricOffset } from "@/hooks/useLyricOffset";
-import { useSourceColor, useSourceLabel } from "@/stores/sourceRegistry";
 import { LyricOffsetControl } from "@/components/lyric/LyricOffsetControl";
 import { LyricSearchButton } from "@/components/lyric/LyricSearchButton";
 import {
@@ -23,6 +22,7 @@ import {
   type LyricLine,
 } from "@/lib/lrc";
 import { WindowControls } from "@/components/WindowControls";
+import { SourceTag } from "@/components/common/SourceTag";
 import { errMsg } from "@/lib/utils";
 import { LyricScroller } from "@/components/player/LyricScroller";
 
@@ -321,27 +321,6 @@ function TrackInfo(props: { track: Track | null; cross?: CrossSourceHit | null }
         </div>
       )}
     </div>
-  );
-}
-
-/**
- * 歌名右侧的当前音源徽标：换源后就地替换了 track，所以 track.platform 就是「现在实际在播的音源」。
- * 用注册表里的音源色做淡色底（未知源兜底中性灰），不抢标题的视觉重心。
- */
-function SourceTag(props: { platform: string }): React.JSX.Element {
-  const label = useSourceLabel(props.platform);
-  const color = useSourceColor(props.platform);
-  return (
-    <span
-      className="shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium leading-none"
-      style={{
-        color,
-        backgroundColor: `color-mix(in srgb, ${color} 16%, transparent)`,
-      }}
-      title={`当前音源：${label}`}
-    >
-      {label}
-    </span>
   );
 }
 

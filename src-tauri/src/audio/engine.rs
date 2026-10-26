@@ -10,7 +10,7 @@
 //! 位置口径：`sink.get_pos()` 是 rodio 对当前源的真实播放位置（暂停时冻结），
 //! tick 时以它为准并回写快照，避免自增累计漂移。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
@@ -139,6 +139,11 @@ pub enum AudioCmd {
     /// 只改当前这首的音质（播放条入口）：不写 settings，切到别的歌自动回到默认。
     SetTrackQuality {
         quality: Quality,
+    },
+    /// 各平台独立音质（音源账号页）：前端全量推送 {平台: 档位}，只更新运行时
+    /// 副本（持久化在前端设置库，引擎重启后由前端重灌）。
+    SetSourceQualities {
+        qualities: HashMap<String, Quality>,
     },
     /// 改播放倍速（0.5 ~ 2.0）。rodio Player 的速度控制链全权处理，
     /// 进度 / seek 的内容时间域由引擎在读写两侧换算（见 content_pos_ms / sink_seek_content）。
@@ -382,6 +387,10 @@ struct EngineInner {
     /// 播放条上对「当前这首」的临时音质 (track_id, quality)：按曲目 id 绑定，
     /// 不落 settings，切到别的歌就自动回到 default_quality。
     track_quality: Option<(String, Quality)>,
+    /// 各平台的独立播放音质（音源账号页按平台设置）：前端启动/变更时全量推送的
+    /// 运行时副本，不落 settings——持久化在前端设置库里，引擎重启后由前端重灌。
+    /// 查找顺序见 effective_quality_for：本曲临时 → 平台独立 → 全局默认。
+    source_qualities: HashMap<String, Quality>,
     /// 当前实际挂接的输出设备名（快照里展示用）
     current_device: String,
     current_shared: Option<Arc<RangeShared>>,
@@ -637,6 +646,21 @@ fn parse_quality(s: &str) -> Option<Quality> {
     Quality::parse(s)
 }
 
+/// 一首歌的有效请求音质：本曲被播放条单独指定过就用指定的；否则按平台独立
+/// 音质（音源账号页，前端启动/变更时经 SetSourceQualities 推送）；都没配再
+/// 落到全局默认（settings["quality"] 旧键，兼容升级前的存量设置）。
+fn effective_quality_for(inner: &EngineInner, track: &Track) -> Quality {
+    if let Some((id, q)) = &inner.track_quality {
+        if *id == track.id {
+            return q.clone();
+        }
+    }
+    if let Some(q) = inner.source_qualities.get(track.platform.as_str()) {
+        return q.clone();
+    }
+    inner.default_quality.clone()
+}
+
 /// settings 中的 play_mode 键值：listLoop / oneLoop / random
 fn mode_key(m: PlayMode) -> String {
     serde_json::to_string(&m).unwrap().trim_matches('"').into()
@@ -801,6 +825,7 @@ fn run_engine(deps: EngineDeps) {
         // 真正的默认值在下面从 settings 读；这里与 PlaybackStateSnapshot 的默认值对齐
         default_quality: Quality::default(),
         track_quality: None,
+        source_qualities: HashMap::new(),
         current_device: String::new(),
         current_shared: None,
         volume_before_mute: 0.8,
@@ -1657,6 +1682,11 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                 load_queue_track(inner, track, autoplay, pos);
             }
         }
+        AudioCmd::SetSourceQualities { qualities } => {
+            // 平台独立音质（音源账号页）：只更新运行时副本，不触发重取——选择器
+            // 变更后前端对当前曲目按需走 setTrackQuality 立即生效。
+            inner.source_qualities = qualities;
+        }
         AudioCmd::SetSpeed(v) => {
             let v = v.clamp(SPEED_MIN, SPEED_MAX);
             // 变速重锚：get_pos() 是真实时间口径（rodio 的 TrackPosition 包在 Speed
@@ -1926,11 +1956,8 @@ fn load_queue_track(inner: &mut EngineInner, track: Track, autoplay: bool, start
     if switched {
         inner.settle_listen(false, true);
     }
-    // 有效音质：这首歌被播放条单独指定过就用指定的，否则用设置里的默认
-    let quality = match &inner.track_quality {
-        Some((id, q)) if *id == track.id => q.clone(),
-        _ => inner.default_quality.clone(),
-    };
+    // 有效音质：本曲临时指定 → 平台独立音质 → 全局默认（见 effective_quality_for）
+    let quality = effective_quality_for(inner, &track);
     // 每次新加载推进代次：在途的旧加载结果回来时据此丢弃
     inner.load_gen = inner.load_gen.wrapping_add(1);
     let gen = inner.load_gen;
@@ -2970,10 +2997,7 @@ fn maybe_preload(inner: &mut EngineInner) {
     let gen = inner.preload_gen;
     // Choose Random exactly once; the retained index is committed on activation.
     inner.preload = Some(PreloadSlot { gen, index, track: track.clone(), ready: None, failed: false });
-    let quality = match &inner.track_quality {
-        Some((id, quality)) if *id == track.id => quality.clone(),
-        _ => inner.default_quality.clone(),
-    };
+    let quality = effective_quality_for(inner, &track);
     let job = LoadJob {
         app: inner.app.clone(), tx: inner.tx.clone(), cache: Arc::clone(&inner.url_cache),
         cache_dir: inner.cache_dir.clone(), history_db: inner.db.clone(), quality,
@@ -3046,10 +3070,7 @@ fn sync_gapless_transition(inner: &mut EngineInner) {
     inner.sync_queue_to_snapshot();
     inner.queue_emit();
     let position_ms = content_pos_ms(inner);
-    let quality = match &inner.track_quality {
-        Some((id, quality)) if *id == slot.track.id => quality.clone(),
-        _ => inner.default_quality.clone(),
-    };
+    let quality = effective_quality_for(inner, &slot.track);
     inner.mutate(|state| {
         state.track_id = Some(slot.track.id.clone());
         state.track = Some(slot.track.clone());

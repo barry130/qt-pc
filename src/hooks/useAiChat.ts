@@ -23,6 +23,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   AiAction,
   AiAgentCard,
+  AiBlock,
   AiCapabilities,
   AiChatMessage,
   AiConversation,
@@ -38,6 +39,7 @@ import {
   emptyCapabilities,
   emptyChatMessage,
   findSong,
+  isFollowUpWithoutTopic,
   normalizeAgentCard,
   normalizeCapabilities,
   normalizeConversation,
@@ -52,11 +54,23 @@ import {
   titleOf,
   toChatMessage,
   toolProgressLabel,
+  trackFromCandidate,
 } from "@/lib/ai";
 import { errMsg } from "@/lib/utils";
+import { AI_MODE_HINT, readAiMode, resolveAiMode, type AiEngineMode } from "@/lib/ai-mode";
+import { runAssistantTurn, type LocalAssistantMode } from "@/lib/ai-assistant-local";
+import {
+  appendLocalMessages,
+  createLocalConversation,
+  listLocalConversations,
+  loadLocalMessages,
+  removeLocalConversation,
+} from "@/lib/ai-assistant-history";
 import { searchAllBatches } from "@/source-scripts";
+import { readAggregateSources } from "@/lib/aggregate-sources";
 import * as ipc from "@/services/ipc";
 import { registrySourceIds, useSourceRegistryStore } from "@/stores/sourceRegistry";
+import { isAdmin, useAuthStore } from "@/stores/auth";
 import { usePlayerStore } from "@/stores/player";
 import type { Track } from "@/types";
 
@@ -94,6 +108,10 @@ export interface UseAiChatResult {
   agent: AiAgentCard | null;
   agentName: string;
   capabilities: AiCapabilities;
+  /** 全局 AI 模式（`rule` / `local` 走本地回合，`server` 走 astral 会话） */
+  mode: AiEngineMode;
+  /** 当前模式的说明，页面横幅用 */
+  modeHint: string;
   conversations: AiConversation[];
   activeConversationId: number;
   messages: AiChatMessage[];
@@ -128,7 +146,10 @@ function trackJson(track: Track): Record<string, unknown> {
 }
 
 export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
-  const { agentCode } = options;
+  // context 单独解构出来做依赖：options 是每渲染的新字面量，整个对象进 deps
+  // 会让 buildContext（连带 send）每渲染重建。当前唯一调用方
+  // AiAssistantPage 不传 context（恒为 undefined），身份天然稳定。
+  const { agentCode, context } = options;
   const [agent, setAgent] = useState<AiAgentCard | null>(null);
   const [capabilities, setCapabilities] = useState<AiCapabilities>(emptyCapabilities());
   const [conversations, setConversations] = useState<AiConversation[]>([]);
@@ -138,11 +159,28 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
+  /** 全局 AI 模式：每次发送前从库里重读，设置页改了不用重进页面 */
+  const [mode, setMode] = useState<AiEngineMode>("rule");
+  /**
+   * 当前账号能不能用「服务端 AI」（2026-10-24 起管理员专属）。
+   *
+   * 订阅 store 而不是只在 send 时取快照：AppShell 恢复登录态是异步的，
+   * profile 从 null 变成管理员时 `init` 的依赖会变，页面里的 `useEffect(init)`
+   * 会自己重跑一次 —— 否则管理员会一直停在「纯规则」直到手动刷新。
+   */
+  const profile = useAuthStore((s) => s.profile);
+  const canUseServer = isAdmin(profile);
 
   const pollTimer = useRef<number | null>(null);
   const pollStartedAt = useRef(0);
   /** 切会话竞态：请求回来时若已切到别的会话，结果直接丢 */
   const loadSeq = useRef(0);
+  /** 上一轮候选搜索用的关键词与页码：追问（「再来点」）时沿用主题、往后翻页 */
+  const lastSearchKeyword = useRef("");
+  const lastSearchPage = useRef(1);
+  /** 本地回合序号：停止/重发/切会话时递增，让在途结果回来时自己作废（本地没有
+   * 请求 id 可以取消，模型调用也不一定响应 abort） */
+  const localSeq = useRef(0);
   /** 卸载后不再 setState（轮询回调可能还在飞） */
   const alive = useRef(true);
 
@@ -156,6 +194,24 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
       }
     };
   }, []);
+
+  /** 当前会话 id 的镜像：`sendLocal` 的闭包里拿不到最新 state，用它把这一轮写回历史 */
+  const activeConversationRef = useRef(0);
+
+  useEffect(() => {
+    activeConversationRef.current = activeConversationId;
+  }, [activeConversationId]);
+
+  /**
+   * messages 的镜像（与 activeConversationRef 同款）：sendLocal / stop / runAction /
+   * feedback 只读「最近几条」，若 deps 直接含 messages，流式期间每 300ms 一批
+   * delta 就把四个 useCallback 全部重建，消费它们的 memo 组件跟着一起失效。
+   */
+  const messagesRef = useRef<AiChatMessage[]>([]);
+
+  useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
 
   /** 按 uid 改某一条气泡；找不到就原样返回（消息可能已被切会话清空） */
   const patch = useCallback((uid: string, fn: (m: AiChatMessage) => AiChatMessage): void => {
@@ -184,6 +240,16 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
     setLoading(true);
     setError("");
     try {
+      // 库里可能存着「服务端 AI」但当前账号不是管理员（老版本或换号登录）：
+      // 统一收敛成有效模式，非管理员不会走到下面拉 astral 智能体的分支。
+      const nextMode = resolveAiMode(await readAiMode(), canUseServer);
+      if (!alive.current) return;
+      setMode(nextMode);
+      // rule / local 不碰服务端：不拉智能体、不拉远端会话；侧栏改读本地历史
+      if (nextMode !== "server") {
+        if (alive.current) setConversations(listLocalConversations());
+        return;
+      }
       const raw = await ipc.astralAiAgents();
       if (!alive.current) return;
       const agents = listOfAgents(raw);
@@ -199,21 +265,25 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
         return;
       }
       setAgent(picked);
-      try {
-        const capRaw = await ipc.astralAiCapabilities(picked.agentCode);
-        if (!alive.current) return;
-        setCapabilities(normalizeCapabilities(capRaw));
-      } catch {
-        // 能力接口失败就按默认能力走：少个引用/反馈按钮，不该让整页打不开
-        setCapabilities(picked.capabilities);
-      }
-      await loadConversations();
+      // 能力与会话列表互不依赖（各自内部都有 alive/try-catch 兜底）：并行拉，
+      // 不再串行各等一遍
+      const loadCaps = async (): Promise<void> => {
+        try {
+          const capRaw = await ipc.astralAiCapabilities(picked.agentCode);
+          if (!alive.current) return;
+          setCapabilities(normalizeCapabilities(capRaw));
+        } catch {
+          // 能力接口失败就按默认能力走：少个引用/反馈按钮，不该让整页打不开
+          setCapabilities(picked.capabilities);
+        }
+      };
+      await Promise.all([loadCaps(), loadConversations()]);
     } catch (err) {
       if (alive.current) setError(errMsg(err));
     } finally {
       if (alive.current) setLoading(false);
     }
-  }, [agentCode, loadConversations]);
+  }, [agentCode, canUseServer, loadConversations]);
 
   /** 打开某个会话并拉最近一页消息 */
   const selectConversation = useCallback(
@@ -225,6 +295,12 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
       setActiveConversationId(id);
       if (id <= 0) {
         setMessages([]);
+        return;
+      }
+      // 规则 / 本地模式的历史在 localStorage 里：同步读，不走 IPC
+      if (mode !== "server") {
+        setLoadingMessages(false);
+        setMessages(loadLocalMessages(id));
         return;
       }
       setLoadingMessages(true);
@@ -240,7 +316,7 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
         if (alive.current && loadSeq.current === seq) setLoadingMessages(false);
       }
     },
-    [stopPolling],
+    [mode, stopPolling],
   );
 
   /** 新建：只清本地，真正建会话推迟到首次发送（避免堆一串空会话） */
@@ -254,6 +330,13 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
 
   const removeConversation = useCallback(
     async (id: number): Promise<void> => {
+      // 本地历史没有远端会话可删：直接清 localStorage 并刷新侧栏
+      if (mode !== "server") {
+        removeLocalConversation(id);
+        if (id === activeConversationId) newConversation();
+        setConversations(listLocalConversations());
+        return;
+      }
       try {
         await ipc.astralAiDeleteConversation(id);
         if (id === activeConversationId) newConversation();
@@ -262,7 +345,7 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
         setError(errMsg(err));
       }
     },
-    [activeConversationId, loadConversations, newConversation],
+    [activeConversationId, loadConversations, mode, newConversation],
   );
 
   /**
@@ -273,10 +356,26 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
    */
   const prepareCandidates = useCallback(async (content: string): Promise<AiMusicCandidate[]> => {
     try {
-      await useSourceRegistryStore.getState().ensure();
       const keyword = searchKeyword(content);
-      if (keyword.length === 0) return [];
-      const batches = await searchAllBatches(keyword, 1, AI_CANDIDATE_MAX);
+      // 「再来点/换一批」这类追问没有新主题词：用退化词（如「来20首」）重搜只会
+      // 捞回与上一轮主题无关的垃圾候选。沿用上一轮搜索词，把候选池往前翻页。
+      const isFollowUp = isFollowUpWithoutTopic(content, keyword);
+      const effective = isFollowUp && lastSearchKeyword.current.length > 0
+        ? lastSearchKeyword.current
+        : keyword;
+      if (effective.length === 0) return [];
+      const page = isFollowUp ? lastSearchPage.current + 1 : 1;
+      if (!isFollowUp) {
+        lastSearchKeyword.current = keyword;
+      }
+      lastSearchPage.current = page;
+      // 聚合音源由设置决定（null = 全部）；AI 找歌和搜索页共用同一份选择。
+      // 它与音源注册表 ensure() 互不依赖：并行等待，不再串行各等一遍
+      const [aggSources] = await Promise.all([
+        readAggregateSources(),
+        useSourceRegistryStore.getState().ensure(),
+      ]);
+      const batches = await searchAllBatches(effective, page, AI_CANDIDATE_MAX, aggSources ?? undefined);
       const out: AiMusicCandidate[] = [];
       const seen = new Set<string>();
       for (const batch of batches) {
@@ -288,11 +387,125 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
           if (out.length >= AI_CANDIDATE_MAX) return out;
         }
       }
+      // 翻页翻到底（没有新歌）：退回第 1 页补齐，宁多勿空
+      if (out.length === 0 && page > 1) {
+        lastSearchPage.current = 1;
+        const first = await searchAllBatches(effective, 1, AI_CANDIDATE_MAX, aggSources ?? undefined);
+        for (const batch of first) {
+          for (const track of batch.tracks) {
+            const key = `${track.platform}:${track.id}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            out.push(candidateFromTrack(track));
+            if (out.length >= AI_CANDIDATE_MAX) return out;
+          }
+        }
+      }
       return out;
     } catch {
       return [];
     }
   }, []);
+
+  /**
+   * 本地回合：`rule` / `local` 共用。
+   *
+   * 与 server 模式的区别只有「谁挑歌」：候选仍由本地搜（`prepareCandidates`），
+   * 但不再创建 astral 会话、不轮询事件。本地回合没有请求 id 可取消，用 `localSeq`
+   * 让「停止 / 重发 / 切会话」之后回来的结果自己作废。
+   */
+  const sendLocal = useCallback(
+    async (localMode: LocalAssistantMode, text: string): Promise<void> => {
+      setSending(true);
+      setError("");
+      const seq = localSeq.current + 1;
+      localSeq.current = seq;
+      const userMsg = emptyChatMessage("USER", text);
+      userMsg.status = "COMPLETED";
+      const assistantMsg = emptyChatMessage("ASSISTANT", "");
+      assistantMsg.streaming = true;
+      assistantMsg.status = "STREAMING";
+      assistantMsg.progress =
+        localMode === "local" ? "正在让本地模型挑歌…" : "正在按规则挑歌…";
+      const uid = assistantMsg.uid;
+      // 历史快照在本轮两条消息入列**之前**取：与原先读闭包 messages 等价（text 已
+      // 单独传给模型，不能把当前问题再塞进 history 重复一遍）。改读 messagesRef
+      // 是为了让 deps 摆脱 messages —— 流式期间每 300ms 一批 delta 都会重建本回调
+      const history = messagesRef.current
+        .slice(-6)
+        .map((m) => ({
+          role: (m.role === "USER" ? "user" : "assistant") as "user" | "assistant",
+          content: m.content,
+        }))
+        .filter((item) => item.content.trim().length > 0);
+      setMessages((prev) => [...prev, userMsg, assistantMsg]);
+      try {
+        const candidates = await prepareCandidates(text);
+        if (!alive.current || localSeq.current !== seq) return;
+        patch(uid, (m) => ({ ...m, progress: "正在整理歌单…" }));
+        const result = await runAssistantTurn({
+          mode: localMode,
+          text,
+          history,
+          candidates: candidates.map(trackFromCandidate),
+          // 口味画像在这里留空：助手的主任务是听懂「这句话要找什么」，每条消息再读
+          // 一遍收藏 / 歌单 / 收听统计太重；要按口味排有每日推荐页。
+          profile: null,
+        });
+        if (!alive.current || localSeq.current !== seq) return;
+        // 助手页的播放条依赖 `song_list` 块（MessageBubble 从 `data.items` 还原 Track），
+        // 所以本地结果也必须造成这个形状，而不是直接塞 Track[]。
+        const blocks: AiBlock[] =
+          result.songs.length > 0
+            ? [
+                {
+                  type: "song_list",
+                  title: "为你找到的歌",
+                  data: {
+                    items: result.songs.map((track) => candidateFromTrack(track)),
+                    total: result.songs.length,
+                  },
+                },
+              ]
+            : [];
+        patch(uid, (m) => ({
+          ...m,
+          content: result.reply,
+          blocks,
+          streaming: false,
+          progress: "",
+          status: "COMPLETED",
+        }));
+        // 规则 / 本地模式没有服务端会话：把这一轮写进本地历史，左侧「历史对话」才有内容
+        const conversationId =
+          activeConversationRef.current > 0
+            ? activeConversationRef.current
+            : createLocalConversation(text);
+        if (activeConversationRef.current !== conversationId) {
+          activeConversationRef.current = conversationId;
+          setActiveConversationId(conversationId);
+        }
+        appendLocalMessages(conversationId, [
+          { role: "USER", content: text, blocks: [] },
+          { role: "ASSISTANT", content: result.reply, blocks },
+        ]);
+        setConversations(listLocalConversations());
+      } catch (err) {
+        const message = errMsg(err);
+        patch(uid, (m) => ({
+          ...m,
+          streaming: false,
+          progress: "",
+          status: "FAILED",
+          error: message,
+          content: m.content.length > 0 ? m.content : `出错了：${message}`,
+        }));
+      } finally {
+        if (alive.current && localSeq.current === seq) setSending(false);
+      }
+    },
+    [patch, prepareCandidates],
+  );
 
   /** 组装上下文：只放后端白名单里的键，放了别的会被 `sanitizeContext` 丢掉 */
   const buildContext = useCallback(
@@ -316,13 +529,13 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
         // 历史读不到就算了，模型少一点口味参考而已
       }
       if (candidates.length > 0) ctx.musicCandidates = candidates;
-      const extra = options.context?.();
+      const extra = context?.();
       if (extra !== undefined) {
         for (const [key, value] of Object.entries(extra)) ctx[key] = value;
       }
       return ctx;
     },
-    [options],
+    [context],
   );
 
   const applyEvent = useCallback(
@@ -416,8 +629,44 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
     [patch],
   );
 
+  /**
+   * 终态兜底：拿服务端落库的最终消息覆盖本地气泡。
+   *
+   * <p>正常路径下 {@code message.completed} 已经把 answer 与 blocks 带回来了。
+   * 但事件是分批拉的，任何原因导致终态事件没读到时，气泡里剩下的就是流式增量
+   * 拼出来的半截原始 JSON —— 文案与歌曲卡片全无，用户只会看到一坨括号。
+   * 服务端 `ai_message` 里存的一定是解析后的干净结果，所以终态后回读一次最保险。</p>
+   *
+   * <p>只在「内容像 JSON」或「有回答却没有任何块」时回读，避免每条消息多打一次请求。</p>
+   */
+  const reconcile = useCallback(
+    async (conversationId: number, assistantMessageId: number, uid: string): Promise<void> => {
+      if (conversationId <= 0 || assistantMessageId <= 0) return;
+      try {
+        const raw = await ipc.astralAiMessages(conversationId, undefined, AI_MESSAGE_PAGE_SIZE);
+        if (!alive.current) return;
+        const page = normalizeMessagePage(raw);
+        const saved = page.items.find((item) => item.id === assistantMessageId);
+        if (saved === undefined) return;
+        patch(uid, (m) => {
+          const content = saved.content.length > 0 ? saved.content : m.content;
+          // 服务端存的是解析后的正文；本地若还是原始 JSON，一律以服务端为准
+          return {
+            ...m,
+            content,
+            blocks: saved.blocks.length > 0 ? saved.blocks : m.blocks,
+            citations: saved.citations.length > 0 ? saved.citations : m.citations,
+          };
+        });
+      } catch {
+        // 回读失败不影响已经显示的内容
+      }
+    },
+    [patch],
+  );
+
   const startPolling = useCallback(
-    (requestId: number, uid: string): void => {
+    (requestId: number, uid: string, conversationId: number, assistantMessageId: number): void => {
       stopPolling();
       pollStartedAt.current = Date.now();
       let cursor = 0;
@@ -447,7 +696,8 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
           if (batch.terminal) {
             finalize(uid, batch.status);
             setSending(false);
-            void loadConversations();
+            // 终态后回读落库消息：万一终态事件没读到，本地还是半截 JSON
+            void reconcile(conversationId, assistantMessageId, uid).then(() => loadConversations());
             return;
           }
         } catch (err) {
@@ -460,7 +710,7 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
       };
       void tick();
     },
-    [applyEvent, finalize, loadConversations, patch, stopPolling],
+    [applyEvent, finalize, loadConversations, patch, reconcile, stopPolling],
   );
 
   const send = useCallback(
@@ -469,6 +719,15 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
       if (text.length === 0 || sending) return;
       if (text.length > AI_MESSAGE_MAX_CHARS) {
         setError(`消息太长了（上限 ${AI_MESSAGE_MAX_CHARS} 字），请分几次说`);
+        return;
+      }
+      // 设置页可能刚改过模式：每次发送都以库里的值为准，用户不用重进页面。
+      // 但「服务端 AI」是管理员专属，非管理员一律降级成纯规则（本地回合）。
+      const currentMode = resolveAiMode(await readAiMode(), canUseServer);
+      if (!alive.current) return;
+      setMode(currentMode);
+      if (currentMode !== "server") {
+        await sendLocal(currentMode, text);
         return;
       }
       setSending(true);
@@ -483,15 +742,24 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
       setMessages((prev) => [...prev, userMsg, assistantMsg]);
 
       try {
-        const candidates = await prepareCandidates(text);
-        let conversationId = activeConversationId;
-        if (conversationId <= 0) {
-          const raw = await ipc.astralAiCreateConversation(agentCode, titleOf(text));
-          const created = normalizeConversation(raw);
-          conversationId = created.id;
-          if (conversationId <= 0) throw new Error("会话创建失败，请重试");
-          setActiveConversationId(conversationId);
-        }
+        // 候选搜索（全源聚合，链路最慢）与建会话互不依赖：并行发出，AI 首字
+        // 等待从两者之和降到 max(两者)。buildContext 合并 ctx.musicCandidates
+        // 时才需要候选结果，仍排在 Promise.all 之后 —— 消息流与错误语义不变
+        // （prepareCandidates 内部自 catch 永不 reject；建会话失败照旧走外层 catch）
+        const candidatesPromise = prepareCandidates(text);
+        const conversationIdPromise =
+          activeConversationId > 0
+            ? Promise.resolve(activeConversationId)
+            : ipc.astralAiCreateConversation(agentCode, titleOf(text)).then((raw) => {
+                const created = normalizeConversation(raw);
+                if (created.id <= 0) throw new Error("会话创建失败，请重试");
+                setActiveConversationId(created.id);
+                return created.id;
+              });
+        const [candidates, conversationId] = await Promise.all([
+          candidatesPromise,
+          conversationIdPromise,
+        ]);
         const ctx = await buildContext(candidates);
         const idempotencyKey = `pc-${Date.now()}-${uid}`;
         const sent = normalizeSendResult(
@@ -504,7 +772,7 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
           progress: "正在生成回答…",
         }));
         void loadConversations();
-        startPolling(sent.requestId, uid);
+        startPolling(sent.requestId, uid, conversationId, sent.assistantMessageId);
       } catch (err) {
         const message = errMsg(err);
         patch(uid, (m) => ({
@@ -522,9 +790,11 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
       activeConversationId,
       agentCode,
       buildContext,
+      canUseServer,
       loadConversations,
       patch,
       prepareCandidates,
+      sendLocal,
       sending,
       startPolling,
     ],
@@ -537,8 +807,10 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
    * 本地立刻停轮询并置 CANCELLED，不干等下一轮事件 —— 用户按了停止就该马上停。
    */
   const stop = useCallback(async (): Promise<void> => {
-    const streaming = [...messages].reverse().find((m) => m.streaming);
+    const streaming = [...messagesRef.current].reverse().find((m) => m.streaming);
     stopPolling();
+    // 本地回合没有可取消的远端请求：递增序号，在途结果回来时直接丢掉
+    localSeq.current += 1;
     setSending(false);
     if (streaming === undefined) return;
     patch(streaming.uid, (m) => ({
@@ -555,12 +827,12 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
         // 已终态或网络抖动都不影响本地已经停下的状态
       }
     }
-  }, [messages, patch, stopPolling]);
+  }, [patch, stopPolling]);
 
   /** 执行播放类动作；回报后端只报真执行了的（不支持的不报，否则采纳率是假的） */
   const runAction = useCallback(
     async (messageUid: string, action: AiAction): Promise<AiActionResult> => {
-      const message = messages.find((m) => m.uid === messageUid);
+      const message = messagesRef.current.find((m) => m.uid === messageUid);
       if (message === undefined) return { ok: false, note: "这条消息已经不在当前会话里了" };
       const payload = action.payload;
       const songId = strOf(payload, "songId");
@@ -595,7 +867,8 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
         result = { ok: false, note: `这个操作请在界面上完成：${actionLabel(action.type)}` };
       }
 
-      if (result.ok) {
+      // 只有服务端模式才有采纳回报：本地模式没有会话，回报无处可去
+      if (result.ok && mode === "server") {
         try {
           await ipc.astralAiExecuteAction(action.actionId, action.type, true, result.note);
         } catch {
@@ -604,12 +877,12 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
       }
       return result;
     },
-    [messages],
+    [mode],
   );
 
   const feedback = useCallback(
     async (messageUid: string, good: boolean): Promise<void> => {
-      const message = messages.find((m) => m.uid === messageUid);
+      const message = messagesRef.current.find((m) => m.uid === messageUid);
       if (message === undefined || message.id <= 0) return;
       try {
         await ipc.astralAiFeedback(message.id, good ? "LIKE" : "DISLIKE", "", "");
@@ -617,7 +890,7 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
         setError(errMsg(err));
       }
     },
-    [messages],
+    [],
   );
 
   const canRun = useCallback((type: string): boolean => PLAYBACK_ACTIONS.includes(type), []);
@@ -638,6 +911,8 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
     agent,
     agentName: agent?.name ?? "音乐助手",
     capabilities,
+    mode,
+    modeHint: AI_MODE_HINT[mode],
     conversations,
     activeConversationId,
     messages,

@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Play } from "lucide-react";
 import type { Track } from "@/types";
+import { DEFAULT_TRACK_SORT, parseTrackSort, sortTracks } from "@/lib/track-sort";
 import * as sourceApi from "@/source-scripts";
 import { useMusicSourceStore } from "@/stores/musicSource";
 import { usePlayerStore } from "@/stores/player";
@@ -14,6 +15,7 @@ import { retainTrackSelection, trackSelectionKey } from "@/lib/track-selection";
 import { usePagedList, type PageResult } from "@/hooks/usePagedList";
 import { TrackList } from "./TrackList";
 import { BatchBar } from "./BatchBar";
+import { TrackSortSelect } from "@/components/TrackSortSelect";
 import { ErrorRetry, TrackRowsSkeleton } from "./Skeletons";
 import { IconButton } from "@/components/common/IconButton";
 
@@ -155,6 +157,18 @@ export function DailyPage(): React.JSX.Element {
   /** 批量操作的失败提示：与整页加载失败分开，别把已加载的列表顶掉 */
   const [actionError, setActionError] = useState<string | null>(null);
 
+  // 排序（用户 m00002 / m00029）：与其余 6 个歌曲列表页同一套 lib/track-sort，
+  // 只为当前**已加载**的 songs 换显示顺序 —— 「播放全部」「批量条」「勾选」都
+  // 用排序后的列表，用户看到什么顺序就播什么顺序。默认不排序（两个弹窗都
+  // 不勾选），保持音源新歌流的原始顺序；往下翻页只追加成员，已排好的相对
+  // 顺序不变（sortTracks 是纯函数，重排整段已加载列表）。
+  const [sortValue, setSortValue] = useState(DEFAULT_TRACK_SORT);
+  const { key: sortKey, desc: sortDesc } = parseTrackSort(sortValue);
+  const sortedSongs = useMemo(
+    () => sortTracks(songs, sortKey, sortDesc),
+    [songs, sortKey, sortDesc],
+  );
+
   // hero 的门面封面：本页不是某个实体（没有歌单封面 / 榜单配图可拿），
   // 沿用列表里**第一张有图的曲目封面**，与专辑页同款回退 —— 一张都取不到
   // （还没加载完 / 当前源的新歌不带图）就落回首字占位。
@@ -233,25 +247,28 @@ export function DailyPage(): React.JSX.Element {
                 size="lg"
                 disabled={songs.length === 0}
                 className="h-9 w-9 rounded-lg shadow-lg shadow-primary/25"
-                onClick={() => void playQueue(songs, 0)}
+                onClick={() => void playQueue(sortedSongs, 0)}
               >
                 <Play className="h-4 w-4 fill-current" />
               </IconButton>
             </div>
           </div>
 
-          {/* 批量条摆在页头右侧，与左边那颗「播放全部」同一行（用户口径：批量
-              操作属于页头，不该在列表上方再占一行；与歌单 / 榜单详情页同位置）。
+          {/* 右端：排序控件 + 批量条。批量条与左边那颗「播放全部」同一行
+              （用户口径：批量操作属于页头，不该在列表上方再占一行；与歌单 /
+              榜单详情页同位置），排序控件按 m00002 / m00029 的「两个弹窗」
+              竖排贴在批量条上方 —— 与 DailyRecommendPage 的右列同构。
               每日新歌是分页流，全选 / 批量只作用于**当前已加载**的 songs ——
               继续下拉会追加新页，已勾选的保持不动（见上面收窄勾选的副作用）。
               收藏 / 取消收藏都在条子的歌单面板里选（与单曲红心同逻辑），
               这里没有宿主歌单，所以不传 hostPlaylistId。
               `items-end` + `pb-1` 与信息列底线对齐（同详情页）。 */}
           {!loading && !error && songs.length > 0 ? (
-            <div className="relative flex shrink-0 items-end pb-1">
+            <div className="relative flex shrink-0 flex-col items-end justify-end gap-2 pb-1">
+              <TrackSortSelect value={sortValue} onChange={setSortValue} />
               <BatchBar
                 embedded
-                tracks={songs}
+                tracks={sortedSongs}
                 selected={selected}
                 selectionKey={trackSelectionKey}
                 onSelectedChange={setSelected}
@@ -277,7 +294,7 @@ export function DailyPage(): React.JSX.Element {
         ) : (
           <>
             <TrackList
-              tracks={songs}
+              tracks={sortedSongs}
               showIndex
               showCollect
               showDownload

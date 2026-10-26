@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useTauriEvent } from "@/hooks/useTauriEvent";
 import { getLyricOffset, LYRIC_OFFSET_CHANGED_EVENT, setLyricOffset } from "@/services/ipc";
 import type { LyricOffsetChangedPayload } from "@/services/ipc";
+import { trackKey as lyricTrackId } from "@/lib/text";
 import type { Track } from "@/types";
 
 /**
@@ -28,10 +29,9 @@ import type { Track } from "@/types";
  */
 export const MAX_LYRIC_OFFSET_MS = 10_000;
 
-/** 与 Rust `db::store::db_track_id()` 同口径：`platform:原始id` */
-export function lyricTrackId(track: Track): string {
-  return `${track.platform}:${track.id}`;
-}
+// 与 Rust `db::store::db_track_id()` 同口径：`platform:原始id`。
+// 实现在 `@/lib/text` 的 `trackKey`（全仓唯一），这里保留既有导出名。
+export { lyricTrackId };
 
 export interface LyricOffset {
   /** 已落库（或本次已提交）的偏移值，毫秒 */
@@ -58,10 +58,22 @@ export function useLyricOffset(track: Track | null | undefined): LyricOffset {
   const [draftMs, setDraftState] = useState(0);
   // 提交用的最新曲目键：切歌后再收到旧的异步读结果不得覆盖（防竞态）
   const keyRef = useRef(trackId);
-  keyRef.current = trackId;
+  // draft 的同步镜像：commit/nudge 需要在事件处理器里当场算出目标值，
+  // 不能再把副作用（setOffsetMs + IPC 落库）塞进 setState updater —— updater
+  // 必须是纯函数，StrictMode/并发渲染会重复调用它，等于重复写库。
+  const draftRef = useRef(0);
+  const applyDraft = useCallback((v: number) => {
+    draftRef.current = v;
+    setDraftState(v);
+  }, []);
+
+  useEffect(() => {
+    keyRef.current = trackId;
+  }, [trackId]);
 
   useEffect(() => {
     if (trackId.length === 0) {
+      draftRef.current = 0;
       setOffsetMs(0);
       setDraftState(0);
       return;
@@ -72,6 +84,7 @@ export function useLyricOffset(track: Track | null | undefined): LyricOffset {
         const ms = await getLyricOffset(trackId);
         if (stale) return;
         const v = clamp(ms);
+        draftRef.current = v;
         setOffsetMs(v);
         setDraftState(v);
       } catch {
@@ -84,34 +97,36 @@ export function useLyricOffset(track: Track | null | undefined): LyricOffset {
   }, [trackId]);
 
   // 跨窗口同步：任一边改完偏移都会广播，这里收到就即时对齐。
-  // 只在值真的不同时才 setState —— 自己刚写出去的那一份会原样广播回来，
-  // 不比较的话会在拖动中途把 draft 打回去。（订阅竞态由 useTauriEvent 内部处理）
+  // 自己刚写出去的那一份会原样广播回来，值相同时 setState 会被 React 跳过。
+  // （订阅竞态由 useTauriEvent 内部处理）
   useTauriEvent<LyricOffsetChangedPayload>(LYRIC_OFFSET_CHANGED_EVENT, (e) => {
     const { trackId, offsetMs } = e.payload;
     if (trackId.length === 0 || trackId !== keyRef.current) return;
     const v = clamp(offsetMs);
-    setOffsetMs((cur) => (cur === v ? cur : v));
-    setDraftState((cur) => (cur === v ? cur : v));
+    draftRef.current = v;
+    setOffsetMs(v);
+    setDraftState(v);
   });
 
   const setDraftMs = useCallback((ms: number) => {
-    setDraftState(clamp(ms));
+    const v = clamp(ms);
+    draftRef.current = v;
+    setDraftState(v);
   }, []);
 
   const commit = useCallback(() => {
     if (trackId.length === 0) return;
-    setDraftState((cur) => {
-      const v = clamp(cur);
-      setOffsetMs(v);
-      void setLyricOffset(trackId, v).catch(() => {
-        /* 写失败不回滚界面：用户看到的偏移仍然是刚拖到的位置，下次进歌重读即可 */
-      });
-      return v;
+    const v = clamp(draftRef.current);
+    applyDraft(v);
+    setOffsetMs(v);
+    void setLyricOffset(trackId, v).catch(() => {
+      /* 写失败不回滚界面：用户看到的偏移仍然是刚拖到的位置，下次进歌重读即可 */
     });
-  }, [trackId]);
+  }, [trackId, applyDraft]);
 
   const reset = useCallback(() => {
     if (trackId.length === 0) return;
+    draftRef.current = 0;
     setOffsetMs(0);
     setDraftState(0);
     void setLyricOffset(trackId, 0).catch(() => undefined);
@@ -120,14 +135,12 @@ export function useLyricOffset(track: Track | null | undefined): LyricOffset {
   const nudge = useCallback(
     (deltaMs: number) => {
       if (trackId.length === 0) return;
-      setDraftState((cur) => {
-        const v = clamp(cur + deltaMs);
-        setOffsetMs(v);
-        void setLyricOffset(trackId, v).catch(() => undefined);
-        return v;
-      });
+      const v = clamp(draftRef.current + deltaMs);
+      applyDraft(v);
+      setOffsetMs(v);
+      void setLyricOffset(trackId, v).catch(() => undefined);
     },
-    [trackId],
+    [trackId, applyDraft],
   );
 
   return { offsetMs, draftMs, setDraftMs, commit, reset, nudge };

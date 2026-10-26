@@ -10,8 +10,8 @@ import { useSourceLabelFn } from "@/stores/sourceRegistry";
 import { usePlayerStore } from "@/stores/player";
 import { toastError } from "@/stores/toast";
 import { IconButton } from "@/components/common/IconButton";
-import { ArtistAvatar } from "@/components/common/ArtistAvatar";
-import { SourceLogo } from "@/components/common/SourceLogo";
+import { SourceTag } from "@/components/common/SourceTag";
+import { EntryPicture } from "./ListenReportBits";
 
 const PAGE_SIZE = 30;
 const KIND_TITLE: Record<ListenReportKind, string> = { tracks: "歌曲", singers: "歌手", sources: "音源" };
@@ -138,7 +138,7 @@ export function ListenReportDetail(props: {
               <button type="button" className="flex w-full items-center gap-3 border-b border-border/50 py-3 text-left hover:bg-secondary/40" onClick={() => select(entry)}>
                 <span className="w-6 shrink-0 text-center text-xs tabular-nums text-muted-foreground">{offset + index + 1}</span>
                 <EntryPicture entry={entry} name={nameOf(entry)} kind={kind} />
-                <span className="min-w-0 flex-1"><span className="block truncate text-sm font-medium">{nameOf(entry)}</span><span className="mt-0.5 block truncate text-xs text-muted-foreground">{entry.track ? `${entry.track.singer || "未知歌手"} · ${reportSourceLabel(sourceLabel, entry.platform)}` : `${entry.trackCount} 首歌曲`}</span></span>
+                <span className="min-w-0 flex-1"><span className="flex min-w-0 items-center gap-1.5 text-sm font-medium"><span className="truncate">{nameOf(entry)}</span>{entry.track ? <SourceTag platform={entry.track.platform} size="xs" /> : null}</span><span className="mt-0.5 block truncate text-xs text-muted-foreground">{entry.track ? `${entry.track.singer || "未知歌手"} · ${reportSourceLabel(sourceLabel, entry.platform)}` : `${entry.trackCount} 首歌曲`}</span></span>
                 <span className="shrink-0 text-right text-xs tabular-nums text-muted-foreground"><span className="block">{entry.playCount} 次</span><span className="mt-0.5 block text-[11px]">{formatReportDuration(entry.totalPlayedMs)}</span></span>
                 <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
               </button>
@@ -158,16 +158,4 @@ export function ListenReportDetail(props: {
   );
 }
 
-function EntryPicture(props: { entry: ListenReportEntry; name: string; kind: ListenReportKind }): React.JSX.Element {
-  const { entry, name, kind } = props;
-  // 三档分组各自的图片口径（对齐移动端 pages/stats/index.uvue）：
-  // 歌曲行 → 封面；歌手行 → 歌手真实头像（失败回退首字）；音源行 → 官方 logo。
-  if (entry.track) {
-    const cover = qtresCoverUrl(entry.track.picUrl, 96);
-    return <span className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-primary/10 text-sm text-primary">
-      {cover ? <img src={cover} alt="" loading="lazy" className="h-full w-full object-cover" /> : <Music4 className="h-5 w-5" />}
-    </span>;
-  }
-  if (kind === "sources") return <SourceLogo platform={entry.id} size={40} />;
-  return <ArtistAvatar platform={entry.platform} name={name} size={40} />;
-}
+// EntryPicture 合并到 `./ListenReportBits`（趋势区块也用它，曾各写一份）。

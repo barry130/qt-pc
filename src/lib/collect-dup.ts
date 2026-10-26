@@ -1,3 +1,4 @@
+import { compactText } from "@/lib/text";
 import type { Track } from "@/types";
 
 /**
@@ -21,16 +22,14 @@ import type { Track } from "@/types";
  */
 const ARTIST_SEPARATORS = /[/／\\|&、,，;；+＋]|\s*(?:和|与|feat\.?|ft\.?)\s*/gi;
 
-/** 归一化匹配文本：小写 + 折叠空白（与换源 scoreCandidate 同口径） */
-function normalize(text: string): string {
-  return text.toLowerCase().replace(/\s+/g, "");
-}
+// 归一化匹配文本（小写 + 折叠空白）= `@/lib/text` 的 compactText：
+// 与换源 scoreCandidate、歌手名对齐同口径，全仓只有这一份实现。
 
 /** 把歌手字段拆成集合（归一化后的每个名字） */
 function splitArtists(text: string): string[] {
   const out: string[] = [];
   for (const part of (text ?? "").split(ARTIST_SEPARATORS)) {
-    const name = normalize(part);
+    const name = compactText(part);
     if (name.length > 0) out.push(name);
   }
   return out;
@@ -57,29 +56,19 @@ function normalizeTitle(text: string): string {
 }
 
 /**
- * 两首歌是否「同名」：歌名归一化后相等，或互相包含（一边带后缀时包含关系仍成立）。
- * 任一侧歌名为空判否——空名不具备判定价值。
+ * 两首**已归一化**的歌名是否同名：相等或互相包含（一边带后缀时包含关系仍成立）。
+ * 任一侧为空判否——空名不具备判定价值。
  */
-function sameTitle(a: string, b: string): boolean {
-  const x = normalizeTitle(a);
-  const y = normalizeTitle(b);
+function sameNormalizedTitle(x: string, y: string): boolean {
   if (x.length === 0 || y.length === 0) return false;
   return x === y || x.includes(y) || y.includes(x);
 }
 
 /**
- * 歌手是否对得上：**拆成集合后只要有一个名字对得上就算**。
- *
- * 为什么要拆：各音源的合写符号完全不同（`/`、`&`、`&`、`、`、`／`、`|`、
- * `+`、`和`、`feat.`），「周杰伦 / 林妙可」与「周杰伦&林妙可」是同一批人，
- * 但整串比对（旧写法）互不包含，会被判成两首歌 —— 这正是要修的漏判。
- * 拆开比对还顺带解决了「谁排在前」的问题。
- *
+ * 两侧**已拆分**的歌手集合是否对得上：只要有一个名字对得上就算。
  * 双方都为空（纯音乐 / 元数据缺失）时不拦，按同名处理。
  */
-function singerCompatible(a: string, b: string): boolean {
-  const x = splitArtists(a);
-  const y = splitArtists(b);
+function artistsCompatible(x: string[], y: string[]): boolean {
   if (x.length === 0 || y.length === 0) return true;
   for (const p of x) {
     for (const q of y) {
@@ -100,10 +89,13 @@ function singerCompatible(a: string, b: string): boolean {
  */
 export function findCrossSourceDup(track: Track, existing: Track[]): Track[] {
   const out: Track[] = [];
+  // 待收藏这首的标题归一化 / 歌手拆分只做一次（原先在循环里每轮重算，归一化含 3 个正则）
+  const trackTitle = normalizeTitle(track.title);
+  const trackArtists = splitArtists(track.singer);
   for (const item of existing) {
     if (item.platform === track.platform) continue;
-    if (!sameTitle(item.title, track.title)) continue;
-    if (!singerCompatible(item.singer, track.singer)) continue;
+    if (!sameNormalizedTitle(normalizeTitle(item.title), trackTitle)) continue;
+    if (!artistsCompatible(splitArtists(item.singer), trackArtists)) continue;
     out.push(item);
   }
   return out;

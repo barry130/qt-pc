@@ -240,6 +240,14 @@ node scripts/sync-config.mjs      # 或 pnpm config:sync
    判断文件编码请用编辑器或 `read` 工具，不要凭 `Get-Content` 的输出下结论。
 7. 不要用 `>nul` 这类 POSIX 写法 —— 在 PowerShell 里会生成一个名为 `nul` 的垃圾文件
    （已在 `.gitignore` 里，但别制造它）。
+8. **用户报「本地模型调用失败」时的排查顺序**（每日推荐 → 本地模型）：
+   ① 设置页「AI」分节点「试连」，先确认地址 / Key / 模型名三件事通不通；
+   ② 通但生成仍失败，多半是**上游对该模型偶发拒绝**（中转站常见 429 / 5xx / `request illegal`），
+      代码侧已做 3 次重试与退避（`src-tauri/src/ai_local.rs` 的 `CHAT_ATTEMPTS` / `retryable_status`），
+      仍失败就换个模型试 —— 实测 `deepseek-v4.1-flash` 在 `api.haogpt.net` 上约六成请求被拒；
+   ③ 想看原始原因就把 toast 里的文案记下来，它透传的是上游错误体里的 `error.message`；
+   ④ 这些配置存在 SQLite 的 `settings` 表（`ai.profiles` / `ai.activeProfile`），**不在任何配置文件里**，
+      所以改 `app.config.json` 不会影响它。
 
 ## 8. 仓库卫生（哪些是产物、哪些被保留）
 

@@ -28,11 +28,13 @@ export async function runCheck(
   setUpdate: (info: AppUpdateInfoLike | null) => void,
   setOfficialValid?: (v: boolean | null) => void,
 ): Promise<AppUpdateInfoLike | null> {
-  // 官方版本校验失败（非官版）只标记，不阻断更新提示
-  const official = await ipc.astralCheckOfficialVersion().catch(() => null);
+  // 两个请求互不依赖，并行发出（官方版本校验失败只标记，不阻断更新提示）
+  const [official, update] = await Promise.all([
+    ipc.astralCheckOfficialVersion().catch(() => null),
+    ipc.astralAppUpdate().catch(() => null),
+  ]);
   if (setOfficialValid) setOfficialValid(official != null);
 
-  const update = await ipc.astralAppUpdate().catch(() => null);
   const info =
     update && typeof update === "object" && (update as AppUpdateInfoLike).versionName
       ? (update as AppUpdateInfoLike)

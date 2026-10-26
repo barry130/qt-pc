@@ -389,15 +389,21 @@ export async function searchLyricCandidates(
   const kw = keyword.trim();
   if (kw.length === 0) return [];
   const hits = await sourceApi.searchMusic(kw, source, 1, size);
+  // 逐条取词互不依赖：并行发（原先是 8 次串行网络往返，最坏 8×超时）。
+  // 结果按 hits 原序保留，空词与失败项各自过滤，语义与串行完全一致。
+  const lyrics = await Promise.all(
+    hits.map((hit) =>
+      sourceApi
+        .getLyric(hit)
+        .then((lyric) => (lyric.lrc.trim().length === 0 ? null : lyric))
+        .catch(() => null),
+    ),
+  );
   const out: LyricCandidate[] = [];
-  for (const hit of hits) {
-    try {
-      const lyric = await sourceApi.getLyric(hit);
-      if (lyric.lrc.trim().length === 0) continue;
-      out.push({ track: hit, lyric, source });
-    } catch {
-      // 该候选取词失败：继续看下一条
-    }
+  for (let i = 0; i < hits.length; i += 1) {
+    const lyric = lyrics[i];
+    if (lyric === null) continue;
+    out.push({ track: hits[i], lyric, source });
   }
   return out;
 }

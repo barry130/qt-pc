@@ -5,7 +5,9 @@ import {
   ChevronsLeft,
   ChevronsRight,
   Clock,
+  Compass,
   Download,
+  KeyRound,
   ListMusic,
   Music,
   Radio,
@@ -13,7 +15,6 @@ import {
 } from "lucide-react";
 import { useMusicSourceStore } from "@/stores/musicSource";
 import { useAppearanceStore } from "@/stores/appearance";
-import { useAuthStore, canUseMusicAssistant } from "@/stores/auth";
 import { useSourceLabel, useSourceSupports, useAnySourceSupports } from "@/stores/sourceRegistry";
 import { cn } from "@/lib/utils";
 import { migrateLegacyStorageKey } from "@/lib/legacy-storage";
@@ -33,6 +34,9 @@ type Item = {
 
 const ONLINE_ITEMS: Item[] = [
   { label: "首页", to: "/", icon: Radio },
+  // 「每日推荐」与「每日新歌」是两个功能，入口刻意相邻但分开：
+  // 每日新歌 = 当前音源的最新流（谁发新歌就有什么）；每日推荐 = 按你自己的播放历史挑的。
+  { label: "每日推荐", to: "/daily-recommend", icon: Compass },
   { label: "每日新歌", to: "/daily", icon: Clock },
   { label: "歌单广场", to: "/playlists", icon: ListMusic },
   { label: "排行榜", to: "/charts", icon: BarChart3 },
@@ -41,6 +45,8 @@ const ONLINE_ITEMS: Item[] = [
 const MINE_ITEMS: Item[] = [
   // 「我的歌单」与「收藏」已合成一页（/my/playlists），不再分两个入口
   { label: "我的歌单", to: "/my/playlists", icon: ListMusic },
+  // 音源账号登录与各源「数据/播放是否使用登录态」开关，紧跟我的歌单（用户指定位置）
+  { label: "音源账号", to: "/source-accounts", icon: KeyRound },
   { label: "本地音乐", to: "/library", icon: Music },
   { label: "下载管理", to: "/downloads", icon: Download },
   { label: "最近播放", to: "/history", icon: Clock },
@@ -52,8 +58,9 @@ const MINE_ITEMS: Item[] = [
  * 它既依赖在线音源搜索，又产生本机会话历史；挂哪边都会误导。
  * 与移动端「我的 → 音乐助手」是同一个智能体（music_assistant）。
  *
- * 入口按权限显隐：没有 `user:ai:music:use` 的账号（含未登录）整组不显示，
- * 与「播放链接」「日志级别」同一口径 —— 前端控制显隐，后端仍会校验。
+ * 2026-10-24 起这一组对全部用户开放（含未登录）：音乐助手不再需要管理员/专用权限码，
+ * 后端 `APP_USER` 角色本来就有 `user:ai:music:use`，前端再按权限显隐只会把入口藏错。
+ * 「服务端 AI」模式才是管理员专属，那条闸在设置页与执行层（`isAdmin`），不在入口这里。
  */
 const ASSISTANT_ITEMS: Item[] = [{ label: "音乐助手", to: "/ai-assistant", icon: Sparkles }];
 
@@ -84,8 +91,6 @@ export function Sidebar(): React.JSX.Element {
   // 那层 8px 模糊会把侧栏里的壁纸糊掉，与内容区之间出现一条明显的模糊分界。
   const hasBgImage = useAppearanceStore((s) => Boolean(s.preference.bgImage));
   const sourceName = useSourceLabel(activeSourceId);
-  const profile = useAuthStore((s) => s.profile);
-  const canUseAssistant = canUseMusicAssistant(profile);
 
   // 导航始终保留相同顺序，本地模式和不支持的功能显示禁用态，避免切源时布局跳动。
   // 未声明功能面的旧包仍按支持处理；本地模式单独禁用全部在线入口。
@@ -134,13 +139,11 @@ export function Sidebar(): React.JSX.Element {
             <NavLink key={item.to} item={item} collapsed={collapsed} />
           ))}
         </NavGroup>
-        {canUseAssistant ? (
-          <NavGroup title="助手" collapsed={collapsed}>
-            {ASSISTANT_ITEMS.map((item) => (
-              <NavLink key={item.to} item={item} collapsed={collapsed} />
-            ))}
-          </NavGroup>
-        ) : null}
+        <NavGroup title="助手" collapsed={collapsed}>
+          {ASSISTANT_ITEMS.map((item) => (
+            <NavLink key={item.to} item={item} collapsed={collapsed} />
+          ))}
+        </NavGroup>
         <button
           type="button"
           onClick={() => setCollapsed((c) => !c)}

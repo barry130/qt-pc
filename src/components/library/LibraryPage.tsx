@@ -204,13 +204,14 @@ export function LibraryPage(): React.JSX.Element {
         );
         // 扫描返回的 Track 不带文件元数据：不合并的话刚扫完的列表按大小 /
         // 修改时间排序显示空值、无损计数为 0，要切页回来才恢复
-        const metas = await ipc
-          .getLocalTrackFiles()
-          .catch(() => [] as ipc.LocalTrackFileMeta[]);
+        // 文件元数据 / 缺失列表 / 扫描目录三者互不依赖，并行取（各自失败走原默认值）
+        const [metas, m, d] = await Promise.all([
+          ipc.getLocalTrackFiles().catch(() => [] as ipc.LocalTrackFileMeta[]),
+          ipc.getMissingLocalTracks().catch(() => [] as Track[]),
+          ipc.getScanDirs().catch(() => list),
+        ]);
         setTracks(mergeFileMetas(Array.isArray(scanned) ? scanned : [], metas));
-        const m = await ipc.getMissingLocalTracks().catch(() => [] as Track[]);
         setMissing(Array.isArray(m) ? m : []);
-        const d = await ipc.getScanDirs().catch(() => list);
         setDirs(Array.isArray(d) ? d : list);
       } catch (err) {
         setError(errMsg(err));

@@ -11,6 +11,8 @@
  * 与移动端（qt-uniappx services/feedback.ts）同一套口径。
  */
 
+import { asNumber as num, asString as str } from "@/lib/coerce";
+
 /** 分页默认条数（与移动端 FEEDBACK_PAGE_SIZE 一致） */
 export const FEEDBACK_PAGE_SIZE = 10;
 
@@ -50,13 +52,7 @@ export interface FeedbackReplyItem {
   userType: string;
 }
 
-function str(v: unknown, fallback = ""): string {
-  return typeof v === "string" ? v : fallback;
-}
-
-function num(v: unknown, fallback = 0): number {
-  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
-}
+// str/num 的实现合并到 `@/lib/coerce`（strict 族）；调用处不用改。
 
 /** 后端字段可空：规整成带默认值的完整对象（与移动端 normalizeFeedback 同口径） */
 export function normalizeFeedback(raw: unknown): FeedbackItem {

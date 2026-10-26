@@ -3,8 +3,8 @@
 - 项目名称：轻听 PC 版
 - 目标平台：Windows 10 / Windows 11
 - 技术栈：Tauri 2 + React 19 + TypeScript + Tailwind CSS v4 + shadcn/ui + Rust
-- 文档版本：v1.4
-- 更新日期：2026-09-27
+- 文档版本：v1.22
+- 更新日期：2026-10-24
 - 关联文档：`qt-pc/REQUIREMENTS.md`、`../UPDATE_DESIGN.md`、`docs/CONFIG.md`、`docs/PACKAGING.md`
 
 ---
@@ -55,6 +55,28 @@
 | R13 | 补 `tauri.conf.json` / `capabilities` / CSP 骨架与无边框窗口的代价说明 | §4.1、§17.4 |
 | R14 | 补 PC `versionCode` 规则与发布流程 | §15.7 |
 | R15 | 路由表、事件表、状态结构补全至与 §19 目录结构一致 | §5.2、§11.8、§12.1 |
+| R16 | 路由表拆出 `/daily-recommend`（每日推荐）与 `/daily`（每日新歌）两个独立页面，原文把两者混成一行；设置页分节补 `network` / `ai` | §5.2、§5.4 |
+| R17 | 补「每日推荐」完整设计：三种推荐方式、三种口味、候选池四路、同歌手打散、当天缓存与失效规则、空态与降级文案 | §5.2「每日推荐」 |
+| R18 | 补 `ai_local` 客户端直连模型：五个命令、重试与超时口径、SSE 兼容、Key 只留 Rust 侧 | §11.7.1、§17.1 |
+| R19 | 「每日推荐」排序口径从**按歌手**改为**按风格画像多维综合**：新增 `music-style`（画像）/ `recommend-rank`（打分与多样性）/ `recommend-types`（契约）三个纯逻辑模块；候选池新增「同专辑」「风格歌单」两路；配额放宽改两阶段（先语种后歌手）；推荐理由改事实分级 | §0.3-F、§5.2「每日推荐」、§19.1、§20.2 |
+| R20 | 「每日推荐」补**冷启动**：无播放记录也无收藏时不再给空页面，改为列出音源平台风格分类让用户点 2–4 个（存 `dailyRecommend.styleSeeds`，并入画像 tags），跳过则先给一批按分类歌单 + 最新流铺的兜底内容；冷启动**不调本地模型**（没有画像，让模型挑等于让它瞎猜） | §0.3-G、§5.2「每日推荐」、§8.8、§20.2 |
+| R21 | 跨源聚合搜索下沉到**数据包**：qt-sources 新增 `searchMany` 入口（`META_REVISION` 5→6，一次调用搜 N 个关键词：包内 worker 池并发、总预算闸、逐词失败隔离），qt-pc facade 加 `searchManyBatches`，每日推荐候选池 ② 改为按 `SEARCH_CONCURRENCY` 分块调用；装在旧数据包上时自动退回 app 侧扇出（探测后记住，不再重复失败调用） | §0.3-H、§5.2「每日推荐」、§20.2 |
+| R22 | **聚合搜索只用勾选的音源**：设置 → 音源包新增「聚合搜索音源」开关（`search.aggregateSources`，存源 id 数组，空 = 全部），未勾选的源在**数据包侧就不发请求**（`searchAll`/`searchMany` 可选 `sources` 入参，`META_REVISION` 保持 6），qt-pc facade 再按勾选集过滤一遍作答旧包兜底；覆盖搜索页「全部音源」、AI 找歌、手动换源、每日推荐跨源四个入口，单源搜索不受影响 | §0.3-I、§5.2、§6.2、§8.8、§20.2 |
+| R23 | **聚合搜索的合并去重下沉到数据包**：qt-sources 新增 `searchMerged` 入口（`META_REVISION` 6→7，包内负责多源合并、去重、按相关性排序，并回 `full`「是否有任一源满页」作分页依据），qt-pc facade 加 `searchMergedPage`（返回 `{tracks, full}`），搜索页聚合模式改为一条去重列表、去掉「源名 + N 首」分组头、行尾只留源标；装在旧数据包上时退回本地 `mergeAggregateTracks`（探测后记住） | §0.3-J、§5.2、§20.2 |
+| R24 | **所有音乐列表在歌名右侧标出平台简称**：抽公共组件 `components/common/SourceTag.tsx`（全站唯一实现，正在播放页 `sm`=11px、列表行 `xs`=10px；取注册表 `short` 简称，旧包无 `short` 回落全名，本地曲目不渲染），替换 12 处自绘源标（`TrackList` / 搜索页 / 队列 / AI 卡片 / 统计页 / 榜单卡片 / 歌曲卡片 / 换源面板 / 歌词搜索 / 听歌记录 ×2）；顺带把原本在歌名**左侧**的全名 chip 统一改成右侧简称；`LOCAL_PLATFORM` 抽到 `lib/platform.ts`，展示组件不再依赖整个 IPC 层 | §0.3-K、§12.2、§20.2 |
+| R25 | **去重合并：能公用的实现不再各写一份**。新增四个叶子模块 —— `lib/text.ts`（`normText` / `compactText` / `trackKey` / `songNameKey` / `localDateKey` / `hashString` / `jitter` / `truncateChars` / `safeDecodeURIComponent`）、`lib/coerce.ts`（strict 族 `as*` + coerce 族 `coerce*`，头注释写明「不互相兜底」）、`lib/format.ts`（`formatBytes`）、`lib/pending-cache.ts`（在飞去重 + 已落定缓存）；`components/common/SourceTag` 之后再把听歌报告的两份 `EntryPicture` 合并成 `components/mine/ListenReportBits.tsx`（`size` 32/40 两档）；三份 facade 测试的 `engineInvoke` mock 收敛成 `tests/helpers/engine-client.ts`。**顺带修掉一个真 bug**：`recommend-rank` 曾自带一套 `durationBand` 边界（180/270/420），与 `music-style` 的（150/240/330）不一致 —— 同一首歌在画像里算「长歌」、在打分里算「普通」，`mainBand` 对比错位；现在用 `music-style` 那一份。语义确实不同的（聚合合并的 `normText`/`songKey`、两种 `formatTime`、两个 `SectionTitle`/`CollectButton`、队列的片段级 `trackKey`）**明确不合并**，理由见 §0.3-L | §0.3-L、§19.1、§20.2 |
+| R26 | **搜索改成独立的整页**：标题栏原来的输入框改为「打开搜索页」的入口按钮（点击 → `/search` 落地页），搜索页落地页补齐**搜索历史 / 热门搜索**两块内容并自动聚焦输入框；页签栏与聚合开关只在**搜过之后**出现；歌曲页签右端加「播放全部」（已加载的整批入队起播）。理由：完整的搜索需要一个能摆下历史与热搜的版面，标题栏里的小框既放不下也重复实现了一遍输入逻辑 | §0.3-M、§5.2、§5.3、§20.2 |
+| R27 | **本地模型精选与规则推荐拉不开差距（根因修复）**：`rankCandidates` 的 `target` 缺省是 `DAILY_TARGET`（50），所以 `rulePicked` 从来不超过 50 首，`DAILY_AI_POOL_MAX`（当时 60、后来 150）**是一段死代码** —— 模型永远拿到「和规则结果逐首相同的 50 首」再挑 50 首，两次结果只有顺序与理由不同。现在本地模型模式下把规则排序的目标放大到 `max(DAILY_TARGET, DAILY_AI_POOL_MAX)`（150），规则结果仍只取前 50；模型回执加三级容错（原样 → 修裸控制字符/尾逗号 → 正则捞序号）与一次低温重试；结果多带 `model` 字段并显示在页头 | §0.3-N、§5.2、§20.2 |
+| R28 | **AI 推荐「像随机选」：从「求风格齐全」改成「求贴合」**：用户连续三次反馈后查当天缓存，50 首里第 47–50 首是 `Everywhere We Go`（陈冠希）/ `One Last Time`（Ariana Grande）/ `Control`（Zoe Wees）等与「华语古风」画像无关的英文歌 —— 根因是提示词在**主动推模型凑拼盘**（「不要直接照抄前 50 首」「尽量分散在不同歌手和不同风格」），且候选行只有歌名 / 歌手 / 专辑 / 语种，模型手上没有任何「这首对用户意味着什么」的证据。改法：候选行带本地证据（已收藏 / 听过 N 次 / 常听歌手 / 收藏歌手 / 常听专辑 / **非主语种**）+ 时长带；主语种定得下来时给「50 首里至少 40 首是华语」这种可对账的硬下限；规则改成「越靠前越贴合 / 非主语种不要选 / 整张歌单一个主题」，删掉那两句凑风格的指令；温度 0.8→**0.4**、重试 0.5→**0.2**；结果侧新增 `filterAiPicks`：非探索口味下模型挑进「本地零证据且非主语种」的歌会被剔掉并由规则补满 50 首；补 `limitAiPicks`：提示词让模型从第 51–90 首换进 6–10 首（防止退化成纯规则复读），但其实际会超额，app 侧封顶 12 首且每首需有画像依据；实测 150 首合成池两轮最终 50 首全华语、0 首英文、与规则前 50 重合 38–42 首；`spreadItemsBySinger` 从整段贪心重排改为**最小相邻交换**（第一首永不动，模型排好的顺序基本保留）；`DAILY_RULE_VERSION` 7→8，当天旧缓存自动重算 | §0.3-O、§5.2、§20.2 |
+| R29 | **风格更多变、维度更多：先扩候选池，再按风格线配额**：v1.15 把提示词从「求多样」改成「求贴合」后，用户 2026-10-24 08:03 反馈「风格能够在多变一点…推荐的维度可以在多一点…你的数据来源是历史和搜索出来的，AI 主要是在你的结果里面选歌，那么你的搜索维度和结果就非常重要」—— 查当天缓存，50 首里古风 16 + 华语抒情 14 + 冷门网络流行 11 + kg 古风 5，**两条主线吃掉 30 首，其余是同一批种子歌手的边角料**。根因不在提示词而在**候选池只有两条路**：`buildCandidatePool` 的 6 条路全从「种子歌手 + 收藏/歌单 + 风格分类歌单」长出来，同一个画像永远长回同一片歌。改法：新增 `src/lib/recommend-dimensions.ts`（`planDimensionQueries` 按 画像标签 → 歌单名 → 次要语种 → 相邻风格 → 轮换兜底词 → 搜索历史 生成 ≤10 条查询；`collectDimensionLanes` 走**榜单 / 关键词跨源搜索 / 风格歌单**三路，每条结果挂「风格线」provenance）；`buildCandidatePoolWithLanes` 把维度层与原 6 路并行合并（`local` 源跳过、异常吞掉退化为空）；`diversifyByLanes` 在规则排序后按「七成保贴合、三成给风格线」补齐（≤5 条线，每条线按配额补位）；`interleaveByLanes` 按线交织排展示顺序；提示词 v9 给候选行加 `风格线：X`、给画像加「语种分布」、要求「覆盖 3–5 条线、主风格约一半、相邻线各 4–10 首」；`filterAiPicks` / `limitAiPicks` 放宽：画像里占比 ≥5% 的次要语种与有风格线依据的歌不再被硬剔；结果新增 `styleLanes`（按条数降序、最多 5 条），每日推荐页在「口味画像」下显示「本期风格」chips；`DAILY_RULE_VERSION` 8→9。真实模型两轮里有一轮给出 4 条线（古风 18 / 华语流行 8 / 粤语 6 / 纯音乐 2，0 首非华语） | §0.3-P、§5.2、§20.2 |
+| R30 | **多源聚合接口一律下沉音源包，删除宿主侧 fan-out 与本地合并**：按用户 2026-10-24「后面所有使用多个音源的聚合接口必须放到音源包里面」逐处审计，`getAllLatestSongs` 是最后一处宿主逐源扇出（根因：包 `allLatest` 返回的 `MusicInfo` 不带 `platform`，混批后取链无法归属）；数据包 `META_REVISION` 7→8 给 `allLatest` 每条曲目盖 `platform`（交错合并抽成包内纯函数 `interleaveLatestBatches`），宿主改为一次 `sourceCall("allLatest")` 的薄包装；同时删掉「旧包降级」路径 —— `searchMany` / `searchMerged` 不再退回 app 侧 `fanOutSearch` / `localMerge`，缺入口一律抛「数据包版本过旧，请更新」；`lib/aggregate-merge.ts` 整体删除（`songKey` 迁到 `lib/song-key.ts` 供搜索页跨页去重，`mergeAggregateTracks` / `isJunkTrack` 随包侧 `merge-search.ts` 唯一实现消失） | §0.3-Q、§1.2、§20.2 |
+| R31 | **详情页 hero 统一：左封面（176px）右内容，内容不得高于封面**：按用户 2026-10-24「把每日推荐和歌单详情模板类似的，左边图片，右边内容，高度不要超过图片，内容全部往右边搭」把两页 hero 改成与歌手页同一套结构并收紧内容 —— 封面 144→176px 定高；每日推荐把「共 N 首」并入元信息行、摘要限两行、口味画像与「本期风格」chips 并排一行、口味按钮与操作按钮并排一行；歌单详情简介限两行。结果：两页 hero 高度恒等于封面高度（176px），右侧内容约 170px / 164px，不再出现「图片下方的空白」 | §0.3-R |
+| R32 | **AI 模式全局化：三种模式同时作用于「每日推荐」与「音乐助手」**：按用户 2026-10-24「这个需要完全支持音乐助手，每日推荐。选择哪个全局都得使用这个模式」把设置里只管每日推荐的「推荐方式」提升为全局 AI 模式 —— 设置项抽到 `src/lib/ai-mode.ts`（`AiEngineMode` / `AI_MODE_LABEL` / `AI_MODE_HINT` / `AI_MODE_OPTIONS` / `parseAiMode` / `readAiMode` / `saveAiMode`，键沿用 `dailyRecommend.mode`），`daily-recommend.ts` 只做别名 re-export 且 `effectiveMode()` 改为恒等；每日推荐的服务端模式不再降级，而是借 astral 音乐助手跑一次性会话（新增 `src/lib/ai-server-picks.ts`：校验登录 → 取 `MUSIC` 智能体 → 建会话 → 把 `buildPrompt()` 拼成一条消息（system 加 `【系统设定】` 前缀、上下文带前 150 首候选）→ 600ms 轮询到终态（总超时 90s）→ `parsePicks` 解析，失败时用 `song_list` 块按 `trackKey` 对回序号 → 删会话；运行时失败才退回规则并在 notice 写原因）；音乐助手补本地两种模式（新增 `src/lib/ai-assistant-local.ts`：rule = 风格词表 + 歌名/歌手点名 + 画像相似度，同歌手 ≤2 首取前 8；local = 本地模型 JSON 契约，失败整体回退 rule，永不抛错），`useAiChat` 按模式分流（非 server 不建 astral 会话、`init` 不拉智能体、`send` 前重读模式），助手页非 server 隐藏会话侧栏并显示模式横幅，设置页「推荐方式」改「AI 模式」并逐项说明。验收：全量 **96 files / 937 tests** 全绿、`tsc --noEmit` 0 错、eslint 干净 | §0.3-S |
+| R33 | **音乐助手本地模式补齐：左侧历史对话 + 20 首上限**：按用户 2026-10-24「规则模式怎么左边不显示历史对话，然后每次只有8首，我要20首也是8首」修三处硬缺口 —— ①规则/本地模式在 `useAiChat.init()` 里直接 return，从不填会话列表，页面又按 `serverMode` 把侧栏整块隐藏；②`src/lib/ai-assistant-local.ts` 的 `MAX_SONGS = 8` 写死，且完全不解析用户话里的数量；③`MAX_PER_SINGER = 2` 让「点周杰伦」最多只出 2 首。修法：新增 `src/lib/ai-assistant-history.ts`（localStorage 持久化本地会话：最多 30 个会话 × 40 条消息、标题取首句、`AiConversation`/`AiChatMessage` 同构还原、时间并列按 id 倒序稳定排序），`useAiChat` 的 `init` / `selectConversation` / `removeConversation` / `sendLocal` 接本地历史，侧栏对三种模式都渲染（标题「历史对话」）；引擎默认给满 20 首（`DEFAULT_SONG_COUNT`）、解析「20 首 / 二十首」并封顶 20，`count` 贯通 `pickRuleSongs` / `buildLocalMessages` / `mapPicks` / `parseLocalReply` / `runLocalTurn`，用户点名的歌手不再受同歌手配额限制。验收：全量 **97 files / 957 tests** 全绿、`tsc --noEmit` 0 错、eslint 干净；新增 `tests/ai-assistant-history.test.ts` 11 条，hook 测试 5→8 条、引擎测试 17→23 条 | §0.3-T |
+| R34 | **AI 接口配置改成「供应商列表 → 详情」主从 UI（多协议 / 多 Key / 模型多选 / 图标 / 跳过证书校验）** — 用户 2026-10-24 反馈「把本地模型精选下面 AI 配置的内容换成类似于截图这样的 UI，外面只展示一个列表，点进去进行配置 api 和密钥、模型等等」。设置页原来的「接口配置」是一排表单：多套接口靠下拉切当前生效，Key 只有一个明文输入框，模型只存一个字符串 —— 想换协议、存第二把 Key、试多个模型都得改代码。改成主从两态：列表每行 = 图标 / 名称 / 地址 / 协议 / N 个模型 / 掩码 Key / 生效开关 / 箭头；详情 = 名称、ID、Base URL、协议四选一（OpenAI 兼容 / OpenAI Responses / Anthropic 兼容 / Gemini 兼容）+ 检测协议、Key 多把（第一把生效，可删 / 置顶 / 追加）、内置图标 + 上传、跳过证书校验、模型 chips 多选（第一项生效），底部移除 / 复制 / 取消 / 保存。Rust 侧 `ai_local.rs` 扩了 `protocol` / `keys` / `models` / `icon` / `skipCertVerify` 字段，按协议分派请求体与鉴权（OpenAI `/chat/completions`、Responses `/responses`、Anthropic `/v1/messages` + `x-api-key` / `anthropic-version`、Gemini `generateContent` + `x-goog-api-key`，`systemInstruction` 与 `max_tokens` 各有坑，已按真机返回落住）；前端 `AiProvidersPanel.tsx` 保存时用增量字段（`addKeys` / `removeKeyIndexes` / `activeKeyIndex`），永远拿不到 Key 明文。验证：`ai_local.rs` 5 条单测（`cargo check --all-targets` 0 warning）、`tests/settings-ai-providers.test.tsx` 10 条，全量 98 files / 968 tests、`tsc` 0 错、eslint 干净。**同日追加**：设置页不再内联展开整块，只保留一行「接口配置」入口与「管理供应商…」按钮，列表/详情放进弹窗 `AiProvidersDialog`（`role="dialog"`，遮罩点击 / Esc / 右上角关闭）；`tests/settings-ai-providers.test.tsx` 增至 11 条。 同日修复：开关几何改回与设置页 `Switch` 一致的 `left-[0.125rem]` / `left-[1.125rem]` 两端定位（原先 `absolute` + `translate-x-*` 没有 `left`，勾选态小球会跑到轨道右外侧），列表行「正在使用」与详情「跳过证书校验」共用一个 `SwitchButton`，一处修改全部生效。| §0.3-U |
+| R35 | **所有歌曲列表页加「排序」（对标 qt-uniappx 的 7 个合并选项）** — 用户 2026-10-24「所有歌曲列表的页面，需要和qt-uniappx一样，增加一个排序的功能，如歌单详情啊等等」。原状：只有本地曲库 `LibraryPage` 有排序（`SORT_OPTIONS` + 方向按钮），歌单/专辑/歌手/每日推荐/最近播放/我的混合这些 TrackList 页完全没有排序，想按歌名或歌手看一张上千首的歌单只能自己翻。修法：新增 `src/lib/track-sort.ts`（`TRACK_SORT_OPTIONS` = 默认顺序 / 按歌曲名·正序·倒序 / 按专辑名·正序·倒序 / 按歌手名·正序·倒序，`parseTrackSort` 把选项拆成 `key + desc`，`sortTracks` 用 `normText` 归一后 `localeCompare("zh-Hans-CN")` 比较、并列依次比较歌名/专辑/歌手、仍并列保留原始下标保证稳定）与共享控件 `src/components/TrackSortSelect.tsx`（`<select aria-label="排序方式">`）；每个页面把「播放全部 / `BatchBar` 的 `tracks` / `TrackList` 的 `tracks`」三处统一换成排序后的数组，保证播放顺序、批量管理范围、列表显示顺序三者一致。已接：歌单/榜单/专辑详情、专辑页、歌手页、每日推荐、最近播放、我的混合。明确不接：搜索页（分页结果）、每日新歌（分页流）、音频节目（无限下拉）、下载任务（`TaskRow` 非 `TrackList`）、播放队列（本身即顺序语义）；本地曲库保持原有 UI。验证：`tests/track-sort.test.ts` 6 条、全量 99 files / 974 tests 全绿、`tsc --noEmit` 0 错、eslint 干净。**同日改版**（用户 2026-10-24 晚，见 R36 / §0.3-W）：控件改为上下两个弹窗（字段 + 方向，默认都不勾选），`DailyPage` 每日新歌也接入排序。 | §0.3-V |
+| R36 | **排序格式改成两个弹窗 + 每日新歌接入排序**（v1.23 · 2026-10-24）：用户「每日新歌也要支持排序。排序格式换一下，换成两个弹窗，上面显示按歌曲名、按专辑名、按歌手名，下面显示正序、倒序。默认顺序都不勾选」。`src/components/TrackSortSelect.tsx` 从单个 7 项 `<select>` 改为上下两个 `Popover` 弹层（字段：按歌曲名 / 按专辑名 / 按歌手名；方向：正序 / 倒序），`value === "none"` 时两个按钮都是占位「排序」/「方向」、方向按钮 `disabled`，即默认都不勾选；再点一次已选字段 = 取消回 `none`。`src/lib/track-sort.ts` 增 `TRACK_SORT_FIELDS` / `TRACK_SORT_DIRECTIONS` / `trackSortValue(key, desc)`，原 `TRACK_SORT_OPTIONS` / `DEFAULT_TRACK_SORT` / `parseTrackSort` / `sortTracks` 编码不变（6 个既有页面签名不动）。`DailyPage` 加 `sortValue` + `sortedSongs`，hero 右列竖排「排序 + BatchBar」，「播放全部 / `BatchBar` / `TrackList`」三处统一用排序后数组。验证：`tests/track-sort.test.ts` 10 条、新增 `tests/track-sort-select.test.tsx` 6 条 / `tests/daily-page-sort.test.tsx` 3 条；全量 **101 files / 990 tests** 全绿；`tsc --noEmit` 0 错；eslint 干净 | §0.3-W |
+| R37 | **音乐助手全量开放 + 「服务端 AI」仅管理员**（v1.23 · 2026-10-24）：用户「音乐助手不再需要管理员权限了，但是服务端 AI 需要管理员权限才展示和允许使用（看后端是否满足控制条件，可以由后端建议，前端隐藏）」。① `Sidebar` 删除 `canUseMusicAssistant` 门禁，「助手 → 音乐助手」对全部用户（含未登录）渲染，`stores/auth.ts` 移除 `MUSIC_ASSISTANT_PERM` / `canUseMusicAssistant`（`isAdmin` / `hasPermission` 保留）；② `src/lib/ai-mode.ts` 增 `resolveAiMode(mode, canUseServer)`（server + 非管理员 → rule）与 `aiModeOptionsFor(canUseServer)`，设置页 `AiSection` 用 `isAdmin(profile)` 过滤选项，并修掉从不回读 `readAiMode()` / `readTaste()` 的旧 bug（载入前显示「载入中…」，带 unmount 守卫），库里有 server 但非管理员时显示 rule + 提示「服务端 AI 仅管理员可用，当前按纯规则运行。」；③ `useAiChat` 的 `init()` / `send()` 按 `resolveAiMode` 收敛，非管理员不拉 `astralAiAgents`、不建服务端会话、走本地回合；④ 执行层 `askServerForPicks()` 入口先判 `isAdmin(...)`，非管理员直接 throw，`daily-recommend.ts` 的 `readMode()` 返回有效模式、`generateDailyRecommend` 对显式 `options.mode` 再收敛且 `requested` 记 rule（否则非管理员每天命中不了当日缓存），规则分支 notice 说明。后端 astral 没有「服务端 AI」专用权限码（App 用户默认持有全部 `user:%`），故不改后端，仍按智能体权限码 + 客户端默认权限校验。验证：`tests/sidebar-assistant-entry.test.tsx` 重写为三种身份都展示、`tests/auth.store.test.ts` 删旧 `canUseMusicAssistant` 用例、`tests/ai-mode.test.ts` / `tests/use-ai-chat-modes.test.tsx` / `tests/daily-recommend-generate.test.ts` / `tests/ai-server-picks.test.ts` 补管理员与非管理员用例；全量 **101 files / 990 tests** 全绿、`tsc --noEmit` 0 错、eslint 干净 | §0.3-W |
 
 ### 0.3 实现现状修订（v1.4 · 2026-09-27）
 
@@ -92,6 +114,306 @@
 - `src/main.tsx` 的全局错误兜底改为**叠加可关闭浮层**，不再清空 `#root`；
 - KeepAlive 常驻页引入 `active` 标记（`components/layout/keepAliveActive.ts`），激活时才重新校验数据。
 
+**E. 每日推荐与客户端直连模型（v1.5 · 2026-10-22）**
+
+- 「每日推荐」不再是音源给的列表，改为**按本机播放历史 + 收藏本地算**：`src/lib/daily-recommend.ts`（纯逻辑，1658 行）+ `components/discovery/DailyRecommendPage.tsx`（渲染，463 行），另有 `music-style` / `recommend-rank` / `recommend-types` 三个纯逻辑模块（v1.6 拆出），合计 5 个测试文件 171 条单测。入口 `/daily-recommend`，与 `/daily`「每日新歌」（音源最新流）并存 —— 见 §5.2「每日推荐」。
+- 三种推荐方式：`rule`（纯本地）/ `local`（本地模型挑序号，默认）/ `server`（Astral）。三种口味：`heart` / `familiar` / `explore`。**AI 只挑不造**，回执失败自动退回规则推荐并 toast 说明。
+- 新增 Rust 模块 `src-tauri/src/ai_local.rs`（885 行）：让用户把任意 OpenAI 兼容接口填进设置页「AI」分节，Key 只留 Rust 侧、前端只读 `hasKey`。含 3 次重试与退避、120s 超时、SSE 兼容、上游错误透传 —— 见 §11.7.1。
+- 设置页新增 `network` / `ai` 两个分节；`ai` 只管「模型接口怎么连」，不绑定具体功能。
+
+**F. 每日推荐改按「风格」综合推荐（v1.6 · 2026-10-23）**
+
+- 旧实现虽然号称"跨源推荐"，**排序实际只认歌手**：`heart` 收藏歌手 +4、`familiar` 常听歌手 ×3、`explore` 常听歌手倒扣，再按歌手分组轮流取。用户的原话是「不应该根据你听过的歌手去推荐，应该根据你之前听过歌曲的风格等等各方面综合一起去推荐」——一屏 50 首里全是同几个人的歌，也确实不像"每日推荐"。
+- 音源契约（`src/source-scripts/qt-contract/contract.ts` 的 `MusicInfo`）与本地 `Track`（`src/types/index.ts`）**都没有 genre / 年代 / 语种字段**，风格只能从本地可算的信号推导 —— 这是整个设计的硬约束，决定了为什么不直接读"风格标签"。
+- 拆成三个纯逻辑模块（都能单测，互不依赖 UI 与 IPC）：
+  - `src/lib/recommend-types.ts`：`DailyTaste` / `MusicLang` / `DurationBand` / `TrackStyle` / `TrackQuality` / `StyleProfile` / `ScoredCandidate` / `RankHit` / `RankOptions` 等契约类型，零运行时代码；
+  - `src/lib/music-style.ts`：从播放历史 + 收藏 + 歌单名提取**风格画像**（`buildStyleProfile`），并提供 `detectLanguage` / `durationBand` / `trackStyle` / `trackQuality` / `describeProfile`；
+  - `src/lib/recommend-rank.ts`：多维打分 `scoreCandidates` + 多样性选择 `selectDiverse`（MMR）+ 理由生成 `reasonFor`。
+- 画像的输入是**真实收听行为**，不只看播放次数：`play_stats` 的 `total_played_ms` 能算出**完播比**（`totalPlayedMs / (playCount × 时长)`），于是「点开听 20 秒就切」和「一遍遍听完」不再同分；`skipped`（听了 3 次以上但完播比 < 0.4）会被扣分。
+- 候选池新增两路，只依赖音源包已验证存在的能力：`searchAlbums` + `getAlbumDetail`（同专辑兄弟，专辑是最强的风格代理）、`getPlaylistCategories` + `getRecommendations` + `getPlaylistDetail`（平台自己的"摇滚 / 华语 / 民谣"歌单；`explore` 故意挑画像**不**匹配的分类来换口味）。
+- 结果页在摘要下一行显示「口味画像：…」（`describeProfile` 生成，如「华语为主，偏 3–4 分钟，常听 周杰伦 / 陈奕迅」），让用户知道系统是从哪几个维度判断的 —— 推荐理由不透明时，用户只会觉得"又在瞎推"。
+
+**G. 每日推荐补冷启动（v1.7 · 2026-10-23）**
+
+- v1.6 把排序改成了「按风格」，但**风格画像需要样本**：`heart` 是默认口味，新用户（没有 `play_stats`、没有收藏）进来时旧逻辑直接 `return` 一个空结果，页面上一句「先随便听几首」——功能第一次打开就是死的，用户没有理由第二天再来看。
+- 现在的做法是**先问一句**：冷启动时页面顶部列出音源平台下发的风格分类（`getPlaylistCategories`，如「华语」「摇滚」「民谣」），用户点 2–4 个 → 存进 `settings` 的 `dailyRecommend.styleSeeds` → 画像把这些名字当歌单名一样抽成 `tags`（复用 `buildStyleProfile` 的 `playlistNames` 入参，`music-style.ts` 一行没改）→ 同日重算，`coldStart` 变 `false`。
+- **不选也给内容**：冷启动的候选池按「分类歌单 + 最新流」放宽，用户不点也能听到一批歌（等于自动降级成"平台热门兜底"）；`notice` 保持 `null` 不弹 toast —— 冷启动不是错误，别用报错语气说话。
+- **冷启动不调本地模型**：`mode = local` 时也直接走规则分支。没有画像时让模型"挑几首符合你口味的"，等于让它编。
+- 设置键存**风格名**而不是分类 id：分类 id 是平台内部标识，换音源就失效，名字是用户认得、也不会随音源漂移的东西。读坏了的旧值按 `,，、/` 分隔符兜底救回来，最多 4 个。
+
+**H. 跨源聚合搜索下沉到数据包（v1.8 · 2026-10-23）**
+
+- 起因：每日推荐的候选池 ② 要按「种子歌手」跨源搜歌，旧实现是 app 侧 `mapLimit(singers, SEARCH_CONCURRENCY)` 逐词调 `searchAll` —— N 个歌手就是 N 次跨窗口 invoke，而**并发上限、单源超时（4000ms）、逐词失败隔离**这三件事每加一端就要重写一遍（PC / 安卓 / 以后别的 APP）。用户原话：「把这些聚合搜索接口放到 qt-sources 里面，后续直接通过这个聚合进行搜索是不是更方便些，因为后续我还需要支持其他 APP」。
+- 分层：**单关键词四源聚合本来就在数据包里**（`searchAll` → `src/actions/aggregate.ts` 的 `allSearchBatches`）。本次补的是它上面那层「多关键词编排」，落成新入口 `searchMany({keywords, page, size, concurrency?, budgetMs?})`：
+  - `src/actions/batch-search.ts` 是纯编排层（零平台依赖、可离线单测）：关键词归一化（trim / 丢空 / 折叠空白 + 小写去重保原文 / 封顶 32）、worker 池并发（缺省 3，clamp 1..8）、总预算闸（缺省 15s，clamp 1..18s；超预算只停「还没启动」的词，在途的等它跑完）、单关键词失败隔离（`ok=false`，空结果仍算成功）、`merged` 按 `${source}:${id}` 展平去重；
+  - `meta-entries.ts` 把 `searchMany` 注册成宿主入口，`META_REVISION` 5 → 6；
+  - 宿主契约（`src/contract.ts`）**没动** —— 新入口是**增量**能力，旧宿主不认识它不影响任何既有入口。
+- app 侧（`src/source-scripts/index.ts`）：`searchManyBatches(keywords, page, size, {concurrency, budgetMs})` → `{groups, truncated}`。~~**兼容旧数据包**：应答报「缺少该接口」时不报错，退回 app 侧 `fanOutSearch`（worker 池 + 逐词 try/catch，语义与包内对齐），再把 `searchManySupported` 记成 `false`，后续调用不再白跑一次失败 invoke。~~ **v1.17 起（见 §0.3-Q）不再有宿主降级**：缺入口直接抛「数据包版本过旧，请更新数据包」，`fanOutSearch` / `searchManySupported` 已删除；`merged` 字段无人消费，一并移除。引擎未就绪、接口内部失败照旧抛错 —— 静默降级会把「包坏了」伪装成「搜不到」。
+- 每日推荐只吃这一层：候选池 ② 按 `SEARCH_CONCURRENCY` = 3 个歌手一块调用，块内由数据包并发、块间串行。分块而不是一次全塞：单块超时 / 失败只影响这一块，容错粒度与旧实现「每个歌手各自失败」一致。
+- 推荐策略（画像、候选池五路、打分与多样性）**仍留在 app**：它依赖本机播放历史与收藏，是产品策略不是音源能力 —— 换端时策略可以不同，音源编排不该不同。
+
+**I. 聚合搜索音源可选（v1.9 · 2026-10-23）**
+
+- 需求原话：「可不可以**在 qt-pc 设置聚合搜索源，选择哪几个源就搜索这几个，没有选择的就不使用**」。要的是「勾掉的源别被我搜到」，而不是「搜完再筛」。
+- 分层（两层都做，理由不同）：
+  - **数据包侧**（`qt-sources`）：`searchAll` / `searchMany` 入参加可选 `sources?: unknown`，`src/actions/source-filter.ts` 的 `pickSources` 归一化 —— undefined / 非数组 / 空数组 → 全量（返回副本）；否则 trim 后按注册表顺序投影，去重 + 未知 id 静默丢弃。**过滤发生在 `Promise.allSettled` 之前**，没勾的源根本不会发起请求（少一份往返、少一条超时线）。新增字段是可选的，所以 `META_REVISION` 保持 6 —— 新旧宿主行为都不变。
+  - **app 侧**（`src/source-scripts/index.ts`）：`searchAllBatches(keyword, page, size, sources?)`、`searchManyBatches(..., {sources})` 把白名单透传下去，**收到应答后再按白名单过滤一遍** —— 装在旧数据包上时包会忽略未知字段、把四个源全返回，这一层是旧包兼容的唯一保证（幂等，新包上不会二次生效）。
+- 设置项：`search.aggregateSources`（`settings` 表，JSON 字符串数组，存**源 id**）。**空值 / 未配置 = 全部音源**：一个都没勾不该变成「什么都搜不到」；UI 侧同时禁止关掉最后一个。「全选」写空值而不是写全量 id 数组 —— 以后数据包新增音源会自动参与，不会被一份旧白名单永久排除。
+- 读取带进程内缓存（`src/lib/aggregate-sources.ts` 的 `readAggregateSources`）：聚合搜索是点一次跑一次，不值得每次走 IPC；设置页保存后同步刷新缓存，因此立即生效。解析失败一律按「全部」兜底 —— 一条坏设置不能让搜索变空。
+- 覆盖面：`SearchPage` 的「全部音源」分组、`useAiChat` 的 AI 找歌候选池、`source-switch` 的手动换源、`daily-recommend` 候选池 ② 的跨源补充。**单源搜索不受影响**（某源的页签、榜单、歌单、歌手页用的是用户明确选中的那个源）。
+- 设置 UI：`SettingsPage` 的 `AggregateSourcesRow`（音源包分节，动态按 `useSourceRegistryStore` 的 `sources` 渲染，不硬编码源列表）；乐观更新 + 串行写队列 —— 连点两个开关不丢第二个点击，落库顺序也不会乱。
+
+**J. 聚合搜索的「合并去重」下沉到数据包（v1.10 · 2026-10-23）**
+
+- 需求演进：先按用户「聚合搜索不应该这样展示，而是应该后台调用聚合搜索音源，然后过滤掉一些重复的内容，最终展示一些比较合适的」+「展示其实不需要在上方写个网易云音乐、qq音乐之类的」，把搜索页聚合模式的**按源分组**改成一条去重列表（客户端侧已实现 `src/lib/aggregate-merge.ts`）；随后用户问「这种聚合能不能由 qt-sources 去做，而不是客户端做」，于是把合并逻辑整体下沉成数据包入口 `searchMerged`（`META_REVISION` 6 → 7），客户端那份实现曾保留为旧数据包的降级路径 —— **v1.17 已删除**（见 §0.3-Q），现在只剩包侧一份。
+- 为什么属音源层：「多源结果怎么合、重复怎么判、哪条更合适」依赖各平台的标题写法、版本后缀（`Live` / `伴奏` / `片段`）、元数据完整度 —— 这些知识在包侧最全；放 app 里意味着每个端（PC / 安卓 / 以后别的 APP）各写一份，必然漂移。与 R21 的 `searchMany` 是同一个判断。
+- 包侧新增（`qt-sources`）：`src/actions/merge-search.ts`（`mergeSearchResults` 等纯函数，与 qt-pc `lib/song-key.ts` 的 `normText`/`songKey` 口径一致（v1.17 起 app 侧只留搜索页跨页去重键） —— 栈式剥**任意嵌套**括号、歌手集合排序后作键、junk 词看**原始标题**且关键词本身命中时豁免、打分 base 200 / 标题 60-45-30 互斥 / 歌手 55-35 / 专辑 10 / 软降级 −25 / `preferSource` +8 / 封面 +3 / 时长 +2、按「歌名+歌手集合」去重留最高分、分数降序 + 展平序稳定、`limit` 排序后截断、返回原件不改入参）；`aggregate.ts` 加 `searchMergedPageBatches`（一次扇出同时算 `full` 与合并结果，不让入口为拿 `full` 重复打一轮）；`meta-entries.ts` 注册入口 `searchMerged`。
+- **`full` 是分页收尾的唯一依据**：出参 `{ list, full }`，`full` = 这一页是否有**任一源**返回满页，且必须用**合并前的原始批次**判定 —— 合并去重后条数必然少于各源之和，宿主拿 `tracks.length` 比 `size` 会永远判成「到底了」，后面的歌再也翻不出来；各源原始条数只有包侧知道。
+- app 侧（`src/source-scripts/index.ts`）：`searchMergedPage(keyword, page, size, {sources, preferSource})` → `{tracks, full}`；~~**兼容旧数据包**：应答报「缺少该接口」时退回 `searchAllBatches` + 本地 `mergeAggregateTracks`…~~ **v1.17 起（见 §0.3-Q）直接抛「数据包版本过旧」**：`localMerge` / `searchMergedSupported` / `dropJunk` 已删除；其它错误照旧抛出（静默降级会把「包坏了」伪装成「搜不到」）。
+- 搜索页（`src/components/SearchPage.tsx`）：聚合模式只渲染一条列表，**不再有「源名 + N 首」分组头**，行尾保留一个源标（用户认可的形态）；跨页去重按 `songKey`（歌名 + 歌手集合）而不是「源 + id」—— 第 2 页的同歌往往来自**另一个源**，只比 `platform:id` 会漏掉；`hasMore` 直接用包回的 `full`。
+- 测试：`tests/source-scripts-search-merged.test.ts` 6 条（应答映射与 `full` 透传、空关键词不打引擎、非缺入口错误原样抛、旧包缺入口报「数据包版本过旧」且不再本地合并；v1.17 起 `aggregate-merge.test.ts` 已删）、`tests/search-page-pagination.test.tsx` 的聚合用例改为 mock `searchMergedPage` 并断言无分组头。
+
+**K. 音乐列表统一标出平台简称（v1.11 · 2026-10-23）**
+
+- 需求原话：「所有的音乐列表都需要增加一个展示该歌曲对应的平台的简称，放在歌名右边吧，样式和详情页歌曲名旁边的平台展示类似吧」。
+- 为什么抽公共组件：改造前源标散在十几处，配色各写一份（正在播放页一套、搜索页一套、队列一套……），改一次颜色要动十几处，且必然有地方被漏掉。现在全站只有 `src/components/common/SourceTag.tsx` 一个实现，样式口径也只有一个地方可改。
+- 两档尺寸：正在播放页 `sm`（`text-[11px]` / `px-1.5`，与改造前完全一致）；列表行 `xs`（`text-[10px]` / `px-1`）—— 曲目行行高只有 20px，11px 的徽标会把行撑高、行距变得忽宽忽窄。
+- 展示**简称**而不是全名：`sourceRegistry` 的 `short`（如「网易云」「QQ」，由数据包下发）；旧数据包没有 `short` 时回落 `name`，再没有回落「未知」。全名（「网易云音乐」）在列表里会把歌名挤掉一截。未注册的源 `useSourceColor` 返回中性灰，徽标照常显示。
+- 本地曲目没有「平台」概念：`SourceTag` 内部判 `LOCAL_PLATFORM` 直接返回 `null`，所以调用处不必逐个判 platform（`TrackList` 被 9 个页面复用，其中本地库、下载页、本地歌单都是本地曲目）。
+- `LOCAL_PLATFORM` 从 `@/services/ipc` 抽到 `@/lib/platform.ts`（`ipc.ts` 改为再导出，旧 import 不受影响）：展示组件为判一个字符串常量把整个 IPC 层拖进依赖图不划算 —— 组件单测会因此被迫给整个 `@/services/ipc` 铺 mock，反而更容易与真实实现漂移。
+- 覆盖面（12 处）：`discovery/TrackList`（9 个页面共用）、`SearchPage` 的 `TrackRow`（原来用行尾 `badge`，现统一成歌名右侧徽标）、`player/QueuePanel`、`ai-assistant/MessageBubble`、`mine/StatsPage`（前四名卡片 + 第 5 名开外列表）、`discovery/ChartSpotlight`（前三首）、`discovery/TrackCard`（首页 / 新歌速递卡片）、`player/SourceSwitchPanel` 与 `lyric/LyricSearchButton`（**原本在歌名左侧放全名 chip，现改为右侧简称**）、`mine/ListenReportDetail` 与 `mine/ListenTrendSection`（听歌记录里的歌曲行，`entry.track` 存在才渲染 —— 歌手 / 音源分组行不加）。
+- 不覆盖：下载页与本地库页（本地文件无平台）、歌单类列表（歌单不是歌曲）、播放条 / 标题栏 / 分享卡（不是列表）。
+
+**L. 去重合并：能公用的实现不再各写一份（v1.12 · 2026-10-23）**
+
+- 需求原话：「这就是代码质量，把一些能公用的方法和代码全部合并一下，不要都各写各的，不方便维护」。触发点是 K 节把源标抽成 `SourceTag` 之后用户认可这个方向，要求全库同办。
+- 原则一：**只合并语义相同的**。合并的前提是「同名函数在原处行为逐字一致」，否则就是拿改行为换行数。审计后落地的四个叶子模块：`lib/text.ts`（三处曾各有一份 `normText`：`music-style` / `daily-recommend` / `recommend-rank`；`trackKey`/`songNameKey`/`todayKey`/`hashString`/`jitter`/`truncateChars`/`safeDecode` 同理）、`lib/coerce.ts`（`ai.ts` / `feedback.ts` / `messages-data.ts` / `qt-NoticeDialog` / `store/disclaimer` 五处各有一套 `as*` 或 `coerce*`）、`lib/format.ts`（设置页与下载页各一份 `formatBytes`）、`lib/pending-cache.ts`（`artist-id` 与 `artist-pic` 两份同构的「在飞去重 + 已落定 + 逐出」缓存）。
+- `lib/coerce.ts` 里刻意保留**两族**：`as*` 严格族（只认本类型，`asNumber("42")` → `0`，给「结构不符就当缺失」的解析用）与 `coerce*` 宽松族（`coerceNumber("42")` → `42`，给「后端字段经常是字符串/0-1」的读取用）。两族语义不同，合并成一族会让某一侧的行为悄悄变掉 —— 头注释写明了这条边界。
+- 原则二：**跨仓镜像的代码不动**。`lib/song-key.ts` 的 `normText`/`songKey` 与 `qt-sources/src/actions/merge-search.ts` 的对应实现口径一致（v1.17 起 app 侧不再有 `mergeAggregateTracks`，只剩这个去重键）（栈式剥**嵌套**括号、额外剥 `《》〈〉「」『』【】`、歌手拆集合后排序），属「搜索合并」语义，不能改吃 `text.ts` 的 flat 版；两仓文件头互相标注了「唯一真源在包侧、改规则必须两边一起改」，单测各锁同一批用例。
+- 原则三：**同名的「不是同一件事」不合并**，并在汇报里说明为什么：`lrc.ts` 的 `formatTime`（`mm:ss`）与 `messages-data.ts` 的 `formatTime`（日期时间）；`discovery/CoverCard` 与 `mine/StatsPage` 的两个 `SectionTitle`（`text-xl` 区块标题 vs `text-sm` + 右侧「全部」）；`mine` 与 `player` 的两个 `CollectButton`（列表行触发 vs 圆形按钮自持收藏态）；`QueuePanel` 的 `trackKey`（`JSON.stringify([platform,id,startMs,endMs])`，区分片段，与 `lib/text` 的同名函数不同义）。
+- 顺带修掉的**真 bug**：`recommend-rank.ts` 原来为了「避免循环依赖」自带一份 `durationBand`（180/270/420），`music-style.ts` 的是 150/240/330 —— 同一首 240 秒的歌在画像里落 `long`、在打分里落 `normal`，`W_MAIN_BAND` 的主带对比一直错位。下沉到叶子模块后 `recommend-rank` 直接用 `music-style` 那一份（画像与打分必须同一个带边界），并把它自己那份删掉；`tests/recommend-rank.test.ts` 的夹具时长从 240 改成 200（两套边界下都是 `normal`，用例本意不变）。
+- 组件层再合并一处：`mine/ListenReportDetail.tsx` 与 `mine/ListenTrendSection.tsx` 各写了一份 `EntryPicture`（三档分组 → 封面 / 歌手头像 / 音源 logo），现在只在 `components/mine/ListenReportBits.tsx` 有一份，`size` 取 32 / 40 两档（趋势区块行更紧凑用 32，详情页列表用 40）；两页各自删掉不再用的 `Music4` / `SourceLogo` / `ArtistAvatar` / `qtresCoverUrl` import。
+- 测试替身也去重：`source-scripts-search-many` / `-source-filter` / `-search-merged` 三个文件原来各抄一遍约 25 行的 `vi.mock("@/source-engine/client")` 工厂，现在 mock 行为只有 `tests/helpers/engine-client.ts` 一份（`createEngineMock` 状态 + `engineClientModule(state)` + `resetEngineState`），错误注入统一成 `errors.set("searchAll:陈奕迅", …)` 这种「入口名或入口:关键词」的键，比原来两个文件各用一套数组/Map 更好读。
+- 验收口径：`npx tsc --noEmit` 干净、全量 `npx vitest run` 88 files / 868 tests 全绿、`npm run build` ✓、改动文件 eslint 无告警；新增 `tests/shared-utils.test.ts`（15 条）把四个叶子模块的语义钉死 —— 消费方太多，改一处会牵动画像、听歌报告、AI 回复解析、头像缓存。
+
+**M. 搜索改成独立的整页（v1.13 · 2026-10-23）**
+
+- 需求原话：「我想要右上角的搜索变成一个完整的单独的页面，包括历史搜索，热门搜索等等」。
+- 改造前的问题：标题栏里是一个真正的 `<input>`（输入关键词回车才跳 `/search`），而 `/search` 只有带 `?q=` 时才有内容 —— 用户点开「搜索」既看不到历史也看不到热搜，等于每次都在盲打一个词；同时搜索页自己也有一份输入框与联想逻辑，两处实现注定漂移。
+- 标题栏（`src/components/TitleBar.tsx`）：`<input>` 换成**按钮**（胶囊样式与原来一致，左侧放大镜 + 提示语「搜索歌曲 / 歌手 / 专辑 / 歌单」），点击 `navigate({ to: "/search", search: { q: "", type: "song" } })` 落到搜索首页。标题栏不再持有任何输入状态（`useState` / `useSearch` / `parseSearchType` 三个依赖一并删掉）。
+- 搜索首页（`src/components/SearchPage.tsx`，`?q=` 为空时）：`SearchLanding` **两块** ——
+  1. **搜索历史**：settings 表 `search.history`（`lib/search-history.ts`，≤ 20 条，去重置顶）渲染成可点的胶囊，右侧一个「清空搜索历史」按钮，单个胶囊带 `×` 删除；
+  2. **热门搜索**：当前音源 `hotWords`（数据包入口 `hotWords`），两列带序号，前三名用主色；标题旁标「按当前音源」；本地音源没有热搜，整块不出现。
+  - **不放「热门歌单」**：第一版曾加过一块 `playlistCategories` → `recommendations` 的歌单网格，用户当轮就指出「热门搜索，不是热门歌单」——歌单推荐在「歌单广场」已经有整页，塞进搜索首页只会把真正要的入口挤下去。
+- 输入框：进入落地页时 `inputRef.current?.focus()`（只在 `!searched` 时抢焦点；带 `?q=` 进来是看结果的，不该把光标抢走），并补了「清空输入」的 `×`。
+- 页签栏（歌曲 / 歌单 / 歌手 / 专辑 + 聚合搜索开关）改为**只在搜过之后**渲染：落地页没有结果可切，摆一排灰按钮只会让人以为「搜索已经开始但没结果」。
+- 歌曲页签的**播放全部**：页签栏右侧（聚合开关右边）一颗按钮，`playQueue(songs, 0)` —— 整批入队并从第一首起播（与列表播放入口同一语义，DESIGN §11.2）。「全部」只能是**已加载**的那批（搜索是滚到底续页的），所以按钮 `title` 写明「把已加载的 N 首加入队列」。没有结果时不渲染这颗按钮。
+- **页签只有一个真源：URL**（`?type=`）。`SearchPage.tsx:133` `const tab = parseSearchType(urlParams.type)` 每帧派生，点页签只 `navigate(..., { replace: true })`，`resetKey` 带上 tab，`usePagedList` 在渲染期发现 `cursor.key !== resetKey` 就归第 1 页、清列表、nonce+1，并用 `cancelled` 丢弃旧页签的迟到应答。0b72104（2026-10-12）之前是 `useState<Tab>("song")` + `setTab`，URL 与 state 两个真源、谁最后写谁赢，这才是「页签切换偶发不生效」的历史成因（返回 / 前进后退 / 深链入口都会按默认 song 初始化）。2026-10-24 复查确认当前树已不存在该路径，并补了 `tests/search-tab-switch.test.tsx` 7 条把它钉住（含迟到应答竞态、翻到第 2 页再切页签必须回第 1 页）。
+- 测试：`tests/search-landing.test.tsx` 5 条（历史与热搜都在且无页签栏、**不出现「热门歌单」**、输入框自动聚焦、点历史词发起搜索并写历史、输入 + 「搜索」按钮发起搜索、带 `?q=` 时落地内容全部收起）、`tests/search-play-all.test.tsx` 3 条（点播放全部 = `playQueue(songs, 0)`、无结果时没有这颗按钮、歌单/歌手/专辑页签没有它）与 `tests/titlebar-search.test.tsx` 2 条（点按钮跳 `/search`、标题栏里不再有文本框）。
+
+**N. 本地模型精选 & 规则推荐：为什么看起来一样，以及怎么改的（v1.14 · 2026-10-23）**
+
+- 用户反馈原话：「目前没有感觉到用AI推荐和规则推荐有什么不同」。查 `settings` 表里当天的 `dailyRecommend.cache`：`requested=local` 但 `mode=rule`、`notice=本地模型调用失败（模型返回的 JSON 无法解析），已退回规则推荐。`，50 条 `reason` 全是同一句「你收藏里的歌」——那天页面上的「AI 推荐」根本不是 AI 挑的。
+- 但就算模型回执正常，结果也会几乎一样。**根因在 `rankCandidates` 的 `target` 缺省值**：`generateDailyRecommend` 调用它时没传 `target`，缺省即 `DAILY_TARGET`（50），于是 `rulePicked` 最多 50 首；后面 `const aiPool = pickAiPool(rulePicked, variant)` 再怎么扩 `DAILY_AI_POOL_MAX` 也是空转 —— 池子就是规则结果本身，让模型从 50 首里挑 50 首，歌单必然逐首相同，只剩顺序和理由文案不同。
+- 修法（`src/lib/daily-recommend.ts`）：本地模型模式把排序目标放大到 `Math.max(DAILY_TARGET, DAILY_AI_POOL_MAX)`（**150**），规则结果仍然只取前 50（降级与补齐都用它）：
+  ```ts
+  const rankTarget = mode === "local" && !coldStart ? Math.max(DAILY_TARGET, DAILY_AI_POOL_MAX) : DAILY_TARGET;
+  const rulePicked = rankCandidates(pool, pref, { ..., target: rankTarget });
+  const ruleItems = rulePicked.slice(0, DAILY_TARGET).map(...);
+  ```
+  候选再多也不整池丢给模型：`pickAiPool` 固定保留前 `DAILY_AI_CORE`（90）首，剩下 60 个名额从尾巴按 `variant` 轮转取样 —— 「换一批」时模型看到的是**不同的候选**，不是同一批歌换顺序。`DAILY_RULE_VERSION` 6→7，旧缓存（那批退回规则的结果）作废重算。
+- 回执容错三级（`parsePicks`）：① 原样 `JSON.parse`；② 失败先 `repairJsonText` 再试（裸控制字符逐个换空格、尾逗号去掉，**逐字符实现**而不是正则字符类，避免 `no-control-regex`）；③ 再失败 `salvagePicks` 用正则捞 `"index": N`（及其后紧跟的 `reason`）或 `"picks":[3,17,42]` 纯数字数组，`title`/`summary` 用 `salvageField` 捞。另外 `extractJsonArray` 支持模型直接回一个裸数组。全都捞不到才算失败。
+- 失败重试一次（`askModelForPicks`，`AI_PICK_ATTEMPTS=2`）：第一次失败后追加一条「上一次的输出不是合法 JSON（可能有裸换行、多余逗号或多说了话）…」并以 0.5 温度重试；两次都不行才退回规则并写 `notice`。**网络错误不在 JS 侧重试**（`ai_local.rs` 内部已有 3 次退避重试）。
+- ~~提示词加两句防「照抄」：「清单的序号顺序是规则粗排的结果，不代表推荐优先级：请按主题与风格重新组织」「不要直接照抄前 50 首，也不要只挑常听歌手的歌」。~~ **这两句在 v1.15 已删除** —— 实测它们让模型为了「不一样」去凑风格拼盘，把无关的英文歌 / 冷门网络流行塞进歌单，正是用户说的「像随机选」。现行口径见 §0.3-O。
+- 页面：`DailyRecommendResult.model` 记录本次用的模型名，页头小字渲染成 `2026-10-23 · 本地模型精选 · deepseek-v4.1-flash · 心动` —— 换模型后能直接对比，也不会再出现「写着 AI、其实是规则」却看不出来的情况（退回规则时 `model` 为空）。
+- 真实模型实测（`_tmp/probe150.mjs`，库里的真实 key/模型、150 首候选 + 新提示词，跑了 3 轮）：3/3 `HTTP 200`、`finish=stop`、JSON 解析成功，耗时 7.4–9.5 s；`picks` 分别 **50 / 51 / 51** 条，其中**落在规则前 50 名之外的有 22 / 23 / 37 条**（即与规则模式歌单的重合度从 100% 降到 26%–74%，索引范围最远用到 115/141）。顺带发现模型偶尔多给一两首（要 50 给 51），结果组装时按 `DAILY_TARGET` 截住。
+- 测试：`tests/daily-recommend.test.ts` 65 条（新增 `parsePicks 容错` 7 条 + `pickAiPool` 3 条）、`tests/daily-recommend-generate.test.ts` 32 条（新增「候选池给到 150 首」「第一次回执格式坏了会重试一次」「两次都拿不到序号才退回规则」「模型多给了一两首时按目标条数截住」）。验收：`npx tsc --noEmit` 干净、全量 88 files / 868 tests 全绿、`npm run build` ✓、改动文件 eslint 无告警。
+
+**O. AI 推荐「像随机选」：从求多样改成求贴合（v1.15 · 2026-10-24）**
+
+- **现象与证据**：用户 2026-10-23 22:32 起连续三次追问「AI 推荐怎么那么像随机选」。直接查 `%APPDATA%\QuietMusic\data\music.db` 的 `settings.dailyRecommend.cache`：当天 `mode=local`、`model=deepseek-v4.1-flash`、`title=心动古风·华语慢听`、`profileText=华语 · 三四分钟 · 常听 314 位歌手 · 常听古风`；前 46 首确实是古风 / 华语抒情，**第 47–50 首是 `5:20AM - 刀酱`、`Everywhere We Go - 陈冠希/MC仁/厨房仔/应采儿`、`One Last Time - Ariana Grande`、`Control - Zoe Wees`** —— 与画像完全无关的英文歌。摘要里那句「按古风、深情、轻快与混搭风格铺排」正是模型对「分散风格」的理解。
+- **根因（四个，全在 app 侧）**：
+  1. **提示词在要求「多样」而不是「贴合」**：`buildPrompt` 写了「清单的序号顺序是规则粗排的结果，不代表推荐优先级：请按主题与风格重新组织」「不要直接照抄前 50 首」「尽量分散在不同歌手和不同风格」。小模型对「分散」的理解就是「凑风格种类」—— 它会把池子尾部的弱匹配歌挑上来，只为让语种 / 风格不重样。
+  2. **候选行没有证据**：旧行只有 `歌名 - 歌手（专辑 / 语种）`。模型看不到「这首你收藏过」「这个歌手你常听」「这首你单曲循环过 12 次」，只能按歌名猜贴合度 —— 猜错与随机无异。
+  3. **温度过高**：`aiLocalChat(payload, 0.8)`，同一份候选池两次能给出差异很大的歌单；重试还是 0.5。推荐不是写诗，0.8 的「创造力」在这里就是噪声。
+  4. **打散破坏模型排序**：`spreadItemsBySinger` 是贪心重排（每步取「第一个不同歌手」），模型按贴合度排好的顺序会被整段打乱；用户看到的第 2、3 首经常是池子里 20 名开外的歌。
+- **修法**（`src/lib/daily-recommend.ts`）：
+  1. **证据层** `evidenceSnapshot()` / `trackEvidence()` / `evidenceText()`：从 `favoriteTracks` / `playlistTracks` / `topTracks` 的播放次数 / `topSingers` / 画像（`singers`、`albums`、`mainLang`）算出每首候选的证据，行尾最多 3 条：`已收藏` → `听过N次` → `常听歌手`（没有则 `收藏歌手`）→ `常听专辑` → `非主语种`。括号里固定带时长带（旧提示词让模型「按时长判断」，却从没给过时长数据）。
+  2. **语种下限**：画像主语种定得下来时写「他平时主要听华语：50 首里请至少有 40 首是华语」。「别挑奇怪的歌」小模型听不懂，「至少 40 首」它听得懂。探索口味换成「可以换歌手换风格，但别整张歌单都跳到别的语种去」。
+  3. **规则改写**：用 ①②③④ 开头（`1. ` 会和候选行的「序号. 歌名」冲突，模型和测试的行解析都会数错）。心 / 熟口味五条：越靠前越贴合 → 不要为「看起来不一样」塞无关歌 → 整张歌单一个主题 → 同歌手 ≤3、勿重复 → 理由必须落到画像。system 加一句「你的目标是让这份歌单听起来像同一个人按同一套口味挑出来的，而不是随机抽样」。
+  4. **温度**：`AI_PICK_TEMPERATURE = 0.4`、`AI_PICK_RETRY_TEMPERATURE = 0.2`。
+  5. **结果侧依据校验** `filterAiPicks(items, pref, taste)`：非 `explore`、且画像已成形（`sampleSize > 0` 或 `mainLang !== "und"`）时，剔掉「本地零证据且非主语种」的歌（`hasProfileGrounding` = 已收藏 / 听过 / 常听歌手 / 收藏歌手 / 常听专辑 / 主语种；时长带单列不算依据）；被剔掉的歌记进 `used` 不再补回，补齐循环遍历 `rulePicked`（150 首）直到 50 首 —— 页面不会少行。画像没成形时不硬筛（新用户不砍半），`explore` 直接放行。
+  6. **打散改最小相邻交换**：只处理「相邻同歌手」，向后找第一首不同歌手的歌交换一次；没有冲突时原样返回，第一首永远不动。
+  7. **中段穿插封顶**（`DAILY_AI_OFF_CORE_MAX = 12`）：只删凑风格的指令会让模型变成「照抄规则前 50 首」，那又回到 R27 修掉的「AI 推荐和规则推荐一模一样」。折中写进提示词第 ⑤ 条：从第 51–90 首里挑 6–10 首换进来（规则前 90 首都算贴合，只是播放次数低），播放顺序按「开场 → 沉浸 → 收束」自己排。实测小模型会超额（要 6–10 给 30），所以 app 侧 `limitAiPicks()` 硬封顶：`index > DAILY_TARGET` 的最多留 12 首，且每首都要过 `hasProfileGrounding`。
+  8. **缓存作废**：`DAILY_RULE_VERSION` 7→8，当天旧结果自动重算。
+- **真实模型验证**（150 首合成池：前 60 古风 + 70 华语流行 + 尾部 20 首英文，画像「华语古风」；用库里 `ai.*` 配置直连 `deepseek-v4.1-flash`，温度 0.4，跑两轮，闸门与补齐逻辑与 `generateDailyRecommend` 一致）：两轮**最终 50 首全部是华语、英文歌 0 首**；模型回执 51 / 38 首，过闸后 40 / 38 首，规则补 10 / 12 首；中段穿插 12 / 8 首（正好卡在上限内）；与规则前 50 首重合 38 / 42 首 —— 既没有随机歌，也不是纯规则复读。改前的对照是同一天真实缓存里第 47–50 首的英文歌。
+- **测试**：`tests/daily-recommend.test.ts` 78 条（新增「候选行带本地行为证据」「主语种定得下来时给可对账的语种下限，无关歌标非主语种」「顺序本来就没有相邻撞歌手时原样保留」「只有相邻撞歌手时才动一两首」+ `filterAiPicks` 4 条 + `limitAiPicks` 4 条）、`tests/daily-recommend-generate.test.ts` 34 条（新增「提示词改成贴合优先」「模型硬挑一首与画像无关的歌 → 剔掉并补满 50 首」；重试温度断言 0.5→0.2 并新增首次 0.4）。另新增 `tests/search-tab-switch.test.tsx` 7 条（搜索页页签切换回归：URL 唯一真源、迟到应答丢弃、翻页后切页签回第 1 页）。验收：`npx tsc --noEmit` 干净、全量 **89 files / 890 tests** 全绿。
+- **待用户确认**：三重收口后最终观感要用户重新生成一次看真实结果（旧缓存已因版本号 +1 失效自动重算）；中段 12 首上限如果仍显多/显少，调 `DAILY_AI_OFF_CORE_MAX` 一个常量即可。
+
+**P. 风格更多变、维度更多：先扩候选池，再按风格线配额（v1.16 · 2026-10-24）**
+
+- **现象与证据**：v1.15 收口后，用户 2026-10-24 08:03 反馈「风格能够在多变一点吧，而不是只有那么一个两个，推荐的维度可以在多一点。因为你的数据来源是历史和搜索出来的，AI 主要是在你的结果里面选歌，那么你的搜索维度和结果就非常重要」。查当天缓存（v7）：50 首 = 16 古风 + 14 华语抒情 + 11 冷门网络流行 + 5 kg 古风 + 4 英文歌 —— **两条主线吃掉 30 首**，其余是同一批种子歌手的边角料。提示词在 v1.15 已经改成「贴合优先」，所以这次的问题不在提示词，而在**候选池的取数维度**。
+- **根因（全在取数侧）**：
+  1. `buildCandidatePool` 的 6 条路（收藏/歌单、按歌手、跨源按歌手名、最新、按专辑、风格分类歌单）全部从「画像里已有的东西」长出来 —— 同一个画像永远长回同一片歌；`pickStyleCategories` 又只取 `STYLE_CATEGORY_MAX`=2 个分类 × `STYLE_PLAYLIST_MAX`=2 张歌单，等于只给两条线。
+  2. 规则排序只按「和画像的贴合度 + 同歌手/语种 MMR」，没有「风格线」概念：池子里就算有粤语、纯音乐，只要分数略低就排不进前 50。
+  3. 结果闸门（`filterAiPicks`）只认「主语种 / 已有证据」，画像里占比 8% 的次要语种会被当成「非主语种」硬剔 —— 维度路刚带回来的歌反而进不了终选。
+  4. AI 只做「在给定清单里挑」：池子里没有的风格，提示词再怎么写也变不出来。用户那句「AI 主要是在你的结果里面选歌，那么你的搜索维度和结果就非常重要」已经把根因说透了。
+- **修法**：
+  1. **维度规划与采集**（新模块 `src/lib/recommend-dimensions.ts`）：`planDimensionQueries()` 按 画像风格标签 → 歌单名 → 画像里的次要语种（占比 ≥ `LANG_AFFINITY_MIN`=5%）→ 相邻风格词（古风→国风/戏腔/民乐…）→ 按 `variant` 轮换的兜底词（3 个；explore 4 个）→ 用户搜索历史（≤3 条）生成 ≤10 条查询。`collectDimensionLanes()` 三路采集：**榜单**（`getCharts` 取 ≤5 张，榜单名天然带风格/年代语义，每榜 ≤60 首）、**关键词跨源搜索**（`searchManyBatches`，每词 ≤24 首）、**风格歌单**（`searchPlaylists` + `getPlaylistDetail`，2 个 tag/genre 词 × 20 首）；全部 try/catch 兜底，单路失败不影响其它路。每条曲目都带「风格线」label（`laneOf: Map<trackKey, string[]>`）—— 这是配额、提示词、结果展示共用的 provenance。
+  2. **池子合并**：`buildCandidatePoolWithLanes()` 并行跑原 6 路与维度层（`local` 源直接跳过，不为一个必失败的调用白等超时；维度层异常退化为空），按 `trackKey` 去重，返回 `{ tracks, laneOf, affinityLanes }`；`buildCandidatePool` 保留为它的 `Track[]` 包装。
+  3. **规则排序按线配额**：`diversifyByLanes(ranked, laneOf, target)` 在 `rankCandidates()` 之后做「七成保贴合、三成给风格线」—— 先收下排名前 `target - round(target × 30%)` 首作底盘，再按线的首个出现顺序给最多 `LANE_DIVERSITY_MAX`=5 条线各补到 `floor(30% × target / 线数)` 首（底盘里已有的计数在内），最后按原序补满；没有风格线时退化为 `ranked.slice(0, target)`。之后 `interleaveByLanes()` 按线交织排展示顺序（权重 4/2/2/1）；未标线的曲目补成 `"常规"` 线（不能留成 `__` 前缀，否则会被当兜底线沉到末尾）。
+  4. **提示词 v9**：候选行括号最前面加 `风格线：古风`；画像段加「画像里的语种分布：华语 82%、日语 8%」；新增风格线规则「这张歌单要覆盖 3–5 条不同的「风格线」（候选里一共 N 条：古风（62 首）…）：「古风」占一半左右，再挑 2–4 条相邻的线各 4–10 首，线内连贯线间有别」；候选线 ≤3 条时按实际条数说（避免指向不存在的线）；explore 要求其中至少 2 条平时不常听、每条线 ≥3 首；title / summary 要写出多风格结构（例「古风打底，掺几首粤语和纯音乐」）。规则仍用 ①②③ 编号，不与候选行的「序号. 歌名」冲突。
+  5. **闸门放宽 + 结果可解释**：`TrackEvidence` 增 `langAffinity`（该语种在画像里占比 ≥ `LANG_AFFINITY_MIN`），只有「画像里完全没出现过的语种」才标「非主语种」；`hasProfileGrounding()` 认 `langAffinity || laneGrounded`，`filterAiPicks` / `limitAiPicks` 都接受 `{ laneOf, affinityLanes }`（旧 3/4 参调用不变）。结果新增 `styleLanes`（`laneCoverage()` 现算、最多 5 条、按条数降序），页面在「口味画像」下方渲染「本期风格」chips。`DAILY_RULE_VERSION` 8→9，当天旧缓存自动重算。
+- **真实模型验证**（200 首合成池：古风 70 / 华语流行 60 / 粤语 25 / 纯音乐 25 / 日语 20，前 75 首为主风格头部；画像古风 + 华语流行；真实 `deepseek-v4.1-flash`，温度 0.4；闸门、补齐、交织逻辑与 `generateDailyRecommend` 一致，两轮）：
+  - 模型正常回执那轮：回 50 首 → 其中 22 首在规则前 50 之外 → `limitAiPicks` 收到 40 首（中段 12 首封顶规则内）→ `filterAiPicks` 全留 40 首 → 规则补 10 → **最终 50 首覆盖 4 条线（古风 25 / 华语流行 13 / 粤语 8 / 纯音乐 1）**，`title = 古风打底，掺几首粤语与纯音乐`，与规则前 50 重合 22 首（模型真在选，不是复读）。
+  - 模型回空那轮：走规则兜底，最终 50 首仍覆盖 4 条线（古风 18 / 粤语 10 / 华语流行 8 / 纯音乐 5）—— **即使模型不出结果，配额与交织也让风格线出现在结果里**。
+  - 对照：改前同一天真实缓存只有 2 条主线（古风 16 + 华语抒情 14）。两次重跑里各有一轮模型 `content` 为空（0 字符，不是 JSON 解析问题），app 侧有一次纠正重试 + 规则兜底，不影响出结果。
+- **测试**：新增 `tests/recommend-dimensions.test.ts` 25 条（维度规划 / 三路采集 / 交织 / 覆盖统计）、`tests/daily-recommend-page.test.tsx` 4 条（chips 渲染与空态）；`tests/daily-recommend.test.ts` 84 条（新增 v9 提示词风格线 + 语种分布、`filterAiPicks` 线依据放宽、`diversifyByLanes` 4 条）、`tests/daily-recommend-generate.test.ts` 36 条（新增「维度路：榜单把新风格带进候选池」2 条）。验收：`npx tsc --noEmit` 干净、全量 **91 files / 927 tests** 全绿。
+- **待用户确认**：真机「换一批」看是否真的多出几条线；线数上限（`LANE_GOAL_MAX` / `LANE_DIVERSITY_MAX` = 5）与配额（`LANE_QUOTA_SHARE` = 0.3）都是常量，嫌多嫌少调这两个。
+
+**Q. 多源聚合接口一律下沉音源包（v1.17 · 2026-10-24）**
+
+- **需求原话**：「这次有没有新增的聚合接口，后面所有使用多个音源的聚合接口必须放到音源包里面」。要求是**接口住哪**，不是改哪个功能：凡「一次要打多个音源、再把结果合成一份」的能力，都只能在数据包里实现，宿主一次 invoke 拿成品。
+- **审计结论**：本次 v1.16（风格更多变）没有新增聚合接口 —— `src/lib/recommend-dimensions.ts` 只调用包侧 `searchManyBatches`（数据包 `searchMany`）与单源的 `getCharts` / `getChartDetail` / `searchPlaylists` / `getPlaylistDetail`（都只打当前音源），前端没有逐源 fan-out。但历史上有**三处宿主侧聚合**没下沉干净：
+  1. `getAllLatestSongs`：绕过包 `allLatest`，用 `getSourceRegistry()` 逐源调 `latest` 再在宿主交错合并（最新音乐页 + 每日推荐 `latest` 路每次都跑）。根因是包 `allLatest` 把多源结果展平成 `MusicInfo[]`，**条目不带 `platform`**，而取链、封面、跳转都靠 platform 归属 —— 裸 `MusicInfo` 一道混合就没法归谁了。
+  2. `searchManyBatches`：包缺 `searchMany`（< `META_REVISION` 6）时退回宿主 `fanOutSearch`（worker 池 + 逐词逐源扇出）。
+  3. `searchMergedPage`：包缺 `searchMerged`（< 7）时退回宿主 `localMerge()`（`searchAllBatches` + `mergeAggregateTracks`）。
+- **为什么必须住包内**：并发度、超时预算、单源失败隔离、去重与排序口径都属于「怎么打多个源」，各端（PC / 安卓 / 以后别的端）共用一份才不会漂移；放在宿主还意味着每次「最新 / 聚合搜索」都要前端先拉注册表、再自己算交错与超时，等于把音源层的编排知识复制到 UI 层。**降级路径本身也是重复实现**：`fanOutSearch` / `localMerge` 与包内实现语义必须永远对齐，改一边忘一边就是静默漂移 —— 用户看到的是「有时重复、有时少歌」。
+- **修法**：
+  1. **包侧**（`qt-sources`，`META_REVISION` 7→8）：`allLatest` 每条曲目盖 `platform`；交错展平抽成纯函数 `interleaveLatestBatches(batches, limit)`（逐轮取各源第 i 首、`out.length >= limit` 立即返回、不改写入参），`allLatest` 入口只负责 `allLatestBatches` + 展平。入口名与返回结构（`{ list }`）不变，**旧宿主不读新字段则行为不变**。
+  2. **宿主**：`getAllLatestSongs(limit, offset)` 改为一次 `sourceCall("allLatest")` 的薄包装 —— 校验 `list` 形状、逐条读 `platform`（`undefined` / `"local"` 跳过，按 `toAppTrack` 映射），到 `limit` 截断；缺入口抛「数据包版本过旧」；旧包（REV 7，入口在但没 platform）抛「数据包版本过旧：缺少带 platform 的 allLatest」—— 让用户去更新数据包，而不是静默扇出。`buildCandidatePool` 的 `latest` 路本来就有 `.catch(() => [])`，拿不到最新流不会让每日推荐整单失败。
+  3. **删除旧包降级**：`searchManyBatches` / `searchMergedPage` 缺入口时统一抛 `packOutdated(...)`（消息含「数据包版本过旧…请到「设置 → 音源包」更新数据包后重试」），删 `searchManySupported` / `searchMergedSupported` / `fanOutSearch` / `mergeSearchGroups` / `localMerge`；`AggregateSearchResult` 去掉无人消费的 `merged`，`MergedSearchOptions` 去掉 `dropJunk`。
+  4. **删除 app 侧合并实现**：`src/lib/aggregate-merge.ts`（`mergeAggregateTracks` / `isJunkTrack` / `normText` / `songKey`）整体删除；搜索页跨页去重仍需要 `songKey`，迁到新叶子模块 `src/lib/song-key.ts`（口径必须与包侧 `src/actions/merge-search.ts` 一致，头注释写明）；`tests/aggregate-merge.test.ts` 删除，`tests/song-key.test.ts` 继承 13 条键口径用例。
+- **测试**：qt-sources 新增 `tests/aggregate-latest.test.ts` 6 条（交错顺序、platform 归属、limit 封顶、空批次不占位、不改写入参、空输入）；qt-pc `tests/source-scripts-search-many.test.ts` 5 条、`tests/source-scripts-search-merged.test.ts` 6 条、`tests/source-scripts-source-filter.test.ts` 5 条全部改为「应答映射 + 缺入口报版本过旧」，不再断言降级；`tests/song-key.test.ts` 13 条。验收：qt-pc 全量 **91 files / 886 tests** 全绿、`tsc --noEmit` 0 错、eslint 改动文件 0 错；qt-sources `tsc --noEmit` 0 错、`aggregate-latest` 6/6 过（该包另有 3 条真网络外链用例失败，属既有环境问题，与本次改动无关）。
+- **数据包重装**：`sources.config.json` meta 包 `versionCode 2026102201 → 2026102401` / `versionName 2026.10.22.1 → 2026.10.24.1`，`node scripts/build-sources.mjs` 重打（ed25519 签名在包内，245 KB），覆盖到 `%APPDATA%\QuietMusic\source-bundle\install\meta-official\meta-bundle.js` 并同步 `state.json` 的版本号（加载路径不验签，安装流程才验）；**已装好的旧包不更新则 `getAllLatestSongs` 会提示升级**。
+- **待用户确认**：重启 App 后看「最新音乐」与每日推荐是否正常（包内交错口径与旧宿主实现一致，顺序应无变化）；如果暂时不想更新数据包，可以装回旧 `meta-bundle.js.prev` 再改 `state.json` 回 2026102201，但「最新 / 聚合搜索」会按「版本过旧」提示 —— 这是有意为之，不再静默降级。
+
+**R. 详情页 hero：左封面 / 右内容，内容不得高于封面（v1.18 · 2026-10-24）**
+
+- **需求原话**：「把每日推荐和歌单详情模板类似的，左边图片，右边内容，高度不要超过图片，内容全部往右边搭，否则很丑」。
+- **问题**：两页 hero 其实早就是「左封面右内容」，但右侧行数太多（每日推荐：元信息 / 标题 / 共 N 首 / 摘要 3 行 / 口味画像 / 本期风格 / 口味按钮 / 操作按钮 ≈ 229px），把页头撑得比 144px 封面高 —— 封面只有上半截，下面挂着纯色空白，所以「丑」；歌单详情简介 clamp-3 时内容 161px 也会把 144px 封面比下去。
+- **修法（两页共用一套）**：
+  1. 封面 `h-36 w-36` → `h-44 w-44`（176px），**封面高度就是 hero 高度**；
+  2. 每日推荐：元信息与「共 N 首」并成一行（`truncate` 收住长模型名）、摘要 `line-clamp-2`、口味画像与「本期风格」chips 并排一行（画像 `truncate` + `title` 放全文、chips `whitespace-nowrap`）、口味按钮组与播放 / 换一批 / 设置同一行；
+  3. 歌单详情：简介 `line-clamp-2`；
+  4. 两页内容列保持 `flex-col justify-end`（底对齐封面底边），不新增行、不往下溢出。
+- **结果与验证**：每日推荐右侧约 170px、歌单详情约 164px，均 ≤ 176px —— hero 高度由封面决定，图片旁边不再有空白条；`tsc --noEmit` 0 错、eslint 改动文件 0 错、全量 **91 files / 886 tests** 全绿；`tests/daily-recommend-page.test.tsx` 4 条仍过（「口味画像 → 本期风格 → 推荐口味」的 DOM 顺序未变）。
+- **未动**：歌手页 / 专辑页保持 144px 那套（右侧本来就只有 4 行，不超）；每日推荐页无 BackButton 行，与带返回键的详情页保持各自排版。
+
+**S. AI 模式全局化：三种模式同时作用于「每日推荐」与「音乐助手」（v1.19 · 2026-10-24）**
+
+- **需求原话**：「这个需要完全支持音乐助手，每日推荐。选择哪个全局都得使用这个模式」（附设置页「推荐方式」那一行的截图，三个按钮：纯规则 / 本地模型精选 / 服务端 AI）。
+- **问题**：设置里的「推荐方式」只有每日推荐在读（键 `dailyRecommend.mode`），而且「服务端 AI」在每日推荐里被 `effectiveMode()` 直接降级成规则，只弹一句「当前页面不支持服务端 AI 精选」；音乐助手（`/ai-assistant`）固定走 astral 服务端会话，从不读这个设置 —— 「三选一」在一半页面上是假的。
+- **修法**：
+  1. 新增 `src/lib/ai-mode.ts` 作为模式的唯一来源（`AiEngineMode = "rule" | "local" | "server"`、标签、各模式一句话说明、`AI_MODE_OPTIONS`、`parseAiMode` / `readAiMode` / `saveAiMode`），键沿用 `dailyRecommend.mode` 不迁移；`daily-recommend.ts` 只做别名 re-export（`DailyRecommendMode` / `DAILY_MODE_LABEL` / `parseDailyRecommendMode` / `readMode` / `saveMode` / `effectiveMode`），`effectiveMode` 改为恒等。
+  2. 每日推荐的服务端模式真调用：新增 `src/lib/ai-server-picks.ts` 的 `askServerForPicks()` —— 校验登录 → 取 `MUSIC` 智能体 → 建一次性会话 → 把 `buildPrompt()` 的 system/user 拼成一条消息发出（system 加 `【系统设定】` 前缀，上下文带前 150 首候选）→ 每 600ms 轮询事件到终态（总超时 90s）→ 正文走 `parsePicks`，正文不是 JSON 时用 `song_list` 块里的曲目按 `trackKey` 对回候选池序号；`finally` 删除会话。失败一律抛错，由 `generateDailyRecommend` 退回规则并在 notice 里说明原因（「服务端 AI 调用失败（…），已退回规则推荐。」），不静默兜底；失败落盘的结果按 `requested` 命中缓存，不会每次进页面都重搜。
+  3. 音乐助手补本地两种模式：新增 `src/lib/ai-assistant-local.ts` 的 `runAssistantTurn()` —— rule 用风格词表 + 歌名/歌手点名 + 画像相似度打分（同歌手最多 2 首、取前 8 首），local 用「只输出 `{"reply", "picks"}`」的 JSON 契约调 `aiLocalChat`（温度 0.6），解析失败或模型异常整体回退 rule，永不抛错；`src/hooks/useAiChat.ts` 增加 `mode` / `modeHint`，非 server 模式在 `init()` 里不拉智能体与会话列表，`send()` 前重读一遍模式（设置页刚改也能生效），本地回合把结果拼成 `song_list` 块（页面上的播放 / 加入队列按钮沿用既有渲染，不需要分支）。
+  4. 页面与文案：音乐助手页非 server 模式隐藏会话侧栏、折叠按钮与 agentCode 徽标，消息区上方显示模式横幅（含「设置 → AI 可切换」）；设置页「推荐方式」改「AI 模式」，每个模式下方一行说明，服务端未登录时提示「当前未登录服务端，实际会退回规则。」；每日推荐页链接文案改「AI 模式设置」。
+- **结果与验证**：三种模式在「每日推荐」与「音乐助手」两侧都生效；服务端模式在每日推荐里走真会话（运行时失败才退回规则），本地模式两侧共用同一套候选准备与解析思路。`npx tsc --noEmit` 0 错、eslint 改动 13 个文件无 error/warning、全量 **96 files / 937 tests** 全绿（新增 `tests/ai-mode.test.ts` 7、`tests/ai-server-picks.test.ts` 9、`tests/use-ai-chat-modes.test.tsx` 5、`tests/ai-assistant-local.test.ts` 18、`tests/ai-assistant-modes.test.tsx` 11 条）。
+- **注意**：`AiChatMessage` / `song_list` 块形状沿用服务端口径（`data.items` 是 `AiMusicCandidate[]`），本地回合只是自己造了一个同样的块，所以 `MessageBubble` 与播放动作不需要分支；模式切换对已生成的结果不追溯（每日推荐点「换一批」、助手下一条消息即生效）。
+
+**T. 音乐助手本地模式补齐：左侧历史对话 + 20 首上限（v1.20 · 2026-10-24）**
+
+- **需求原话**：「规则模式怎么左边不显示历史对话，然后每次只有8首，我要20首也是8首」（附「纯规则」模式截图：页头写着「按关键词规则选歌、不联网、不调模型」，左侧空白、结果块「为你找到的歌 8 首」）。
+- **问题**：三处硬缺口叠加 ——
+  1. `useAiChat.init()` 在 `mode !== "server"` 时直接 return，不拉会话列表；`AiAssistantPage` 又按 `serverMode` 把侧栏、折叠按钮一起隐藏，所以规则/本地模式左边永远空着，也没有「本地历史」可显示。
+  2. `src/lib/ai-assistant-local.ts` 的 `MAX_SONGS = 8` 写死（`pickRuleSongs` / `mapPicks` / prompt 三处），用户说「20 首」也只会给 8 首。
+  3. `MAX_PER_SINGER = 2` 对任何歌手都生效，用户点「周杰伦」时最多只出 2 首，剩下的名额被冲淡。
+- **修法**：
+  1. 新增 `src/lib/ai-assistant-history.ts`：本地会话存储（键 `quietmusic.ai-assistant.local-history.v1`，最多 30 个会话 × 40 条消息，超出丢最旧），`createLocalConversation` / `appendLocalMessages` / `listLocalConversations` / `loadLocalMessages` / `removeLocalConversation`；会话按 `lastMessageTime` 倒序（时间并列按 `id` 倒序兜底 —— 初版比较器在并列时两边都返回 -1，排序不稳定导致侧栏顺序错乱，已修）；消息还原成 `AiChatMessage`（`id` 用本地会话 id，`status: "COMPLETED"`，`blocks` 原样保留 `song_list`）。
+  2. `useAiChat`：非 server 模式 `init` 读本地历史填侧栏；`selectConversation` 同步读本地消息；`removeConversation` 只删 localStorage；`sendLocal` 成功后把用户这句与助手回复一起写回历史（首条自动建会话），并刷新会话列表。
+  3. 侧栏对三种模式都渲染（标题「历史对话」、空态「还没有对话」、折叠按钮文案改「收起历史对话 / 展开历史对话」），只有 server 模式保留智能体编号徽标。
+  4. 引擎：`MAX_SONGS = 20` + `DEFAULT_SONG_COUNT = MAX_SONGS`；新增 `requestedSongCount(text)` 解析「20 首 / 二十首 / 5 首」（clamp 1..20，没点数量就按 20）；新增 `namedSingers(candidates, named)` 找出用户点名的歌手并对其放松同歌手配额；`count` 一路传到 `pickRuleSongs` / `buildLocalMessages`（prompt 里「最多 N 个」）/ `parseLocalReply` / `mapPicks` / `runLocalTurn`；答复文案随实际首数变化。
+- **结果与验证**：规则/本地模式左侧有可切换、可删除、持久化的历史对话；默认 20 首、说「5 首」给 5 首、点名歌手可以给更多。`npx tsc --noEmit` 0 错、eslint 改动文件干净、全量 **97 files / 957 tests** 全绿（新增 `tests/ai-assistant-history.test.ts` 11 条、`tests/use-ai-chat-modes.test.tsx` 5→8 条、`tests/ai-assistant-local.test.ts` 17→23 条）。
+- **注意**：本地历史与服务端会话是两套存储，切换模式时侧栏内容随之切换（不迁移、不混用）；引擎与服务端解析仍共用 `song_list` 块形状。
+
+---
+**U. AI 接口配置改成「供应商列表 → 详情」主从 UI（v1.21 · 2026-10-24）**
+
+**需求（用户 2026-10-24）**
+
+> 把本地模型精选下面 AI 配置的内容换成类似于截图这样的 UI，外面只展示一个列表，点进去进行配置 api 和密钥、模型等等内容。
+
+设置页原来的「接口配置」是一排平铺表单：一套下拉切换当前生效接口、一个明文 API Key 输入框、一个模型字符串。配置两套 API（比如主用 OpenAI 兼容、备用 Anthropic）、给同一个接口存第二把 Key、或者试几个模型时，要么改代码要么互相覆盖；用户希望像主流客户端那样「外面是供应商列表，点进去是详情」。
+
+**弹窗（2026-10-24 追加）**
+
+> 能改为弹窗模式吗，不是这种一个页面展开的。
+
+设置页 `AiSection` 里只留一行「接口配置」入口：说明文字 + 右侧「管理供应商…」按钮；点开才挂载弹窗 `AiProvidersDialog`（`createPortal` 到 `document.body`，`role="dialog"` / `aria-modal` / `aria-labelledby`，`max-w-3xl`、`max-h-[calc(100dvh-2rem)]`，标题「AI 供应商」+ 副标题说明「第一把密钥、第一个模型生效」，点遮罩 / 按 Esc / 点右上角关闭）。弹窗内容就是本节的列表态与详情态，状态与保存逻辑都在 `AiProvidersPanel` 里，关掉弹窗不会丢已保存的配置。
+
+**列表态**
+
+- 每行：拖拽点（视觉保留）/ 图标方块 / 名称（空则地址主机名）/ 缩写地址 / 协议 / `N 个模型` / 掩码 Key / 生效开关 / 箭头。
+- 顶部「查找供应商」按名称与地址过滤；右上「添加供应商」直接进空白详情。
+- 生效开关直接调 `ai_local_save_config` 换 `activeId`，不要求先进详情。
+- 至少保留一个供应商；删最后一个会提示而不是强行删空。
+
+**详情态**
+
+- 基础：名称（占位 `例如 官方 / 中转 / 本机`）、ID（自动生成，只读展示）、Base URL（占位 `https://api.openai.com/v1`）。
+- 协议四选一 + 「检测协议」按钮：按 `baseUrl` 试 `/models` 判断是哪种（结果只提示，不阻止保存）。
+- 账号 · 密钥（第一把生效）：每把一把掩码行，可删、可「设为使用中」（置顶）；输入框新增 Key，保存时走 `addKeys`；「清空」= 把所有已存 Key 标 `removeKeyIndexes` 且 `apiKey: ""`。
+- 图标：8 个内置图标 + 上传图片（data URL）；「清除图标」回退首字母方块。
+- 跳过证书校验：内网自签网关用，透传 `skipCertVerify`。
+- 模型：`获取列表` 拉 `/models`，chips 多选；「全选 / 全不选 / 仅所选」切视图；第一项是默认模型，文案提示「第一个「X」是默认模型」。
+- 底部：移除（新建时禁用）/ 复制（同配置改名）/ 取消 / 保存。
+
+**保存语义**
+
+- 前端把当前列表整体映射成 `AiProfileInput[]`（`id` 为空的项 = 新建，由 Rust 生成 id），连同期望的 `activeId` 一起 `ai_local_save_config`。
+- 详情态只改一个供应商时，其它供应商原样回传（不丢 Key：`keys` 不传即保留）。
+- Key 的三条增量字段：`addKeys` 追加、`removeKeyIndexes` 按已存下标删除、`activeKeyIndex` 置顶；同时出现「删除」与「置顶」时以前者为准（下标会漂，置顶不生效）。
+- 新增供应商保存后如果没被设成生效，会再补一次 `save_config` 把它设为 `activeId`（用户刚配完就是想用它）。
+
+**Rust 侧（`src-tauri/src/ai_local.rs`，885 → ~1630 行）**
+
+- `AiProfile` 增：`protocol`（openai / openai-responses / anthropic / gemini，缺省 openai）、`keys: Vec<String>`（第一把生效，`apiKey` 与 `keys[0]` 双向同步）、`models: Vec<String>`（`model = models[0]`）、`icon`、`skipCertVerify`。
+- 协议分派：OpenAI `/chat/completions`（Bearer）、OpenAI Responses `/responses`（`input` / `max_output_tokens` 形状不同）、Anthropic `/v1/messages`（`x-api-key` + `anthropic-version`，`system` 独立字段、`max_tokens` 必填）、Gemini `generateContent`（`x-goog-api-key`、`systemInstruction`、`contents`/`parts`）。
+- 端点识别：用户可能填 `https://api.openai.com` 或带 `/v1` 或带完整 `/chat/completions`，统一归一后拼协议路径；`/models` 也做同样归一。
+- 查看接口永远不回 Key 明文，只回 `keyMasks` / `keyMask`（`≤4` 字符的 Key 整串打码）。
+- `ai_local_test` / `ai_local_list_models` 增加 `protocol` / `skipCertVerify` 可选参数。
+
+**验证**
+
+- `cargo check --all-targets`：0 error 0 warning；`ai_local.rs` 5 条单测过（含 Key 掩码、增量保存、协议别名归一）。
+- `tests/settings-ai-providers.test.tsx` 10 条：列表展示 / 搜索 / 行内切生效 / 改名保存形状 / `addKeys` / `removeKeyIndexes` / `activeKeyIndex` / 获取模型点选 / Base URL 为空拦截 / 新增后追加并生效。
+- 全量 `npx vitest run`：98 files / 968 tests 全过；`tsc --noEmit` 0 错；eslint 干净。
+
+**注意**
+
+- 「检测协议」只是探测 `/models` 是否可达并猜协议，不保证该 baseUrl 一定支持所选协议的对话接口；真正的握手失败在「测试连接」或下一次对话时才暴露。
+- 明文 Key 只在用户当场输入时存在于内存与本机 settings（`ai.profiles`），界面与 `ai_local_config` 都只给掩码。
+- 老配置（只有 `baseUrl` + `model` + `apiKey`）自动按 openai 协议、单 Key、单模型读出来，不需要迁移步骤。
+
+---
+
+
+
+**V. 所有歌曲列表页加「排序」（v1.22 · 2026-10-24）**
+
+- **需求（用户原话）**：「所有歌曲列表的页面，需要和qt-uniappx一样，增加一个排序的功能，如歌单详情啊等等」。
+- **对标**：qt-uniappx 的歌单/榜单/专辑详情页用一个动作面板给 7 个合并选项 —— 默认顺序 / 按歌曲名·正序·倒序 / 按专辑名·正序·倒序 / 按歌手名·正序·倒序；排序只作用于「搜索过滤后的可见列表」，播放全部与批量管理共用同一顺序。
+- **实现**：`src/lib/track-sort.ts`（选项表 + `parseTrackSort` + `sortTracks`）与 `src/components/TrackSortSelect.tsx`（一个 `<select>`，`aria-label="排序方式"`）。排序是**纯展示顺序**：不改 `items` 本身，不写缓存；默认「默认顺序」即接口给的顺序（歌单/推荐各有自己的语义，排序只覆盖用户主动选择）。
+- **接入页面**：`PlaylistDetailPage`（歌单/榜单/专辑详情）、`AlbumPage`、`ArtistPage`、`DailyRecommendPage`、`HistoryPage`、`LocalMixPage`；每页统一替换「播放全部 / `BatchBar` / `TrackList`」三处，排序发生在 `visibleSongs` / `visibleTracks` / `songs` / `tracks` 之上。
+- **不接的页面与原因**：`SearchPage`（分页结果，翻页顺序由接口决定）、`DailyPage`（分页流）、`AudioProgramPage`（无限下拉）、`DownloadsPage`（`TaskRow` 任务列表、不是曲目列表）、`QueuePanel`（队列顺序本身就代表播放顺序）；`LibraryPage` 已有排序 UI，保持不动。
+- **验证**：`tests/track-sort.test.ts` 6 条（选项与默认值、解析、默认顺序浅拷贝、歌名正倒序、专辑正倒序互逆、歌手同名内按歌名收敛）；全量 **99 files / 974 tests** 全绿；`tsc --noEmit` 0 错；eslint 干净。
+
+**W. 排序改成两个弹窗 + 每日新歌接入；音乐助手全量开放、服务端 AI 仅管理员（v1.23 · 2026-10-24）**
+
+- **需求（用户原话）**：「音乐助手不再需要管理员权限了，但是服务端 AI 需要管理员权限才展示和允许使用（看后端是否满足控制条件，可以由后端建议，前端隐藏）。每日新歌也要支持排序。排序格式换一下，换成两个弹窗，上面显示按歌曲名、按专辑名、按歌手名，下面显示正序、倒序。默认顺序都不勾选。」本节修订 §V 的控件形态与接入页面，并记录助手侧权限口径。
+- **排序控件**：`src/components/TrackSortSelect.tsx` 保留 `{ value, onChange, label? = "排序方式", className? }` 契约，内部改成上下两个 `Popover`（来自 `src/components/common/Popover.tsx`，外层 `role="group"`，弹层 `role="listbox"`、选项 `role="option"` + `aria-selected` + `Check`）：
+  - 上「排序字段」按钮（`aria-label="排序字段"`）：按歌曲名 / 按专辑名 / 按歌手名；
+  - 下「排序方向」按钮（`aria-label="排序方向"`）：正序 / 倒序，未选字段时 `disabled`（提示「先在上面选排序字段」）；
+  - 默认 `value === "none"`：两个按钮显示占位「排序」/「方向」，方向按钮置灰 —— **默认都不勾选**；再点一次已选字段 = 取消排序回 `none`；选方向复用当前字段拼成 `album-desc` 之类。
+  - 数据源：`src/lib/track-sort.ts` 新增 `TRACK_SORT_FIELDS`（`{key: "name"|"album"|"singer", label}` 三项）、`TRACK_SORT_DIRECTIONS`（`{value: "asc"|"desc", label, desc}`）、`trackSortValue(key, desc = false): string`（`none` → `"none"`，否则 `${key}-${desc ? "desc" : "asc"}`）；`TRACK_SORT_OPTIONS` / `parseTrackSort` / `sortTracks` 编码不变，6 个既有页面（歌单/专辑/歌手/每日推荐/最近播放/我的混合）零改动。
+- **每日新歌**：`src/components/discovery/DailyPage.tsx` 加 `const [sortValue, setSortValue] = useState(DEFAULT_TRACK_SORT)`、`parseTrackSort(sortValue)` 与 `sortedSongs = useMemo(() => sortTracks(songs, sortKey, sortDesc), [songs, sortKey, sortDesc])`；hero 右端从单行 `BatchBar` 改为 `flex shrink-0 flex-col items-end justify-end gap-2 pb-1`，上放 `<TrackSortSelect>`、下放 `<BatchBar embedded tracks={sortedSongs} …/>`（封面仍 `h-36`，高度不出封面）；「播放全部」改成 `playQueue(sortedSongs, 0)`，`TrackList` 的 `tracks` 也换成 `sortedSongs` —— 播放顺序、批量管理范围、列表显示三者一致。`DailyPage` 是分页流（`usePagedList` scroll），排序只作用于已加载的 `songs`，不改分页请求。至此唯一不接排序的页面只剩搜索 / 音频节目 / 下载任务 / 播放队列。
+- **助手入口全量开放**：`src/components/layout/Sidebar.tsx` 删掉 `canUseMusicAssistant(profile)` 门禁与 profile 订阅，「助手 → 音乐助手」对全部用户（含未登录）始终渲染；`src/stores/auth.ts` 移除 `MUSIC_ASSISTANT_PERM` / `canUseMusicAssistant`，只留 `hasPermission` / `isAdmin`。与移动端 `isQtAdmin` 同口径：**只有「服务端 AI」是管理员专属**。
+- **服务端 AI 仅管理员（三层）**：① 展示层 —— `src/lib/ai-mode.ts` 新增 `resolveAiMode(mode, canUseServer)`（`server` + 非管理员 → `rule`）与 `aiModeOptionsFor(canUseServer)`（非管理员过滤 `server` 项）；设置页 `AiSection` 的 `Segmented` 用 `aiModeOptionsFor(isAdmin(profile))`，库里有 `server` 但非管理员时显示 `rule` 并提示「服务端 AI 仅管理员可用，当前按纯规则运行。」，`pickMode` 再收一次口；同时修掉 `AiSection` 从不回读 `readAiMode()` / `readTaste()` 导致「永远显示纯规则」的旧 bug（读回前显示「载入中…」，带 unmount 守卫）。② 逻辑层 —— `src/hooks/useAiChat.ts` 的 `init()` / `send()` 读到模式后 `resolveAiMode(…, isAdmin(profile))`：非管理员不拉 `astralAiAgents`、不建服务端会话、`send` 走本地回合，`mode` / `modeHint` 显示 `rule`；`profile` 异步恢复后 init 依赖变化自动重跑。③ 执行层 —— `src/lib/ai-server-picks.ts` 的 `askServerForPicks()` 入口先判 `isAdmin(useAuthStore.getState().profile)`，非管理员直接 throw「服务端 AI 仅管理员可用」，不建会话不发消息；`src/lib/daily-recommend.ts` 的 `readMode()` 返回收敛后的**有效模式**、`generateDailyRecommend` 对显式 `options.mode` 再 `resolveAiMode` 一次，`requested` 也记收敛后的 `rule`（否则非管理员每天对不上当日缓存、反复重算），规则分支 notice 写「服务端 AI 仅管理员可用，已按纯规则推荐。」。
+- **后端结论**：astral 没有「服务端 AI」专用权限码（`AiPlugin` 只有 `user:ai:music:use` 等；`AiAccessService.requireForClient` 按智能体声明的权限码 + 客户端默认权限校验，超管 `*:*:*` 天然通过），且 `V20261001005__app_user_role_and_permissions.sql` 已给普通 App 用户 `APP_USER` 授予全部 `user:%` 权限 —— 即**普通用户本来就能用音乐助手**，后端无需改动；前端用 `profile.permissions` 里的 `admin:qt:admin` 判管理员，后端仍按智能体权限码独立校验，**前端隐藏不是安全边界**。
+- **测试**：`tests/track-sort.test.ts` 6→10 条（弹窗数据源顺序、`trackSortValue` 正反向与 `none`、默认不勾选）；新增 `tests/track-sort-select.test.tsx` 6 条（初值两个占位 + 方向禁用、选字段出 `album-asc`、选方向出 `album-desc`、再点字段回 `none`、受控回填、`listbox` 无障碍）；新增 `tests/daily-page-sort.test.tsx` 3 条（默认保持原顺序、排序后播放全部与批量条一致、排序不改分页参数）；AI 侧 `tests/sidebar-assistant-entry.test.tsx` 重写为「未登录 / 普通用户 / 管理员都展示」、`tests/auth.store.test.ts` 删旧 `canUseMusicAssistant` 用例、`tests/ai-mode.test.ts` 补 `resolveAiMode` / `aiModeOptionsFor`、`tests/use-ai-chat-modes.test.tsx` 补「非管理员存过 server 仍走本地」、`tests/daily-recommend-generate.test.ts` 补「非管理员 server → rule + notice」、`tests/ai-server-picks.test.ts` 补「非管理员 rejects」。
+- **验证**：全量 **101 files / 990 tests** 全绿；`pnpm typecheck`（`tsc --noEmit`）0 错；`pnpm lint`（`eslint .`）干净；未改 Rust 与 astral，桌面端实机交互（弹层位置、hero 高度）建议用户跑一次 `pnpm tauri dev` 目视确认。
+
 ---
 
 ## 1. 设计目标
@@ -115,6 +437,7 @@
 | Rust 重 | 音频、文件、系统集成、数据层由 Rust 处理 |
 | 单向数据流 | Rust 推送状态，前端订阅渲染 |
 | 音源抽象 | 所有音乐来源统一走音源脚本引擎的契约接口（`src/source-scripts/qt-contract/contract.ts`），第三方实现以音源包形式按需安装（仓库不内置） |
+| 跨音源聚合下沉音源包 | v1.16 定死：凡要同时打多个音源的接口（聚合搜索 / 多关键词搜索 / 合并去重排序 / 最新歌曲 / 榜单 / 热词）**一律在音源包内实现**，宿主一次 invoke 取结果，不允许在前端逐源 fan-out 再本地合并（并发、预算、逐源失败隔离、去重口径都属音源层，各端共用一份）。宿主只做展示、缓存与分页触发。老包缺入口时应提示升级数据包，不得在前端补一套 |
 | 主题 token 化 | 所有视觉参数通过 CSS Variables 控制 |
 | 数据分层 | 永久数据、缓存数据、内存数据明确分离 |
 | 可降级 | 高级视觉效果可关闭，核心播放优先保障 |
@@ -543,8 +866,9 @@ Windows 平台注意事项（原文未覆盖，均为实测坑点）：
 | 路由 | 页面 | 说明 |
 |---|---|---|
 | `/` | 首页 | Hero（当前音源 + 每日新歌/歌单广场/热门榜单/本地音乐快捷入口）、榜单精选（列数按内容区实测宽度自适应，2~5 列 × 2 排；卡片与 `/charts` 共用）、新歌速递、推荐歌单（后两者同为一行横向滚动卡片，条数一致）、**为你整理**（本机收听记录生成的固定五类合辑，详见 §5.2「为你整理」） |
-| `/daily` | 每日推荐 | 对齐移动端 `pages/daily`（原文缺失） |
-| `/search?q=&type=&scope=` | 搜索页 | 歌曲 / 歌单 / 歌手 / 专辑 分页签，`scope=current\|all` |
+| `/daily` | 每日新歌 | 当前音源的**最新歌曲流**（`get_latest_songs`，滚到底自动续页，`LATEST_PAGE_SIZE` = 50）。与「每日推荐」是两个功能，入口相邻但分开：这里跟"你"没关系，谁发新歌就有什么 |
+| `/daily-recommend` | 每日推荐 | 按**本机播放历史 + 收藏**挑的跨源推荐（`@/lib/daily-recommend`），跨天变化、屏蔽生效、可本地模型精选，详见 §5.2「每日推荐」。**与 `/daily` 不是一回事**：原文把这行写成「对齐移动端 `pages/daily`」，实际移动端 `pages/daily` 就是最新歌曲流，对应的是本表的 `/daily` 行 |
+| `| `/search?q=&type=&scope=` | 搜索页 | **`q` 为空时的落地页 = 搜索首页**：搜索历史 + 热门搜索（不放热门歌单），输入框自动聚焦，页签栏不渲染（见 §0.3-M）；有 `q` 时才是结果视图：歌曲 / 歌单 / 歌手 / 专辑 分页签，`scope=current\|all`。`all`（聚合）**只查**「设置 → 音源包 → 聚合搜索音源」里勾选的源（未勾选的不发请求，见 §0.3-I），结果由数据包 `searchMerged` 合并去重成**一条**按相关性排序的列表、**不按源分组**（行尾只有源标），分页收尾用包回的 `full`（见 §0.3-J）；歌曲页签右端有「播放全部」（已加载的整批 `playQueue` 起播）；`current` 不受该设置影响 |
 | `/playlists` | 歌单广场 | 分类 + 分页推荐歌单 |
 | `/playlist/:platform/:id` | 歌单详情 | **必须带 platform**，否则跨音源同 ID 会撞车（原文缺失） |
 | `/charts` | 排行榜列表 | 跟随当前音源（不做全源聚合）；**与首页「榜单精选」共用同一套卡片版式** —— `ChartSpotlightCard`（左封面 + 右前三首）配 `useSpotlightColumns` 按内容区实测宽度取 2~5 列，区别只是这里铺当前音源的全部榜单、不限排数。曲目**按可视区懒加载**（`IntersectionObserver`，前留 240px）：chartDetail 契约没有 limit、一次就是整榜（包内最多 200 条），二十几张卡照首页那样全量并发会在进页瞬间甩出二十几个整榜请求。详情缓存 `@/lib/chart-detail` 与首页共用，从首页「全部榜单」进来不必重拉 |
@@ -563,7 +887,7 @@ Windows 平台注意事项（原文未覆盖，均为实测坑点）：
 | `/feedback` | 意见反馈 | 提交、我的、公开反馈 |
 | `/profile` | 个人中心 | 资料、签到、退出登录 |
 | `/login` | 登录 / 注册 | 含邮箱验证码、忘记密码（`changePass`） |
-| `/settings/:section` | 设置 | `general \| appearance \| desktop-lyric \| playback \| player-bar \| sound \| download \| dislike \| source-package \| shortcut \| about`（标签顺序即 `SECTION_TITLES` 的键顺序，`general` 在最前） |
+| `/settings/:section` | 设置 | `general \| appearance \| desktop-lyric \| playback \| player-bar \| sound \| download \| network \| ai \| dislike \| source-package \| shortcut \| about`（标签顺序即 `SECTION_TITLES` 的键顺序，`general` 在最前）。`ai` 分节只管「模型接口怎么连」（`ai.profiles` 多档地址 + `ai.activeProfile`），不绑定某个功能：眼下给「每日推荐」用，后续接别的 AI 能力不再加分区；`network` 对应 §3.21.6 的代理与超时 |
 | `/onboarding` | 首次启动引导 | 对齐 REQUIREMENTS §5.1，原文缺失 |
 | `/lyrics` | 桌面歌词 | **仅供歌词窗口加载**，不在主窗口导航中出现 |
 
@@ -593,13 +917,155 @@ Windows 平台注意事项（原文未覆盖，均为实测坑点）：
 - 每类最多取 `MAX_TRACKS` = 20 首；卡片封面取前 3 张非空图。
 - 移动端同规则的实现是 `qt-uniappx/services/local-mixes.ts`（`MIN_SONGS` / `finish()` / `shouldShowLocalMixes`），两端门槛与条件必须保持一致。移动端五类**全部**只读听歌统计存档，而它的「清除听歌统计」会把整份存档清空，所以移动端天然同源、不会出现本节记的 PC 那个不一致。差异一处：移动端「收藏里的常客」还要求收藏带 `pids` 且该歌单仍在现存本地歌单里，避免已删除的歌单把收藏「复活」。
 
+### 每日推荐
+
+实现 `src/lib/daily-recommend.ts`（流程与缓存，纯逻辑可单测）+ `src/lib/music-style.ts`（风格画像）+ `src/lib/recommend-rank.ts`（打分与多样性）+ `src/components/discovery/DailyRecommendPage.tsx`（渲染）。**它和「每日新歌」（`/daily`）不是一回事**：那个是音源的最新歌曲流，跟用户没关系；这个是从**本机播放历史 + 收藏**里推，跨源、跨天变化、屏蔽生效。
+
+**排序口径是「风格」而不是「歌手」**（v1.6 起）：音源契约没有 genre 字段（见 §0.3-F），风格由语种、时长带、专辑、歌单名、真实收听质量这些本地可算的信号推导成一份**口味画像**，再按画像给候选打多维分 —— 单曲的歌手只是其中一个维度，`explore` 口味下甚至是负分项。**没有播放记录也没有收藏时也不再是空页面**（v1.7 起）：页头让用户点 2–4 个平台风格分类当初始画像种子，不选也能看一批兜底内容 —— 见 §0.3-G 与下面「冷启动」小节。
+
+#### 三种推荐方式（`dailyRecommend.mode`）
+
+| 值 | 名称 | 做法 | 依赖 |
+| --- | --- | --- | --- |
+| `rule` | 规则推荐 | 本地算，无网络请求 | 无 |
+| `local` | 本地模型 | 规则先出候选池 → 交本地模型（`ai_local`）挑序号 → 结果按歌手打散 | 设置页「AI」分节配好的接口 |
+| `server` | 服务端 AI | 走 Astral 音乐助手 | 已登录 |
+
+`local` 是默认值。**三种方式都只有「规则 + AI 排序」两层，AI 永远只做挑选和排序，不负责生成歌曲** —— 歌名 / 歌手 / 封面全部来自音源真实返回值，模型只回一串候选序号（`{"picks":[1,5,3,…]}`）。这样模型胡说八道最多是"挑得不好"，不会推出一首不存在的歌。
+
+模型挑得不够（少于 `DAILY_AI_MIN_PICKS` = 3 首）或整段回执解析失败时，**不报错、退回规则推荐**，并在结果里带一条 `notice`（页面用全局 toast 弹出，不占页面布局），文案形如「本地模型调用失败（原因），已退回规则推荐。」。
+
+#### 三种口味（`dailyRecommend.taste`）
+
+| 值 | 名称 | 单歌手上限 | 候选池侧重 | 排序侧重 |
+| --- | --- | --- | --- | --- |
+| `heart` | 心头好 | 3 | 收藏（⓪）+ 同专辑兄弟（④）+ 风格歌单（⑤） | 收藏 / 同专辑 / 主语种重奖，常听歌手 +8，新歌手 +3 |
+| `familiar` | 老熟人 | 5 | 只加同专辑兄弟（④） | 常听歌手权重最高（+10），新歌手只 +1 |
+| `explore` | 换换口味 | 1 | 风格歌单（⑤，故意挑画像**不**匹配的分类）+ 最新流（③） | 常听歌手倒扣（−4），新歌手 +9，全新语种 +6 |
+
+**三种口味都会把同一歌手的歌摊开**，只是摊开的力度不同（单歌手上限 3 / 5 / 1）。没有"不摊开"的档位 —— 一屏 50 首里连着五首同一个人的歌，用户第一反应是"这功能坏了"。摊开由两层保证：MMR 选择时相似度就惩罚同歌手/同专辑，配额是硬上限，最后还有一遍相邻打散。
+
+#### 风格画像与打分引擎（v1.6）
+
+**为什么不直接读风格标签**：音源契约 `MusicInfo`（`src/source-scripts/qt-contract/contract.ts`）与本地 `Track`（`src/types/index.ts`）都**没有** genre / 年代 / 语种字段，音源包也不下发。所以画像全部从本地事实推导，只用五个信号源：
+
+| 信号 | 来源 | 作用 |
+| --- | --- | --- |
+| 语种 | 标题 / 歌手 / 专辑的字符集（假名 > 谚文 > 汉字 > 拉丁，都没有给 `und`） | 主语种 / 次要语种 / 全新语种 |
+| 时长带 | `duration`：`short` < 150s、`normal` 150–240s、`long` 240–330s、`epic` ≥ 330s | 判断口味节奏是否接近 |
+| 专辑 | `歌手键\|专辑名` | 同专辑直接重奖（专辑是最强的风格代理） |
+| 歌单名 | 用户自己建的歌单名 | 唯一的人工风格自述，抽风格词做画像标签 |
+| 收听质量 | `play_stats` 的 `play_count` / `total_played_ms` / `last_played_at` | 算完播比 / 复听率 / 新鲜度 → `affinity`；`skipped` 扣分 |
+
+画像 `StyleProfile`（`buildStyleProfile`）：`langs` / `bands` 是 Σ=1 的分布，`singers` / `albums` 是最大值归一化的相对权重，`mainLang` / `mainBand` 是主导项（主语种份额 < 0.34 时 `mainLang` 给 `und`，**不硬下结论**），`tags` 是歌单名抽出的风格词，`sampleSize` 是样本数。页面摘要下方有一行「口味画像：…」，让用户知道系统从哪几个维度判断 —— 推荐理由不透明时，用户只会觉得"又在瞎推"。
+
+行为质量里最关键的是**完播比**：`completion = totalPlayedMs / (playCount × 时长)`。旧实现只用播放次数排行，导致「点开听 20 秒就切」和「一遍遍听完」同分；现在 `affinity = 0.5×完播 + 0.3×复听 + 0.2×新鲜度`，播放 3 次以上但完播比 < 0.4 的标 `skipped` 额外 −8。**没有改 Rust**：`total_played_ms` 本来就在 `play_stats` 里，从 IPC 回来就能算，不必新增 `finished_count`。
+
+打分（`scoreCandidates`）按口味查权重表：
+
+| 特征 | heart | familiar | explore |
+| --- | --- | --- | --- |
+| 已收藏（本身在收藏 / 歌单里） | +9 | +5 | +2 |
+| 同专辑（画像里有权重的） | +10 × 权重 | +6 × 权重 | +3 × 权重 |
+| 主语种 | +7 | +6 | +4 |
+| 次要语种 | +2 | +2 | +2 |
+| 全新语种 | −5 | −4 | **+6** |
+| 主导时长带 | +2 | +2 | +1 |
+| 常听歌手 | +8 × 歌手权重 | +10 × 歌手权重 | **−4 × 歌手权重** |
+| 新歌手 | +3 | +1 | **+9** |
+| 没听过 | +4 | +2 | +6 |
+| 行为质量 | +4 × affinity | 同左 | 同左 |
+| `skipped` | −8 | −8 | −8 |
+| 近 7 天推过 | −20（降权，不排除） | 同左 | 同左 |
+| 抖动 | 至多 1.5（按日期 + 曲目键哈希） | 同左 | 同左 |
+
+「常听歌手」的权重来自两处合并：画像 `singers`（加权结果，样本太少的歌手会被丢掉）与歌手榜 + 最近播放（`familiarSingers`，覆盖全部历史但粒度粗）—— 后者**只算一半分量**（`FAMILIAR_SINGER_FALLBACK` = 0.5）。这样「只听了 3 次的老熟人」不会被当成新歌手，也不会因为榜单粒度粗就拿到满权重。
+
+多样性选择（`selectDiverse`）用 MMR：每步取 `score − λ × 与已选各项的最大相似度`，相似度 = 同歌手 0.4 / 同专辑 0.2 / 同语种 0.25 / 同时长带 0.15，λ 缺省 heart 0.6 / familiar 0.4 / explore 0.9。硬配额：同歌手 3 / 5 / 1，同语种 `max(2, ⌈target × 0.6⌉)`（`und` 不计、0 = 不限）。
+
+**配额放宽分两阶段，先语种后歌手**。池子全是华语时（华语库很常见），语种上限会先把结果卡住；旧写法这时连歌手配额一起放宽，"同一个歌手霸屏"就复现了 —— 实测 5 首周杰伦 + 4 首其他的池子、target 6，旧逻辑选出 4 首周杰伦（上限 3，且尾部两首相邻）。现在先把语种上限 ×2 逐级放到底，仍然不够才动歌手配额；`explore` 两级都不放宽，池子不够就少推，诚实于口味。
+
+打散（`spreadAdjacentSinger`）保留：只调顺序不增删，**第一首钉住** —— 它是 MMR 的最高分，也是用户打开页面第一眼看到的那首。
+
+**推荐理由按事实分级**（`reasonFor`，规则链路与模型链路共用同一个函数）：
+
+| 命中 | 文案 | 口径 |
+| --- | --- | --- |
+| 已收藏 | 你收藏里的歌 | 收藏是用户自己按的按钮，最硬 |
+| 同专辑 | 同专辑《…》 / 和你常听的专辑相近 | 专辑是风格代理 |
+| 常听歌手（有播放证据） | 你常听 X | 播放记录或歌手榜里有这个人 |
+| 只收藏过这个歌手 | 和你的收藏口味相近 | **收藏 ≠ 听过**，说成"常听"就是编故事 |
+| 新歌手 + 主语种 | 新歌手，和你的华语口味接近 | 语种名取 `MUSIC_LANG_LABEL` |
+| 主语种 | 符合你常听的华语 | |
+| 没听过 | 你没听过，换个口味试试 | 查得到"没听过"这个事实才这么说 |
+| 兜底 | 换一批看看 | 什么事实都没有，不编造 |
+
+#### 生成流程
+
+1. **读偏好**（`loadPreference()`）：七路并发 —— `getTopSingers(12)` / `getTopTracks(200)`（`play_stats` 排行，带 `playCount` / `totalPlayedMs` / `lastPlayedAt`）/ `listHistory(50)` / `listFavorites` / `listDislikes` / `loadPlaylistTracks()`（同时返回歌单名 —— 画像是靠它拿"用户自己说的风格"）/ `readStyleSeeds()`（用户手选的风格种子）。歌手串按 `[/、,，&＆;；]+` 拆开入种子，上限 `SEED_SINGER_MAX` = 8；最近播放取 `RECENT_SEED_MAX` = 12 首。随后 `trackQuality` 把收听统计折成完播 / 复听 / 新鲜度，`buildStyleProfile` 出画像 —— 它的 `playlistNames` 入参是「歌单名 + 风格种子」两串拼起来的，种子因此直接进 `tags`。
+2. **建候选池**（`buildCandidatePool()`）：按口味裁剪后并发，按 `trackKey` 去重 ——
+   - ⓪ 收藏（仅 `heart`）：收藏曲目 + 最近 6 个歌单里的曲目（每单取前 `PLAYLIST_TRACKS_MAX` = 80）；
+   - ① `getArtistSongs`：每个种子歌手在当前音源取 `SONGS_PER_SINGER` = 20 首；
+   - ② `searchManyBatches`（数据包 `searchMany` 入口，见 §0.3-H）：种子歌手跨源搜索，每歌手 `CROSS_SOURCE_PER_SINGER` = 20 首；按 `SEARCH_CONCURRENCY` = 3 个歌手一块调用 —— 并发、单源超时与逐词失败隔离由数据包做，块间串行，单块失败只影响这一块；装在旧数据包上时自动退回 app 侧扇出；
+   - ③ `getAllLatestSongs`（仅 `explore`；冷启动也走）：当前音源最新流前 120 首；
+   - ④ **同专辑兄弟**（`heart` / `familiar`）：从收藏 + 歌单 + 最近播放里收集最多 `ALBUM_SEED_MAX` = 4 张专辑，`searchAlbums` 按「歌手 专辑」找到那张 → `getAlbumDetail` → 每张取前 `ALBUM_TRACKS_MAX` = 30 首。专辑是最强的风格代理，同一张专辑的歌几乎必然同风格；
+   - ⑤ **风格歌单**（`heart` / `explore`；冷启动也走）：`getPlaylistCategories` 拿平台分类（华语 / 摇滚 / 民谣 …）→ `pickStyleCategories` 挑 `STYLE_CATEGORY_MAX` = 2 个（`heart` 挑与画像匹配的；**`explore` 挑不匹配的**，那才是真换口味）→ `getRecommendations` → `STYLE_PLAYLIST_MAX` = 2 张歌单 → `getPlaylistDetail` → 每单前 `STYLE_PLAYLIST_TRACKS_MAX` = 40 首。
+3. **过滤与降权**：`listDislikes` 里的直接排除（引擎的 `disliked` 布尔数组，硬排除）；近 `DAILY_HISTORY_DAYS` = 7 天推荐过的降权 20 分而**不是硬排除**（降权由引擎做，见权重表的「近 7 天推过」行）—— 每天 50 首 × 7 天 = 350 首，硬排除会把候选池掏空，最后变成"今天没歌可推"。
+4. **排序**（`rankCandidates()`）：`scoreCandidates` 按画像 + 口味打多维分 → `selectDiverse` 做 MMR 与两阶段配额放宽（详见上「风格画像与打分引擎」）→ 有 `variant` 时轮转队首歌手（同一天多次点"换一批"不会每次都是同一批开头）。凑不满 50 首时逐级放宽配额，`explore` 不放宽：池子不够就少推。
+5. **本地模型精选**（仅 `local`）：规则排序按 `target = max(DAILY_TARGET, DAILY_AI_POOL_MAX)` 排出 **150** 首，再由 `pickAiPool` 定池（前 `DAILY_AI_CORE` = 90 首必进，剩余 60 个名额从尾巴按 `variant` 轮转取样），`pickCount = min(DAILY_TARGET, 池大小)` = 50。提示词（v1.15 重写，见 §0.3-O）给模型的是**能对账的东西**，不是「发挥空间」：① 每首候选 `序号. 歌名 - 歌手（专辑 / 语种 / 时长带；已收藏·听过N次·常听歌手·常听专辑·非主语种）`，证据最多 3 条；② 口味画像一句话 + 风格标签 + 主时长带 + 常听歌手 + 最近在听；③ 主语种定得下来时给硬下限「50 首里请至少有 40 首是华语」（explore 换成「别整张歌单都跳到别的语种去」）；④ 规则 ①②③④⑤⑥ 开头：越靠前越贴合 → 不要为「看起来不一样」塞无关歌 → 整张歌单一个主题 → 同歌手 ≤3 / 勿重复 → 从第 51–90 首里换进 6–10 首（有证据的）、顺序按「开场 → 沉浸 → 收束」自己排 → 理由落到画像。**不再要求「别照抄前 N 首」「尽量分散风格」** —— 那两句是「像随机选」的源头；但也不许整份照抄（那就退化成纯规则），所以给中段穿插这道口子、由 app 侧 `limitAiPicks` 封顶 12 首。温度 `AI_PICK_TEMPERATURE` = **0.4**，重试 `AI_PICK_RETRY_TEMPERATURE` = **0.2**。模型回执经 `parsePicks` 三级容错（原样 → `repairJsonText` → `salvagePicks`/`extractJsonArray`）后仍做硬校验（序号必须是 `1..poolSize` 的整数、不能重复、越界/重复/布尔值直接丢），解析失败追加一条纠正消息重试一次；解析出的条目先过 `limitAiPicks`（中段最多 `DAILY_AI_OFF_CORE_MAX` = 12 首、每首需有画像依据）与 `filterAiPicks`（非 explore 且画像已成形时剔掉「本地零证据且非主语种」的歌，被剔的记进 `used` 不补回），再 `spreadItemsBySinger` 打散，模型只挑了几首就用 `rulePicked` 顺序补齐到 50，多给了则截断到 50；结果带 `model` 字段显示在页头。
+**v1.16 增补（候选池扩维 + 风格线配额，见 §0.3-P）**：喂给模型的池子不再只有「种子歌手 + 收藏/歌单 + 风格分类」这几条路。
+
+- **取数**：`buildCandidatePoolWithLanes()` 并行跑原 6 路与维度层 `collectDimensionLanes()`（榜单 / 关键词跨源搜索 / 风格歌单，关键词来源含用户搜索历史；`local` 源直接跳过维度层、异常吞掉退化为空），按 `trackKey` 去重，返回 `{ tracks, laneOf, affinityLanes }`；`laneOf` 是每首候选的「风格线」provenance（`trackKey → string[]`，第一条是主线）。
+- **排序**：规则排序（`rankCandidates`，`target = max(50,150)`）之后先 `diversifyByLanes(ranked, laneOf, target)` 按「七成贴合底盘 + 三成风格线」补位（最多 `LANE_DIVERSITY_MAX` = 5 条线、每条线份额 `LANE_QUOTA_SHARE` = 30%），再 `interleaveByLanes()` 按线交织排展示顺序（权重 4/2/2/1；未标线的歌补成 `CORE_LANE = "常规"`，避免被当成 `__` 兜底线沉底）；没有风格线时两个函数都退化为原顺序。
+- **提示词**：候选行括号最前面加 `风格线：古风`；画像段加「画像里的语种分布：华语 82%、日语 8%」；心 / 熟口味第 ② 条变成「这张歌单要覆盖 3–5 条不同的「风格线」（候选里一共 N 条：…）：「古风」占一半左右，再挑 2–4 条相邻的线各 4–10 首」（候选线 ≤3 条时按实际条数说，避免指向不存在的线）；explore 要求其中至少 2 条平时不常听、每条线 ≥3 首；title / summary 要求写出多风格结构。
+- **闸门放宽**：`LANG_AFFINITY_MIN` = 5% —— 画像里出现过的次要语种不再被标「非主语种」；`filterAiPicks(items, pref, taste, { laneOf, affinityLanes })` 与 `limitAiPicks(..., lanes)` 对「有风格线依据」的歌放行（`hasProfileGrounding` 认 `langAffinity` 与 `laneGrounded`）。
+- **展示**：结果带 `styleLanes`（`laneCoverage()` 现算，最多 5 条、按条数降序），页面在「口味画像」下方渲染「本期风格」chips（`古风 22` / `粤语 7`）。
+- **版本**：`DAILY_RULE_VERSION` 8→9，当天旧缓存自动重算。
+
+6. **同歌手打散**（`spreadItemsBySinger()`）：模型给的顺序可能把同歌手连在一起，但**只做最小相邻交换** —— 第一首原地不动（保住"今天第一首"的稳定感），遇到相邻同歌手才向后找第一首不同歌手的交换一次；原本没有相邻冲突时顺序原样保留（v1.15 之前的贪心重排会把模型按贴合度排好的顺序整段打乱，也是「随机感」来源之一）。只调顺序，不增删。
+7. **落缓存 + 回执**：结果写 `dailyRecommend.cache`，标题 / 摘要由本地模板生成，`profileText`（画像一句话）随结果带给页面。
+
+#### 冷启动：先让用户点风格（v1.7）
+
+画像需要样本，而新用户没有样本 —— 旧逻辑这时直接返回空结果，功能第一次打开就是死的（详见 §0.3-G 的来由）。现在：
+
+- **触发条件**（`generateDailyRecommend`）：`pref.topSingers.length === 0 && !hasSaved && (pref.styleSeeds?.length ?? 0) === 0` —— 三样都没有（听过、收藏、手选风格）才算冷启动；只要有任何一样，就按正常画像推荐。
+- **页头**（`DailyRecommendPage`）在摘要与列表之间渲染「你爱听什么风格？」区块：chip 来自音源平台分类（`getPlaylistCategories` → `pickStyleOptions`，去脏去重、最多 `STYLE_OPTION_MAX` = 12 个、**保持平台给的顺序** —— 平台把大分类排前面比我们猜的可靠）。多选上限 `DAILY_STYLE_SEED_MAX` = 4，选中态用 `aria-pressed` + 主色描边。
+- **点「按这些风格生成（N）」**：`saveStyleSeeds` → `clearTodayResult()` → `generate(true)`。**清缓存是必须的**：否则 `loadTodayResult` 会原样返回当天那份冷启动结果，用户点了半天没反应。
+- **不选**：下面的兜底内容照常可播，`notice` 为 `null` 不弹 toast；音源不提供分类时区块改成一句说明（见下面「空状态与降级文案」），不会空白。
+- **冷启动不走本地模型**：`if (mode !== "local" || coldStart)` 走规则分支 —— 没有画像时让模型挑"符合你口味的"，等于让它编。
+- 结果带上 `coldStart` / `styleOptions` / `styleSeeds` 三个字段（`DailyRecommendResult`），页面据此决定是否渲染 chip；`profileText` 在冷启动时为空，用户选了种子之后变成「你选的风格：摇滚 · 电子」（`describeProfile` 在 `sampleSize === 0` 但 `tags` 非空时不再说"口味还不明显"—— 亲手点的风格不能说他没口味）。
+
+#### 缓存与失效
+
+缓存结构 `DailyCacheStore { v, days: [{date, mode, keys}], today }`：
+
+- **命中条件**（`loadTodayResult(mode, taste)`）：`today.date === 今天` && `cache.v === DAILY_RULE_VERSION` && `items` 非空 && 有效 mode 一致 && taste 一致。任一不符就重算。
+- **当天多次"换一批"是合并而非覆盖**：`saveResult` 把新一批的 `keys` 并入 `days[今天]`，跨天只保留 `DAILY_HISTORY_DAYS` 天。这样"今天推过的"判断不会因为刷新而失忆。
+- `DAILY_RULE_VERSION` 每改一次排序 / 打散逻辑就要 +1，否则旧缓存会让新逻辑看不到效果（冷启动这版是 **6**：结果多了 `coldStart` / `styleOptions` / `styleSeeds` 三个字段，且"没记录就空页面"的旧结果必须作废）。
+- 冷启动结果同样落缓存；用户点完风格要 `clearTodayResult()` 再强制重算（只清 `today`，`days` 里的历史保留 —— 换一批的降权记忆不该被一次冷启动清掉）。
+- keep-alive 页面重新激活时会重校验一次（跨天、改了设置项都要能自动换掉旧结果），不能只在首次挂载时算。
+
+#### 空状态与降级文案
+
+| 情形 | 文案 |
+| --- | --- |
+| 没有播放记录也没收藏（冷启动） | 页头「你爱听什么风格？」+ 风格 chip；不选也照常展示兜底内容，**不弹 toast**（冷启动不是错误，别用报错语气说话） |
+| 冷启动但音源不提供分类 | 「当前音源没有提供风格分类，先听下面这批；听几首之后推荐就会开始像你。」 |
+| 候选池为空 | 「音源搜索没有结果，检查一下音源包是否正常。」 |
+| 候选都推过了 | 「候选池里的歌最近都推荐过（或被屏蔽），已无新歌可推。」 |
+| 服务端 AI 不可用 | 「当前页面不支持服务端 AI 精选，已按规则推荐。」 |
+| 本地模型失败 | 「本地模型调用失败（原因），已退回规则推荐。」 |
+
+入口**不依赖任何音源能力位**（不像「每日新歌」要看 `latest`），没记录时页内先让用户点风格（冷启动）并照常给兜底内容，不隐藏侧边栏入口。
+
 ## 5.3 标题栏
 
 组成：
 
 1. 应用 Logo
 2. 当前音源切换器
-3. 全局搜索框
+3. **搜索入口按钮**（不是输入框）：点击打开独立的搜索页 `/search`（落地页 = 搜索历史 + 热门搜索），输入统一在搜索页里做（见 §0.3-M）
 4. 返回 / 前进按钮（可选）
 5. 主页按钮
 6. 设置入口（跳 `/settings/general`，即「通用」；不是「外观」）
@@ -617,9 +1083,18 @@ Windows 平台注意事项（原文未覆盖，均为实测坑点）：
 
 ### 在线（跟随当前音源）
 
-- 首页 / 每日推荐
+- 首页（`/`）
+- 每日推荐（`/daily-recommend`）
+- 每日新歌（`/daily`）
 - 歌单广场
 - 排行榜
+
+**「每日推荐」与「每日新歌」是两个功能，入口刻意相邻但分开**（`Sidebar.tsx` 的 `ONLINE_ITEMS` 注释同口径）：
+
+- 每日新歌 = 当前音源的**最新歌曲流**，跟"你"没关系，谁发新歌就有什么（对应移动端 `pages/daily`）；
+- 每日推荐 = 按**你自己的播放历史 + 收藏**挑的，跨源、跨天变化、屏蔽生效、可本地模型精选；没有播放记录时用风格种子冷启动（§5.2「冷启动」）。
+
+显隐口径也不同：每日新歌按当前音源的 `latest` 能力显隐（本地音源整组禁用），每日推荐**不依赖**任何音源能力位 —— 它要的是「有播放记录」，没记录时页内给冷启动引导（风格 chip + 兜底内容），入口不做隐藏。
 
 ### 我的
 
@@ -633,7 +1108,7 @@ Windows 平台注意事项（原文未覆盖，均为实测坑点）：
 
 - 音乐助手（`/ai-assistant`）
 
-**按权限显隐**：只有持有 `user:ai:music:use`（后端 `AiPlugin.PERM_MUSIC_USE`）的账号才渲染这一组，未登录同样不显示。判定复用 `isAdmin` 的同一套匹配规则（精确码 + `*:*:*` + 层级通配），见 `stores/auth.ts` 的 `hasPermission` / `canUseMusicAssistant`。后端 `/api/v1/app/ai/agents` 本身已按 `accessService.permitted()` 过滤智能体、无权限返回空列表，前端提前判定只是为了不让用户点进一个空页面 —— **前端显隐不代替后端校验**，与服务端仍是两道独立的关卡。
+**全量开放（2026-10-24）**：这一组对全部用户（含未登录）始终渲染，不再要求 `user:ai:music:use` —— `Sidebar` 已删掉 `canUseMusicAssistant` 门禁，`stores/auth.ts` 也移除了该 helper。与移动端 `isQtAdmin` 同口径：**只有「服务端 AI」模式是管理员专属**（`isAdmin(profile)` 即 `admin:qt:admin` / `qt_admin`）。设置页用 `aiModeOptionsFor(isAdmin(profile))` 过滤掉 server 选项，`resolveAiMode()` 把库里残留的 server 收敛成 rule，`useAiChat` 的非管理员不拉 `astralAiAgents`、`askServerForPicks()` 入口直接拒绝。后端 `AiPlugin` 没有「服务端 AI」专用权限码（App 用户默认持有全部 `user:%`），仍按智能体权限码 + 客户端默认权限独立校验 —— **前端显隐不代替后端校验**。见 R37 / §0.3-W。
 
 ### 我的歌单
 
@@ -823,6 +1298,7 @@ WebDAV、自建音乐服务、咪咕等不进入第一版实现，只保留 Prov
 4. 单个音源请求失败时，聚合结果继续返回其他音源数据。
 5. 音源状态在 UI 中显示为可用、请求中、失败。
 6. 音源状态与 Astral 账号登录状态分离。
+7. **聚合搜索（`scope=all` / AI 找歌 / 手动换源 / 每日推荐跨源）只在「聚合搜索音源」勾选的源里进行**：设置项是 `search.aggregateSources`（设置 → 音源包，动态按数据包下发的源渲染），未勾选的源在数据包侧就不发请求，门面再过滤一遍作答旧包兜底。单源模式（某源页签、榜单、歌单、歌手页）不受影响，见 §0.3-I。
 
 ## 6.3 Provider 抽象
 
@@ -2049,6 +2525,11 @@ CREATE VIRTUAL TABLE tracks_fts USING fts5(
 | 当前皮肤 ID + 外观模式 | `settings` 表；皮肤内容存 `themes/*.ltskin.json` 文件，`themes` 表只做索引 |
 | 音源启用状态 | `settings` 表；`providers` 表在第一版**不建**（四大音源硬编码注册，无用户配置），留到 WebDAV 阶段再加 |
 | Astral satoken / refreshToken | Windows 凭据管理器（§17.1），不入库 |
+| AI 模型接口配置档（`ai.profiles` + `ai.activeProfile`） | `settings` 表，JSON。**Key 明文入库**，不走凭据管理器 —— 理由与代价见 §17.1「例外：AI 模型 Key」 |
+| 每日推荐的推荐方式 / 口味（`dailyRecommend.mode` / `.taste`） | `settings` 表 |
+| 每日推荐的风格种子（`dailyRecommend.styleSeeds`） | `settings` 表，JSON 数组。存**风格名**（如「摇滚」）而不是平台分类 id —— id 跨音源不稳定，名字是用户认得、也不会随音源漂移的东西 |
+| 每日推荐的当天结果与历史（`dailyRecommend.cache`） | `settings` 表，JSON。属于**可再生的派生数据**，但随 `settings` 表一起进备份（`backup.rs` 的 `TABLES` 含 `settings`）；「清理缓存」的可选项（`lib/runtime-cache.ts` 的 5 类进程内缓存 + 音频 / 浏览器缓存 + 听歌统计）**不含它** —— 用户点「清理缓存」的心智是清可再生的临时文件，不该顺手把今天的推荐重置掉 |
+| 聚合搜索只用哪几个源（`search.aggregateSources`） | `settings` 表，JSON 字符串数组（源 id）。**空值 / 未配置 = 全部音源**（一个都不勾不该变成搜不到）；「全选」也写空值，好让数据包以后新增的源自动参与。读侧带进程内缓存，解析失败按「全部」兜底，见 §0.3-I |
 
 ## 9. 主题与皮肤设计
 
@@ -2735,6 +3216,32 @@ Rust `AstralClient` 统一封装以下接口，前端不直接使用 `fetch` 请
 | `astral_github_accels` | `GET /app/github/accels` |
 | `astral_report_stats` | `POST /app/stat/report`，事件 `ut=app-windows / app-linux / app-macos`（按编译目标） |
 
+## 11.7.1 客户端直连模型（`ai_local`，原文缺失）
+
+设置页「AI」分节 + 「每日推荐」的本地模型精选要用到大模型，但**不经过 Astral 后端**：由 Rust 侧直接 `POST {baseUrl}/chat/completions`。原因有三条 ——
+
+1. 用户的 Key 不能进 WebView：`ai_local_config` 只回 `hasKey: bool`，Key 从读库到发请求全程在 Rust 进程内，前端 JS 永远拿不到明文（这一点与 §17.1 的凭据存储口径不同，见该节）；
+2. 换服务商不该改代码：提示词组装、候选池注入、回执硬校验全在 `@/lib/daily-recommend`，Rust 侧只做「转发 + 取回 content」的哑管道；
+3. 允许自建 / 中转站地址，所以地址与模型名都是用户可填的自由文本（`GET /v1/models` 只是便利，不实现也不影响使用）。
+
+| Command | 作用 | 关键约束 |
+|---|---|---|
+| `ai_local_config` | 读配置档列表 + 当前档 | **只回 `hasKey` 布尔**，绝不回 Key 明文 |
+| `ai_local_save_config` | 整体保存配置档列表 + `activeId` | 每档 `apiKey` 传 `None` = 不改动已存 Key、`Some("")` = 清空；地址非空必须能归一成合法的 `chat_endpoint()`，否则当场报错不落库；id 重复保留先出现的；空列表回落默认档 |
+| `ai_local_test` | 试连（发一句「你好」） | 用**表单值**而非已存值，支持「先试再存」；失败时 `error` 带可读原因 |
+| `ai_local_list_models` | `GET {baseUrl}/models` | 兼容 `{"data":[…]}` / `{"models":[…]}` / 裸数组三种形态；失败不阻断，设置页照旧允许手输模型名 |
+| `ai_local_chat` | 转发 `messages` 并取回 content | 前端给完整 messages（系统提示 + 用户），Rust 不拼提示词 |
+
+`ai_local_chat` 的健壮性处理（都是实际踩出来的）：
+
+- **3 次重试 + 退避 200ms → 600ms**（`CHAT_ATTEMPTS`）：中转站对同一请求偶发 5xx / 429 是常态，一次失败就报错会把「模型不可用」的错觉甩给用户。可重试状态码：400 / 403 / 408 / 409 / 425 / 429 / 500 / 502 / 503 / 504 / 520–524 / 529；**401 / 404 / 422 不重试**（Key 错、地址错、参数错，重试三次只是让用户多等）。
+- **超时不重试**：单次 120s（`CHAT_TIMEOUT_SECS`），重试三次要 6 分钟，超时重试等于卡死界面。
+- **兼容 SSE**：部分网关无视 `stream: false` 仍回 `text/event-stream`，`extract_reply` 先按整体 JSON 解析，失败再退化成按 `data:` 行拼 `delta.content` / `message.content` / `text`，跳过 `[DONE]`。
+- **空内容当失败**：模型回了空 `content` 报「模型返回了空内容」，不静默返回空串让上层以为成功。
+- **上游拒绝加提示**：响应体含 `11140` / `request illegal` 时在原因后追加「（上游拒绝了这次请求，属于中转站侧的偶发问题：可以重试，或换一个模型）」。
+
+配置落在 `settings` 表的 `ai.profiles`（JSON 数组）+ `ai.activeProfile`（当前档 id），旧的单档 `ai.baseUrl` / `ai.model` / `ai.apiKey` 只用于首次迁移读取。
+
 ## 11.8 事件设计
 
 | Event | 载荷 | 频率 | 目标窗口 |
@@ -2890,6 +3397,9 @@ export interface LyricStore {
 ```text
 components/
  ├─ ui/                 # shadcn/ui 基础组件
+ ├─ common/             # 全站共用的展示组件
+ │   ├─ SourceTag.tsx   # 歌名右侧的平台简称徽标（sm=正在播放页 / xs=列表行；本地曲目不渲染）
+ │   └─ ToastHost.tsx   # 右上角通知
  ├─ layout/
  │   ├─ AppShell.tsx
  │   ├─ TitleBar.tsx
@@ -3450,6 +3960,15 @@ logs/
 5. 退出登录时清理 token。
 6. token 过期时由 Rust 自动刷新。
 7. 后续若增加 WebDAV 或授权音源登录，同样必须使用系统凭据管理器。
+
+### 例外：AI 模型 Key（`ai.apiKey`）
+
+「AI」设置里用户自填的大模型 Key **存在 `settings` 表的 `ai.profiles` JSON 里，是明文，不走 Windows 凭据管理器**。这是有意为之的例外，理由与代价：
+
+- **为什么不用凭据管理器**：配置档是「多套地址 + 各自的 Key + 当前档」的整体结构（用户会在官方接口、自建网关、中转站之间切），凭据管理器的条目模型是「一条 key = 一个字符串」，把结构化的多档配置拆成 N 条凭据再拼回来，每次增删档都要对账，容易留下孤儿条目；而 `settings` 表本来就是这类「用户设置」的唯一归属（§8.8）。
+- **代价与缓解**：Key 明文落盘，能读到 `music.db` 的人就能读到 Key。缓解措施是**前端永远拿不到明文** —— `ai_local_config` 只回 `hasKey: bool`，Key 从读库到发请求全程在 Rust 进程内（见 §11.7.1），WebView 里跑的任何脚本（包括被注入的）都读不到；设置页显示为掩码，留空 = 保持原值，不会因为「没重填」被清掉。
+- **与上文的边界**：Astral 账号 token 是**服务端签发、代表用户身份**的凭据，泄露后果是账号被顶；AI Key 是用户自己填的第三方 API Key，泄露后果限于额度。两者风险等级不同，所以策略不同。若将来引入需要更高保障的第三方授权（OAuth refresh token 之类），仍按上文走凭据管理器。
+
 ## 17.2 IPC 安全
 
 1. Tauri Capability 按窗口最小授权。
@@ -3564,13 +4083,26 @@ src/
  │   ├─ discovery/         # 发现（推荐、排行榜、歌单广场）
  │   ├─ library/           # 本地音乐库
  │   ├─ lyric/             # 歌词
- │   ├─ mine/              # 我的（收藏、歌单、下载、设置、账号）
+ │   ├─ mine/              # 我的（收藏、歌单、下载、设置、账号；听歌报告的 EntryPicture 等共用件在 ListenReportBits.tsx）
  │   ├─ music-source/      # 音源切换与管理
  │   ├─ onboarding/        # 首次启动引导
  │   ├─ player/            # 播放条 / 播放队列
  │   └─ update/            # 更新弹窗与下载进度
  ├─ hooks/                 # 位置插值、播放事件订阅等
  ├─ lib/                   # 工具函数
+ │   ├─ daily-recommend.ts # 每日推荐的流程：偏好读取 / 冷启动 / 五路候选池 / 打散 / 缓存 / 模型提示词，可单测
+ │   ├─ music-style.ts     # 风格画像：语种 / 时长带 / 专辑 / 歌单名 / 收听质量 → StyleProfile，可单测
+ │   ├─ recommend-rank.ts  # 多维打分 + MMR 多样性 + 两阶段配额放宽 + 推荐理由，可单测
+ │   ├─ recommend-types.ts # 上面三个模块共用的契约类型（零运行时代码）
+ │   ├─ aggregate-sources.ts # 「聚合搜索只用哪几个源」的设置读写（解析容错 + 进程内缓存），可单测
+ │   ├─ recommend-dimensions.ts # 候选池扩维：查询规划 / 榜单·关键词·风格歌单三路采集 / 风格线交织，可单测
+ │   ├─ song-key.ts       # 搜索页跨页去重键（歌名 + 歌手集合），口径与包侧 merge-search 一致，可单测
+ │   ├─ text.ts            # 文本归一化 / 键 / 日期 / 抖动等纯函数（全仓唯一实现，零依赖），可单测
+ │   ├─ coerce.ts          # 未知 JSON 的取值：strict 族 as* 与宽松族 coerce*（两族语义不同，头注释写明）
+ │   ├─ format.ts          # 体积等展示格式化（设置页与下载页共用）
+ │   ├─ pending-cache.ts   # 在飞去重 + 已落定字符串缓存（歌手头像 / 歌手 id 共用）
+ │   ├─ ai.ts              # 本地模型调用的前端封装（提示词与硬校验在这层之上）
+ │   └─ …                  # router / storageKeys / lazyPage 等
  ├─ services/ipc.ts        # 所有 Tauri invoke 的唯一出口
  ├─ source-engine/         # 引擎页客户端（跑音源包取链）
  ├─ source-scripts/        # 音源包宿主 facade（统一入口 / 版本检查 / qt-contract 宿主契约）
@@ -3628,6 +4160,7 @@ src-tauri/
  │   ├─ shortcuts.rs
  │   ├─ media_control.rs
  │   ├─ updater.rs
+ │   ├─ ai_local.rs         # 客户端直连大模型（配置档读写 / 试连 / 取模型列表 / 转发对话，§11.7.1）
  │   └─ logger.rs
  ├─ Cargo.toml
  └─ tauri.conf.json
@@ -3647,6 +4180,7 @@ src-tauri/
 | storage | SQLite 读写、迁移 |
 | provider | 音源状态和搜索 |
 | theme | 主题校验 |
+| ai_local | SSE 拼接、JSON 快路径、空 content 报错、可重试状态码白/黑名单（5 例） |
 
 ## 20.2 前端测试
 
@@ -3657,6 +4191,24 @@ src-tauri/
 | MusicSourceSwitcher | 音源切换和状态 |
 | ThemeStore | 主题应用 |
 | LyricView | 当前行计算 |
+| daily-recommend | **136 条单测**（`tests/daily-recommend.test.ts` 84 / `daily-recommend-generate.test.ts` 36 / `daily-recommend-cache.test.ts` 16）：偏好解析、候选池去重、三种口味配额、同歌手打散（v1.15 起**最小相邻交换**：无冲突原样保留、只动相邻撞歌手的那一两首）、推荐理由分级、`parsePicks` 硬校验（越界 / 重复 / 布尔值）与**三级容错**（裸控制字符 / 尾逗号 / 正则捞序号 / 裸数字数组 / `title`、`summary` 捞回）、`pickAiPool`（150 上限、前 90 必进、尾巴按 variant 轮转）、缓存命中与跨天失效、「换一批」合并而非覆盖、模型失败退回规则、**模型回执格式坏了重试一次（0.4 → 0.2 温度）**、**多给一两首按目标条数截住**、**候选池给到 150 首（不是 50 首硬塞）**、**提示词求贴合**（候选行证据 / 语种下限 / 不再要求凑风格 / 第 51–90 首换进 6–10 首 / **池子不够长时这条整条不出现且编号仍连续**）、**`filterAiPicks` 剔掉无依据的歌**、**`limitAiPicks` 中段穿插封顶 12 首**、**冷启动**（无记录不空页面 / 下发风格分类 / 跳过也有内容且不 toast / 存种子后重算且不再冷启动 / 音源不支持分类时降级）与 `parseStyleSeeds` 容错、候选池跨源聚合走数据包 `searchMany`（分块调用、单块失败不连坐）、「聚合搜索音源」设置透传到跨源搜索（默认不传 / 勾选后带白名单）、**v1.16 多维度**（候选行带 `风格线：X` 与「画像里的语种分布」、线 ≤3 条时目标按实际条数给、`diversifyByLanes` 七成底盘 + 三成配额 4 条、有画像风格线支撑的歌不被 `filterAiPicks` 剔、**维度路把榜单里的新风格带进候选池**（local 与规则两条分支都断言 `styleLanes` 含榜单线）） |
+| recommend-dimensions | **25 条单测**（`tests/recommend-dimensions.test.ts`）：维度查询规划（画像标签 / 歌单名 / 次要语种（≥5%）/ 相邻风格 / 按 variant 轮换的兜底词 / 搜索历史 → 去重截断 ≤10）、`chartLane` 从榜单名抽风格线（词表命中优先、否则去「榜」后缀）、三路采集的应答归一与 provenance（`laneOf` 主线在前）、单路失败 / 空结果不 throw、`interleaveByLanes`（SWRR 权重 4/2/2/1、未标线进末尾兜底、组内保序、去重）、`laneCoverage`（只统计主线、按 count 降序、截断 5） |
+| daily-recommend-page | **4 条 jsdom 用例**（`tests/daily-recommend-page.test.tsx`）：`styleLanes` 非空时在「口味画像」下方渲染「本期风格」chips（`古风 22` / `粤语 7`）、每颗 chip 有 `title` 说明、空数组与缺字段都不渲染、chips 位于口味按钮组之前 |
+| AI 模式与本地助手 | **69 条单测 / jsdom 用例**：`ai-mode` 7（解析 / 读写 / 选项与说明）、`ai-server-picks` 9（未登录、无智能体、会话创建失败、事件终态、超时、`finally` 删会话）、`ai-assistant-local` 23（rule 打分、点名歌手不受同歌手配额、默认 20 首与「5 首 / 二十首」解析、local JSON 契约与整段回退 rule）、`ai-assistant-history` 11（增删 / 消息还原 / 30 会话封顶 / 排序稳定 tiebreak）、`ai-assistant` 页面 11（三种模式的横幅与侧栏）、`use-ai-chat` 8（模式分流、非 server 不拉 astral、本地回合写回历史、切换与删除会话） |
+| music-style | **38 条单测**（`tests/music-style.test.ts`）：语种判定（假名 / 谚文 / 汉字 / 拉丁 / 器乐）、时长带边界（150 / 240 / 330）、专辑键、完播比与 `skipped` 判定、画像归一化（`mainLang` 份额 < 0.34 时给 `und`）、歌单名抽风格词、`describeProfile` 文案（含只有风格种子时说「你选的风格：…」而不是「口味还不明显」） |
+| recommend-rank | **34 条单测**（`tests/recommend-rank.test.ts`）：相似度权重、六项验收（新歌手能进前排 / 同语种不霸屏 / 无相邻同歌手 / 历史降权不排除 / 屏蔽硬排除 / 配额放宽兜底）、语种上限单独放宽、`familiarSingers` 兜底、理由分级与 20 字上限、可复现性 |
+| source-scripts 聚合搜索 | **5 条单测**（`tests/source-scripts-search-many.test.ts`）：`searchMany` 应答映射（关键词归一化去重、batches → `Track`、`truncated`）、空关键词不发调用、非「缺入口」错误原样抛出、旧数据包缺入口时直接抛「数据包版本过旧」且只 invoke 一次（v1.17 删掉宿主 `fanOutSearch` 降级） |
+| source-tag | **7 条 jsdom 用例**（`tests/source-tag.test.tsx`）：列表用 `xs`（10px / `px-1`）与正在播放页 `sm`（11px / `px-1.5`）两档、`title` 为「来源：简称」、底色是该音源颜色 16% 淡底、简称缺失的旧数据包回落全名、未注册源显示「未知」、本地曲目不渲染、`whitespace-nowrap`（简称不能被折成两行） |
+| song-key | **13 条单测**（`tests/song-key.test.ts`）：`normText` 归一化（嵌套括号剥离、歌手集合拆分后排序）与 `songKey`（标题 + 歌手集合；标题归一化为空时回落 `${platform}:${id}`）—— v1.17 从 `aggregate-merge.ts` 摘出，只服务搜索页跨页去重，口径与包侧 `merge-search.ts` 一致 |
+| source-scripts 合并入口 | **6 条单测**（`tests/source-scripts-search-merged.test.ts`）：`{list, full}` 应答映射成 `Track` 并按勾选集再过滤、`full` 原样透传、未配勾选集时入参与旧版一致、空关键词不打引擎、非「缺入口」错误原样抛出、旧数据包缺入口时直接抛「数据包版本过旧」且不再退回本地合并（v1.17 删掉 `localMerge`） |
+| aggregate-sources | **15 条单测**（`tests/aggregate-sources.test.ts`）：`parseAggregateSources` 的空值 / 坏 JSON / 非数组 / 空数组 / 非字符串项 / 非法 id / 去重保序 / 16 个截断，读写的缓存命中与重置、「全选存空值 → 读回全部」、保存前归一化、读设置抛错按全部兜底 |
+| source-scripts 源过滤 | **5 条单测**（`tests/source-scripts-source-filter.test.ts`）：不配置时 invoke 参数不带 `sources`（不破坏既有调用）、配了就把 `sources` 传下去且**应答里未勾选的源被丢掉**（旧包兼容兜底）、空数组等于不过滤、`searchManyBatches` 同样过滤 groups 与 `merged`、旧包退回逐词 `searchAll` 时也带 `sources` |
+| 设置页 · 聚合搜索音源 | **5 条 jsdom 用例**（`tests/settings-aggregate-sources.test.tsx`）：默认全开且显示「已选 N/M」、关掉一个立刻落库、最后一个源不允许关（提示且不写坏设置）、点回全部写空值、已配置的勾选按 id 还原 |
+| 公共工具（去重合并） | **15 条单测**（`tests/shared-utils.test.ts`）：`normText` 去括号/标点/大小写与全角空格、`compactText` 只折叠空白不剥括号、`trackKey`/`songNameKey` 同源不同平台的合并口径、`localDateKey` 本地时区补零、`safeDecodeURIComponent` 坏编码原样返回、`hashString`/`jitter` 的稳定性与值域、`truncateChars` 按码点不劈代理对；`as*` 严格族与 `coerce*` 宽松族的边界（`asNumber("42")`→0、`coerceNumber("42")`→42）；`formatBytes` 换单位与小数位；`pending-cache` 在飞去重、失败落空串、超容量逐出、`clear` 计数。另：三份 facade 测试的引擎 mock 已收敛到 `tests/helpers/engine-client.ts` |
+| 搜索首页 | **5 条 jsdom 用例**（`tests/search-landing.test.tsx`）：无关键词时渲染两块（搜索历史 / 热门搜索）且**不出现「热门歌单」**、输入框自动聚焦、点历史词或热词 = 写历史 + 改 URL、带 `?q=` 进来时落地内容全部收起且页签栏出现 |
+| 搜索页 · 播放全部 | **3 条 jsdom 用例**（`tests/search-play-all.test.tsx`）：点「播放全部」= `playQueue(已加载 songs, 0)`、没有结果时不渲染这颗按钮、歌单 / 歌手 / 专辑页签不渲染 |
+| 标题栏搜索入口 | **2 条 jsdom 用例**（`tests/titlebar-search.test.tsx`）：点按钮跳到 `/search`（`q` 为空、落在搜索首页）、标题栏不再有输入框（`textbox` 查不到）只留入口按钮文案 |
+| 搜索页 · 页签切换 | **7 条 jsdom 用例**（`tests/search-tab-switch.test.tsx`，真 memory-history 路由 + `RouterProvider`）：点页签改 URL 后按新页签重拉、连切多个以最新为准、旧页签请求在飞时切走则迟到结果不覆盖、`?type=playlist` 直接落地（详情页返回场景）、翻到第 2 页后切页签必须回第 1 页重拉、聚合模式歌曲→歌单走歌单动作、快速连点两页签 URL 与列表不分叉 |
 
 ## 20.3 集成测试
 
@@ -3667,6 +4219,9 @@ src-tauri/
 5. 开启桌面歌词 → 切歌 → 校验同步。
 6. 修改主题 → 重启 → 校验持久化。
 7. 更新检查 → 下载 → 安装。
+8. 听几首歌 → 打开每日推荐 → 校验结果按画像出歌（不只常听歌手）、摘要下有口味画像 → 换一批 → 校验当天推过的降权而非重复 → 跨天（改系统时间）→ 校验重算。
+9. 清空播放记录与收藏（模拟新用户）→ 打开每日推荐 → 校验页头列出风格 chip 且下方已有兜底内容 → 点两个风格 → 按这些风格生成 → 校验结果页显示「你选的风格：…」且不再出现 chip → 重启应用后仍按该风格推荐（种子已入库）。
+10. 设置 → 音源包 → 关掉两个音源 → 回到搜索页切「全部音源」搜一个词 → 校验分组里只剩已勾选的源（关掉的那些**一条都不出现**）→ 再关到只剩一个 → 校验最后一个源关不掉且有提示 → 点回全部 → 校验分组恢复。
 
 ## 20.4 性能测试
 

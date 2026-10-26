@@ -1,5 +1,6 @@
 import { Play } from "lucide-react";
 import type { Track } from "@/types";
+import { SourceTag } from "@/components/common/SourceTag";
 import { qtresCoverUrl } from "@/lib/lrc";
 
 /**
@@ -37,7 +38,10 @@ export function TrackCard(props: {
           </span>
         </div>
       </div>
-      <div className="mt-2 truncate text-xs font-medium">{track.title}</div>
+      <div className="mt-2 flex min-w-0 items-center gap-1.5 text-xs font-medium">
+        <span className="truncate">{track.title}</span>
+        <SourceTag platform={track.platform} size="xs" />
+      </div>
       <div className="mt-0.5 truncate text-[11px] text-muted-foreground">
         {track.singer}
       </div>

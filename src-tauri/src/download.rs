@@ -884,6 +884,36 @@ async fn with_db<T: Send + 'static>(
 pub const SETTING_DOWNLOAD_SAVE_COVER: &str = "download.saveCover";
 pub const SETTING_DOWNLOAD_SAVE_LYRIC: &str = "download.saveLyric";
 
+/// 「下载存储方式」设置键（用户 2026-10「下载歌曲时同时将封面和歌词内嵌到
+/// 歌曲中」）：`"embed"` = 封面 / 歌词内嵌进音频文件标签（默认，见 embed.rs）；
+/// `"sidecar"` = 同目录文件（旧行为）。未设置 / 非法值一律按 embed——新行为
+/// 就是默认行为。
+pub const SETTING_DOWNLOAD_STORAGE: &str = "download.storage";
+
+/// 封面 / 歌词的存储去向（设置页「下载存储方式」二选一）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageMode {
+    /// 内嵌进音频文件标签（embed.rs：APIC / METADATA_BLOCK_PICTURE / covr …）。
+    /// 白名单外格式与写入失败都自动降级回 sidecar。
+    Embed,
+    /// 同目录文件：`<音频名>.jpg/png/…` + `<音频名>.lrc`（2026-11 的旧行为）。
+    Sidecar,
+}
+
+/// 读「下载存储方式」。取值口径见 [`SETTING_DOWNLOAD_STORAGE`]。
+pub async fn download_storage(db: &Arc<Database>) -> StorageMode {
+    let key = SETTING_DOWNLOAD_STORAGE.to_string();
+    let val = with_db(db, move |c| crate::db::store::get_setting(c, &key))
+        .await
+        .ok()
+        .flatten();
+    if val.as_deref() == Some("sidecar") {
+        StorageMode::Sidecar
+    } else {
+        StorageMode::Embed
+    }
+}
+
 /// 封面字节 → 扩展名。只认常见的四种魔数；认不出（错误页 / HTML）就不落盘，
 /// 免得在下载目录里攒垃圾文件。
 fn cover_ext(bytes: &[u8]) -> Option<&'static str> {
@@ -912,14 +942,110 @@ async fn download_flag_on(db: &Arc<Database>, key: &str) -> bool {
         .unwrap_or(true)
 }
 
-/// 下载成功后把封面 / 歌词存到歌曲旁边（`<音频文件名>.<ext>` / `.lrc`）。
-/// 由 `launch_download` 在 [`run_job_with_slot`] 拿到 Done 之后调用：
-/// - 封面：取**原图**（不走代取的缩略图改写与内存缓存，见
-///   `qtres::fetch_cover_original_bytes`），按魔数定扩展名；
-/// - 歌词：把库里已有的歌词先落一份 `.lrc`。下载当时还没词的（比如刚加的新歌），
-///   前端在之后拿到词时经 `write_download_lyric` 命令补写同一个文件。
+/// sidecar 落盘的封面半边（2026-11 原逻辑抽出，sidecar 模式与内嵌降级共用）。
+/// 扩展名按魔数定（[`cover_ext`]），认不出就不落盘。
+fn write_cover_sidecar(final_path: &Path, bytes: &[u8]) {
+    match cover_ext(bytes) {
+        Some(ext) => {
+            let cover_path = final_path.with_extension(ext);
+            if let Err(e) = std::fs::write(&cover_path, bytes) {
+                log::warn!("[download] 封面存盘失败: {e}");
+            } else {
+                log::info!("[download] 封面已存: {}", cover_path.display());
+            }
+        }
+        None => log::warn!("[download] 封面格式未识别，跳过存盘"),
+    }
+}
+
+/// sidecar 落盘的歌词半边：只写主词（lrc），不拼翻译——sidecar 的口径是
+/// 「跟 2026-11 的旧行为一字不差」，播放器直接读 .lrc 时多一段翻译反而乱。
+fn write_lyric_sidecar(final_path: &Path, lrc: &str) {
+    if lrc.trim().is_empty() {
+        return;
+    }
+    let lrc_path = final_path.with_extension("lrc");
+    if let Err(e) = std::fs::write(&lrc_path, lrc.as_bytes()) {
+        log::warn!("[download] 歌词存盘失败: {e}");
+    } else {
+        log::info!("[download] 歌词已存: {}", lrc_path.display());
+    }
+}
+
+/// 抓封面**原图**（阻塞 HTTP 挪进 blocking 池）。None = 无 URL / 抓取失败。
+async fn fetch_cover_bytes(track: &crate::provider::types::Track) -> Option<Vec<u8>> {
+    if track.pic_url.trim().is_empty() {
+        return None;
+    }
+    let url = track.pic_url.clone();
+    tauri::async_runtime::spawn_blocking(move || crate::qtres::fetch_cover_original_bytes(&url))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// 取库里的歌词 → `(内嵌正文, sidecar lrc)`。内嵌正文 = 主词 + 空行 + 翻译
+/// （并排读太挤，双段拼接是设计文档定的口径）；sidecar lrc 只含主词。
+/// None = 没词 / 纯音乐。
+async fn download_lyric_parts(
+    db: &Arc<Database>,
+    track: &crate::provider::types::Track,
+) -> Option<(String, String)> {
+    let track_key = crate::db::store::db_track_id(track);
+    let rec = with_db(db, move |c| crate::db::store::get_lyric(c, &track_key))
+        .await
+        .ok()
+        .flatten()?;
+    if rec.lrc.trim().is_empty() {
+        return None;
+    }
+    let mut text = rec.lrc.clone();
+    if !rec.translation.trim().is_empty() {
+        text.push_str("\n\n");
+        text.push_str(&rec.translation);
+    }
+    Some((text, rec.lrc))
+}
+
+/// sidecar 模式（与 2026-11 旧行为一字不差）：同名封面图片 + `.lrc`。
+async fn save_sidecar_extras(
+    db: &Arc<Database>,
+    track: &crate::provider::types::Track,
+    final_path: &Path,
+    save_cover: bool,
+    save_lyric: bool,
+) {
+    if save_cover {
+        if let Some(bytes) = fetch_cover_bytes(track).await {
+            write_cover_sidecar(final_path, &bytes);
+        }
+    }
+    if save_lyric {
+        if let Some((_embed_text, lrc)) = download_lyric_parts(db, track).await {
+            write_lyric_sidecar(final_path, &lrc);
+        }
+    }
+}
+
+/// 内嵌没成时的兜底：手头有的封面 / 歌词一律按 sidecar 落盘，内容不丢。
+fn sidecar_fallback(final_path: &Path, cover_bytes: Option<&[u8]>, lrc: Option<&str>) {
+    if let Some(bytes) = cover_bytes {
+        write_cover_sidecar(final_path, bytes);
+    }
+    if let Some(lrc) = lrc {
+        write_lyric_sidecar(final_path, lrc);
+    }
+}
+
+/// 下载成功后把封面 / 歌词按「下载存储方式」落到成品旁边。由
+/// `launch_download` 在 [`run_job_with_slot`] 拿到 Done 之后调用：
+/// - `embed`（默认）：标题 / 歌手 / 专辑 / 封面 / 歌词内嵌进音频文件标签
+///   （见 embed.rs），白名单外格式与写入失败自动降级 sidecar；webp / gif
+///   封面进不了标签，也按 sidecar 落盘，内容不丢；
+/// - `sidecar`：`<音频名>.<ext>` + `.lrc`（旧行为）。
 ///
-/// 任何一步失败都只记日志：sidecar 是锦上添花，不能反过来把下载链路拖挂。
+/// 任何一步失败都只记日志：这是锦上添花，不能反过来把下载链路拖挂。
+/// 下载当时还没词的，前端之后拿到词经 `write_download_lyric` 命令补写。
 pub async fn save_download_extras(
     db: Arc<Database>,
     track: &crate::provider::types::Track,
@@ -927,46 +1053,94 @@ pub async fn save_download_extras(
 ) {
     let save_cover = download_flag_on(&db, SETTING_DOWNLOAD_SAVE_COVER).await;
     let save_lyric = download_flag_on(&db, SETTING_DOWNLOAD_SAVE_LYRIC).await;
-
-    if save_cover && !track.pic_url.trim().is_empty() {
-        let url = track.pic_url.clone();
-        // 封面代取是阻塞 HTTP，挪进 blocking 池，别占着 tokio worker
-        let bytes = tauri::async_runtime::spawn_blocking(move || {
-            crate::qtres::fetch_cover_original_bytes(&url)
-        })
-        .await
-        .ok()
-        .flatten();
-        if let Some(bytes) = bytes {
-            match cover_ext(&bytes) {
-                Some(ext) => {
-                    let cover_path = final_path.with_extension(ext);
-                    if let Err(e) = std::fs::write(&cover_path, &bytes) {
-                        log::warn!("[download] 封面存盘失败: {e}");
-                    } else {
-                        log::info!("[download] 封面已存: {}", cover_path.display());
-                    }
-                }
-                None => log::warn!("[download] 封面格式未识别，跳过存盘"),
-            }
-        }
+    if !save_cover && !save_lyric {
+        return;
+    }
+    if download_storage(&db).await == StorageMode::Sidecar {
+        save_sidecar_extras(&db, track, final_path, save_cover, save_lyric).await;
+        return;
     }
 
-    if save_lyric {
-        let track_key = crate::db::store::db_track_id(track);
-        let existing = with_db(&db, move |c| crate::db::store::get_lyric(c, &track_key))
-            .await
-            .ok()
-            .flatten();
-        if let Some(rec) = existing {
-            if !rec.lrc.trim().is_empty() {
-                let lrc_path = final_path.with_extension("lrc");
-                if let Err(e) = std::fs::write(&lrc_path, rec.lrc.as_bytes()) {
-                    log::warn!("[download] 歌词存盘失败: {e}");
-                } else {
-                    log::info!("[download] 歌词已存: {}", lrc_path.display());
-                }
+    // ---- embed 模式（默认）：写进音频文件标签 ----
+    let cover_bytes = if save_cover {
+        fetch_cover_bytes(track).await
+    } else {
+        None
+    };
+    // 只有 jpg / png 进得了标签；webp / gif 抓到了也进不去 → 这一项按
+    // sidecar 落盘（pending），其余照常内嵌
+    let (embed_cover, cover_sidecar_pending) = match &cover_bytes {
+        Some(bytes) => match crate::embed::embeddable_png(bytes) {
+            Some(png) => (
+                Some(crate::embed::EmbedCover {
+                    data: bytes.clone(),
+                    png,
+                }),
+                false,
+            ),
+            None => (None, true),
+        },
+        None => (None, false),
+    };
+    let lyric_parts = if save_lyric {
+        download_lyric_parts(&db, track).await
+    } else {
+        None
+    };
+
+    if embed_cover.is_none() && lyric_parts.is_none() {
+        // 没有能内嵌的内容：进不了标签的封面（webp/gif）仍按 sidecar 落盘
+        if cover_sidecar_pending {
+            write_cover_sidecar(final_path, cover_bytes.as_deref().expect("pending 必有字节"));
+        }
+        return;
+    }
+
+    let payload = crate::embed::EmbedPayload {
+        title: track.title.clone(),
+        singer: track.singer.clone(),
+        album: track.album.clone(),
+        cover: embed_cover,
+        lyric: lyric_parts.as_ref().map(|(text, _)| text.clone()),
+    };
+    let p = final_path.to_path_buf();
+    let outcome = match tauri::async_runtime::spawn_blocking(move || {
+        crate::embed::embed_tags(&p, &payload)
+    })
+    .await
+    {
+        Ok(o) => o,
+        Err(e) => crate::embed::EmbedOutcome::Failed(format!("内嵌任务异常: {e}")),
+    };
+    match outcome {
+        crate::embed::EmbedOutcome::Done => {
+            log::info!("[download] 封面/歌词已内嵌: {}", final_path.display());
+            // 内嵌成了，但进不了标签的封面（webp/gif）不能丢
+            if cover_sidecar_pending {
+                write_cover_sidecar(final_path, cover_bytes.as_deref().expect("pending 必有字节"));
             }
+        }
+        crate::embed::EmbedOutcome::Skipped(why) => {
+            log::info!(
+                "[download] 内嵌跳过（{why}），封面/歌词降级为同目录文件: {}",
+                final_path.display()
+            );
+            sidecar_fallback(
+                final_path,
+                cover_bytes.as_deref(),
+                lyric_parts.as_ref().map(|(_, l)| l.as_str()),
+            );
+        }
+        crate::embed::EmbedOutcome::Failed(why) => {
+            log::warn!(
+                "[download] 内嵌失败（{why}），封面/歌词降级为同目录文件: {}",
+                final_path.display()
+            );
+            sidecar_fallback(
+                final_path,
+                cover_bytes.as_deref(),
+                lyric_parts.as_ref().map(|(_, l)| l.as_str()),
+            );
         }
     }
 }

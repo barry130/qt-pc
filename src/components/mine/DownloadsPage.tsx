@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Eraser, ListEnd, Pause, Play, RotateCcw, X } from "lucide-react";
+import { formatBytes } from "@/lib/format";
 import { errMsg } from "@/lib/utils";
 import type { DownloadTask, Track } from "@/types";
 import * as ipc from "@/services/ipc";
@@ -24,17 +25,7 @@ const STATUS_LABEL: Record<DownloadTask["status"], string> = {
 };
 
 /** 字节数 → 人类可读（下载大小展示用） */
-function formatBytes(n: number | null | undefined): string {
-  if (!n || n <= 0) return "";
-  const units = ["B", "KB", "MB", "GB"];
-  let v = n;
-  let i = 0;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i += 1;
-  }
-  return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${units[i]}`;
-}
+// formatBytes 合并到 `@/lib/format`（与设置页同一实现）。
 
 /**
  * 已完成的任务 → 可直接播放的本地曲目。

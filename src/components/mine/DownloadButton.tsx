@@ -6,14 +6,15 @@ import * as ipc from "@/services/ipc";
 import { useDownloadsStore } from "@/stores/downloads";
 import { toastError, toastSuccess } from "@/stores/toast";
 import { clampQualityForPlatform } from "@/stores/sourceRegistry";
+import { sourceDownloadQualityOf } from "@/lib/source-quality";
 import { IconButton } from "@/components/common/IconButton";
 
 /**
  * 下载一首歌（DESIGN §5.3）。命令只负责发起，实际下载与进度写库都在 Rust 后台。
  *
- * 音质不传时取设置里的「默认下载音质」（下载与播放音质互相独立），发起前
- * 按该曲目的源收敛（v5 契约：包侧声明了可用档位，如 B 站无真无损、默认
- * flac 会自动落到 320；未声明 = 不钳制）。
+ * 音质不传时取该平台的下载音质（音源账号页按平台设置；未配置的平台回落旧
+ * 全局键/320），发起前按该曲目的源收敛（v5 契约：包侧声明了可用档位，如
+ * B 站无真无损、默认 flac 会自动落到 320；未声明 = 不钳制）。
  * 本地曲目本来就在磁盘上，不给下载入口。
  * 已下载 / 正在下载的曲目按钮变成状态提示，避免重复点击（后端也会去重）。
  *
@@ -59,7 +60,7 @@ export function DownloadButton(props: {
     if (busy) return;
     setBusy(true);
     try {
-      const wanted = quality ?? (await ipc.getDownloadQuality());
+      const wanted = quality ?? sourceDownloadQualityOf(track.platform);
       // 默认音质按该曲目所在的源收敛（B 站等无真无损的源自动落到可用档）
       await ipc.startDownload(track, clampQualityForPlatform(track.platform, wanted));
       toastSuccess("加入下载队列成功");

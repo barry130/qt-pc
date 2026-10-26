@@ -67,6 +67,11 @@ const AudioProgramPage = lazyPage<{ platform: string; id: string }>(
   "AudioProgramPage",
 );
 const LocalMixPage = lazyPage<{ mixKey: string }>(() => import("@/components/mine/LocalMixPage"), "LocalMixPage");
+/** 音源账号：每源独立管理登录与「数据/播放是否使用登录态」（二级页，直接渲染） */
+const SourceAccountsPage = lazyPage(
+  () => import("@/components/mine/SourceAccountsPage"),
+  "SourceAccountsPage",
+);
 
 const rootRoute = createRootRoute({ component: AppShell });
 
@@ -81,6 +86,14 @@ const indexRoute = createRoute({
 const dailyRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/daily",
+  // 一级页面由 AppShell 的 KeepAliveOutlet 常驻渲染（切 tab 不重载），
+  // 这里只保留路由用于匹配与导航，组件渲染 null。
+  component: () => null,
+});
+
+const dailyRecommendRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/daily-recommend",
   // 一级页面由 AppShell 的 KeepAliveOutlet 常驻渲染（切 tab 不重载），
   // 这里只保留路由用于匹配与导航，组件渲染 null。
   component: () => null,
@@ -215,6 +228,13 @@ const localMixRoute = createRoute({
   },
 });
 
+/** 音源账号（侧边栏「我的」组）：每源登录 + 按源独立的 meta/play 开关 */
+const sourceAccountsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/source-accounts",
+  component: SourceAccountsPage,
+});
+
 const historyRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/history",
@@ -325,6 +345,7 @@ const lyricsRoute = createRoute({
 const routeTree = rootRoute.addChildren([
   indexRoute,
   dailyRoute,
+  dailyRecommendRoute,
   searchRoute,
   playlistsRoute,
   playlistDetailRoute,
@@ -338,6 +359,7 @@ const routeTree = rootRoute.addChildren([
   libraryFoldersRoute,
   myPlaylistsRoute,
   myPlaylistDetailRoute,
+  sourceAccountsRoute,
   localMixRoute,
   historyRoute,
   downloadsRoute,

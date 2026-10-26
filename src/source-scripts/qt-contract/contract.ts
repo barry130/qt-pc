@@ -125,6 +125,11 @@ export interface SourceRequestOptions {
   body?: string;
   /** 默认 15000ms */
   timeoutMs?: number;
+  /** v14（QQ 扫码 authorize 取 code）："manual" = 不跟随重定向，302 的
+   *  Location 原样在 headers.location（默认自动跟随会丢中间跳转头） */
+  redirect?: "follow" | "manual";
+  /** v14（QQ 扫码 ptqrshow 出 PNG）："base64" = 原始字节 base64 串回传 */
+  responseEncoding?: "text" | "base64";
 }
 
 export interface SourceResponse {

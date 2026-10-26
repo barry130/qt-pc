@@ -1,6 +1,6 @@
 //! Tauri 命令函数，与 lib.rs 分离以规避宏展开冲突。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -33,6 +33,13 @@ pub struct SourceRequestOptions {
     pub headers: Option<std::collections::HashMap<String, String>>,
     pub body: Option<String>,
     pub timeout_ms: Option<u64>,
+    /// v14（QQ 扫码 authorize 取 code）："manual" = 不跟随重定向，302 的
+    /// Location 原样回传 headers.location（reqwest 默认自动跟随，中间跳转的
+    /// Location/中间响应 Set-Cookie 全丢）。缺省 follow 保持原行为。
+    pub redirect: Option<String>,
+    /// v14（QQ 扫码 ptqrshow 出 PNG）："base64" = 原始字节 base64 串回传
+    /// （默认文本通道会经 UTF-8 lossy 损坏二进制）。
+    pub response_encoding: Option<String>,
 }
 
 /// 音源脚本的响应（契约见 src/source-scripts/qt-contract/contract.ts）
@@ -73,6 +80,27 @@ fn source_builtin_client() -> reqwest::Client {
     })
 }
 
+/// redirect=manual 专用客户端（v14，QQ 扫码链）：不跟随重定向——302 的
+/// Location 与该响应上的 Set-Cookie 都必须原样交给脚本。与默认客户端共用
+/// 网络设置（代理/超时等），只是 redirect 策略不同，同样走代际缓存。
+static SOURCE_BUILTIN_MANUAL_CLIENT_CACHE: std::sync::OnceLock<
+    std::sync::RwLock<(u64, reqwest::Client)>,
+> = std::sync::OnceLock::new();
+
+fn source_builtin_manual_client() -> reqwest::Client {
+    crate::net_config::shared_async_client(&SOURCE_BUILTIN_MANUAL_CLIENT_CACHE, || {
+        crate::net_config::configure(
+            reqwest::Client::builder()
+                .user_agent(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                )
+                .redirect(reqwest::redirect::Policy::none()),
+        )
+        .build()
+        .expect("source builtin manual client")
+    })
+}
+
 /// builtin_request 的可直调实现（供命令与测试共用）
 pub(crate) async fn source_builtin_request(
     url: &str,
@@ -96,12 +124,20 @@ pub(crate) async fn source_builtin_request(
             .and_then(|o| o.timeout_ms)
             .unwrap_or_else(crate::net_config::source_timeout_ms),
     );
-    let mut req = source_builtin_client()
-        .request(
-            reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?,
-            target.as_str(),
-        )
-        .timeout(timeout);
+    let manual_redirect = options
+        .and_then(|o| o.redirect.as_deref())
+        .map(|v| v.eq_ignore_ascii_case("manual"))
+        .unwrap_or(false);
+    let mut req = (if manual_redirect {
+        source_builtin_manual_client()
+    } else {
+        source_builtin_client()
+    })
+    .request(
+        reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?,
+        target.as_str(),
+    )
+    .timeout(timeout);
     if let Some(headers) = options.and_then(|o| o.headers.as_ref()) {
         for (key, value) in headers {
             req = req.header(key, value);
@@ -118,10 +154,22 @@ pub(crate) async fn source_builtin_request(
         }
     }
     let status = res.status().as_u16();
-    let mut headers = std::collections::HashMap::new();
+    let mut headers: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for (name, value) in res.headers() {
         if let Ok(v) = value.to_str() {
-            headers.insert(name.as_str().to_lowercase(), v.to_string());
+            let key = name.as_str().to_lowercase();
+            // 重复头（多值）按 fetch 语义用 ", " 合并：last-wins 会把一次下发多个
+            // 的 Set-Cookie 只留最后一个（扫码确认一次回 4 个），包侧就取不到
+            // SESSDATA 了。Expires 日期里自带的逗号由包侧按 cookie 名白名单拆分。
+            match headers.get_mut(&key) {
+                Some(prev) => {
+                    prev.push_str(", ");
+                    prev.push_str(v);
+                }
+                None => {
+                    headers.insert(key, v.to_string());
+                }
+            }
         }
     }
     // 上游 content-type 不可靠（网易歌单接口回 text/plain、QQ 回 x-javascript、
@@ -138,6 +186,22 @@ pub(crate) async fn source_builtin_request(
         headers.insert("x-qt-flac-bits".to_string(), bits.to_string());
     }
     let text = String::from_utf8_lossy(&raw).into_owned();
+    // v14：base64 通道（QQ 扫码 ptqrshow 的 PNG 等）——原始字节 base64 回传，
+    // 不做 JSON 解析（base64 串被 serde_json 解析成字符串没有歧义，但显式短路
+    // 更省一次无谓解析；flac 嗅探对二进制图像无意义但无害，保持共用逻辑）。
+    if options
+        .and_then(|o| o.response_encoding.as_deref())
+        .map(|v| v.eq_ignore_ascii_case("base64"))
+        .unwrap_or(false)
+    {
+        use base64::Engine as _;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
+        return Ok(SourceResponse {
+            status_code: status,
+            headers,
+            body: serde_json::Value::String(encoded),
+        });
+    }
     let body =
         serde_json::from_str::<serde_json::Value>(&text).unwrap_or(serde_json::Value::String(text));
     Ok(SourceResponse {
@@ -286,6 +350,23 @@ pub async fn cmd_set_track_quality(
     quality: crate::audio::state::Quality,
 ) -> Result<(), String> {
     state.engine.send(AudioCmd::SetTrackQuality { quality });
+    Ok(())
+}
+
+/// 各平台独立音质（音源账号页）：全量推送 {平台: 档位}，只更新引擎运行时副本
+/// （持久化在前端设置库，应用启动/变更时由前端重灌）。缺平台 = 该平台回落
+/// 全局默认音质。未知档位直接报错（前端归一后的值都来自注册表声明）。
+#[tauri::command(rename = "set_source_qualities")]
+pub async fn cmd_set_source_qualities(
+    state: State<'_, AppState>,
+    qualities: HashMap<String, String>,
+) -> Result<(), String> {
+    let mut parsed: HashMap<String, Quality> = HashMap::new();
+    for (platform, q) in qualities {
+        let quality = Quality::parse(&q).ok_or_else(|| format!("未知音质: {q}"))?;
+        parsed.insert(platform, quality);
+    }
+    state.engine.send(AudioCmd::SetSourceQualities { qualities: parsed });
     Ok(())
 }
 
@@ -2103,6 +2184,14 @@ pub async fn cmd_list_track_playlists(
     .map_err(|e| format!("读取收藏归属失败: {e}"))?
 }
 
+/// musicId 主段：kg 打包形态 "主hash|320hash|sqhash"（v15 官方线路取档载体），
+/// 收藏直连只用主 hash；无 "|" 即旧形态整串。
+fn primary_music_id(music_id: Option<&str>) -> Option<&str> {
+    music_id
+        .map(|v| v.split('|').next().unwrap_or(v))
+        .filter(|v| !v.is_empty())
+}
+
 /// 本地收藏写库成功后推一份到云端。
 /// 未登录**静默跳过**；推送失败（断网 / 后端不可达）入 pending_like_ops
 /// 离线队列，启动和网络恢复时 flush_pending_like_ops 按序重放（LIKE_SYNC_DESIGN.md §3）。
@@ -2126,7 +2215,7 @@ async fn push_like_song(
         name: &track.title,
         singer: &track.singer,
         album: &track.album,
-        hash: track.music_id.as_deref(),
+        hash: primary_music_id(track.music_id.as_deref()),
         pid,
         // 收藏时带上封面 URL 快照（LIKE_SONG_PIC_SYNC_DESIGN §8.3）；
         // 为空时 like_song 不会上送，服务端保留已有图片
@@ -2170,7 +2259,7 @@ async fn push_like_songs_batch(
                 name: &track.title,
                 singer: &track.singer,
                 album: &track.album,
-                hash: track.music_id.as_deref(),
+                hash: primary_music_id(track.music_id.as_deref()),
                 pid: pid.as_deref(),
                 pic_url: Some(track.pic_url.as_str()),
             };
@@ -3463,9 +3552,10 @@ pub async fn cmd_resume_downloads(
     Ok(resumed)
 }
 
-/// 把前端取到的歌词写进下载目录（`<音频文件名>.lrc`）。下载完成时 Rust 侧
-/// 会先落一次本地缓存词（见 launch_download 的 sidecar）；这条命令兜另一种
-/// 情况：下载完成当时本地还没有歌词，之后播放 / 取词拿到再补写。
+/// 把前端取到的歌词写进下载成品（内嵌标签或 `.lrc`，跟随「下载存储方式」）。
+/// 下载完成时 Rust 侧会先存一次本地缓存词（见 launch_download 的
+/// save_download_extras）；这条命令兜另一种情况：下载完成当时本地还没有
+/// 歌词，之后播放 / 取词拿到再补写。
 #[tauri::command(rename = "write_download_lyric")]
 pub async fn cmd_write_download_lyric(
     state: State<'_, AppState>,
@@ -3478,6 +3568,8 @@ pub async fn cmd_write_download_lyric(
     if lrc.trim().is_empty() {
         return Ok(()); // 纯音乐 / 空词不落文件
     }
+    // 存储方式要在 db 被 move 进任务查询闭包之前读出来
+    let storage = download::download_storage(&db).await;
     let task = tauri::async_runtime::spawn_blocking(move || {
         db.with(|c| crate::db::store::download_task_by_id(c, &id))
     })
@@ -3490,7 +3582,28 @@ pub async fn cmd_write_download_lyric(
     let Some(file) = task.file_path else {
         return Err("该任务没有音频文件".to_string());
     };
-    let path = std::path::PathBuf::from(&file).with_extension("lrc");
+    let audio_path = std::path::PathBuf::from(&file);
+    // embed（默认）：歌词写进音频标签；格式不支持 / 写入失败降级回 .lrc，
+    // 与下载完成时的降级口径一致
+    if storage == download::StorageMode::Embed {
+        let p = audio_path.clone();
+        let lrc_for_embed = lrc.clone();
+        let outcome = tauri::async_runtime::spawn_blocking(move || {
+            crate::embed::update_embedded_lyric(&p, &lrc_for_embed)
+        })
+        .await
+        .map_err(|e| format!("内嵌歌词失败: {e}"))?;
+        match outcome {
+            crate::embed::EmbedOutcome::Done => return Ok(()),
+            crate::embed::EmbedOutcome::Skipped(why) => {
+                log::info!("[download] 歌词内嵌跳过（{why}），改写 .lrc");
+            }
+            crate::embed::EmbedOutcome::Failed(why) => {
+                log::warn!("[download] 歌词内嵌失败（{why}），改写 .lrc");
+            }
+        }
+    }
+    let path = audio_path.with_extension("lrc");
     tauri::async_runtime::spawn_blocking(move || std::fs::write(&path, lrc.as_bytes()))
         .await
         .map_err(|e| format!("写入歌词失败: {e}"))?
@@ -4119,7 +4232,7 @@ pub async fn cmd_like_push_song(
             name: &track.title,
             singer: &track.singer,
             album: &track.album,
-            hash: track.music_id.as_deref(),
+            hash: primary_music_id(track.music_id.as_deref()),
             pid: pid.as_deref(),
             pic_url: Some(track.pic_url.as_str()),
         })
@@ -5570,6 +5683,8 @@ mod tests {
                 ),
                 body: None,
                 timeout_ms: Some(15_000),
+                redirect: None,
+                response_encoding: None,
             }),
         )
         .await

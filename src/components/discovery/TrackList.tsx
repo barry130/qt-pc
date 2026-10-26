@@ -13,6 +13,7 @@ import { useTrackSelection } from "@/hooks/useTrackSelection";
 import type { TrackSelection } from "@/lib/track-selection";
 import { toastError, toastSuccess } from "@/stores/toast";
 import { clampQualityForPlatform } from "@/stores/sourceRegistry";
+import { sourceDownloadQualityOf } from "@/lib/source-quality";
 import * as ipc from "@/services/ipc";
 import { errMsg } from "@/lib/utils";
 import { CollectButton } from "../mine/CollectButton";
@@ -21,6 +22,7 @@ import { DownloadButton } from "../mine/DownloadButton";
 import { SourceSwitchPanel } from "../player/SourceSwitchPanel";
 import { LocalCover } from "../library/LocalCover";
 import { RowActions } from "../common/RowActions";
+import { SourceTag } from "../common/SourceTag";
 import { IconButton } from "../common/IconButton";
 import { PlayNextIcon } from "../common/PlayNextIcon";
 import { ContextMenu, FloatingPanel, type ContextMenuItem } from "../common/ContextMenu";
@@ -93,6 +95,15 @@ export function TrackList(props: {
    * 本地行专属配置（plainRow / onChanged / onError 只对 `platform === "local"` 的行生效）。
    */
   local?: LocalListOptions;
+  /**
+   * 每行的补充说明（如每日推荐的「推荐理由」）。
+   *
+   * 用「按曲目取」的函数而不是 `Map`：调用方几乎都是现造箭头函数，函数本身
+   * 每次渲染都换引用会让 `memo` 白做；而 `TrackRow` 只在**自己这行**调用它，
+   * 传下去的是同一份 `Track`，`memo` 的浅比较仍然命中（调用方要用 `useCallback`
+   * 包一下，`DailyRecommendPage` 已这么做）。
+   */
+  reasonOf?: (track: Track) => string | undefined;
 }): React.JSX.Element {
   const {
     tracks,
@@ -103,6 +114,7 @@ export function TrackList(props: {
     showDownload = false,
     selection: selectionProp,
     local,
+    reasonOf,
   } = props;
   const selection = selectionProp ?? local?.selection;
   const { keyOf, select, selectAll, clear } = useTrackSelection(tracks, selection);
@@ -231,6 +243,7 @@ export function TrackList(props: {
             onChanged={handleChanged}
             onError={handleError}
             play={play}
+            reason={reasonOf?.(t)}
           />
         );
       })}
@@ -274,6 +287,8 @@ interface TrackRowProps {
   onChanged: () => void;
   onError: (msg: string) => void;
   play: (track: Track) => Promise<void>;
+  /** 行内补充说明（每日推荐的推荐理由）；空则不渲染 */
+  reason?: string;
 }
 
 const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element {
@@ -302,6 +317,7 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
     onChanged,
     onError,
     play,
+    reason,
   } = props;
   const navigate = useNavigate();
   const cover = qtresCoverUrl(t.picUrl);
@@ -343,7 +359,7 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
   const download = (): void => {
     void (async () => {
       try {
-        const wanted = await ipc.getDownloadQuality();
+        const wanted = sourceDownloadQualityOf(t.platform);
         await ipc.startDownload(t, clampQualityForPlatform(t.platform, wanted));
         toastSuccess("加入下载队列成功");
       } catch (err) {
@@ -539,6 +555,8 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-1.5">
           <span className="truncate text-sm">{t.title}</span>
+          {/* 平台简称：本地曲目由 SourceTag 自己判空（本地没有"平台"可言） */}
+          <SourceTag platform={t.platform} size="xs" />
           {!plainRow && isDownloaded && (
             <span className="shrink-0 rounded bg-primary/15 px-1 py-px text-[10px] text-primary">
               已下载
@@ -590,6 +608,11 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
             </>
           ) : null}
         </div>
+        {/* 推荐理由（每日推荐页）：单独一行、字号更小，不与「歌手 · 专辑」抢同一行。
+            只有调用方传了 `reasonOf` 才有值，其它页面不渲染任何多余节点。 */}
+        {reason ? (
+          <p className="mt-0.5 truncate text-[11px] text-muted-foreground/80">{reason}</p>
+        ) : null}
       </div>
       {/* 悬停露出队列操作：下一首播放 / 加入队尾（不打断当前播放）；
           本地模式第一个按钮改为「播放」，语义同点击整行（从这首起播当前列表） */}

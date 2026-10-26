@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import * as ipc from "@/services/ipc";
+import { coerceNumber as numberValue, coerceString as stringValue } from "@/lib/coerce";
 import { DISCLAIMER_KEY } from "@/lib/storageKeys";
 
 /**
@@ -185,11 +186,4 @@ export function pickDisclaimer(data: unknown): DisclaimerNotice | null {
   };
 }
 
-function stringValue(value: unknown): string {
-  return typeof value === "string" ? value : value == null ? "" : String(value);
-}
-
-function numberValue(value: unknown): number {
-  const result = Number(value);
-  return Number.isFinite(result) ? result : 0;
-}
+// stringValue/numberValue 的实现合并到 `@/lib/coerce`（coerceString/coerceNumber）。

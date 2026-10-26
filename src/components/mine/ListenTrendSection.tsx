@@ -1,13 +1,13 @@
 import { useEffect, useState } from "react";
-import { ChevronRight, Music4 } from "lucide-react";
+import { ChevronRight } from "lucide-react";
 import type { ListenDayReport, ListenReportEntry, ListenReportKind } from "@/types";
 import * as ipc from "@/services/ipc";
 import { cn, errMsg } from "@/lib/utils";
-import { qtresCoverUrl } from "@/lib/lrc";
+
 import { formatDayAxis, formatReportDuration, listenDayKey, reportSourceLabel } from "@/lib/listen-report";
 import { useSourceLabelFn } from "@/stores/sourceRegistry";
-import { ArtistAvatar } from "@/components/common/ArtistAvatar";
-import { SourceLogo } from "@/components/common/SourceLogo";
+import { SourceTag } from "@/components/common/SourceTag";
+import { EntryPicture } from "./ListenReportBits";
 import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 
 /** 时间档，与 Rust 侧 `days` 窗口一一对应（1 = 今天）。 */
@@ -106,9 +106,9 @@ export function ListenTrendSection(props: {
             <li key={entry.id} className="border-b border-border/50 last:border-b-0">
               <button type="button" className="flex w-full items-center gap-3 py-2 text-left transition-colors hover:bg-secondary/60" onClick={() => onOpenDetail(kind, days, entry)}>
                 <span className="w-5 shrink-0 text-center text-xs tabular-nums text-muted-foreground">{index + 1}</span>
-                <EntryPicture entry={entry} kind={kind} name={nameOf(entry)} />
+                <EntryPicture entry={entry} kind={kind} name={nameOf(entry)} size={32} />
                 <span className="min-w-0 flex-1">
-                  <span className="block truncate text-sm">{nameOf(entry)}</span>
+                  <span className="flex min-w-0 items-center gap-1.5 text-sm"><span className="truncate">{nameOf(entry)}</span>{entry.track ? <SourceTag platform={entry.track.platform} size="xs" /> : null}</span>
                   <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">{kind === "tracks" ? entry.track?.singer || "未知歌手" : `${entry.trackCount} 首歌曲`}</span>
                 </span>
                 <span className="shrink-0 text-right text-[11px] tabular-nums text-muted-foreground">{entry.playCount} 次<span className="mt-0.5 block">{formatReportDuration(entry.totalPlayedMs)}</span></span>
@@ -137,13 +137,4 @@ function Segmented<T extends string | number>(props: {
   </div>;
 }
 
-/** 三档维度各自的图片口径，与累计榜的 GroupRow / EntryPicture 保持一致。 */
-function EntryPicture(props: { entry: ListenReportEntry; kind: ListenReportKind; name: string }): React.JSX.Element {
-  const { entry, kind, name } = props;
-  if (kind === "sources") return <SourceLogo platform={entry.id} size={32} />;
-  if (kind === "singers") return <ArtistAvatar platform={entry.platform} name={name} size={32} />;
-  const cover = entry.track ? qtresCoverUrl(entry.track.picUrl, 96) : "";
-  return <span className="flex h-8 w-8 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-primary/10 text-primary">
-    {cover ? <img src={cover} alt="" loading="lazy" className="h-full w-full object-cover" /> : <Music4 className="h-4 w-4" />}
-  </span>;
-}
+// EntryPicture 合并到 `./ListenReportBits`（与收听详情页同一实现，这里传 size={32}）。
