@@ -123,6 +123,10 @@ export function resetSourceAuthCaches(): void {
 export interface SourceAuthToggles {
   useMeta: boolean;
   usePlay: boolean;
+  /** 登录成功后是否自动同步该账户平台侧收藏歌单（2026-10-26 需求）。可选键：
+   *  旧记录没有该键 = 缺省开（读取方兜底）；parse 只收 boolean，缺省不写键，
+   *  记录形状向后兼容。 */
+  syncPlaylists?: boolean;
 }
 
 type SourceAuthTogglesMap = Record<string, SourceAuthToggles>;
@@ -146,7 +150,14 @@ export function parseSourceAuthToggles(raw: string | null | undefined): SourceAu
     const toggles = value as Record<string, unknown>;
     if (typeof toggles.useMeta !== "boolean") continue;
     if (typeof toggles.usePlay !== "boolean") continue;
-    out[source] = { useMeta: toggles.useMeta, usePlay: toggles.usePlay };
+    out[source] = {
+      useMeta: toggles.useMeta,
+      usePlay: toggles.usePlay,
+      // syncPlaylists 只收 boolean：缺省/坏值不写键（缺省语义 = 开，读取方兜底）
+      ...(typeof toggles.syncPlaylists === "boolean"
+        ? { syncPlaylists: toggles.syncPlaylists }
+        : {}),
+    };
   }
   return out;
 }
@@ -329,6 +340,25 @@ export async function setSourceAuthToggle(
   await writeTogglesMap({ ...map, [source]: next });
   await applySourceAuthForSource(source);
   if (scope === "play") emitPlayLoginChanged();
+}
+
+/** 读单源「登录后同步歌单」生效值（缺省 = 开）。不继承旧全局键——旧全局键
+ *  只有 meta/play 两面，没有同步语义。 */
+export async function readSourceAuthSyncPlaylistsFor(source: string): Promise<boolean> {
+  const map = await readTogglesMap();
+  return map[source]?.syncPlaylists ?? true;
+}
+
+/** 保存单源「登录后同步歌单」开关：把生效值物化进 per-source 表（与两面开关
+ *  同口径，物化后缺省值不再影响该源），无变化短路。该开关不影响引擎注入面，
+ *  不触发 setAuth/事件。失败抛给调用方决定提示。 */
+export async function saveSourceAuthSyncPlaylists(source: string, on: boolean): Promise<void> {
+  const map = { ...(await readTogglesMap()) };
+  // 开关行只在登录后显示；仍以库里账号表为准（缓存未热也能算对）
+  const accounts = await readSourceAuthAccounts();
+  const current = await effectiveTogglesFor(source, map, accounts[source] !== undefined);
+  if ((current.syncPlaylists ?? true) === on) return;
+  await writeTogglesMap({ ...map, [source]: { ...current, syncPlaylists: on } });
 }
 
 // ---------- 官方线路档位（v10：登录态下档位展示整体切官方清单） ----------

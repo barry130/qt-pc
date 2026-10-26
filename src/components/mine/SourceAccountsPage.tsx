@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { stripErrorUrls } from "@/lib/utils";
 import {
   mergeCredentialExtras,
@@ -7,6 +7,7 @@ import {
   readSourceAuthTogglesFor,
   removeSourceAuthAccount,
   saveSourceAuthAccount,
+  saveSourceAuthSyncPlaylists,
   setSourceAuthToggle,
   type SourceAuthAccount,
   type SourceAuthToggles,
@@ -22,6 +23,8 @@ import {
   type SourceAuthUser,
 } from "@/source-scripts";
 import { runWebLoginFlow } from "@/lib/source-web-login";
+import { autoSyncMissingAfterLogin } from "@/lib/source-playlist-sync";
+import { SourcePlaylistSyncDialog } from "./SourcePlaylistSyncDialog";
 import { toast, toastError } from "@/stores/toast";
 import { sourceQualityOptionsOf, useSourceRegistryStore } from "@/stores/sourceRegistry";
 import { qualityOptionsFromRegistry } from "@/lib/quality";
@@ -257,6 +260,8 @@ export function SourceAccountsPage(): React.JSX.Element {
         setToggles((prev) => ({ ...prev, [item.id]: tg }));
         if (acc) {
           toast(`已登录${acc.user.nickname}（${acc.user.vip ? acc.user.vipLabel || "会员" : "非会员"}）`);
+          // 落库成功的下一步：按「登录后同步歌单」开关决定是否自动拉差集
+          maybeAutoSync(item.id, item.name);
         }
       })
       .catch((e) => {
@@ -271,6 +276,7 @@ export function SourceAccountsPage(): React.JSX.Element {
   // 轮询按「会话 key」起停：状态更新不改依赖，只有换二维码/关弹窗才重置间隔
   const qrKey = qr?.key;
   const qrSource = qr?.source;
+  const qrSourceName = qr?.sourceName;
   useEffect(() => {
     if (qrKey === undefined || qrSource === undefined) return;
     let cancelled = false;
@@ -295,6 +301,8 @@ export function SourceAccountsPage(): React.JSX.Element {
                 setStale((prev) => ({ ...prev, [qrSource]: false }));
                 setQr(null);
                 toast(`已登录${r.user.nickname}（${r.user.vip ? r.user.vipLabel || "会员" : "非会员"}）`);
+                // 落库成功的下一步：按「登录后同步歌单」开关决定是否自动拉差集
+                maybeAutoSync(qrSource, qrSourceName ?? qrSource);
               })
               .catch((e) => {
                 toastError(`登录态保存失败：${stripErrorUrls(String(e))}`);
@@ -313,7 +321,7 @@ export function SourceAccountsPage(): React.JSX.Element {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [qrKey, qrSource]);
+  }, [qrKey, qrSource, qrSourceName]);
 
   const importCookie = (): void => {
     if (cookieSource === null) return;
@@ -341,6 +349,8 @@ export function SourceAccountsPage(): React.JSX.Element {
           setCookieSource(null);
           setCookieText("");
           toast(`已导入${sourceName}登录：${user.nickname}`);
+          // 落库成功的下一步：按「登录后同步歌单」开关决定是否自动拉差集
+          maybeAutoSync(source, sourceName);
         });
       })
       .catch((e) => {
@@ -350,14 +360,17 @@ export function SourceAccountsPage(): React.JSX.Element {
   };
 
   /** 短信/密码登录成功的公共落库路径（与扫码 confirmed 同流程）。
-   *  短信/密码应答同样暂无凭据副键，extras 留空由后台保活轮换时补齐。 */
-  const finishLogin = (source: string, cookie: string, user: SourceAuthUser): Promise<void> =>
+   *  短信/密码应答同样暂无凭据副键，extras 留空由后台保活轮换时补齐。
+   *  sourceName 仅供落库成功后的自动同步弹窗标题用。 */
+  const finishLogin = (source: string, cookie: string, user: SourceAuthUser, sourceName: string): Promise<void> =>
     saveSourceAuthAccount(source, cookie, user, undefined).then(async () => {
       const tg = await readSourceAuthTogglesFor(source);
       setToggles((prev) => ({ ...prev, [source]: tg }));
       refreshAccounts();
       setStale((prev) => ({ ...prev, [source]: false }));
       toast(`已登录${user.nickname}（${user.vip ? user.vipLabel || "会员" : "非会员"}）`);
+      // 落库成功的下一步：按「登录后同步歌单」开关决定是否自动拉差集
+      maybeAutoSync(source, sourceName);
     });
 
   const sendSms = (): void => {
@@ -387,7 +400,7 @@ export function SourceAccountsPage(): React.JSX.Element {
     setSmsBusy(true);
     authLoginByPhone(sms.source, sms.key, code)
       .then((r) =>
-        finishLogin(sms.source, r.cookie, r.user).then(() => {
+        finishLogin(sms.source, r.cookie, r.user, sms.sourceName).then(() => {
           setSms(null);
           setPhoneText("");
           setCodeText("");
@@ -408,7 +421,7 @@ export function SourceAccountsPage(): React.JSX.Element {
     setPwdBusy(true);
     authLoginByPassword(pwd.source, account, password)
       .then((r) =>
-        finishLogin(pwd.source, r.cookie, r.user).then(() => {
+        finishLogin(pwd.source, r.cookie, r.user, pwd.sourceName).then(() => {
           setPwd(null);
           setAccountText("");
           setPwdText("");
@@ -433,6 +446,45 @@ export function SourceAccountsPage(): React.JSX.Element {
     if (current === undefined) return;
     setToggles((prev) => ({ ...prev, [source]: { ...current, [scope === "meta" ? "useMeta" : "usePlay"]: on } }));
     setSourceAuthToggle(source, scope, on).catch((e) => {
+      setToggles((prev) => ({ ...prev, [source]: current }));
+      toastError(`保存失败：${stripErrorUrls(String(e))}`);
+    });
+  };
+
+  /** 账户歌单同步弹窗（2026-10-26 需求）：卡片「同步歌单」按钮与登录成功
+   *  后的自动触发共用一个 state；null = 关闭。 */
+  const [syncDialog, setSyncDialog] = useState<{ source: string; sourceName: string } | null>(null);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  /** 登录成功后的自动同步：该源「登录后同步歌单」开着才拉差集预览；平台侧
+   *  有本地没有的歌单就自动打开同步弹窗。预览失败（包旧/未实现/网络问题）
+   *  只 console.warn 静默——不打扰登录成功的反馈；弹窗 state 更新前校验
+   *  页面还挂着，卸载/竞态不再弹。 */
+  const maybeAutoSync = (source: string, sourceName: string): void => {
+    void autoSyncMissingAfterLogin(source)
+      .then((missing) => {
+        if (missing === null || missing.length === 0) return;
+        if (!mountedRef.current) return;
+        setSyncDialog({ source, sourceName });
+      })
+      .catch((e) => {
+        console.warn(`[source-playlist-sync] 登录后自动同步预览失败（${source}）`, e);
+      });
+  };
+
+  /** 「登录后同步歌单」开关（只在登录态显示；缺省开）。乐观更新 + 失败回滚，
+   *  与 toggleScope 同款反馈。 */
+  const toggleSyncPlaylists = (source: string, on: boolean): void => {
+    const current = toggles[source];
+    if (current === undefined) return;
+    setToggles((prev) => ({ ...prev, [source]: { ...current, syncPlaylists: on } }));
+    saveSourceAuthSyncPlaylists(source, on).catch((e) => {
       setToggles((prev) => ({ ...prev, [source]: current }));
       toastError(`保存失败：${stripErrorUrls(String(e))}`);
     });
@@ -480,6 +532,13 @@ export function SourceAccountsPage(): React.JSX.Element {
                     </div>
                     {account ? (
                       <span className="flex shrink-0 items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setSyncDialog({ source: item.id, sourceName: item.name })}
+                          className="rounded-md border border-border px-2 py-1 text-xs hover:bg-accent"
+                        >
+                          同步歌单
+                        </button>
                         {account.user.avatar ? (
                           <img
                             src={account.user.avatar}
@@ -610,6 +669,20 @@ export function SourceAccountsPage(): React.JSX.Element {
                         disabled={!account}
                       />
                     </div>
+                    {account ? (
+                      <div className="flex items-center justify-between gap-4 py-2">
+                        <div className="min-w-0">
+                          <p className="text-sm">登录后同步歌单</p>
+                          <p className="mt-0.5 text-xs text-muted-foreground">
+                            登录成功后自动拉取该账户在平台侧的收藏歌单，提示收藏本地还没有的；也可随时点上方「同步歌单」手动触发。
+                          </p>
+                        </div>
+                        <Switch
+                          checked={tg.syncPlaylists ?? true}
+                          onToggle={() => toggleSyncPlaylists(item.id, !(tg.syncPlaylists ?? true))}
+                        />
+                      </div>
+                    ) : null}
                     {(
                       <>
                         {([
@@ -870,6 +943,18 @@ export function SourceAccountsPage(): React.JSX.Element {
             </div>
           </div>
         </div>
+      ) : null}
+
+      {syncDialog !== null ? (
+        <SourcePlaylistSyncDialog
+          source={syncDialog.source}
+          sourceName={syncDialog.sourceName}
+          onClose={() => setSyncDialog(null)}
+          onDone={() => {
+            // 收藏动作改的是「我的歌单」，页面本身只需保持账号缓存一致
+            refreshAccounts();
+          }}
+        />
       ) : null}
     </div>
   );

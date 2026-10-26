@@ -1109,13 +1109,18 @@ function normalizeAuthUser(raw: unknown): SourceAuthUser | null {
   };
 }
 
-/** 包装 v9 入口调用：缺入口（旧包）换成「该更新包了」，其余错误原样抛 */
-async function authCall<T>(entry: string, run: () => Promise<T>): Promise<T> {
+/** 包装入口调用：缺入口（旧包）换成「该更新包了」，其余错误原样抛。
+ *  outdated 缺省按 v9 提示（auth 段多数入口出自 v9），新版本入口传自己的提示。 */
+async function authCall<T>(
+  entry: string,
+  run: () => Promise<T>,
+  outdated: (missingEntry: string) => Error = packOutdatedV9,
+): Promise<T> {
   try {
     return await run();
   } catch (err) {
     if (!isMissingEntryError(err)) throw err;
-    throw packOutdatedV9(entry);
+    throw outdated(entry);
   }
 }
 
@@ -1380,6 +1385,64 @@ export async function authClearCredential(scope: SourceAuthScope, source?: Sourc
       source === undefined ? { scope } : { scope, source },
       (p) => (p.ok === true ? { ok: true } : undefined),
     ),
+  );
+}
+
+// ---------- 账户歌单同步（v18 契约 accountPlaylists） ----------
+
+/** 登录账户在平台侧的歌单（平台侧收藏的在线歌单 + 平台自建歌单，owned 区分）。
+ *  宿主侧与本地已收藏在线歌单 diff（lib/source-playlist-sync），缺失项引导
+ *  用户勾选收藏。 */
+export interface SourceAccountPlaylist {
+  id: string;
+  name: string;
+  picUrl?: string;
+  trackCount?: number;
+  /** true = 平台侧自建歌单；false = 平台侧收藏的（别人的）歌单 */
+  owned: boolean;
+}
+
+/** v18 入口的缺包提示（accountPlaylists） */
+function packOutdatedV18(entry: string): Error {
+  return packOutdated(entry, "数据包 2026.10.26.3（META_REVISION 14）");
+}
+
+/** 拉取登录账户在平台侧的歌单清单（v18）。包侧应答 { list: [...] }：
+ *  id/name 非空字符串的条目才收（形状不对/字段缺失的坏条目直接丢弃），
+ *  顺序保持包侧下发顺序。未登录/包旧抛错由调用方决定展示。 */
+export async function accountPlaylists(source: SourceId): Promise<SourceAccountPlaylist[]> {
+  return authCall(
+    "accountPlaylists",
+    () =>
+      sourceCall<SourceAccountPlaylist[]>(
+        "accountPlaylists",
+        { source },
+        (p) => {
+          // 包侧 meta 入口（meta-entries v14）回 { list: [...] }
+          const list = Array.isArray(p.list) ? p.list : undefined;
+          if (list === undefined) return undefined;
+          const out: SourceAccountPlaylist[] = [];
+          for (const raw of list) {
+            if (raw === null || typeof raw !== "object") continue;
+            const item = raw as Record<string, unknown>;
+            if (typeof item.id !== "string" || item.id.length === 0) continue;
+            if (typeof item.name !== "string" || item.name.length === 0) continue;
+            out.push({
+              id: item.id,
+              name: item.name,
+              ...(typeof item.picUrl === "string" && item.picUrl.length > 0
+                ? { picUrl: item.picUrl }
+                : {}),
+              ...(typeof item.trackCount === "number" && Number.isFinite(item.trackCount)
+                ? { trackCount: item.trackCount }
+                : {}),
+              owned: item.owned === true,
+            });
+          }
+          return out;
+        },
+      ),
+    packOutdatedV18,
   );
 }
 
