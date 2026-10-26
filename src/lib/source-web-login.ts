@@ -18,12 +18,19 @@ import { saveSourceAuthAccount } from "@/lib/source-auth";
 /** runWebLoginFlow 的三态结果（页面据此提示） */
 export type WebLoginOutcome = "ok" | "timeout" | "cancelled";
 
+/** capture 的返回：closed=true 表示登录窗口已不存在（用户手动关闭） */
+export interface WebLoginCapture {
+  closed: boolean;
+  /** 逐 URL 拼好的 Cookie 字符串（"name=value; …"） */
+  chunks: string[];
+}
+
 /** runWebLoginFlow 的可注入依赖（全部可换桩） */
 export interface WebLoginDeps {
   /** 打开（或重建）登录窗口 */
   openWindow(url: string): Promise<void>;
-  /** 逐 URL 读 Cookie 字符串（"name=value; …"，窗口不存在返回 []） */
-  capture(urls: string[]): Promise<string[]>;
+  /** 逐 URL 读 Cookie；closed=true = 窗口已被用户关闭（立即收摊） */
+  capture(urls: string[]): Promise<WebLoginCapture>;
   /** 官方校验：ok=false = Cookie 无效（继续轮询） */
   validateImport(
     source: string,
@@ -106,9 +113,10 @@ function defaultDeps(): Pick<
 /**
  * 跑一轮网页登录：openWindow → 每 intervalMs 捕获一次 Cookie → 合并去重 →
  * 命中任一 cookieMarkers（空 markers = 有任意 Cookie）→ authImportCookie 校验
- * → ok 则 save + closeWindow + "ok"；校验不过继续轮询；总时长 timeoutMs 未果
- * → closeWindow + "timeout"；capture/open 抛错（用户手动关窗等）→ closeWindow
- * 兜底 + "cancelled"。
+ * → ok 则 save + closeWindow + "ok"；校验不过继续轮询；capture 返回
+ * closed=true（用户手动关窗）→ "cancelled" 立即收摊（不能等超时，否则按钮
+ * 会一直卡在「登录中…」）；总时长 timeoutMs 未果 → closeWindow + "timeout"；
+ * capture/open 抛错 → closeWindow 兜底 + "cancelled"。
  */
 export async function runWebLoginFlow(
   args: WebLoginArgs,
@@ -122,8 +130,13 @@ export async function runWebLoginFlow(
   try {
     await deps.openWindow(args.webLogin.url);
     while (Date.now() < deadline) {
-      const chunks = await deps.capture(urls);
-      const cookie = mergeCookies(chunks);
+      const captured = await deps.capture(urls);
+      if (captured.closed) {
+        // 用户把登录窗口关了：窗口已不存在（closeWindow 是幂等销毁，这里
+        // 不必再调），立即结束，让页面把「登录中…」复位。
+        return "cancelled";
+      }
+      const cookie = mergeCookies(captured.chunks);
       if (markerHit(cookie, args.webLogin.cookieMarkers)) {
         let verdict: { ok: boolean; user: SourceAuthUser | null };
         try {

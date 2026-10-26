@@ -1129,10 +1129,13 @@ export async function sourceWebLoginOpen(url: string): Promise<void> {
 
 /**
  * 逐 URL 读取登录窗口 Cookie（含 httpOnly/secure）：每个 URL 拼
- * `name=value; name2=v2` 字符串；窗口不存在返回 []。
+ * `name=value; name2=v2` 字符串；窗口不存在（用户手动关窗）返回
+ * `{ closed: true, chunks: [] }`，调用方据此立即结束轮询。
  * 注意：Rust 侧必须 async command（Windows 上同步调用 cookies_for_url 会死锁）。
  */
-export async function sourceWebLoginCapture(urls: string[]): Promise<string[]> {
+export async function sourceWebLoginCapture(
+  urls: string[],
+): Promise<{ closed: boolean; chunks: string[] }> {
   return invoke("source_web_login_capture", { urls });
 }
 

@@ -6,6 +6,8 @@
 //! （QQ/微信/手机号…）登录；前端（src/lib/source-web-login.ts）轮询
 //! [`source_web_login_capture`] 逐 URL 读 Cookie，合并后命中 marker 就走
 //! 现有 authImportCookie 校验并 saveSourceAuthAccount 入库，最后关窗。
+//! 用户手动关窗由 capture 返回 `closed=true` 明确告知前端（不能只回空列表：
+//! 页面加载期本来就可能是空 Cookie，前端无法区分）。
 //!
 //! 为什么读 Cookie 必须走 Rust：窗口内是官方页面的 httpOnly/secure Cookie，
 //! JS 读不到，只能用 `WebviewWindow::cookies_for_url`（含 httpOnly/secure）。
@@ -43,15 +45,27 @@ pub async fn source_web_login_open(app: AppHandle, url: String) -> Result<(), St
         .map_err(|_| "主线程建窗结果通道关闭".to_string())?
 }
 
+/// [`source_web_login_capture`] 的返回：`closed=true` 表示登录窗口已不存在
+/// （用户手动关闭），前端据此立即结束本轮（cancelled），不再空转到超时。
+#[derive(serde::Serialize)]
+pub struct WebLoginCapture {
+    pub closed: bool,
+    /// 逐 URL 拼好的 Cookie 字符串（closed=true 时为空）
+    pub chunks: Vec<String>,
+}
+
 /// 逐 URL 读取登录窗口的 Cookie（含 httpOnly/secure）：每个 URL 把命中的
 /// Cookie 拼成 `name=value; name2=v2` 字符串，空串（无 Cookie/解析失败）过滤。
-/// 窗口不存在（用户已关）→ 返回空 vec，由前端判定为「已取消」。
+/// 窗口不存在（用户已关）→ `closed=true`，前端判定为「已取消」。
 #[tauri::command]
-pub async fn source_web_login_capture(app: AppHandle, urls: Vec<String>) -> Vec<String> {
+pub async fn source_web_login_capture(
+    app: AppHandle,
+    urls: Vec<String>,
+) -> Result<WebLoginCapture, String> {
     let Some(win) = app.get_webview_window(WEB_LOGIN_LABEL) else {
-        return Vec::new();
+        return Ok(WebLoginCapture { closed: true, chunks: Vec::new() });
     };
-    let mut out = Vec::new();
+    let mut chunks = Vec::new();
     for raw in urls {
         // 单个 URL 解析失败只跳过该条，不拖垮整批
         let Ok(url) = tauri::Url::parse(&raw) else {
@@ -66,13 +80,13 @@ pub async fn source_web_login_capture(app: AppHandle, urls: Vec<String>) -> Vec<
                     .collect::<Vec<_>>()
                     .join("; ");
                 if !joined.is_empty() {
-                    out.push(joined);
+                    chunks.push(joined);
                 }
             }
             Err(e) => log::warn!("[web-login] capture 读取 Cookie 失败 {raw}: {e}"),
         }
     }
-    out
+    Ok(WebLoginCapture { closed: false, chunks })
 }
 
 /// 关闭并销毁登录窗口（校验成功/超时/取消后调用；不存在则忽略）。

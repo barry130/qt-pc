@@ -21,7 +21,7 @@ const WEBLOGIN = {
 function makeDeps() {
   return {
     openWindow: vi.fn().mockResolvedValue(undefined),
-    capture: vi.fn().mockResolvedValue([]),
+    capture: vi.fn().mockResolvedValue({ closed: false, chunks: [] }),
     validateImport: vi.fn().mockResolvedValue({ ok: false, user: null }),
     save: vi.fn().mockResolvedValue(undefined),
     closeWindow: vi.fn().mockResolvedValue(undefined),
@@ -50,7 +50,7 @@ describe("runWebLoginFlow", () => {
 
   it("marker 命中 → 校验通过 → 保存 → 关窗，返回 ok", async () => {
     const deps = makeDeps();
-    deps.capture.mockResolvedValue(["uin=o123; qm_keyst=AAA"]);
+    deps.capture.mockResolvedValue({ closed: false, chunks: ["uin=o123; qm_keyst=AAA"] });
     deps.validateImport.mockResolvedValue({ ok: true, user: { id: "u1", nickname: "小明", avatar: "", vip: true, vipLabel: "豪华VIP" } });
 
     const outcome = await runWebLoginFlow(
@@ -70,7 +70,7 @@ describe("runWebLoginFlow", () => {
 
   it("captureUrls 缺省时回退按 domains 拼 https://{domain}/", async () => {
     const deps = makeDeps();
-    deps.capture.mockResolvedValue([]);
+    deps.capture.mockResolvedValue({ closed: false, chunks: [] });
 
     await runWebLoginFlow(
       { source: "qq", webLogin: { url: WEBLOGIN.url, cookieMarkers: [] }, domains: ["y.qq.com", "qq.com"] },
@@ -82,7 +82,7 @@ describe("runWebLoginFlow", () => {
 
   it("markers 空数组：有任意 Cookie 即触发校验", async () => {
     const deps = makeDeps();
-    deps.capture.mockResolvedValue(["somecookie=1"]);
+    deps.capture.mockResolvedValue({ closed: false, chunks: ["somecookie=1"] });
     deps.validateImport.mockResolvedValue({ ok: true, user: { id: "u2", nickname: "小红", avatar: "", vip: false, vipLabel: "" } });
 
     const outcome = await runWebLoginFlow(
@@ -96,7 +96,7 @@ describe("runWebLoginFlow", () => {
 
   it("校验失败继续轮询，最终成功", async () => {
     const deps = makeDeps();
-    deps.capture.mockResolvedValue(["qm_keyst=AAA"]);
+    deps.capture.mockResolvedValue({ closed: false, chunks: ["qm_keyst=AAA"] });
     deps.validateImport
       .mockResolvedValueOnce({ ok: false, user: null })
       .mockResolvedValueOnce({ ok: false, user: null })
@@ -115,7 +115,7 @@ describe("runWebLoginFlow", () => {
 
   it("总时长超限仍未命中/校验不过 → 关窗返回 timeout", async () => {
     const deps = makeDeps();
-    deps.capture.mockResolvedValue([]);
+    deps.capture.mockResolvedValue({ closed: false, chunks: [] });
 
     const outcome = await runWebLoginFlow(
       { source: "qq", webLogin: WEBLOGIN, domains: ["y.qq.com"] },
@@ -141,5 +141,22 @@ describe("runWebLoginFlow", () => {
     expect(outcome).toBe("cancelled");
     expect(deps.save).not.toHaveBeenCalled();
     expect(deps.closeWindow).toHaveBeenCalledTimes(1);
+  });
+
+  it("capture 返回 closed=true（用户手动关窗）→ 立即 cancelled，不空转到超时", async () => {
+    const deps = makeDeps();
+    deps.capture.mockResolvedValue({ closed: true, chunks: [] });
+
+    const outcome = await runWebLoginFlow(
+      { source: "qq", webLogin: WEBLOGIN, domains: ["y.qq.com"] },
+      { ...deps, intervalMs: 1, timeoutMs: 60_000 },
+    );
+
+    expect(outcome).toBe("cancelled");
+    expect(deps.validateImport).not.toHaveBeenCalled();
+    expect(deps.save).not.toHaveBeenCalled();
+    // 只在首轮 capture 就发现已关：不应拖到 60s 超时（真实耗时 < 1s）
+    expect(deps.capture).toHaveBeenCalledTimes(1);
+    expect(deps.openWindow).toHaveBeenCalledTimes(1);
   });
 });
