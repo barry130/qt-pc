@@ -164,7 +164,13 @@ export async function runWebLoginFlow(
         }
         if (!failNotified) {
           failNotified = true;
-          deps.onProgress?.("已捕获官方登录 Cookie，但校验未通过，继续重试…（若一直失败请改用扫码登录或导入 Cookie）");
+          // 诊断信息只带 Cookie 名单（绝不带值）：帮助区分「jar 里缺登录态
+          // 主体」还是「主体在但官方校验拒识」
+          const names = [...new Set(cookie.split(";").map((p) => p.trim().split("=")[0] ?? "").filter((n) => n.length > 0))];
+          const shown = names.slice(0, 8).join(", ") + (names.length > 8 ? ` 等 ${names.length} 项` : "");
+          deps.onProgress?.(
+            `已捕获官方登录 Cookie（${names.length} 项：${shown}），但校验未通过，继续重试…（若一直失败请改用扫码登录或导入 Cookie）`,
+          );
         }
       }
       await sleep(Math.min(intervalMs, Math.max(deadline - Date.now(), 0)));
