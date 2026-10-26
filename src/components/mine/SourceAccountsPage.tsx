@@ -240,18 +240,31 @@ export function SourceAccountsPage(): React.JSX.Element {
   /** 网页登录（v17 契约 auth.webLogin）：打开官方登录窗，宿主按节奏轮询读
    *  Cookie（含 httpOnly，走 Rust source_web_login_capture），命中 marker 后
    *  authImportCookie 校验并 saveSourceAuthAccount 入库、自动关窗——全部在
-   *  runWebLoginFlow 内完成；这里按三态结果用既有 toast 模式反馈。 */
+   *  runWebLoginFlow 内完成；这里按三态结果用既有 toast 模式反馈。onProgress
+   *  把「已捕获 Cookie 但校验未通过 / 超时原因」透出，避免长时间无反馈的
+   *  静默轮询（用户在官方页登录完成后理应自动关窗，若没有会看到原因）。 */
   const startWebLogin = (item: SourceCard): void => {
     if (!item.webLogin || webLoginBusy !== null) return;
     setWebLoginBusy(item.id);
-    runWebLoginFlow({ source: item.id, webLogin: item.webLogin, domains: item.domains })
+    let progressNote: string | null = null;
+    runWebLoginFlow(
+      { source: item.id, webLogin: item.webLogin, domains: item.domains },
+      {
+        onProgress: (msg) => {
+          progressNote = msg;
+          toast(msg);
+        },
+      },
+    )
       .then(async (outcome) => {
         if (outcome === "timeout") {
-          toast("网页登录超时，请重试");
+          // 具体原因已由 onProgress 透出（捕获到 Cookie 校验不过 / 没捕获到）；
+          // 兜底仅在一条进度都没有时给静态文案。
+          if (progressNote === null) toast("网页登录超时，请重试");
           return;
         }
         if (outcome === "cancelled") {
-          toast("网页登录已取消");
+          toast("网页登录已取消（你关闭了登录窗口）");
           return;
         }
         // ok：与扫码/短信/密码登录同款提示（用户信息从已入库账号取）

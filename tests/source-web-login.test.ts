@@ -127,6 +127,40 @@ describe("runWebLoginFlow", () => {
     expect(deps.closeWindow).toHaveBeenCalledTimes(1);
   });
 
+  it("捕获到 marker 但校验一直不过 → onProgress 提示一次；超时说明已捕获 Cookie", async () => {
+    const deps = makeDeps();
+    deps.capture.mockResolvedValue({ closed: false, chunks: ["qm_keyst=AAA"] });
+    deps.validateImport.mockResolvedValue({ ok: false, user: null });
+    const onProgress = vi.fn();
+
+    const outcome = await runWebLoginFlow(
+      { source: "qq", webLogin: WEBLOGIN, domains: ["y.qq.com"] },
+      { ...deps, intervalMs: 1, timeoutMs: 30, onProgress },
+    );
+
+    expect(outcome).toBe("timeout");
+    const retry = onProgress.mock.calls.filter(([m]) => String(m).includes("校验未通过，继续重试"));
+    expect(retry.length).toBe(1); // 重试提示只发一次，不刷屏
+    const last = String(onProgress.mock.calls.at(-1)![0]);
+    expect(last).toContain("已捕获官方 Cookie"); // 超时原因区分「抓到了」
+  });
+
+  it("全程未捕获到 marker → 超时原因说明没抓到 Cookie", async () => {
+    const deps = makeDeps();
+    deps.capture.mockResolvedValue({ closed: false, chunks: ["tracker=1"] });
+    const onProgress = vi.fn();
+
+    const outcome = await runWebLoginFlow(
+      { source: "qq", webLogin: WEBLOGIN, domains: ["y.qq.com"] },
+      { ...deps, intervalMs: 1, timeoutMs: 30, onProgress },
+    );
+
+    expect(outcome).toBe("timeout");
+    expect(deps.validateImport).not.toHaveBeenCalled();
+    const last = String(onProgress.mock.calls.at(-1)![0]);
+    expect(last).toContain("未能"); // 超时原因区分「没抓到」
+  });
+
   it("capture 抛错（用户手动关窗）→ 兜底关窗返回 cancelled", async () => {
     const deps = makeDeps();
     deps.capture.mockRejectedValue(new Error("window destroyed"));

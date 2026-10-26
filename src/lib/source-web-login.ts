@@ -40,6 +40,12 @@ export interface WebLoginDeps {
   save(source: string, cookie: string, user: SourceAuthUser): Promise<void>;
   /** 关闭并销毁登录窗口 */
   closeWindow(): Promise<void>;
+  /**
+   * 进度反馈（可选）：把轮询途中的里程碑透给页面，避免静默空转——
+   * ① 捕获到 marker Cookie 但官方校验未通过（每轮只提示一次）；
+   * ② 超时收摊前的具体原因（捕获到 Cookie 校验不过 / 压根没捕获到）。
+   */
+  onProgress?(msg: string): void;
 }
 
 /** runWebLoginFlow 的入参：源 id + 数据包下发的 webLogin 声明 */
@@ -113,10 +119,11 @@ function defaultDeps(): Pick<
 /**
  * 跑一轮网页登录：openWindow → 每 intervalMs 捕获一次 Cookie → 合并去重 →
  * 命中任一 cookieMarkers（空 markers = 有任意 Cookie）→ authImportCookie 校验
- * → ok 则 save + closeWindow + "ok"；校验不过继续轮询；capture 返回
- * closed=true（用户手动关窗）→ "cancelled" 立即收摊（不能等超时，否则按钮
- * 会一直卡在「登录中…」）；总时长 timeoutMs 未果 → closeWindow + "timeout"；
- * capture/open 抛错 → closeWindow 兜底 + "cancelled"。
+ * → ok 则 save + closeWindow + "ok"；校验不过继续轮询（onProgress 提示一次）；
+ * capture 返回 closed=true（用户手动关窗）→ "cancelled" 立即收摊（不能等
+ * 超时，否则按钮会一直卡在「登录中…」）；总时长 timeoutMs 未果 → closeWindow
+ * + 经 onProgress 透出原因后返回 "timeout"；capture/open 抛错 → closeWindow
+ * 兜底 + "cancelled"。
  */
 export async function runWebLoginFlow(
   args: WebLoginArgs,
@@ -127,6 +134,10 @@ export async function runWebLoginFlow(
   const timeoutMs = overrides?.timeoutMs ?? 180_000;
   const urls = captureUrlsOf(args);
   const deadline = Date.now() + timeoutMs;
+  // 至少一次捕获到含 marker 的 Cookie（决定超时文案：校验不过 vs 没抓到）
+  let markerSeen = false;
+  // 「捕获到 Cookie 但校验未通过」的提示每轮流程只发一次，避免刷屏
+  let failNotified = false;
   try {
     await deps.openWindow(args.webLogin.url);
     while (Date.now() < deadline) {
@@ -138,6 +149,7 @@ export async function runWebLoginFlow(
       }
       const cookie = mergeCookies(captured.chunks);
       if (markerHit(cookie, args.webLogin.cookieMarkers)) {
+        markerSeen = true;
         let verdict: { ok: boolean; user: SourceAuthUser | null };
         try {
           verdict = await deps.validateImport(args.source, cookie);
@@ -150,10 +162,19 @@ export async function runWebLoginFlow(
           await deps.closeWindow();
           return "ok";
         }
+        if (!failNotified) {
+          failNotified = true;
+          deps.onProgress?.("已捕获官方登录 Cookie，但校验未通过，继续重试…（若一直失败请改用扫码登录或导入 Cookie）");
+        }
       }
       await sleep(Math.min(intervalMs, Math.max(deadline - Date.now(), 0)));
     }
     await deps.closeWindow();
+    deps.onProgress?.(
+      markerSeen
+        ? "登录超时：已捕获官方 Cookie 但校验一直未通过，登录未完成"
+        : "登录超时：未能在官方页面捕获到登录 Cookie（请确认已在窗口内完成登录）",
+    );
     return "timeout";
   } catch (e) {
     // capture/open 抛错 = 现场已破坏（用户手动关窗等）：兜底关窗收摊
