@@ -3,8 +3,8 @@
 - 项目名称：轻听 PC 版
 - 目标平台：Windows 10 / Windows 11
 - 技术定位：Tauri 2 + React + Tailwind CSS + shadcn/ui + Rust 音频核心
-- 文档版本：v1.22
-- 更新日期：2026-10-24
+- 文档版本：v1.23
+- 更新日期：2026-10-27
 - 关联文档：`qt-pc/DESIGN.md`、`../UPDATE_DESIGN.md`、`docs/CONFIG.md`、`docs/PACKAGING.md`
 
 ---
@@ -62,6 +62,7 @@
 | B27 | **账户歌单同步：登录自动对比 + 差集勾选收藏 + 同步开关** （v1.23 · 2026-10-26）：用户「登录源帐户时自动获取当前帐户的收藏歌单，然后和本地的在线收藏歌单进行对比，将结果展示出来供用户选择是否收藏未收藏的歌单……在音源帐户那里增加一个选项，供选择是否需要继续同步」。包侧契约 v18：meta 面新入口 `accountPlaylists(source)`（`AccountPlaylist{id,name,picUrl?,trackCount?,owned}`，五平台实现，wyy 把握最高、其余离线冻结待真机验证，失败全有人话报错；qt-sources v2026102603）。宿主：`accountPlaylists` 包装 + `source-playlist-sync`（与本地已收藏在线歌单 diff → missing 列表；勾选后逐个 `favoritePlaylist` 幂等收藏）；账号页每源第三开关「登录后同步歌单」（`syncPlaylists?` 缺省 true）+「同步歌单」按钮 + 弹窗（全选/单选/收藏所选/空态/错误展示）；四个登录成功点保存后自动拉 diff，missing>0 自动弹同步窗（异常静默）。验收：qt-pc 新增 20 条、全量 104 files / 1042 tests 全绿、tsc/eslint 干净；qt-sources auth.test.ts 64/64、tsc 0 错、build + smoke 全过（DESIGN R39 / §0.3-W） |
 | B28 | **音源账号卡片改版：默认开启歌单同步 + 卡片可折叠 + 数据请求备注** （v1.23 · 2026-10-27）：用户「将截图红色的那个删掉，不需要展示这个，默认开启，上面的同步歌单已经足够了；绿色框改为一个可折叠的，折叠就是将这个容器下面几行收起来；数据请求使用登录态后面加个备注，只有启用时才能同步歌单」。① 删除每源「登录后同步歌单」开关及其持久化（`SourceAuthToggles.syncPlaylists` 字段、读写函数、`autoSyncMissingAfterLogin` 的开关门控、账号页开关行），登录成功一律自动对比平台侧歌单，missing>0 自动弹同步弹窗；旧记录里的该键读入即丢弃，不需要迁移。② 卡片标题行（源名 + 登录状态）点一下折叠下面的「数据请求/播放请求开关 + 播放/下载音质」四行，`ChevronDown` 指示方向（`aria-expanded` 同步），默认展开、只存内存不持久化。③ 「数据请求使用登录态」描述补一句「只有启用时才能同步歌单。」——同步依赖数据面开关，不做额外禁用逻辑。验收：`tests/source-playlist-sync.test.tsx` 22 条（含折叠与备注）、全量 **105 files / 1047 tests** 全绿、`tsc --noEmit` 0 错、eslint 干净（DESIGN R40 / §0.3-W） |
 | B29 | **音源账号卡片默认收起 + 一键全部折叠/展开 + 两面开关缺省调整** （v1.23 · 2026-10-27）：用户「修改为默认折叠的，页面右上角加一个全部折叠/打开的按钮。页面里面的数据请求使用登录态默认为开，播放请求使用登录态为关」。① 卡片默认折叠（页面级 `allCollapsed=true` + 单卡覆盖），进页面只露标题行；② 页头右上角「全部折叠 / 全部展开」按钮按当前是否有卡片展开切换文案与图标，一点统一切换并清空单卡覆盖；③ 登录态缺省开关改为数据面开、播放面关（`effectiveTogglesFor` 与 `saveSourceAuthAccount` 首登物化只注 meta、clear play），`sourcePlayLoginActiveSync` 冷缓存兜底改为按关处理；未登录源也用同一缺省展示（开关行本就禁用）。验收：`tests/source-auth-toggles.test.ts` 与 `tests/source-playlist-sync.test.tsx`（折叠组 6 条）同步改断言，全量 105 files / 1050 tests 全绿、tsc 0 错、eslint 干净。另修：旧全局键 `sourceAuth.useMeta` / `sourceAuth.usePlay` 残留的 `true/true` 等于旧缺省、无用户意图，不再当继承源（否则永久盖住新缺省，未物化源全显示双开），仅任一面为 false 时才继承。（DESIGN R41 / §0.3-W） |
+| B30 | **无缝播放预热时机提前**（v1.23 · 2026-10-27）：用户「能不能优化一下，改为当前音乐加载完成后就开始预热」→ 当前曲目挂载成功即预热下一首，不等播放圈轮询；`Seek` / `SetSpeed` 不再打断预载；预载失败当场换目标重试（同曲上限 2 次）。验收：`cargo test --lib audio::` 82 条全绿（含新增 `preload_gate_tests` 4 条）、`cargo check` 0 错（DESIGN R42 / §7.5） |
 
 ---
 

@@ -353,7 +353,6 @@ struct PreloadSlot {
     index: usize,
     track: Track,
     ready: Option<PreparedTrack>,
-    failed: bool,
 }
 
 struct PreparedTrack {
@@ -376,6 +375,8 @@ struct EngineInner {
     gapless: bool,
     preload_gen: u64,
     preload: Option<PreloadSlot>,
+    /// 本曲内已用掉的预载失败重试次数（换曲/切歌边界归零，见 PRELOAD_RETRY_LIMIT）
+    preload_retries: u32,
     current_progress: Option<Arc<SourceProgress>>,
     sink: Player,
     /// 持有输出流（丢掉它会立即关闭音频端点）
@@ -817,6 +818,7 @@ fn run_engine(deps: EngineDeps) {
         gapless: false,
         preload_gen: 0,
         preload: None,
+        preload_retries: 0,
         current_progress: None,
         sink,
         _stream,
@@ -1273,15 +1275,21 @@ fn playing_cycle(inner: &mut EngineInner, last_publish: &mut std::time::Instant)
 
 fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
     sync_gapless_transition(inner);
+    // 作废预载：凡可能改变「下一首是谁」或「它的音质」的命令都要重选目标。
+    // 刻意不在名单里的两条：
+    // - `Seek` / `SetSpeed` 只作用于当前这条流，改不了队列下标也改不了下一首的
+    //   取链参数，作废它只会白丢一次已取好的地址（随机模式下还要重掷一次骰子，
+    //   等于「拖了下进度条，下一首就换成别的歌」）。
+    // - 暂停不在这里，但 `finish_pause` 会主动作废：暂停期间不该继续预取带宽。
     if matches!(&cmd,
-        AudioCmd::Play | AudioCmd::Pause | AudioCmd::Stop | AudioCmd::Seek(_)
+        AudioCmd::Play | AudioCmd::Pause | AudioCmd::Stop
         | AudioCmd::SetQueue { .. } | AudioCmd::PlayTrack(_) | AudioCmd::PlayAt(_)
         | AudioCmd::Next | AudioCmd::Previous | AudioCmd::SetPlayMode(_)
         | AudioCmd::ClearQueue | AudioCmd::AddNext(_) | AudioCmd::Append(_)
         | AudioCmd::RemoveAt(_) | AudioCmd::RemoveIndices(_) | AudioCmd::MoveItem { .. }
         | AudioCmd::ClearAfter | AudioCmd::RestoreSession { .. }
         | AudioCmd::SetOutputDevice { .. } | AudioCmd::SetDefaultQuality { .. }
-        | AudioCmd::SetTrackQuality { .. } | AudioCmd::SetSpeed(_)
+        | AudioCmd::SetTrackQuality { .. }
         | AudioCmd::SetSleepTimer { .. } | AudioCmd::SetGapless(_)
         | AudioCmd::ReloadDislikes | AudioCmd::SetCacheDir(_) | AudioCmd::Shutdown
     ) {
@@ -1764,10 +1772,18 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             maybe_preload(inner);
         }
         AudioCmd::PreloadFailed { gen } => {
-            if let Some(slot) = inner.preload.as_mut().filter(|slot| slot.gen == gen) {
-                // Keep the failed slot until the next boundary/invalidation, rather
-                // than retrying a failed speculative request every 25ms.
-                slot.failed = true;
+            // 预载失败立刻作废槽位并记一次重试：下一圈预热会重新选目标
+            // （随机模式重新掷骰），不必再死等到曲末才由 advance() 现场取链。
+            // 次数上限见 PRELOAD_RETRY_LIMIT —— 连续失败时不再反复拉流。
+            if inner.preload.as_ref().is_some_and(|slot| slot.gen == gen) {
+                inner.preload = None;
+                inner.preload_gen = inner.preload_gen.wrapping_add(1);
+                inner.preload_retries = inner.preload_retries.saturating_add(1);
+                log::debug!(
+                    "[gapless] 预热失败，换目标重试（{}/{}）",
+                    inner.preload_retries,
+                    PRELOAD_RETRY_LIMIT
+                );
             }
         }
         AudioCmd::SetFade(params) => {
@@ -1925,6 +1941,10 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             return true;
         }
     }
+    // 每条命令处理完立刻补一次预热：挂载完成（LoadReady）/ 恢复播放 / 重新开
+    // 无缝，都在这一条命令里把状态推到可预热，不必再等播放圈的下一次轮询
+    // （非播放态那一圈要等满 1s，等于白等一秒才开始预取）。
+    maybe_preload(inner);
     false
 }
 
@@ -2974,19 +2994,77 @@ fn invalidate_preload(inner: &mut EngineInner) {
     inner.preload_gen = inner.preload_gen.wrapping_add(1);
 }
 
+/// 同一首曲目内预载失败的容忍次数：失败即作废槽位换目标重试（见
+/// `AudioCmd::PreloadFailed`），超过这个次数就不再白试 —— 宁可到点现场取链，
+/// 也不要每 25ms 反复拉一次注定失败的流。
+const PRELOAD_RETRY_LIMIT: u32 = 2;
+
+/// 预热闸门的输入：全是纯数据，逐条否决理由都可单测（见 `preload_gate_tests`）。
+#[derive(Debug, Clone, Copy)]
+struct PreloadFacts {
+    gapless: bool,
+    sleep_after_track: bool,
+    auto_next: bool,
+    has_slot: bool,
+    pausing: bool,
+    playing: bool,
+    has_progress: bool,
+    retries_left: bool,
+}
+
+/// `None` = 这一圈可以预热；`Some(理由)` = 不预热（理由同时用于调试日志与断言）。
+fn preload_block(facts: PreloadFacts) -> Option<&'static str> {
+    if !facts.gapless {
+        return Some("gapless-off");
+    }
+    if facts.sleep_after_track {
+        return Some("sleep-after-track");
+    }
+    if !facts.auto_next {
+        return Some("auto-next-off");
+    }
+    if facts.has_slot {
+        return Some("already-preloading");
+    }
+    if facts.pausing {
+        return Some("pausing");
+    }
+    if !facts.playing {
+        return Some("not-playing");
+    }
+    if !facts.has_progress {
+        return Some("not-mounted");
+    }
+    if !facts.retries_left {
+        return Some("retry-exhausted");
+    }
+    None
+}
+
+/// 预载下一首（无缝播放的「预热」）。
+///
+/// 触发点有三个，都要求「当前曲目已经加载完成」：挂载成功当场
+/// （`mount_decoder` 末尾，不必等 25ms 的播放圈）、每条命令处理完之后
+/// （`handle_cmd` 末尾，恢复播放 / 开关无缝也走这里），以及播放圈的常规巡检。
 fn maybe_preload(inner: &mut EngineInner) {
-    if !inner.gapless || inner.sleep_after_track || !inner.auto_next || inner.preload.is_some()
-        || inner.pause_deadline.is_some()
-    {
+    let (playing, mode) = {
+        let state = inner.state.read().unwrap_or_else(|e| e.into_inner());
+        (state.status == PlaybackStatus::Playing, state.play_mode)
+    };
+    let facts = PreloadFacts {
+        gapless: inner.gapless,
+        sleep_after_track: inner.sleep_after_track,
+        auto_next: inner.auto_next,
+        has_slot: inner.preload.is_some(),
+        pausing: inner.pause_deadline.is_some(),
+        playing,
+        has_progress: inner.current_progress.is_some(),
+        retries_left: inner.preload_retries < PRELOAD_RETRY_LIMIT,
+    };
+    if let Some(reason) = preload_block(facts) {
+        log::trace!("[gapless] 跳过预热：{reason}");
         return;
     }
-    let mode = {
-        let state = inner.state.read().unwrap_or_else(|e| e.into_inner());
-        if state.status != PlaybackStatus::Playing || inner.current_progress.is_none() {
-            return;
-        }
-        state.play_mode
-    };
     let candidate = {
         let queue = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
         queue.next_index_skipping(mode, true, |track| inner.dislikes.matches(track))
@@ -2996,7 +3074,8 @@ fn maybe_preload(inner: &mut EngineInner) {
     inner.preload_gen = inner.preload_gen.wrapping_add(1);
     let gen = inner.preload_gen;
     // Choose Random exactly once; the retained index is committed on activation.
-    inner.preload = Some(PreloadSlot { gen, index, track: track.clone(), ready: None, failed: false });
+    inner.preload = Some(PreloadSlot { gen, index, track: track.clone(), ready: None });
+    log::debug!("[gapless] 开始预热下一首 {}（mode={mode:?}, index={index}）", track.id);
     let quality = effective_quality_for(inner, &track);
     let job = LoadJob {
         app: inner.app.clone(), tx: inner.tx.clone(), cache: Arc::clone(&inner.url_cache),
@@ -3024,7 +3103,7 @@ fn append_preloaded(
     }
     let Some(slot) = inner.preload.as_ref() else { return; };
     if slot.gen != gen || slot.track.id != track.id || slot.track.platform != track.platform
-        || slot.ready.is_some() || slot.failed
+        || slot.ready.is_some()
     {
         return;
     }
@@ -3088,6 +3167,8 @@ fn sync_gapless_transition(inner: &mut EngineInner) {
     record_play_start(inner.db.clone(), slot.track);
     inner.tick_anchor = None;
     inner.persist_state();
+    // 换曲边界：这是新一首，预载重试额度归零
+    inner.preload_retries = 0;
     spawn_cache_prune(inner);
 }
 
@@ -3179,6 +3260,10 @@ fn mount_decoder(
     inner.tick_anchor = None;
     emit_position_tick(inner);
     inner.persist_state();
+    // 「当前这首加载完成」= 预热的最佳时机：地址/缓存/解码器都已经就位，
+    // 下一首的取链现在开始，离真正换曲还有整首歌的时间可以失败重试。
+    inner.preload_retries = 0;
+    maybe_preload(inner);
 }
 
 static AUDIO_HTTP: std::sync::OnceLock<RwLock<(u64, reqwest::blocking::Client)>> =
@@ -3667,5 +3752,85 @@ mod device_action_tests {
         assert!(active.contains("耳机") && active.contains("播放已暂停"));
         let idle = device_gone_reason("耳机", "不可用", false);
         assert!(idle.contains("耳机") && !idle.contains("播放已暂停"));
+    }
+}
+
+#[cfg(test)]
+mod preload_gate_tests {
+    use super::{preload_block, PreloadFacts};
+
+    /// 全部条件满足的对照组：当前曲目已挂载且在播、无缝开着、有预载额度。
+    fn facts() -> PreloadFacts {
+        PreloadFacts {
+            gapless: true,
+            sleep_after_track: false,
+            auto_next: true,
+            has_slot: false,
+            pausing: false,
+            playing: true,
+            has_progress: true,
+            retries_left: true,
+        }
+    }
+
+    #[test]
+    fn all_clear_allows_preload() {
+        assert_eq!(preload_block(facts()), None);
+    }
+
+    /// 每个条件单独破坏都必须被拦住，且理由不串台 —— 日志里那串就是排查依据。
+    #[test]
+    fn each_condition_blocks_with_its_own_reason() {
+        assert_eq!(
+            preload_block(PreloadFacts { gapless: false, ..facts() }),
+            Some("gapless-off")
+        );
+        assert_eq!(
+            preload_block(PreloadFacts { sleep_after_track: true, ..facts() }),
+            Some("sleep-after-track")
+        );
+        assert_eq!(
+            preload_block(PreloadFacts { auto_next: false, ..facts() }),
+            Some("auto-next-off")
+        );
+        assert_eq!(
+            preload_block(PreloadFacts { has_slot: true, ..facts() }),
+            Some("already-preloading")
+        );
+        assert_eq!(
+            preload_block(PreloadFacts { pausing: true, ..facts() }),
+            Some("pausing")
+        );
+        assert_eq!(
+            preload_block(PreloadFacts { playing: false, ..facts() }),
+            Some("not-playing")
+        );
+        assert_eq!(
+            preload_block(PreloadFacts { has_progress: false, ..facts() }),
+            Some("not-mounted")
+        );
+        assert_eq!(
+            preload_block(PreloadFacts { retries_left: false, ..facts() }),
+            Some("retry-exhausted")
+        );
+    }
+
+    /// 加载完成但还没开始播（暂停态加载 / 恢复现场）不该预热：
+    /// 预取会白占带宽，且取来的地址可能等不到用就过期了。
+    #[test]
+    fn loaded_but_paused_does_not_preload() {
+        let paused = PreloadFacts { playing: false, ..facts() };
+        assert_eq!(preload_block(paused), Some("not-playing"));
+    }
+
+    /// 重试额度是最后一道闸：前七条都放行，只有它能把重试用光的局面拦住，
+    /// 免得每 25ms 反复拉一次注定失败的流。
+    #[test]
+    fn retry_budget_is_the_last_gate() {
+        let exhausted = PreloadFacts { retries_left: false, ..facts() };
+        assert_eq!(preload_block(exhausted), Some("retry-exhausted"));
+        // 额度还在就继续试 —— 失败一次不等于放弃这一首的预热
+        let ready = PreloadFacts { retries_left: true, ..facts() };
+        assert_eq!(preload_block(ready), None);
     }
 }

@@ -3,7 +3,7 @@
 - 项目名称：轻听 PC 版
 - 目标平台：Windows 10 / Windows 11
 - 技术栈：Tauri 2 + React 19 + TypeScript + Tailwind CSS v4 + shadcn/ui + Rust
-- 文档版本：v1.23
+- 文档版本：v1.24
 - 更新日期：2026-10-27
 - 关联文档：`qt-pc/REQUIREMENTS.md`、`../UPDATE_DESIGN.md`、`docs/CONFIG.md`、`docs/PACKAGING.md`
 
@@ -81,6 +81,7 @@
 | R39 | **账户歌单同步：登录后自动对比平台侧歌单，差集勾选收藏**（v1.23 · 2026-10-26）：用户「登录源帐户时自动获取当前帐户的收藏歌单，然后和本地的在线收藏歌单进行对比，将结果展示出来供用户选择是否收藏未收藏的歌单……在音源帐户那里增加一个选项，供选择是否需要继续同步」。① **包侧契约 v18**（qt-sources v2026102603，META_REVISION 14）：`AccountPlaylist { id, name, picUrl?, trackCount?, owned }`（owned=平台自建）+ meta 面新入口 `accountPlaylists(source)` → `{ list: [...] }`，五平台实现（wyy=/api/user/playlist 翻页、bili=登录态 created/list-all+collected/list 双接口、qq=musicu.fcg playlist 族、kg=mobiles v3 getuserlinkspecial、kw=kwapp/ www 双分支——后四者离线冻结待真机验证，失败路径全有人话报错不静默；凭据由实现内部自读 meta 面）。② **宿主**：`source-scripts` 新包装 `accountPlaylists(source)`（`SourceAccountPlaylist`，解析 `{ list }`，缺包提示 v2026.10.26.3）；新建 `src/lib/source-playlist-sync.ts`：`accountSyncPreview(source)` 与本地 `ipc.listMyPlaylists()` 同平台 pid 集合 diff（保平台顺序）→ `{missing, total}`、`collectAccountPlaylists(source, picks)` 顺序逐个 `favoritePlaylist`（幂等，已收藏 skipped、单失败不中断，返回 `{collected, skipped, failed}`）、`autoSyncMissingAfterLogin(source)`（syncPlaylists 开关把关）。③ **UI**：账号页每源卡片登录态下新增第三开关「登录后同步歌单」（`SourceAuthToggles.syncPlaylists?`，缺省 true，旧记录向后兼容）与「同步歌单」按钮；新弹窗 `SourcePlaylistSyncDialog`（预览 diff 列表 + 全选/单选 + 「收藏所选（N）」+ 空态/错误原样展示，样式对齐 ImportPlaylistDialog）。④ **自动触发**：四个登录成功点（扫码 confirmed / 导入 Cookie / 网页登录 / 密码短信）保存成功后经 `maybeAutoSync` 拉预览，missing>0 自动打开同步弹窗（mountedRef 竞态守卫，异常静默；不动 extras 落库与保活 mount effect）。验证：qt-pc 新增 `tests/source-playlist-sync.test.tsx` 20 条、全量 **104 files / 1042 tests** 全绿、tsc/eslint 干净；qt-sources auth.test.ts 64/64（新 6 条）、tsc 0 错、build（meta-bundle 368KB v2026102603）+ smoke 全过 | §0.3-W |
 | R40 | **音源账号卡片改版：删「登录后同步歌单」开关（默认开启）+ 卡片可折叠 + 数据请求备注**（v1.23 · 2026-10-27）：用户「将截图红色的那个删掉，不需要展示这个，默认开启，上面的同步歌单已经足够了；绿色框改为一个可折叠的，折叠就是将这个容器下面几行收起来；数据请求使用登录态后面加个备注，只有启用时才能同步歌单」。① **删开关**：`SourceAuthToggles` 去掉 `syncPlaylists?` 字段、`parseSourceAuthToggles` 不再收该键（旧记录里的键读入即丢弃，向后兼容无需迁移），`source-auth.ts` 删 `readSourceAuthSyncPlaylistsFor` / `saveSourceAuthSyncPlaylists`；`autoSyncMissingAfterLogin(source)` 返回值从 `SourceAccountPlaylist[] | null` 收紧为 `SourceAccountPlaylist[]` 并去掉唯一开关门控——登录成功即对比，四个登录成功点（扫码 confirmed / 导入 Cookie / 网页登录 / 密码短信）行为不变；账号页删 `toggleSyncPlaylists` 与登录态下第三行开关，右上「同步歌单」按钮保留为唯一手动入口。② **卡片折叠**：新增 `collapsed: Record<string, boolean>`（缺省键 = 展开，仅内存不持久化，重进页面回到展开态）；卡片标题行左侧（源名 + 已登录/未登录/凭据已过期）由 `div` 改成 `<button aria-expanded title>`，前置 `ChevronDown`（折叠时 `-rotate-90` + `transition-transform`），下面 `.mt-2 border-t` 容器整块 `{isCollapsed ? null : …}` 条件渲染——「数据请求/播放请求开关 + 播放/下载音质」四行一起收起，标题行右侧的账号/登录工具条不受影响。③ **备注**：「数据请求使用登录态」描述追加「只有启用时才能同步歌单。」（写清同步依赖该面开关，不新增禁用逻辑）。验证：`tests/source-playlist-sync.test.tsx` 22 条（删 5 条旧开关用例，新增「库里残留开关也照样拉差集」「旧记录 syncPlaylists 键被丢弃」「平台侧无缺失不弹窗」「默认展开」「点标题行折叠/展开」「不再渲染开关行」「备注文案」）；全量 **105 files / 1047 tests** 全绿、`tsc --noEmit` 0 错、eslint 干净 | §0.3-W |
 | R41 | **音源账号卡片折叠改默认收起 + 右上角一键全部折叠/展开 + 两面开关缺省调整**（v1.23 · 2026-10-27）：用户「修改为默认折叠的，页面右上角加一个全部折叠/打开的按钮。页面里面的数据请求使用登录态默认为开，播放请求使用登录态为关」。① **默认折叠**：折叠态从「单卡 override 表缺省展开」改成「页面级 `allCollapsed`（初值 true）+ 单卡覆盖表」，`isCollapsed = collapsed[id] ?? allCollapsed` —— 进页面所有卡片只露标题行（源名 + 已登录/未登录/凭据已过期 + 右侧账号工具条），四行设置默认收起。② **一键全开/全收**：页头 h1 与说明右侧新增按钮，文案与图标随状态切换（有任意卡片展开 → `ChevronsDownUp` +「全部折叠」；全收起 → `ChevronsUpDown` +「全部展开」），点击 `setAllCollapsed(anyCardExpanded)` 并清空单卡覆盖表；`cards.length === 0` 时不渲染（与「正在读取音源清单…」空态一致）。③ **两面缺省**：`effectiveTogglesFor` 登录态缺省从 `{ useMeta: true, usePlay: true }` 改为 `{ useMeta: true, usePlay: false }`（新登录源 `saveSourceAuthAccount` 随之物化为数据面开/播放面关，只注入 meta 面、显式 clear play 面），页面 `toggles[id] ?? { useMeta: true, usePlay: false }` 兜底同步调整；`sourcePlayLoginActiveSync` 的冷缓存兜底从「按开处理」改为「按关处理」（宁可先不展示官方档，也不展示取链会失败的档位）。未登录源也用同一缺省展示（开关行本就禁用，登录后这对值立刻生效）。验证：`tests/source-auth-toggles.test.ts` 5 条断言随缺省改成数据开/播放关（首登物化、解析链、`setSourceAuthToggle` 先开后关、`ensureSourceAuthInjected` 逐面对账）；`tests/source-playlist-sync.test.tsx` 折叠组重写为 6 条（默认全收起 + 「全部展开」、一键开/收、单卡开收、未登录两面禁用、登录后数据开播放关、开关行已移除、备注文案）；全量 **105 files / 1050 tests** 全绿、`tsc --noEmit` 0 错、eslint 干净。④ **旧全局键不再盖住新缺省**（同日追加，用户「但是我看现在没有登录的怎么还是双开」）：解析链第二级的旧全局键 `sourceAuth.useMeta` / `sourceAuth.usePlay` 是 per-source 表上线前所有源共用的一对，旧版缺省本身就是双开——库里残留的 `true/true` 与「从没动过」不可区分、不携带用户意图，整体继承会让它永久盖住新缺省，导致新装/未物化的源（如 migu）全都显示双开。`legacyGlobalToggles()` 改为只在「任一面为 false」时才返回继承值（那才证明用户主动关过），双开/两键都没有一律返回 null 回落新缺省；`sourcePlayLoginActiveSync` 的冷缓存兜底同步收敛。 | §0.3-W |
+| R42 | **无缝播放预热提前到「当前曲目加载完成」**（v1.24 · 2026-10-27）：用户「能不能优化一下，改为当前音乐加载完成后就开始预热」。① 触发点从「播放圈下一次轮询」移到 `mount_decoder` 末尾当场触发（非播放态那一圈要等满 1s，等于白等一秒）+ `handle_cmd` 末尾补一次（恢复播放 / 重开无缝 / 弱网重载成功都即时生效）；② 作废名单收窄：`Seek` / `SetSpeed` 不再作废预载（改不了下一首是谁，随机模式下还表现为「拖进度条下一首就换人」）；③ 预载失败不再死等到曲末：`PreloadFailed` 立刻作废槽位换目标重试，同曲最多 2 次（`PRELOAD_RETRY_LIMIT`），用尽后到点现场取链；④ 闸门抽成纯函数 `preload_block` + `PreloadFacts`，8 条否决理由各自可断言。随机模式仍是「预热时掷一次骰并把下标存进 `PreloadSlot`，换曲时提交」，不重掷。验收：`preload_gate_tests` 4 条、`cargo test --lib audio::` 82 条全绿、`cargo check` / `clippy` 干净（3 条 warning 均在 ai_local.rs 既有代码） | §7.5 |
 
 ### 0.3 实现现状修订（v1.4 · 2026-09-27）
 
@@ -1855,12 +1856,13 @@ enum AudioCmd {
 
 实现路径：
 
-1. 当前曲目剩余时长 < 15s 时，向队列下一首发 `Preload`，在后台完成取址 + 首包缓冲 + 构建 `Decoder`。
+1. **当前曲目一加载完成就预热下一首**：`mount_decoder` 末尾（地址/缓存/解码器都已就位）立刻为队列下一首发起预载——后台完成取址 + 首包探测 + 构建 `Decoder`，结果存进引擎侧 `PreloadSlot.ready`。不等播放圈轮询（非播放态那一圈要等满 1s）；`handle_cmd` 末尾也会补一次，所以「恢复播放 / 重新开无缝 / 弱网重载成功」同样是当场预热。暂停态加载（恢复现场、`autoplay=false`）不预热：预取会白占带宽，地址也可能等不到用就过期。
 2. 预解码结果暂存为 `Option<Box<dyn Source>>`；当前曲目自然结束前，直接 `sink.append(next)` 到**同一个 Sink**，由 rodio 连续消费，不重建输出流——这是达到 <20ms 间隙的唯一可行路径。
-3. 队列变更（切歌、清空、改播放模式）时丢弃预解码结果并重新计算目标。
-4. 「随机播放」模式下预取需要先固定下一首（预生成随机序列），否则无法预加载。
-5. 无缝仅在**同采样率**曲目间生效；采样率不同必须重建输出流，此时退化为普通切歌并在设置中说明。
-6. 单曲循环模式下不做预加载，直接 `seek(0)`。
+3. 队列变更（切歌、清空、改播放模式、改音质、换输出设备、暂停）时丢弃预载结果并重算目标。刻意**不作废**的两条：`Seek` 与 `SetSpeed` —— 它们只作用于当前这条流，改不了下一首是谁、也改不了它的取链参数，作废只会白丢一次已取好的地址（随机模式下还会重掷骰子，表现为「拖了下进度条，下一首就换人」）。
+4. 「随机播放」模式下，预热那一刻用 `fastrand` 掷一次骰并把**下标**一起存进 `PreloadSlot`；换曲时提交这个下标（`queue.index = Some(slot.index)`），不再重掷——随机结果在预热时就已经固定。
+5. 预载失败（取链失败 / 首包超时 / 文件过大等）立刻作废槽位并在下一圈换目标重试，同一首最多 2 次（`PRELOAD_RETRY_LIMIT`）；用尽就不再预热，到点由 `advance` 现场取链，避免每 25ms 反复拉一次注定失败的流。
+6. 无缝仅在**同采样率**曲目间生效；采样率不同必须重建输出流，此时退化为普通切歌并在设置中说明。
+7. 单曲循环模式下不做预加载，直接 `seek(0)`。
 
 ## 7.6 淡入淡出（crossfade）
 
