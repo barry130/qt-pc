@@ -48,7 +48,7 @@ function CoverCardInner<T>(props: CoverCardProps<T>): React.JSX.Element {
         layout === "row" ? "w-32 shrink-0 snap-start" : "w-full",
       )}
     >
-      <div className="relative aspect-square w-full overflow-hidden rounded-xl shadow-md transition-shadow duration-200 group-hover:shadow-xl">
+      <div className="relative aspect-square w-full overflow-hidden rounded-xl shadow-md ring-1 ring-inset ring-foreground/10 transition-shadow duration-200 group-hover:shadow-xl">
         {cover && !loadFailed ? (
           <img
             src={cover}

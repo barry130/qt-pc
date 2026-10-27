@@ -11,6 +11,7 @@ import { useFavoritesStore } from "@/stores/favorites";
 import { useFavoriteFlags } from "@/hooks/useFavoriteFlags";
 import { useTrackSelection } from "@/hooks/useTrackSelection";
 import type { TrackSelection } from "@/lib/track-selection";
+import { EmptyState } from "@/components/common/EmptyState";
 import { toastError, toastSuccess } from "@/stores/toast";
 import { clampQualityForPlatform } from "@/stores/sourceRegistry";
 import { sourceDownloadQualityOf } from "@/lib/source-quality";
@@ -187,9 +188,11 @@ export function TrackList(props: {
 
   if (tracks.length === 0) {
     return (
-      <div className="px-4 py-10 text-center text-sm text-muted-foreground">
-        暂无歌曲
-      </div>
+      <EmptyState
+        icon={Disc3}
+        title="暂无歌曲"
+        className="px-4"
+      />
     );
   }
 
@@ -492,7 +495,7 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
         e.preventDefault();
         setCtx({ x: e.clientX, y: e.clientY });
       }}
-      className={`cv-row group flex w-full cursor-pointer items-center gap-3 px-4 py-2 text-left transition-colors hover:bg-secondary ${
+      className={`cv-row group flex w-full cursor-pointer items-center gap-3 px-4 py-2 text-left transition-colors hover:bg-secondary focus-visible:bg-secondary focus-visible:outline-none ${
         selected ? "bg-primary/10 ring-1 ring-inset ring-primary/25" : activeRow ? "bg-secondary/60" : ""
         // 被屏蔽的行压暗：还能点、还能播（规则只是「别自动出现」），
         // 但要让人一眼看出它不在常规轮换里

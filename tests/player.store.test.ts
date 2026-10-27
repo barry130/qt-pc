@@ -148,6 +148,57 @@ describe("乐观 seek", () => {
     expect(usePlayerStore.getState().pendingSeekMs).toBeNull();
   });
 
+  it("超时前（>1s 的慢 seek）陈旧 tick 仍被冻结，不回跳", () => {
+    usePlayerStore.getState().applySnapshot(playingSnapshot(60_000));
+    usePlayerStore.setState({
+      pendingSeekMs: 120_000,
+      pendingSeekAt: performance.now() - 2_000, // 引擎阻塞式定位 + 网络 Range 重取常 >1s
+      positionAnchorValue: 120_000,
+      positionMs: 120_000,
+    });
+
+    // seek 前发出的旧位置 tick 晚到 2s：窗口（10s）内仍冻结在目标
+    usePlayerStore.getState().applyTick(tick(61_000));
+    const s = usePlayerStore.getState();
+    expect(s.positionAnchorValue).toBe(120_000);
+    expect(s.pendingSeekMs).toBe(120_000);
+    expect(s.positionMs).toBe(120_000);
+  });
+
+  it("超时后（>10s 还没确认）陈旧 tick 接管并清标记，不再永久冻结", () => {
+    usePlayerStore.getState().applySnapshot(playingSnapshot(60_000));
+    usePlayerStore.setState({
+      pendingSeekMs: 120_000,
+      pendingSeekAt: performance.now() - 11_000,
+      positionAnchorValue: 120_000,
+    });
+
+    usePlayerStore.getState().applyTick(tick(61_000));
+    const s = usePlayerStore.getState();
+    expect(s.pendingSeekMs).toBeNull();
+    expect(s.positionAnchorValue).toBe(61_000);
+  });
+
+  it("引擎 seek 失败的错误快照立即撤销乐观标记并回到真实位置", () => {
+    usePlayerStore.getState().applySnapshot(playingSnapshot(60_000));
+    usePlayerStore.setState({
+      pendingSeekMs: 120_000,
+      pendingSeekAt: performance.now(),
+      positionAnchorValue: 120_000,
+    });
+
+    // 引擎 try_seek 失败：音频仍在旧位置继续播，快照带 error 到达
+    const failed: PlaybackState = {
+      ...playingSnapshot(60_800),
+      error: "进度拖动失败",
+    };
+    usePlayerStore.getState().applySnapshot(failed);
+    const s = usePlayerStore.getState();
+    expect(s.pendingSeekMs).toBeNull();
+    expect(s.positionAnchorValue).toBe(60_800);
+    expect(s.state?.error).toBe("进度拖动失败");
+  });
+
   it("停止的空快照会让乐观标记作废，避免进度条卡在目标位置", () => {
     usePlayerStore.getState().applySnapshot(playingSnapshot(60_000));
     usePlayerStore.setState({

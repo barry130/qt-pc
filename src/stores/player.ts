@@ -132,8 +132,15 @@ const MODE_ORDER = ["listLoop", "oneLoop", "random"] as const;
  * seek 前的旧位置误判成生效（那种情况下偏差也小，即使误判最多跳 0.5s）。
  */
 const PENDING_SEEK_TOLERANCE_MS = 500;
-/** 乐观 seek 的兜底超时：超过后不再拦截 tick，避免标记卡死 */
-const PENDING_SEEK_TIMEOUT_MS = 1000;
+/**
+ * 乐观 seek 的兜底超时：超过后不再拦截 tick，避免标记卡死。
+ * 取 10s（原 1s 太短）：引擎处理 seek 要先阻塞式定位解码器，网络流还要重新
+ * 取 Range，实测慢源上「目标位置的 tick」晚到 1~3s 很常见；窗口一过，seek
+ * 之前发出的陈旧 tick 就会被当成真实位置接管——进度条先跳回旧位置、等真正
+ * 的 tick 到了再跳回目标，也就是用户看到的「来回变一次才定位」。
+ * 真正的失败由引擎的错误快照即时撤销（见 applySnapshot），不靠这个超时兜。
+ */
+const PENDING_SEEK_TIMEOUT_MS = 10_000;
 
 const initialSnapshot: PlaybackState = {
   trackId: null,
@@ -209,14 +216,18 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
     const { pendingSeekMs, pendingSeekAt } = get();
     if (pendingSeekMs !== null) {
       const sameTrack = (cur?.trackId ?? null) === (incoming.trackId ?? null);
+      // 引擎 seek 失败（如「进度拖动失败」）：快照带 error 到达即撤掉乐观标记，
+      // 立刻回到引擎的真实位置。否则进度条会在目标位置空等到超时，而音频其实
+      // 一直在旧位置继续播——用户看到的就是先停在拖到的位置、过一会儿又跳回去。
+      const seekFailed = sameTrack && incoming.error != null && incoming.error !== "";
       const stale =
         sameTrack &&
         Math.abs(anchorMs - pendingSeekMs) > PENDING_SEEK_TOLERANCE_MS &&
         performance.now() - pendingSeekAt <= PENDING_SEEK_TIMEOUT_MS;
-      if (stale) {
-        anchorMs = pendingSeekMs;
-      } else {
+      if (seekFailed || !stale) {
         set({ pendingSeekMs: null });
+      } else {
+        anchorMs = pendingSeekMs;
       }
     }
 
@@ -239,7 +250,14 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
       const confirmed =
         Math.abs(t.positionMs - pendingSeekMs) <= PENDING_SEEK_TOLERANCE_MS;
       const expired = performance.now() - pendingSeekAt > PENDING_SEEK_TIMEOUT_MS;
-      if (!confirmed && !expired) return;
+      if (!confirmed && !expired) {
+        // 位置冻结在乐观目标，但时长/缓冲照常跟随，进度条信息不失真
+        set({
+          durationMs: effectiveDurationMs(t.durationMs),
+          bufferedMs: t.bufferedMs,
+        });
+        return;
+      }
       set({ pendingSeekMs: null });
     }
     // 只更新高频进度标量与锚点，**不重建 state**（见 positionMs 字段的注释）。

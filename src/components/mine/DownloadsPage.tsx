@@ -596,7 +596,7 @@ function TaskRow(props: {
       {inFlight && (
         <div className="mt-2 h-1 w-full overflow-hidden rounded bg-secondary">
           <div
-            className="h-full bg-primary transition-all"
+            className="h-full bg-primary transition-[width] duration-300 ease-out"
             style={{ width: `${pct}%` }}
           />
         </div>

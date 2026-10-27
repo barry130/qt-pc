@@ -109,7 +109,7 @@ export function UpdateDialog(): React.JSX.Element | null {
           <div className="mt-4">
             <div className="h-1.5 w-full overflow-hidden rounded bg-secondary">
               <div
-                className="h-full bg-primary transition-all"
+                className="h-full bg-primary transition-[width] duration-300 ease-out"
                 style={{ width: `${percent}%` }}
               />
             </div>

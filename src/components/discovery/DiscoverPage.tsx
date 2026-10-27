@@ -21,6 +21,7 @@ import {
 import { HorizontalScroller } from "./HorizontalScroller";
 import { TrackCard } from "./TrackCard";
 import { LocalMixSection } from "@/components/mine/LocalMixSection";
+import { EmptyState } from "@/components/common/EmptyState";
 
 /**
  * 首页 / 发现（路由 /，DESIGN §5.2 / §5.3）。
@@ -382,7 +383,7 @@ export function DiscoverPage(): React.JSX.Element {
           }
         />
         {charts.length === 0 ? (
-          <EmptyBlock icon={BarChart3} text="暂无榜单" />
+          <EmptyState variant="block" size="sm" className="py-8" icon={BarChart3} title="暂无榜单" />
         ) : (
           <div
             ref={spotlightRef}
@@ -424,7 +425,7 @@ export function DiscoverPage(): React.JSX.Element {
           }
         />
         {songs.length === 0 ? (
-          <EmptyBlock icon={Sparkles} text="暂无新歌" />
+          <EmptyState variant="block" size="sm" className="py-8" icon={Sparkles} title="暂无新歌" />
         ) : (
           <HorizontalScroller>
             {songs.map((t, i) => (
@@ -456,7 +457,7 @@ export function DiscoverPage(): React.JSX.Element {
           }
         />
         {playlists.length === 0 ? (
-          <EmptyBlock icon={Disc3} text="暂无推荐歌单" />
+          <EmptyState variant="block" size="sm" className="py-8" icon={Disc3} title="暂无推荐歌单" />
         ) : (
           // 与「新歌速递」同款横向滚动行（同宽卡片、同箭头、同滚轮转横滚）。
           // 此前是一行静态网格（CoverGrid maxRows={1}），滑不动也点不到被裁掉的歌单。
@@ -485,15 +486,4 @@ export function DiscoverPage(): React.JSX.Element {
  * 替换此前的裸文本 <p>——空态与正常内容共用同一版式骨架（圆角容器），
  * 数据到达后切换不会产生明显的排版跳变。
  */
-function EmptyBlock(props: {
-  icon: React.ComponentType<{ className?: string }>;
-  text: string;
-}): React.JSX.Element {
-  const Icon = props.icon;
-  return (
-    <div className="flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-border/80 py-8 text-muted-foreground">
-      <Icon className="h-6 w-6 opacity-50" />
-      <span className="text-xs">{props.text}</span>
-    </div>
-  );
-}
+/* 空态统一走 @/components/common/EmptyState（原先的本地 EmptyBlock 已并入） */

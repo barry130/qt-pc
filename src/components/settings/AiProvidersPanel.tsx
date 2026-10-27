@@ -189,7 +189,7 @@ function SwitchButton(props: {
       }`}
     >
       <span
-        className={`absolute top-[0.125rem] h-4 w-4 rounded-full bg-background shadow transition-all ${
+        className={`absolute top-[0.125rem] h-4 w-4 rounded-full bg-background shadow transition-[left,transform] duration-200 ${
           checked ? "left-[1.125rem]" : "left-[0.125rem]"
         }`}
       />

@@ -50,6 +50,16 @@
   --page-fade: var(--background);
   --lyric-highlight: var(--primary);
   --lyric-inactive: oklch(0.55 0.02 265);
+  /*
+   * 动效令牌：时长三档 + 两条缓动。组件里统一用
+   * `duration-[var(--motion-fast|base|slow)]` / `ease-[var(--motion-ease-*)]`，
+   * 不要再硬写 150/200/300 与 cubic-bezier(...)（否则改手感要翻遍全仓）。
+   */
+  --motion-fast: 150ms;
+  --motion-base: 200ms;
+  --motion-slow: 300ms;
+  --motion-ease-out-expo: cubic-bezier(0.21, 1.02, 0.73, 1);
+  --motion-ease-out-soft: cubic-bezier(0.32, 0.72, 0, 1);
 }
 
 .dark {
@@ -282,7 +292,7 @@
   }
 }
 .qt-toast {
-  animation: qt-toast-in 0.22s cubic-bezier(0.21, 1.02, 0.73, 1);
+  animation: qt-toast-in var(--motion-base) var(--motion-ease-out-expo);
 }
 @keyframes qt-toast-progress {
   from {
@@ -377,4 +387,37 @@
   transition-duration: 0.01ms !important;
   animation-duration: 0.01ms !important;
   animation-iteration-count: 1 !important;
+}
+
+/* 可选中文本：body 默认 user-select: none（桌面 App 手感，避免一拖动就选中）。
+ * 但歌名 / 歌手 / 播放链接 / 错误码这些「用户需要复制」的内容必须能选。
+ * 用法：给容器（或单个元素）加 .selectable；输入类控件本来就该可选，一并放开。 */
+:where(.selectable, .selectable *, input, textarea, [contenteditable="true"]) {
+  user-select: text;
+}
+
+/* 降低透明度偏好（Windows 关闭「透明效果」/ macOS「降低透明度」）：
+ * 全站的 backdrop-blur 毛玻璃降级为不透明表面。配套约定：凡加 backdrop-blur
+ * 的表面都必须自带 ≥40% 不透明底色（bg-black/40、bg-card/80 之类），
+ * 这样模糊被关掉后正文仍然可读，不会透出底下滚动的内容。 */
+@media (prefers-reduced-transparency: reduce) {
+  [class*="backdrop-blur"] {
+    backdrop-filter: none !important;
+  }
+}
+
+/* 提高对比度偏好（Windows 高对比 / macOS「增强对比度」）：
+ * 分隔线与次级文字各提一档。注意 skins.ts 用行内样式覆盖主色/背景，
+ * 行内样式优先级高于这里——这两个变量不在它的覆盖清单里，仍然生效。 */
+@media (prefers-contrast: more) {
+  :root {
+    --muted-foreground: oklch(0.38 0.02 265);
+    --border: oklch(0.78 0.012 260);
+    --input: oklch(0.78 0.012 260);
+  }
+  .dark {
+    --muted-foreground: #cbd5e1;
+    --border: #3d3d63;
+    --input: #3d3d63;
+  }
 }

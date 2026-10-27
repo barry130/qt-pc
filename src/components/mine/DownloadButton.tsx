@@ -121,7 +121,7 @@ export function DownloadButton(props: {
         }}
         title="下载"
         aria-label="下载"
-        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-foreground/80 transition-all hover:bg-secondary/50 hover:text-foreground disabled:opacity-50"
+        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-foreground/80 transition-colors hover:bg-secondary/50 hover:text-foreground disabled:opacity-50"
       >
         <Download className="h-4 w-4" />
       </button>

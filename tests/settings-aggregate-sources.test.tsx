@@ -37,7 +37,7 @@ vi.mock("@/stores/toast", () => ({
   toastSuccess: vi.fn(),
 }));
 
-import { AggregateSourcesRow } from "@/components/SettingsPage";
+import { AggregateSourcesRow } from "@/components/settings/sections/SourcePackageSection";
 import { resetAggregateSourcesCache } from "@/lib/aggregate-sources";
 import { AGGREGATE_SOURCES_KEY } from "@/lib/storageKeys";
 

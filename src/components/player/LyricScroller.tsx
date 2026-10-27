@@ -321,7 +321,7 @@ const LyricLineRow = memo(function LyricLineRow(props: {
         onSeekMs(line.timeMs);
       } : undefined}
       className={cn(
-        "rounded-md text-center transition-all duration-300",
+        "rounded-md text-center transition-[transform,color,background-color] duration-300",
         line.timeMs >= 0 && (dragging
           ? "cursor-grabbing"
           : "cursor-pointer hover:text-lyric-highlight/70 focus-visible:outline-none"),

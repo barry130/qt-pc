@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AudioWaveform,
   Captions,
@@ -69,39 +69,71 @@ import { setSourcePlayQuality } from "@/lib/source-quality";
 import { toastSuccess } from "@/stores/toast";
 
 /**
+ * 子组件的 memo 版本。
+ *
+ * 函数声明会提升，所以这组别名可以写在定义之前。这些子组件的 props 全是标量
+ * 或稳定引用（`track` 只在切歌时换引用），包一层 memo 之后，播放条本体因
+ * 「与它们无关的字段」重渲染时（例如播放/暂停切换、队列开关），菜单与按钮
+ * 不会跟着重跑一遍渲染函数。频谱画布与音量控件无 props，命中率 100%。
+ */
+const SpectrumBackgroundMemo = memo(SpectrumBackground);
+const VolumeControlMemo = memo(VolumeControl);
+const DesktopLyricButtonMemo = memo(DesktopLyricButton);
+const MiniModeButtonMemo = memo(MiniModeButton);
+const SpectrumButtonMemo = memo(SpectrumButton);
+const EqualizerButtonMemo = memo(EqualizerButton);
+const QualityMenuMemo = memo(QualityMenu);
+const SpeedMenuMemo = memo(SpeedMenu);
+const SleepTimerMenuMemo = memo(SleepTimerMenu);
+const PlayModeButtonMemo = memo(PlayModeButton);
+const PlayUrlButtonMemo = memo(PlayUrlButton);
+
+/**
  * 播放条（DESIGN §5.5）：
  * 封面 / 歌名歌手 / 上一首 / 播放 / 下一首 / 模式 / 队列 / 进度条 / 音量
  * 进度拖动期间暂停插值（isDraggingProgress），松手即 seek */
 export function PlayerBar(): React.JSX.Element {
-  const state = usePlayerStore((s) => s.state);
   const toggle = usePlayerStore((s) => s.toggle);
-  const seekTo = usePlayerStore((s) => s.seekTo);
-  const setDragging = usePlayerStore((s) => s.setDragging);
   const nextTrack = usePlayerStore((s) => s.nextTrack);
   const prevTrack = usePlayerStore((s) => s.prevTrack);
   const cyclePlayMode = usePlayerStore((s) => s.cyclePlayMode);
-  const position = useInterpolatedPosition();
+  // 稳定回调：给 memo 化的子组件用。内联闭包（() => void prevTrack()）每次
+  // 渲染都是新引用，props 一变 memo 等于白包。
+  const handleToggle = useCallback(() => void toggle(), [toggle]);
+  const handlePrevTrack = useCallback(() => void prevTrack(), [prevTrack]);
+  const handleNextTrack = useCallback(() => void nextTrack(), [nextTrack]);
+  const handleCyclePlayMode = useCallback(
+    () => void cyclePlayMode(),
+    [cyclePlayMode],
+  );
   const navigate = useNavigate();
   const router = useRouter();
   const pathname = useRouterState({ select: (s) => s.location.pathname });
-  const [dragPreviewMs, setDragPreviewMs] = useState<number | null>(null);
-  // 松手后到 seek 生效前的乐观目标（store 侧），优先于插值位置展示
-  const pendingSeekMs = usePlayerStore((s) => s.pendingSeekMs);
   // 队列面板是布局级组件（挂在 AppShell 主区右侧），开关状态放 store 里共享
   const queueOpen = usePlayerStore((s) => s.queueOpen);
   const toggleQueue = usePlayerStore((s) => s.toggleQueue);
-  // 拖动进度条期间拖块常显（hover 才浮现的互补态）
-  const isDraggingProgress = usePlayerStore((s) => s.isDraggingProgress);
 
-  const track = state?.track ?? null;
+  /*
+   * **字段级订阅**，不要再写 `const state = usePlayerStore((s) => s.state)`：
+   * state 是「语义快照」，音量 / 音质 / 倍速 / 睡眠定时任何一项变化都会换掉
+   * 整个对象，订整对象等于让整棵播放条（频谱画布 + 十几个菜单按钮）跟着
+   * 与自己无关的字段一起重渲染。拆成标量后每根订阅按值比较，只在该字段真变时重渲。
+   * 进度位置与时长是高频字段（tick 250ms / 插值 100ms 一档），这里**不订**，
+   * 全部下沉到 <ProgressSlider/>，见该组件的说明。
+   */
+  const track = usePlayerStore((s) => s.state?.track ?? null);
+  const status = usePlayerStore((s) => s.state?.status ?? null);
+  const quality = usePlayerStore((s) => s.state?.quality ?? null);
+  const playMode = usePlayerStore((s) => s.state?.playMode ?? "listLoop");
+  const speed = usePlayerStore((s) => s.state?.speed ?? 1);
+  const sleepTimerMs = usePlayerStore((s) => s.state?.sleepTimerMs ?? null);
+  const sleepAfterTrack = usePlayerStore((s) => s.state?.sleepAfterTrack ?? false);
+  const playUrl = usePlayerStore((s) => s.state?.playUrl ?? null);
+
   const isPlayingPage = pathname === "/playing";
-  // 时长是高频字段（tick 里每 250ms 带一次），单独订阅标量：
-  // 订整个 state 会让整棵播放条跟着 tick 重渲染（见 stores/player.ts 的说明）
-  const duration = usePlayerStore((s) => s.durationMs);
-  const playing = state?.status === "playing";
-  const loading = state?.status === "loading" || state?.status === "buffering";
+  const playing = status === "playing";
+  const loading = status === "loading" || status === "buffering";
   const cover = track ? qtresCoverUrl(track.picUrl) : null;
-  const shownPosition = dragPreviewMs ?? pendingSeekMs ?? position;
   // qt_admin 专属：播放地址调试入口只向内部账号展示
   const profile = useAuthStore((s) => s.profile);
   const showPlayUrl = isAdmin(profile);
@@ -109,7 +141,9 @@ export function PlayerBar(): React.JSX.Element {
   // 歌手下面那行的「实际码率」（REQUIREMENTS：显示真正在播的东西，不显示请求档）。
   // 只显示码率本身：档位标签要么是请求档（没测出来时等于撒谎），要么要按码率
   // 贴一套本地档位口径（与音质菜单两套命名），都不如直接给数字诚实。
-  const bitrateKbps = state?.bitrateKbps ?? null;
+  const bitrateKbps = usePlayerStore((s) => s.state?.bitrateKbps ?? null);
+  // 播放失败的那句说明（REQUIREMENTS §3.1），只在 error / paused 态展示
+  const playError = usePlayerStore((s) => s.state?.error ?? null);
 
   // 播放条按钮开关（设置 → 播放条）：只存「展示中的按钮 id」（见 lib/player-bar.ts），
   // 名额上限（非音量 ≤10）在 store.toggle 里把守；按钮行为一律不变
@@ -150,7 +184,7 @@ export function PlayerBar(): React.JSX.Element {
         return (
           <ControlButton key="quality" label="音质（本地音乐不可选）" disabled>
             <span className="flex h-full min-w-12 items-center justify-center px-2.5 text-xs font-medium tabular-nums">
-              {qualityShortLabel(state?.quality ?? "320", barQualities)}
+              {qualityShortLabel(quality ?? "320", barQualities)}
             </span>
           </ControlButton>
         );
@@ -173,23 +207,23 @@ export function PlayerBar(): React.JSX.Element {
     switch (id) {
       case "playUrl":
         return (
-          <PlayUrlButton
+          <PlayUrlButtonMemo
             key="playUrl"
-            url={state?.playUrl ?? null}
-            line={playUrlLine(track, state?.quality ?? null)}
-            miss={playUrlMiss(track, state?.quality ?? null)}
+            url={playUrl}
+            line={playUrlLine(track, quality)}
+            miss={playUrlMiss(track, quality)}
           />
         );
       // 倍速：放在收藏左边（用户习惯位）；菜单向上弹出
       case "speed":
-        return track ? <SpeedMenu key="speed" current={state?.speed ?? 1} /> : null;
+        return track ? <SpeedMenuMemo key="speed" current={speed} /> : null;
       // 睡眠定时：倍速与收藏之间（用户习惯位）
       case "sleep":
         return (
-          <SleepTimerMenu
+          <SleepTimerMenuMemo
             key="sleep"
-            remainingMs={state?.sleepTimerMs ?? null}
-            afterTrack={state?.sleepAfterTrack ?? false}
+            remainingMs={sleepTimerMs}
+            afterTrack={sleepAfterTrack}
           />
         );
       // 收藏：点开是本地歌单清单，勾上/取消即收藏/取消收藏
@@ -197,16 +231,16 @@ export function PlayerBar(): React.JSX.Element {
         return <CollectButton key="collect" track={track} />;
       case "mode":
         return (
-          <PlayModeButton
+          <PlayModeButtonMemo
             key="mode"
-            mode={state?.playMode ?? "listLoop"}
-            onCycle={() => void cyclePlayMode()}
+            mode={playMode}
+            onCycle={handleCyclePlayMode}
           />
         );
       case "desktopLyric":
-        return <DesktopLyricButton key="desktopLyric" />;
+        return <DesktopLyricButtonMemo key="desktopLyric" />;
       case "mini":
-        return <MiniModeButton key="mini" />;
+        return <MiniModeButtonMemo key="mini" />;
       case "queue":
         // emphasis：展开态和「桌面歌词」开启态同一套点亮（用户 m04741 口径：
         // 「我要和左边桌面歌词打开后效果一样就行」）。队列面板本身在右侧，
@@ -231,17 +265,17 @@ export function PlayerBar(): React.JSX.Element {
         return track ? <DownloadButton key="download" track={track} variant="icon" /> : null;
       case "quality":
         return track && track.platform !== "local" ? (
-          <QualityMenu key="quality" current={state?.quality ?? "320"} platform={track.platform} />
+          <QualityMenuMemo key="quality" current={quality ?? "320"} platform={track.platform} />
         ) : null;
       // 屏蔽（不喜欢）：点一下屏蔽这首歌（Alt+点击屏蔽歌手），已屏蔽时变成取消屏蔽
       case "dislike":
         return track ? <DislikeButton key="dislike" track={track} /> : null;
       // 频谱背景开关：与设置页频谱开关同一个引擎侧后端（setSpectrum）
       case "spectrum":
-        return <SpectrumButton key="spectrum" />;
+        return <SpectrumButtonMemo key="spectrum" />;
       // 均衡器入口：跳设置页音效节（引擎侧 DSP 的 EQ / 响度归一化都在那）
       case "equalizer":
-        return <EqualizerButton key="equalizer" />;
+        return <EqualizerButtonMemo key="equalizer" />;
       // 分享：复制歌曲信息到剪贴板（PC 没有分享面板，用复制兜底）
       case "share":
         return track ? <ShareButton key="share" track={track} /> : null;
@@ -266,7 +300,7 @@ export function PlayerBar(): React.JSX.Element {
   // 被反复重置、永远烧不到（以前 tick 重建 state 就是这个效果）。
   const healAttemptsRef = useRef(0);
   useEffect(() => {
-    if (track || !state || healAttemptsRef.current >= 3) return;
+    if (track || !status || healAttemptsRef.current >= 3) return;
     const timer = setTimeout(() => {
       void getPlaybackState()
         .then((s) => {
@@ -282,7 +316,7 @@ export function PlayerBar(): React.JSX.Element {
         .catch(() => {});
     }, 800);
     return () => clearTimeout(timer);
-  }, [track, state]);
+  }, [track, status]);
 
   /**
    * 封面/歌名点击 = 播放页开关：第一次进播放页（歌词页）
@@ -300,6 +334,174 @@ export function PlayerBar(): React.JSX.Element {
     void navigate({ to: "/playing" });
   };
 
+  return (
+    <div
+      className={cn(
+        // z-20 不能省：播放条自成层叠上下文（z-20），而它本身 z 是 auto；
+        // 内容区是 `relative z-10`，层数更高的内容区会盖在播放条（连同它的弹窗）上面，
+        // 于是向上弹的收藏 / 音质菜单被页面内容整个遮住，表现是「点了没反应」。
+        // 与 TitleBar 的 z-20 同理（见 TitleBar.tsx 同位置注释）。
+        "relative z-20 flex h-[80px] shrink-0 items-center gap-4 border-t px-4",
+        // 播放条的底色**不**跟队列开关联动：用户口径（m04741「我要和左边桌面歌词
+        // 打开后效果一样就行」）指的是队列按钮**自身点亮**——和桌面歌词按钮开启态
+        // 同一套填充（见下方 "queue" 分支的 emphasis），不是整条换表面。
+        // 先前试过整条换 bg-secondary / 提高不透明度，都被判定为「没有变色」/「不是
+        // 我要的」。播放页不渲染队列面板（AppShell 里 !isPlayingPage 才挂
+        // QueuePanel），且那里播放条走自己的封面色渐变，本分支不受影响。
+        isPlayingPage ? "" : "border-border bg-card/70",
+      )}
+      style={
+        isPlayingPage
+          ? {
+              // 顶部略带封面色调 → 底部回到背景色，与页面渐变无缝衔接
+              background:
+                "linear-gradient(to bottom, color-mix(in srgb, var(--playing-cover-accent, var(--background)) 16%, var(--background)) 0%, color-mix(in srgb, var(--playing-cover-accent, var(--background)) 4%, var(--background)) 100%)",
+              // 细分隔线用封面色调的极淡色，几乎隐入背景，只保留一点层次
+              borderColor:
+                "color-mix(in srgb, var(--playing-cover-accent, var(--border)) 20%, transparent)",
+            }
+          : undefined
+      }
+    >
+      {/*
+        毛玻璃单独成层：backdrop-filter 每次重绘都要重新抓取并模糊身后内容，
+        而本组件内部的进度条每帧都在更新——毛玻璃和它同层时，等于每帧重做一次
+        全宽模糊（实测该层 paintCount 高达 527，而其它层都是 1）。
+        拆成独立层（负 z 序，位于底色之上、内容之下，观感不变）后，
+        进度条的更新不再触发背景重抓。
+      */}
+      <div aria-hidden className="pointer-events-none absolute inset-0 -z-10 backdrop-blur-xl" />
+      {/* 频谱背景：与毛玻璃同为 -z-10，DOM 顺序靠后所以画在毛玻璃之上、内容之下 */}
+      <SpectrumBackgroundMemo />
+      {/* 播放失败提示（REQUIREMENTS §3.1：重取仍失败时提示不可播放）。
+          暂停态也显示：掉设备（拔耳机 / 蓝牙断开）是「暂停 + 说明」而不是错误态，
+          状态是 paused，只在 error 态显示的话这句说明就没人看得见。 */}
+      {playError && (status === "error" || status === "paused") && (
+        <div className="pointer-events-none absolute bottom-full left-1/2 mb-1 max-w-[60%] -translate-x-1/2 truncate rounded-md bg-destructive/10 px-3 py-1 text-xs text-destructive shadow">
+          {playError}
+        </div>
+      )}
+      {/* 封面 + 歌名/歌手（点击打开/收起播放页） */}
+      <button
+        type="button"
+        aria-label={pathname === "/playing" ? "返回之前页面" : "打开播放页"}
+        onClick={togglePlayingPage}
+        className="flex w-56 min-w-0 items-center gap-3 rounded-md text-left transition-colors hover:bg-secondary/60"
+      >
+        <div className="flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-secondary">
+          {cover ? (
+            <img
+              src={cover}
+              alt=""
+              className="h-full w-full object-cover"
+              draggable={false}
+            />
+          ) : (
+            // 空态与列表占位一致：图标而非文字，避免播放条上出现孤立小字
+            <span className="flex h-full w-full items-center justify-center text-muted-foreground/60">
+              <Music className="h-5 w-5" />
+            </span>
+          )}
+        </div>
+        <div className="min-w-0 selectable">
+          <div className="truncate text-sm font-medium">
+            {track ? track.title : "未在播放"}
+          </div>
+          <div className="truncate text-xs text-muted-foreground">
+            {track ? track.singer : "未知"}
+          </div>
+          {/* 实际播的码率（不是"请求了什么"，是"真在播什么"）。
+              测不出来就整行不渲染：宁可空着，也不写个 0 kbps 冒充"码率极低"。 */}
+          {track && bitrateKbps !== null ? (
+            <div className="truncate text-[11px] tabular-nums text-muted-foreground/80">
+              {bitrateKbps} kbps
+            </div>
+          ) : null}
+        </div>
+      </button>
+
+      {/* 控制 + 进度 */}
+      <div className="flex min-w-0 flex-1 flex-col items-center gap-1">
+        {/* 三栏栅格：两侧各占 1fr、中间栏 auto 放「上一首/播放/下一首」——
+            播放键因此恒在中间栏正中，左右按钮的条数与宽窄都推不偏它 */}
+        <div className="grid w-full grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3">
+          {/* 可配置按钮分列在播放键两侧（设置 → 播放条 逐个开关）：
+              条数由 lib/player-bar.ts 的 splitPlayerBarButtons 按数量均分 */}
+          <div className="flex items-center justify-end gap-3">
+            {leftBarButtons.map(renderBarButton)}
+          </div>
+          <div className="flex items-center gap-3">
+            <ControlButton label="上一首" onClick={handlePrevTrack}>
+              <SkipBack className="h-4 w-4" />
+            </ControlButton>
+            <button
+              type="button"
+              aria-label={playing ? "暂停" : "播放"}
+              onClick={handleToggle}
+              disabled={!track}
+              className={cn(
+                // 辉光颜色跟 --primary 走（color-mix 派生），换肤/换主色时不会留旧色残影
+                "flex h-12 w-12 items-center justify-center rounded-full bg-gradient-to-br from-primary to-primary/80 text-primary-foreground shadow-[0_4px_14px_color-mix(in_srgb,var(--primary)_32%,transparent),0_2px_4px_rgba(0,0,0,0.12),inset_0_1px_2px_rgba(255,255,255,0.2)] transition-[transform,box-shadow] duration-200 ease-out hover:shadow-[0_6px_18px_color-mix(in_srgb,var(--primary)_42%,transparent),0_3px_6px_rgba(0,0,0,0.15),inset_0_1px_2px_rgba(255,255,255,0.25)] hover:scale-105 active:shadow-[inset_0_2px_6px_rgba(0,0,0,0.25)] disabled:cursor-not-allowed disabled:opacity-40",
+                loading && "animate-pulse",
+              )}
+            >
+              {playing ? (
+                <Pause className="h-5 w-5" />
+              ) : (
+                <Play className="h-5 w-5 translate-x-0.5" />
+              )}
+            </button>
+            <ControlButton label="下一首" onClick={handleNextTrack}>
+              <SkipForward className="h-4 w-4" />
+            </ControlButton>
+          </div>
+          <div className="flex items-center gap-3">
+            {rightBarButtons.map(renderBarButton)}
+          </div>
+        </div>
+
+        {/* 进度行：高频位置订阅全部下沉在 ProgressSlider 内部（见其注释） */}
+        <ProgressSlider />
+      </div>
+
+      {/* 音量：固定在播放条最右侧，不参与左右分列（设置 → 播放条 可隐藏）。
+          容器定宽 w-56 与左侧封面区等宽：两侧等宽，中间控制区的中点才落在窗口中点，
+          否则播放键会被挤偏（音量控件本身只有 w-32，右侧比左侧窄） */}
+      <div className="flex w-56 shrink-0 items-center justify-end">
+        {visibleBarIds.includes("volume") && <VolumeControlMemo />}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * 播放进度条。
+ *
+ * **为什么单独成组件**：位置是高频字段（rAF 插值 + 100ms 量化 ≈ 10 次/秒），
+ * 而播放条本体挂着频谱画布与十几个菜单按钮。以前位置由 PlayerBar 自己订阅，
+ * 每次插值推进都把整棵播放条重渲染一遍。把订阅下沉到这个小树（两个时间标签 +
+ * 一条轨道 + 一个拖块）之后，高频重渲染的代价被限制在这十几个节点上，
+ * 播放条其余部分只随「语义快照」变化重渲染。memo 无 props，父组件重渲也不带动它。
+ *
+ * 拖动交互：指针捕获 + 本地预览值，松手才 seek（拖动期间不追着播放头跳）；
+ * 悬停轨道变粗、拖块浮现，**拖动时上方浮出时间气泡**——不用再眯眼读左侧小字。
+ */
+const ProgressSlider = memo(function ProgressSlider(): React.JSX.Element {
+  const position = useInterpolatedPosition();
+  const duration = usePlayerStore((s) => s.durationMs);
+  // 松手后到 seek 生效前的乐观目标（store 侧），优先于插值位置展示
+  const pendingSeekMs = usePlayerStore((s) => s.pendingSeekMs);
+  // 拖动进度条期间拖块常显（hover 才浮现的互补态）
+  const isDraggingProgress = usePlayerStore((s) => s.isDraggingProgress);
+  const seekTo = usePlayerStore((s) => s.seekTo);
+  const setDragging = usePlayerStore((s) => s.setDragging);
+  const [dragPreviewMs, setDragPreviewMs] = useState<number | null>(null);
+
+  const shownPosition = dragPreviewMs ?? pendingSeekMs ?? position;
+  const percent =
+    duration > 0 ? Math.min(100, Math.max(0, (shownPosition / duration) * 100)) : 0;
+
+  /** 指针横坐标 → 目标毫秒（时长未知时返回 null，避免除零与「跳到 0」） */
   const ratioFromEvent = (
     e: ReactPointerEvent<HTMLDivElement>,
   ): number | null => {
@@ -353,190 +555,74 @@ export function PlayerBar(): React.JSX.Element {
     [setDragging],
   );
 
+  // 键盘可达：滑块是 role="slider"，必须能用 ←/→（±5s）、Home/End 操作，
+  // 否则纯键盘用户根本没法 seek（aria-* 只描述状态，不提供操作）。
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>): void => {
+    if (duration <= 0) return;
+    const step = e.shiftKey ? 30_000 : 5_000;
+    const from = dragPreviewMs ?? pendingSeekMs ?? position;
+    let target: number | null = null;
+    if (e.key === "ArrowLeft") target = from - step;
+    else if (e.key === "ArrowRight") target = from + step;
+    else if (e.key === "Home") target = 0;
+    else if (e.key === "End") target = duration;
+    if (target === null) return;
+    e.preventDefault();
+    void seekTo(Math.min(duration, Math.max(0, target)));
+  };
+
   return (
-    <div
-      className={cn(
-        // z-20 不能省：播放条自成层叠上下文（z-20），而它本身 z 是 auto；
-        // 内容区是 `relative z-10`，层数更高的内容区会盖在播放条（连同它的弹窗）上面，
-        // 于是向上弹的收藏 / 音质菜单被页面内容整个遮住，表现是「点了没反应」。
-        // 与 TitleBar 的 z-20 同理（见 TitleBar.tsx 同位置注释）。
-        "relative z-20 flex h-[80px] shrink-0 items-center gap-4 border-t px-4",
-        // 播放条的底色**不**跟队列开关联动：用户口径（m04741「我要和左边桌面歌词
-        // 打开后效果一样就行」）指的是队列按钮**自身点亮**——和桌面歌词按钮开启态
-        // 同一套填充（见下方 "queue" 分支的 emphasis），不是整条换表面。
-        // 先前试过整条换 bg-secondary / 提高不透明度，都被判定为「没有变色」/「不是
-        // 我要的」。播放页不渲染队列面板（AppShell 里 !isPlayingPage 才挂
-        // QueuePanel），且那里播放条走自己的封面色渐变，本分支不受影响。
-        isPlayingPage ? "" : "border-border bg-card/70",
-      )}
-      style={
-        isPlayingPage
-          ? {
-              // 顶部略带封面色调 → 底部回到背景色，与页面渐变无缝衔接
-              background:
-                "linear-gradient(to bottom, color-mix(in srgb, var(--playing-cover-accent, var(--background)) 16%, var(--background)) 0%, color-mix(in srgb, var(--playing-cover-accent, var(--background)) 4%, var(--background)) 100%)",
-              // 细分隔线用封面色调的极淡色，几乎隐入背景，只保留一点层次
-              borderColor:
-                "color-mix(in srgb, var(--playing-cover-accent, var(--border)) 20%, transparent)",
-            }
-          : undefined
-      }
-    >
-      {/*
-        毛玻璃单独成层：backdrop-filter 每次重绘都要重新抓取并模糊身后内容，
-        而本组件内部的进度条每帧都在更新——毛玻璃和它同层时，等于每帧重做一次
-        全宽模糊（实测该层 paintCount 高达 527，而其它层都是 1）。
-        拆成独立层（负 z 序，位于底色之上、内容之下，观感不变）后，
-        进度条的更新不再触发背景重抓。
-      */}
-      <div aria-hidden className="pointer-events-none absolute inset-0 -z-10 backdrop-blur-xl" />
-      {/* 频谱背景：与毛玻璃同为 -z-10，DOM 顺序靠后所以画在毛玻璃之上、内容之下 */}
-      <SpectrumBackground />
-      {/* 播放失败提示（REQUIREMENTS §3.1：重取仍失败时提示不可播放）。
-          暂停态也显示：掉设备（拔耳机 / 蓝牙断开）是「暂停 + 说明」而不是错误态，
-          状态是 paused，只在 error 态显示的话这句说明就没人看得见。 */}
-      {state?.error && (state.status === "error" || state.status === "paused") && (
-        <div className="pointer-events-none absolute bottom-full left-1/2 mb-1 max-w-[60%] -translate-x-1/2 truncate rounded-md bg-destructive/10 px-3 py-1 text-xs text-destructive shadow">
-          {state.error}
-        </div>
-      )}
-      {/* 封面 + 歌名/歌手（点击打开/收起播放页） */}
-      <button
-        type="button"
-        aria-label={pathname === "/playing" ? "返回之前页面" : "打开播放页"}
-        onClick={togglePlayingPage}
-        className="flex w-56 min-w-0 items-center gap-3 rounded-md text-left transition-colors hover:bg-secondary/60"
+    <div className="flex w-full items-center gap-2 text-[11px] tabular-nums text-muted-foreground">
+      <span className="w-10 text-right selectable">{formatTime(shownPosition)}</span>
+      <div
+        role="slider"
+        aria-label="播放进度"
+        aria-valuemin={0}
+        aria-valuemax={Math.round(duration)}
+        aria-valuenow={Math.round(shownPosition)}
+        aria-valuetext={`${formatTime(shownPosition)} / ${formatTime(duration)}`}
+        tabIndex={0}
+        onKeyDown={onKeyDown}
+        onPointerDown={onBarDown}
+        onPointerMove={onBarMove}
+        onPointerUp={onBarUp}
+        onPointerCancel={onBarCancel}
+        style={{ touchAction: "none" }}
+        className="group relative flex h-4 min-w-0 flex-1 cursor-pointer items-center rounded-full"
       >
-        <div className="flex h-12 w-12 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-secondary">
-          {cover ? (
-            <img
-              src={cover}
-              alt=""
-              className="h-full w-full object-cover"
-              draggable={false}
-            />
-          ) : (
-            // 空态与列表占位一致：图标而非文字，避免播放条上出现孤立小字
-            <span className="flex h-full w-full items-center justify-center text-muted-foreground/60">
-              <Music className="h-5 w-5" />
-            </span>
-          )}
-        </div>
-        <div className="min-w-0">
-          <div className="truncate text-sm font-medium">
-            {track ? track.title : "未在播放"}
-          </div>
-          <div className="truncate text-xs text-muted-foreground">
-            {track ? track.singer : "未知"}
-          </div>
-          {/* 实际播的码率（不是"请求了什么"，是"真在播什么"）。
-              测不出来就整行不渲染：宁可空着，也不写个 0 kbps 冒充"码率极低"。 */}
-          {track && bitrateKbps !== null ? (
-            <div className="truncate text-[11px] tabular-nums text-muted-foreground/80">
-              {bitrateKbps} kbps
-            </div>
-          ) : null}
-        </div>
-      </button>
-
-      {/* 控制 + 进度 */}
-      <div className="flex min-w-0 flex-1 flex-col items-center gap-1">
-        {/* 三栏栅格：两侧各占 1fr、中间栏 auto 放「上一首/播放/下一首」——
-            播放键因此恒在中间栏正中，左右按钮的条数与宽窄都推不偏它 */}
-        <div className="grid w-full grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3">
-          {/* 可配置按钮分列在播放键两侧（设置 → 播放条 逐个开关）：
-              条数由 lib/player-bar.ts 的 splitPlayerBarButtons 按数量均分 */}
-          <div className="flex items-center justify-end gap-3">
-            {leftBarButtons.map(renderBarButton)}
-          </div>
-          <div className="flex items-center gap-3">
-            <ControlButton label="上一首" onClick={() => void prevTrack()}>
-              <SkipBack className="h-4 w-4" />
-            </ControlButton>
-            <button
-              type="button"
-              aria-label={playing ? "暂停" : "播放"}
-              onClick={() => void toggle()}
-              disabled={!track}
-              className={cn(
-                // 辉光颜色跟 --primary 走（color-mix 派生），换肤/换主色时不会留旧色残影
-                "flex h-12 w-12 items-center justify-center rounded-full bg-gradient-to-br from-primary to-primary/80 text-primary-foreground shadow-[0_4px_14px_color-mix(in_srgb,var(--primary)_32%,transparent),0_2px_4px_rgba(0,0,0,0.12),inset_0_1px_2px_rgba(255,255,255,0.2)] transition-all hover:shadow-[0_6px_18px_color-mix(in_srgb,var(--primary)_42%,transparent),0_3px_6px_rgba(0,0,0,0.15),inset_0_1px_2px_rgba(255,255,255,0.25)] hover:scale-105 active:shadow-[inset_0_2px_6px_rgba(0,0,0,0.25)] disabled:cursor-not-allowed disabled:opacity-40",
-                loading && "animate-pulse",
-              )}
-            >
-              {playing ? (
-                <Pause className="h-5 w-5" />
-              ) : (
-                <Play className="h-5 w-5 translate-x-0.5" />
-              )}
-            </button>
-            <ControlButton label="下一首" onClick={() => void nextTrack()}>
-              <SkipForward className="h-4 w-4" />
-            </ControlButton>
-          </div>
-          <div className="flex items-center gap-3">
-            {rightBarButtons.map(renderBarButton)}
-          </div>
-        </div>
-
-        {/* 进度条：外层 16px 高命中区，轨道 hover 从 6px 长到 8px 并浮现拖块；
-            拖动期间（isDraggingProgress）拖块常显。时间标签在容器高度内不跳动 */}
-        <div className="flex w-full items-center gap-2 text-[11px] tabular-nums text-muted-foreground">
-          <span className="w-10 text-right">{formatTime(shownPosition)}</span>
+        <div className="relative h-1.5 w-full rounded-full bg-secondary/60 transition-[height] duration-[var(--motion-fast)] ease-[var(--motion-ease-out-soft)] group-hover:h-2 group-focus-visible:h-2">
           <div
-            role="slider"
-            aria-label="播放进度"
-            aria-valuemin={0}
-            aria-valuemax={Math.round(duration)}
-            aria-valuenow={Math.round(shownPosition)}
-            onPointerDown={onBarDown}
-            onPointerMove={onBarMove}
-            onPointerUp={onBarUp}
-            onPointerCancel={onBarCancel}
-            style={{ touchAction: "none" }}
-            className="group relative flex h-4 min-w-0 flex-1 cursor-pointer items-center"
-          >
-            <div className="relative h-1.5 w-full rounded-full bg-secondary/60 transition-[height] duration-150 group-hover:h-2">
-              <div
-                className="absolute inset-y-0 left-0 rounded-full bg-primary"
-                style={{
-                  width:
-                    duration > 0
-                      ? `${Math.min(100, (shownPosition / duration) * 100)}%`
-                      : "0%",
-                }}
-              />
-            </div>
-            {/* 拖块：hover 浮现，拖动中常显；两端超出轨道属预期（标准滑块形态） */}
-            <div
-              aria-hidden
-              className={cn(
-                "pointer-events-none absolute top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-primary shadow-[0_1px_4px_rgba(0,0,0,0.3)] transition-opacity duration-150",
-                isDraggingProgress
-                  ? "opacity-100"
-                  : "opacity-0 group-hover:opacity-100",
-              )}
-              style={{
-                left:
-                  duration > 0
-                    ? `${Math.min(100, Math.max(0, (shownPosition / duration) * 100))}%`
-                    : "0%",
-              }}
-            />
-          </div>
-          <span className="w-10">{formatTime(duration)}</span>
+            className="absolute inset-y-0 left-0 rounded-full bg-primary"
+            style={{ width: `${percent}%` }}
+          />
         </div>
+        {/* 拖块：hover / 键盘聚焦浮现，拖动中常显并放大；两端超出轨道属预期（标准滑块形态） */}
+        <div
+          aria-hidden
+          className={cn(
+            "pointer-events-none absolute top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-primary shadow-[0_1px_4px_rgba(0,0,0,0.3)]",
+            "transition-[opacity,scale] duration-[var(--motion-fast)] ease-[var(--motion-ease-out-soft)]",
+            isDraggingProgress
+              ? "scale-125 opacity-100"
+              : "opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100",
+          )}
+          style={{ left: `${percent}%` }}
+        />
+        {/* 时间气泡：只在「手指/鼠标真在拖」时出现（键盘 seek 有 aria-valuetext 兜底） */}
+        {isDraggingProgress && dragPreviewMs !== null ? (
+          <div
+            aria-hidden
+            className="pointer-events-none absolute bottom-full mb-1.5 -translate-x-1/2 rounded-md bg-popover px-2 py-0.5 text-[11px] font-medium tabular-nums text-popover-foreground shadow-md ring-1 ring-border"
+            style={{ left: `${percent}%` }}
+          >
+            {formatTime(dragPreviewMs)}
+          </div>
+        ) : null}
       </div>
-
-      {/* 音量：固定在播放条最右侧，不参与左右分列（设置 → 播放条 可隐藏）。
-          容器定宽 w-56 与左侧封面区等宽：两侧等宽，中间控制区的中点才落在窗口中点，
-          否则播放键会被挤偏（音量控件本身只有 w-32，右侧比左侧窄） */}
-      <div className="flex w-56 shrink-0 items-center justify-end">
-        {visibleBarIds.includes("volume") && <VolumeControl />}
-      </div>
+      <span className="w-10 selectable">{formatTime(duration)}</span>
     </div>
   );
-}
+});
 
 /** 桌面歌词开关（DESIGN §10）：初始读 Rust 状态，此后跟随 lyric-window-changed */
 /** 引擎侧一帧频谱的频段数（fx.rs SPECTRUM_BANDS），事件按数组顺序到达 */
@@ -761,7 +847,7 @@ function QualityMenu(props: { current: Quality; platform: string }): React.JSX.E
           aria-expanded={t.open}
           disabled={busy}
           onClick={t.toggle}
-          className="flex h-9 min-w-12 items-center justify-center rounded-full px-2.5 text-xs font-medium tabular-nums transition-all disabled:opacity-50 text-foreground/80 hover:bg-secondary/50 hover:text-foreground"
+          className="flex h-9 min-w-12 items-center justify-center rounded-full px-2.5 text-xs font-medium tabular-nums transition-colors disabled:opacity-50 text-foreground/80 hover:bg-secondary/50 hover:text-foreground"
         >
           {shortOf(current)}
         </button>
@@ -826,7 +912,7 @@ function SpeedMenu(props: { current: number }): React.JSX.Element {
           aria-haspopup="menu"
           aria-expanded={t.open}
           onClick={t.toggle}
-          className="flex h-9 min-w-12 items-center justify-center rounded-full px-2.5 text-xs font-medium tabular-nums text-foreground/80 transition-all hover:bg-secondary/50 hover:text-foreground"
+          className="flex h-9 min-w-12 items-center justify-center rounded-full px-2.5 text-xs font-medium tabular-nums text-foreground/80 transition-colors hover:bg-secondary/50 hover:text-foreground"
         >
           {speedLabel(props.current)}
         </button>
@@ -1301,7 +1387,7 @@ function ControlButton(props: {
       disabled={props.disabled}
       onClick={props.onClick}
       className={cn(
-        "flex h-9 w-9 items-center justify-center rounded-full transition-all",
+        "flex h-9 w-9 items-center justify-center rounded-full transition-colors",
         // 其余按钮一律不铺底色（用户口径：除四个状态按钮外不要背景色），
         // 只留 hover 浮出的浅底做可点提示。
         // 开启态填充从 80% 降到 60%（用户反馈「选中的颜色再浅一点」），

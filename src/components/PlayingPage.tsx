@@ -241,7 +241,7 @@ function VinylCover(props: { track: Track | null; playing: boolean }): React.JSX
       {/* 封面色光晕：唱片不再浮在纯色上，与整窗背景同一色源 */}
       <div
         aria-hidden
-        className="absolute -inset-10 rounded-full opacity-60 blur-3xl"
+        className="absolute -inset-10 rounded-full opacity-60 blur-3xl [mask-image:radial-gradient(circle,black_55%,transparent_75%)]"
         style={{
           background:
             "color-mix(in srgb, var(--playing-cover-accent, var(--primary)) 38%, transparent)",
