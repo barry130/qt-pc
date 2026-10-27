@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { ChevronDown, ChevronsDownUp, ChevronsUpDown } from "lucide-react";
 import { stripErrorUrls } from "@/lib/utils";
 import {
   mergeCredentialExtras,
@@ -7,7 +8,6 @@ import {
   readSourceAuthTogglesFor,
   removeSourceAuthAccount,
   saveSourceAuthAccount,
-  saveSourceAuthSyncPlaylists,
   setSourceAuthToggle,
   type SourceAuthAccount,
   type SourceAuthToggles,
@@ -142,6 +142,11 @@ export function SourceAccountsPage(): React.JSX.Element {
   const [armedLogout, setArmedLogout] = useState<string | null>(null);
   /** 网页登录进行中的源（v17 契约）：期间禁用全部网页登录按钮（登录窗互斥） */
   const [webLoginBusy, setWebLoginBusy] = useState<string | null>(null);
+  /** 卡片折叠（2026-10-27 用户需求）：点标题行收起下面的开关/音质行。
+   *  默认全部折叠，页面右上角「全部折叠/展开」一键统一切换；单卡手动展开只
+   *  覆盖到下一次一键切换（清空覆盖表）。只存内存，重进页面回到默认折叠态。 */
+  const [allCollapsed, setAllCollapsed] = useState(true);
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 
   /** 卡片清单（2026-10-25 用户需求「全平台写入音源账号」）：注册表全部源按展示
    *  顺序——登录行仍按 auth.methods 门控（kg/migu 无登录接口不渲染登录区），
@@ -166,7 +171,7 @@ export function SourceAccountsPage(): React.JSX.Element {
       const acc = await readSourceAuthAccounts();
       setAccounts(acc);
       setLoaded(true);
-      // 每源读生效开关（未物化的源走解析链：旧全局键 → 双开）
+      // 每源读生效开关（未物化的源走解析链：旧全局键 → 数据开/播放关）
       const entries = await Promise.all(
         [...sources.map((s) => s.id), ...Object.keys(acc)].map(async (id) => [id, await readSourceAuthTogglesFor(id)] as const),
       );
@@ -273,7 +278,7 @@ export function SourceAccountsPage(): React.JSX.Element {
         setToggles((prev) => ({ ...prev, [item.id]: tg }));
         if (acc) {
           toast(`已登录${acc.user.nickname}（${acc.user.vip ? acc.user.vipLabel || "会员" : "非会员"}）`);
-          // 落库成功的下一步：按「登录后同步歌单」开关决定是否自动拉差集
+          // 落库成功的下一步：登录即自动拉差集（用户 2026-10-27 定稿：默认开启）
           maybeAutoSync(item.id, item.name);
         }
       })
@@ -314,7 +319,7 @@ export function SourceAccountsPage(): React.JSX.Element {
                 setStale((prev) => ({ ...prev, [qrSource]: false }));
                 setQr(null);
                 toast(`已登录${r.user.nickname}（${r.user.vip ? r.user.vipLabel || "会员" : "非会员"}）`);
-                // 落库成功的下一步：按「登录后同步歌单」开关决定是否自动拉差集
+                // 落库成功的下一步：登录即自动拉差集（用户 2026-10-27 定稿：默认开启）
                 maybeAutoSync(qrSource, qrSourceName ?? qrSource);
               })
               .catch((e) => {
@@ -362,7 +367,7 @@ export function SourceAccountsPage(): React.JSX.Element {
           setCookieSource(null);
           setCookieText("");
           toast(`已导入${sourceName}登录：${user.nickname}`);
-          // 落库成功的下一步：按「登录后同步歌单」开关决定是否自动拉差集
+          // 落库成功的下一步：登录即自动拉差集（用户 2026-10-27 定稿：默认开启）
           maybeAutoSync(source, sourceName);
         });
       })
@@ -382,7 +387,7 @@ export function SourceAccountsPage(): React.JSX.Element {
       refreshAccounts();
       setStale((prev) => ({ ...prev, [source]: false }));
       toast(`已登录${user.nickname}（${user.vip ? user.vipLabel || "会员" : "非会员"}）`);
-      // 落库成功的下一步：按「登录后同步歌单」开关决定是否自动拉差集
+      // 落库成功的下一步：登录即自动拉差集（用户 2026-10-27 定稿：默认开启）
       maybeAutoSync(source, sourceName);
     });
 
@@ -475,14 +480,14 @@ export function SourceAccountsPage(): React.JSX.Element {
     };
   }, []);
 
-  /** 登录成功后的自动同步：该源「登录后同步歌单」开着才拉差集预览；平台侧
-   *  有本地没有的歌单就自动打开同步弹窗。预览失败（包旧/未实现/网络问题）
-   *  只 console.warn 静默——不打扰登录成功的反馈；弹窗 state 更新前校验
-   *  页面还挂着，卸载/竞态不再弹。 */
+  /** 登录成功后的自动同步：登录即拉差集预览（用户 2026-10-27 定稿，不再有
+   *  开关把关）；平台侧有本地没有的歌单就自动打开同步弹窗。预览失败（包旧/
+   *  未实现/网络问题）只 console.warn 静默——不打扰登录成功的反馈；弹窗
+   *  state 更新前校验页面还挂着，卸载/竞态不再弹。 */
   const maybeAutoSync = (source: string, sourceName: string): void => {
     void autoSyncMissingAfterLogin(source)
       .then((missing) => {
-        if (missing === null || missing.length === 0) return;
+        if (missing.length === 0) return;
         if (!mountedRef.current) return;
         setSyncDialog({ source, sourceName });
       })
@@ -491,25 +496,38 @@ export function SourceAccountsPage(): React.JSX.Element {
       });
   };
 
-  /** 「登录后同步歌单」开关（只在登录态显示；缺省开）。乐观更新 + 失败回滚，
-   *  与 toggleScope 同款反馈。 */
-  const toggleSyncPlaylists = (source: string, on: boolean): void => {
-    const current = toggles[source];
-    if (current === undefined) return;
-    setToggles((prev) => ({ ...prev, [source]: { ...current, syncPlaylists: on } }));
-    saveSourceAuthSyncPlaylists(source, on).catch((e) => {
-      setToggles((prev) => ({ ...prev, [source]: current }));
-      toastError(`保存失败：${stripErrorUrls(String(e))}`);
-    });
-  };
+  /** 只要有卡片处于展开态，右上角按钮就是「全部折叠」，否则是「全部展开」 */
+  const anyCardExpanded = cards.some((item) => !(collapsed[item.id] ?? allCollapsed));
 
   return (
     <div className="flex h-full min-w-0 flex-col">
-      <div className="border-b border-border px-4 py-3">
-        <h1 className="text-base font-medium">音源账号</h1>
-        <p className="mt-1 text-xs text-muted-foreground">
-          扫码登录音源官方账号，凭据只存本机；每个音源单独决定数据/播放请求是否使用登录态。
-        </p>
+      <div className="flex items-start justify-between gap-3 border-b border-border px-4 py-3">
+        <div className="min-w-0">
+          <h1 className="text-base font-medium">音源账号</h1>
+          <p className="mt-1 text-xs text-muted-foreground">
+            扫码登录音源官方账号，凭据只存本机；每个音源单独决定数据/播放请求是否使用登录态。
+          </p>
+        </div>
+        {cards.length > 0 ? (
+          <button
+            type="button"
+            onClick={() => {
+              // 有展开的 → 全部折叠（allCollapsed=true）；全折叠 → 全部展开
+              // （allCollapsed=false）。顺带清掉单卡覆盖表。
+              setAllCollapsed(anyCardExpanded);
+              setCollapsed({});
+            }}
+            title={anyCardExpanded ? "收起所有音源的登录态设置" : "展开所有音源的登录态设置"}
+            className="flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+          >
+            {anyCardExpanded ? (
+              <ChevronsDownUp aria-hidden="true" className="h-3.5 w-3.5" />
+            ) : (
+              <ChevronsUpDown aria-hidden="true" className="h-3.5 w-3.5" />
+            )}
+            {anyCardExpanded ? "全部折叠" : "全部展开"}
+          </button>
+        ) : null}
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
         {cards.length === 0 ? (
@@ -522,14 +540,27 @@ export function SourceAccountsPage(): React.JSX.Element {
           <div className="flex flex-col gap-3">
             {cards.map((item) => {
               const account = accounts[item.id];
-              const tg = toggles[item.id] ?? { useMeta: true, usePlay: true };
+              const tg = toggles[item.id] ?? { useMeta: true, usePlay: false };
+              const isCollapsed = collapsed[item.id] ?? allCollapsed;
               return (
                 <div
                   key={item.id}
                   className="rounded-xl border border-border bg-card/60 px-4 py-3"
                 >
                   <div className="flex items-center justify-between gap-3">
-                    <div className="flex min-w-0 items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        setCollapsed((prev) => ({ ...prev, [item.id]: !isCollapsed }))
+                      }
+                      aria-expanded={!isCollapsed}
+                      title={isCollapsed ? "展开该音源的登录态设置" : "收起该音源的登录态设置"}
+                      className="flex min-w-0 items-center gap-1.5 rounded-md px-1 py-0.5 text-left hover:bg-accent"
+                    >
+                      <ChevronDown
+                        aria-hidden="true"
+                        className={`h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform ${isCollapsed ? "-rotate-90" : ""}`}
+                      />
                       <span className="shrink-0 text-sm font-medium">{item.name}</span>
                       {account ? (
                         stale[item.id] ? (
@@ -542,7 +573,7 @@ export function SourceAccountsPage(): React.JSX.Element {
                       ) : (
                         <span className="shrink-0 text-[11px] text-muted-foreground">未登录</span>
                       )}
-                    </div>
+                    </button>
                     {account ? (
                       <span className="flex shrink-0 items-center gap-2">
                         <button
@@ -655,87 +686,75 @@ export function SourceAccountsPage(): React.JSX.Element {
                     ) : null}
                   </div>
 
-                  <div className="mt-2 border-t border-border/70 pt-1">
-                    <div className="flex items-center justify-between gap-4 py-2">
-                      <div className="min-w-0">
-                        <p className="text-sm">数据请求使用登录态</p>
-                        <p className="mt-0.5 text-xs text-muted-foreground">
-                          搜索/歌单/歌词等数据请求带上该源凭据（如B站登录后才能取AI字幕歌词）。
-                        </p>
-                      </div>
-                      <Switch
-                        checked={tg.useMeta}
-                        onToggle={() => toggleScope(item.id, "meta", !tg.useMeta)}
-                        disabled={!account}
-                      />
-                    </div>
-                    <div className="flex items-center justify-between gap-4 py-2">
-                      <div className="min-w-0">
-                        <p className="text-sm">播放请求使用登录态</p>
-                        <p className="mt-0.5 text-xs text-muted-foreground">
-                          取链/播放请求带上该源凭据（如大会员解锁 hires/dolby 音质档）。与数据请求互不影响。
-                        </p>
-                      </div>
-                      <Switch
-                        checked={tg.usePlay}
-                        onToggle={() => toggleScope(item.id, "play", !tg.usePlay)}
-                        disabled={!account}
-                      />
-                    </div>
-                    {account ? (
+                  {isCollapsed ? null : (
+                    <div className="mt-2 border-t border-border/70 pt-1">
                       <div className="flex items-center justify-between gap-4 py-2">
                         <div className="min-w-0">
-                          <p className="text-sm">登录后同步歌单</p>
+                          <p className="text-sm">数据请求使用登录态</p>
                           <p className="mt-0.5 text-xs text-muted-foreground">
-                            登录成功后自动拉取该账户在平台侧的收藏歌单，提示收藏本地还没有的；也可随时点上方「同步歌单」手动触发。
+                            搜索/歌单/歌词等数据请求带上该源凭据（如B站登录后才能取AI字幕歌词）。只有启用时才能同步歌单。
                           </p>
                         </div>
                         <Switch
-                          checked={tg.syncPlaylists ?? true}
-                          onToggle={() => toggleSyncPlaylists(item.id, !(tg.syncPlaylists ?? true))}
+                          checked={tg.useMeta}
+                          onToggle={() => toggleScope(item.id, "meta", !tg.useMeta)}
+                          disabled={!account}
                         />
                       </div>
-                    ) : null}
-                    {(
-                      <>
-                        {([
-                          { key: "play", title: "播放音质", desc: "播放该源歌曲时的取址音质；播放条音质按钮会同步改这里。", value: sourcePlayQualityOf(item.id), change: changePlayQuality },
-                          { key: "download", title: "下载音质", desc: "下载该源歌曲时的目标音质。", value: sourceDownloadQualityOf(item.id), change: changeDownloadQuality },
-                        ] as const).map((row) => {
-                          const declared = qualityOptionsFromRegistry(sourceQualityOptionsOf(item.id));
-                          // 落库值不在该源档位清单里（换包/换清单）时保留显示，
-                          // 避免下拉显示与实际存储不符的假值；发起时会按源钳到可用档
-                          const opts = declared.some((o) => o.value === row.value)
-                            ? declared
-                            : [
-                                { value: row.value, label: row.value, short: row.value.toUpperCase() },
-                                ...declared,
-                              ];
-                          const current = row.value;
-                          return (
-                            <div key={`${row.key}-${qualityTick}`} className="flex items-center justify-between gap-4 py-2">
-                              <div className="min-w-0">
-                                <p className="text-sm">{row.title}</p>
-                                <p className="mt-0.5 text-xs text-muted-foreground">{row.desc}</p>
+                      <div className="flex items-center justify-between gap-4 py-2">
+                        <div className="min-w-0">
+                          <p className="text-sm">播放请求使用登录态</p>
+                          <p className="mt-0.5 text-xs text-muted-foreground">
+                            取链/播放请求带上该源凭据（如大会员解锁 hires/dolby 音质档）。与数据请求互不影响。
+                          </p>
+                        </div>
+                        <Switch
+                          checked={tg.usePlay}
+                          onToggle={() => toggleScope(item.id, "play", !tg.usePlay)}
+                          disabled={!account}
+                        />
+                      </div>
+                      {(
+                        <>
+                          {([
+                            { key: "play", title: "播放音质", desc: "播放该源歌曲时的取址音质；播放条音质按钮会同步改这里。", value: sourcePlayQualityOf(item.id), change: changePlayQuality },
+                            { key: "download", title: "下载音质", desc: "下载该源歌曲时的目标音质。", value: sourceDownloadQualityOf(item.id), change: changeDownloadQuality },
+                          ] as const).map((row) => {
+                            const declared = qualityOptionsFromRegistry(sourceQualityOptionsOf(item.id));
+                            // 落库值不在该源档位清单里（换包/换清单）时保留显示，
+                            // 避免下拉显示与实际存储不符的假值；发起时会按源钳到可用档
+                            const opts = declared.some((o) => o.value === row.value)
+                              ? declared
+                              : [
+                                  { value: row.value, label: row.value, short: row.value.toUpperCase() },
+                                  ...declared,
+                                ];
+                            const current = row.value;
+                            return (
+                              <div key={`${row.key}-${qualityTick}`} className="flex items-center justify-between gap-4 py-2">
+                                <div className="min-w-0">
+                                  <p className="text-sm">{row.title}</p>
+                                  <p className="mt-0.5 text-xs text-muted-foreground">{row.desc}</p>
+                                </div>
+                                <select
+                                  value={current}
+                                  aria-label={`${item.name} ${row.title}`}
+                                  onChange={(e) => row.change(item.id, e.target.value as Quality)}
+                                  className="shrink-0 rounded-md border border-input bg-background px-2 py-1.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                                >
+                                  {opts.map((o) => (
+                                    <option key={o.value} value={o.value}>
+                                      {o.label}（{o.short}）
+                                    </option>
+                                  ))}
+                                </select>
                               </div>
-                              <select
-                                value={current}
-                                aria-label={`${item.name} ${row.title}`}
-                                onChange={(e) => row.change(item.id, e.target.value as Quality)}
-                                className="shrink-0 rounded-md border border-input bg-background px-2 py-1.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                              >
-                                {opts.map((o) => (
-                                  <option key={o.value} value={o.value}>
-                                    {o.label}（{o.short}）
-                                  </option>
-                                ))}
-                              </select>
-                            </div>
-                          );
-                        })}
-                      </>
-                    )}
-                  </div>
+                            );
+                          })}
+                        </>
+                      )}
+                    </div>
+                  )}
                 </div>
               );
             })}

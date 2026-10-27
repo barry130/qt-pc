@@ -94,7 +94,8 @@ export const SOURCE_AUTH_ACCOUNTS_KEY = "sourceAuth.accounts";
 /**
  * 「是否使用登录态」开关（JSON：source → { useMeta, usePlay }），**按音源独立**：
  * 数据面（meta）与播放面（play）每源各一对。源未物化时的解析优先级见
- * lib/source-auth.ts（per-source 表 → 旧全局键 → 双开）。
+ * lib/source-auth.ts（per-source 表 → 旧全局键（仅当它偏离旧缺省时）→
+ * 缺省数据开/播放关）。
  */
 export const SOURCE_AUTH_TOGGLES_KEY = "sourceAuth.toggles";
 

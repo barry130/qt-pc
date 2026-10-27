@@ -123,10 +123,6 @@ export function resetSourceAuthCaches(): void {
 export interface SourceAuthToggles {
   useMeta: boolean;
   usePlay: boolean;
-  /** 登录成功后是否自动同步该账户平台侧收藏歌单（2026-10-26 需求）。可选键：
-   *  旧记录没有该键 = 缺省开（读取方兜底）；parse 只收 boolean，缺省不写键，
-   *  记录形状向后兼容。 */
-  syncPlaylists?: boolean;
 }
 
 type SourceAuthTogglesMap = Record<string, SourceAuthToggles>;
@@ -153,10 +149,6 @@ export function parseSourceAuthToggles(raw: string | null | undefined): SourceAu
     out[source] = {
       useMeta: toggles.useMeta,
       usePlay: toggles.usePlay,
-      // syncPlaylists 只收 boolean：缺省/坏值不写键（缺省语义 = 开，读取方兜底）
-      ...(typeof toggles.syncPlaylists === "boolean"
-        ? { syncPlaylists: toggles.syncPlaylists }
-        : {}),
     };
   }
   return out;
@@ -180,37 +172,49 @@ async function writeTogglesMap(next: SourceAuthTogglesMap): Promise<void> {
 }
 
 /** 旧全局键（per-source 表上线前所有源共用一对）。只读不写：作为未物化源的
- * 一次性继承源，让升级前调过全局开关的用户不回跳。两键都没有 = null。 */
+ *  一次性继承源，让升级前调过全局开关的用户不回跳。
+ *
+ *  **只继承「偏离旧缺省」的值**：旧版缺省就是双开，所以库里残留的 `true/true`
+ *  与「从没动过」完全不可区分、不携带任何用户意图——若照旧整体继承，这对键会
+ *  永久盖住新缺省（数据开/播放关），新装的源、没物化过的源全都显示双开
+ *  （2026-10-27 用户报「没有登录的怎么还是双开」的根因）。任一面为 false 才
+ *  证明用户主动关过东西，此时才整体继承。两键都没有 / 两键都是 true = null。 */
 async function legacyGlobalToggles(): Promise<SourceAuthToggles | null> {
   if (cachedLegacy === undefined) {
     const [meta, play] = await Promise.all([
       ipc.getSetting(SOURCE_AUTH_USE_META_KEY).catch(() => null),
       ipc.getSetting(SOURCE_AUTH_USE_PLAY_KEY).catch(() => null),
     ]);
-    cachedLegacy = meta === null && play === null ? null : { useMeta: meta === "true", usePlay: play === "true" };
+    if (meta === null && play === null) {
+      cachedLegacy = null;
+    } else {
+      const inherited: SourceAuthToggles = { useMeta: meta === "true", usePlay: play === "true" };
+      // 双开 = 旧缺省 = 无信息量，不当继承源
+      cachedLegacy = inherited.useMeta && inherited.usePlay ? null : inherited;
+    }
   }
   return cachedLegacy;
 }
 
-/** 单源生效开关的解析优先级：per-source 表 → 旧全局键（升级继承）→ 双开。
- * 「登录了却默认不用，用户会以为登录没生效」，所以登录态下缺省双开、要不用
- * 自己关；未登录的源两面按关闭展示（v14 口径：开关跟着登录走，没账号谈不上
- * 「使用登录态」）。 */
+/** 单源生效开关的解析优先级：per-source 表 → 旧全局键（升级继承）→ 缺省。
+ *  缺省口径（2026-10-27 用户需求「数据请求使用登录态默认为开，播放请求使用
+ *  登录态为关」）：数据面默认开、播放面默认关——数据面是搜索/歌单/歌词这类
+ *  「不带凭据就用不了」的必需项；播放面默认不带凭据，避免冷门音质档拿不到链
+ *  就被误判成播放失败，需要时用户自己开。**未登录的源用同一缺省**（用户
+ *  2026-10-27：「非登录态也是使用这个」）：开关行在无账号时本就禁用，展示口径
+ *  与登录态一致，登录后立刻生效的就是用户看到的那对值。 */
 async function effectiveTogglesFor(
   source: string,
   map: SourceAuthTogglesMap,
-  hasAccount: boolean,
 ): Promise<SourceAuthToggles> {
   const hit = map[source];
   if (hit !== undefined) return hit;
-  if (!hasAccount) return { useMeta: false, usePlay: false };
-  return (await legacyGlobalToggles()) ?? { useMeta: true, usePlay: true };
+  return (await legacyGlobalToggles()) ?? { useMeta: true, usePlay: false };
 }
 
-/** 读单源生效开关（页面展示用） */
+/** 读单源生效开关（页面展示用）：与登录态无关，登录前后同一套解析链 */
 export async function readSourceAuthTogglesFor(source: string): Promise<SourceAuthToggles> {
-  const accounts = await readSourceAuthAccounts();
-  return effectiveTogglesFor(source, await readTogglesMap(), accounts[source] !== undefined);
+  return effectiveTogglesFor(source, await readTogglesMap());
 }
 
 /** 保存/覆盖一个源的登录：落库 + 该源开关未物化时按解析链初始化（旧全局值
@@ -232,8 +236,8 @@ export async function saveSourceAuthAccount(
   };
   const map = { ...(await readTogglesMap()) };
   if (map[source] === undefined) {
-    // 刚登录成功：该源必有账号，走登录态缺省（旧全局继承→双开）
-    await writeTogglesMap({ ...map, [source]: await effectiveTogglesFor(source, map, true) });
+    // 刚登录成功：该源必有账号，走登录态缺省（旧全局继承→数据开/播放关）
+    await writeTogglesMap({ ...map, [source]: await effectiveTogglesFor(source, map) });
   }
   await writeAccounts(accounts);
   await applySourceAuthForSource(source);
@@ -331,34 +335,13 @@ export async function setSourceAuthToggle(
   on: boolean,
 ): Promise<void> {
   const map = { ...(await readTogglesMap()) };
-  // 开关行只在登录后可点；仍以库里账号表为准（缓存未热也能算对）
-  const accounts = await readSourceAuthAccounts();
-  const current = await effectiveTogglesFor(source, map, accounts[source] !== undefined);
+  const current = await effectiveTogglesFor(source, map);
   const next: SourceAuthToggles =
     scope === "meta" ? { ...current, useMeta: on } : { ...current, usePlay: on };
   if (next.useMeta === current.useMeta && next.usePlay === current.usePlay) return;
   await writeTogglesMap({ ...map, [source]: next });
   await applySourceAuthForSource(source);
   if (scope === "play") emitPlayLoginChanged();
-}
-
-/** 读单源「登录后同步歌单」生效值（缺省 = 开）。不继承旧全局键——旧全局键
- *  只有 meta/play 两面，没有同步语义。 */
-export async function readSourceAuthSyncPlaylistsFor(source: string): Promise<boolean> {
-  const map = await readTogglesMap();
-  return map[source]?.syncPlaylists ?? true;
-}
-
-/** 保存单源「登录后同步歌单」开关：把生效值物化进 per-source 表（与两面开关
- *  同口径，物化后缺省值不再影响该源），无变化短路。该开关不影响引擎注入面，
- *  不触发 setAuth/事件。失败抛给调用方决定提示。 */
-export async function saveSourceAuthSyncPlaylists(source: string, on: boolean): Promise<void> {
-  const map = { ...(await readTogglesMap()) };
-  // 开关行只在登录后显示；仍以库里账号表为准（缓存未热也能算对）
-  const accounts = await readSourceAuthAccounts();
-  const current = await effectiveTogglesFor(source, map, accounts[source] !== undefined);
-  if ((current.syncPlaylists ?? true) === on) return;
-  await writeTogglesMap({ ...map, [source]: { ...current, syncPlaylists: on } });
 }
 
 // ---------- 官方线路档位（v10：登录态下档位展示整体切官方清单） ----------
@@ -369,15 +352,16 @@ export async function saveSourceAuthSyncPlaylists(source: string, on: boolean): 
 // clampQualityForPlatform / quality-fallback）——判定口径与包侧官方前置
 // 线路的启用条件一致：有凭据（账号存在）且播放面开关开启。
 
-/** 该源播放面登录态是否生效（同步版，读进程内缓存；缓存未热时开关按默认开处理） */
+/** 该源播放面登录态是否生效（同步版，读进程内缓存；缓存未热时按缺省「播放面
+ *  关」处理——宁可先不展示官方档，也不要展示一个取链会失败的档位） */
 export function sourcePlayLoginActiveSync(source: string): boolean {
   const accounts = cachedAccounts;
   if (accounts === undefined || accounts[source] === undefined) return false;
   const map = cachedToggles;
-  if (map === undefined) return true; // 开关表还没读进来：默认两面都开
+  if (map === undefined) return false; // 开关表还没读进来：按缺省播放面关
   const materialized = map[source];
   if (materialized !== undefined) return materialized.usePlay;
-  return cachedLegacy?.usePlay ?? true;
+  return cachedLegacy?.usePlay ?? false;
 }
 
 /** 播放面登录态变化事件（登录/登出/切开关后派发，档位展示订阅它刷新） */
@@ -417,7 +401,7 @@ async function applySourceAuthForSource(source: string): Promise<void> {
     await authClearCredential("play", source);
     return;
   }
-  const toggles = await effectiveTogglesFor(source, map, true); // 前面已早退无账号分支
+  const toggles = await effectiveTogglesFor(source, map);
   for (const scope of ["meta", "play"] as const) {
     const on = scope === "meta" ? toggles.useMeta : toggles.usePlay;
     if (on) await authSetCredential(scope, source, account.cookie);

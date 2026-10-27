@@ -1,7 +1,8 @@
 /**
  * 账户歌单同步（2026-10-26 需求）：登录音源账户后拉取该账户在平台侧的收藏
  * 歌单，与本地已收藏的在线歌单（我的歌单里 platform 匹配的部分）diff，
- * 缺失项引导用户勾选收藏；登录成功后可按「登录后同步歌单」开关自动触发。
+ * 缺失项引导用户勾选收藏；登录成功后默认自动触发（用户 2026-10-27 定稿：
+ * 不再提供「登录后同步歌单」开关，登录即对比，嫌吵可在弹窗里直接关掉）。
  *
  * 数据链路：平台侧清单走数据包 v18 契约 accountPlaylists（source-scripts
  * 包装层，旧包缺入口抛「数据包版本过旧」提示）；本地侧只读
@@ -11,7 +12,6 @@
  */
 import * as ipc from "@/services/ipc";
 import { accountPlaylists, type SourceAccountPlaylist } from "@/source-scripts";
-import { readSourceAuthSyncPlaylistsFor } from "@/lib/source-auth";
 
 /** 平台侧与本地收藏的差集预览：missing 保持平台返回顺序；total = 平台侧歌单总数 */
 export interface AccountSyncPreview {
@@ -75,13 +75,13 @@ export async function collectAccountPlaylists(
 }
 
 /**
- * 登录成功后的自动同步决策：该源「登录后同步歌单」关着 → null（页面不弹）；
- * 开着 → 返回缺失清单（空数组 = 平台侧没有要补的）。预览失败（包旧/未实现/
- * 网络）原样上抛——页面统一 console.warn 静默，不打扰登录成功的反馈。
+ * 登录成功后的自动同步决策：返回缺失清单（空数组 = 平台侧没有要补的）。
+ * 用户 2026-10-27 定稿后这里没有任何开关门控——登录成功就对比，
+ * 弹窗由调用方决定开不开。预览失败（包旧/未实现/网络）原样上抛——
+ * 页面统一 console.warn 静默，不打扰登录成功的反馈。
  */
 export async function autoSyncMissingAfterLogin(
   source: string,
-): Promise<SourceAccountPlaylist[] | null> {
-  if (!(await readSourceAuthSyncPlaylistsFor(source))) return null;
+): Promise<SourceAccountPlaylist[]> {
   return (await accountSyncPreview(source)).missing;
 }

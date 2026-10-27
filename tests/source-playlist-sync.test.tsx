@@ -1,14 +1,16 @@
-// 账户歌单同步（2026-10-26 需求）：
+// 账户歌单同步（2026-10-26 需求；2026-10-27 定稿去掉「登录后同步歌单」开关）：
 // 1) accountSyncPreview 的 diff 语义——missing 保持平台返回顺序、只与「同平台」
 //    本地收藏 diff（网易同 pid / 本地自建都算缺失）；
 // 2) collectAccountPlaylists 的计数语义——collected/skipped/failed，单个失败
 //    不中断整体，已收藏跳过（预检失败视为未收藏继续）；
-// 3) autoSyncMissingAfterLogin 的开关语义——「登录后同步歌单」缺省开、关着
-//    返回 null 且不拉平台数据；包旧错误原样上抛（页面 console.warn 静默）；
+// 3) autoSyncMissingAfterLogin 的语义——登录即拉差集、无任何开关门控；包旧
+//    错误原样上抛（页面 console.warn 静默）；
 // 4) SourcePlaylistSyncDialog 组件——missing 渲染、收藏调用参数、空/错误态、
 //    failed>0 的 toastError；
-// 5) SourceAccountsPage 登录成功自动触发——默认开且 missing>0 自动弹窗；
-//    syncPlaylists=false 不自动弹。
+// 5) SourceAccountsPage——登录成功且 missing>0 自动弹窗；平台侧无缺失不弹；
+//    卡片默认全部折叠（右上角「全部折叠/展开」一键切、标题行单卡切）、
+//    「登录后同步歌单」开关行已移除、数据请求行带「只有启用时才能同步歌单」
+//    备注、两面开关缺省 = 数据面开 / 播放面关（2026-10-27 用户定稿）。
 //
 // 环境用 jsdom（页面/弹窗用例需要）；lib 用例在 jsdom 下跑纯逻辑无碍。
 // @vitest-environment jsdom
@@ -140,11 +142,9 @@ import {
 } from "@/lib/source-playlist-sync";
 import {
   parseSourceAuthToggles,
-  readSourceAuthSyncPlaylistsFor,
   resetSourceAuthCaches,
-  saveSourceAuthSyncPlaylists,
 } from "@/lib/source-auth";
-import { SOURCE_AUTH_ACCOUNTS_KEY, SOURCE_AUTH_TOGGLES_KEY } from "@/lib/storageKeys";
+import { SOURCE_AUTH_TOGGLES_KEY } from "@/lib/storageKeys";
 import { SourcePlaylistSyncDialog } from "@/components/mine/SourcePlaylistSyncDialog";
 import { SourceAccountsPage } from "@/components/mine/SourceAccountsPage";
 import type { SourceAccountPlaylist } from "@/source-scripts";
@@ -274,27 +274,28 @@ describe("collectAccountPlaylists（收藏执行计数）", () => {
   });
 });
 
-describe("autoSyncMissingAfterLogin（登录后自动同步决策）", () => {
-  it("开关关（syncPlaylists=false）→ 返回 null 且不拉平台数据", async () => {
+describe("autoSyncMissingAfterLogin（登录后自动同步）", () => {
+  it("无任何开关门控：库里残留 syncPlaylists=false 也照样拉差集", async () => {
     ipcState.store.set(
       SOURCE_AUTH_TOGGLES_KEY,
       JSON.stringify({ bili: { useMeta: true, usePlay: true, syncPlaylists: false } }),
     );
+    scriptsState.playlists = [remoteRow({ id: "a2", name: "缺失" })];
+    ipcState.mine = [];
 
     const r = await autoSyncMissingAfterLogin("bili");
 
-    expect(r).toBeNull();
-    expect(scriptsState.calls).toEqual([]);
+    expect(r.map((p) => p.id)).toEqual(["a2"]);
+    expect(scriptsState.calls).toEqual(["bili"]);
   });
 
-  it("缺省开（无记录）→ 拉差集并返回缺失清单", async () => {
+  it("缺省无记录 → 拉差集并返回缺失清单", async () => {
     scriptsState.playlists = [remoteRow({ id: "a1", name: "已收藏" }), remoteRow({ id: "a2", name: "缺失" })];
     ipcState.mine = [mineRow("a1", "bili")];
 
     const r = await autoSyncMissingAfterLogin("bili");
 
-    expect(r).not.toBeNull();
-    expect(r?.map((p) => p.id)).toEqual(["a2"]);
+    expect(r.map((p) => p.id)).toEqual(["a2"]);
     expect(scriptsState.calls).toEqual(["bili"]);
   });
 
@@ -310,41 +311,17 @@ describe("autoSyncMissingAfterLogin（登录后自动同步决策）", () => {
   });
 });
 
-describe("source-auth：syncPlaylists 开关持久化", () => {
-  it("parse 只收 boolean，坏值/缺省不写键（记录向后兼容）", () => {
-    const dropped = parseSourceAuthToggles(
-      JSON.stringify({ bili: { useMeta: true, usePlay: false, syncPlaylists: "yes" } }),
-    );
-    expect(dropped.bili).toEqual({ useMeta: true, usePlay: false });
-
-    const kept = parseSourceAuthToggles(
+describe("source-auth：旧记录里的 syncPlaylists 键", () => {
+  it("parse 不再收该键（旧记录读进来只剩两面开关，记录向后兼容）", () => {
+    const parsed = parseSourceAuthToggles(
       JSON.stringify({ bili: { useMeta: true, usePlay: false, syncPlaylists: false } }),
     );
-    expect(kept.bili?.syncPlaylists).toBe(false);
-  });
+    expect(parsed.bili).toEqual({ useMeta: true, usePlay: false });
 
-  it("readSourceAuthSyncPlaylistsFor 缺省 = true", async () => {
-    await expect(readSourceAuthSyncPlaylistsFor("bili")).resolves.toBe(true);
-  });
-
-  it("saveSourceAuthSyncPlaylists 物化进 per-source 表并可读回", async () => {
-    ipcState.store.set(
-      SOURCE_AUTH_ACCOUNTS_KEY,
-      JSON.stringify({
-        bili: { cookie: "c", user: { nickname: "张三" }, savedAt: "2026-10-26T00:00:00.000Z" },
-      }),
+    const badValue = parseSourceAuthToggles(
+      JSON.stringify({ bili: { useMeta: true, usePlay: false, syncPlaylists: "yes" } }),
     );
-
-    await saveSourceAuthSyncPlaylists("bili", false);
-    await expect(readSourceAuthSyncPlaylistsFor("bili")).resolves.toBe(false);
-    const stored = JSON.parse(ipcState.store.get(SOURCE_AUTH_TOGGLES_KEY) ?? "{}") as Record<
-      string,
-      { useMeta: boolean; usePlay: boolean; syncPlaylists?: boolean }
-    >;
-    expect(stored.bili).toEqual({ useMeta: true, usePlay: true, syncPlaylists: false });
-
-    await saveSourceAuthSyncPlaylists("bili", true);
-    await expect(readSourceAuthSyncPlaylistsFor("bili")).resolves.toBe(true);
+    expect(badValue.bili).toEqual({ useMeta: true, usePlay: false });
   });
 });
 
@@ -426,7 +403,7 @@ describe("SourceAccountsPage：登录成功自动触发同步", () => {
     fireEvent.click(screen.getByText("导入"));
   }
 
-  it("默认开且平台侧有缺失 → 登录成功自动打开同步弹窗", async () => {
+  it("平台侧有缺失 → 登录成功自动打开同步弹窗（无需任何开关）", async () => {
     scriptsState.playlists = [remoteRow({ id: "p1", name: "我的最爱", trackCount: 9 })];
 
     render(<SourceAccountsPage />);
@@ -439,20 +416,109 @@ describe("SourceAccountsPage：登录成功自动触发同步", () => {
     expect(screen.getByText("B站 · 同步歌单")).toBeTruthy();
   });
 
-  it("syncPlaylists=false → 登录成功不拉平台数据、不弹窗", async () => {
-    ipcState.store.set(
-      SOURCE_AUTH_TOGGLES_KEY,
-      JSON.stringify({ bili: { useMeta: true, usePlay: true, syncPlaylists: false } }),
-    );
+  it("平台侧无缺失 → 拉了差集但不弹窗", async () => {
+    scriptsState.playlists = [];
 
     render(<SourceAccountsPage />);
     await screen.findByText("B站");
     await loginViaCookie();
 
     await waitFor(() => expect(toastState.toast).toHaveBeenCalledWith("已导入B站登录：张三"));
-    // 排空异步：自动触发链已走完仍未拉平台数据
+    // 排空异步：自动触发链已走完、差集拉过、但没有可补的歌单
     await new Promise((resolve) => setTimeout(resolve, 20));
-    expect(scriptsState.calls).toEqual([]);
-    expect(screen.queryByText("我的最爱")).toBeNull();
+    expect(scriptsState.calls).toEqual(["bili"]);
+    expect(screen.queryByText("B站 · 同步歌单")).toBeNull();
+  });
+});
+
+describe("SourceAccountsPage：卡片折叠与开关行", () => {
+  it("默认全部折叠：下面的开关/音质行都不可见，右上角是「全部展开」", async () => {
+    render(<SourceAccountsPage />);
+    await screen.findByText("B站");
+
+    expect(screen.queryByText("数据请求使用登录态")).toBeNull();
+    expect(screen.queryByText("播放请求使用登录态")).toBeNull();
+    expect(screen.queryByText("播放音质")).toBeNull();
+    expect(screen.getByRole("button", { name: /B站/ }).getAttribute("aria-expanded")).toBe("false");
+    expect(screen.getByRole("button", { name: /全部展开/ })).toBeTruthy();
+  });
+
+  it("右上角「全部展开 / 全部折叠」一键统一切换", async () => {
+    render(<SourceAccountsPage />);
+    await screen.findByText("B站");
+
+    fireEvent.click(screen.getByRole("button", { name: /全部展开/ }));
+    expect(screen.getByText("数据请求使用登录态")).toBeTruthy();
+    expect(screen.getByText("播放请求使用登录态")).toBeTruthy();
+    expect(screen.getByText("播放音质")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /B站/ }).getAttribute("aria-expanded")).toBe("true");
+    expect(screen.getByRole("button", { name: /全部折叠/ })).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /全部折叠/ }));
+    expect(screen.queryByText("数据请求使用登录态")).toBeNull();
+    expect(screen.queryByText("播放音质")).toBeNull();
+    expect(screen.getByRole("button", { name: /全部展开/ })).toBeTruthy();
+  });
+
+  it("点标题行单独展开，再点收起；登录按钮始终不受影响", async () => {
+    render(<SourceAccountsPage />);
+    await screen.findByText("B站");
+
+    fireEvent.click(screen.getByRole("button", { name: /B站/ }));
+    expect(screen.getByText("数据请求使用登录态")).toBeTruthy();
+    expect(screen.getByRole("button", { name: /B站/ }).getAttribute("aria-expanded")).toBe("true");
+    // 标题行右侧的登录工具条不参与折叠
+    expect(screen.getByText("导入Cookie")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: /B站/ }));
+    expect(screen.queryByText("数据请求使用登录态")).toBeNull();
+    expect(screen.getByText("导入Cookie")).toBeTruthy();
+  });
+
+  it("未登录的源也按缺省展示数据开/播放关，但开关不可点", async () => {
+    render(<SourceAccountsPage />);
+    await screen.findByText("B站");
+    fireEvent.click(screen.getByRole("button", { name: /全部展开/ }));
+
+    // 开关顺序跟行顺序一致：数据请求在前、播放请求在后
+    const switches = screen.getAllByRole("switch");
+    expect(switches.length).toBeGreaterThanOrEqual(2);
+    expect(switches[0].getAttribute("aria-checked")).toBe("true");
+    expect(switches[1].getAttribute("aria-checked")).toBe("false");
+    // 没账号时开关仍禁用（缺省值只是展示口径，注入要等登录）
+    expect(switches[0].hasAttribute("disabled")).toBe(true);
+    expect(switches[1].hasAttribute("disabled")).toBe(true);
+  });
+
+  it("已登录的源按缺省展示：数据请求使用登录态=开、播放请求使用登录态=关", async () => {
+    scriptsState.playlists = [];
+    render(<SourceAccountsPage />);
+    await screen.findByText("B站");
+    fireEvent.click(await screen.findByText("导入Cookie"));
+    fireEvent.change(screen.getByPlaceholderText("粘贴 Cookie…"), { target: { value: "SESSDATA=abc" } });
+    fireEvent.click(screen.getByText("导入"));
+    await waitFor(() => expect(toastState.toast).toHaveBeenCalledWith("已导入B站登录：张三"));
+
+    fireEvent.click(screen.getByRole("button", { name: /全部展开/ }));
+    await waitFor(() =>
+      expect(screen.getAllByRole("switch")[0].getAttribute("aria-checked")).toBe("true"),
+    );
+    expect(screen.getAllByRole("switch")[1].getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("不再渲染「登录后同步歌单」开关行（默认开启）", async () => {
+    render(<SourceAccountsPage />);
+    await screen.findByText("B站");
+    fireEvent.click(screen.getByRole("button", { name: /全部展开/ }));
+
+    expect(screen.queryByText("登录后同步歌单")).toBeNull();
+  });
+
+  it("数据请求使用登录态带「只有启用时才能同步歌单」备注", async () => {
+    render(<SourceAccountsPage />);
+    await screen.findByText("B站");
+    fireEvent.click(screen.getByRole("button", { name: /全部展开/ }));
+
+    expect(screen.getByText(/只有启用时才能同步歌单/)).toBeTruthy();
   });
 });

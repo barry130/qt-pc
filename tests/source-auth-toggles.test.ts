@@ -102,13 +102,21 @@ describe("parseSourceAuthToggles", () => {
 });
 
 describe("生效开关解析链（per-source 表 → 旧全局键 → 登录态缺省）", () => {
-  it("未登录的源 = 双关（v14 口径：没账号谈不上使用登录态）", async () => {
-    expect(await readSourceAuthTogglesFor("bili")).toEqual({ useMeta: false, usePlay: false });
+  it("未登录的源也用同一缺省：数据面开 / 播放面关（2026-10-27 用户定稿）", async () => {
+    expect(await readSourceAuthTogglesFor("bili")).toEqual({ useMeta: true, usePlay: false });
   });
 
-  it("已登录但什么都没配置过 = 双开（登录了缺省生效）", async () => {
+  it("已登录但什么都没配置过 = 数据面开 / 播放面关（2026-10-27 用户定稿缺省）", async () => {
     seedAccount("bili");
-    expect(await readSourceAuthTogglesFor("bili")).toEqual({ useMeta: true, usePlay: true });
+    expect(await readSourceAuthTogglesFor("bili")).toEqual({ useMeta: true, usePlay: false });
+  });
+
+  it("旧全局键残留双开（=旧缺省，无用户意图）不当继承源，回落新缺省", async () => {
+    // 用户库里几乎必然留着这对键：旧版缺省就是双开，所以 true/true 与「从没
+    // 动过」不可区分。若整体继承，新缺省（数据开/播放关）会被永久盖住。
+    state.store.set(SOURCE_AUTH_USE_META_KEY, "true");
+    state.store.set(SOURCE_AUTH_USE_PLAY_KEY, "true");
+    expect(await readSourceAuthTogglesFor("migu")).toEqual({ useMeta: true, usePlay: false });
   });
 
   it("旧全局键半配置按原语义继承：缺的那面=关（与升级前 readSourceAuthToggles 完全同口径）", async () => {
@@ -132,21 +140,18 @@ describe("生效开关解析链（per-source 表 → 旧全局键 → 登录态�
       JSON.stringify({ bili: { useMeta: true, usePlay: false } }),
     );
     expect(await readSourceAuthTogglesFor("bili")).toEqual({ useMeta: true, usePlay: false });
-    // 未登录的未物化源按 v14 口径双关
+    // 未登录的未物化源走同一条链：这里命中旧全局键 → 双关（与登录态无关）
     expect(await readSourceAuthTogglesFor("wyy")).toEqual({ useMeta: false, usePlay: false });
   });
 });
 
 describe("saveSourceAuthAccount", () => {
-  it("首登物化双开并双面注入", async () => {
+  it("首登物化「数据面开 / 播放面关」并只注入该开的面", async () => {
     await saveSourceAuthAccount("bili", "SESSDATA=fake", USER);
     const map = JSON.parse(state.store.get(SOURCE_AUTH_TOGGLES_KEY) ?? "{}");
-    expect(map.bili).toEqual({ useMeta: true, usePlay: true });
-    expect(state.sets).toEqual([
-      { scope: "meta", source: "bili", cookie: "SESSDATA=fake" },
-      { scope: "play", source: "bili", cookie: "SESSDATA=fake" },
-    ]);
-    expect(state.clears).toEqual([]);
+    expect(map.bili).toEqual({ useMeta: true, usePlay: false });
+    expect(state.sets).toEqual([{ scope: "meta", source: "bili", cookie: "SESSDATA=fake" }]);
+    expect(state.clears).toEqual([{ scope: "play", source: "bili" }]);
   });
 
   it("升级用户全局关着 play 时，新登录的源继承关态（不绕过用户选择）", async () => {
@@ -179,11 +184,15 @@ describe("setSourceAuthToggle（按源独立）", () => {
   it("关一个源的 play 面只清单源单面，别的源不动", async () => {
     seedAccount("bili");
     seedAccount("wyy");
+    // 缺省播放面是关的，先打开再关掉，才走得到「清单面」这条路径
+    await setSourceAuthToggle("bili", "play", true);
+    state.sets.length = 0;
+    state.clears.length = 0;
     await setSourceAuthToggle("bili", "play", false);
     expect(state.clears).toEqual([{ scope: "play", source: "bili" }]);
     // 只对账被切的源：bili 的 meta 面仍注入；wyy 不在本次动作范围内
     expect(state.sets.map((c) => `${c.scope}:${c.source}`)).toEqual(["meta:bili"]);
-    // 开关表里只有 bili 被物化，wyy 留在解析链下一级（旧全局/双开）
+    // 开关表里只有 bili 被物化，wyy 留在解析链下一级（旧全局/缺省）
     const map = JSON.parse(state.store.get(SOURCE_AUTH_TOGGLES_KEY) ?? "{}");
     expect(map).toEqual({ bili: { useMeta: true, usePlay: false } });
   });
@@ -229,8 +238,8 @@ describe("退出登录 / 全量对账", () => {
   });
 
   it("ensureSourceAuthInjected 按源逐面对账：关的面显式清，引擎炸了整轮吞掉", async () => {
-    seedAccount("bili"); // 双开
-    seedAccount("wyy"); // meta 关
+    seedAccount("bili"); // 数据开 / 播放关
+    seedAccount("wyy"); // meta 关 / play 开
     state.store.set(
       SOURCE_AUTH_TOGGLES_KEY,
       JSON.stringify({ wyy: { useMeta: false, usePlay: true } }),
@@ -238,10 +247,12 @@ describe("退出登录 / 全量对账", () => {
     await ensureSourceAuthInjected();
     expect(state.sets.map((c) => `${c.scope}:${c.source}`).sort()).toEqual([
       "meta:bili",
-      "play:bili",
       "play:wyy",
     ]);
-    expect(state.clears).toEqual([{ scope: "meta", source: "wyy" }]);
+    expect(state.clears).toEqual([
+      { scope: "play", source: "bili" },
+      { scope: "meta", source: "wyy" },
+    ]);
 
     state.setThrows = true;
     state.sets.length = 0;
