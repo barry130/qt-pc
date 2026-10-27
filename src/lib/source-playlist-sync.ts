@@ -10,8 +10,19 @@
  * ipc.listMyPlaylists（本地自建歌单 platform 是 LOCAL_PLATFORM，天然被
  * 平台过滤排除）；收藏/取消收藏走 ipc.favoritePlaylist / ipc.unfavoritePlaylist
  * ——幂等的元数据写入，顺序逐个执行不做并发轰炸。
+ *
+ * **数据面登录态前置检查（2026-10-27 用户报「已经登录了，点击同步歌单报错」）**：
+ * 宿主只在该源「数据请求使用登录态」开启时才把凭据灌进数据包 meta 面，关着时
+ * 包侧一定回「未登录」——用户明明在账号页看到「已登录」，错误文案因此极容易
+ * 被理解成「登录失效」。这里在读包之前先看本地库：有账号但数据面开关关着 →
+ * 抛 {@link AccountSyncNeedsMetaLoginError}，UI 据此给「一键开启后重试」，
+ * 不再把误导性的包侧文案直接摊给用户。
  */
 import * as ipc from "@/services/ipc";
+import {
+  readSourceAuthAccounts,
+  readSourceAuthTogglesFor,
+} from "@/lib/source-auth";
 import { accountPlaylists, type SourceAccountPlaylist } from "@/source-scripts";
 
 /** 平台侧一行：歌单本体 + 本地「我的歌单」里是否已收藏（同平台同 pid） */
@@ -33,11 +44,48 @@ export interface AccountSyncPreview {
 }
 
 /**
+ * 同步前置检查没过的可识别错误：**已登录**（库里该源有账号）但「数据请求使用
+ * 登录态」是关的。包侧只会看到「没凭据」→ 报「未登录」，对用户是误导；
+ * 调用方据此展示「开启并同步」的一键入口，而不是原样抛包侧文案。
+ * 继承 Error 并带稳定 `name`，跨模块/测试里都能用 {@link isAccountSyncNeedsMetaLoginError} 判型。
+ */
+export class AccountSyncNeedsMetaLoginError extends Error {
+  readonly source: string;
+
+  constructor(source: string) {
+    super("账户歌单同步需要「数据请求使用登录态」开启：该源已登录，但数据面登录态当前是关闭的");
+    this.name = "AccountSyncNeedsMetaLoginError";
+    this.source = source;
+  }
+}
+
+export function isAccountSyncNeedsMetaLoginError(
+  err: unknown,
+): err is AccountSyncNeedsMetaLoginError {
+  return err instanceof AccountSyncNeedsMetaLoginError;
+}
+
+/** 同步前置检查：本地库有该源账号、但数据面开关关着 → 抛可识别错误。
+ *  没有账号时不拦（由包侧给「未登录」，那是真的没登录）。 */
+export async function assertAccountSyncMetaLogin(source: string): Promise<void> {
+  const [accounts, toggles] = await Promise.all([
+    readSourceAuthAccounts(),
+    readSourceAuthTogglesFor(source),
+  ]);
+  if (accounts[source] !== undefined && !toggles.useMeta) {
+    throw new AccountSyncNeedsMetaLoginError(source);
+  }
+}
+
+/**
  * 预览：平台侧 accountPlaylists(source) 与本地已收藏在线歌单（platform 与该源
  * 匹配的 pid 集合）对比，逐行标注 favorited。
- * 包未实现（旧包）/未登录/网络错误原样抛错，调用方决定展示方式。
+ * 包未实现（旧包）/未登录/网络错误原样抛错，调用方决定展示方式；唯一的例外是
+ * 「库里有账号但数据面开关关着」——先抛 {@link AccountSyncNeedsMetaLoginError}，
+ * 不让包侧的「未登录」误导用户。
  */
 export async function accountSyncPreview(source: string): Promise<AccountSyncPreview> {
+  await assertAccountSyncMetaLogin(source);
   const [remote, mine] = await Promise.all([accountPlaylists(source), ipc.listMyPlaylists()]);
   const localIds = new Set(mine.filter((p) => p.platform === source).map((p) => p.pid));
   const rows: AccountSyncRow[] = remote.map((playlist) => ({
@@ -140,9 +188,18 @@ export async function uncollectAccountPlaylists(
  * 用户 2026-10-27 定稿后这里没有任何开关门控——登录成功就对比，
  * 弹窗由调用方决定开不开。预览失败（包旧/未实现/网络）原样上抛——
  * 页面统一 console.warn 静默，不打扰登录成功的反馈。
+ *
+ * 例外：有账号但数据面登录态关着（{@link AccountSyncNeedsMetaLoginError}）
+ * 属于「用户显式关掉的开关」，登录成功不弹窗打扰，等用户自己点「同步歌单」
+ * 时再给可操作提示——所以这里静默吞掉、返回空清单。
  */
 export async function autoSyncMissingAfterLogin(
   source: string,
 ): Promise<SourceAccountPlaylist[]> {
-  return (await accountSyncPreview(source)).missing;
+  try {
+    return (await accountSyncPreview(source)).missing;
+  } catch (err) {
+    if (isAccountSyncNeedsMetaLoginError(err)) return [];
+    throw err;
+  }
 }

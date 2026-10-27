@@ -13,8 +13,11 @@
 //    收藏项、应用更改同时处理收藏与取消收藏、空/错误态、failed>0 的 toastError；
 // 5) SourceAccountsPage——登录成功且 missing>0 自动弹窗；平台侧无缺失不弹；
 //    卡片默认全部折叠（右上角「全部折叠/展开」一键切、标题行单卡切）、
-//    「登录后同步歌单」开关行已移除、数据请求行带「只有启用时才能同步歌单」
-//    备注、两面开关缺省 = 数据面开 / 播放面关（2026-10-27 用户定稿）。
+//    「登录后同步歌单」开关行已移除、数据请求行带「同步歌单也依赖此项」备注、
+//    两面开关缺省 = 数据面开 / 播放面关（2026-10-27 用户定稿）；
+// 6) 「已登录但数据请求登录态关着」这一报错路径（2026-10-27 用户报 bili 同步
+//    报未登录）：lib 抛 AccountSyncNeedsMetaLoginError、autoSync 静默返回空、
+//    弹窗给「开启并使用登录态同步」一键重试、页面按钮带提示且开关态同步。
 //
 // 环境用 jsdom（页面/弹窗用例需要）；lib 用例在 jsdom 下跑纯逻辑无碍。
 // @vitest-environment jsdom
@@ -150,9 +153,11 @@ vi.mock("@/lib/source-web-login", () => ({
 }));
 
 import {
+  AccountSyncNeedsMetaLoginError,
   accountSyncPreview,
   autoSyncMissingAfterLogin,
   collectAccountPlaylists,
+  isAccountSyncNeedsMetaLoginError,
   uncollectAccountPlaylists,
 } from "@/lib/source-playlist-sync";
 import {
@@ -183,6 +188,28 @@ function mineRow(pid: string, platform: string): Record<string, unknown> {
 
 function remoteRow(overrides: Partial<SourceAccountPlaylist> & { id: string; name: string }): SourceAccountPlaylist {
   return { owned: false, ...overrides };
+}
+
+/** 库里存一个已登录账号（数据面开关由 seedMetaToggle 单独控制） */
+function seedAccount(source = "bili"): void {
+  ipcState.store.set(
+    SOURCE_AUTH_ACCOUNTS_KEY,
+    JSON.stringify({
+      [source]: {
+        cookie: "SESSDATA=abc",
+        user: { id: "1", nickname: "张三", avatar: "", vip: false, vipLabel: "" },
+        savedAt: "2026-10-27T00:00:00.000Z",
+      },
+    }),
+  );
+}
+
+/** 存该源的两面开关（2026-10-27：数据面关掉的场景 = 用户报的「同步报未登录」） */
+function seedToggles(source: string, useMeta: boolean, usePlay = false): void {
+  ipcState.store.set(
+    SOURCE_AUTH_TOGGLES_KEY,
+    JSON.stringify({ [source]: { useMeta, usePlay } }),
+  );
 }
 
 beforeEach(() => {
@@ -245,6 +272,48 @@ describe("accountSyncPreview（平台侧全量清单 + 本地收藏态）", () =
 
     expect(err).toBeInstanceOf(Error);
     expect((err as Error).message).toBe(PACK_OUTDATED_MSG);
+  });
+
+  it("已登录但「数据请求使用登录态」关着 → 抛可识别错误、不调数据包", async () => {
+    seedAccount();
+    seedToggles("bili", false);
+    scriptsState.error = "未登录";
+
+    const err = await accountSyncPreview("bili").then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+    // 不把包侧「未登录」直接摊给用户（他明明登录了），给可操作错误
+    expect(isAccountSyncNeedsMetaLoginError(err)).toBe(true);
+    expect((err as AccountSyncNeedsMetaLoginError).source).toBe("bili");
+    expect((err as Error).message).not.toBe("未登录");
+    expect(scriptsState.calls).toEqual([]);
+  });
+
+  it("数据面开关开着 → 正常拉清单（不被前置检查拦）", async () => {
+    seedAccount();
+    seedToggles("bili", true);
+    scriptsState.playlists = [remoteRow({ id: "p1", name: "歌单" })];
+
+    const r = await accountSyncPreview("bili");
+
+    expect(r.rows.map((row) => row.playlist.id)).toEqual(["p1"]);
+    expect(scriptsState.calls).toEqual(["bili"]);
+  });
+
+  it("没有账号时不拦（包侧「未登录」是真的没登录）", async () => {
+    seedToggles("bili", false);
+    scriptsState.error = "未登录";
+
+    const err = await accountSyncPreview("bili").then(
+      () => null,
+      (e: unknown) => e,
+    );
+
+    expect(isAccountSyncNeedsMetaLoginError(err)).toBe(false);
+    expect((err as Error).message).toBe("未登录");
+    expect(scriptsState.calls).toEqual(["bili"]);
   });
 });
 
@@ -381,6 +450,17 @@ describe("autoSyncMissingAfterLogin（登录后自动同步）", () => {
 
     expect((err as Error).message).toBe(PACK_OUTDATED_MSG);
   });
+
+  it("已登录但数据面关着 → 静默返回空清单（登录成功不弹误导弹窗）", async () => {
+    seedAccount();
+    seedToggles("bili", false);
+    scriptsState.playlists = [remoteRow({ id: "p1", name: "歌单" })];
+
+    const r = await autoSyncMissingAfterLogin("bili");
+
+    expect(r).toEqual([]);
+    expect(scriptsState.calls).toEqual([]);
+  });
 });
 
 describe("source-auth：旧记录里的 syncPlaylists 键", () => {
@@ -398,13 +478,24 @@ describe("source-auth：旧记录里的 syncPlaylists 键", () => {
 });
 
 describe("SourcePlaylistSyncDialog（同步弹窗组件）", () => {
-  function renderDialog(): { onClose: ReturnType<typeof vi.fn>; onDone: ReturnType<typeof vi.fn> } {
+  function renderDialog(): {
+    onClose: ReturnType<typeof vi.fn>;
+    onDone: ReturnType<typeof vi.fn>;
+    onMetaLoginEnabled: ReturnType<typeof vi.fn>;
+  } {
     const onClose = vi.fn();
     const onDone = vi.fn();
+    const onMetaLoginEnabled = vi.fn();
     render(
-      <SourcePlaylistSyncDialog source="bili" sourceName="B站" onClose={onClose} onDone={onDone} />,
+      <SourcePlaylistSyncDialog
+        source="bili"
+        sourceName="B站"
+        onClose={onClose}
+        onDone={onDone}
+        onMetaLoginEnabled={onMetaLoginEnabled}
+      />,
     );
-    return { onClose, onDone };
+    return { onClose, onDone, onMetaLoginEnabled };
   }
 
   it("列出平台侧全部歌单：已收藏的带「已收藏」标记且默认勾上", async () => {
@@ -512,6 +603,49 @@ describe("SourcePlaylistSyncDialog（同步弹窗组件）", () => {
     renderDialog();
 
     expect(await screen.findByText(PACK_OUTDATED_MSG)).toBeTruthy();
+  });
+
+  it("数据面开着但仍报未登录 → 文案之下补「登录态可能已失效」提示", async () => {
+    seedAccount();
+    seedToggles("bili", true);
+    scriptsState.error = "未登录";
+    renderDialog();
+
+    expect(await screen.findByText("未登录")).toBeTruthy();
+    expect(screen.getByText(/通常是登录态已失效/)).toBeTruthy();
+  });
+
+  it("已登录但数据面关着 → 可操作面板，一键开启后自动重试并列出歌单", async () => {
+    seedAccount();
+    seedToggles("bili", false);
+    scriptsState.playlists = [remoteRow({ id: "p1", name: "平台歌单" })];
+    const { onMetaLoginEnabled } = renderDialog();
+
+    // 不展示误导性的包侧「未登录」，而是解释开关并给一键入口
+    expect(await screen.findByText(/「数据请求使用登录态」是关闭的/)).toBeTruthy();
+    expect(screen.queryByText("未登录")).toBeNull();
+    expect(scriptsState.calls).toEqual([]);
+
+    fireEvent.click(screen.getByText("开启并使用登录态同步"));
+
+    // 开启后自动重试预览：开关落库、页面回调、歌单渲染出来
+    expect(await screen.findByText("平台歌单")).toBeTruthy();
+    expect(onMetaLoginEnabled).toHaveBeenCalledWith("bili");
+    expect(JSON.parse(ipcState.store.get(SOURCE_AUTH_TOGGLES_KEY) as string)).toEqual({
+      bili: { useMeta: true, usePlay: false },
+    });
+    expect(scriptsState.calls).toEqual(["bili"]);
+    expect(screen.getByText("应用更改（1）")).toBeTruthy();
+  });
+
+  it("数据面开着时不出可操作面板（正常走预览）", async () => {
+    seedAccount();
+    seedToggles("bili", true);
+    scriptsState.playlists = [remoteRow({ id: "p1", name: "正常歌单" })];
+    renderDialog();
+
+    expect(await screen.findByText("正常歌单")).toBeTruthy();
+    expect(screen.queryByText("开启并使用登录态同步")).toBeNull();
   });
 
   it("failed>0 → toastError 提示部分失败", async () => {
@@ -644,12 +778,35 @@ describe("SourceAccountsPage：卡片折叠与开关行", () => {
     expect(screen.queryByText("登录后同步歌单")).toBeNull();
   });
 
-  it("数据请求使用登录态带「只有启用时才能同步歌单」备注", async () => {
+  it("数据请求使用登录态带「同步歌单也依赖此项」备注", async () => {
     render(<SourceAccountsPage />);
     await screen.findByText("B站");
     fireEvent.click(screen.getByRole("button", { name: /全部展开/ }));
 
-    expect(screen.getByText(/只有启用时才能同步歌单/)).toBeTruthy();
+    expect(screen.getByText(/同步歌单也依赖此项，关闭时同步会报「未登录」/)).toBeTruthy();
+  });
+
+  it("已登录但数据面关着 → 同步按钮带提示，弹窗一键开启后页面开关同步", async () => {
+    seedAccount();
+    seedToggles("bili", false);
+    scriptsState.playlists = [remoteRow({ id: "p1", name: "平台歌单" })];
+    render(<SourceAccountsPage />);
+
+    // 卡片上的提示 + 弹窗里的可操作面板
+    const syncBtn = await screen.findByText("同步歌单");
+    expect(syncBtn.getAttribute("title")).toContain("未开启");
+    fireEvent.click(syncBtn);
+    expect(await screen.findByText(/「数据请求使用登录态」是关闭的/)).toBeTruthy();
+
+    fireEvent.click(screen.getByText("开启并使用登录态同步"));
+    expect(await screen.findByText("平台歌单")).toBeTruthy();
+
+    // 页面开关态跟着刷新（弹窗关闭后展开卡片：数据面开关是开的）
+    fireEvent.click(screen.getByRole("button", { name: "取消" }));
+    fireEvent.click(screen.getByRole("button", { name: /全部展开/ }));
+    await waitFor(() =>
+      expect(screen.getAllByRole("switch")[0].getAttribute("aria-checked")).toBe("true"),
+    );
   });
 });
 

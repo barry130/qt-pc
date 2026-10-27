@@ -592,6 +592,11 @@ export function SourceAccountsPage(): React.JSX.Element {
                         <button
                           type="button"
                           onClick={() => setSyncDialog({ source: item.id, sourceName: item.name })}
+                          title={
+                            tg.useMeta
+                              ? "拉取平台侧全部收藏歌单，与本地「我的歌单」对比"
+                              : "已登录，但「数据请求使用登录态」未开启：点开后会提示一键开启再同步"
+                          }
                           className="rounded-md border border-border px-2 py-1 text-xs hover:bg-accent"
                         >
                           同步歌单
@@ -705,7 +710,7 @@ export function SourceAccountsPage(): React.JSX.Element {
                         <div className="min-w-0">
                           <p className="text-sm">数据请求使用登录态</p>
                           <p className="mt-0.5 text-xs text-muted-foreground">
-                            搜索/歌单/歌词等数据请求带上该源凭据（如B站登录后才能取AI字幕歌词）。只有启用时才能同步歌单。
+                            搜索/歌单/歌词等数据请求带上该源凭据（如B站登录后才能取AI字幕歌词）。同步歌单也依赖此项，关闭时同步会报「未登录」。
                           </p>
                         </div>
                         <Switch
@@ -998,6 +1003,13 @@ export function SourceAccountsPage(): React.JSX.Element {
           onDone={() => {
             // 收藏动作改的是「我的歌单」，页面本身只需保持账号缓存一致
             refreshAccounts();
+          }}
+          onMetaLoginEnabled={(source) => {
+            // 弹窗里一键开了「数据请求使用登录态」：同步页面开关态，卡片文案/开关
+            // 立刻一致（不然关掉弹窗还显示关闭，下次再点同步又走一遍提示）
+            void readSourceAuthTogglesFor(source).then((tg) => {
+              setToggles((prev) => ({ ...prev, [source]: tg }));
+            });
           }}
         />
       ) : null}
