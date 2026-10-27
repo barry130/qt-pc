@@ -1,12 +1,16 @@
-// 账户歌单同步（2026-10-26 需求；2026-10-27 定稿去掉「登录后同步歌单」开关）：
-// 1) accountSyncPreview 的 diff 语义——missing 保持平台返回顺序、只与「同平台」
-//    本地收藏 diff（网易同 pid / 本地自建都算缺失）；
+// 账户歌单同步（2026-10-26 需求；2026-10-27 定稿去掉「登录后同步歌单」开关，
+// 同日再改版为「全量清单 + 已收藏标记 + 可取消收藏」）：
+// 1) accountSyncPreview 的语义——rows = 平台侧全部歌单（保持平台顺序、逐行标
+//    favorited，只与「同平台」本地收藏比对；网易同 pid / 本地自建都算未收藏），
+//    missing 仍保留给登录后自动触发；
 // 2) collectAccountPlaylists 的计数语义——collected/skipped/failed，单个失败
 //    不中断整体，已收藏跳过（预检失败视为未收藏继续）；
+// 2b) uncollectAccountPlaylists 的计数语义——removed/skipped/failed（2026-10-27
+//    取消收藏需求，只动本地收藏关系）；
 // 3) autoSyncMissingAfterLogin 的语义——登录即拉差集、无任何开关门控；包旧
 //    错误原样上抛（页面 console.warn 静默）；
-// 4) SourcePlaylistSyncDialog 组件——missing 渲染、收藏调用参数、空/错误态、
-//    failed>0 的 toastError；
+// 4) SourcePlaylistSyncDialog 组件——全部歌单渲染（已收藏带标记）、默认勾选已
+//    收藏项、应用更改同时处理收藏与取消收藏、空/错误态、failed>0 的 toastError；
 // 5) SourceAccountsPage——登录成功且 missing>0 自动弹窗；平台侧无缺失不弹；
 //    卡片默认全部折叠（右上角「全部折叠/展开」一键切、标题行单卡切）、
 //    「登录后同步歌单」开关行已移除、数据请求行带「只有启用时才能同步歌单」
@@ -25,8 +29,12 @@ const ipcState = vi.hoisted(() => ({
   favorited: new Map<string, boolean>(),
   /** ipc.favoritePlaylist 调用记录（push 顺序 = 执行顺序） */
   favoriteCalls: [] as Array<{ platform: string; id: string; name: string; picUrl?: string; playCount?: string }>,
+  /** ipc.unfavoritePlaylist 调用记录（2026-10-27 取消收藏需求） */
+  unfavoriteCalls: [] as Array<{ platform: string; id: string; name: string; picUrl?: string }>,
   /** 指定 id 的 favoritePlaylist 抛错（模拟单个写入失败） */
   favoriteReject: new Map<string, string>(),
+  /** 指定 id 的 unfavoritePlaylist 抛错 */
+  unfavoriteReject: new Map<string, string>(),
   /** 指定 id 的 isPlaylistFavorited 抛错（预检失败兜底用例） */
   precheckFail: new Set<string>(),
 }));
@@ -73,6 +81,12 @@ vi.mock("@/services/ipc", () => ({
     const hit = ipcState.favoriteReject.get(id);
     if (hit !== undefined) return Promise.reject(new Error(hit));
     ipcState.favoriteCalls.push({ platform, id, name, picUrl, playCount });
+    return Promise.resolve();
+  },
+  unfavoritePlaylist: (platform: string, id: string, name: string, picUrl?: string) => {
+    const hit = ipcState.unfavoriteReject.get(id);
+    if (hit !== undefined) return Promise.reject(new Error(hit));
+    ipcState.unfavoriteCalls.push({ platform, id, name, picUrl });
     return Promise.resolve();
   },
 }));
@@ -139,6 +153,7 @@ import {
   accountSyncPreview,
   autoSyncMissingAfterLogin,
   collectAccountPlaylists,
+  uncollectAccountPlaylists,
 } from "@/lib/source-playlist-sync";
 import {
   parseSourceAuthToggles,
@@ -175,7 +190,9 @@ beforeEach(() => {
   ipcState.mine.length = 0;
   ipcState.favorited.clear();
   ipcState.favoriteCalls.length = 0;
+  ipcState.unfavoriteCalls.length = 0;
   ipcState.favoriteReject.clear();
+  ipcState.unfavoriteReject.clear();
   ipcState.precheckFail.clear();
   scriptsState.playlists.length = 0;
   scriptsState.error = null;
@@ -188,8 +205,8 @@ beforeEach(() => {
 
 afterEach(() => cleanup());
 
-describe("accountSyncPreview（平台侧 vs 本地已收藏 diff）", () => {
-  it("missing 保持平台返回顺序，且只与同平台的本地收藏 diff", async () => {
+describe("accountSyncPreview（平台侧全量清单 + 本地收藏态）", () => {
+  it("rows 返回平台侧全部歌单并标 favorited，missing 只留未收藏、保持平台顺序", async () => {
     scriptsState.playlists = [
       remoteRow({ id: "a1", name: "已收藏" }),
       remoteRow({ id: "a2", name: "网易有同 pid 不算已收藏" }),
@@ -201,16 +218,21 @@ describe("accountSyncPreview（平台侧 vs 本地已收藏 diff）", () => {
     const r = await accountSyncPreview("bili");
 
     expect(r.total).toBe(4);
+    // 2026-10-27：弹窗要显示全部歌单（含已收藏），不再只给缺失项
+    expect(r.rows.map((row) => row.playlist.id)).toEqual(["a1", "a2", "a3", "a4"]);
+    expect(r.rows.map((row) => row.favorited)).toEqual([true, false, false, false]);
     expect(r.missing.map((p) => p.id)).toEqual(["a2", "a3", "a4"]);
   });
 
-  it("全部已收藏 → missing 为空、total 保留", async () => {
+  it("全部已收藏 → rows 全带 favorited、missing 为空、total 保留", async () => {
     scriptsState.playlists = [remoteRow({ id: "a1", name: "一" }), remoteRow({ id: "a2", name: "二" })];
     ipcState.mine = [mineRow("a1", "bili"), mineRow("a2", "bili")];
 
     const r = await accountSyncPreview("bili");
 
-    expect(r).toEqual({ missing: [], total: 2 });
+    expect(r.total).toBe(2);
+    expect(r.rows.map((row) => row.favorited)).toEqual([true, true]);
+    expect(r.missing).toEqual([]);
   });
 
   it("包旧错误原样上抛（不改写文案）", async () => {
@@ -271,6 +293,56 @@ describe("collectAccountPlaylists（收藏执行计数）", () => {
 
     expect(r).toEqual({ collected: 2, skipped: 0, failed: 1 });
     expect(ipcState.favoriteCalls.map((c) => c.id)).toEqual(["p1", "p3"]);
+  });
+});
+
+describe("uncollectAccountPlaylists（取消收藏执行计数）", () => {
+  it("逐个取消收藏并传对参数（只动本地，不碰平台侧）", async () => {
+    ipcState.favorited.set("bili#r1", true);
+    ipcState.favorited.set("bili#r2", true);
+
+    const r = await uncollectAccountPlaylists("bili", [
+      remoteRow({ id: "r1", name: "歌单一", picUrl: "http://img/1.jpg" }),
+      remoteRow({ id: "r2", name: "歌单二" }),
+    ]);
+
+    expect(r).toEqual({ removed: 2, skipped: 0, failed: 0 });
+    expect(ipcState.unfavoriteCalls).toEqual([
+      { platform: "bili", id: "r1", name: "歌单一", picUrl: "http://img/1.jpg" },
+      { platform: "bili", id: "r2", name: "歌单二", picUrl: undefined },
+    ]);
+  });
+
+  it("本地本来就没有 → skipped 计数且不写库", async () => {
+    const r = await uncollectAccountPlaylists("bili", [remoteRow({ id: "r1", name: "没收藏" })]);
+
+    expect(r).toEqual({ removed: 0, skipped: 1, failed: 0 });
+    expect(ipcState.unfavoriteCalls).toEqual([]);
+  });
+
+  it("预检失败按已收藏继续尝试（unfavorite 幂等）", async () => {
+    ipcState.precheckFail.add("r1");
+
+    const r = await uncollectAccountPlaylists("bili", [remoteRow({ id: "r1", name: "预检炸" })]);
+
+    expect(r).toEqual({ removed: 1, skipped: 0, failed: 0 });
+    expect(ipcState.unfavoriteCalls.map((c) => c.id)).toEqual(["r1"]);
+  });
+
+  it("单个失败只计 failed 不中断整体", async () => {
+    ipcState.favorited.set("bili#r1", true);
+    ipcState.favorited.set("bili#r2", true);
+    ipcState.favorited.set("bili#r3", true);
+    ipcState.unfavoriteReject.set("r2", "删除失败");
+
+    const r = await uncollectAccountPlaylists("bili", [
+      remoteRow({ id: "r1", name: "一" }),
+      remoteRow({ id: "r2", name: "二" }),
+      remoteRow({ id: "r3", name: "三" }),
+    ]);
+
+    expect(r).toEqual({ removed: 2, skipped: 0, failed: 1 });
+    expect(ipcState.unfavoriteCalls.map((c) => c.id)).toEqual(["r1", "r3"]);
   });
 });
 
@@ -335,7 +407,24 @@ describe("SourcePlaylistSyncDialog（同步弹窗组件）", () => {
     return { onClose, onDone };
   }
 
-  it("渲染缺失清单（已收藏的不列）+ 默认全选 + 收藏调用参数", async () => {
+  it("列出平台侧全部歌单：已收藏的带「已收藏」标记且默认勾上", async () => {
+    scriptsState.playlists = [
+      remoteRow({ id: "p1", name: "已收藏歌单" }),
+      remoteRow({ id: "p2", name: "待收藏歌单", picUrl: "http://img/p2.jpg", trackCount: 5 }),
+    ];
+    ipcState.mine = [mineRow("p1", "bili")];
+    renderDialog();
+
+    // 2026-10-27：已收藏的不再从列表里消失，而是带标记展示
+    expect(await screen.findByText("已收藏歌单")).toBeTruthy();
+    expect(screen.getByText("待收藏歌单")).toBeTruthy();
+    expect(screen.getByText("已收藏")).toBeTruthy();
+    expect(screen.getByText("全选（平台侧 2 个，已收藏 1 个）")).toBeTruthy();
+    // 只有未收藏的那条需要动作 → 更改数 1
+    expect(screen.getByText("应用更改（1）")).toBeTruthy();
+  });
+
+  it("勾选缺失项 → 收藏调用参数（trackCount 转 playCount 字符串）", async () => {
     scriptsState.playlists = [
       remoteRow({ id: "p1", name: "已收藏歌单" }),
       remoteRow({ id: "p2", name: "待收藏歌单", picUrl: "http://img/p2.jpg", trackCount: 5 }),
@@ -343,11 +432,7 @@ describe("SourcePlaylistSyncDialog（同步弹窗组件）", () => {
     ipcState.mine = [mineRow("p1", "bili")];
     const { onClose, onDone } = renderDialog();
 
-    expect(await screen.findByText("待收藏歌单")).toBeTruthy();
-    expect(screen.queryByText("已收藏歌单")).toBeNull();
-    expect(screen.getByText("收藏所选（1）")).toBeTruthy();
-
-    fireEvent.click(screen.getByText("收藏所选（1）"));
+    fireEvent.click(await screen.findByText("应用更改（1）"));
 
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(onDone).toHaveBeenCalled();
@@ -355,26 +440,71 @@ describe("SourcePlaylistSyncDialog（同步弹窗组件）", () => {
     expect(ipcState.favoriteCalls).toEqual([
       { platform: "bili", id: "p2", name: "待收藏歌单", picUrl: "http://img/p2.jpg", playCount: "5" },
     ]);
+    expect(ipcState.unfavoriteCalls).toEqual([]);
   });
 
-  it("取消勾选 → 计数归零且按钮禁用", async () => {
-    scriptsState.playlists = [remoteRow({ id: "p1", name: "唯一缺失" })];
+  it("取消勾选已收藏项 → 调用 unfavoritePlaylist（本地取消收藏）", async () => {
+    scriptsState.playlists = [remoteRow({ id: "p1", name: "已收藏歌单" })];
+    ipcState.mine = [mineRow("p1", "bili")];
+    ipcState.favorited.set("bili#p1", true);
+    const { onClose } = renderDialog();
+
+    await screen.findByText("已收藏歌单");
+    // 排序：第 0 个是全选，第 1 个是行勾选（初始已勾上）
+    const rowBox = screen.getAllByRole("checkbox")[1] as HTMLInputElement;
+    expect(rowBox.checked).toBe(true);
+    fireEvent.click(rowBox);
+
+    fireEvent.click(screen.getByText("应用更改（1）"));
+
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(ipcState.unfavoriteCalls).toEqual([
+      { platform: "bili", id: "p1", name: "已收藏歌单", picUrl: undefined },
+    ]);
+    expect(ipcState.favoriteCalls).toEqual([]);
+    expect(toastState.toast).toHaveBeenCalledWith("已取消收藏 1 个歌单");
+  });
+
+  it("同时收藏 + 取消收藏 → 一次提交两边的差异", async () => {
+    scriptsState.playlists = [
+      remoteRow({ id: "keep", name: "保留的已收藏" }),
+      remoteRow({ id: "new", name: "要新收藏" }),
+      remoteRow({ id: "drop", name: "要取消收藏" }),
+    ];
+    ipcState.mine = [mineRow("keep", "bili"), mineRow("drop", "bili")];
+    ipcState.favorited.set("bili#keep", true);
+    ipcState.favorited.set("bili#drop", true);
+    const { onClose } = renderDialog();
+
+    await screen.findByText("要取消收藏");
+    // 默认全勾（= 平台侧全同步进本地）；行序 = keep(1) / new(2) / drop(3)
+    // 只把 drop 取消勾选 → 这一次提交里同时有「收藏 new」和「取消收藏 drop」
+    fireEvent.click(screen.getAllByRole("checkbox")[3]);
+
+    fireEvent.click(screen.getByText("应用更改（2）"));
+
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(ipcState.favoriteCalls.map((c) => c.id)).toEqual(["new"]);
+    expect(ipcState.unfavoriteCalls.map((c) => c.id)).toEqual(["drop"]);
+    expect(toastState.toast).toHaveBeenCalledWith("已收藏 1 个，已取消收藏 1 个歌单");
+  });
+
+  it("平台侧全部已收藏且全勾选 → 没有改动、按钮禁用", async () => {
+    scriptsState.playlists = [remoteRow({ id: "p1", name: "唯一歌单" })];
+    ipcState.mine = [mineRow("p1", "bili")];
     renderDialog();
 
-    await screen.findByText("唯一缺失");
-    // checkbox：第 0 个是全选，第 1 个是行选择
-    fireEvent.click(screen.getAllByRole("checkbox")[1]);
-
-    const btn = screen.getByText("收藏所选（0）") as HTMLButtonElement;
+    await screen.findByText("唯一歌单");
+    const btn = screen.getByText("应用更改（0）") as HTMLButtonElement;
     expect(btn.disabled).toBe(true);
   });
 
-  it("平台侧没有歌单 → 空态文案、无收藏按钮", async () => {
+  it("平台侧没有歌单 → 空态文案、无应用按钮", async () => {
     scriptsState.playlists = [];
     renderDialog();
 
     expect(await screen.findByText("平台侧没有歌单")).toBeTruthy();
-    expect(screen.queryByText(/收藏所选/)).toBeNull();
+    expect(screen.queryByText(/应用更改/)).toBeNull();
   });
 
   it("包旧/未登录错误文案原样展示", async () => {
@@ -389,7 +519,7 @@ describe("SourcePlaylistSyncDialog（同步弹窗组件）", () => {
     ipcState.favoriteReject.set("p1", "写入失败");
     const { onClose } = renderDialog();
 
-    fireEvent.click(await screen.findByText("收藏所选（2）"));
+    fireEvent.click(await screen.findByText("应用更改（2）"));
 
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(toastState.toastError).toHaveBeenCalledWith("已收藏 1 个歌单，1 个失败，可稍后重开同步重试");
