@@ -145,6 +145,9 @@ export async function runWebLoginFlow(
   let markerSeen = false;
   // 「捕获到 Cookie 但校验未通过」的提示每轮流程只发一次，避免刷屏
   let failNotified = false;
+  // 最近一次非空捕获：超时且没等到 marker 时也落盘诊断（marker 体系变更的
+  // 音源——如酷我 sid 会话——根本走不到校验，真实值只能靠这条通道拿到）
+  let lastCookie = "";
   try {
     await deps.openWindow(args.webLogin.url);
     while (Date.now() < deadline) {
@@ -155,6 +158,7 @@ export async function runWebLoginFlow(
         return "cancelled";
       }
       const cookie = mergeCookies(captured.chunks);
+      if (cookie.length > 0) lastCookie = cookie;
       if (markerHit(cookie, args.webLogin.cookieMarkers)) {
         markerSeen = true;
         let verdict: { ok: boolean; user: SourceAuthUser | null };
@@ -185,10 +189,13 @@ export async function runWebLoginFlow(
       await sleep(Math.min(intervalMs, Math.max(deadline - Date.now(), 0)));
     }
     await deps.closeWindow();
+    if (!markerSeen && lastCookie.length > 0) {
+      void deps.debugDump?.(lastCookie).catch(() => undefined);
+    }
     deps.onProgress?.(
       markerSeen
         ? "登录超时：已捕获官方 Cookie 但校验一直未通过，登录未完成"
-        : "登录超时：未能在官方页面捕获到登录 Cookie（请确认已在窗口内完成登录）",
+        : "登录超时：未能在官方页面捕获到登录 Cookie（请确认已在窗口内完成登录；诊断名单已存 %TEMP%\\qt-weblogin-debug.txt）",
     );
     return "timeout";
   } catch (e) {

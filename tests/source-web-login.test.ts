@@ -148,7 +148,7 @@ describe("runWebLoginFlow", () => {
     expect(last).toContain("已捕获官方 Cookie"); // 超时原因区分「抓到了」
   });
 
-  it("全程未捕获到 marker → 超时原因说明没抓到 Cookie", async () => {
+  it("全程未捕获到 marker → 超时原因说明没抓到 Cookie；最后一次捕获仍落盘诊断", async () => {
     const deps = makeDeps();
     deps.capture.mockResolvedValue({ closed: false, chunks: ["tracker=1"] });
     const onProgress = vi.fn();
@@ -160,8 +160,12 @@ describe("runWebLoginFlow", () => {
 
     expect(outcome).toBe("timeout");
     expect(deps.validateImport).not.toHaveBeenCalled();
+    // marker 体系变更的音源（如酷我 sid 会话）走不到校验：真实捕获值必须
+    // 在超时路径也落盘，开发者才能离线定位新校验端点
+    expect(deps.debugDump).toHaveBeenCalledWith("tracker=1");
     const last = String(onProgress.mock.calls.at(-1)![0]);
     expect(last).toContain("未能"); // 超时原因区分「没抓到」
+    expect(last).toContain("qt-weblogin-debug.txt");
   });
 
   it("capture 抛错（用户手动关窗）→ 兜底关窗返回 cancelled", async () => {
