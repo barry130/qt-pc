@@ -50,8 +50,10 @@ import type { Quality } from "@/types";
  * - 播放音质 / 下载音质（2026-10-25 需求：各平台独立，设置页不再有全局音质）。
  *
  * 卡片清单 = 注册表全部源（顺序与展示一致；2026-10-25 用户需求「全平台写入
- * 音源账号」）——没有登录接口的源（如 kg/migu，官方登录态查询端点已失效）
- * 也有音质卡，只是不渲染登录行。
+ * 音源账号」）——没有声明 auth 的源（当前包里只有 migu：官方登录态查询端点
+ * 已失效）也有音质卡，只是不渲染登录行。注册表里已经没有、但库里还存着凭据
+ * 的源补一张「残留卡」（2026-10-27 用户需求）：标题旁标出「音源包已卸载」，
+ * 否则用户只看到一个内部 id（如 netease）不知道这是什么。
  *
  * 播放面登录态生效时，该源官方前置线路启用，音质选择整体切换到官方档位
  * 清单（注册表 auth.officialQualities，v10/v11）——下拉选项经
@@ -72,6 +74,9 @@ type SourceCard = {
   webLogin?: { url: string; cookieMarkers: string[]; note?: string; captureUrls?: string[] };
   /** 该源 auth.domains：旧包未下发 captureUrls 时回退拼接捕获地址用 */
   domains: string[];
+  /** 残留卡：注册表里已经没有这个源（包下掉/换了源 id），只剩库里凭据。
+   *  name 直接是原始 id，渲染时标出「音源包已卸载」解释它为什么叫这个名字 */
+  orphan?: boolean;
 };
 
 function Switch(props: { checked: boolean; onToggle: () => void; disabled?: boolean }): React.JSX.Element {
@@ -90,7 +95,7 @@ function Switch(props: { checked: boolean; onToggle: () => void; disabled?: bool
       }`}
     >
       <span
-        className={`absolute top-[0.125rem] h-4 w-4 rounded-full bg-background shadow transition-all ${
+        className={`absolute top-[0.125rem] h-4 w-4 rounded-full bg-background shadow transition-[left,transform] duration-200 ${
           props.checked ? "left-[1.125rem]" : "left-[0.125rem]"
         }`}
       />
@@ -101,6 +106,9 @@ function Switch(props: { checked: boolean; onToggle: () => void; disabled?: bool
 export function SourceAccountsPage(): React.JSX.Element {
   const sources = useSourceRegistryStore((s) => s.sources);
   const ensure = useSourceRegistryStore((s) => s.ensure);
+  /** 注册表是否真的取到过：区分「包已卸载」与「引擎还没就绪」——残留卡的
+   *  标签文案靠它选词，不能把「还没取到」误说成「已卸载」 */
+  const registryReady = useSourceRegistryStore((s) => s.ready);
   /** 已登录账号（source → 凭据+用户信息）；loaded 区分「还没读」与「没有」 */
   const [accounts, setAccounts] = useState<Record<string, SourceAuthAccount>>({});
   const [loaded, setLoaded] = useState(false);
@@ -162,7 +170,7 @@ export function SourceAccountsPage(): React.JSX.Element {
     })),
     ...Object.keys(accounts)
       .filter((id) => !sources.some((s) => s.id === id))
-      .map((id) => ({ id, name: id, methods: [], domains: [] })),
+      .map((id) => ({ id, name: id, methods: [], domains: [], orphan: true })),
   ];
 
   useEffect(() => {
@@ -562,6 +570,11 @@ export function SourceAccountsPage(): React.JSX.Element {
                         className={`h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform ${isCollapsed ? "-rotate-90" : ""}`}
                       />
                       <span className="shrink-0 text-sm font-medium">{item.name}</span>
+                      {item.orphan ? (
+                        <span className="shrink-0 text-[11px] text-amber-500 dark:text-amber-400">
+                          {registryReady ? "音源包已卸载" : "音源包未就绪"}
+                        </span>
+                      ) : null}
                       {account ? (
                         stale[item.id] ? (
                           <span className="shrink-0 text-[11px] text-amber-500 dark:text-amber-400">

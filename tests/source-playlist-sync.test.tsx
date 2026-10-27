@@ -51,7 +51,7 @@ const registryState = vi.hoisted(() => {
     Record<string, unknown>
   >;
   // 稳定快照：页面 effect 依赖 registryProfiles，引用每次变化会导致无限重渲染
-  const snapshot = { sources, ensure, profiles: {} };
+  const snapshot = { sources, ensure, profiles: {}, ready: true };
   return { ensure, sources, snapshot };
 });
 
@@ -144,7 +144,7 @@ import {
   parseSourceAuthToggles,
   resetSourceAuthCaches,
 } from "@/lib/source-auth";
-import { SOURCE_AUTH_TOGGLES_KEY } from "@/lib/storageKeys";
+import { SOURCE_AUTH_ACCOUNTS_KEY, SOURCE_AUTH_TOGGLES_KEY } from "@/lib/storageKeys";
 import { SourcePlaylistSyncDialog } from "@/components/mine/SourcePlaylistSyncDialog";
 import { SourceAccountsPage } from "@/components/mine/SourceAccountsPage";
 import type { SourceAccountPlaylist } from "@/source-scripts";
@@ -520,5 +520,48 @@ describe("SourceAccountsPage：卡片折叠与开关行", () => {
     fireEvent.click(screen.getByRole("button", { name: /全部展开/ }));
 
     expect(screen.getByText(/只有启用时才能同步歌单/)).toBeTruthy();
+  });
+});
+
+describe("SourceAccountsPage：注册表外的残留账号", () => {
+  /** 库里存一个注册表已不再声明的源（模拟换包/包下掉后留下的凭据） */
+  function seedOrphanAccount(): void {
+    ipcState.store.set(
+      SOURCE_AUTH_ACCOUNTS_KEY,
+      JSON.stringify({
+        netease: {
+          cookie: "n-cookie",
+          user: { id: "9", nickname: "老用户", avatar: "", vip: false, vipLabel: "" },
+          savedAt: "2026-10-24T00:00:00.000Z",
+        },
+      }),
+    );
+  }
+
+  it("补一张残留卡：名字是原始 id + 标「音源包已卸载」，登录入口消失但保留退出", async () => {
+    seedOrphanAccount();
+    render(<SourceAccountsPage />);
+
+    // 注册表只有 bili，netease 只能靠残留卡出现（名字就是原始 id）
+    expect(await screen.findByText("netease")).toBeTruthy();
+    expect(screen.getByText("音源包已卸载")).toBeTruthy();
+    // 残留卡只给展示与退出（包都没了，登录入口一条都不给）
+    expect(screen.getByText("退出")).toBeTruthy();
+    // 唯一的登录入口属于注册表里的 bili 卡，残留卡不出登录按钮
+    expect(screen.getAllByText("导入Cookie")).toHaveLength(1);
+  });
+
+  it("注册表还没取到时不误标「已卸载」，改说「未就绪」", async () => {
+    seedOrphanAccount();
+    registryState.snapshot.ready = false;
+    try {
+      render(<SourceAccountsPage />);
+
+      expect(await screen.findByText("netease")).toBeTruthy();
+      expect(screen.getByText("音源包未就绪")).toBeTruthy();
+      expect(screen.queryByText("音源包已卸载")).toBeNull();
+    } finally {
+      registryState.snapshot.ready = true;
+    }
   });
 });
