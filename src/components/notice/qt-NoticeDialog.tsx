@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
 import { coerceNumber as numberValue, coerceString as stringValue } from "@/lib/coerce";
+import { markFirstLoginShown, migrateLegacyFirstLogin, readFirstLoginShown } from "@/lib/noticeFirstLogin";
 import { RichText } from "@/lib/richText";
 import * as ipc from "@/services/ipc";
 import { useAuthStore } from "@/stores/auth";
 
 const DISPLAY_SPLASH = 1;
-const FIRST_LOGIN_KEY = "quietmusic.notice.first-login";
 
 interface NoticeItem {
   id: number;
@@ -58,11 +58,8 @@ export function QtNoticeDialog(): React.JSX.Element | null {
     if (!notice.dialogClosable) return;
     if (hideToday) writeHiddenDate(notice.id, todayStr());
     if (notice.firstLoginOnly) {
-      try {
-        localStorage.setItem(FIRST_LOGIN_KEY, "shown");
-      } catch {
-        // Storage failure only affects future display suppression.
-      }
+      // 按公告 id 单独记：新发布的「仅首次登录」公告不受旧公告的已弹标记影响
+      markFirstLoginShown(notice.id);
     }
     setIndex((value) => value + 1);
   };
@@ -129,11 +126,17 @@ export function QtNoticeDialog(): React.JSX.Element | null {
 
 function normalizeSplashNotices(data: unknown, loggedIn: boolean): NoticeItem[] {
   if (!Array.isArray(data)) return [];
-  const firstLoginShown = readFirstLoginShown();
+  const items = data.map((item) => (item ?? {}) as Record<string, unknown>);
+  // 老版本用一个全局布尔记「已弹过首次登录公告」：升级后先把它迁移成按条标记，
+  // 否则老用户明明看过，新公告也会因为老标记而永远不弹。
+  migrateLegacyFirstLogin(
+    items
+      .filter((o) => (numberValue(o.display) & DISPLAY_SPLASH) !== 0 && numberValue(o.firstLoginOnly) === 1)
+      .map((o) => numberValue(o.id)),
+  );
   const seen = new Set<string>();
-  return data
-    .filter((item) => {
-      const o = (item ?? {}) as Record<string, unknown>;
+  return items
+    .filter((o) => {
       if ((numberValue(o.display) & DISPLAY_SPLASH) === 0) return false;
       // 首次启动免责声明（termsVersion 非空）由 FirstRunDisclaimer 单独渲染：
       // 它有读秒和「改了条款重新确认」的语义，混进这个通用公告弹窗会两个弹窗叠着弹
@@ -141,11 +144,13 @@ function normalizeSplashNotices(data: unknown, loggedIn: boolean): NoticeItem[] 
       const audience = stringValue(o.audience || "ALL");
       if (audience === "LOGGED_IN" && !loggedIn) return false;
       if (audience === "NOT_LOGGED_IN" && loggedIn) return false;
-      if (numberValue(o.firstLoginOnly) === 1 && (!loggedIn || firstLoginShown)) return false;
+      // 每条公告各自记已弹：用户看过旧的那条，新发布的这条仍然应当弹出
+      if (numberValue(o.firstLoginOnly) === 1 && (!loggedIn || readFirstLoginShown(numberValue(o.id)))) {
+        return false;
+      }
       return true;
     })
-    .map((item) => {
-      const o = (item ?? {}) as Record<string, unknown>;
+    .map((o) => {
       return {
         id: numberValue(o.id),
         title: stringValue(o.title),
@@ -190,13 +195,5 @@ function writeHiddenDate(id: number, value: string): void {
     localStorage.setItem(hiddenKey(id), value);
   } catch {
     // Storage failure only affects today's suppression.
-  }
-}
-
-function readFirstLoginShown(): boolean {
-  try {
-    return localStorage.getItem(FIRST_LOGIN_KEY) === "shown";
-  } catch {
-    return false;
   }
 }
