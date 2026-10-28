@@ -1864,6 +1864,26 @@ fn windows_registry_string(name: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// 按内部版本号修正产品名（Windows 11 的注册表 `ProductName` 仍写「Windows 10 …」）。
+///
+/// 微软为老程序兼容保留了这个字符串：装了 Windows 11 的机器上
+/// `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProductName` 依然是
+/// 「Windows 10 Home China」，而 `CurrentBuildNumber` 是 26200、`DisplayVersion`
+/// 是 25H2 —— 直接拼出来就成了「Windows 10 Home China 25H2 (26200)」这种自相矛盾
+/// 的反馈记录（用户一眼看出不对）。Windows 11 从 21H2 起内部版本号就是 22000 段，
+/// 所以 ≥ 22000 一律按 11 改写前缀；也顺手覆盖 Win11 24H2/25H2 的 26100/26200。
+/// 只改写以「Windows 10」开头的产品名：`Windows Server 2025`（26100）之类的
+/// 服务器版本来就没写错，不能动。
+// 非 Windows 目标上没有调用点（只有 cfg(windows) 的 os_description 用它）
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn windows_family_of(product: &str, build: &str) -> String {
+    let build_no: u32 = build.trim().parse().unwrap_or(0);
+    if build_no >= 22_000 && product.starts_with("Windows 10") {
+        return product.replacen("Windows 10", "Windows 11", 1);
+    }
+    product.to_string()
+}
+
 /// 操作系统描述（`X-OS` 的值）。
 /// Windows 下取「Windows 11 Pro 23H2 (22631)」这种能直接定位问题的完整描述
 /// （音频驱动 / WebView2 的差异常常只体现在内部版本号上）；注册表读不到时退化为 `Windows`。
@@ -1872,7 +1892,7 @@ fn os_description() -> String {
     let product = windows_registry_string("ProductName").unwrap_or_else(|| "Windows".to_string());
     let display = windows_registry_string("DisplayVersion").unwrap_or_default();
     let build = windows_registry_string("CurrentBuildNumber").unwrap_or_default();
-    let mut out = product;
+    let mut out = windows_family_of(&product, &build);
     if !display.is_empty() {
         out.push(' ');
         out.push_str(&display);
@@ -2118,6 +2138,35 @@ mod tests {
         let os = get(HDR_CLIENT_OS).expect("X-OS 不应缺失");
         assert!(!os.is_empty());
         assert!(os.chars().count() <= MAX_OS_LEN, "X-OS 超长: {os}");
+    }
+
+    #[test]
+    fn windows_family_follows_build_not_registry_product_name() {
+        // 用户机器真实取值（2026-10-27 反馈详情截图）：ProductName 永远写
+        // 「Windows 10 Home China」，靠 CurrentBuildNumber 才认得出是 Windows 11
+        assert_eq!(
+            windows_family_of("Windows 10 Home China", "26200"),
+            "Windows 11 Home China"
+        );
+        // 21H2 起的 22000 段都是 11
+        assert_eq!(
+            windows_family_of("Windows 10 Pro", "22631"),
+            "Windows 11 Pro"
+        );
+        // 22000 以下仍是 10：不能把真 Windows 10 写成 11
+        assert_eq!(
+            windows_family_of("Windows 10 Pro", "19045"),
+            "Windows 10 Pro"
+        );
+        // 服务器版本来就没写「Windows 10」，命名正确，别动
+        assert_eq!(
+            windows_family_of("Windows Server 2025", "26100"),
+            "Windows Server 2025"
+        );
+        // build 读不到（空串 / 非数字）时保持原样，宁可少改不可乱改
+        assert_eq!(windows_family_of("Windows 10 Pro", ""), "Windows 10 Pro");
+        assert_eq!(windows_family_of("Windows 10 Pro", "abc"), "Windows 10 Pro");
+        assert_eq!(windows_family_of("Windows", ""), "Windows");
     }
 
     #[test]
