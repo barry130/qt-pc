@@ -8,8 +8,9 @@ import { disclaimerVisible, useDisclaimerStore } from "@/stores/disclaimer";
  * 首次启动的免责声明 + 开源通知（DESIGN §5.6）。
  *
  * **文案不在代码里**：正文、标题、读秒时长、条款版本号全部由后端下发，
- * 后台「消息管理」发一条开屏公告（`display` 含 1，填「条款版本号」）即可改，
- * 不用发版。判定哪个公告是这份声明见 `stores/disclaimer.ts`。
+ * 后台「消息中心 → 通知管理」发一条通知并打开「仅首次启动弹出」开关即可改，
+ * 不用发版。开关会自动生成 `termsVersion` 并强制开屏位/App 六端/可关闭，
+ * 判定哪个公告是这份声明见 `stores/disclaimer.ts`。
  *
  * 只在安装后第一次启动出现：接受记录存在 SQLite settings 表
  * （`disclaimer.acceptedAt`，JSON：`{termsVersion, acceptedAt}`），之后返回 null。
