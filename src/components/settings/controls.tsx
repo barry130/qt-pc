@@ -50,7 +50,7 @@ export function Switch(props: {
       }`}
     >
       <span
-        className={`absolute top-[0.125rem] h-4 w-4 rounded-full bg-background shadow transition-[left,transform] duration-200 ${
+        className={`absolute top-[0.125rem] h-4 w-4 rounded-full bg-background shadow transition-[left,transform] duration-base ${
           props.checked ? "left-[1.125rem]" : "left-[0.125rem]"
         }`}
       />

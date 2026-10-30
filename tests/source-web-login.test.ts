@@ -5,7 +5,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // 顶层 import 的三个依赖模块按仓库测试惯例 mock 掉（全注入时不触默认实现）
-vi.mock("@/services/ipc", () => ({ sourceWebLoginOpen: vi.fn(), sourceWebLoginCapture: vi.fn(), sourceWebLoginClose: vi.fn(), sourceWebLoginDebugDump: vi.fn().mockResolvedValue("C:/temp/qt-weblogin-debug.txt") }));
+vi.mock("@/services/ipc", () => ({
+  sourceWebLoginOpen: vi.fn(),
+  sourceWebLoginCapture: vi.fn(),
+  sourceWebLoginClose: vi.fn(),
+  sourceWebLoginCookieNames: vi.fn().mockResolvedValue(["qm_keyst"]),
+}));
 vi.mock("@/source-scripts", () => ({ authImportCookie: vi.fn() }));
 vi.mock("@/lib/source-auth", () => ({ saveSourceAuthAccount: vi.fn() }));
 
@@ -25,7 +30,7 @@ function makeDeps() {
     validateImport: vi.fn().mockResolvedValue({ ok: false, user: null }),
     save: vi.fn().mockResolvedValue(undefined),
     closeWindow: vi.fn().mockResolvedValue(undefined),
-    debugDump: vi.fn().mockResolvedValue(undefined),
+    cookieNames: vi.fn().mockResolvedValue(["qm_keyst"]),
   };
 }
 
@@ -142,13 +147,13 @@ describe("runWebLoginFlow", () => {
     expect(outcome).toBe("timeout");
     const retry = onProgress.mock.calls.filter(([m]) => String(m).includes("校验未通过，继续重试"));
     expect(retry.length).toBe(1); // 重试提示只发一次，不刷屏
-    // 诊断两件套：Cookie 原文落本地调试文件（只落本机）+ toast 报名摘要
-    expect(deps.debugDump).toHaveBeenCalledWith("qm_keyst=AAA");
+    // 诊断只回报 Cookie 名称（不含值）：安全评审 P0 之后不再把凭据原文写进 %TEMP%
+    expect(deps.cookieNames).toHaveBeenCalledWith("qm_keyst=AAA");
     const last = String(onProgress.mock.calls.at(-1)![0]);
     expect(last).toContain("已捕获官方 Cookie"); // 超时原因区分「抓到了」
   });
 
-  it("全程未捕获到 marker → 超时原因说明没抓到 Cookie；最后一次捕获仍落盘诊断", async () => {
+  it("全程未捕获到 marker → 超时原因说明没抓到 Cookie；最后一次捕获仍回报名称清单", async () => {
     const deps = makeDeps();
     deps.capture.mockResolvedValue({ closed: false, chunks: ["tracker=1"] });
     const onProgress = vi.fn();
@@ -160,12 +165,13 @@ describe("runWebLoginFlow", () => {
 
     expect(outcome).toBe("timeout");
     expect(deps.validateImport).not.toHaveBeenCalled();
-    // marker 体系变更的音源（如酷我 sid 会话）走不到校验：真实捕获值必须
-    // 在超时路径也落盘，开发者才能离线定位新校验端点
-    expect(deps.debugDump).toHaveBeenCalledWith("tracker=1");
+    // marker 体系变更的音源（如酷我 sid 会话）走不到校验：超时路径也要回报
+    // 名称清单，开发者才能判断是「新端点的会话键换了名字」而不是完全没抓到
+    expect(deps.cookieNames).toHaveBeenCalledWith("tracker=1");
     const last = String(onProgress.mock.calls.at(-1)![0]);
     expect(last).toContain("未能"); // 超时原因区分「没抓到」
-    expect(last).toContain("qt-weblogin-debug.txt");
+    // 旧文案会把用户引向 %TEMP% 的明文调试文件，已随 P0 撤掉
+    expect(last).not.toContain("qt-weblogin-debug.txt");
   });
 
   it("capture 抛错（用户手动关窗）→ 兜底关窗返回 cancelled", async () => {

@@ -536,7 +536,7 @@ export function BatchBar(props: {
         )}
       >
         {() => (
-          <div className="absolute right-0 top-full z-20 mt-1 w-60 rounded-md border border-border bg-popover p-1 shadow-md">
+          <div className="absolute right-0 top-full z-20 mt-1 w-60 rounded-xl border border-border bg-popover/95 p-1 backdrop-blur-xl shadow-raised">
             <div className="px-2 py-1 text-xs text-muted-foreground">
               {membersLoading ? "读取歌单…" : `收藏 / 取消收藏 ${count} 首`}
             </div>
@@ -584,7 +584,7 @@ export function BatchBar(props: {
                 data-testid="batch-collect-dup-confirm"
                 className="border-t border-border px-2 py-2"
               >
-                <p className="text-[11px] leading-snug text-foreground/90">
+                <p className="text-2xs leading-snug text-foreground/90">
                   「{pending.playlist.name}」里已经有了
                   {pending.dups.length > 1 ? ` ${pending.dups.length} 首` : ""}同名的
                   {sourceLabel(pending.dups[0].platform)}版本
@@ -598,7 +598,7 @@ export function BatchBar(props: {
                     type="button"
                     disabled={menuBusy}
                     onClick={() => void addTo(pending.playlist, pending.adds)}
-                    className="flex-1 rounded border border-border px-2 py-1 text-[11px] transition-colors hover:bg-secondary disabled:opacity-50"
+                    className="flex-1 rounded border border-border px-2 py-1 text-2xs transition-colors hover:bg-secondary disabled:opacity-50"
                   >
                     继续收藏
                   </button>
@@ -606,7 +606,7 @@ export function BatchBar(props: {
                     type="button"
                     disabled={menuBusy}
                     onClick={() => setPending(null)}
-                    className="flex-1 rounded border border-border px-2 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-secondary disabled:opacity-50"
+                    className="flex-1 rounded border border-border px-2 py-1 text-2xs text-muted-foreground transition-colors hover:bg-secondary disabled:opacity-50"
                   >
                     取消
                   </button>
@@ -636,7 +636,7 @@ export function BatchBar(props: {
             </div>
 
             {menuError && (
-              <div className="px-2 py-1 text-[11px] text-destructive">{menuError}</div>
+              <div className="px-2 py-1 text-2xs text-destructive">{menuError}</div>
             )}
           </div>
         )}

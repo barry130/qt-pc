@@ -368,7 +368,7 @@ mod tests {
             .status()
             .ok()?
             .success();
-        ok.then(|| out)
+        ok.then_some(out)
     }
 
     /// 封面字节只需魔数正确：lofty 只存取字节、不解码图片。

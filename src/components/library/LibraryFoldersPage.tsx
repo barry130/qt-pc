@@ -92,7 +92,7 @@ export function LibraryFoldersPage(): React.JSX.Element {
     <div className="h-full min-w-0 overflow-y-auto px-5 py-5">
       <div className="mb-3 flex items-center gap-2">
         <BackButton />
-        <h1 className="text-lg font-semibold">音乐文件夹</h1>
+        <h1 className="text-xl font-bold tracking-tight">音乐文件夹</h1>
       </div>
       <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
         添加存放音乐的文件夹，轻听会把里面的音频文件读进本地曲库。

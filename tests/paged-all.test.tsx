@@ -31,6 +31,7 @@ function Probe(props: {
   resetKey: string;
   cacheKey?: string;
   maxPages?: number;
+  emptyStreakLimit?: number;
 }): React.JSX.Element {
   last = usePagedList<string>({
     fetchPage: props.fetchPage,
@@ -40,6 +41,7 @@ function Probe(props: {
     mode: "all",
     cacheKey: props.cacheKey,
     maxPages: props.maxPages,
+    emptyStreakLimit: props.emptyStreakLimit,
   });
   return <div ref={last.sentinelRef} data-testid="sentinel" />;
 }
@@ -75,6 +77,22 @@ describe("usePagedList all 模式收尾", () => {
     // 拉到第 2 页发现零新增就停，不会打满 60 页
     expect(fetchPage).toHaveBeenCalledTimes(2);
     expect(last.items).toEqual(["same-a", "same-b"]);
+    expect(last.finished).toBe(true);
+  });
+
+  it("emptyStreakLimit=2：整页被客户端过滤掉不算上游失效，后面的页照样并入", async () => {
+    // 专辑名/歌手名回填是「按名搜一批再按名字过滤」的过滤型列表：某一页可能整页
+    // 都不属于本专辑 —— 列表一条不涨，但包里 hasMore 仍为真。默认阈值 1 会在这一页
+    // 直接收尾（后半张专辑永远不出现），放宽到 2 才能跨过去。
+    const fetchPage = vi.fn(async (p: number): Promise<PageResult<string>> => {
+      if (p === 1) return { list: ["a1", "a2"], hasMore: true };
+      if (p === 2) return { list: [], hasMore: true };
+      if (p === 3) return { list: ["b1"], hasMore: false };
+      return { list: [], hasMore: false };
+    });
+    render(<Probe fetchPage={fetchPage} resetKey="k-empty" emptyStreakLimit={2} />);
+    await act(settle);
+    expect(last.items).toEqual(["a1", "a2", "b1"]);
     expect(last.finished).toBe(true);
   });
 

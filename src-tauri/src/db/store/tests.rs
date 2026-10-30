@@ -673,8 +673,8 @@ fn download_dedupe_offline_lookup_and_stale_cleanup() {
     assert!(find_download_task(&conn, &db_id, "320")
         .expect("find")
         .is_none());
-    assert!(downloaded_file_for(&conn, &db_id)
-        .expect("offline")
+    assert!(download_file_for(&conn, &db_id)
+        .expect("ledger")
         .is_none());
 
     let id = create_download_task(&conn, &t, "320", Some("p.part"), None).expect("create");
@@ -698,24 +698,31 @@ fn download_dedupe_offline_lookup_and_stale_cleanup() {
     assert_eq!(task.status, "paused");
     assert!(task.error.is_some(), "应给出中断原因");
 
-    // 完成后：去重仍命中（done），离线查找能拿到文件路径
+    // 完成后：去重仍命中（done），账本（download_files）能按身份查到文件
     finish_download_task(&conn, &id, "D:\\dl\\x.flac", 999).expect("finish");
     assert!(find_download_task(&conn, &db_id, "320")
         .expect("find")
         .is_some());
     assert_eq!(
-        downloaded_file_for(&conn, &db_id)
-            .expect("offline")
-            .as_deref(),
-        Some("D:\\dl\\x.flac")
+        download_file_for(&conn, &db_id)
+            .expect("ledger")
+            .map(|m| m.path),
+        Some("D:\\dl\\x.flac".to_string())
+    );
+    // 任务删了（取消态不清账本之外的路径——文件还在用户盘上），账本仍能
+    // 离线定位文件：这正是「行删了它还在」的账本价值。
+    set_download_status(&conn, &id, "canceled", None).expect("cancel");
+    assert_eq!(
+        download_file_for(&conn, &db_id)
+            .expect("ledger")
+            .map(|m| m.path),
+        Some("D:\\dl\\x.flac".to_string())
     );
     assert_eq!(
         downloaded_track_ids(&conn).expect("ids"),
-        vec![db_id.clone()]
+        Vec::<String>::new()
     );
-
     // 取消态不再挡新任务
-    set_download_status(&conn, &id, "canceled", None).expect("cancel");
     assert!(find_download_task(&conn, &db_id, "320")
         .expect("find")
         .is_none());

@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { Ban, Copy, Disc3, Download, Heart, ListEnd, Play, RefreshCw, User, X } from "lucide-react";
 import type { Track } from "@/types";
@@ -186,6 +186,21 @@ export function TrackList(props: {
     [unbanSong, handleDislikeError],
   );
 
+  // 行 key：`身份#第几次出现`。以前是 `身份-下标`——切排序（艺人页的
+  // TrackSortSelect 会对全量列表重排）时下标全变，所有行 key 一起变，整表
+  // unmount/remount（可见闪烁 + 重挂载卡顿）。带上出现序号是为了兼容
+  // 「聚合列表里同一首歌出现多次」的情况，避免重复 key 让 React 复用错行
+  // （评审 2026-10-29）。
+  const rowKeys = useMemo(() => {
+    const seen = new Map<string, number>();
+    return tracks.map((t) => {
+      const dbId = trackDbId(t);
+      const occurrence = seen.get(dbId) ?? 0;
+      seen.set(dbId, occurrence + 1);
+      return `${dbId}#${occurrence}`;
+    });
+  }, [tracks]);
+
   if (tracks.length === 0) {
     return (
       <EmptyState
@@ -218,7 +233,7 @@ export function TrackList(props: {
         const isDownloaded = downloaded.has(dbId);
         return (
           <TrackRow
-            key={`${trackDbId(t)}-${i}`}
+            key={rowKeys[i]}
             track={t}
             index={i}
             active={currentTrackId === t.id}
@@ -561,12 +576,12 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
           {/* 平台简称：本地曲目由 SourceTag 自己判空（本地没有"平台"可言） */}
           <SourceTag platform={t.platform} size="xs" />
           {!plainRow && isDownloaded && (
-            <span className="shrink-0 rounded bg-primary/15 px-1 py-px text-[10px] text-primary">
+            <span className="shrink-0 rounded bg-primary/15 px-1 py-px text-3xs text-primary">
               已下载
             </span>
           )}
           {!plainRow && isDownloading && (
-            <span className="shrink-0 rounded bg-secondary px-1 py-px text-[10px] text-muted-foreground">
+            <span className="shrink-0 rounded bg-secondary px-1 py-px text-3xs text-muted-foreground">
               下载中
             </span>
           )}
@@ -614,7 +629,7 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
         {/* 推荐理由（每日推荐页）：单独一行、字号更小，不与「歌手 · 专辑」抢同一行。
             只有调用方传了 `reasonOf` 才有值，其它页面不渲染任何多余节点。 */}
         {reason ? (
-          <p className="mt-0.5 truncate text-[11px] text-muted-foreground/80">{reason}</p>
+          <p className="mt-0.5 truncate text-2xs text-muted-foreground/80">{reason}</p>
         ) : null}
       </div>
       {/* 悬停露出队列操作：下一首播放 / 加入队尾（不打断当前播放）；
@@ -728,13 +743,13 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
           <CollectMenu
             track={t}
             onClose={() => setPanel(null)}
-            className="rounded-md border border-border bg-popover p-1 shadow-md"
+            className="rounded-xl border border-border bg-popover/95 p-1 backdrop-blur-xl shadow-raised"
           />
         </FloatingPanel>
       ) : null}
       {panel?.kind === "switch" ? (
         <FloatingPanel x={panel.x} y={panel.y} width={404} onClose={() => setPanel(null)}>
-          <div className="rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-lg">
+          <div className="rounded-xl border border-border bg-popover/95 backdrop-blur-xl p-3 text-popover-foreground shadow-raised">
             <SourceSwitchPanel
               track={t}
               onPick={(candidate) => {

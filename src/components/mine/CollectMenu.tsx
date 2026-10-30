@@ -211,7 +211,7 @@ export function CollectMenu(props: {
           把这个提示顶掉（确认错对象） */}
       {pending !== null ? (
         <div data-testid="collect-dup-confirm" className="border-t border-border px-2 py-2">
-          <p className="text-[11px] leading-snug text-foreground/90">
+          <p className="text-2xs leading-snug text-foreground/90">
             「{pending.playlist.name}」里已经有了
             {pending.dups.length > 1 ? ` ${pending.dups.length} 首` : ""}同名的
             {sourceLabel(pending.dups[0].platform)}版本
@@ -228,7 +228,7 @@ export function CollectMenu(props: {
                 e.stopPropagation();
                 void addTo(pending.playlist);
               }}
-              className="flex-1 rounded border border-border px-2 py-1 text-[11px] transition-colors hover:bg-secondary disabled:opacity-50"
+              className="flex-1 rounded border border-border px-2 py-1 text-2xs transition-colors hover:bg-secondary disabled:opacity-50"
             >
               继续收藏
             </button>
@@ -239,7 +239,7 @@ export function CollectMenu(props: {
                 e.stopPropagation();
                 setPending(null);
               }}
-              className="flex-1 rounded border border-border px-2 py-1 text-[11px] text-muted-foreground transition-colors hover:bg-secondary disabled:opacity-50"
+              className="flex-1 rounded border border-border px-2 py-1 text-2xs text-muted-foreground transition-colors hover:bg-secondary disabled:opacity-50"
             >
               取消
             </button>
@@ -273,7 +273,7 @@ export function CollectMenu(props: {
         </button>
       </div>
 
-      {error && <div className="px-2 py-1 text-[11px] text-destructive">{error}</div>}
+      {error && <div className="px-2 py-1 text-2xs text-destructive">{error}</div>}
     </div>
   );
 }

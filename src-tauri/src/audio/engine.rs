@@ -1487,7 +1487,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             let track = {
                 let mut q = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
                 let i = q.append_or_find(*track);
-                q.index = Some(i);
+                q.commit_index(i);
                 q.current().cloned()
             };
             inner.sync_queue_to_snapshot();
@@ -1508,7 +1508,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                 if index >= q.len() {
                     None
                 } else {
-                    q.index = Some(index);
+                    q.commit_index(index);
                     q.current().cloned()
                 }
             };
@@ -2031,7 +2031,7 @@ fn advance(inner: &mut EngineInner, auto: bool) {
         Some(i) => {
             let track = {
                 let mut q = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
-                q.index = Some(i);
+                q.commit_index(i);
                 q.current().cloned()
             };
             inner.sync_queue_to_snapshot();
@@ -2303,7 +2303,7 @@ fn skip_if_recoverable(inner: &mut EngineInner, track_id: &str, autoplay: bool) 
 
     let track = {
         let mut q = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
-        q.index = Some(i);
+        q.commit_index(i);
         q.current().cloned()
     };
     inner.sync_queue_to_snapshot();
@@ -2379,7 +2379,7 @@ fn go_previous(inner: &mut EngineInner) {
     let prev = {
         let mut q = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
         q.previous_index(mode).map(|i| {
-            q.index = Some(i);
+            q.commit_index(i);
             q.current().cloned()
         })
     };
@@ -2665,33 +2665,109 @@ struct LoadJob {
     preload: bool,
 }
 
+/// 异步自递归的断环点：`LoadJob::run` 内部会为在线替身再起一个
+/// `LoadJob`（见 run() 的 `Substitute::Online` 分支）。若在 run() 里直接
+/// `spawn(job.run())`，匿名 generator 类型会在自己内部再包含自己，
+/// rustc 无法证明其 `Send`（E0283）。抽成普通同步函数后，`Gen: Send`
+/// 的检查脱离任何生成器作用域独立完成，类型递归被打断。
+fn spawn_load_job(job: LoadJob) {
+    tauri::async_runtime::spawn(job.run());
+}
+
 impl LoadJob {
     async fn run(self) {
-        // 本地曲目：Track.id 即文件绝对路径，无需 Provider 取址（DESIGN §13）
+        // 本地曲目：Track.id 即文件绝对路径，无需 Provider 取址（DESIGN §13）。
+        // 文件不在了（被移动/改名/删除——收藏死条目的主要来源）时走替身链
+        // （DESIGN §7.13）：池 A 本地曲库 → 池 B 账本/孤儿 → 池 C 前端搜索，
+        // 顶上一首接着播。预热任务不找替身（投机加载，真点播时才值得找）；
+        // 总开关关（play.localFirst=false，find_local_substitute 内部查）
+        // 也直接按原样失败。
         if self.track.platform.is_local() {
-            log::debug!("[queue] local track path={}", self.track.id);
             let path = crate::cue::strip_cue_suffix(&self.track.id).to_string();
-            self.build_and_dispatch(PlaySource::Local { path }, true, None)
-                .await;
+            if std::path::Path::new(&path).exists() {
+                log::debug!("[queue] local track path={}", self.track.id);
+                self.build_and_dispatch(PlaySource::Local { path }, true, None)
+                    .await;
+                return;
+            }
+            log::warn!("[queue] 本地文件不存在，尝试替身链: {path}");
+            if let Some(db) = self.history_db.clone() {
+                if !self.preload {
+                    match crate::local_first::find_local_substitute(&self.app, &db, &self.track)
+                        .await
+                    {
+                        Some(crate::local_first::Substitute::Local { track, kind }) => {
+                            log::info!(
+                                "[queue] 替身链命中（{kind}）：{} -> {}",
+                                self.track.id,
+                                track.id
+                            );
+                            // 只换本次播放，不改收藏（用户定案 2026-10-28）。
+                            let file = track.id.clone();
+                            self.build_and_dispatch(PlaySource::Local { path: file }, true, None)
+                                .await;
+                            return;
+                        }
+                        Some(crate::local_first::Substitute::Online { track }) => {
+                            log::info!(
+                                "[queue] 替身链命中在线替身：{} -> {}:{}",
+                                self.track.title,
+                                track.platform.as_str(),
+                                track.id
+                            );
+                            // 在线替身按一次新的 LoadJob 走完整在线链
+                            //（取链→构建→回发，失败提示也复用）；gen/tx 对引擎
+                            // 侧就是同一次换歌，行为与原曲目在线播完全一致。
+                            // 必须经 spawn_load_job 间接递归：run() 里直接
+                            // spawn(job.run()) 是异步自递归，匿名 future 类型
+                            // 无限自嵌，rustc 证不出 Send（E0283）；经同步
+                            // 函数转一道后，Send 检查脱离生成器作用域，
+                            // 环被断开。
+                            let job = LoadJob {
+                                app: self.app.clone(),
+                                tx: self.tx.clone(),
+                                cache: Arc::clone(&self.cache),
+                                cache_dir: self.cache_dir.clone(),
+                                history_db: self.history_db.clone(),
+                                quality: self.quality.clone(),
+                                track,
+                                autoplay: self.autoplay,
+                                start_ms: 0,
+                                gen: self.gen,
+                                preload: self.preload,
+                            };
+                            spawn_load_job(job);
+                            return;
+                        }
+                        None => {
+                            log::info!("[queue] 替身链无替身，按本地文件缺失失败: {path}");
+                        }
+                    }
+                }
+            }
+            self.dispatch_failed_message("load", format!("本地文件不存在：{path}"), false);
             return;
         }
 
-        // 离线优先：这首歌若已下载完成且文件还在，直接当本地文件播放。
-        // 断网、播放地址失效都不影响，下载功能才算真正闭环（§5.3 下载 2.0）。
+        // 本地优先解析链（DESIGN §7.13）：在线歌播之前先全本地找一遍文件
+        //（① 账本 → ② done 任务 → ④ 孤儿索引 → ⑤ 本地曲库，见
+        // local_first.rs），命中且文件在就直接当本地文件播——断网、播放地址
+        // 失效都不影响，下载/导入的文件才算真正闭环（§5.3 下载 2.0 的扩展）。
+        // 总开关 `play.localFirst=false` 时整段跳过（find_online_local_file
+        // 内部查库）：用户要在线高音质时不能被本地文件截和（连老的
+        // 「已下载文件离线播」一起关）。
         if let Some(db) = self.history_db.clone() {
-            let db_id = crate::db::store::db_track_id(&self.track);
-            let found = tauri::async_runtime::spawn_blocking(move || {
-                db.with(|c| crate::db::store::downloaded_file_for(c, &db_id))
-            })
-            .await;
-            if let Ok(Ok(Some(path))) = found {
-                if std::path::Path::new(&path).exists() {
-                    log::debug!("[queue] 命中已下载文件，离线播放: {path}");
-                    self.build_and_dispatch(PlaySource::Local { path }, true, None)
-                        .await;
-                    return;
-                }
-                log::warn!("[queue] 已下载文件已不存在，回落在线取址: {path}");
+            if let Some(hit) = crate::local_first::find_online_local_file(&db, &self.track).await
+            {
+                log::debug!(
+                    "[queue] 本地优先解析链命中（{}）：{} -> {}",
+                    hit.kind,
+                    self.track.id,
+                    hit.path
+                );
+                self.build_and_dispatch(PlaySource::Local { path: hit.path }, true, None)
+                    .await;
+                return;
             }
         }
 
@@ -3136,7 +3212,7 @@ fn sync_gapless_transition(inner: &mut EngineInner) {
     inner.settle_listen(true, true);
     {
         let mut queue = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
-        queue.index = Some(slot.index);
+        queue.commit_index(slot.index);
     }
     inner.current_progress = Some(ready.progress);
     inner.current_shared = ready.shared;

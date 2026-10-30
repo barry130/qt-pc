@@ -1,6 +1,5 @@
 import { useEffect } from "react";
-import { usePlayerStore } from "@/stores/player";
-import { qtresCoverUrl } from "@/lib/lrc";
+import { useNowPlayingCover } from "@/hooks/useNowPlayingLocalMedia";
 import { extractCoverAccent, extractCoverColor } from "@/lib/skins";
 
 /**
@@ -11,7 +10,10 @@ import { extractCoverAccent, extractCoverColor } from "@/lib/skins";
  * 与 useCoverColor 解耦：即使「跟随封面取色」关闭，播放页背景仍然映射封面。
  */
 export function usePlayingCoverBg(): void {
-  const picUrl = usePlayerStore((s) => s.state?.track?.picUrl ?? null);
+  // 在播封面口径与播放页一致：本地文件有内嵌封面时用它（useNowPlayingCover），
+  // 否则背景色调与页面上的封面会是两张不同的图。
+  const cover = useNowPlayingCover();
+  const picUrl = cover;
 
   useEffect(() => {
     const root = document.documentElement;
@@ -22,7 +24,8 @@ export function usePlayingCoverBg(): void {
       return;
     }
 
-    const url = qtresCoverUrl(picUrl);
+    // useNowPlayingCover 已产出最终 URL（内嵌封面是 data URL，在线封面已过 qtres 代理）
+    const url = picUrl;
     if (!url) return;
 
     let cancelled = false;

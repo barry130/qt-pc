@@ -275,7 +275,7 @@ export function DailyRecommendPage(): React.JSX.Element {
           {/* 封面（h-44，176px）定义整块 hero 的高度：右侧内容必须塞进这个高度里，
               不能把页头撑得比封面高（用户 2026-10-24：「高度不要超过图片，内容
               全部往右边搭」）。比歌单/专辑页的 144px 大一号 —— 这页右侧信息更多。 */}
-          <div className="h-44 w-44 shrink-0 overflow-hidden rounded-2xl bg-secondary shadow-xl ring-1 ring-border">
+          <div className="h-44 w-44 shrink-0 overflow-hidden rounded-2xl bg-secondary shadow-surface ring-1 ring-border">
             {coverUrl ? (
               <img src={coverUrl} alt="" className="h-full w-full object-cover" loading="lazy" />
             ) : (
@@ -288,7 +288,7 @@ export function DailyRecommendPage(): React.JSX.Element {
           <div className="flex min-w-0 flex-1 flex-col justify-end">
             {/* 元信息与「共 N 首」并成一行：hero 高度由封面定死，右侧每多一行就会
                 把页头撑得比封面高（用户 2026-10-24）。模型名长的时候靠 truncate 收住。 */}
-            <p className="truncate text-[11px] font-medium uppercase tracking-[0.2em] text-muted-foreground">
+            <p className="truncate text-2xs font-medium uppercase tracking-[0.2em] text-muted-foreground">
               {/* 本地模型精选时把模型名也写出来：用户要能看出「这次真的是哪个模型在挑」 */}
               {result
                 ? `${result.date} · ${modeLabel}${result.model ? ` · ${result.model}` : ""} · ${tasteLabel} · ${
@@ -321,13 +321,13 @@ export function DailyRecommendPage(): React.JSX.Element {
               ) : null}
               {result?.styleLanes?.length ? (
                 <div className="flex shrink-0 items-center gap-1.5">
-                  <span className="text-[11px] text-muted-foreground">本期风格</span>
+                  <span className="text-2xs text-muted-foreground">本期风格</span>
                   <ul role="list" aria-label="本期风格" className="flex items-center gap-1.5">
                     {result.styleLanes.map((lane) => (
                       <li
                         key={lane.label}
                         title={`本期歌单里来自「${lane.label}」这条风格线的歌曲数`}
-                        className="whitespace-nowrap rounded-full border border-border px-2 py-0.5 text-[11px] text-muted-foreground"
+                        className="whitespace-nowrap rounded-full border border-border px-2 py-0.5 text-2xs text-muted-foreground"
                       >
                         {`${lane.label} ${lane.count}`}
                       </li>

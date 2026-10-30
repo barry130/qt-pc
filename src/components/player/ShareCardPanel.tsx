@@ -330,7 +330,7 @@ export function ShareCardPanel(props: { track: Track }): React.JSX.Element {
 
   return (
     <div className="w-[318px] max-w-[80vw]">
-      <div className="mb-2 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+      <div className="mb-2 flex items-center gap-1.5 text-2xs text-muted-foreground">
         <Share2 className="h-3 w-3" />
         <span className="min-w-0 flex-1 truncate">分享「{props.track.title}」</span>
       </div>
@@ -363,11 +363,11 @@ export function ShareCardPanel(props: { track: Track }): React.JSX.Element {
         <canvas ref={canvasRef} className="h-auto w-[220px] rounded-lg" data-drawn={coverReady ? "1" : "0"} />
       </div>
       {!coverReady ? (
-        <div className="mt-1 text-center text-[11px] text-muted-foreground">封面加载中…</div>
+        <div className="mt-1 text-center text-2xs text-muted-foreground">封面加载中…</div>
       ) : null}
 
       {hint ? (
-        <div className="mt-2 rounded-md bg-destructive/10 px-2 py-1.5 text-[11px] text-destructive">
+        <div className="mt-2 rounded-md bg-destructive/10 px-2 py-1.5 text-2xs text-destructive">
           {hint}
         </div>
       ) : null}
@@ -406,7 +406,7 @@ export function ShareCardPanel(props: { track: Track }): React.JSX.Element {
           保存为图片
         </button>
       </div>
-      <div className="mt-1.5 text-center text-[10px] text-muted-foreground">
+      <div className="mt-1.5 text-center text-3xs text-muted-foreground">
         复制后可直接粘贴到聊天窗口
       </div>
     </div>

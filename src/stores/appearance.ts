@@ -32,6 +32,8 @@ interface AppearanceStore {
 const RETRY_DELAYS_MS = [1_000, 3_000, 9_000];
 /** 待落库的最新值（重试时写它，永远写"最后一次"而不是中间态） */
 let pendingSave: AppearancePreference | null = null;
+/** 写库串行链（见 flushSave）：保证同一时刻只有一趟 setAppearance 在飞 */
+let saveChain: Promise<void> = Promise.resolve();
 let retryTimer: number | null = null;
 let retryIndex = 0;
 
@@ -104,7 +106,27 @@ export const useAppearanceStore = create<AppearanceStore>()((set, get) => ({
  * 把 pendingSave 写库；失败则按 RETRY_DELAYS_MS 退避重试，用尽后留下 saveError。
  * 抽成函数是为了让 update / retrySave / 定时器三条路径共用同一套语义。
  */
-async function flushSave(
+function flushSave(
+  set: (partial: Partial<AppearanceStore>) => void,
+  get: () => AppearanceStore,
+): Promise<void> {
+  // 串行化：并发的 `setAppearance` 会互相超车——先发出的旧 payload 可能后落地，
+  // 把用户刚改的最新值又覆盖回去（P1 缺陷，2026-10-29 修）。排成一条链之后，
+  // 「最后一次改动的 payload 最后写库」与用户操作顺序一致。
+  // 失败分支不复用链上的 reject：一条写失败不该让后续写入全部短路。
+  saveChain = saveChain.then(
+    () => doFlushSave(set, get),
+    () => doFlushSave(set, get),
+  );
+  return saveChain;
+}
+
+/**
+ * 真正写库的那一趟（串行链里的单次任务）。失败按 RETRY_DELAYS_MS 退避重试，
+ * 用尽后留下 saveError。抽出来是为了让 update / retrySave / 定时器三条路径
+ * 共用同一套语义，同时把「排队」与「写入」分开。
+ */
+async function doFlushSave(
   set: (partial: Partial<AppearanceStore>) => void,
   get: () => AppearanceStore,
 ): Promise<void> {

@@ -375,3 +375,58 @@ fn is_under_dir(path: &str, dir: &str) -> bool {
             .strip_prefix(&dir)
             .is_some_and(|rest| rest.starts_with('/'))
 }
+
+/// 本地优先播放（DESIGN §7.13）候选池：本地曲库按元数据预筛。
+///
+/// K2 严格匹配（标题+歌手+时长）在 `local_first::matcher` 里做，这里只负责
+/// 把候选集压小：时长已知（>0）按时长窗口 ±4s 预筛（比匹配器的 ±3s 略宽，
+/// 给归一化误差留余量）；时长未知按**精确标题**兜底（LIKE 会把误配放大，
+/// 宁可错过不能错放）。CUE 子轨（cue_path 非空）永远排除：替身链只接受
+/// 完整文件，子轨的起止偏移属于另一个父文件，匹配上了也放不对位。
+///
+/// 这是 ⑤「在线歌先看本地曲库」与替身池 A 共用的同一个入口。
+pub fn local_candidates_by_meta(
+    conn: &Connection,
+    want_title: &str,
+    duration_ms: i64,
+) -> Result<Vec<Track>, rusqlite::Error> {
+    let (sql, params): (&str, Vec<&dyn rusqlite::ToSql>) = if duration_ms > 0 {
+        (
+            "SELECT id, title, singer, album, duration_ms, music_id, start_ms, end_ms
+               FROM tracks
+              WHERE platform = 'local' AND missing = 0 AND cue_path IS NULL
+                AND duration_ms BETWEEN ?1 - 4000 AND ?1 + 4000",
+            vec![&duration_ms],
+        )
+    } else {
+        (
+            "SELECT id, title, singer, album, duration_ms, music_id, start_ms, end_ms
+               FROM tracks
+              WHERE platform = 'local' AND missing = 0 AND cue_path IS NULL AND title = ?1",
+            vec![&want_title],
+        )
+    };
+    let mut stmt = conn.prepare(sql)?;
+    let mut rows = stmt.query(params.as_slice())?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let db_id: String = row.get(0)?;
+        out.push(Track {
+            id: strip_local_prefix(&db_id),
+            platform: SourceId::local(),
+            title: row.get(1)?,
+            singer: row.get(2)?,
+            album: row.get(3)?,
+            pic_url: String::new(),
+            duration: row.get::<_, Option<i64>>(4)?.unwrap_or(0) as f64 / 1000.0,
+            music_id: row.get(5)?,
+            start_ms: row
+                .get::<_, Option<i64>>(6)?
+                .and_then(|v| u64::try_from(v).ok()),
+            end_ms: row
+                .get::<_, Option<i64>>(7)?
+                .and_then(|v| u64::try_from(v).ok()),
+        });
+    }
+    Ok(out)
+}

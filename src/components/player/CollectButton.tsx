@@ -75,7 +75,7 @@ export function CollectButton(props: { track: Track | null }): React.JSX.Element
             track={track}
             onLikedChange={setLiked}
             onClose={() => setOpen(false)}
-            className="absolute bottom-full left-1/2 z-30 mb-2 w-56 -translate-x-1/2 rounded-xl border border-border bg-popover/95 p-1 text-popover-foreground shadow-2xl backdrop-blur-xl"
+            className="absolute bottom-full left-1/2 z-30 mb-2 w-56 -translate-x-1/2 rounded-xl border border-border bg-popover/95 p-1 text-popover-foreground shadow-raised backdrop-blur-xl"
           />
         ) : null
       }

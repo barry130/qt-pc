@@ -58,3 +58,10 @@ pub const SETTING_DAILY_RECOMMEND_CACHE: &str = "dailyRecommend.cache";
 /// 每日推荐口味（推荐策略）：`heart` 心动 / `familiar` 常听 / `explore` 探索。
 /// 与 [`SETTING_DAILY_RECOMMEND_MODE`] 正交：mode 决定要不要叫模型，taste 决定怎么搜怎么排。
 pub const SETTING_DAILY_RECOMMEND_TASTE: &str = "dailyRecommend.taste";
+
+/// 本地优先播放（DESIGN §7.13）总开关：`true`（默认，含键不存在）/ `false`。
+/// 开：在线歌先走「账本 → 已完成任务 → 孤儿索引 → 本地曲库」找文件，命中即
+/// 离线播；本地歌打不开走替身链（曲库 → 账本/孤儿 → 在线搜索）。
+/// 关：完全回到在线取链（连老的「已下载文件离线播」一起关，用户要的就是
+/// 在线高音质时不能被本地文件截和）。
+pub const SETTING_PLAY_LOCAL_FIRST: &str = "play.localFirst";

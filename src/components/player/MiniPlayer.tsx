@@ -17,7 +17,8 @@ import { usePlayerStore } from "@/stores/player";
 import { usePlaybackEvents } from "@/hooks/usePlaybackEvents";
 import { useInterpolatedPosition } from "@/hooks/useInterpolatedPosition";
 import { useAppearanceEffect } from "@/hooks/useAppearanceEffect";
-import { formatTime, qtresCoverUrl } from "@/lib/lrc";
+import { formatTime } from "@/lib/lrc";
+import { useNowPlayingCover } from "@/hooks/useNowPlayingLocalMedia";
 import { toggleMiniPlayer } from "@/services/ipc";
 import { cn } from "@/lib/utils";
 import { log } from "@/lib/logger";
@@ -62,7 +63,8 @@ export function MiniPlayer(): React.JSX.Element {
 
   const playing = status === "playing";
   const loading = status === "loading" || status === "buffering";
-  const cover = track ? qtresCoverUrl(track.picUrl) : null;
+  // 在播封面：内嵌优先、在线兜底（本地优先命中时播的是磁盘文件）
+  const cover = useNowPlayingCover();
   const ratio =
     durationMs > 0 ? Math.min(1, Math.max(0, position / durationMs)) : 0;
 
@@ -133,7 +135,7 @@ export function MiniPlayer(): React.JSX.Element {
   );
 
   return (
-    <div className="flex h-screen w-screen flex-col overflow-hidden rounded-xl border border-border/60 bg-card text-foreground shadow-lg">
+    <div className="flex h-screen w-screen flex-col overflow-hidden rounded-xl border border-border/60 bg-card text-foreground shadow-raised">
       {/* 条状主区：封面 / 歌名歌手 / 基础控制 */}
       <div
         onPointerDown={startDrag}
@@ -162,11 +164,11 @@ export function MiniPlayer(): React.JSX.Element {
           >
             <div className="h-1 flex-1 overflow-hidden rounded-full bg-secondary">
               <div
-                className="h-full rounded-full bg-primary transition-[width] duration-150"
+                className="h-full rounded-full bg-primary transition-[width] duration-fast"
                 style={{ width: `${ratio * 100}%` }}
               />
             </div>
-            <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
+            <span className="shrink-0 text-3xs tabular-nums text-muted-foreground">
               {formatTime(position)} / {formatTime(durationMs)}
             </span>
           </div>

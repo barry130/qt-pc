@@ -50,7 +50,7 @@ export function FirstRunDisclaimer(): React.JSX.Element | null {
         role="dialog"
         aria-modal="true"
         aria-label={notice.title || "使用前请先阅读"}
-        className="flex max-h-[85vh] w-[32rem] max-w-[92vw] flex-col rounded-2xl border border-white/20 bg-white/70 p-5 text-card-foreground shadow-2xl backdrop-blur-xl dark:border-white/10 dark:bg-black/40"
+        className="flex max-h-[85vh] w-[32rem] max-w-[92vw] flex-col rounded-2xl border border-white/20 bg-white/70 p-5 text-card-foreground shadow-overlay backdrop-blur-xl dark:border-white/10 dark:bg-black/40"
       >
         <h2 className="text-base font-medium">{notice.title || "使用前请先阅读"}</h2>
         <div className="mt-3 flex-1 overflow-y-auto text-muted-foreground">

@@ -62,7 +62,7 @@ export function SourceUpdatePrompt(): React.JSX.Element | null {
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-      <div className="w-full max-w-sm rounded-xl border border-border bg-card/90 p-4 shadow-lg backdrop-blur-xl">
+      <div className="w-full max-w-sm rounded-xl border border-border bg-card/90 p-4 shadow-raised backdrop-blur-xl">
         <div className="flex items-start gap-3">
           <ArrowDownCircle className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
           <div className="min-w-0 flex-1">
@@ -73,7 +73,7 @@ export function SourceUpdatePrompt(): React.JSX.Element | null {
               {offerLabel(offer)}
               {offer.notes ? `。${offer.notes}` : ""}
             </div>
-            <div className="mt-1 text-[11px] text-muted-foreground/70">
+            <div className="mt-1 text-2xs text-muted-foreground/70">
               共 {offers.length} 条待确认 ·{" "}
               {offer.channel === "manifest" ? "官方通道" : "包自带更新直链"}
             </div>
@@ -88,7 +88,7 @@ export function SourceUpdatePrompt(): React.JSX.Element | null {
           </button>
         </div>
         {error ? (
-          <div className="mt-2 rounded-lg bg-destructive/10 px-3 py-2 text-[11px] leading-relaxed text-destructive">
+          <div className="mt-2 rounded-lg bg-destructive/10 px-3 py-2 text-2xs leading-relaxed text-destructive">
             {error}（已自动回滚到原版本）
           </div>
         ) : null}

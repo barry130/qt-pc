@@ -176,7 +176,7 @@ function NavGroup(props: {
   return (
     <div className="mb-3">
       <div className="mb-1 flex items-center justify-between px-2">
-        <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+        <span className="text-2xs font-medium uppercase tracking-wide text-muted-foreground">
           {props.title}
         </span>
         {props.action}
@@ -206,7 +206,7 @@ function NavLink(props: { item: Item; collapsed: boolean; disabledReason?: strin
         {!collapsed && (
           <>
             <span className="truncate">{item.label}</span>
-            <span aria-hidden className="ml-auto shrink-0 text-[10px]">不可用</span>
+            <span aria-hidden className="ml-auto shrink-0 text-3xs">不可用</span>
           </>
         )}
       </span>

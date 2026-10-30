@@ -98,7 +98,7 @@ function ScrollArrow(props: {
       aria-label={props.side === "left" ? "向左滚动" : "向右滚动"}
       onClick={props.onClick}
       className={cn(
-        "pointer-events-auto absolute top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-full border border-border bg-card/90 text-foreground opacity-0 shadow-md transition-opacity hover:bg-accent group-hover/scroller:opacity-100",
+        "pointer-events-auto absolute top-1/2 flex h-8 w-8 -translate-y-1/2 items-center justify-center rounded-full border border-border bg-card/90 text-foreground opacity-0 shadow-raised transition-opacity hover:bg-accent group-hover/scroller:opacity-100",
         props.side === "left" ? "left-0" : "right-0",
       )}
     >

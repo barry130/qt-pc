@@ -65,7 +65,7 @@ export function MessageBubble(props: {
           )}
 
           {message.streaming && message.content.length > 0 && message.progress.length > 0 ? (
-            <div className="mt-2 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+            <div className="mt-2 flex items-center gap-1.5 text-2xs text-muted-foreground">
               <Loader2 className="h-3 w-3 animate-spin" />
               <span>{message.progress}</span>
             </div>
@@ -87,7 +87,7 @@ export function MessageBubble(props: {
 
           {message.citations.length > 0 ? (
             <div className="mt-3 border-t border-border/70 pt-2">
-              <div className="mb-1 text-[11px] font-medium text-muted-foreground">来源</div>
+              <div className="mb-1 text-2xs font-medium text-muted-foreground">来源</div>
               <div className="flex flex-col gap-1">
                 {message.citations.map((citation, i) => (
                   <CitationRow key={i} index={i + 1} citation={citation} />
@@ -113,7 +113,7 @@ export function MessageBubble(props: {
             />
           ))}
           {status.length > 0 ? (
-            <span className="text-[11px] text-muted-foreground">{status}</span>
+            <span className="text-2xs text-muted-foreground">{status}</span>
           ) : null}
           {props.feedbackEnabled && message.id > 0 && !message.streaming ? (
             <div className="ml-auto flex items-center gap-0.5">
@@ -183,7 +183,7 @@ function ActionButton(props: {
       disabled={!props.enabled}
       title={props.enabled ? label : `${label}（这个入口在电脑端不可用）`}
       className={cn(
-        "rounded-full border border-border bg-background px-2.5 py-1 text-[11px] transition-colors",
+        "rounded-full border border-border bg-background px-2.5 py-1 text-2xs transition-colors",
         props.enabled
           ? "hover:border-primary/50 hover:bg-primary/5 hover:text-primary"
           : "cursor-not-allowed text-muted-foreground/60",
@@ -211,11 +211,11 @@ function BlockView(props: {
           <span className="text-xs font-medium">
             {block.title.length > 0 ? block.title : "推荐歌曲"}
           </span>
-          <span className="text-[11px] text-muted-foreground">{songs.length} 首</span>
+          <span className="text-2xs text-muted-foreground">{songs.length} 首</span>
           <button
             type="button"
             onClick={() => props.onPlayBlock(songs)}
-            className="ml-auto flex items-center gap-1 rounded-full bg-primary px-2.5 py-1 text-[11px] font-medium text-primary-foreground transition-opacity hover:opacity-90"
+            className="ml-auto flex items-center gap-1 rounded-full bg-primary px-2.5 py-1 text-2xs font-medium text-primary-foreground transition-opacity hover:opacity-90"
           >
             <Play className="h-3 w-3 fill-current" />
             播放全部
@@ -272,7 +272,7 @@ function SongRow(props: {
       }}
       className="group flex cursor-pointer items-center gap-2.5 px-2.5 py-1.5 transition-colors hover:bg-secondary/60"
     >
-      <span className="w-4 shrink-0 text-center text-[11px] text-muted-foreground">{props.index}</span>
+      <span className="w-4 shrink-0 text-center text-2xs text-muted-foreground">{props.index}</span>
       {cover !== null ? (
         <img src={cover} alt="" loading="lazy" className="h-8 w-8 shrink-0 rounded object-cover" />
       ) : (
@@ -283,7 +283,7 @@ function SongRow(props: {
           <span className="truncate text-xs font-medium">{track.title}</span>
           <SourceTag platform={track.platform} size="xs" />
         </span>
-        <span className="block truncate text-[11px] text-muted-foreground">
+        <span className="block truncate text-2xs text-muted-foreground">
           {track.singer}
           {track.album.length > 0 ? ` · ${track.album}` : ""}
         </span>
@@ -315,7 +315,7 @@ function SongRow(props: {
               track={track}
               onLikedChange={setLiked}
               onClose={() => setOpen(false)}
-              className="absolute right-0 top-full z-20 mt-1 w-56 rounded-md border border-border bg-popover p-1 shadow-md"
+              className="absolute right-0 top-full z-20 mt-1 w-56 rounded-xl border border-border bg-popover/95 p-1 backdrop-blur-xl shadow-raised"
             />
           )}
         </Popover>
@@ -354,7 +354,7 @@ function SongRow(props: {
         )}
       >
         {(close) => (
-          <div className="absolute right-0 top-full z-20 mt-1 w-32 rounded-md border border-border bg-popover p-1 shadow-md">
+          <div className="absolute right-0 top-full z-20 mt-1 w-32 rounded-xl border border-border bg-popover/95 p-1 backdrop-blur-xl shadow-raised">
             <button
               type="button"
               onClick={(e) => {
@@ -409,21 +409,21 @@ function CitationRow(props: { index: number; citation: AiCitation }): React.JSX.
         onClick={() => setExpanded((v) => !v)}
         className="flex w-full items-start gap-1.5 text-left"
       >
-        <span className="shrink-0 text-[11px] text-muted-foreground">[{index}]</span>
+        <span className="shrink-0 text-2xs text-muted-foreground">[{index}]</span>
         <span className="min-w-0 flex-1">
-          <span className="block truncate text-[11px] font-medium">{citation.title}</span>
+          <span className="block truncate text-2xs font-medium">{citation.title}</span>
           {where.length > 0 ? (
-            <span className="block truncate text-[10px] text-muted-foreground">{where}</span>
+            <span className="block truncate text-3xs text-muted-foreground">{where}</span>
           ) : null}
         </span>
         {citation.matchedText.length > 0 ? (
-          <span className="shrink-0 text-[10px] text-muted-foreground">
+          <span className="shrink-0 text-3xs text-muted-foreground">
             {expanded ? "收起" : "展开"}
           </span>
         ) : null}
       </button>
       {expanded && citation.matchedText.length > 0 ? (
-        <div className="mt-1 border-t border-border/60 pt-1 text-[11px] leading-relaxed text-muted-foreground">
+        <div className="mt-1 border-t border-border/60 pt-1 text-2xs leading-relaxed text-muted-foreground">
           {citation.matchedText}
         </div>
       ) : null}

@@ -158,6 +158,17 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
   const [loading, setLoading] = useState(true);
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [sending, setSending] = useState(false);
+  /**
+   * `sending` 的同步影子。state 要等下一次渲染才生效，而 `send` 在置位之前还要
+   * `await readAiMode()`：连按两次回车（或按钮双击）会两条一起穿过 `if (sending)`
+   * 的检查，发出两遍同样的消息（P1 缺陷，2026-10-29 修）。所有改 sending 的地方
+   * 统一走 `commitSending`，保证 ref 与 state 不脱节。
+   */
+  const sendingRef = useRef(false);
+  const commitSending = useCallback((next: boolean): void => {
+    sendingRef.current = next;
+    setSending(next);
+  }, []);
   const [error, setError] = useState("");
   /** 全局 AI 模式：每次发送前从库里重读，设置页改了不用重进页面 */
   const [mode, setMode] = useState<AiEngineMode>("rule");
@@ -289,7 +300,7 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
   const selectConversation = useCallback(
     async (id: number): Promise<void> => {
       stopPolling();
-      setSending(false);
+      commitSending(false);
       const seq = loadSeq.current + 1;
       loadSeq.current = seq;
       setActiveConversationId(id);
@@ -316,17 +327,17 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
         if (alive.current && loadSeq.current === seq) setLoadingMessages(false);
       }
     },
-    [mode, stopPolling],
+    [commitSending, mode, stopPolling],
   );
 
   /** 新建：只清本地，真正建会话推迟到首次发送（避免堆一串空会话） */
   const newConversation = useCallback((): void => {
     stopPolling();
-    setSending(false);
+    commitSending(false);
     setActiveConversationId(0);
     setMessages([]);
     setError("");
-  }, [stopPolling]);
+  }, [commitSending, stopPolling]);
 
   const removeConversation = useCallback(
     async (id: number): Promise<void> => {
@@ -416,7 +427,7 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
    */
   const sendLocal = useCallback(
     async (localMode: LocalAssistantMode, text: string): Promise<void> => {
-      setSending(true);
+      commitSending(true);
       setError("");
       const seq = localSeq.current + 1;
       localSeq.current = seq;
@@ -501,10 +512,10 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
           content: m.content.length > 0 ? m.content : `出错了：${message}`,
         }));
       } finally {
-        if (alive.current && localSeq.current === seq) setSending(false);
+        if (alive.current && localSeq.current === seq) commitSending(false);
       }
     },
-    [patch, prepareCandidates],
+    [commitSending, patch, prepareCandidates],
   );
 
   /** 组装上下文：只放后端白名单里的键，放了别的会被 `sanitizeContext` 丢掉 */
@@ -682,7 +693,7 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
             error: "等待超时，请稍后重试",
           }));
           finalize(uid, "FAILED");
-          setSending(false);
+          commitSending(false);
           return;
         }
         try {
@@ -695,7 +706,7 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
           }
           if (batch.terminal) {
             finalize(uid, batch.status);
-            setSending(false);
+            commitSending(false);
             // 终态后回读落库消息：万一终态事件没读到，本地还是半截 JSON
             void reconcile(conversationId, assistantMessageId, uid).then(() => loadConversations());
             return;
@@ -710,27 +721,43 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
       };
       void tick();
     },
-    [applyEvent, finalize, loadConversations, patch, reconcile, stopPolling],
+    [applyEvent, commitSending, finalize, loadConversations, patch, reconcile, stopPolling],
   );
 
   const send = useCallback(
     async (content: string): Promise<void> => {
       const text = content.trim();
-      if (text.length === 0 || sending) return;
+      // 用同步 ref 判重：`sending` state 在这一刻可能还是 false（上一条刚发出、
+      // 渲染尚未提交），光看 state 挡不住连击。
+      if (text.length === 0 || sendingRef.current) return;
       if (text.length > AI_MESSAGE_MAX_CHARS) {
         setError(`消息太长了（上限 ${AI_MESSAGE_MAX_CHARS} 字），请分几次说`);
         return;
       }
+      // 立刻落闩：下面 `await readAiMode()` 期间第二次回车会直接返回。
+      // 复位由 sendLocal 的 finally / 服务端分支的 catch / stop 统一负责。
+      sendingRef.current = true;
       // 设置页可能刚改过模式：每次发送都以库里的值为准，用户不用重进页面。
       // 但「服务端 AI」是管理员专属，非管理员一律降级成纯规则（本地回合）。
-      const currentMode = resolveAiMode(await readAiMode(), canUseServer);
-      if (!alive.current) return;
+      let currentMode: AiEngineMode;
+      try {
+        currentMode = resolveAiMode(await readAiMode(), canUseServer);
+      } catch (err) {
+        // 读设置失败不能让门闩一直锁着：否则之后再点发送全都被静默吞掉。
+        sendingRef.current = false;
+        setError(errMsg(err));
+        return;
+      }
+      if (!alive.current) {
+        sendingRef.current = false;
+        return;
+      }
       setMode(currentMode);
       if (currentMode !== "server") {
         await sendLocal(currentMode, text);
         return;
       }
-      setSending(true);
+      commitSending(true);
       setError("");
       const userMsg = emptyChatMessage("USER", text);
       userMsg.status = "COMPLETED";
@@ -783,7 +810,7 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
           error: message,
           content: m.content.length > 0 ? m.content : `请求失败：${message}`,
         }));
-        setSending(false);
+        commitSending(false);
       }
     },
     [
@@ -791,11 +818,11 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
       agentCode,
       buildContext,
       canUseServer,
+      commitSending,
       loadConversations,
       patch,
       prepareCandidates,
       sendLocal,
-      sending,
       startPolling,
     ],
   );
@@ -811,7 +838,7 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
     stopPolling();
     // 本地回合没有可取消的远端请求：递增序号，在途结果回来时直接丢掉
     localSeq.current += 1;
-    setSending(false);
+    commitSending(false);
     if (streaming === undefined) return;
     patch(streaming.uid, (m) => ({
       ...m,
@@ -827,7 +854,7 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
         // 已终态或网络抖动都不影响本地已经停下的状态
       }
     }
-  }, [patch, stopPolling]);
+  }, [commitSending, patch, stopPolling]);
 
   /** 执行播放类动作；回报后端只报真执行了的（不支持的不报，否则采纳率是假的） */
   const runAction = useCallback(

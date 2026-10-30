@@ -371,7 +371,7 @@ export function LibraryPage(): React.JSX.Element {
     <div className="flex h-full min-w-0 flex-col">
       <div className="border-b border-border px-4 py-3">
         <div className="flex items-baseline justify-between">
-          <h1 className="text-base font-medium">
+          <h1 className="text-xl font-bold tracking-tight">
             本地音乐
             {tracks.length > 0 && (
               <span className="ml-2 text-xs font-normal text-muted-foreground">
@@ -654,7 +654,7 @@ export function LibraryPage(): React.JSX.Element {
                 {missing.map((t) => (
                   <li
                     key={t.id}
-                    className="truncate text-[11px] text-muted-foreground"
+                    className="truncate text-2xs text-muted-foreground"
                     title={t.id}
                   >
                     {t.title}

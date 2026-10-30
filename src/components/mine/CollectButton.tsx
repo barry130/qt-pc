@@ -59,7 +59,7 @@ export function CollectButton(props: {
           track={track}
           onLikedChange={setLiked}
           onClose={() => setOpen(false)}
-          className="absolute right-0 top-full z-20 mt-1 w-56 rounded-md border border-border bg-popover p-1 shadow-md"
+          className="absolute right-0 top-full z-20 mt-1 w-56 rounded-xl border border-border bg-popover/95 p-1 backdrop-blur-xl shadow-raised"
         />
       )}
     </Popover>

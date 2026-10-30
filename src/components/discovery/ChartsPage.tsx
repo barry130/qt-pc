@@ -157,7 +157,7 @@ export function ChartsPage(): React.JSX.Element {
   return (
     <div className="flex h-full min-w-0 flex-col">
       <div className="border-b border-border px-4 py-3">
-        <h1 className="text-base font-medium">排行榜</h1>
+        <h1 className="text-xl font-bold tracking-tight">排行榜</h1>
         <p className="mt-0.5 text-xs text-muted-foreground">
           跟随当前音源（{sourceLabel}），点歌名直接播放，点榜单名看全部歌曲
         </p>

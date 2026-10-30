@@ -104,10 +104,18 @@ pnpm config:check    # 只校验（已挂进 pnpm build / pnpm test：手改派�
 
 ## 测试
 
+提交前跑这两条就够（都当门禁用，警告即失败）：
+
 ```bash
-# 前端（Vitest，47 个测试文件）
+pnpm check                                    # 配置一致性 → tsc → 字号/动效令牌 → eslint --max-warnings 0 → vitest
+cd src-tauri && cargo clippy --all-targets -- -D warnings && cargo test --lib
+```
+
+```bash
+# 只跑前端测试（Vitest，47 个测试文件）
 pnpm test
 pnpm typecheck
+pnpm lint                                     # 只跑 eslint（pnpm check 里带 --max-warnings 0）
 
 # Rust 单元测试
 cd src-tauri && cargo test --lib

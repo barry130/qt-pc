@@ -16,7 +16,7 @@ import { usePagedList, type PageResult } from "@/hooks/usePagedList";
 import { TrackList } from "./TrackList";
 import { BatchBar } from "./BatchBar";
 import { TrackSortSelect } from "@/components/TrackSortSelect";
-import { ErrorRetry, TrackRowsSkeleton } from "./Skeletons";
+import { ErrorRetry, ListLoadProgress, TrackRowsSkeleton } from "./Skeletons";
 import { IconButton } from "@/components/common/IconButton";
 
 /**
@@ -32,7 +32,8 @@ const LATEST_PAGE_SIZE = 50;
  * 每日新歌（路由 /daily）。
  *
  * 只展示当前音源的最新歌曲，列表形式（带序号 / 加歌单 / 下载），
- * 滚到底自动续页（usePagedList 的 scroll 模式）。
+ * 进页一次拉全量（usePagedList 的 all 模式；用户 m05614 要求不要滚动续页、
+ * 底部也不要出现「已经到底了」）。
  *
  * ---------------------------------------------------------------------------
  * 原 bug：offset 恒为 0，「翻页」根本不存在
@@ -61,8 +62,8 @@ const LATEST_PAGE_SIZE = 50;
  * ---------------------------------------------------------------------------
  * 怎么修的
  * ---------------------------------------------------------------------------
- * 1. 改用 usePagedList（与 AlbumPage 同款 scroll 模式）：滚到底追加下一页，
- *    按 `platform:id` 去重（上游偶有重复项，去重后列表才不会越翻越重）；
+ * 1. 改用 usePagedList（与 AlbumPage 同款 all 模式，2026-10-30 起进页直接取完
+ *    后续页）：按 `platform:id` 去重（上游偶有重复项，去重后列表才不会越翻越重）；
  * 2. offset 按**记录偏移**算，`(page - 1) * PAGE_SIZE`，与包侧 wyy
  *    （`limit` + `offset` 查询参数）、bili（`pn = floor(offset / size) + 1`）
  *    的口径一致 —— 页码从 1 起、offset 从 0 起，不再混用；
@@ -133,15 +134,7 @@ export function DailyPage(): React.JSX.Element {
     [activeSourceId, canPage],
   );
 
-  const {
-    items: songs,
-    loading,
-    loadingMore,
-    error,
-    hasMore,
-    sentinelRef,
-    reload,
-  } = usePagedList<Track>({
+  const { items: songs, loading, error, finished, reload } = usePagedList<Track>({
     fetchPage,
     keyOf: (t) => `${t.platform}:${t.id}`,
     // canPage/metaGeneration 也进 resetKey：注册表异步到位后翻页口径可能翻转、
@@ -149,7 +142,12 @@ export function DailyPage(): React.JSX.Element {
     // 后续页却按 offset 翻（或反之），条数对不上；卸载包后旧数据一直挂在页上。
     resetKey: `${activeSourceId}:${canPage}:${metaGeneration}`,
     pageSize: LATEST_PAGE_SIZE,
-    mode: "scroll",
+    // 一次拉全量（用户 m05614）：进页即把 offset 往后翻到没新歌为止，
+    // 不再滚到底续页。不支持 offset 的源 fetchPage 第一页就回 hasMore=false。
+    mode: "all",
+    cacheKey: `daily:${activeSourceId}:${canPage}:${metaGeneration}`,
+    // 新歌流越往后越旧，20 页 × 50 = 1000 首足够，再多没有使用价值
+    maxPages: 20,
   });
 
   // 批量管理的已勾选曲目 id 集合（见 BatchBar）
@@ -214,7 +212,7 @@ export function DailyPage(): React.JSX.Element {
             不是被推进来的详情页；标题栏里已经有全局返回。所以这里省掉详情页
             那条 `BackButton` 行，hero 直接从封面 + 信息开始。 */}
         <div className="relative flex gap-5 px-6 pb-6 pt-6">
-          <div className="h-36 w-36 shrink-0 overflow-hidden rounded-2xl bg-secondary shadow-xl ring-1 ring-border">
+          <div className="h-36 w-36 shrink-0 overflow-hidden rounded-2xl bg-secondary shadow-surface ring-1 ring-border">
             {coverUrl ? (
               <img
                 src={coverUrl}
@@ -230,7 +228,7 @@ export function DailyPage(): React.JSX.Element {
           </div>
 
           <div className="flex min-w-0 flex-1 flex-col justify-end pb-1">
-            <p className="text-[11px] font-medium uppercase tracking-[0.2em] text-muted-foreground">
+            <p className="text-2xs font-medium uppercase tracking-[0.2em] text-muted-foreground">
               {sourceLabel}
             </p>
             <h1 className="mt-1 truncate text-2xl font-bold tracking-tight">每日新歌</h1>
@@ -258,8 +256,8 @@ export function DailyPage(): React.JSX.Element {
               （用户口径：批量操作属于页头，不该在列表上方再占一行；与歌单 /
               榜单详情页同位置），排序控件按 m00002 / m00029 的「两个弹窗」
               竖排贴在批量条上方 —— 与 DailyRecommendPage 的右列同构。
-              每日新歌是分页流，全选 / 批量只作用于**当前已加载**的 songs ——
-              继续下拉会追加新页，已勾选的保持不动（见上面收窄勾选的副作用）。
+              每日新歌进页即拉全量，全选 / 批量按 songs 全部曲目算 ——
+              后台补页期间已勾选的保持不动（见上面收窄勾选的副作用）。
               收藏 / 取消收藏都在条子的歌单面板里选（与单曲红心同逻辑），
               这里没有宿主歌单，所以不传 hostPlaylistId。
               `items-end` + `pb-1` 与信息列底线对齐（同详情页）。 */}
@@ -300,15 +298,8 @@ export function DailyPage(): React.JSX.Element {
               showDownload
               selection={{ ids: selected, onToggle: toggleSelect, onChange: setSelected }}
             />
-            {/* 哨兵：进入视口就拉下一页。不支持翻页的源没有下一页，不挂哨兵 */}
-            {hasMore ? <div ref={sentinelRef} className="h-1" /> : null}
-            {/* 页脚只在**真会翻页**的源上出现：不支持翻页的源整页就是全部内容，
-                「不支持翻页」是实现细节，对用户没有可用信息（用户 m02747）。 */}
-            {canPage ? (
-              <div className="py-4 text-center text-xs text-muted-foreground">
-                {loadingMore ? "加载中…" : hasMore ? "继续下拉加载更多" : "已经到底了"}
-              </div>
-            ) : null}
+            {/* 不挂哨兵：整轮拉完前才提示进度，拉到就没有底部文案（用户 m05614） */}
+            <ListLoadProgress finished={finished} count={songs.length} />
           </>
         )}
       </div>

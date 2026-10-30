@@ -32,7 +32,7 @@ export function PlayPackPrompt(): React.JSX.Element | null {
   if (!visible) return null;
   return (
     <div className="fixed bottom-24 left-1/2 z-50 -translate-x-1/2">
-      <div className="flex items-center gap-3 rounded-xl border border-border bg-card/90 px-4 py-3 shadow-lg backdrop-blur-xl">
+      <div className="flex items-center gap-3 rounded-xl border border-border bg-card/90 px-4 py-3 shadow-raised backdrop-blur-xl">
         <PackageOpen className="h-4 w-4 shrink-0 text-primary" />
         <div className="text-xs leading-relaxed text-muted-foreground">
           在线播放需要播放音源包（应用未内置，需自行安装）

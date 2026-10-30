@@ -93,9 +93,14 @@ pub(crate) fn update_download_progress(
     id: &str,
     progress: f64,
 ) -> Result<(), rusqlite::Error> {
+    // 状态守卫：暂停/取消只置取消旗标，后台任务要等下一个 chunk 边界才收工
+    // （最长 CHUNK_TIMEOUT）。这中间任何一次进度写都会把刚落的终态改回
+    // 'downloading'，任务随后以 Stopped 退出、不再写任何东西 → 行卡在
+    // 「下载中 + 冻结进度」，要重启应用才被 mark_stale_downloads_paused 修正
+    // （评审，2026-10-29 修）。
     conn.execute(
         "UPDATE download_tasks SET status = 'downloading', progress = ?1, updated_at = ?2
-          WHERE id = ?3",
+          WHERE id = ?3 AND status IN ('pending', 'queued', 'downloading')",
         params![progress, now_ms(), id],
     )?;
     Ok(())
@@ -120,13 +125,55 @@ pub(crate) fn finish_download_task(
     file_path: &str,
     file_size: i64,
 ) -> Result<(), rusqlite::Error> {
-    conn.execute(
+    let now = now_ms();
+    let updated = conn.execute(
         "UPDATE download_tasks
             SET status = 'done', progress = 1, file_path = ?1, file_size = ?2,
                 part_path = NULL, error = NULL, updated_at = ?3
           WHERE id = ?4",
-        params![file_path, file_size, now_ms(), id],
+        params![file_path, file_size, now, id],
     )?;
+    // 任务行已被用户删掉（下载中点删除）时，这一趟什么都别写：
+    // 否则「刚删掉的下载」会被下面这段回填进 download_files 账本，于是
+    // 文件复活在磁盘上、又回到「已下载」列表里（评审，2026-10-29 修）。
+    if updated == 0 {
+        return Ok(());
+    }
+    // 本地优先账本（§7.13）：下载完成当场把「身份 → 文件」固化进 download_files。
+    // 任务行之后被删（清空下载列表）不影响解析链——这正是账本存在的意义。
+    // 元数据从 tracks 行冗余一份，仅供 K2 元数据级匹配兜底（身份级命中永远优先）。
+    let key: Option<String> = conn
+        .query_row(
+            "SELECT track_id FROM download_tasks WHERE id = ?1",
+            params![id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(key) = key {
+        let meta = conn
+            .query_row(
+                "SELECT title, singer, duration_ms FROM tracks WHERE id = ?1",
+                params![key],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .unwrap_or((None, None, None));
+        upsert_download_file(
+            conn,
+            &key,
+            file_path,
+            meta.0.as_deref().unwrap_or(""),
+            meta.1.as_deref().unwrap_or(""),
+            meta.2.unwrap_or(0),
+            Some(file_size),
+        )?;
+    }
     Ok(())
 }
 
@@ -345,22 +392,6 @@ pub(crate) fn mark_stale_downloads_paused(conn: &Connection) -> Result<usize, ru
     )
 }
 
-/// 离线播放用：该曲目是否有已下载完成且文件路径在库的任务。
-/// 返回文件路径（是否仍存在由调用方确认）。
-pub(crate) fn downloaded_file_for(
-    conn: &Connection,
-    db_track_id: &str,
-) -> Result<Option<String>, rusqlite::Error> {
-    conn.query_row(
-        "SELECT file_path FROM download_tasks
-          WHERE track_id = ?1 AND status = 'done' AND file_path IS NOT NULL
-          ORDER BY updated_at DESC LIMIT 1",
-        params![db_track_id],
-        |r| r.get::<_, String>(0),
-    )
-    .optional()
-}
-
 /// 已下载完成的曲目 db 主键集合（前端给「已下载」打标用）。
 pub(crate) fn downloaded_track_ids(conn: &Connection) -> Result<Vec<String>, rusqlite::Error> {
     let mut stmt = conn.prepare(
@@ -411,4 +442,188 @@ pub(crate) fn delete_download_tasks(
     }
     tx.commit()?;
     Ok(out)
+}
+
+// ---------- 本地优先播放（DESIGN §7.13）：文件账本 / 孤儿索引 ----------
+//
+// 账本（download_files）与孤儿（orphan_files）的表结构见 migrations.rs 的 V19。
+// 写入方与清理时机：
+// - 下载完成 → `upsert_download_file`（记录身份→文件，行删了它还在）；
+// - 删除任务且勾选删文件 / 对账发现文件不在 → `remove_download_file_by_path`；
+// - 启动对账 → `rescue_done_tasks_to_ledger`（V19 前已 done 的存量补进账本）、
+//   `prune_*` 清掉文件已消失的条目、孤儿扫描重建 orphan_files（见 local_first.rs）。
+
+/// 账本/孤儿共用的「本地文件 + 元数据」快照：K2 严格匹配（标题+歌手+时长）
+/// 的输入。只要文件路径 + 元数据；身份键匹配直接在 SQL 里按 key 查（`download_file_for`）。
+#[derive(Debug, Clone)]
+pub(crate) struct MetaFileRow {
+    pub path: String,
+    pub title: String,
+    pub singer: String,
+    pub duration_ms: i64,
+}
+
+/// 下载完成写账本（幂等）：身份 → 文件 + 冗余元数据。
+/// 元数据来自下载时的曲目快照，仅供 K2 元数据级匹配兜底；身份级命中永远优先。
+pub(crate) fn upsert_download_file(
+    conn: &Connection,
+    key: &str,
+    file_path: &str,
+    title: &str,
+    singer: &str,
+    duration_ms: i64,
+    size: Option<i64>,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO download_files (key, file_path, title, singer, duration_ms, size, saved_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(key) DO UPDATE SET
+           file_path = excluded.file_path,
+           title = excluded.title,
+           singer = excluded.singer,
+           duration_ms = excluded.duration_ms,
+           size = excluded.size,
+           saved_at = excluded.saved_at",
+        params![key, file_path, title, singer, duration_ms, size, now_ms()],
+    )?;
+    Ok(())
+}
+
+/// 账本按身份查（只查账本，不含 download_tasks 兜底）。
+pub(crate) fn download_file_for(
+    conn: &Connection,
+    key: &str,
+) -> Result<Option<MetaFileRow>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT file_path, title, singer, duration_ms FROM download_files WHERE key = ?1",
+        params![key],
+        |r| {
+            Ok(MetaFileRow {
+                path: r.get(0)?,
+                title: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                singer: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                duration_ms: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+            })
+        },
+    )
+    .optional()
+}
+
+/// 统一身份级查找：账本优先（任务行删了它还在），再回落 download_tasks
+/// （V19 之前已经下载完成的存量）。返回文件路径，存在性由调用方确认。
+pub(crate) fn local_file_for_track(
+    conn: &Connection,
+    db_track_id: &str,
+) -> Result<Option<MetaFileRow>, rusqlite::Error> {
+    if let Some(row) = download_file_for(conn, db_track_id)? {
+        return Ok(Some(row));
+    }
+    conn.query_row(
+        "SELECT t.file_path, tr.title, tr.singer, tr.duration_ms
+           FROM download_tasks t LEFT JOIN tracks tr ON tr.id = t.track_id
+          WHERE t.track_id = ?1 AND t.status = 'done' AND t.file_path IS NOT NULL
+          ORDER BY t.updated_at DESC LIMIT 1",
+        params![db_track_id],
+        |r| {
+            Ok(MetaFileRow {
+                path: r.get(0)?,
+                title: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                singer: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                duration_ms: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+            })
+        },
+    )
+    .optional()
+}
+
+/// 按文件路径删账本条目（删任务勾删文件 / 对账发现文件没了），返回删掉的行数。
+pub(crate) fn remove_download_file_by_path(
+    conn: &Connection,
+    file_path: &str,
+) -> Result<usize, rusqlite::Error> {
+    conn.execute("DELETE FROM download_files WHERE file_path = ?1", params![file_path])
+}
+
+/// 全量账本（对账清尸体 + K2 元数据级匹配的候选池 B 的一部分）。
+pub(crate) fn all_download_files(conn: &Connection) -> Result<Vec<MetaFileRow>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT file_path, title, singer, duration_ms FROM download_files",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(MetaFileRow {
+                path: r.get(0)?,
+                title: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                singer: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                duration_ms: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+            })
+        })?
+        .filter_map(Result::ok)
+        .collect();
+    Ok(rows)
+}
+
+/// V19 存量救援：把 download_tasks 里已 done 且账本还没有的行补进账本。
+/// 幂等（ON CONFLICT 跳过），返回补写的行数。
+pub(crate) fn rescue_done_tasks_to_ledger(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "INSERT OR IGNORE INTO download_files (key, file_path, title, singer, duration_ms, saved_at)
+         SELECT t.track_id, t.file_path, tr.title, tr.singer, tr.duration_ms, ?1
+           FROM download_tasks t LEFT JOIN tracks tr ON tr.id = t.track_id
+          WHERE t.status = 'done' AND t.file_path IS NOT NULL",
+    )?;
+    let n = stmt.execute(params![now_ms()])?;
+    Ok(n)
+}
+
+/// 孤儿文件入库（对账扫描重建，见 local_first.rs）。
+pub(crate) fn upsert_orphan_file(
+    conn: &Connection,
+    file_path: &str,
+    title: &str,
+    singer: &str,
+    duration_ms: i64,
+    size: Option<i64>,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO orphan_files (file_path, title, singer, duration_ms, size, indexed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(file_path) DO UPDATE SET
+           title = excluded.title,
+           singer = excluded.singer,
+           duration_ms = excluded.duration_ms,
+           size = excluded.size,
+           indexed_at = excluded.indexed_at",
+        params![file_path, title, singer, duration_ms, size, now_ms()],
+    )?;
+    Ok(())
+}
+
+/// 全量孤儿（K2 元数据级匹配的候选池 B 的一部分）。
+pub(crate) fn all_orphan_files(conn: &Connection) -> Result<Vec<MetaFileRow>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT file_path, title, singer, duration_ms FROM orphan_files",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(MetaFileRow {
+                path: r.get(0)?,
+                title: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                singer: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                duration_ms: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+            })
+        })?
+        .filter_map(Result::ok)
+        .collect();
+    Ok(rows)
+}
+
+/// 清空孤儿索引（每次对账全量重建前调用）。
+pub(crate) fn clear_orphan_files(conn: &Connection) -> Result<usize, rusqlite::Error> {
+    conn.execute("DELETE FROM orphan_files", [])
+}
+
+/// 删单条孤儿（解析链发现文件已消失时顺手清尸体，见 local_first.rs）。
+pub(crate) fn remove_orphan_file(conn: &Connection, file_path: &str) -> Result<usize, rusqlite::Error> {
+    conn.execute("DELETE FROM orphan_files WHERE file_path = ?1", params![file_path])
 }

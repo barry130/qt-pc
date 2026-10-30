@@ -97,6 +97,18 @@ interface PlayerStore {
   pendingSeekAt: number;
   /** 播放列表面板是否展开（布局级右侧面板，DESIGN §5.5） */
   queueOpen: boolean;
+  /**
+   * 当前这首**在播本地文件**时，从文件内嵌标签里读出的封面（data URL，无内嵌则为空串）。
+   *
+   * 为什么单独存、不写进 `state.track.picUrl`：`track` 会随「加歌单 / 收藏 / 历史」
+   * 一路 upsert 进 Rust 的 tracks 表（`db::store::upsert_tracks` 直接把 pic_url 落库），
+   * 塞一份 200KB 的 base64 进去就是数据库体积和同步请求体的双重污染。封面只用于
+   * 「当前在播」的展示，所以放在 store 顶层，由 `useNowPlayingLocalMedia` 维护。
+   */
+  embeddedCover: string;
+  /** `embeddedCover` 属于哪首（`platform:id`）：切歌瞬间立即失配，避免上一首的封面闪一帧 */
+  embeddedCoverTrack: string;
+  setEmbeddedCover: (trackKey: string, url: string) => void;
 
   applySnapshot: (s: PlaybackState) => void;
   applyTick: (t: PositionChanged) => void;
@@ -177,6 +189,13 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
   positionAnchorMs: 0,
   positionAnchorValue: 0,
   isDraggingProgress: false,
+  embeddedCover: "",
+  embeddedCoverTrack: "",
+  setEmbeddedCover: (trackKey, url) => {
+    const cur = get();
+    if (cur.embeddedCover === url && cur.embeddedCoverTrack === trackKey) return;
+    set({ embeddedCover: url, embeddedCoverTrack: trackKey });
+  },
   pendingSeekMs: null,
   pendingSeekAt: 0,
   queueOpen: false,
@@ -201,13 +220,17 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
     // 忽略这次快照。真有切歌引擎随后会推带曲目的事件，
     // 而一个"空快照"会把播放条打回「未在播放」而音频其实在响。
     if (cur?.track && !incoming.track) {
-      // 但播完/换曲是真实的结束信号：乐观 seek 标记必须作废，
-      // 否则（停止后不再有 tick）进度条会永远停在被拖到的目标位置。
       const ended =
         incoming.status === "stopped" ||
         (cur.trackId ?? null) !== (incoming.trackId ?? null);
+      // 真结束（停止 / 换曲 / 清空队列）必须照单全收：以前这里无条件 return，
+      // 「清空队列」后引擎只推一条不带曲目的 stopped 快照，被吞掉 → 播放条继续
+      // 显示上一首、进度条还在走，用户以为还在播（P0 缺陷，2026-10-29 修）。
+      // 只有「自称还在 playing、trackId 也没变、却不带曲目」这种自相矛盾的负载
+      // 才当成心跳竞态吞掉。
+      const contradictory = incoming.status === "playing" && !ended;
       if (ended && get().pendingSeekMs !== null) set({ pendingSeekMs: null });
-      return;
+      if (contradictory) return;
     }
 
     // 乐观 seek 尚未确认时：切歌作废标记；同曲的陈旧快照保留乐观位置，
@@ -272,12 +295,18 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
     });
   },
 
-  applyQueue: (q) =>
-    set({
-      // 队列事件缺 tracks 时保持旧值，别让渲染端 findIndex 撞上 undefined
-      queue: Array.isArray(q?.tracks) ? q.tracks : get().queue,
-      queueIndex: q?.index ?? get().queueIndex,
-    }),
+  applyQueue: (q) => {
+    const next: Partial<PlayerStore> = {};
+    // 队列事件缺 tracks 时保持旧值，别让渲染端 findIndex 撞上 undefined
+    if (Array.isArray(q?.tracks)) next.queue = q.tracks;
+    // index 允许显式 null（清空队列 / 当前没有曲目）——写成 `q?.index ?? get().queueIndex`
+    // 会把 null 当成「字段缺席」，于是清空后 queueIndex 残留旧下标，高亮与
+    // 上一首/下一首都指向不存在的行（P1 缺陷）。只有字段真的缺席才保持旧值。
+    if (q != null && Object.prototype.hasOwnProperty.call(q, "index")) {
+      next.queueIndex = q.index ?? null;
+    }
+    set(next);
+  },
 
   setDragging: (d) => set({ isDraggingProgress: d }),
 
@@ -345,7 +374,9 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
     const gen = ++playActionSeq;
     const st = get().state;
     const { queue, queueIndex } = get();
-    if (st && queue.length > 0 && queueIndex !== null) {
+    // 随机模式下「上一首」由引擎自己掷骰子，并不等于队列里前一行；预先解析
+    // 前一行会白拉一次 URL，还可能把解析结果错配给真正要播的歌（P1 缺陷）。
+    if (st && st.playMode !== "random" && queue.length > 0 && queueIndex !== null) {
       const prevIndex = (queueIndex - 1 + queue.length) % queue.length;
       await preResolvePlayUrl(queue[prevIndex]);
       if (gen !== playActionSeq) return;

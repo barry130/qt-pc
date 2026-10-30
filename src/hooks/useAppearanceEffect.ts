@@ -155,7 +155,7 @@ export function useAppearanceEffect(): void {
   useEffect(() => {
     const root = document.documentElement;
     const scale = Math.min(1.25, Math.max(0.85, fontScale || 1));
-    root.style.transition = reduceMotion ? "" : "font-size 120ms ease-out";
+    root.style.transition = reduceMotion ? "" : "font-size 120ms ease-soft";
     const raf = requestAnimationFrame(() => {
       root.style.fontSize = `${16 * scale}px`;
     });

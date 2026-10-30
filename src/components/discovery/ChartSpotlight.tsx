@@ -110,7 +110,7 @@ export function ChartSpotlightCard(props: {
   const isPrograms = chart.contentType === "programs";
 
   return (
-    <div className="group flex flex-col rounded-xl border border-border bg-card/60 p-4 transition-shadow duration-200 hover:shadow-lg">
+    <div className="group flex flex-col rounded-xl border border-border bg-card/60 p-4 transition-shadow duration-base hover:shadow-raised">
       {/* 整条标题行都是「进榜单详情」的命中区：只让标题那几个字可点太小，右侧的
           「共 N 首」看着也是这一条的一部分，点它没反应就是坏的。
           所以整行做成一个按钮、标题退成 span —— 按钮里不能再套按钮。
@@ -141,7 +141,7 @@ export function ChartSpotlightCard(props: {
             aria-hidden
             className="pointer-events-none absolute inset-0 -translate-x-0.5 translate-y-0.5 rounded-lg bg-border/80"
           />
-          <div className="group/cover relative h-full w-full overflow-hidden rounded-lg shadow-md">
+          <div className="group/cover relative h-full w-full overflow-hidden rounded-lg shadow-surface">
             <button
               type="button"
               onClick={onOpen}
@@ -170,7 +170,7 @@ export function ChartSpotlightCard(props: {
               type="button"
               onClick={isPrograms ? onOpen : onPlayAll}
               aria-label={isPrograms ? `浏览榜单节目 ${chart.name}` : `播放榜单 ${chart.name}`}
-              className="absolute inset-0 flex items-center justify-center bg-black/40 opacity-0 transition-opacity duration-200 group-hover/cover:opacity-100"
+              className="absolute inset-0 flex items-center justify-center bg-black/40 opacity-0 transition-opacity duration-base group-hover/cover:opacity-100"
             >
               <span className="flex h-8 w-8 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg">
                 {isPrograms ? <Headphones className="h-4 w-4" /> : <Play className="h-4 w-4 fill-current" />}

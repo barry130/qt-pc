@@ -34,26 +34,9 @@ vi.mock("@/services/ipc", () => ({
 }));
 
 import { AlbumPage } from "@/components/discovery/AlbumPage";
+import { clearPagedAllJobs } from "@/lib/paged-all";
 import { usePlayerStore } from "@/stores/player";
 import { useSourceRegistryStore } from "@/stores/sourceRegistry";
-
-class FakeIO {
-  static instances: FakeIO[] = [];
-  private target: Element | null = null;
-  private disconnected = false;
-  private callback: (entries: IntersectionObserverEntry[]) => void;
-
-  constructor(callback: (entries: IntersectionObserverEntry[]) => void) {
-    this.callback = callback;
-    FakeIO.instances.push(this);
-  }
-  observe(target: Element): void { this.target = target; }
-  disconnect(): void { this.disconnected = true; }
-  trigger(): void {
-    if (this.disconnected || !this.target?.isConnected) return;
-    this.callback([{ isIntersecting: true, target: this.target } as IntersectionObserverEntry]);
-  }
-}
 
 function track(id: string, title: string, album = "Album", singer = "Singer", platform: SourceId = "qq"): Track {
   return { id, title, album, singer, platform, picUrl: "", duration: 180, musicId: null };
@@ -70,12 +53,6 @@ function seedPageSize(size: number): void {
 function search(): HTMLInputElement {
   return screen.getByRole("searchbox", { name: "专辑内搜索" });
 }
-async function scrollToBottom(): Promise<void> {
-  const observer = FakeIO.instances.at(-1);
-  expect(observer).toBeDefined();
-  await act(async () => { observer!.trigger(); });
-}
-
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.searchMusic.mockReset().mockResolvedValue(songs);
@@ -83,11 +60,10 @@ beforeEach(() => {
   mocks.route = { platform: "qq", id: "Album" };
   usePlayerStore.setState({ playQueue: mocks.playQueue });
   seedPageSize(10);
-  FakeIO.instances = [];
-  vi.stubGlobal("IntersectionObserver", FakeIO);
+  // all 模式的任务按 cacheKey 缓存在模块上（卸载也继续跑）：不清就会拿上一条用例的全量
+  clearPagedAllJobs();
 });
 afterEach(() => {
-  vi.unstubAllGlobals();
   useSourceRegistryStore.setState({ sources: [], qualities: [], ready: false });
 });
 
@@ -136,7 +112,7 @@ describe("专辑内搜索", () => {
     expect((screen.getByLabelText("选择 Beta") as HTMLInputElement).checked).toBe(false);
   });
 
-  it("无匹配时仍能跨过专辑过滤为空的满页续载，追加结果不会自动选中", async () => {
+  it("无匹配时仍会跨过专辑过滤为空的满页继续取完，追加结果不会自动选中", async () => {
     seedPageSize(2);
     mocks.searchMusic.mockImplementation(async (_name: string, _source: SourceId, page: number) => {
       if (page === 1) return [songs[0], track("other-1", "无关一", "Other")];
@@ -146,23 +122,22 @@ describe("专辑内搜索", () => {
     render(<AlbumPage />);
     await screen.findByText("Alpha");
     expect(mocks.searchMusic).toHaveBeenCalledWith("Album", "qq", 1, 2);
-    fireEvent.click(screen.getByLabelText("全选"));
-    fireEvent.change(search(), { target: { value: "beta" } });
-    expect(screen.getByText("显示 0 / 1 首")).toBeTruthy();
-    await scrollToBottom();
-    await waitFor(() => expect(mocks.searchMusic).toHaveBeenCalledWith("Album", "qq", 2, 2));
-    expect(screen.getByText(/没有匹配的歌曲/)).toBeTruthy();
-    expect(screen.getByText("继续下拉加载更多")).toBeTruthy();
-    await scrollToBottom();
+    // 一次性加载（用户 m05614）：第 2 页被专辑过滤裁成 0 条也要继续拉，
+    // 第 3 页的 Beta 不需滚动就自动到手
     await screen.findByText("Beta");
-    expect(screen.queryByText("Alpha")).toBeNull();
-    expect(screen.getByText("显示 1 / 2 首")).toBeTruthy();
+    expect(mocks.searchMusic).toHaveBeenCalledWith("Album", "qq", 3, 2);
+    // 自动追加进来的行不会被顺手勾选（勾选永远只来自用户动作）
     expect(screen.getByText("已选 0 首")).toBeTruthy();
     expect((screen.getByLabelText("选择 Beta") as HTMLInputElement).checked).toBe(false);
+    fireEvent.click(screen.getByLabelText("全选"));
+    fireEvent.change(search(), { target: { value: "beta" } });
+    expect(screen.queryByText("Alpha")).toBeNull();
+    expect(screen.getByText("显示 1 / 2 首")).toBeTruthy();
+    // 被专辑内搜索隐藏的行同时退出批量范围
+    expect(screen.getByText("已选 1 首")).toBeTruthy();
     fireEvent.click(screen.getByLabelText("播放全部"));
     expect(mocks.playQueue).toHaveBeenCalledWith([songs[1]], 0);
-    expect(screen.getByText("已经到底了")).toBeTruthy();
-    expect(mocks.searchMusic).toHaveBeenCalledTimes(3);
+    expect(screen.queryByText("已经到底了")).toBeNull();
   });
 
   it("首屏无同名专辑时沿用搜索回退，后续页不改成仅保留同名专辑", async () => {
@@ -171,7 +146,7 @@ describe("专辑内搜索", () => {
     mocks.searchMusic.mockResolvedValueOnce(fallback).mockResolvedValueOnce([songs[1]]);
     render(<AlbumPage />);
     await screen.findByText("Fallback A");
-    await scrollToBottom();
+    // 后续页自动取完，回退列表与命中项并进同一条列表
     await screen.findByText("Beta");
     expect(screen.getByText("Fallback A")).toBeTruthy();
     expect(screen.getByText("3 首歌曲")).toBeTruthy();
@@ -219,13 +194,11 @@ describe("专辑内搜索", () => {
     expect(mocks.searchMusic).not.toHaveBeenCalled();
     // 页头用上游真名，而不是那串 id
     expect(screen.getByRole("heading", { name: "真专辑名" })).toBeTruthy();
-    expect(screen.getByText("2 首歌曲（继续下拉加载更多）")).toBeTruthy();
-    await scrollToBottom();
+    // 全量已到手，本地切页；一次性加载把 3 首直接铺满，页头不留续页提示
     await screen.findByText("Gamma");
-    // 全量已到手，本地切页，不再打源站
     expect(mocks.getAlbumDetail).toHaveBeenCalledTimes(1);
     expect(screen.getByText("3 首歌曲")).toBeTruthy();
-    expect(screen.getByText("已经到底了")).toBeTruthy();
+    expect(screen.queryByText("已经到底了")).toBeNull();
   });
 
   it("专辑 id 取不到时静默退回名字搜索", async () => {

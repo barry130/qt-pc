@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ChevronDown } from "lucide-react";
-import { errMsg } from "@/lib/utils";
 import { formatPlayCount } from "@/lib/format";
 import { useNavigate } from "@tanstack/react-router";
 import type { Playlist, PlaylistCategory } from "@/types";
@@ -9,16 +8,25 @@ import { useMusicSourceStore } from "@/stores/musicSource";
 import { usePlaylistSorts, useSourceRegistryStore } from "@/stores/sourceRegistry";
 import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 import { CoverCard, CoverGrid } from "./CoverCard";
+import { CoverGridSkeleton, ErrorRetry, ListLoadProgress } from "./Skeletons";
+import { usePagedList, type PageResult } from "@/hooks/usePagedList";
 
 /**
  * 歌单广场（路由 /playlists，DESIGN §5.2）。
  * 分类来自当前音源（wyy/qq/kw/kg 各有自己的分类体系），切换音源重新拉分类。
  * 移动端同款行为：分类取不到时降级为「全部」，不阻断歌单列表。
  *
- * 列表是**下拉加载**（滚到底自动追加下一页），不再手动翻页。
- * 已知降级：qq 等音源的分页参数不生效，会重复返回同一批，所以追加时按 id 去重；
- * 一页全是被去重掉的旧数据也没关系，最多是提前认为到底。
+ * 列表**一次拉全量**（usePagedList 的 all 模式，用户 m05614：不要滚动续页、
+ * 底部不要「已经到底了」）：进页就把所有页并发取完，底部只在没拉完时提示进度。
+ * 已知降级：qq 等音源的分页参数不生效，会重复返回同一批，所以按 id 去重；
+ * 一整批都是重复项时提前收尾，不会顺着满页判断空转到上限。
  */
+
+/**
+ * 歌单广场每页条数：包侧 recommendations 不接收条数参数，各家都是 30 条一页。
+ * all 模式里 hasMore 是显式给的，这个值只用于任务内部的满页判断。
+ */
+const PLAYLIST_PAGE_SIZE = 30;
 export function PlaylistsPage(): React.JSX.Element {
   const navigate = useNavigate();
   const activeSourceId = useMusicSourceStore((s) => s.activeSourceId);
@@ -31,20 +39,12 @@ export function PlaylistsPage(): React.JSX.Element {
   const [categories, setCategories] = useState<PlaylistCategory[]>([]);
   const [category, setCategory] = useState<string | null>(null);
   const [sort, setSort] = useState("");
-  const [page, setPage] = useState(1);
-  const [items, setItems] = useState<Playlist[]>([]);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [hasMore, setHasMore] = useState(true);
 
   // 音源切换 / 数据包变化 → 重取分类并回到「全部」第一页
   useEffect(() => {
     let cancelled = false;
     setCategories([]);
     setCategory(null);
-    setPage(1);
-    setItems([]);
-    setHasMore(true);
     void (async () => {
       try {
         const cats = await sourceApi.getPlaylistCategories(activeSourceId);
@@ -59,94 +59,55 @@ export function PlaylistsPage(): React.JSX.Element {
   }, [activeSourceId, metaGeneration]);
 
   // 排序随源声明变化（切源/换包后）：当前排序不在声明里就回退到第一项。
-  // 回退本身也要重置分页与已加载列表（#36）：否则新排序的第一页会被
-  // append 到旧排序的列表后面，出现两种排序混排。
   useEffect(() => {
-    if (sorts.length > 0 && !sorts.some((s) => s.id === sort)) {
-      setSort(sorts[0]!.id);
-      setPage(1);
-      setItems([]);
-      setHasMore(true);
-    }
-    if (sorts.length === 0 && sort !== "") {
-      setSort("");
-      setPage(1);
-      setItems([]);
-      setHasMore(true);
-    }
+    // 排序不在声明里就回退到第一项。切排序不用手工清列表：resetKey 里有 sort，
+    // key 一变 usePagedList 在同一帧归位重拉（#36 的两种排序混排由它保证）。
+    if (sorts.length > 0 && !sorts.some((s) => s.id === sort)) setSort(sorts[0]!.id);
+    if (sorts.length === 0 && sort !== "") setSort("");
   }, [sorts, sort]);
 
-  const load = useCallback(
-    async (cat: string | null, p: number): Promise<void> => {
-      setLoading(true);
-      setError(null);
-      try {
-        const list = await sourceApi.getRecommendations(activeSourceId, cat, p, sort);
-        const arr = Array.isArray(list) ? list : [];
-        setItems((prev) => {
-          if (p <= 1) return arr;
-          const seen = new Set(prev.map((x) => `${x.platform}:${x.id}`));
-          return [
-            ...prev,
-            ...arr.filter((x) => !seen.has(`${x.platform}:${x.id}`)),
-          ];
-        });
-        // 空页 = 到底了
-        if (arr.length === 0) setHasMore(false);
-      } catch (err) {
-        if (p <= 1) setItems([]);
-        setError(errMsg(err));
-      } finally {
-        setLoading(false);
-      }
+  /**
+   * 取第 page 页。hasMore 显式给出：包侧 recommendations 基本不回总数，
+   * 返回空页才是到底；重复页由 paged-all 的「一整批没有新增」兜住。
+   */
+  const fetchPage = useCallback(
+    async (page: number): Promise<PageResult<Playlist>> => {
+      const list = await sourceApi.getRecommendations(activeSourceId, category, page, sort);
+      const arr = Array.isArray(list) ? list : [];
+      return { list: arr, hasMore: arr.length > 0 };
     },
-    [activeSourceId, sort],
+    [activeSourceId, category, sort],
   );
 
-  useEffect(() => {
-    void load(category, page);
-  }, [category, page, load]);
-
-  // 滚到底自动加载下一页。loading 用 ref 读，避免 observer 被反复重建。
-  const sentinel = useRef<HTMLDivElement | null>(null);
-  const loadingRef = useRef(false);
-  loadingRef.current = loading;
-
-  useEffect(() => {
-    const el = sentinel.current;
-    if (!el || !hasMore) return;
-    const io = new IntersectionObserver(
-      (entries) => {
-        if (entries[0]?.isIntersecting && !loadingRef.current) {
-          setPage((p) => p + 1);
-        }
-      },
-      // 提前一屏触发，滚到底时通常已经加载好了
-      { rootMargin: "240px" },
-    );
-    io.observe(el);
-    return () => io.disconnect();
-  }, [hasMore, items.length]);
+  // 一次拉全量：并发把所有页取完，不再自己维护 page/items/hasMore 和观察器。
+  const { items, loading, error, finished, reload } = usePagedList<Playlist>({
+    fetchPage,
+    // 按 id 去重，替代原先 load() 里的手工 seen 集合
+    keyOf: (p) => `${p.platform}:${p.id}`,
+    // 音源 / 分类 / 排序 / 数据包世代变化都要整轮重拉（替代原先逐处 setPage+清空）
+    resetKey: `${activeSourceId}:${category ?? "*"}:${sort}:${metaGeneration}`,
+    pageSize: PLAYLIST_PAGE_SIZE,
+    mode: "all",
+    // 命中缓存：来回切分类/页签不重复拉同一批（任务在后台跑完并留在内存里）
+    cacheKey: `playlists:${activeSourceId}:${category ?? "*"}:${sort}:${metaGeneration}`,
+    // 推荐流没有「总数」可言：40 页 × 30 张 = 1200 张封顶。封面卡是
+    // loading="lazy"，不会同时解码，但卡片节点本身占内存，别无限拉。
+    maxPages: 40,
+  });
 
   const pick = (cat: string | null): void => {
     setCategory(cat);
-    setPage(1);
-    setItems([]);
-    setHasMore(true);
   };
 
-  /** 切换排序（v5 契约：id 原样透传给包侧 recommendations），重拉第一页 */
+  /** 切换排序（v5 契约：id 原样透传给包侧 recommendations），整轮重拉 */
   const pickSort = (id: string): void => {
     if (id === sort) return;
     setSort(id);
-    setPage(1);
-    setItems([]);
-    setHasMore(true);
   };
 
   /**
    * 稳定回调（#12）：封面卡是 memo 组件，内联箭头每次渲染都换新引用会把 memo 打穿；
-   * 无限滚动累积几百张卡时，翻页 loading 翻转都会让整网格重画。
+   * 全量模式下每批页到达都会重渲染一次，累积上千张卡时整网格重画代价很实在。
    */
   const openPlaylist = useCallback(
     (p: Playlist): void => {
@@ -161,7 +122,7 @@ export function PlaylistsPage(): React.JSX.Element {
   return (
     <div className="flex h-full min-w-0 flex-col">
       <div className="border-b border-border px-4 py-3">
-        <h1 className="text-base font-medium">歌单广场</h1>
+        <h1 className="text-xl font-bold tracking-tight">歌单广场</h1>
         {sorts.length > 1 && (
           <div className="mt-2 flex items-center gap-1.5">
             {sorts.map((s) => (
@@ -181,10 +142,10 @@ export function PlaylistsPage(): React.JSX.Element {
 
       <div className="min-h-0 flex-1 overflow-y-auto p-4">
         {error ? (
-          <div className="py-10 text-center text-sm text-destructive">
-            加载失败：{error}
-          </div>
-        ) : !loading && items.length === 0 ? (
+          <ErrorRetry message={`加载失败：${error}`} onRetry={reload} />
+        ) : loading ? (
+          <CoverGridSkeleton />
+        ) : items.length === 0 ? (
           <div className="py-10 text-center text-sm text-muted-foreground">
             该分类暂无歌单
           </div>
@@ -203,12 +164,8 @@ export function PlaylistsPage(): React.JSX.Element {
               ))}
             </CoverGrid>
 
-            {/* 哨兵：进入视口就拉下一页 */}
-            <div ref={sentinel} className="h-1" />
-
-            <div className="py-4 text-center text-xs text-muted-foreground">
-              {loading ? "加载中…" : hasMore ? "继续下拉加载更多" : "已经到底了"}
-            </div>
+            {/* 端到端拉完前才提示进度，拉到就没有底部文案（用户 m05614） */}
+            <ListLoadProgress finished={finished} count={items.length} noun="歌单" unit="个" />
           </>
         )}
       </div>
@@ -356,7 +313,7 @@ function CategoryFilter(props: {
 
       {/* 下拉面板：全部分类（含行里已露出的），点选即生效并收起 */}
       {open && (
-        <div className="absolute left-0 right-0 top-full z-20 mt-1.5 max-h-80 overflow-y-auto rounded-xl border border-border bg-popover p-3 shadow-lg">
+        <div className="absolute left-0 right-0 top-full z-20 mt-1.5 max-h-80 overflow-y-auto rounded-xl border border-border bg-popover/95 backdrop-blur-xl p-3 shadow-raised">
           <div className="flex flex-wrap gap-1.5">{chips(true)}</div>
         </div>
       )}

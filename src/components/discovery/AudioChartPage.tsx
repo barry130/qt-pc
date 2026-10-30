@@ -65,11 +65,11 @@ export function AudioChartPage(props: { platform: SourceId; id: string }): React
       <header className="relative shrink-0 border-b border-border">
         <div className="relative flex items-center px-6 pt-5"><BackButton /></div>
         <div className="relative flex gap-5 px-6 pb-6 pt-4">
-          <div className="h-28 w-28 shrink-0 overflow-hidden rounded-2xl bg-secondary shadow-xl ring-1 ring-border">
+          <div className="h-28 w-28 shrink-0 overflow-hidden rounded-2xl bg-secondary shadow-surface ring-1 ring-border">
             {cover ? <img src={cover} alt="" className="h-full w-full object-cover" /> : <div className="flex h-full items-center justify-center text-3xl text-muted-foreground/50"><Headphones /></div>}
           </div>
           <div className="min-w-0 self-end pb-1">
-            <p className="text-[11px] font-medium uppercase tracking-[0.2em] text-muted-foreground">有声榜</p>
+            <p className="text-2xs font-medium uppercase tracking-[0.2em] text-muted-foreground">有声榜</p>
             <h1 className="mt-1 truncate text-2xl font-bold tracking-tight">{chart.name}</h1>
             <p className="mt-1 text-xs text-muted-foreground">{loading ? "加载中…" : `${programs.length} 个节目`}</p>
           </div>
@@ -83,7 +83,7 @@ export function AudioChartPage(props: { platform: SourceId; id: string }): React
           {programs.map((program, index) => {
             const image = qtresCoverUrl(program.picUrl);
             return (
-              <div key={`${program.id}:${index}`} className="flex min-w-0 items-center gap-3 rounded-xl border border-border bg-card/60 p-3 hover:shadow-md">
+              <div key={`${program.id}:${index}`} className="flex min-w-0 items-center gap-3 rounded-xl border border-border bg-card/60 p-3 hover:shadow-surface">
                 <button type="button" className="h-16 w-16 shrink-0 overflow-hidden rounded-lg bg-secondary" onClick={() => open(program)} aria-label={`查看节目 ${program.name}`}>
                   {image ? <img src={image} alt="" loading="lazy" className="h-full w-full object-cover" /> : <div className="flex h-full items-center justify-center text-muted-foreground"><Headphones className="h-5 w-5" /></div>}
                 </button>
@@ -92,7 +92,7 @@ export function AudioChartPage(props: { platform: SourceId; id: string }): React
                   <p className="mt-1 truncate text-xs text-muted-foreground">{program.artist || "QQ音乐"}</p>
                   {/* 榜单接口只给节目容器、不给集数（chapterCount 恒 0），
                       集数在节目详情里按 albummid 取 total 才有真值。 */}
-                  <p className="mt-1 text-[11px] text-muted-foreground">{program.chapterCount > 0 ? `${program.chapterCount} 集` : "有声节目 · 进入查看章节"}</p>
+                  <p className="mt-1 text-2xs text-muted-foreground">{program.chapterCount > 0 ? `${program.chapterCount} 集` : "有声节目 · 进入查看章节"}</p>
                 </button>
                 <button type="button" className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full border border-border text-muted-foreground hover:bg-accent hover:text-foreground" onClick={() => open(program)} aria-label={`播放节目 ${program.name}`}>
                   <Play className="h-3.5 w-3.5 fill-current" />

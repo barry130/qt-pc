@@ -24,6 +24,8 @@ pub mod library_maintenance;
 pub mod library_scan;
 /// 听歌报告只读分页查询
 pub mod listen_report;
+/// 本地优先播放（DESIGN §7.13）：解析链 / 替身链 / 启动对账
+pub mod local_first;
 pub mod local;
 pub mod lyric_window;
 pub mod media;
@@ -44,6 +46,8 @@ pub mod qtres;
 pub mod recommend;
 /// 运行期私有配置（自有域名 / 生产后端 / 官网地址，启动时按顺序找本地文件）
 pub mod runtime_config;
+/// 引擎 → 前端替身搜索桥（本地优先池 C，DESIGN §7.13）
+pub mod search_bridge;
 pub mod settings_keys;
 pub mod shortcuts;
 pub mod smtc;
@@ -275,6 +279,18 @@ pub fn run() {
                 );
             }
 
+            // 本地优先播放（DESIGN §7.13）启动对账：把 V19 之前已 done 的
+            // 存量任务补进账本、清掉指向已消失文件的账本条目、重建孤儿
+            // 索引。后台跑不卡冷启动；失败只记日志（下次启动重试，期间
+            // 解析链照常工作——账本/孤儿可能少几条，回落在线不受影响）。
+            if let Some(db) = db.clone() {
+                let dl_dir = crate::commands::download_dir_for(Some(&db));
+                tauri::async_runtime::spawn_blocking(move || match dl_dir {
+                    Ok(dir) => crate::local_first::reconcile(&db, &dir),
+                    Err(e) => log::warn!("[local-first] 下载目录不可用，跳过对账: {e}"),
+                });
+            }
+
             // 缓存根目录：默认**安装目录下的 `cache`**（见 app_paths::cache_root），
             // 安装目录不可写时回落 app_cache_dir()。设置页可改成任意目录
             // （settings key = cache.dir，见 commands::cmd_choose_cache_dir）。
@@ -445,6 +461,10 @@ pub fn run() {
             cmd_set_resolved_play_url,
             cmd_script_bridge_ready,
             cmd_resolve_play_url_reply,
+            cmd_search_substitute_reply,
+            cmd_get_local_first,
+            cmd_set_local_first,
+            cmd_resolve_local_file,
             cmd_invalidate_play_url,
             source_bundle::cmd_source_chain_overlay,
             source_install::cmd_source_state,
@@ -468,7 +488,7 @@ pub fn run() {
             web_login::source_web_login_open,
             web_login::source_web_login_capture,
             web_login::source_web_login_close,
-            web_login::source_web_login_debug_dump,
+            web_login::source_web_login_diagnose_names,
             cmd_play_track,
             cmd_play_queue,
             cmd_set_default_quality,

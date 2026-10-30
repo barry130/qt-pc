@@ -54,6 +54,8 @@ vi.mock("@/hooks/usePagedList", () => ({
     loadingMore: false,
     error: null,
     hasMore: false,
+    // 一次性加载完毕（用户 m05614）：页面靠它决定底部还要不要挂进度条
+    finished: true,
     sentinelRef: { current: null },
     reload: vi.fn(),
   }),
@@ -81,6 +83,8 @@ vi.mock("@/components/discovery/BatchBar", () => ({
 vi.mock("@/components/discovery/Skeletons", () => ({
   ErrorRetry: () => <div data-testid="error" />,
   TrackRowsSkeleton: () => <div data-testid="skeleton" />,
+  // 取全量期间底部只挂这条进度提示，收尾后返回 null —— 本文件不关心它
+  ListLoadProgress: () => null,
 }));
 
 vi.mock("@/components/common/IconButton", () => ({

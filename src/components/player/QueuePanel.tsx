@@ -578,10 +578,15 @@ export function QueuePanel(): React.JSX.Element | null {
                   hover="secondary"
                   danger
                   onClick={() =>
-                    void ipc.clearQueue().catch((err) => {
-                      log.warn("[queue] 清空队列失败", err);
-                      toastError(`清空队列失败：${errMsg(err)}`);
-                    })
+                    void ipc
+                      .clearQueue()
+                      // 乐观清空：引擎随后会推 queue 事件，但那一跳要等 IPC 往返，
+                      // 面板会先闪一帧旧队列；这里立刻按空队列渲染，事件到达时幂等覆盖。
+                      .then(() => usePlayerStore.getState().applyQueue({ tracks: [], index: null }))
+                      .catch((err) => {
+                        log.warn("[queue] 清空队列失败", err);
+                        toastError(`清空队列失败：${errMsg(err)}`);
+                      })
                   }
                 >
                   <Trash2 />
@@ -761,12 +766,12 @@ const QueueRow = memo(function QueueRow({
           </span>
           <SourceTag platform={t.platform} size="xs" />
         </div>
-        <div className="truncate text-[11px] text-muted-foreground">
+        <div className="truncate text-2xs text-muted-foreground">
           {t.singer}
         </div>
       </div>
       {t.duration > 0 && (
-        <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">
+        <span className="shrink-0 text-2xs tabular-nums text-muted-foreground">
           {formatTime(t.duration * 1000)}
         </span>
       )}

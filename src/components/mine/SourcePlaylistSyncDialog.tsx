@@ -172,9 +172,9 @@ export function SourcePlaylistSyncDialog(props: {
         if (e.target === e.currentTarget && !busy) props.onClose();
       }}
     >
-      <div className="w-[30rem] rounded-2xl border border-white/20 bg-white/70 p-5 text-card-foreground shadow-2xl backdrop-blur-xl dark:border-white/10 dark:bg-black/40">
+      <div className="w-[30rem] rounded-2xl border border-white/20 bg-white/70 p-5 text-card-foreground shadow-overlay backdrop-blur-xl dark:border-white/10 dark:bg-black/40">
         <div className="text-sm font-medium">{props.sourceName} · 同步歌单</div>
-        <p className="mt-1 text-[11px] text-muted-foreground">
+        <p className="mt-1 text-2xs text-muted-foreground">
           拉取该账户在平台侧的全部收藏歌单：勾选 = 收藏到本地「我的歌单」，把「已收藏」的取消勾选
           即从本地移除（只改本地收藏，不影响平台侧）。
         </p>
@@ -201,7 +201,7 @@ export function SourcePlaylistSyncDialog(props: {
           <>
             <p className="mt-4 break-all text-xs text-destructive">{error}</p>
             {/未登录|未登陆/.test(error) ? (
-              <p className="mt-2 text-[11px] text-muted-foreground">
+              <p className="mt-2 text-2xs text-muted-foreground">
                 账号卡显示「已登录」却仍报未登录，通常是登录态已失效：请在账号卡上重新登录后再试。
               </p>
             ) : null}
@@ -241,18 +241,18 @@ export function SourcePlaylistSyncDialog(props: {
                       className="h-8 w-8 shrink-0 rounded object-cover"
                     />
                   ) : (
-                    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded bg-muted text-[10px] text-muted-foreground">
+                    <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded bg-muted text-3xs text-muted-foreground">
                       歌单
                     </span>
                   )}
                   <span className="min-w-0 flex-1 truncate text-xs">{row.playlist.name}</span>
                   {row.playlist.trackCount !== undefined ? (
-                    <span className="shrink-0 text-[11px] text-muted-foreground">
+                    <span className="shrink-0 text-2xs text-muted-foreground">
                       {row.playlist.trackCount} 首
                     </span>
                   ) : null}
                   {row.favorited ? (
-                    <span className="shrink-0 rounded border border-primary/40 px-1.5 py-0.5 text-[10px] leading-none text-primary">
+                    <span className="shrink-0 rounded border border-primary/40 px-1.5 py-0.5 text-3xs leading-none text-primary">
                       已收藏
                     </span>
                   ) : null}

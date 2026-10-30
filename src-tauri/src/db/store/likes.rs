@@ -546,3 +546,4 @@ fn ensure_pending_like_ops_table(conn: &Connection) -> Result<(), rusqlite::Erro
     )?;
     Ok(())
 }
+

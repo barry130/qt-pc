@@ -207,7 +207,7 @@ export function AppearanceSection(): React.JSX.Element {
             />
             <div className="text-center text-xs text-muted-foreground">
               <p>点击选择图片</p>
-              <p className="mt-1 text-[10px]">支持 JPG / PNG / WebP</p>
+              <p className="mt-1 text-3xs">支持 JPG / PNG / WebP</p>
             </div>
           </label>
         )}

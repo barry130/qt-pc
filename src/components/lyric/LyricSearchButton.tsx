@@ -14,6 +14,7 @@ import { SourceTag } from "@/components/common/SourceTag";
 import { Popover } from "@/components/common/Popover";
 import { cn, errMsg } from "@/lib/utils";
 import type { Lyric, SourceId, Track } from "@/types";
+import { isComposingEnter } from "@/lib/keyboard";
 
 /**
  * 播放页「搜索歌词」入口（2026-10-07，用户 m09160：方案同换源一样）。
@@ -70,7 +71,7 @@ export function LyricSearchButton(props: {
         track !== null ? (
           <div
             data-testid="lyric-search-panel"
-            className="absolute right-0 z-20 mt-1 w-[380px] max-w-[80vw] rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-lg"
+            className="absolute right-0 z-20 mt-1 w-[380px] max-w-[80vw] rounded-xl border border-border bg-popover/95 backdrop-blur-xl p-3 text-popover-foreground shadow-raised"
           >
             <LyricSearchPanel
               track={track}
@@ -214,7 +215,7 @@ function LyricSearchPanel(props: {
 
   return (
     <div>
-      <div className="mb-2 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+      <div className="mb-2 flex items-center gap-1.5 text-2xs text-muted-foreground">
         <Search className="h-3 w-3 shrink-0" />
         <span className="min-w-0 flex-1 truncate">给「{track.title}」找歌词</span>
         {/* 结果有缓存（10 分钟内重开弹层直接复用），这里给一条强制重搜的路 */}
@@ -238,7 +239,7 @@ function LyricSearchPanel(props: {
           value={keyword}
           onChange={(event) => setKeyword(event.currentTarget.value)}
           onKeyDown={(event) => {
-            if (event.key === "Enter") submit();
+            if (event.key === "Enter" && !isComposingEnter(event)) submit();
           }}
           placeholder="歌名 歌手"
           aria-label="歌词搜索关键字"
@@ -276,13 +277,13 @@ function LyricSearchPanel(props: {
       </div>
 
       {/* 本地曲目的 id 是文件路径，不能拿它去搜；提示一句用户才知道搜的是「歌名 + 歌手」 */}
-      <p className="mt-1.5 text-[11px] leading-snug text-muted-foreground">
+      <p className="mt-1.5 text-2xs leading-snug text-muted-foreground">
         按「歌名 + 歌手」在其他版本里找词，选中后只用于当前这首
         {track.platform === "local" ? "本地曲目" : "歌"}，不会改动原文件。
       </p>
 
       {error !== null && (
-        <div className="mt-2 rounded-md bg-destructive/10 px-2 py-1.5 text-[11px] text-destructive">
+        <div className="mt-2 rounded-md bg-destructive/10 px-2 py-1.5 text-2xs text-destructive">
           搜索失败：{error}
         </div>
       )}
@@ -314,7 +315,7 @@ function LyricSearchPanel(props: {
                       <span className="truncate text-xs text-foreground/90">{item.track.title}</span>
                       <SourceTag platform={item.track.platform} size="xs" />
                     </span>
-                    <span className="truncate text-[11px] text-muted-foreground">
+                    <span className="truncate text-2xs text-muted-foreground">
                       {item.track.singer}
                       {item.track.album.length > 0 ? ` · ${item.track.album}` : ""}
                     </span>
@@ -322,7 +323,7 @@ function LyricSearchPanel(props: {
                   {/* 逐字 / 罗马音有没有，直接标出来：这是用户挑版本的实际依据之一 */}
                   {((item.lyric.wordByWord ?? "").length > 0 ||
                     (item.lyric.romanization ?? "").length > 0) && (
-                    <span className="shrink-0 rounded bg-primary/10 px-1.5 py-0.5 text-[10px] text-primary">
+                    <span className="shrink-0 rounded bg-primary/10 px-1.5 py-0.5 text-3xs text-primary">
                       {(item.lyric.wordByWord ?? "").length > 0 ? "逐字" : ""}
                       {(item.lyric.wordByWord ?? "").length > 0 &&
                       (item.lyric.romanization ?? "").length > 0

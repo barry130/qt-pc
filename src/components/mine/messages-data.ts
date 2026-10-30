@@ -15,6 +15,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { coerceBool as bool, coerceNumber as num, coerceString as str } from "@/lib/coerce";
 import { errMsg } from "@/lib/utils";
 import { migrateLegacyStorageKey } from "@/lib/legacy-storage";
+import { parseNoticeLink, type NoticeLink } from "@/lib/notice-link";
 import * as ipc from "@/services/ipc";
 import { useAuthStore } from "@/stores/auth";
 import { htmlToText } from "@/lib/richText";
@@ -32,7 +33,10 @@ export interface MessageItem {
   content: string;
   time: string;
   read: boolean;
+  /** 后端原始 url（外观层不要直接当链接用，走 link） */
   url?: string;
+  /** 解析后的跳转目标；null/undefined = 不可点 */
+  link?: NoticeLink;
 }
 
 export interface MessagesData {
@@ -127,6 +131,7 @@ function normalizeMessages(data: unknown): MessageItem[] {
   return pickList(data).map((item, i) => {
     const o = (item ?? {}) as Record<string, unknown>;
     const url = str(o.url ?? o.link);
+    const link = parseNoticeLink(url);
     return {
       id: num(o.id ?? o.messageId ?? o.msgId ?? i),
       title: str(o.title ?? o.subject ?? o.name ?? "通知"),
@@ -134,6 +139,7 @@ function normalizeMessages(data: unknown): MessageItem[] {
       time: formatTime(o.createTime ?? o.createdAt ?? o.time ?? o.sendTime),
       read: bool(o.read ?? o.isRead ?? o.readed ?? o.hasRead),
       url: url.length > 0 ? url : undefined,
+      link: link ?? undefined,
     };
   });
 }

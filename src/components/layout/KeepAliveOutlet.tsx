@@ -22,7 +22,7 @@
 import { Suspense, useRef } from "react";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { KeepAliveActiveContext } from "@/components/layout/keepAliveActive";
-import { PageFallback, lazyPage } from "@/lib/lazyPage";
+import { PageFallback, lazyPage, type PageFallbackShape } from "@/lib/lazyPage";
 
 /**
  * 一级页面的懒加载组件：页面模块只在首次访问该 tab 时才下载。
@@ -74,6 +74,25 @@ export const KEEP_ALIVE_PAGES: Record<string, () => React.JSX.Element> = {
   "/ai-assistant": () => <AiAssistantPage />,
 };
 
+/**
+ * 各常驻页的骨架形状（chunk 首次加载时的兜底）：与页面真实排布对齐，
+ * 换内容时不跳。新增常驻页漏登记会退化成列表骨架，不影响功能。
+ */
+const PAGE_SHAPE: Record<string, PageFallbackShape> = {
+  "/": "grid",
+  "/daily": "list",
+  "/daily-recommend": "list",
+  "/playlists": "grid",
+  "/charts": "grid",
+  "/library": "list",
+  "/library/folders": "list",
+  "/downloads": "list",
+  "/history": "list",
+  "/stats": "detail",
+  "/my/playlists": "list",
+  "/ai-assistant": "list",
+};
+
 /** 当前路径是否为常驻缓存页（AppShell 据此决定是否再渲染 <Outlet />） */
 export function isKeepAlivePath(pathname: string): boolean {
   return pathname in KEEP_ALIVE_PAGES;
@@ -97,7 +116,7 @@ export function KeepAliveOutlet(props: { pathname: string }): React.JSX.Element 
           // 内联 display：页面根节点自带 flex/h-full，用 hidden 属性会被类样式盖掉
           <div
             key={path}
-            className="h-full"
+            className="qt-page-enter h-full"
             style={active ? undefined : { display: "none" }}
             aria-hidden={!active}
           >
@@ -105,7 +124,7 @@ export function KeepAliveOutlet(props: { pathname: string }): React.JSX.Element 
             <ErrorBoundary label={path} resetKey={active ? `${path}:active` : `${path}:idle`}>
               {/* 每个常驻页自己的 Suspense：本页懒加载 chunk 还没到时只让这一页
                   显示占位，不影响其它常驻页与外面的内容区边界 */}
-              <Suspense fallback={<PageFallback />}>
+              <Suspense fallback={<PageFallback shape={PAGE_SHAPE[path]} />}>
                 <KeepAliveActiveContext.Provider value={active}>
                   {node}
                 </KeepAliveActiveContext.Provider>

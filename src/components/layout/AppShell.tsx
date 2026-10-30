@@ -8,6 +8,7 @@ import { Sidebar } from "@/components/layout/Sidebar";
 import { KeepAliveOutlet, isKeepAlivePath } from "@/components/layout/KeepAliveOutlet";
 import { ScrollTopLayer } from "@/components/layout/ScrollTopLayer";
 import { PlayerBar } from "@/components/PlayerBar";
+import { CommandPalette } from "@/components/common/CommandPalette";
 import { QueuePanel } from "@/components/player/QueuePanel";
 import { useFramelessWindow } from "@/hooks/useFramelessWindow";
 import { usePlaybackEvents } from "@/hooks/usePlaybackEvents";
@@ -16,6 +17,7 @@ import { useAppearanceEffect } from "@/hooks/useAppearanceEffect";
 import { useCoverColor } from "@/hooks/useCoverColor";
 import { usePlayingCoverBg } from "@/hooks/usePlayingCoverBg";
 import { useLocalTrackOnlineMeta } from "@/hooks/useLocalTrackOnlineMeta";
+import { useNowPlayingLocalMedia } from "@/hooks/useNowPlayingLocalMedia";
 import { useExternalOpen } from "@/hooks/useExternalOpen";
 import { useUpdateCheck } from "@/hooks/useUpdateCheck";
 import { useSourceUpdateCheck } from "@/hooks/useSourceUpdateCheck";
@@ -41,6 +43,7 @@ import { QtNoticeDialog } from "@/components/notice/qt-NoticeDialog";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { ToastHost } from "@/components/common/ToastHost";
 import { FirstRunDisclaimer } from "@/components/common/FirstRunDisclaimer";
+import { usePageEnter } from "@/hooks/usePageEnter";
 import { PageFallback } from "@/lib/lazyPage";
 
 /**
@@ -56,6 +59,8 @@ export function AppShell(): React.JSX.Element {
   useCoverColor();
   usePlayingCoverBg();
   useLocalTrackOnlineMeta();
+  // 在播本地文件：内嵌封面优先于在线封面（本地优先命中时 platform 仍是原平台）
+  useNowPlayingLocalMedia();
   // 外部打开（拖拽入窗 / 命令行参数 / 第二实例转发）：只挂一次，返回值只用于拖拽提示浮层
   const { dragging: externalDragging, count: externalDragCount } = useExternalOpen();
   // 数据库自愈回执：启动体检发现库损坏、已隔离重建时如实提示一次（Rust 侧取过即消失）。
@@ -99,6 +104,8 @@ export function AppShell(): React.JSX.Element {
   );
   const navigate = useNavigate();
   const pathname = useLocation().pathname;
+  // 非常驻路由的入场动画（常驻页由 display 切换自然重播，见 usePageEnter）
+  const enterClass = usePageEnter(pathname);
   const isPlayingPage = pathname === "/playing";
 
   // 首次启动免责声明（装完第一次启动弹一次，读完 3 秒才能确认）：只读一次库
@@ -266,10 +273,15 @@ export function AppShell(): React.JSX.Element {
               {/* 页面路由是懒加载的（见 lib/lazyPage）：这里给 Outlet 兜一层，
                   否则首次进入未下载完的路由会同步挂起报错。常驻页各自在
                   KeepAliveOutlet 内部有自己的兜底。 */}
-              <Suspense fallback={<PageFallback />}>
+              <Suspense fallback={<PageFallback shape="detail" />}>
                 {/* 一级页面常驻缓存（切 tab 不再整页重载）；其余路由仍走 Outlet */}
                 <KeepAliveOutlet pathname={pathname} />
-                {!isKeepAlivePath(pathname) && <Outlet />}
+                {!isKeepAlivePath(pathname) && (
+                  // 入场类名由 usePageEnter 一并带出 h-full（页面根节点普遍是 h-full/flex）
+                  <div className={enterClass}>
+                    <Outlet />
+                  </div>
+                )}
               </Suspense>
             </ErrorBoundary>
           </div>
@@ -300,6 +312,8 @@ export function AppShell(): React.JSX.Element {
       <ErrorBoundary label="对话框">
         {/* 首次启动的免责声明 / 开源通知（装完第一次启动弹一次）。
             层内最先挂，且自身用 z-[60] 高过其他 z-50 弹窗，两重保险都留着 */}
+        {/* 命令面板（Ctrl/Cmd+K）：页面 / 设置 / 播放操作 / 搜索的统一入口 */}
+        <CommandPalette />
         <FirstRunDisclaimer />
         {/* 更新弹窗（启动自动检查发现新版本时弹出，§15.3） */}
         <UpdateDialog />

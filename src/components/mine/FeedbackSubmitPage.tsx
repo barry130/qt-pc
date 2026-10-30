@@ -49,7 +49,7 @@ export function FeedbackSubmitPage(): React.JSX.Element {
       <div className="px-5 pb-4 pt-6">
       <div className="mb-4 flex items-center gap-2">
         <BackButton />
-        <h1 className="text-base font-semibold">意见反馈</h1>
+        <h1 className="text-xl font-bold tracking-tight">意见反馈</h1>
       </div>
 
       {/* 表单装进玻璃卡：壁纸页不做实底，与个人中心/资料编辑同一表面语言 */}

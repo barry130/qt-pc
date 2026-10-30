@@ -62,7 +62,7 @@ export function MusicSourceSwitcher(): React.JSX.Element {
           role="listbox"
           // 语义令牌：写死 bg-white/70 dark:bg-black/40 会在换肤 / 深浅切换时脱节。
           // 透明度也别太靠页：80% 会让下面的内容明显透上来
-          className="absolute left-1/2 top-full z-50 mt-1 w-36 -translate-x-1/2 overflow-hidden rounded-xl border border-border bg-popover/95 py-1 shadow-2xl backdrop-blur-xl"
+          className="absolute left-1/2 top-full z-50 mt-1 w-36 -translate-x-1/2 overflow-hidden rounded-xl border border-border bg-popover/95 py-1 shadow-raised backdrop-blur-xl"
         >
           {sources.length === 0 && (
             <li className="px-3 py-1.5 text-xs text-muted-foreground">数据包未就绪</li>

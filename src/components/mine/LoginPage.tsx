@@ -191,7 +191,7 @@ export function LoginPage(): React.JSX.Element {
             </button>
           </div>
         ) : (
-          <p className="text-center text-[11px] leading-relaxed text-muted-foreground">
+          <p className="text-center text-2xs leading-relaxed text-muted-foreground">
             注册后可用该邮箱重置密码，请填真实邮箱
           </p>
         )}

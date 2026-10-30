@@ -39,20 +39,20 @@ afterEach(() => {
 });
 
 describe("SourceTag", () => {
-  it("列表用小号：10px 字、px-1，标题是「来源：简称」", () => {
+  it("列表用小号：3xs 字号（10px）、px-1，标题是「来源：简称」", () => {
     const { container } = render(<SourceTag platform="qq" size="xs" />);
     const tag = container.firstElementChild as HTMLElement;
     expect(tag.textContent).toBe("QQ");
-    expect(tag.className).toContain("text-[10px]");
+    expect(tag.className).toContain("text-3xs");
     expect(tag.className).toContain("px-1");
     expect(tag.title).toBe("来源：QQ");
   });
 
-  it("正在播放页用默认尺寸：11px、px-1.5（与改造前的详情页一致）", () => {
+  it("正在播放页用默认尺寸：2xs 字号（11px）、px-1.5（与改造前的详情页一致）", () => {
     const { container } = render(<SourceTag platform="netease" />);
     const tag = container.firstElementChild as HTMLElement;
     expect(tag.textContent).toBe("网易云");
-    expect(tag.className).toContain("text-[11px]");
+    expect(tag.className).toContain("text-2xs");
     expect(tag.className).toContain("px-1.5");
   });
 

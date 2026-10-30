@@ -23,10 +23,11 @@ import { readAggregateSources } from "@/lib/aggregate-sources";
 import { songKey } from "@/lib/song-key";
 import { formatPlayCount } from "@/lib/format";
 import { CoverCard, CoverGrid } from "./discovery/CoverCard";
-import { TrackRowsSkeleton } from "./discovery/Skeletons";
+import { ListLoadProgress, TrackRowsSkeleton } from "./discovery/Skeletons";
 import { BackButton } from "@/components/layout/BackButton";
 import { IconButton } from "@/components/common/IconButton";
 import { SourceTag } from "@/components/common/SourceTag";
+import { isComposingEnter } from "@/lib/keyboard";
 
 /**
  * 搜索页（路由 /search?q=，DESIGN §5.2：关键字走 URL query，前进 / 后退可复现）。
@@ -44,9 +45,10 @@ import { SourceTag } from "@/components/common/SourceTag";
  * - 输入中：按历史 + 热搜词前缀/包含联想（音源包没有 suggest 接口，取自本地数据）
  * - 聚合开关只作用于「歌曲」页签（歌单/歌手/专辑保持当前源）
  *
- * 翻页（2026-10）：四类结果与聚合模式都走 `usePagedList` 滚动续页，哨兵挂在
- * 列表末尾。搜索类接口没有 total/hasMore 返回位，收尾只能靠「满页 = 可能还有
- * 下一页」推断（见 fetchPage），所以每页条数必须等于音源包自述的 searchPageMax。
+ * 取全量（2026-10-30，用户 m05614）：四类结果与聚合模式都走 `usePagedList` 的
+ * all 模式 —— 进页就把后续页并发取完，没有哨兵，也没有「继续下拉加载更多 /
+ * 已经到底了」。搜索类接口没有 total/hasMore 返回位，收尾只能靠「满页 = 可能
+ * 还有下一页」推断（见 fetchPage），所以每页条数必须等于音源包自述的 searchPageMax。
  *
  * 页签（`?type=`）进 URL（2026-10）：搜索页不在 KeepAliveOutlet 的常驻名单里，
  * 从歌单 / 歌手 / 专辑详情页返回时本组件是重新挂载的 —— 页签留在 useState 里
@@ -242,13 +244,17 @@ export function SearchPage(): React.JSX.Element {
 
   // 搜索代际、请求去重、追加去重全部交给 usePagedList：resetKey 一变（换词 /
   // 换页签 / 换源 / 切聚合）就在同一帧回第一页重拉，旧请求的应答被丢弃
-  const { items, loading, loadingMore, error, hasMore, sentinelRef, reload } =
-    usePagedList<SearchHit>({
-      fetchPage,
-      keyOf: hitKey,
-      resetKey,
-      pageSize,
-    });
+  const { items, loading, error, finished, reload } = usePagedList<SearchHit>({
+    fetchPage,
+    keyOf: hitKey,
+    resetKey,
+    pageSize,
+    // 一次拉全量（用户 m05614：不要滚动续页、底部不要「已经到底了」）。
+    mode: "all",
+    // 搜索不做 cacheKey：每个关键词一张全量表太占内存，离开页面即取消任务。
+    // 12 页 × 每页上限（聚合模式取各源最小上限）≈ 上千条，再往后用户也不会翻。
+    maxPages: 12,
+  });
 
   // 有 q 才算「搜过」：落地页（历史 + 热搜）只在没有关键词时展示
   const searched = q.length > 0;
@@ -443,7 +449,7 @@ export function SearchPage(): React.JSX.Element {
               window.setTimeout(() => setSuggestOpen(false), 120);
             }}
             onKeyDown={(e) => {
-              if (e.key === "Enter") submit(keyword);
+              if (e.key === "Enter" && !isComposingEnter(e)) submit(keyword);
               if (e.key === "Escape") setSuggestOpen(false);
             }}
             placeholder="搜索歌曲 / 歌单 / 歌手 / 专辑"
@@ -475,7 +481,7 @@ export function SearchPage(): React.JSX.Element {
         </button>
 
         {suggestOpen && suggestions.length > 0 && (
-          <div className="absolute left-14 right-32 top-full z-20 mt-1 overflow-hidden rounded-lg border border-border bg-popover py-1 text-popover-foreground shadow-lg">
+          <div className="absolute left-14 right-32 top-full z-20 mt-1 overflow-hidden rounded-xl border border-border bg-popover/95 backdrop-blur-xl py-1 text-popover-foreground shadow-raised">
             {suggestions.map((w) => (
               <button
                 key={w}
@@ -529,8 +535,8 @@ export function SearchPage(): React.JSX.Element {
           </button>
         )}
         {tab === "song" && songs.length > 0 && (
-          // 搜索是一页一页往下拉的（usePagedList），「全部」只能是**已加载**的这批；
-          // 文案与 title 都写清楚条数，避免用户以为只放了屏幕里那几首。
+          // 搜索进页即拉全量（all 模式），补页期间 songs 还在涨，所以文案与
+          // title 都写清条数，避免用户以为只放了屏幕里那几首。
           <button
             type="button"
             onClick={() => void playQueue(songs, 0)}
@@ -636,28 +642,22 @@ export function SearchPage(): React.JSX.Element {
           </div>
         )}
 
-        {/* 翻页哨兵（提前一屏触发，见 usePagedList）+ 底部提示。
-            续页失败时 error 有值但列表还在，这里给一个「重试」出口，
-            否则滚到底只剩一行红字、没有任何自救路径。 */}
-        {searched && <div ref={sentinelRef} className="h-1" aria-hidden />}
-        {searched && items.length > 0 && (
+        {/* 全量拉取（all 模式）：没有哨兵、也没有「已经到底了」。
+            后台补页失败时 error 有值但列表还在，给一个「重试」出口，
+            否则只剩顶部红字、没有任何自救路径。 */}
+        {searched && error !== null && !finished && (
           <div className="py-3 text-center text-xs text-muted-foreground">
-            {loadingMore ? (
-              "加载中…"
-            ) : error !== null ? (
-              <button
-                type="button"
-                onClick={reload}
-                className="text-destructive underline-offset-2 hover:underline"
-              >
-                加载更多失败，点此重试
-              </button>
-            ) : hasMore ? (
-              "继续下拉加载更多"
-            ) : (
-              "已经到底了"
-            )}
+            <button
+              type="button"
+              onClick={reload}
+              className="text-destructive underline-offset-2 hover:underline"
+            >
+              剩余结果加载失败，点此重试
+            </button>
           </div>
+        )}
+        {searched && (
+          <ListLoadProgress finished={finished} count={items.length} noun="结果" unit="条" />
         )}
       </div>
     </div>

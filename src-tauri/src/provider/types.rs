@@ -51,8 +51,12 @@ impl SourceId {
     }
 
     /// 是否本地曲目（宿主硬编码的保留值）。
+    ///
+    /// 大小写不敏感：`SourceId::parse` 会原样保留原串（连 `"Local"` 也保留），
+    /// 若这里按 `==` 比较，来一个带大写的 'Local' 就会被静默当成普通音源，
+    /// 本地曲目走在线取链、整条本地分支全部失效（评审 2026-10-29）。
     pub fn is_local(&self) -> bool {
-        self.0 == LOCAL_SOURCE
+        self.0.eq_ignore_ascii_case(LOCAL_SOURCE)
     }
 
     /// 本地曲目 id。
@@ -210,12 +214,16 @@ mod tests {
         }
     }
 
-    /// 保留值 `local` 是唯一硬编码值，但大小写不再由宿主归一化：
-    /// 认不认「Local」是音源包的事，宿主原样透传。
+    /// 保留值 `local` 是唯一硬编码值：`parse` 原样保留大小写，但
+    /// [`SourceId::is_local`] 大小写不敏感地认这个保留词 —— 带大写的 `Local`
+    /// 若被当成普通音源，本地曲目会走在线取链、整条本地分支静默失效
+    /// （2026-10-29 评审改）。因此音源包不能用 `local` 的任何大小写变体作平台号。
     #[test]
     fn parse_preserves_case() {
         assert_eq!(SourceId::parse("Local"), Some(SourceId::new("Local")));
-        assert!(!SourceId::parse("Local").expect("可解析").is_local());
+        assert!(SourceId::parse("Local").expect("可解析").is_local());
+        assert!(SourceId::parse("LOCAL").expect("可解析").is_local());
+        assert!(!SourceId::parse("local-mix").expect("可解析").is_local());
     }
 
     /// 仍然拒绝的是「拿它当 id 用会出事」的字符串：空串，以及会拆坏

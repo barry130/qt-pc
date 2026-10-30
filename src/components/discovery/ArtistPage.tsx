@@ -14,7 +14,7 @@ import { TrackList } from "./TrackList";
 import { TrackSortSelect } from "@/components/TrackSortSelect";
 import { DEFAULT_TRACK_SORT, parseTrackSort, sortTracks } from "@/lib/track-sort";
 import { BatchBar } from "./BatchBar";
-import { ErrorRetry, TrackRowsSkeleton } from "./Skeletons";
+import { ErrorRetry, ListLoadProgress, LoadBar, TrackRowsSkeleton } from "./Skeletons";
 import { BackButton } from "@/components/layout/BackButton";
 import { IconButton } from "@/components/common/IconButton";
 
@@ -186,7 +186,7 @@ function ArtistPageContent({ platform, name, artistId }: {
         </div>
 
         <div className="relative flex gap-5 px-6 pb-6 pt-4">
-          <div className="h-36 w-36 shrink-0 overflow-hidden rounded-2xl bg-secondary shadow-xl ring-1 ring-border">
+          <div className="h-36 w-36 shrink-0 overflow-hidden rounded-2xl bg-secondary shadow-surface ring-1 ring-border">
             {coverUrl ? (
               <img
                 src={coverUrl}
@@ -201,7 +201,7 @@ function ArtistPageContent({ platform, name, artistId }: {
             )}
           </div>
           <div className="flex min-w-0 flex-1 flex-col justify-end pb-1">
-            <p className="text-[11px] font-medium uppercase tracking-[0.2em] text-muted-foreground">
+            <p className="text-2xs font-medium uppercase tracking-[0.2em] text-muted-foreground">
               歌手
             </p>
             <h1 className="mt-1 truncate text-2xl font-bold tracking-tight">{name}</h1>
@@ -306,31 +306,10 @@ function ArtistPageContent({ platform, name, artistId }: {
                 selection={{ ids: visibleSelected, onToggle: toggleSelect, onChange: setSelected }}
               />
             )}
-            {loadingAll ? (
-              <div className="py-4 text-center text-xs text-muted-foreground">
-                正在加载其余歌曲… 已加载 {songs.length} 首
-              </div>
-            ) : null}
+            <ListLoadProgress finished={finished} count={songs.length} />
           </>
         )}
       </div>
-    </div>
-  );
-}
-
-/**
- * 全量拉取进度带：分母未知（搜索接口不回总数），所以是不定长流动条，
- * 已有条数由头部/底部文字给出，不做假百分比。
- */
-function LoadBar(): React.JSX.Element {
-  return (
-    <div
-      role="progressbar"
-      aria-label="正在加载全部歌曲"
-      aria-valuetext="加载中"
-      className="relative h-0.5 w-full overflow-hidden bg-secondary"
-    >
-      <div className="qm-progress-bar absolute inset-y-0 w-1/3 bg-primary" />
     </div>
   );
 }

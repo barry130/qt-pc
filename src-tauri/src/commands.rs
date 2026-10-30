@@ -266,6 +266,17 @@ pub async fn cmd_set_resolved_play_url(
 #[tauri::command(rename = "script_bridge_ready")]
 pub async fn cmd_script_bridge_ready() {
     crate::playurl_bridge::set_ready();
+    // 替身搜索桥（本地优先池 C）与取链桥同一条就绪语义：主窗口挂载后
+    // 才可能有脚本线路应答，两座桥一起置位
+    crate::search_bridge::set_ready();
+}
+
+/// 引擎 → 前端替身搜索桥（search_bridge，本地优先池 C）：前端按
+/// requestId 回一批候选；空列表 = 搜不到 / 搜索失败，都按「无替身」处理。
+/// 挑选逻辑在引擎侧（local_first::pick_best_search），这里只管搬运。
+#[tauri::command(rename = "search_substitute_reply")]
+pub async fn cmd_search_substitute_reply(request_id: u64, tracks: Vec<Track>) {
+    crate::search_bridge::reply(request_id, tracks);
 }
 
 /// 引擎 → 前端取链桥（playurl_bridge）：前端脚本包按 requestId 应答播放地址；
@@ -619,6 +630,87 @@ pub async fn cmd_set_speed(state: State<'_, AppState>, speed: f32) -> Result<(),
 pub async fn cmd_set_gapless(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
     state.engine.set_gapless(enabled);
     Ok(())
+}
+
+// ---------- 本地优先播放（DESIGN §7.13）开关 ----------
+
+/// 本地优先播放总开关读取（settings key = `play.localFirst`）。
+/// 键不存在 / 无数据库都按**开**（默认值，新功能默认生效）。
+#[tauri::command(rename = "get_local_first")]
+pub async fn cmd_get_local_first(state: State<'_, AppState>) -> Result<bool, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(true);
+    };
+    let read = tauri::async_runtime::spawn_blocking(move || {
+        db.with(|c| Ok(crate::local_first::enabled(c)))
+    })
+    .await
+    .map_err(|e| format!("读取本地优先开关失败: {e}"))?;
+    Ok(read.unwrap_or(true))
+}
+
+/// 本地优先播放总开关写入。只落库不通知——引擎每次 LoadJob 现读
+/// （开关是低频操作，现读保证任何播放入口都立即生效，也不用维护缓存）。
+#[tauri::command(rename = "set_local_first")]
+pub async fn cmd_set_local_first(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(());
+    };
+    let v = if enabled { "true" } else { "false" };
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(|c| crate::db::store::set_setting(c, crate::settings_keys::SETTING_PLAY_LOCAL_FIRST, v))
+    })
+    .await
+    .map_err(|e| format!("写入本地优先开关失败: {e}"))??;
+    Ok(())
+}
+
+/// 本地优先命中项：文件绝对路径 + 命中层（见 local_first.rs 的解析链注释）。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalFileHit {
+    pub path: String,
+    /// ledger / task / orphan / library / local
+    pub kind: String,
+}
+
+/// 这条曲目**此刻会播的本地文件**（管理端「播放地址」面板用）。
+///
+/// 面板为什么要问 Rust：本地优先命中时引擎走 `PlaySource::Local`，快照里
+/// `playUrl` 是空的（真的没有在线地址），而真正在播的是磁盘上那个文件——
+/// 只有 Rust 这边知道命中了哪个文件（前端没有这份数据）。纯只读查询：
+/// 与引擎同一条链（`local_first::find_online_local_file`），不触发播放。
+///
+/// 返回 None = 没命中本地 / 本地优先开关关 / 无数据库，面板据此显示
+/// 「未命中本地」而不是编一个地址出来。
+#[tauri::command(rename = "resolve_local_file")]
+pub async fn cmd_resolve_local_file(
+    state: State<'_, AppState>,
+    track: Track,
+) -> Result<Option<LocalFileHit>, String> {
+    // 本地曲目本身就是文件：`id` 即绝对路径（CUE 分轨带 `#start-end` 后缀，
+    // 去后缀口径与引擎的 Local 分支一致），不必再走解析链。
+    if track.platform.is_local() {
+        let path = crate::cue::strip_cue_suffix(&track.id).to_string();
+        if std::path::Path::new(&path).exists() {
+            return Ok(Some(LocalFileHit {
+                path,
+                kind: "local".to_string(),
+            }));
+        }
+        return Ok(None);
+    }
+    let Some(db) = state.db.clone() else {
+        return Ok(None);
+    };
+    Ok(
+        crate::local_first::find_online_local_file(&db, &track)
+            .await
+            .map(|hit| LocalFileHit {
+                path: hit.path,
+                kind: hit.kind.to_string(),
+            }),
+    )
 }
 
 /// 武装 / 取消睡眠定时。`remainingMs` = 倒计时剩余毫秒（None = 取消）；
@@ -2941,9 +3033,11 @@ fn default_download_dir() -> Result<std::path::PathBuf, String> {
     Ok(dir)
 }
 
-/// 当前生效的下载目录：用户自选 > 安装目录/Download
-fn download_dir(state: &AppState) -> Result<std::path::PathBuf, String> {
-    if let Some(db) = &state.db {
+/// 当前生效的下载目录：用户自选 > 安装目录/Download。
+/// `db` 传 None（无库模式）时按默认目录。pub(crate)：本地优先启动对账
+/// （lib.rs setup）也用它定位扫描的下载目录。
+pub(crate) fn download_dir_for(db: Option<&Arc<crate::db::Database>>) -> Result<std::path::PathBuf, String> {
+    if let Some(db) = db {
         if let Ok(Some(saved)) =
             db.with(|conn| crate::db::store::get_setting(conn, SETTING_DOWNLOAD_DIR))
         {
@@ -2953,6 +3047,10 @@ fn download_dir(state: &AppState) -> Result<std::path::PathBuf, String> {
         }
     }
     default_download_dir()
+}
+
+fn download_dir(state: &AppState) -> Result<std::path::PathBuf, String> {
+    download_dir_for(state.db.as_ref())
 }
 
 /// 文件名安全化：去掉 Windows 非法字符与控制符，保留中文，截断 80 字符。
@@ -3057,6 +3155,24 @@ fn download_name_format(db: &Arc<crate::db::Database>) -> String {
 /// 生成不与现有文件冲突的下载路径：`歌手 - 歌名.<ext>`（或按 name_format 反转），重名加 (2) (3)…
 /// 扩展名由取址 URL 决定，避免无损内容被写成 `.mp3`。
 ///
+/// 等某个下载任务从登记表里退场（每 50ms 一次，上限 35s > CHUNK_TIMEOUT）。
+///
+/// 只在「删除任务 / 重新开始任务」这类必须独占文件的操作前调用：后台任务收工前
+/// 释放 `.part` 文件句柄需要时间，抢在它前面删/建文件会静默失败或产生活跃的
+/// 幽灵写入（见 `cmd_delete_download` 的注释）。
+async fn wait_download_inactive(downloads: &crate::download::DownloadManager, id: &str) {
+    const STEP_MS: u64 = 50;
+    const MAX_MS: u64 = 35_000;
+    let mut waited = 0u64;
+    while downloads.is_active(id) && waited < MAX_MS {
+        tokio::time::sleep(std::time::Duration::from_millis(STEP_MS)).await;
+        waited += STEP_MS;
+    }
+    if downloads.is_active(id) {
+        log::warn!("[download] 任务 {id} 在 {MAX_MS}ms 内仍未退场，继续删行（文件可能残留）");
+    }
+}
+
 /// `name_format == "song"` 时用 `歌名 - 歌手`，其余（默认 "artist"）用 `歌手 - 歌名`。
 fn unique_download_path(
     dir: &std::path::Path,
@@ -3093,13 +3209,19 @@ fn unique_download_path(
         };
         dir.join(format!("{name}.{ext}"))
     };
-    if !base.exists() {
+    // 判占用要连 .part 一起看：同一首歌的 128k / 320k 是两个下载任务（去重键是
+    // 「曲目 + 音质」），而文件名不含音质、扩展名又都是 .mp3 → 两条任务会算出
+    // 同一个 final_path/part_path。后者看到前者留下的 .part 就当续传，尾部校验
+    // 失败后从零截断，把对方进度抹掉；并发时两边各写各的 offset，成品是字节混合
+    // 的坏文件（评审，2026-10-29 修）。占位判断加上 .part 就能错开成 "(2)"。
+    let taken = |p: &std::path::Path| p.exists() || crate::download::part_path_for(p).exists();
+    if !taken(&base) {
         return base;
     }
     for n in 2..=99 {
         let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("track");
         let candidate = dir.join(format!("{stem} ({n}).{ext}"));
-        if !candidate.exists() {
+        if !taken(&candidate) {
             return candidate;
         }
     }
@@ -3231,6 +3353,13 @@ pub async fn cmd_delete_download(
         return Ok(());
     };
     state.downloads.request_stop(&id);
+    // 等后台任务真的退场：request_stop 只置旗标（download.rs），任务要等到下一个
+    // chunk 边界才收工（卡在网络读上最长 CHUNK_TIMEOUT=30s）。以前这里抢在任务
+    // 仍在飞的时候删行 + 删文件：Windows 上 .part 还被 writer 持有（无
+    // FILE_SHARE_DELETE），remove_file 静默失败 → .part 变永久垃圾；若删除发生在
+    // 成品 rename 之前，成品随后又被创建回来，而账本还回填成「已下载」
+    // （评审，2026-10-29 修）。
+    wait_download_inactive(&state.downloads, &id).await;
 
     let (path, part) = tauri::async_runtime::spawn_blocking({
         let id = id.clone();
@@ -3249,7 +3378,12 @@ pub async fn cmd_delete_download(
 
     if delete_file {
         if let Some(p) = path {
-            let _ = std::fs::remove_file(&p);
+            // 文件真删掉了才同步删账本（本地优先 §7.13）：删失败说明文件还在
+            //（被占用/权限），账本留着它就还能离线播；文件不在账本里时这条
+            // 删除是空操作（下载目录外的手动文件）
+            if std::fs::remove_file(&p).is_ok() {
+                let _ = db.with(|c| crate::db::store::remove_download_file_by_path(c, &p));
+            }
         }
     }
     // 无论是否删成品，临时文件都该清掉：任务已经不存在了，留着只是垃圾
@@ -3293,7 +3427,10 @@ pub async fn cmd_delete_downloads(
     for (path, part) in &files {
         if delete_file {
             if let Some(p) = path {
-                let _ = std::fs::remove_file(p);
+                // 文件真删掉了才同步删账本（本地优先 §7.13，同单删语义）
+                if std::fs::remove_file(p).is_ok() {
+                    let _ = db.with(|c| crate::db::store::remove_download_file_by_path(c, p));
+                }
             }
         }
         if let Some(p) = part {
@@ -3850,7 +3987,15 @@ async fn relaunch_download(
         return Err("该歌曲已下载完成".to_string());
     }
     if state.downloads.is_active(&id) {
-        return Ok(()); // 已经在下载，忽略重复点击
+        // 登记表里还有这个 id ≠ 它真的在下载：暂停只置取消旗标，后台任务要等到
+        // 下一个 chunk 边界才收工（卡在网络读上最长 30s）。这期间点「继续」如果
+        // 直接 Ok 返回，等于把用户的操作静默吞掉——任务永远不重启、DB 停在 paused，
+        // 而批量继续还会把它算进「已继续 N 个」（评审，2026-10-29 修）。
+        // 先有界等它退场；真等不到就明确报错，不假装成功。
+        wait_download_inactive(&state.downloads, &id).await;
+        if state.downloads.is_active(&id) {
+            return Err("上一次下载还没停下来，请稍后再试".to_string());
+        }
     }
 
     let quality = parse_provider_quality(&task.quality)

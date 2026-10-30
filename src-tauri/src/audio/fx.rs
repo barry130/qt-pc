@@ -489,6 +489,58 @@ fn band_edges(rate: u32) -> Vec<(usize, usize)> {
         .collect()
 }
 
+/// 频谱事件的中转信箱：音频渲染线程只 `offer`（一次 try_lock，失败即丢帧），
+/// 由专属发射线程 `take` 后做 `emit`。
+///
+/// 为什么要中转：`DspSource::next()` 跑在 cpal 输出回调线程上，任何阻塞都会
+/// 直接欠载爆音（见本文件顶部约定）。`emit` 要做 JSON 序列化 + 跨线程派发到
+/// webview，webview 正忙（大列表重排、动画）时会把音频回调拖过缓冲期
+/// （评审 2026-10-29：之前直接在音频线程里 emit）。
+struct SpectrumMailbox {
+    slot: std::sync::Mutex<Option<Vec<f32>>>,
+    ready: std::sync::Condvar,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl SpectrumMailbox {
+    fn new() -> Self {
+        Self {
+            slot: std::sync::Mutex::new(None),
+            ready: std::sync::Condvar::new(),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// 音频线程调用：只试一次锁，拿不到就丢掉这一帧（频谱少一帧没人看得出来，
+    /// 但音频回调不能等）。
+    fn offer(&self, bands: Vec<f32>) {
+        if let Ok(mut slot) = self.slot.try_lock() {
+            // 新帧覆盖旧帧：频谱是「当前状态」，积压旧帧只会让画面延迟
+            *slot = Some(bands);
+            self.ready.notify_one();
+        }
+    }
+
+    /// 发射线程调用：等到有新帧或 tap 被 drop（closed）为止。
+    fn take(&self) -> Option<Vec<f32>> {
+        let mut slot = self.slot.lock().ok()?;
+        loop {
+            if let Some(bands) = slot.take() {
+                return Some(bands);
+            }
+            if self.closed.load(std::sync::atomic::Ordering::Relaxed) {
+                return None;
+            }
+            slot = self.ready.wait(slot).ok()?;
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.ready.notify_all();
+    }
+}
+
 /// 挂在 DspSource 上的频谱采样器：解码域样本混成单声道进环形缓冲，
 /// 攒满一个窗就做 FFT 分频段，节流后经 AppHandle 推 `spectrum` 事件。
 ///
@@ -496,7 +548,8 @@ fn band_edges(rate: u32) -> Vec<(usize, usize)> {
 /// FFT 固定 2048 点、零分配，单次几十微秒，对实时路径安全。
 /// `app` 为 None 时（单测）只算不发。
 pub struct SpectrumTap {
-    app: Option<tauri::AppHandle>,
+    /// 频谱帧出口（None = 单测，只算不发）
+    mailbox: Option<std::sync::Arc<SpectrumMailbox>>,
     ring: Vec<f32>,
     /// 环形缓冲写位置
     write_pos: usize,
@@ -512,8 +565,21 @@ pub struct SpectrumTap {
 
 impl SpectrumTap {
     pub fn new(app: Option<tauri::AppHandle>) -> Self {
+        let mailbox = app.map(|app| {
+            let mailbox = std::sync::Arc::new(SpectrumMailbox::new());
+            let reader = std::sync::Arc::clone(&mailbox);
+            // 一个播放器一条发射线程：约 20Hz，等条件变量不占 CPU。
+            let _ = std::thread::Builder::new()
+                .name("spectrum-emit".into())
+                .spawn(move || {
+                    while let Some(bands) = reader.take() {
+                        let _ = app.emit("spectrum", SpectrumEvent { bands });
+                    }
+                });
+            mailbox
+        });
         let mut tap = Self {
-            app,
+            mailbox,
             ring: vec![0.0; SPECTRUM_FFT_SIZE],
             write_pos: 0,
             pending: 0,
@@ -598,10 +664,21 @@ impl SpectrumTap {
         Some(bands)
     }
 
-    /// 推送一帧频谱给前端（app 为 None 时静默丢弃，单测用）。
+    /// 把一帧频谱交给发射线程（信箱为 None 时静默丢弃，单测用）。
+    ///
+    /// 不在音频线程上直接 `app.emit`：见 SpectrumMailbox 的注释。
     fn emit(&self, bands: Vec<f32>) {
-        if let Some(app) = &self.app {
-            let _ = app.emit("spectrum", SpectrumEvent { bands });
+        if let Some(mailbox) = &self.mailbox {
+            mailbox.offer(bands);
+        }
+    }
+}
+
+impl Drop for SpectrumTap {
+    fn drop(&mut self) {
+        // 播放器销毁时叫醒发射线程让它退出（线程持有 Arc，不 close 会一直等）
+        if let Some(mailbox) = &self.mailbox {
+            mailbox.close();
         }
     }
 }

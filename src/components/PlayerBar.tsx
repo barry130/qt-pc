@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useHint } from "@/components/common/Hint";
 import {
   AudioWaveform,
   Captions,
@@ -47,8 +48,10 @@ import { useTauriEvent } from "@/hooks/useTauriEvent";
 import { Popover } from "@/components/common/Popover";
 import { SPEED_OPTIONS, speedLabel } from "@/lib/fx";
 import type { Quality, Track } from "@/types";
+import type { LocalFileHit } from "@/services/ipc";
 import { useInterpolatedPosition } from "@/hooks/useInterpolatedPosition";
-import { formatTime, qtresCoverUrl } from "@/lib/lrc";
+import { useNowPlayingCover } from "@/hooks/useNowPlayingLocalMedia";
+import { formatTime } from "@/lib/lrc";
 import { playUrlLine, playUrlMiss } from "@/source-scripts/playurl-line";
 import { cn } from "@/lib/utils";
 import {
@@ -58,6 +61,7 @@ import {
   getPlaybackState,
   hideDesktopLyric,
   onLyricWindowChanged,
+  resolveLocalFile,
   setSleepTimer,
   setSpectrum,
   setSpeed,
@@ -129,11 +133,16 @@ export function PlayerBar(): React.JSX.Element {
   const sleepTimerMs = usePlayerStore((s) => s.state?.sleepTimerMs ?? null);
   const sleepAfterTrack = usePlayerStore((s) => s.state?.sleepAfterTrack ?? false);
   const playUrl = usePlayerStore((s) => s.state?.playUrl ?? null);
+  // 引擎这次实际在播本地文件（本地曲目，或在线曲目被本地优先解析链命中）。
+  // 与 track.platform 是两件事：本地优先命中时 platform 还是原平台（kg/qq…），
+  // 但播的是磁盘文件、state.playUrl 为空，见 local_first.rs 的解析链注释。
+  const playingLocal = usePlayerStore((s) => s.state?.isLocal ?? false);
 
   const isPlayingPage = pathname === "/playing";
   const playing = status === "playing";
   const loading = status === "loading" || status === "buffering";
-  const cover = track ? qtresCoverUrl(track.picUrl) : null;
+  // 在播封面：文件有内嵌封面就用它（本地优先命中时优先于在线 picUrl），见 useNowPlayingCover
+  const cover = useNowPlayingCover();
   // qt_admin 专属：播放地址调试入口只向内部账号展示
   const profile = useAuthStore((s) => s.profile);
   const showPlayUrl = isAdmin(profile);
@@ -205,15 +214,26 @@ export function PlayerBar(): React.JSX.Element {
       }
     }
     switch (id) {
-      case "playUrl":
+      case "playUrl": {
+        // 本地播放有两类来源，面板都得显示「本地歌曲 + 本地文件路径」，不能显示
+        // 音源线路（那是上一条在线曲目残留的线路名，纯误导）：
+        // ① 本地曲目：`platform === "local"` + `id` = 文件绝对路径（见
+        //    audio/engine.rs 的 LoadJob::run 与 mine/DownloadsPage.tsx 的约定）；
+        // ② 在线曲目被本地优先解析链命中（DESIGN §7.13）：播放前先全本地找一遍
+        //    文件，命中就直接当本地文件播，这时 platform 还是原平台、playUrl 为空。
+        // 以前这里一律读 state.playUrl，本地播放时恒为 null，面板就误报成
+        // 「尚未取到播放地址」，还挂着上一条在线曲目的线路名。
         return (
           <PlayUrlButtonMemo
             key="playUrl"
             url={playUrl}
             line={playUrlLine(track, quality)}
             miss={playUrlMiss(track, quality)}
+            track={track}
+            playingLocal={playingLocal}
           />
         );
+      }
       // 倍速：放在收藏左边（用户习惯位）；菜单向上弹出
       case "speed":
         return track ? <SpeedMenuMemo key="speed" current={speed} /> : null;
@@ -413,7 +433,7 @@ export function PlayerBar(): React.JSX.Element {
           {/* 实际播的码率（不是"请求了什么"，是"真在播什么"）。
               测不出来就整行不渲染：宁可空着，也不写个 0 kbps 冒充"码率极低"。 */}
           {track && bitrateKbps !== null ? (
-            <div className="truncate text-[11px] tabular-nums text-muted-foreground/80">
+            <div className="truncate text-2xs tabular-nums text-muted-foreground/80">
               {bitrateKbps} kbps
             </div>
           ) : null}
@@ -441,7 +461,7 @@ export function PlayerBar(): React.JSX.Element {
               disabled={!track}
               className={cn(
                 // 辉光颜色跟 --primary 走（color-mix 派生），换肤/换主色时不会留旧色残影
-                "flex h-12 w-12 items-center justify-center rounded-full bg-gradient-to-br from-primary to-primary/80 text-primary-foreground shadow-[0_4px_14px_color-mix(in_srgb,var(--primary)_32%,transparent),0_2px_4px_rgba(0,0,0,0.12),inset_0_1px_2px_rgba(255,255,255,0.2)] transition-[transform,box-shadow] duration-200 ease-out hover:shadow-[0_6px_18px_color-mix(in_srgb,var(--primary)_42%,transparent),0_3px_6px_rgba(0,0,0,0.15),inset_0_1px_2px_rgba(255,255,255,0.25)] hover:scale-105 active:shadow-[inset_0_2px_6px_rgba(0,0,0,0.25)] disabled:cursor-not-allowed disabled:opacity-40",
+                "flex h-12 w-12 items-center justify-center rounded-full bg-gradient-to-br from-primary to-primary/80 text-primary-foreground shadow-[0_4px_14px_color-mix(in_srgb,var(--primary)_32%,transparent),0_2px_4px_rgba(0,0,0,0.12),inset_0_1px_2px_rgba(255,255,255,0.2)] transition-[transform,box-shadow] duration-base ease-soft hover:shadow-[0_6px_18px_color-mix(in_srgb,var(--primary)_42%,transparent),0_3px_6px_rgba(0,0,0,0.15),inset_0_1px_2px_rgba(255,255,255,0.25)] hover:scale-105 active:shadow-[inset_0_2px_6px_rgba(0,0,0,0.25)] disabled:cursor-not-allowed disabled:opacity-40",
                 loading && "animate-pulse",
               )}
             >
@@ -496,10 +516,18 @@ const ProgressSlider = memo(function ProgressSlider(): React.JSX.Element {
   const seekTo = usePlayerStore((s) => s.seekTo);
   const setDragging = usePlayerStore((s) => s.setDragging);
   const [dragPreviewMs, setDragPreviewMs] = useState<number | null>(null);
+  // 悬停预览：鼠标在轨道上但没按下去时，气泡也报出「点这里会跳到哪」
+  const [hoverMs, setHoverMs] = useState<number | null>(null);
 
   const shownPosition = dragPreviewMs ?? pendingSeekMs ?? position;
   const percent =
     duration > 0 ? Math.min(100, Math.max(0, (shownPosition / duration) * 100)) : 0;
+  // 气泡内容：拖动优先于悬停；两者都没有就不出气泡
+  const previewMs = isDraggingProgress ? dragPreviewMs : hoverMs;
+  const previewPercent =
+    previewMs !== null && duration > 0
+      ? Math.min(100, Math.max(0, (previewMs / duration) * 100))
+      : 0;
 
   /** 指针横坐标 → 目标毫秒（时长未知时返回 null，避免除零与「跳到 0」） */
   const ratioFromEvent = (
@@ -519,15 +547,26 @@ const ProgressSlider = memo(function ProgressSlider(): React.JSX.Element {
       e.currentTarget.setPointerCapture(e.pointerId);
       setDragging(true);
       setDragPreviewMs(ms);
+      setHoverMs(null);
     },
     [setDragging],
   );
 
   const onBarMove = useCallback(
     (e: ReactPointerEvent<HTMLDivElement>): void => {
-      if (!usePlayerStore.getState().isDraggingProgress) return;
       const ms = ratioFromEvent(e);
-      if (ms !== null) setDragPreviewMs(ms);
+      if (usePlayerStore.getState().isDraggingProgress) {
+        if (ms !== null) setDragPreviewMs(ms);
+        return;
+      }
+      if (ms === null) {
+        setHoverMs(null);
+        return;
+      }
+      // 气泡只显示 m:ss，同一秒内不必重渲染：指针每移动 1px 都 setState 会让
+      // 这个小树跟着指针频率跑，按「显示的秒」去重后最多 1 次/秒
+      const sec = Math.floor(ms / 1000);
+      setHoverMs((prev) => (prev !== null && Math.floor(prev / 1000) === sec ? prev : ms));
     },
     [],
   );
@@ -538,6 +577,7 @@ const ProgressSlider = memo(function ProgressSlider(): React.JSX.Element {
       const ms = ratioFromEvent(e);
       setDragging(false);
       setDragPreviewMs(null);
+      setHoverMs(null);
       if (ms !== null) void seekTo(ms);
       e.currentTarget.releasePointerCapture(e.pointerId);
     },
@@ -572,7 +612,7 @@ const ProgressSlider = memo(function ProgressSlider(): React.JSX.Element {
   };
 
   return (
-    <div className="flex w-full items-center gap-2 text-[11px] tabular-nums text-muted-foreground">
+    <div className="flex w-full items-center gap-2 text-2xs tabular-nums text-muted-foreground">
       <span className="w-10 text-right selectable">{formatTime(shownPosition)}</span>
       <div
         role="slider"
@@ -587,10 +627,11 @@ const ProgressSlider = memo(function ProgressSlider(): React.JSX.Element {
         onPointerMove={onBarMove}
         onPointerUp={onBarUp}
         onPointerCancel={onBarCancel}
+        onPointerLeave={() => setHoverMs(null)}
         style={{ touchAction: "none" }}
         className="group relative flex h-4 min-w-0 flex-1 cursor-pointer items-center rounded-full"
       >
-        <div className="relative h-1.5 w-full rounded-full bg-secondary/60 transition-[height] duration-[var(--motion-fast)] ease-[var(--motion-ease-out-soft)] group-hover:h-2 group-focus-visible:h-2">
+        <div className="relative h-1.5 w-full rounded-full bg-secondary/60 transition-[height] duration-fast ease-soft group-hover:h-2 group-focus-visible:h-2">
           <div
             className="absolute inset-y-0 left-0 rounded-full bg-primary"
             style={{ width: `${percent}%` }}
@@ -601,21 +642,29 @@ const ProgressSlider = memo(function ProgressSlider(): React.JSX.Element {
           aria-hidden
           className={cn(
             "pointer-events-none absolute top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-primary shadow-[0_1px_4px_rgba(0,0,0,0.3)]",
-            "transition-[opacity,scale] duration-[var(--motion-fast)] ease-[var(--motion-ease-out-soft)]",
+            "transition-[opacity,scale] duration-fast ease-soft",
             isDraggingProgress
               ? "scale-125 opacity-100"
               : "opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100",
           )}
           style={{ left: `${percent}%` }}
         />
-        {/* 时间气泡：只在「手指/鼠标真在拖」时出现（键盘 seek 有 aria-valuetext 兜底） */}
-        {isDraggingProgress && dragPreviewMs !== null ? (
+        {/* 悬停预览线：只在没按下去时出现，1px 竖线标记「点这里落到哪」 */}
+        {!isDraggingProgress && hoverMs !== null ? (
           <div
             aria-hidden
-            className="pointer-events-none absolute bottom-full mb-1.5 -translate-x-1/2 rounded-md bg-popover px-2 py-0.5 text-[11px] font-medium tabular-nums text-popover-foreground shadow-md ring-1 ring-border"
-            style={{ left: `${percent}%` }}
+            className="pointer-events-none absolute top-1/2 h-3.5 w-px -translate-y-1/2 bg-foreground/45"
+            style={{ left: `${previewPercent}%` }}
+          />
+        ) : null}
+        {/* 时间气泡：拖动或悬停时都出现（键盘 seek 有 aria-valuetext 兜底） */}
+        {previewMs !== null ? (
+          <div
+            aria-hidden
+            className="pointer-events-none absolute bottom-full mb-1.5 -translate-x-1/2 rounded-xl border border-border bg-popover/95 px-2 py-0.5 text-2xs font-medium tabular-nums text-popover-foreground shadow-raised backdrop-blur-xl"
+            style={{ left: `${previewPercent}%` }}
           >
-            {formatTime(dragPreviewMs)}
+            {formatTime(previewMs)}
           </div>
         ) : null}
       </div>
@@ -869,7 +918,7 @@ function QualityMenu(props: { current: Quality; platform: string }): React.JSX.E
         return (
         <div
           role="menu"
-          className="absolute bottom-full right-0 z-30 mb-2 w-44 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg"
+          className="absolute bottom-full right-0 z-30 mb-2 w-44 overflow-hidden rounded-xl border border-border bg-popover/95 p-1 backdrop-blur-xl text-popover-foreground shadow-raised"
         >
           {options.map((o) => (
             <button
@@ -887,7 +936,7 @@ function QualityMenu(props: { current: Quality; platform: string }): React.JSX.E
                 {o.value === current ? <Check className="h-3 w-3" /> : null}
                 {o.label}
               </span>
-              <span className="text-[10px] text-muted-foreground">{o.short}</span>
+              <span className="text-3xs text-muted-foreground">{o.short}</span>
             </button>
           ))}
           </div>
@@ -926,7 +975,7 @@ function SpeedMenu(props: { current: number }): React.JSX.Element {
         return (
         <div
           role="menu"
-          className="absolute bottom-full right-0 z-30 mb-2 w-28 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg"
+          className="absolute bottom-full right-0 z-30 mb-2 w-28 overflow-hidden rounded-xl border border-border bg-popover/95 p-1 backdrop-blur-xl text-popover-foreground shadow-raised"
         >
           {SPEED_OPTIONS.map((v) => (
             <button
@@ -943,7 +992,7 @@ function SpeedMenu(props: { current: number }): React.JSX.Element {
                 {v === props.current ? <Check className="h-3 w-3" /> : null}
                 {speedLabel(v)}
               </span>
-              {v === 1 && <span className="text-[10px] text-muted-foreground">原速</span>}
+              {v === 1 && <span className="text-3xs text-muted-foreground">原速</span>}
             </button>
           ))}
           </div>
@@ -1015,7 +1064,7 @@ function SleepTimerMenu(props: {
         return (
         <div
           role="menu"
-          className="absolute bottom-full right-0 z-30 mb-2 w-36 overflow-hidden rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-lg"
+          className="absolute bottom-full right-0 z-30 mb-2 w-36 overflow-hidden rounded-xl border border-border bg-popover/95 p-1 backdrop-blur-xl text-popover-foreground shadow-raised"
         >
           {armed && (
             <button
@@ -1086,75 +1135,153 @@ function PlayModeButton(props: {
   );
 }
 
+/** 本地优先命中层 → 面板文案（Rust `LocalFileHit.kind`，见 local_first.rs 解析链） */
+const LOCAL_HIT_KIND_TEXT: Record<string, string> = {
+  local: "本地曲目（曲库里的文件）",
+  ledger: "下载账本（这首歌下载过，按身份命中）",
+  task: "下载任务记录兜底",
+  orphan: "孤儿文件（下载目录里没登记的文件）",
+  library: "本地曲库（同名 + 同歌手 + 时长差 ≤3s 匹配）",
+};
+
 /**
  * 播放地址入口（qt_admin 专属）：图标按钮，点开向上弹面板展示**当前实际在播**
  * 的地址（换源兜底后指向真正在播的源）、这条地址是**音源包里哪条源**取到的
  * （line，见 @/source-scripts/playurl-line），以及上次取链失败的死因（miss，
  * 逐线路 trace：哪条线挂死/死链/预算耗尽未跑、跨源有没有跑），点地址即复制。
  * 与音质菜单同款：向上弹 + 点外面/Esc 收起。
+ *
+ * 本地播放（本地曲目，或在线曲目被本地优先解析链命中）没有在线地址也没有
+ * 取链环节，面板改显示「本地歌曲 + 本地文件路径 + 是哪层命中的」，见
+ * `playingLocal` 分支。
  */
-function PlayUrlButton(props: { url: string | null; line: string; miss: string }): React.JSX.Element {
+function PlayUrlButton(props: {
+  url: string | null;
+  line: string;
+  miss: string;
+  track: Track | null;
+  /** 引擎这次实际在播本地文件（本地曲目 / 在线曲目被本地优先解析链命中） */
+  playingLocal: boolean;
+}): React.JSX.Element {
   const [open, setOpen] = useState(false);
+  // 本地优先命中的那个文件只有 Rust 侧知道（播放前现查解析链，见 local_first.rs），
+  // 打开面板时问一次；连带记下问的是哪首，切歌之后旧结论作废，不会张冠李戴。
+  const [hit, setHit] = useState<{ key: string; file: LocalFileHit | null } | null>(null);
+  const local = props.playingLocal;
+  const selfPath =
+    props.track !== null && props.track.platform === "local" ? props.track.id : "";
+  const trackKey = props.track !== null ? `${props.track.platform}:${props.track.id}` : "";
+  const remoteHit = hit !== null && hit.key === trackKey ? hit.file : null;
+  const localPath = selfPath.length > 0 ? selfPath : remoteHit !== null ? remoteHit.path : "";
+  const localKind = selfPath.length > 0 ? "local" : remoteHit !== null ? remoteHit.kind : "";
+  const localKindText = LOCAL_HIT_KIND_TEXT[localKind] ?? "";
+  // 本地播放、且不是「本地曲目」（路径要问 Rust）时，hit 还是 null = 还没问/正在问
+  const pendingLocal = local && selfPath.length === 0 && hit === null;
+  const displayUrl = local ? localPath : props.url;
+
+  const emptyText = (): string => {
+    if (!local) return "在线曲目，尚未取到播放地址";
+    return pendingLocal ? "正在查本地文件…" : "没有对应的本地文件（可能刚被移走或删掉）";
+  };
 
   const copy = (): void => {
-    if (!props.url) return;
+    if (!displayUrl) return;
     // 回执走右上角 Toast：面板里那行「已复制」原来只有 1.2 秒，还挤在最底部
     void navigator.clipboard
-      .writeText(props.url)
-      .then(() => toastSuccess("已复制到剪贴板"))
+      .writeText(displayUrl)
+      .then(() => toastSuccess(local ? "已复制文件路径" : "已复制到剪贴板"))
       .catch(() => {});
+  };
+
+  const openPanel = (next: boolean): void => {
+    setOpen(next);
+    const t = props.track;
+    if (!next || !local || t === null || t.platform === "local") return;
+    // 先置 null 让面板显示「正在查本地文件…」，回来再落结论（含「没查到」）
+    setHit(null);
+    const key = `${t.platform}:${t.id}`;
+    resolveLocalFile(t)
+      .then((file) => setHit({ key, file }))
+      .catch(() => setHit({ key, file: null }));
   };
 
   return (
     <Popover
       open={open}
-      onOpenChange={setOpen}
+      onOpenChange={openPanel}
       trigger={(t) => (
-        <ControlButton label="播放地址（仅管理员）" active={t.open} onClick={t.toggle}>
+        <ControlButton
+          label={local ? "本地文件路径（仅管理员）" : "播放地址（仅管理员）"}
+          active={t.open}
+          onClick={t.toggle}
+        >
           <Link2 className="h-4 w-4" />
         </ControlButton>
       )}
     >
       {() => (
-        <div className="absolute bottom-full left-1/2 z-30 mb-2 w-[420px] max-w-[70vw] -translate-x-1/2 rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-lg">
-          <div className="mb-1.5 text-[10px] text-muted-foreground">
-            当前实际播放地址（换源后指向真正在播的源）
+        <div className="absolute bottom-full left-1/2 z-30 mb-2 w-[420px] max-w-[70vw] -translate-x-1/2 rounded-xl border border-border bg-popover/95 backdrop-blur-xl p-3 text-popover-foreground shadow-raised">
+          <div className="mb-1.5 text-3xs text-muted-foreground">
+            {local
+              ? "本地播放：引擎直接读磁盘文件，不经过音源取链（没有在线地址）"
+              : "当前实际播放地址（换源后指向真正在播的源）"}
           </div>
           {/* 音源线路：本次取链命中 chain.json 里的哪条源（安卓端同款文案）。
-              「未知」= 走的是音源包内 10 分钟缓存，或引擎页比宿主旧没有这个字段 */}
+              「未知」= 走的是音源包内 10 分钟缓存，或引擎页比宿主旧没有这个字段。
+              本地播放没有取链环节，直接标注「本地歌曲」——本地优先命中时 platform
+              还是原平台，线路名会照上一次在线播放的残留显示出来，不标就只有误导 */}
           <div
-            className="mb-1.5 text-[11px] leading-relaxed"
-            title="未知 = 走的是音源包内缓存，或本次未重新取链"
+            className="mb-1.5 text-2xs leading-relaxed"
+            title={
+              local
+                ? "本地播放由引擎直接读文件，没有音源线路"
+                : "未知 = 走的是音源包内缓存，或本次未重新取链"
+            }
           >
             <span className="text-muted-foreground">音源线路：</span>
-            <span className={props.line ? "break-all text-foreground/85" : "text-muted-foreground"}>
-              {props.line || "未知"}
-            </span>
+            {local ? (
+              <span className="text-muted-foreground">本地歌曲（不走音源取链）</span>
+            ) : (
+              <span className={props.line ? "break-all text-foreground/85" : "text-muted-foreground"}>
+                {props.line || "未知"}
+              </span>
+            )}
           </div>
-          {props.url ? (
+          {/* 本地播放的另一半事实：响的是哪个本地文件 —— 本地曲目 = 曲库文件，
+              在线曲目 = 本地优先解析链命中的下载/孤儿/曲库文件（local_first.rs） */}
+          {local && localKindText ? (
+            <div className="mb-1.5 text-2xs leading-relaxed">
+              <span className="text-muted-foreground">本地来源：</span>
+              <span className="break-all text-foreground/85">{localKindText}</span>
+            </div>
+          ) : null}
+          {displayUrl ? (
             <button
               type="button"
               onClick={copy}
-              title="点击复制"
-              className="block max-h-24 w-full overflow-y-auto break-all rounded-md bg-secondary/60 px-2 py-1.5 text-left font-mono text-[11px] leading-relaxed transition-colors hover:bg-secondary"
+              title={local ? "点击复制路径" : "点击复制"}
+              className="block max-h-24 w-full overflow-y-auto break-all rounded-md bg-secondary/60 px-2 py-1.5 text-left font-mono text-2xs leading-relaxed transition-colors hover:bg-secondary"
             >
-              {props.url}
+              {displayUrl}
             </button>
           ) : (
             <div className="rounded-md bg-secondary/40 px-2 py-1.5 text-xs text-muted-foreground">
-              本地曲目，或尚未取到播放地址
+              {emptyText()}
             </div>
           )}
           {/* 上次取链死因：bundle 的逐线路 trace（哪条线挂死/死链/预算耗尽未跑、
-              跨源兜底有没有跑）。没有它，「取不到地址」在 PC 上只能靠猜 */}
-          {props.miss ? (
-            <div className="mt-1.5 text-[10px] leading-relaxed">
+              跨源兜底有没有跑）。没有它，「取不到地址」在 PC 上只能靠猜。
+              本地播放没有取链环节，不显示这段 */}
+          {!local && props.miss ? (
+            <div className="mt-1.5 text-3xs leading-relaxed">
               <span className="text-muted-foreground">上次取链死因：</span>
               <span className="break-all font-mono text-amber-500/90">{props.miss}</span>
             </div>
           ) : null}
-          {props.url ? (
-            <div className="mt-1.5 text-[10px] text-muted-foreground">点击地址可复制</div>
+          {displayUrl ? (
+            <div className="mt-1.5 text-3xs text-muted-foreground">
+              {local ? "点击路径可复制" : "点击地址可复制"}
+            </div>
           ) : null}
         </div>
       )}
@@ -1308,7 +1435,7 @@ function ShareButton(props: { track: Track }): React.JSX.Element {
       )}
     >
       {() => (
-        <div className="absolute bottom-full left-1/2 z-30 mb-2 -translate-x-1/2 rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-lg">
+        <div className="absolute bottom-full left-1/2 z-30 mb-2 -translate-x-1/2 rounded-xl border border-border bg-popover/95 backdrop-blur-xl p-3 text-popover-foreground shadow-raised">
           <ShareCardPanel track={props.track} />
         </div>
       )}
@@ -1330,7 +1457,7 @@ function SourceSwitchButton(props: { track: Track }): React.JSX.Element {
       )}
     >
       {(close) => (
-        <div className="absolute bottom-full left-1/2 z-30 mb-2 -translate-x-1/2 rounded-lg border border-border bg-popover p-3 text-popover-foreground shadow-lg">
+        <div className="absolute bottom-full left-1/2 z-30 mb-2 -translate-x-1/2 rounded-xl border border-border bg-popover/95 backdrop-blur-xl p-3 text-popover-foreground shadow-raised">
           <SourceSwitchPanel
             track={props.track}
             onPick={(candidate) => {
@@ -1367,6 +1494,9 @@ function ControlButton(props: {
   ariaExpanded?: boolean;
   children: React.ReactNode;
 }): React.JSX.Element {
+  // 悬停提示走自绘 tooltip（原生 title 有 1s 延迟、深色皮肤下是系统白框）；
+  // 这一处覆盖播放条全部图标按钮：上一首/播放/下一首/模式/队列/音量/收藏…
+  const hint = useHint(props.label);
   const filled = props.active === true && props.emphasis === true;
   const fill =
     props.tone === "destructive"
@@ -1377,28 +1507,31 @@ function ControlButton(props: {
         "bg-destructive/60 text-white shadow-[0_2px_8px_color-mix(in_srgb,var(--destructive)_25%,transparent)] hover:brightness-110 active:brightness-95"
       : "bg-primary/60 text-primary-foreground shadow-[0_2px_8px_color-mix(in_srgb,var(--primary)_25%,transparent)] hover:brightness-110 active:brightness-95";
   return (
-    <button
-      type="button"
-      aria-label={props.label}
-      title={props.label}
-      aria-pressed={props.active}
-      aria-haspopup={props.ariaHasPopup}
-      aria-expanded={props.ariaExpanded}
-      disabled={props.disabled}
-      onClick={props.onClick}
-      className={cn(
-        "flex h-9 w-9 items-center justify-center rounded-full transition-colors",
-        // 其余按钮一律不铺底色（用户口径：除四个状态按钮外不要背景色），
-        // 只留 hover 浮出的浅底做可点提示。
-        // 开启态填充从 80% 降到 60%（用户反馈「选中的颜色再浅一点」），
-        // 辉光同步收敛——中央播放键仍是实心，主次层级不受影响。
-        filled ? fill : "text-foreground/80 hover:bg-secondary/50 hover:text-foreground active:bg-secondary/70",
-        // 禁用态：压暗 + 去掉交互反馈，跟其余按钮的 hover 浅底区分开
-        props.disabled === true && "cursor-not-allowed opacity-40 hover:bg-transparent",
-      )}
-    >
-      {props.children}
-    </button>
+    <>
+      <button
+        type="button"
+        {...hint.hintProps}
+        aria-label={props.label}
+        aria-pressed={props.active}
+        aria-haspopup={props.ariaHasPopup}
+        aria-expanded={props.ariaExpanded}
+        disabled={props.disabled}
+        onClick={props.onClick}
+        className={cn(
+          "flex h-9 w-9 items-center justify-center rounded-full transition-colors",
+          // 其余按钮一律不铺底色（用户口径：除四个状态按钮外不要背景色），
+          // 只留 hover 浮出的浅底做可点提示。
+          // 开启态填充从 80% 降到 60%（用户反馈「选中的颜色再浅一点」），
+          // 辉光同步收敛——中央播放键仍是实心，主次层级不受影响。
+          filled ? fill : "text-foreground/80 hover:bg-secondary/50 hover:text-foreground active:bg-secondary/70",
+          // 禁用态：压暗 + 去掉交互反馈，跟其余按钮的 hover 浅底区分开
+          props.disabled === true && "cursor-not-allowed opacity-40 hover:bg-transparent",
+        )}
+      >
+        {props.children}
+      </button>
+      {hint.hintLayer}
+    </>
   );
 }
 
@@ -1484,7 +1617,7 @@ function VolumeControl(): React.JSX.Element {
         onKeyDown={onKeyDown}
         className="group relative flex h-4 min-w-0 flex-1 cursor-pointer items-center"
       >
-        <div className="relative h-1.5 w-full rounded-full bg-secondary/60 transition-[height] duration-150 group-hover:h-2">
+        <div className="relative h-1.5 w-full rounded-full bg-secondary/60 transition-[height] duration-fast group-hover:h-2">
           <div
             className="absolute inset-y-0 left-0 rounded-full bg-primary"
             style={{ width: `${effective * 100}%` }}
@@ -1492,7 +1625,7 @@ function VolumeControl(): React.JSX.Element {
         </div>
         <div
           aria-hidden
-          className="pointer-events-none absolute top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-primary opacity-0 shadow-[0_1px_4px_rgba(0,0,0,0.3)] transition-opacity duration-150 group-hover:opacity-100"
+          className="pointer-events-none absolute top-1/2 h-3 w-3 -translate-x-1/2 -translate-y-1/2 rounded-full bg-primary opacity-0 shadow-[0_1px_4px_rgba(0,0,0,0.3)] transition-opacity duration-fast group-hover:opacity-100"
           style={{ left: `${effective * 100}%` }}
         />
       </div>

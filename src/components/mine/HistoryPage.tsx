@@ -122,7 +122,7 @@ export function HistoryPage(): React.JSX.Element {
     <div className="flex h-full min-w-0 flex-col">
       <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-3">
         <div className="min-w-0">
-          <h1 className="text-base font-medium">最近播放</h1>
+          <h1 className="text-xl font-bold tracking-tight">最近播放</h1>
           <p className="mt-1 text-xs text-muted-foreground">
             共 {tracks.length} 首
             {missing > 0 && (

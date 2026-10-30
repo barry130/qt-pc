@@ -578,7 +578,7 @@ export function LyricWindow(): React.JSX.Element {
       >
         {toolbarVisible && (
           <div className="relative">
-          <div className="flex items-center gap-0.5 rounded-full bg-black/75 px-2 py-1 shadow-lg">
+          <div className="flex items-center gap-0.5 rounded-full bg-black/75 px-2 py-1 shadow-raised">
             <ToolButton
               title={paused ? "播放" : "暂停"}
               onClick={togglePlay}
@@ -594,12 +594,12 @@ export function LyricWindow(): React.JSX.Element {
             </ToolButton>
             <span className="mx-0.5 h-4 w-px bg-white/20" />
             <ToolButton title="缩小字号" onClick={() => bumpFont(-2)}>
-              <span className="flex items-center text-[11px] font-semibold leading-none">
+              <span className="flex items-center text-2xs font-semibold leading-none">
                 A<Minus size={10} />
               </span>
             </ToolButton>
             <ToolButton title="放大字号" onClick={() => bumpFont(2)}>
-              <span className="flex items-center text-[11px] font-semibold leading-none">
+              <span className="flex items-center text-2xs font-semibold leading-none">
                 A<Plus size={10} />
               </span>
             </ToolButton>
@@ -685,7 +685,7 @@ export function LyricWindow(): React.JSX.Element {
         )}
 
         {paused && hasTrack && (
-          <div className="px-4 text-[11px] text-white/50" style={{ textAlign }}>
+          <div className="px-4 text-2xs text-white/50" style={{ textAlign }}>
             已暂停
           </div>
         )}

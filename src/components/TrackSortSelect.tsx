@@ -3,10 +3,14 @@
  *
  * 2026-10-24 晚改口径（用户 m00002 / m00029）：「排序格式换一下，换成两个弹窗，
  * 上面显示按歌曲名、按专辑名、按歌手名，下面显示正序、倒序。默认顺序都不勾选。」
- * 所以这里不再是塞了 7 项的原生 `<select>`，而是**两个纵向堆叠的弹层**：
+ * 所以这里不再是塞了 7 项的原生 `<select>`，而是**两个并排的触发按钮**（各带一个弹层）：
  *
- * - 上：维度弹窗（按歌曲名 / 按专辑名 / 按歌手名）；
- * - 下：方向弹窗（正序 / 倒序），没选维度时置灰 —— 没有维度就没有方向；
+ * - 左：维度弹窗（按歌曲名 / 按专辑名 / 按歌手名）；
+ * - 右：方向弹窗（正序 / 倒序），没选维度时置灰 —— 没有维度就没有方向；
+ *
+ * 2026-10-29（用户 m03542「把排序和方向改为一行的吧」）：两个按钮原先上下堆叠，
+ * 在页头右侧占掉两行高度、和旁边的搜索框对不齐；改成一排后整块矮 28px，
+ * 右边缘仍与搜索框对齐。
  * - 默认两个都不勾选（value = `DEFAULT_TRACK_SORT`），列表保持音源给的原始顺序；
  *   不再显示「默认顺序」这个假选项，再点一次已选维度就是取消排序。
  *
@@ -45,7 +49,7 @@ const TRIGGER_CLASS =
 
 /** 弹层面板的公共样式（absolute 定位由面板自己带，上下文由 Popover 包裹层提供） */
 const PANEL_CLASS =
-  "absolute right-0 top-full z-50 mt-1 overflow-hidden rounded-xl border border-border bg-popover/95 py-1 shadow-2xl backdrop-blur-xl";
+  "absolute right-0 top-full z-50 mt-1 overflow-hidden rounded-xl border border-border bg-popover/95 py-1 shadow-raised backdrop-blur-xl";
 
 export function TrackSortSelect(props: TrackSortSelectProps): JSX.Element {
   const { value, onChange, label = "排序方式", className } = props;
@@ -72,7 +76,7 @@ export function TrackSortSelect(props: TrackSortSelectProps): JSX.Element {
       role="group"
       aria-label={label}
       title="排序方式（只影响当前列表的显示顺序，不改歌单本身）"
-      className={cn("flex shrink-0 flex-col items-end gap-1", className)}
+      className={cn("flex shrink-0 items-center gap-1", className)}
     >
       <Popover
         trigger={(state) => (
@@ -129,7 +133,7 @@ export function TrackSortSelect(props: TrackSortSelectProps): JSX.Element {
             aria-haspopup="listbox"
             aria-expanded={state.open}
             disabled={field === null}
-            title={field === null ? "先在上面选排序字段" : "排序方向"}
+            title={field === null ? "先选排序字段" : "排序方向"}
             onClick={state.toggle}
             className={cn(TRIGGER_CLASS, state.open && "bg-secondary")}
           >

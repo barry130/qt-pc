@@ -89,7 +89,7 @@ export function FeedbackDetailPage(): React.JSX.Element {
     <div className="flex h-full min-w-0 flex-col">
       <div className="flex items-center gap-2 px-5 pb-2 pt-6">
         <BackButton />
-        <h1 className="text-base font-semibold">反馈详情</h1>
+        <h1 className="text-xl font-bold tracking-tight">反馈详情</h1>
       </div>
 
       <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto px-4 pb-4">
@@ -106,12 +106,12 @@ export function FeedbackDetailPage(): React.JSX.Element {
               <div className="rounded-2xl border border-border bg-card/60 p-5">
                 <div className="flex items-center gap-2">
                   <span
-                    className={`rounded px-1.5 py-0.5 text-[11px] font-medium ${feedbackTypeClass(fb.type)}`}
+                    className={`rounded px-1.5 py-0.5 text-2xs font-medium ${feedbackTypeClass(fb.type)}`}
                   >
                     {feedbackTypeLabel(fb.type)}
                   </span>
                   <span
-                    className={`rounded px-1.5 py-0.5 text-[11px] font-medium ${feedbackStatusClass(fb.status)}`}
+                    className={`rounded px-1.5 py-0.5 text-2xs font-medium ${feedbackStatusClass(fb.status)}`}
                   >
                     {feedbackStatusLabel(fb.status)}
                   </span>
@@ -120,7 +120,7 @@ export function FeedbackDetailPage(): React.JSX.Element {
                 <p className="mt-1.5 whitespace-pre-wrap text-sm leading-relaxed text-muted-foreground">
                   {fb.content}
                 </p>
-                <div className="mt-2.5 flex flex-wrap gap-x-3 text-[11px] text-muted-foreground">
+                <div className="mt-2.5 flex flex-wrap gap-x-3 text-2xs text-muted-foreground">
                   {fb.createTime.length > 0 && <span>{fb.createTime}</span>}
                   {fb.device.length > 0 && (
                     <span>{[fb.device, fb.os].filter((s) => s.length > 0).join(" · ")}</span>
@@ -157,11 +157,11 @@ export function FeedbackDetailPage(): React.JSX.Element {
                                 {r.nickname.length > 0 ? r.nickname : "用户"}
                               </span>
                               {official && (
-                                <span className="rounded bg-primary/10 px-1 py-px text-[10px] text-primary">
+                                <span className="rounded bg-primary/10 px-1 py-px text-3xs text-primary">
                                   官方
                                 </span>
                               )}
-                              <span className="text-[11px] text-muted-foreground">
+                              <span className="text-2xs text-muted-foreground">
                                 {formatFeedbackTime(r.replyTime)}
                               </span>
                             </div>

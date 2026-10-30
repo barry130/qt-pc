@@ -2094,6 +2094,57 @@ CHAIN_BUDGET_MS 9s + CHAIN_GRACE_MS 250ms = 9250ms（链内预算，四端共用
 
 ---
 
+## 7.13 本地优先播放（解析链 / 替身链）
+
+**动机**（用户 2026-10-28 提出）：① 在线歌明明下载过、本地曲库里也有，播放还要走网络取链——断网或播放地址过期就失败；② 本地收藏指向的文件被移动/改名/删除后，点开直接报「文件不存在」，永远放不出来。
+
+两条链共一把总开关 `play.localFirst`（settings 表；键不存在按**开**，新功能默认生效；Rust 侧 `local_first::enabled` 现读，前端设置 → 播放条「本地优先播放」开关）。关 = 两条链全关，连老的「已下载文件离线播」一起关——用户要在线高音质时不能被本地文件截和。
+
+### 7.13.1 在线歌解析链（播放前先找本地文件）
+
+在线歌每次 LoadJob 取链**之前**跑（`local_first::find_online_local_file`，全本地查询，无网络）：
+
+| 顺序 | 池 | 匹配方式 | 说明 |
+|---|---|---|---|
+| ① | `download_files` 账本 | 身份键 `platform:原始id` | 下载完成时写的「身份→文件」快照；下载任务行删了它还在 |
+| ② | `download_tasks`（status=done） | 身份键 | 存量兜底：V19 前已完成的任务靠启动对账 `rescue_done_tasks_to_ledger` 补进账本，正常都走 ① |
+| ③ | （保留位，无池） | — | — |
+| ④ | `orphan_files` 孤儿索引 | K2 元数据级 | 清了下载记录/移动进来的存量孤儿文件，标题+歌手+时长三关都过才算命中 |
+| ⑤ | `tracks` 本地曲库 | K2 元数据级 | 本地扫描进库的歌（K1：`title` 全等 + 歌手 token 相交 + 时长差 ≤3s） |
+
+命中且文件确实在盘上 → 直接当本地文件播（`PlaySource::Local`，跳过全部取链）。文件不在 → 顺手清账本/孤儿尸体再降级到下一池。K2 护栏：标题归一化后全等（`normalize_text` 去标点/空白/大小写），歌手 token 集合相交，时长差 ≤3s（任一侧未知放行——孤儿文件读不到时长的情况不少）。
+
+### 7.13.2 本地歌替身链（文件不在了找替身顶上）
+
+本地歌文件不在时（`LoadJob::run` 本地分支），**非预热**任务走替身链（`local_first::find_local_substitute`，预热不找替身——投机加载，真点播时才值得找）：
+
+| 池 | 来源 | 匹配 | 命中后 |
+|---|---|---|---|
+| A 本地曲库 | `tracks` 全表 | K1 | 直接播本地替身 |
+| B 账本+孤儿 | `download_files` + `orphan_files` | K2 | 直接播本地替身 |
+| C 在线搜索 | `search_bridge::ask`（`title singer` 关键词） | 前 5 条里时长最接近的第一条（护栏 ≤5s，都不接近取第 1 条兜底；不做标题复核——复核会把「现场版/重录版」这类真实存在的替身也拒掉） | 起一个**新的 LoadJob** 走完整在线链（取链→构建→回发），失败提示复用 |
+
+**不改收藏**（用户 2026-10-28 定案）：替身链只决定本次播什么，`liked_songs` / `liked_song_playlists` 一律不动——收藏是用户自己落的选择，失效时自动顶播可以，替用户做主重链不行。
+
+### 7.13.3 账本生命周期（download_files）
+
+| 时机 | 动作 |
+|---|---|
+| 下载完成 | `upsert_download_file` 写入（身份 + 文件 + 冗余元数据） |
+| 删除任务且勾选删文件 | `remove_download_file_by_path` 同步删账本 |
+| 启动对账（`reconcile`） | `rescue_done_tasks_to_ledger`（V19 前存量补录）→ 清文件已消失的账本/孤儿条目 → 全量重建 `orphan_files`（扫描下载目录 + 本地目录，跳过已入账/已在库文件，内嵌标签读元数据） |
+| 解析链发现文件不在 | 顺手清账本/孤儿尸体，降级下一池 |
+
+### 7.13.4 实现锚点
+
+- `src-tauri/src/local_first.rs`：匹配器（`normalize_text`/`singer_tokens`/`singers_overlap`/`duration_close_ms`/`strict_hit_track`/`strict_hit_meta`/`pick_best_search`）、两条链、孤儿扫描、对账、总开关读取。
+- `src-tauri/src/db/store/downloads.rs`：账本/孤儿 CRUD（`MetaFileRow`）。
+- `src-tauri/src/audio/engine.rs::LoadJob::run`：两处接入（本地分支替身链 / 在线分支解析链）；在线替身经 `spawn_load_job` 间接 spawn——run() 里直接 `spawn(job.run())` 是异步自递归，匿名 future 类型无限自嵌，rustc 证不出 Send（E0283），同步函数转一道后环被断开。
+- `src-tauri/src/db/migrations.rs` V19：`download_files`（key 主键 + file_path 唯一）+ `orphan_files`（file_path 主键 + 元数据列 + 元数据索引）。
+- 命令：`get_local_first` / `set_local_first`（commands.rs）。
+
+---
+
 ## 8. 数据存储设计
 
 ## 8.1 数据目录
@@ -2374,6 +2425,40 @@ CREATE INDEX idx_download_tasks_status ON download_tasks(status);
 `find_download_task` 按 `(track_id, quality)` 命中），后者是**实际交付**。
 下载列表展示后者（`actualQuality || quality`）——请求 flac 而线路只回 320k mp3
 时标请求档就是虚标。
+
+### download_files / orphan_files（v19，本地优先播放）
+
+```sql
+-- 文件账本：下载完成时把「身份 → 文件」固化下来。与 download_tasks 的
+-- 区别是生命周期——任务行会随「清空列表 / 删除任务」消失，账本行只在
+-- 文件真的没了时才消失（§7.13.4）。key = platform:原始id。
+CREATE TABLE download_files (
+  key TEXT PRIMARY KEY,
+  file_path TEXT NOT NULL UNIQUE,
+  title TEXT NOT NULL,
+  singer TEXT NOT NULL,
+  album TEXT,
+  duration_ms INTEGER NOT NULL DEFAULT 0
+);
+
+-- 孤儿索引：没进账本也没进本地曲库的存量音频文件（清了下载记录的成品、
+-- 用户手动拷进下载目录的文件）。每次启动对账全量重建；元数据来自内嵌
+-- 标签，读不到就留空（K2 匹配对未知放行）。file_path 同时是主键。
+CREATE TABLE orphan_files (
+  file_path TEXT PRIMARY KEY,
+  title TEXT NOT NULL DEFAULT '',
+  singer TEXT NOT NULL DEFAULT '',
+  album TEXT,
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  size INTEGER NOT NULL DEFAULT 0,
+  indexed_at INTEGER NOT NULL
+);
+CREATE INDEX idx_orphan_files_meta ON orphan_files(title, singer);
+```
+
+两张表都是**快照表**：不设外键、不跟随 tracks / download_tasks 级联——
+账本的价值恰恰是「源行删了它还在」（解析链 §7.13.1 池①）。
+
 ### scan_dirs
 
 ```sql

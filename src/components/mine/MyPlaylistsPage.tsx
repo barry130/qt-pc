@@ -210,7 +210,7 @@ export function MyPlaylistsPage(): React.JSX.Element {
   return (
     <div className="flex h-full min-w-0 flex-col">
       <div className="border-b border-border px-4 py-3">
-        <h1 className="text-base font-medium">我的歌单</h1>
+        <h1 className="text-xl font-bold tracking-tight">我的歌单</h1>
         <p className="mt-1 text-xs text-muted-foreground">
           共 {local.length} 个本地歌单 · {online.length} 个在线歌单
         </p>

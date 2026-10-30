@@ -62,6 +62,10 @@ pub fn is_audio_file(path: &Path) -> bool {
 
 /// 文件名（不含扩展名）降级解析：按 `" - "` 分割，第 0 段作歌手、其余作标题；
 /// 没有分隔符则整段作标题、歌手留空。返回 `(singer, title)`。
+///
+/// 顺序只是**展示用的主读法**：`晴天 - 周杰伦.mp3` 这种「歌名 - 歌手」的
+/// 存量文件同样常见，从字符串本身分不出来。所以匹配层（`local_first` 的
+/// `row_hit_meta`）会把这一对交换后再试一次——解析这里不需要二选一。
 pub fn parse_file_stem(stem: &str) -> (String, String) {
     match stem.split_once(FILENAME_SEPARATOR) {
         Some((singer, title)) => (singer.trim().to_string(), title.trim().to_string()),

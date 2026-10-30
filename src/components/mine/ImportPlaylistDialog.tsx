@@ -220,7 +220,7 @@ export function ImportPlaylistDialog(props: {
         if (e.target === e.currentTarget && !busy) props.onClose();
       }}
     >
-      <div className="w-[30rem] rounded-2xl border border-white/20 bg-white/70 p-5 text-card-foreground shadow-2xl backdrop-blur-xl dark:border-white/10 dark:bg-black/40">
+      <div className="w-[30rem] rounded-2xl border border-white/20 bg-white/70 p-5 text-card-foreground shadow-overlay backdrop-blur-xl dark:border-white/10 dark:bg-black/40">
         <h2 className="text-base font-medium">导入歌单</h2>
         <div className="mt-2 flex gap-1 rounded-md bg-muted p-0.5 text-xs">
           {(

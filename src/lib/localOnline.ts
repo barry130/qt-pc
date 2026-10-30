@@ -1,6 +1,13 @@
 import * as sourceApi from "@/source-scripts";
 import { playUrlHitLine } from "@/source-scripts/playurl-line";
-import { getLyric, notifyLyricManuallyPicked, readLocalLyric, saveLyric } from "@/services/ipc";
+import {
+  getLyric,
+  getPlaybackState,
+  notifyLyricManuallyPicked,
+  readLocalLyric,
+  resolveLocalFile,
+  saveLyric,
+} from "@/services/ipc";
 import { registryHasSource } from "@/stores/sourceRegistry";
 import type { PlayUrlLine } from "@/source-engine/client";
 import type { Lyric, Quality, SourceId, Track } from "@/types";
@@ -131,6 +138,8 @@ async function fetchCrossSourceLyric(
  * 1. **用户手动挑的词**（库里 `manual`）—— 直接回读，连源站都不打；
  * 2. **本地文件自带的词**（库里 `source` 是 `local-lrc` / `local-tag`，或现读文件）——
  *    本地曲目优先用它，离线也有词；
+ * 2.5 **在播本地文件的内嵌词**（在线曲目被本地优先命中，`isLocal` 为真）——同样是
+ *    「文件里就有这首的词」，优先于在线取词，但不落库（主键归在线源）；
  * 3. 在线词：换源兜底在播（cross 非空）时优先取目标源的词——线路带精确命中歌
  *    （targetSong）就按它取，否则在目标源按歌名搜；目标源取不到词才退回原源；
  *    本地曲目没有平台 id，按歌名 + 歌手走酷我匹配（匹配不到返回空歌词，
@@ -159,6 +168,16 @@ async function fetchPlaybackLyric(
   if (saved !== null && (saved.manual || isLocalFileLyric(saved.source))) {
     fromSaved = true;
     return { lyric: saved.lyric, fromSaved };
+  }
+
+  // 在播的是**本地文件**（本地优先命中，platform 仍是在线源）时，文件自带的内嵌歌词
+  // 同样优先于在线词：文件里那份就是这首歌的词，没必要再去源站猜一个版本来盖它。
+  // 与「本地曲目」的区别只在于不落库 —— 主键是 `platform:id`，把 local-tag 写进去会占用
+  // 在线词槽，之后就算文件被删也一直回读到它。
+  const onDisk = await readPlayingLocalFileLyric(track);
+  if (onDisk !== null) {
+    fromSaved = true;
+    return { lyric: onDisk, fromSaved };
   }
 
   try {
@@ -210,6 +229,37 @@ const LOCAL_FILE_LYRIC_SOURCES = ["local-lrc", "local-tag"];
 /** 这份落库的词是不是「本地文件自带的」（同名 .lrc / 内嵌标签） */
 function isLocalFileLyric(source: string): boolean {
   return LOCAL_FILE_LYRIC_SOURCES.includes(source);
+}
+
+/**
+ * **在播曲目实际用的是本地文件**时，读那个文件自带的歌词（同名 `.lrc` 优先，其次内嵌）。
+ *
+ * 触发条件只有一条：引擎快照的 `isLocal === true` 且当前曲目就是 `track`。这是唯一
+ * 权威信号 —— 本地优先（`play.localFirst`）命中时 `platform` 仍是在线源，靠它猜不出来。
+ *
+ * 为什么现查播放状态而不是读前端的播放器 store：桌面歌词窗口是独立 WebView，不走
+ * 主窗口的 store，只有 IPC 是两边共用的。
+ *
+ * 拿到路径不落库（见调用点注释），所以这里只返回正文。
+ */
+async function readPlayingLocalFileLyric(track: Track): Promise<Lyric | null> {
+  if (track.platform === "local") return null; // 本地曲目走下面的既有分支
+  let localSnapshot: boolean;
+  try {
+    const st = await getPlaybackState();
+    const cur = st.track;
+    localSnapshot =
+      st.isLocal && cur !== null && cur.id === track.id && cur.platform === track.platform;
+  } catch {
+    // 非 Tauri 环境（单测）/ 引擎未就绪：当作「不是在播本地文件」
+    return null;
+  }
+  if (!localSnapshot) return null;
+  const hit = await resolveLocalFile(track).catch(() => null);
+  if (hit === null || hit.path.length === 0) return null;
+  const found = await readLocalLyric(hit.path).catch(() => null);
+  if (found === null || found.lrc.trim().length === 0) return null;
+  return { lrc: found.lrc, translation: "" };
 }
 
 /**

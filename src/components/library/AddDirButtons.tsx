@@ -73,7 +73,7 @@ export function AddDirButtons(props: {
         {menuOpen && (
           <ul
             role="menu"
-            className="absolute left-0 top-full z-20 mt-1 min-w-[7rem] rounded-md border border-border bg-background py-1 shadow-md"
+            className="absolute left-0 top-full z-20 mt-1 min-w-[7rem] rounded-xl border border-border bg-popover/95 py-1 shadow-raised backdrop-blur-xl"
           >
             {drives.length === 0 ? (
               <li className="px-3 py-1.5 text-xs text-muted-foreground">

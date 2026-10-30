@@ -96,7 +96,7 @@ export function DislikeSection(): React.JSX.Element {
                     : r.nameRaw}
                 </span>
                 <span
-                  className="shrink-0 rounded bg-secondary px-1 py-px text-[10px] text-muted-foreground"
+                  className="shrink-0 rounded bg-secondary px-1 py-px text-3xs text-muted-foreground"
                   title={
                     r.kind === "singer"
                       ? "这位歌手的所有歌都不会自动出现"

@@ -381,7 +381,7 @@ export function SourcePackageSection(): React.JSX.Element {
             </span>
           )}
           {metaPacks.length > 0 && (
-            <span className="text-[11px] font-medium text-muted-foreground">数据包</span>
+            <span className="text-2xs font-medium text-muted-foreground">数据包</span>
           )}
           {metaPacks.map((p) => (
             <PackRow
@@ -411,7 +411,7 @@ export function SourcePackageSection(): React.JSX.Element {
             </div>
           )}
           {playPacks.length > 0 && (
-            <span className="mt-1 text-[11px] font-medium text-muted-foreground">
+            <span className="mt-1 text-2xs font-medium text-muted-foreground">
               播放包
             </span>
           )}
@@ -538,7 +538,7 @@ export function SourcePackageSection(): React.JSX.Element {
       ) : null}
       {clipTip !== null && !preview && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-sm rounded-xl border border-border bg-card/90 p-4 shadow-lg backdrop-blur-xl">
+          <div className="w-full max-w-sm rounded-xl border border-border bg-card/90 p-4 shadow-raised backdrop-blur-xl">
             <div className="text-sm font-medium text-foreground">
               检测到剪贴板有音源包链接
             </div>
@@ -611,7 +611,7 @@ export function InstallPreviewDialog(props: {
   ];
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-      <div className="w-full max-w-sm rounded-xl border border-border bg-card/90 p-4 shadow-lg backdrop-blur-xl">
+      <div className="w-full max-w-sm rounded-xl border border-border bg-card/90 p-4 shadow-raised backdrop-blur-xl">
         <div className="text-sm font-medium text-foreground">安装音源包</div>
         <div className="mt-2 flex flex-col gap-1 text-xs">
           {rows.map(([key, value]) => (
@@ -622,12 +622,12 @@ export function InstallPreviewDialog(props: {
           ))}
         </div>
         {p.installedCode > 0 ? (
-          <p className="mt-2 text-[11px] text-muted-foreground">
+          <p className="mt-2 text-2xs text-muted-foreground">
             将替换已安装的 v{p.installedCode}（同 id 原位更新）
           </p>
         ) : null}
         {p.signatureVerified ? (
-          <div className="mt-2 rounded-lg bg-primary/10 px-3 py-2 text-[11px] leading-relaxed text-primary">
+          <div className="mt-2 rounded-lg bg-primary/10 px-3 py-2 text-2xs leading-relaxed text-primary">
             ✓ 官方签名校验通过（ed25519，与官方发布密钥匹配）
           </div>
         ) : null}
@@ -703,13 +703,13 @@ export function PackRow(props: {
         </button>
       </div>
       {metaBits.length > 0 ? (
-        <span className="pl-5 text-[11px] text-muted-foreground">
+        <span className="pl-5 text-2xs text-muted-foreground">
           {metaBits.join(" · ")}
           {errSummary ? ` · 上次失败：${errSummary}` : ""}
         </span>
       ) : null}
       {activePlayWarn ? (
-        <span className="pl-5 text-[11px] text-destructive">{activePlayWarn}</span>
+        <span className="pl-5 text-2xs text-destructive">{activePlayWarn}</span>
       ) : null}
     </div>
   );

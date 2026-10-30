@@ -12,7 +12,9 @@
     "lint": "eslint .",
     "test": "node scripts/sync-config.mjs --check && vitest run",
     "config:sync": "node scripts/sync-config.mjs",
-    "config:check": "node scripts/sync-config.mjs --check"
+    "config:check": "node scripts/sync-config.mjs --check",
+    "check:ui": "node scripts/check-motion.mjs",
+    "check": "node scripts/sync-config.mjs --check && tsc --noEmit && node scripts/check-motion.mjs && eslint . --max-warnings 0 && vitest run"
   },
   "dependencies": {
     "@tanstack/react-router": "1.170.32",

@@ -154,7 +154,7 @@ export function ProfilePage(): React.JSX.Element {
               <UserRound className="h-4 w-4 shrink-0 text-primary" />
               <span className="min-w-0 flex-1">
                 <span className="block truncate text-sm font-medium">编辑资料</span>
-                <span className="block truncate text-[11px] text-muted-foreground">
+                <span className="block truncate text-2xs text-muted-foreground">
                   昵称、邮箱与密码
                 </span>
               </span>
@@ -165,7 +165,7 @@ export function ProfilePage(): React.JSX.Element {
       </div>
 
       <section className="px-5 py-4">
-        <h2 className="mb-2.5 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+        <h2 className="mb-2.5 text-2xs font-medium uppercase tracking-wider text-muted-foreground">
           常用
         </h2>
         <div className="grid grid-cols-2 gap-2.5">
@@ -185,7 +185,7 @@ export function ProfilePage(): React.JSX.Element {
                   <span className="block truncate text-sm font-medium">
                     {item.label}
                   </span>
-                  <span className="block truncate text-[11px] text-muted-foreground">
+                  <span className="block truncate text-2xs text-muted-foreground">
                     {item.hint}
                   </span>
                 </span>
@@ -206,7 +206,7 @@ function Stat(props: { label: string; value: number }): React.JSX.Element {
       <div className="text-lg font-semibold tabular-nums leading-tight">
         {props.value}
       </div>
-      <div className="mt-0.5 truncate text-[11px] text-muted-foreground">
+      <div className="mt-0.5 truncate text-2xs text-muted-foreground">
         {props.label}
       </div>
     </div>

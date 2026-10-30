@@ -84,7 +84,7 @@ function Toast({ item }: { item: ToastItem }): React.JSX.Element {
       role={item.kind === "error" ? "alert" : "status"}
       className={cn(
         // 进场动画（右侧滑入）在 .qt-toast 上；退场走下面这组 transition
-        "qt-toast relative flex w-72 max-w-[22rem] items-start gap-2.5 overflow-hidden rounded-xl border px-3.5 py-2.5 shadow-lg backdrop-blur-md transition-[opacity,transform] duration-200 ease-in",
+        "qt-toast relative flex w-72 max-w-[22rem] items-start gap-2.5 overflow-hidden rounded-xl border px-3.5 py-2.5 shadow-overlay backdrop-blur-xl transition-[opacity,transform] duration-base ease-expo",
         leaving && "translate-x-3 scale-95 opacity-0",
         item.kind === "error"
           ? "border-destructive/40 bg-card/95"

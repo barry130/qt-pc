@@ -46,10 +46,18 @@ function useClampedPoint(
   return pos;
 }
 
-/** 浮层跟随鼠标位置时的通用收尾：外部滚动 / 缩放就把它收掉 */
+/**
+ * 浮层跟随鼠标位置时的通用收尾：外部滚动 / 缩放就把它收掉。
+ *
+ * `closeOnScroll=false` 只保留「缩放就收」：播放页的歌词一直在自己滚（逐行高亮
+ * 的自动滚动、用户拖动歌词），菜单/面板刚打开就被那阵滚动收掉等于用不了
+ * （2026-10-29 用户反馈）。这种「底下永远在动」的页面由调用方显式关掉滚动收起；
+ * 其余场景（列表页）保持原行为 —— 列表滚走了菜单还浮在原地会指向错误的行。
+ */
 function useCloseOnViewportChange(
   ref: React.RefObject<HTMLElement | null>,
   onClose: () => void,
+  closeOnScroll = true,
 ): void {
   useEffect(() => {
     const close = (e: Event): void => {
@@ -60,13 +68,13 @@ function useCloseOnViewportChange(
     };
     // capture：滚动事件不冒泡到 window，只有捕获阶段能收到滚动容器的滚动；
     // passive：close 不调 preventDefault，别让浏览器白等一次主线程（滚动会更跟手）
-    window.addEventListener("scroll", close, { capture: true, passive: true });
+    if (closeOnScroll) window.addEventListener("scroll", close, { capture: true, passive: true });
     window.addEventListener("resize", close);
     return () => {
-      window.removeEventListener("scroll", close, { capture: true });
+      if (closeOnScroll) window.removeEventListener("scroll", close, { capture: true });
       window.removeEventListener("resize", close);
     };
-  }, [ref, onClose]);
+  }, [ref, onClose, closeOnScroll]);
 }
 
 /**
@@ -87,12 +95,14 @@ export function ContextMenu(props: {
   y: number;
   items: ContextMenuItem[];
   onClose: () => void;
+  /** 外部滚动是否收起菜单（默认收起；播放页这类「底下一直在滚」的页面传 false） */
+  closeOnScroll?: boolean;
 }): React.JSX.Element {
-  const { x, y, items, onClose } = props;
+  const { x, y, items, onClose, closeOnScroll = true } = props;
   const boxRef = useRef<HTMLDivElement | null>(null);
   const pos = useClampedPoint(boxRef, x, y, items.length);
   useDismissOnOutside(boxRef, true, onClose);
-  useCloseOnViewportChange(boxRef, onClose);
+  useCloseOnViewportChange(boxRef, onClose, closeOnScroll);
 
   return createPortal(
     <div
@@ -108,7 +118,7 @@ export function ContextMenu(props: {
       // （`div[role=button]`，点一下即播放）的子节点，不拦住的话点「加入队列」
       // 会顺手把这首播了。
       onClick={(e) => e.stopPropagation()}
-      className="fixed z-[60] min-w-[180px] max-w-[260px] rounded-md border border-border bg-popover p-1 shadow-md"
+      className="fixed z-[60] min-w-[180px] max-w-[260px] rounded-xl border border-border bg-popover/95 p-1 backdrop-blur-xl shadow-raised"
     >
       {items.map((it) => {
         const Icon = it.icon;
@@ -158,13 +168,15 @@ export function FloatingPanel(props: {
   y: number;
   width: number;
   onClose: () => void;
+  /** 同 ContextMenu：播放页歌词自滚时面板不该跟着消失 */
+  closeOnScroll?: boolean;
   children: React.ReactNode;
 }): React.JSX.Element {
-  const { x, y, width, onClose, children } = props;
+  const { x, y, width, onClose, closeOnScroll = true, children } = props;
   const boxRef = useRef<HTMLDivElement | null>(null);
   const pos = useClampedPoint(boxRef, x, y, width);
   useDismissOnOutside(boxRef, true, onClose);
-  useCloseOnViewportChange(boxRef, onClose);
+  useCloseOnViewportChange(boxRef, onClose, closeOnScroll);
 
   return createPortal(
     <div

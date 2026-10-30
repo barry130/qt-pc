@@ -1,24 +1,24 @@
 // @vitest-environment jsdom
 /**
- * 搜索页翻页：四个页签与聚合模式滚到底都要自动续页。
+ * 搜索页一次拉全量：四个页签与聚合模式都自动把后续页取完，不需要滚动。
  *
- * 回归起因（用户报）：搜索只出一页，滚到底没有任何加载动作 —— SearchPage 原先
- * 把四个动作的 page 全写死 1，整页也没有哨兵。现在统一走 usePagedList，
- * 这里锁住三件最容易再写坏的事：
+ * 回归起因（用户 m05614）：列表不再做「滚到底续页」，进页就把结果取全，
+ * 底部也不再出现「已经到底了 / 继续下拉加载更多」这类终态文案。这里锁住
+ * 四件最容易再写坏的事：
  *
  * 1. 每页条数 = **音源包自述的 searchPageMax**。搜索类接口没有 total/hasMore，
- *    收尾只能靠「满页 = 可能还有下一页」；传超限值会在第 1 页就被判成到底
- *    （qq 要 100 返回 0 条、酷狗恒给 30），正是「只出一页」的来源之一。
+ *    「还有下一页」只能靠「满页 = 可能还有」推断；传超限值会在第 1 页就被判成
+ *    到底（qq 要 100 返回 0 条、酷狗恒给 30），正是「只出一页」的来源之一。
  * 2. 聚合模式一次打四源、只能有一个 size ⇒ 取所有源的最小值；「还有下一页」
  *    由数据包 `searchMerged` 回的 `full`（**合并前**是否有任一源满页）决定，
  *    不能看合并后的条数（合并去重后必然变少，会在第 1 页就误判到底）。
- * 3. 上游无视 page 反复返回同一页时必须收尾：否则 hasMore 恒真、哨兵一相交就
- *    无限续页，把上游打爆。
+ * 3. 上游无视 page 反复返回同一页时必须收尾：否则「满页 = 还有」恒真，一次性
+ *    拉全量会变成无限续页，把上游打爆。零新增即收尾。
  * 4. 页签（`?type=`）由 URL 决定。搜索页不常驻，从歌单/歌手/专辑详情点返回是
  *    **重新挂载** —— 页签留在 useState 里就会被打回「歌曲」（用户实测反馈）。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, fireEvent, render } from "@testing-library/react";
+import { act, fireEvent, render, waitFor } from "@testing-library/react";
 
 /** 路由：SearchPage 只读 q，navigate/useRouter 供 BackButton 用 */
 const router = vi.hoisted(() => ({
@@ -60,7 +60,7 @@ vi.mock("@/lib/search-history", () => ({
   clearSearchHistory: vi.fn(async () => {}),
 }));
 
-// 聚合搜索音源设置（设置 → 音源包）：本文件只关心翻页，按默认「全部音源」处理
+// 聚合搜索音源设置（设置 → 音源包）：本文件只关心取全量，按默认「全部音源」处理
 vi.mock("@/lib/aggregate-sources", () => ({
   readAggregateSources: vi.fn(async () => null),
 }));
@@ -72,46 +72,6 @@ import { SearchPage } from "@/components/SearchPage";
 import { useMusicSourceStore } from "@/stores/musicSource";
 import { useSourceRegistryStore } from "@/stores/sourceRegistry";
 import type { Track } from "@/types";
-
-/**
- * jsdom 没有 IntersectionObserver：stub 出可控实例，手动 trigger 模拟滚到底。
- * hook 在 items 变化时重建 observer，所以翻页后 instances 里会多一个新实例。
- *
- * `disconnect()` 必须真的失效：hook 在 `canLoadMore` 变假时会 disconnect 掉当前
- * observer，而回调里的 setCursor 是无条件自增的 —— stub 若不认 disconnect，
- * 对旧实例再 trigger 一次就能凭空多翻一页，测试会测出真实浏览器里不存在的行为。
- */
-class FakeIO {
-  static instances: FakeIO[] = [];
-  private disconnected = false;
-  private cb: (entries: IntersectionObserverEntry[]) => void;
-
-  constructor(cb: (entries: IntersectionObserverEntry[]) => void) {
-    this.cb = cb;
-    FakeIO.instances.push(this);
-  }
-
-  observe(): void {}
-  disconnect(): void {
-    this.disconnected = true;
-  }
-  unobserve(): void {}
-  takeRecords(): IntersectionObserverEntry[] {
-    return [];
-  }
-
-  trigger(): void {
-    if (this.disconnected) return;
-    this.cb([{ isIntersecting: true } as unknown as IntersectionObserverEntry]);
-  }
-}
-// @ts-expect-error 测试专用 stub，签名是子集
-globalThis.IntersectionObserver = FakeIO;
-
-/** 最后一个 observer = 最新一轮挂上的哨兵 */
-function scrollToBottom(): void {
-  FakeIO.instances[FakeIO.instances.length - 1]?.trigger();
-}
 
 function settle(): Promise<void> {
   return new Promise((r) => setTimeout(r, 40));
@@ -149,8 +109,14 @@ function seedRegistry(entries: { id: string; searchPageMax: number }[]): void {
   });
 }
 
+/** 底部不应该再出现任何终态/续页提示（用户 m05614 明确要求） */
+function expectNoScrollFooter(container: HTMLElement): void {
+  expect(container.textContent).not.toContain("继续下拉加载更多");
+  expect(container.textContent).not.toContain("已经到底了");
+  expect(container.textContent).not.toContain("正在加载其余");
+}
+
 beforeEach(() => {
-  FakeIO.instances = [];
   vi.clearAllMocks();
   router.search = { q: "" };
   router.navigate.mockClear();
@@ -163,8 +129,8 @@ afterEach(() => {
   useSourceRegistryStore.setState({ sources: [], qualities: [], ready: false });
 });
 
-describe("搜索页翻页", () => {
-  it("歌曲页签：按 searchPageMax 取第一页，滚到底自动续第二页并追加", async () => {
+describe("搜索页一次拉全量", () => {
+  it("歌曲页签：按 searchPageMax 自动把后续页拉完，不需要滚动", async () => {
     router.search = { q: "稻香" };
     api.searchMusic.mockImplementation(async (_kw: unknown, _src: unknown, page: unknown) =>
       page === 1
@@ -179,19 +145,14 @@ describe("搜索页翻页", () => {
 
     // 每页条数来自注册表自述值，写死 30/20 都会让「满页=还有」判错
     expect(api.searchMusic).toHaveBeenCalledWith("稻香", "qq", 1, 2);
-    expect(container.textContent).toContain("曲目a1");
-    expect(container.textContent).toContain("继续下拉加载更多");
+    // 第 1 页满页 → 自动续第 2 页（第 2 页只有 1 条 < 2 → 到底收尾）
+    await waitFor(() => expect(api.searchMusic).toHaveBeenCalledWith("稻香", "qq", 2, 2));
+    await act(settle);
 
-    await act(async () => {
-      scrollToBottom();
-      await settle();
-    });
-
-    expect(api.searchMusic).toHaveBeenLastCalledWith("稻香", "qq", 2, 2);
-    // 第二页只有 1 条 < 2 → 到底，且旧页没有被冲掉
+    // 旧页没有被冲掉，两页的行都在同一条列表里
     expect(container.textContent).toContain("曲目a1");
     expect(container.textContent).toContain("曲目b1");
-    expect(container.textContent).toContain("已经到底了");
+    expectNoScrollFooter(container);
   });
 
   it("页签由 URL 决定：带 ?type=playlist 落地就渲染歌单结果（从详情页返回的场景）", async () => {
@@ -217,8 +178,10 @@ describe("搜索页翻页", () => {
     expect(api.searchPlaylists).toHaveBeenCalledWith("qq", "稻香", 1, 2);
     expect(api.searchMusic).not.toHaveBeenCalled();
     expect(container.textContent).toContain("歌单1");
-    // 满页 → 还能继续滚
-    expect(container.textContent).toContain("继续下拉加载更多");
+    // 第 2 页零新增即收尾，底部不留文案
+    await waitFor(() => expect(api.searchPlaylists).toHaveBeenCalledTimes(2));
+    await act(settle);
+    expectNoScrollFooter(container);
   });
 
   it("点页签把 type 写进 URL（replace，不在历史里堆页签）", async () => {
@@ -266,16 +229,12 @@ describe("搜索页翻页", () => {
     expect(container.textContent).toContain("源qq");
     expect(container.textContent).toContain("源bili");
     expect(container.textContent).not.toContain("12 首");
-    expect(container.textContent).toContain("已经到底了");
-
-    await act(async () => {
-      scrollToBottom();
-      await settle();
-    });
+    // full:false 说明第 1 页就是最后一页，不再多发一次请求
     expect(api.searchMergedPage).toHaveBeenCalledTimes(1);
+    expectNoScrollFooter(container);
   });
 
-  it("聚合模式：数据包报满页时续页，续页结果并进同一条列表", async () => {
+  it("聚合模式：数据包报满页时自动续页，续页结果并进同一条列表", async () => {
     seedRegistry([
       { id: "qq", searchPageMax: 50 },
       { id: "bili", searchPageMax: 2 },
@@ -295,60 +254,48 @@ describe("搜索页翻页", () => {
 
     const { container } = render(<SearchPage />);
     await act(settle);
+
     expect(api.searchMergedPage).toHaveBeenCalledWith("稻香", 1, 2, {
       sources: undefined,
       preferSource: "qq",
     });
+    // 第 1 页报满页 → 自动续第 2 页；第 3 页起并发补页，空页即收尾
+    await waitFor(() =>
+      expect(api.searchMergedPage).toHaveBeenCalledWith("稻香", 2, 2, {
+        sources: undefined,
+        preferSource: "qq",
+      }),
+    );
+    await waitFor(() =>
+      expect(api.searchMergedPage).toHaveBeenCalledWith("稻香", 3, 2, {
+        sources: undefined,
+        preferSource: "qq",
+      }),
+    );
+    await act(settle);
 
-    await act(async () => {
-      scrollToBottom();
-      await settle();
-    });
-
-    expect(api.searchMergedPage).toHaveBeenLastCalledWith("稻香", 2, 2, {
-      sources: undefined,
-      preferSource: "qq",
-    });
     expect(container.textContent).toContain("曲目b3");
+    // 跨页重复的 b2 只留一条
+    expect(container.textContent?.match(/曲目b2/g)?.length ?? 0).toBe(1);
     // 没有分组头，也就没有「N 首」这种累计文案
     expect(container.textContent).not.toContain("3 首");
-    // 数据包仍报满页 → 还有下一页
-    expect(container.textContent).toContain("继续下拉加载更多");
-
-    await act(async () => {
-      scrollToBottom();
-      await settle();
-    });
-    expect(api.searchMergedPage).toHaveBeenLastCalledWith("稻香", 3, 2, {
-      sources: undefined,
-      preferSource: "qq",
-    });
-    expect(container.textContent).toContain("已经到底了");
+    expectNoScrollFooter(container);
   });
 
   it("上游无视 page 反复返回同一页：去重后立即收尾，不再请求下一页", async () => {
     router.search = { q: "稻香" };
-    // 恒返回同样两条：满页 → 首轮 hasMore 为真，第二页全是重复条目
+    // 恒返回同样两条：满页 → 第 1 页 hasMore 为真，第二页全是重复条目
     api.searchMusic.mockImplementation(async () => [track("a1"), track("a2")]);
 
     const { container } = render(<SearchPage />);
     await act(settle);
-    expect(api.searchMusic).toHaveBeenCalledTimes(1);
 
-    await act(async () => {
-      scrollToBottom();
-      await settle();
-    });
+    // 第 1 页 + 第 2 页（零新增）后收尾，不会无限续页
+    await waitFor(() => expect(api.searchMusic).toHaveBeenCalledTimes(2));
+    await act(settle);
     expect(api.searchMusic).toHaveBeenLastCalledWith("稻香", "qq", 2, 2);
-    expect(container.textContent).toContain("已经到底了");
-
-    // 再过一轮：hasMore 已收口，哨兵不会再挂 observer
-    const instancesBefore = FakeIO.instances.length;
-    await act(async () => {
-      scrollToBottom();
-      await settle();
-    });
     expect(api.searchMusic).toHaveBeenCalledTimes(2);
-    expect(FakeIO.instances.length).toBe(instancesBefore);
+    expect(container.textContent).toContain("曲目a1");
+    expectNoScrollFooter(container);
   });
 });

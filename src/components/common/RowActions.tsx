@@ -124,7 +124,7 @@ export function RowActions(props: {
       {() => (
         <div
           role="menu"
-          className="absolute right-0 top-full z-20 mt-1 w-48 rounded-md border border-border bg-popover p-1 shadow-md"
+          className="absolute right-0 top-full z-20 mt-1 w-48 rounded-xl border border-border bg-popover/95 p-1 backdrop-blur-xl shadow-raised"
         >
           <MenuItem disabled={busy} onClick={() => void remove(false)}>
             仅删除记录（保留文件）
@@ -206,7 +206,7 @@ export function BatchDeleteButton(props: {
       {() => (
         <div
           role="menu"
-          className="absolute left-0 top-full z-20 mt-1 w-52 rounded-md border border-border bg-popover p-1 shadow-md"
+          className="absolute left-0 top-full z-20 mt-1 w-52 rounded-xl border border-border bg-popover/95 p-1 backdrop-blur-xl shadow-raised"
         >
           <MenuItem disabled={busy} onClick={() => void remove(false)}>
             仅删除记录（保留文件）

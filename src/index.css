@@ -130,6 +130,64 @@
   --color-sidebar-ring: var(--sidebar-ring);
   --color-lyric-highlight: var(--lyric-highlight);
   --color-lyric-inactive: var(--lyric-inactive);
+  /*
+   * 字号阶梯的两档补充（12px 与 14px 之间的辅助信息档）。
+   *
+   * 此前这两档是「野生」的：全仓写死 text-[11px] 122 处、text-[10px] 31 处。
+   * 这说明 text-xs（12px）在中文辅助信息上偏大、在密集列表里挤不开，于是各处
+   * 自己写 px 值 —— 同一个视觉层级出现 10/11/12 三种字号，行高也各不相同。
+   * 这里把两档正式登记进阶梯：以后写辅助信息用 text-2xs / text-3xs，禁止再写
+   * text-[11px] / text-[10px]（tools/check-type-scale.mjs 会拦）。
+   */
+  --text-3xs: 0.625rem; /* 10px */
+  --text-3xs--line-height: 0.9375rem;
+  --text-2xs: 0.6875rem; /* 11px */
+  --text-2xs--line-height: 1.0625rem;
+  /*
+   * 高度（elevation）三档。
+   *
+   * 阴影颜色一律用 color-mix(var(--foreground)) 派生，而不是写死 rgba(0,0,0,x)：
+   * skins.ts / 背景图会改写 --foreground 与底色，写死的黑阴影在浅色皮肤下会发灰、
+   * 在深色皮肤下会糊成一团，切换主题时最容易看出「阴影不属于这套皮」。
+   *
+   * - surface：行内嵌板（列表里浮起来的小块），几乎只加一点点接触阴影；
+   * - raised：下拉 / 菜单 / 小面板（贴着触发元素出现）；
+   * - overlay：大面板 / 模态（脱离页面、自带背景压暗）。
+   * 组件只允许从这三档里选，不要再自己写 shadow-lg / shadow-2xl / shadow-[...]。
+   */
+  --shadow-surface: 0 1px 2px color-mix(in oklab, var(--foreground) 8%, transparent);
+  --shadow-raised:
+    0 10px 26px -12px color-mix(in oklab, var(--foreground) 26%, transparent),
+    0 2px 6px -3px color-mix(in oklab, var(--foreground) 14%, transparent);
+  --shadow-overlay:
+    0 28px 64px -22px color-mix(in oklab, var(--foreground) 38%, transparent),
+    0 8px 20px -10px color-mix(in oklab, var(--foreground) 20%, transparent);
+}
+
+/*
+ * 动效令牌的 Tailwind 入口。
+ *
+ * index.css 顶部定义了 --motion-fast/base/slow 与两条缓动，注释要求组件「统一用
+ * 令牌、不要再硬写 150/200/300」；但令牌此前没有对应 utility，组件里只能写
+ * `duration-[var(--motion-base)]` 这种长串，于是大家都在写裸数字。这里把令牌
+ * 包成原子类，让「守规矩」比「随手写」更短：
+ *   duration-fast / duration-base / duration-slow
+ *   ease-soft（进入、展开）/ ease-expo（需要一点回弹的强调）
+ */
+@utility duration-fast {
+  transition-duration: var(--motion-fast);
+}
+@utility duration-base {
+  transition-duration: var(--motion-base);
+}
+@utility duration-slow {
+  transition-duration: var(--motion-slow);
+}
+@utility ease-soft {
+  transition-timing-function: var(--motion-ease-out-soft);
+}
+@utility ease-expo {
+  transition-timing-function: var(--motion-ease-out-expo);
 }
 
 @layer base {
@@ -380,7 +438,103 @@
   content-visibility: visible;
 }
 
-/* 减弱动效 */
+/*
+ * 换页入场。
+ *
+ * 常驻页（KeepAliveOutlet）之间切换是 display 切换，内容直接「硬切」；而每个页面
+ * 首次加载时还会从骨架跳到真实内容。两处都加同一条入场：只做 4px 上移 + 淡入，
+ * 不缩放、不逐个错峰 —— 位移感越轻，越像「页面本来就在那儿」，而不是「特效在放」。
+ *
+ * 关键点：display:none 的元素不跑动画，切回来时动画从 0 重新开始，所以只要类名
+ * 常驻在页面根节点上，每次变为可见都会天然重播一次，不需要额外维护 key 或状态。
+ */
+@keyframes qt-page-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.qt-page-enter {
+  animation: qt-page-in var(--motion-base) var(--motion-ease-out-soft);
+}
+@media (prefers-reduced-motion: reduce) {
+  .qt-page-enter {
+    animation: none;
+  }
+}
+
+/*
+ * 播放页封面光晕：从封面主色缓速呼吸的一团径向光（9s 一个周期，慢到接近无感）。
+ * 用 opacity + scale 而不是改颜色，避免逐帧重置样式；减弱动效时整块隐藏，
+ * 只留静态光晕（组件里控制）。
+ */
+@keyframes qt-glow-breathe {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.72;
+    transform: scale(1.08);
+  }
+}
+.qt-cover-glow {
+  animation: qt-glow-breathe 9s var(--motion-ease-out-soft) infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .qt-cover-glow {
+    animation: none;
+    opacity: 0.55;
+  }
+}
+
+/*
+ * 当前歌词行的「呼吸」：只让当前行在 3.6s 里极缓慢地明暗一档。
+ * 不做位移/缩放 —— 缩放会带动整列排版抖动，歌词是长驻内容，任何抖动都廉价。
+ */
+@keyframes qt-lyric-breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.86;
+  }
+}
+.qt-lyric-active {
+  animation: qt-lyric-breathe 3.6s var(--motion-ease-out-soft) infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .qt-lyric-active {
+    animation: none;
+  }
+}
+
+
+/*
+ * 轻提示（components/common/Hint.tsx）的入场：120ms 淡入。
+ * 只在「出现」时跑一次，收起时直接消失（提示是瞬时信息，退场动画没有价值）。
+ */
+@keyframes qt-hint-in {
+  from {
+    opacity: 0;
+  }
+}
+.qt-hint-in {
+  animation: qt-hint-in var(--motion-fast) var(--motion-ease-out-soft);
+}
+@media (prefers-reduced-motion: reduce) {
+  .qt-hint-in {
+    animation: none;
+  }
+}
+
+/* 减弱动效：全局把过渡/动画压到一帧（等效关闭），但保留终态 */
 .reduce-motion *,
 .reduce-motion *::before,
 .reduce-motion *::after {
@@ -394,6 +548,35 @@
  * 用法：给容器（或单个元素）加 .selectable；输入类控件本来就该可选，一并放开。 */
 :where(.selectable, .selectable *, input, textarea, [contenteditable="true"]) {
   user-select: text;
+}
+
+/*
+ * 「正在播放」跳动条（components/common/EqBars.tsx）：
+ * 三根竖条 1.1s 循环、错峰延迟制造流动感；只用 transform，不触发重排。
+ * 暂停/减弱动效时停在半高 —— 静态也能表达「这是当前曲目」。
+ */
+@keyframes qt-eq-bounce {
+  0%,
+  100% {
+    transform: scaleY(0.28);
+  }
+  50% {
+    transform: scaleY(1);
+  }
+}
+.qt-eq-bar {
+  transform-origin: bottom;
+  animation: qt-eq-bounce 1.1s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .qt-eq-bar {
+    animation: none;
+    transform: scaleY(0.6);
+  }
+}
+.reduce-motion .qt-eq-bar {
+  animation: none;
+  transform: scaleY(0.6);
 }
 
 /* 降低透明度偏好（Windows 关闭「透明效果」/ macOS「降低透明度」）：

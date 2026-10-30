@@ -425,7 +425,7 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
               收在这个高度以内，不许把页头撑得比封面高（用户 2026-10-24：「左边图片，
               右边内容，高度不要超过图片，内容全部往右边搭」）。与每日推荐页同尺寸，
               两页 hero 模板保持一套；歌单/专辑页保持 144px 那套，不动。 */}
-          <div className="h-44 w-44 shrink-0 overflow-hidden rounded-2xl bg-secondary shadow-xl ring-1 ring-border">
+          <div className="h-44 w-44 shrink-0 overflow-hidden rounded-2xl bg-secondary shadow-surface ring-1 ring-border">
             {cover ? (
               <img src={cover} alt="" className="h-full w-full object-cover" />
             ) : (
@@ -435,7 +435,7 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
             )}
           </div>
           <div className="flex min-w-0 flex-1 flex-col justify-end pb-1">
-            <p className="text-[11px] font-medium uppercase tracking-[0.2em] text-muted-foreground">
+            <p className="text-2xs font-medium uppercase tracking-[0.2em] text-muted-foreground">
               {isLocal ? "我的歌单" : isChart ? "榜单" : "歌单"}
             </p>
             <h1 className="mt-1 truncate text-2xl font-bold tracking-tight">

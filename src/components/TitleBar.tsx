@@ -3,6 +3,7 @@ import { Link, useRouter, useNavigate } from "@tanstack/react-router";
 import { useTitleBarDrag } from "@/hooks/useFramelessWindow";
 import { WindowControls } from "@/components/WindowControls";
 import { MusicSourceSwitcher } from "@/components/music-source/MusicSourceSwitcher";
+import { useHint } from "@/components/common/Hint";
 import { MessagesPopover } from "@/components/mine/MessagesPopover";
 import { avatarUrl, displayName, useAuthStore } from "@/stores/auth";
 import { useAppearanceStore } from "@/stores/appearance";
@@ -36,6 +37,9 @@ export function TitleBar(): React.JSX.Element {
    * 清空、防抖，而落地页（历史 + 热搜）只有整页才有地方摆 —— 用户点开搜索
    * 却看到一张空列表，等于每次都在盲搜。
    */
+  // 两个圆形/方块图标按钮走自绘 tooltip：悬停 380ms 即出，深色皮肤下不再是系统白框
+  const backHint = useHint("返回上一步");
+  const settingsHint = useHint("设置");
   const goSearch = (): void => {
     void navigate({ to: "/search", search: { q: "", type: "song" } });
   };
@@ -65,14 +69,15 @@ export function TitleBar(): React.JSX.Element {
         <button
           type="button"
           onClick={() => router.history.back()}
+          {...backHint.hintProps}
           aria-label="返回上一步"
-          title="返回"
           onMouseDown={(e) => e.stopPropagation()}
           onDoubleClick={(e) => e.stopPropagation()}
           className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-foreground/80 transition-colors hover:bg-secondary hover:text-foreground"
         >
           <ArrowLeft className="h-4 w-4" />
         </button>
+        {backHint.hintLayer}
         <button
           type="button"
           onClick={goSearch}
@@ -84,6 +89,9 @@ export function TitleBar(): React.JSX.Element {
         >
           <Search className="h-3.5 w-3.5 shrink-0" aria-hidden />
           <span className="truncate">搜索歌曲 / 歌手 / 专辑 / 歌单</span>
+          <kbd className="ml-auto hidden shrink-0 rounded border border-border/60 px-1 text-3xs text-muted-foreground sm:inline">
+            Ctrl K
+          </kbd>
         </button>
         <MusicSourceSwitcher />
       </div>
@@ -94,7 +102,7 @@ export function TitleBar(): React.JSX.Element {
         <Link
           to="/settings/$section"
           params={{ section: "general" }}
-          title="设置"
+          {...settingsHint.hintProps}
           aria-label="设置"
           onMouseDown={(e) => e.stopPropagation()}
           onDoubleClick={(e) => e.stopPropagation()}
@@ -104,6 +112,7 @@ export function TitleBar(): React.JSX.Element {
         >
           <Settings className="h-4 w-4" />
         </Link>
+        {settingsHint.hintLayer}
         <Link
           to={session ? "/profile" : "/login"}
           title={session ? displayName(profile, "账号") : "登录"}

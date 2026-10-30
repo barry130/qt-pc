@@ -152,7 +152,7 @@ export function ProfileEditPage(): React.JSX.Element {
           </div>
           <div className="min-w-0 flex-1">
             <div className="text-sm font-medium">头像</div>
-            <div className="mt-0.5 text-[11px] text-muted-foreground">
+            <div className="mt-0.5 text-2xs text-muted-foreground">
               支持 png / jpg / webp，每天最多上传 2 次
             </div>
           </div>
@@ -217,7 +217,7 @@ export function ProfileEditPage(): React.JSX.Element {
         </div>
 
         {/* 保存前就把「会被踢下线」说清楚，别让用户在登录页一脸茫然 */}
-        <p className="mt-4 flex items-start gap-1.5 rounded-lg bg-secondary/60 px-3 py-2 text-[11px] leading-relaxed text-muted-foreground">
+        <p className="mt-4 flex items-start gap-1.5 rounded-lg bg-secondary/60 px-3 py-2 text-2xs leading-relaxed text-muted-foreground">
           <Info className="mt-0.5 h-3 w-3 shrink-0" />
           保存后当前账号会退出登录，需要用新密码重新登录。
         </p>
@@ -259,7 +259,7 @@ function PageShell(props: { children: React.ReactNode }): React.JSX.Element {
           >
             <ArrowLeft className="h-4 w-4" />
           </button>
-          <h1 className="text-base font-semibold">修改个人信息</h1>
+          <h1 className="text-xl font-bold tracking-tight">修改个人信息</h1>
         </div>
         {props.children}
       </div>
@@ -278,7 +278,7 @@ function Labeled(props: {
       <div className="mb-1.5 flex items-baseline gap-1.5">
         <span className="text-xs font-medium">{props.label}</span>
         {props.hint ? (
-          <span className="text-[11px] text-muted-foreground">{props.hint}</span>
+          <span className="text-2xs text-muted-foreground">{props.hint}</span>
         ) : null}
       </div>
       {props.children}

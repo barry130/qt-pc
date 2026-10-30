@@ -68,10 +68,10 @@ function snapshot(playUrl: string | null): PlaybackState {
   };
 }
 
-/** 点开「播放地址」面板（入口按钮按 label 找） */
+/** 点开「播放地址」面板（入口按钮按 aria-label 找：可见文案由自绘 tooltip 承担，原生 title 已移除） */
 function openPanel(container: HTMLElement): void {
   const button = [...container.querySelectorAll("button")].find(
-    (b) => b.title === "播放地址（仅管理员）",
+    (b) => b.getAttribute("aria-label") === "播放地址（仅管理员）",
   );
   expect(button).toBeTruthy();
   fireEvent.click(button!);

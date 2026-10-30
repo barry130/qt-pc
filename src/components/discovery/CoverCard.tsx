@@ -44,16 +44,16 @@ function CoverCardInner<T>(props: CoverCardProps<T>): React.JSX.Element {
       // row：w-32 shrink-0 与「新歌速递」的 TrackCard 同宽，行内不参与压缩。
       // active:scale 是按压反馈（80-150ms、不改布局边界）
       className={cn(
-        "group block text-left transition-transform duration-150 active:scale-[0.98]",
+        "group block text-left transition-transform duration-fast active:scale-[0.98]",
         layout === "row" ? "w-32 shrink-0 snap-start" : "w-full",
       )}
     >
-      <div className="relative aspect-square w-full overflow-hidden rounded-xl shadow-md ring-1 ring-inset ring-foreground/10 transition-shadow duration-200 group-hover:shadow-xl">
+      <div className="relative aspect-square w-full overflow-hidden rounded-xl shadow-surface ring-1 ring-inset ring-foreground/10 transition-shadow duration-base group-hover:shadow-raised">
         {cover && !loadFailed ? (
           <img
             src={cover}
             alt=""
-            className="h-full w-full object-cover transition-transform duration-300 motion-safe:group-hover:scale-105"
+            className="h-full w-full object-cover transition-transform duration-slow motion-safe:group-hover:scale-105"
             loading="lazy"
             onError={() => setLoadFailed(true)}
           />
@@ -67,8 +67,8 @@ function CoverCardInner<T>(props: CoverCardProps<T>): React.JSX.Element {
           </div>
         )}
         {/* 悬停：渐变遮罩 + 播放按钮 */}
-        <div className="absolute inset-0 flex items-end justify-end bg-gradient-to-t from-black/45 via-transparent to-transparent p-3 opacity-0 transition-opacity duration-200 group-hover:opacity-100">
-          <span className="flex h-10 w-10 translate-y-1 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg transition-transform duration-200 group-hover:translate-y-0">
+        <div className="absolute inset-0 flex items-end justify-end bg-gradient-to-t from-black/45 via-transparent to-transparent p-3 opacity-0 transition-opacity duration-base group-hover:opacity-100">
+          <span className="flex h-10 w-10 translate-y-1 items-center justify-center rounded-full bg-primary text-primary-foreground shadow-lg transition-transform duration-base group-hover:translate-y-0">
             <Play className="h-4 w-4 fill-current" />
           </span>
         </div>
@@ -87,7 +87,7 @@ function CoverCardInner<T>(props: CoverCardProps<T>): React.JSX.Element {
         <div
           className={cn(
             "mt-0.5 truncate text-muted-foreground",
-            layout === "row" ? "text-[11px]" : "text-xs",
+            layout === "row" ? "text-2xs" : "text-xs",
           )}
         >
           {subtitle}

@@ -93,7 +93,7 @@ export function OnboardingPage(): React.JSX.Element {
                 }`}
               >
                 <div className="text-sm font-medium">本地音乐</div>
-                <div className="mt-0.5 text-[11px] text-muted-foreground">
+                <div className="mt-0.5 text-2xs text-muted-foreground">
                   播放自己电脑里的音乐（推荐）
                 </div>
                 {activeSourceId === "local" && (
@@ -114,7 +114,7 @@ export function OnboardingPage(): React.JSX.Element {
                     }`}
                   >
                     <div className="text-sm font-medium">{s.name}</div>
-                    <div className="mt-0.5 text-[11px] text-muted-foreground">
+                    <div className="mt-0.5 text-2xs text-muted-foreground">
                       {ONLINE_SOURCE_DESC}
                     </div>
                     {active && (
@@ -124,7 +124,7 @@ export function OnboardingPage(): React.JSX.Element {
                 );
               })}
             </div>
-            <p className="mt-3 text-center text-[11px] leading-relaxed text-muted-foreground">
+            <p className="mt-3 text-center text-2xs leading-relaxed text-muted-foreground">
               在线音源需在「设置 → 音源包」安装音源包后可用，可以先选本地音乐，之后再装。
             </p>
           </section>
@@ -187,7 +187,7 @@ export function OnboardingPage(): React.JSX.Element {
           <button
             type="button"
             onClick={() => void finish()}
-            className="mt-3 w-full text-center text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+            className="mt-3 w-full text-center text-2xs text-muted-foreground transition-colors hover:text-foreground"
           >
             跳过
           </button>

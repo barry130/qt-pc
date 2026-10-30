@@ -35,7 +35,7 @@ export function SourceTag(props: {
       className={cn(
         // whitespace-nowrap：简称是整体，折行会把「网易云」劈成两半
         "shrink-0 whitespace-nowrap rounded font-medium leading-none",
-        props.size === "xs" ? "px-1 py-0.5 text-[10px]" : "px-1.5 py-0.5 text-[11px]",
+        props.size === "xs" ? "px-1 py-0.5 text-3xs" : "px-1.5 py-0.5 text-2xs",
         props.className,
       )}
       style={{

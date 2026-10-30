@@ -3,6 +3,7 @@ import { RefreshCw } from "lucide-react";
 import { usePlayerStore } from "@/stores/player";
 import { SourceTag } from "@/components/common/SourceTag";
 import { findSourceCandidates, peekSourceCandidates } from "@/lib/source-switch";
+import { formatTime } from "@/lib/lrc";
 import { cn } from "@/lib/utils";
 import type { Track } from "@/types";
 
@@ -96,7 +97,7 @@ export function SourceSwitchPanel(props: {
 
   return (
     <div className="w-[380px] max-w-[80vw]">
-      <div className="mb-2 flex items-center gap-1.5 text-[11px] text-muted-foreground">
+      <div className="mb-2 flex items-center gap-1.5 text-2xs text-muted-foreground">
         <RefreshCw className="h-3 w-3" />
         <span className="min-w-0 flex-1 truncate">
           在其他音源里找「{props.track.title}」
@@ -136,18 +137,33 @@ export function SourceSwitchPanel(props: {
         <div className="max-h-72 overflow-y-auto">
           <div className="divide-y divide-border/60">
             {items.map((it) => (
+              /* 三列定死：歌名（吃掉剩余宽度，永不塌成 0）/ 歌手（上限 42%）/ 时长。
+                 旧版是 flex：歌名那格 `flex-1`（basis 0）+ 歌手 `shrink` 且基数是
+                 内容宽。遇到「张信哲、万芳、莫文蔚、杨乃文…」这种十几个歌手的
+                 Live 版，负数剩余空间全部由歌手那一格承担（歌名 shrink 基数 0，
+                 一点都缩不动），结果**歌名和平台徽标被挤成 0 宽**，整行只剩一长条
+                 灰色歌手名（2026-10-29 用户截图反馈）。grid 的 minmax(0,1fr) 给歌名
+                 兜底，歌手列封顶 42% 后自己截断，徽标也就不会被吃掉。 */
               <button
                 key={`${it.track.platform}:${it.track.id}`}
                 type="button"
                 onClick={() => props.onPick(it.track)}
-                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-secondary/60"
+                // 截断后的全量文本靠原生 tooltip 兜底（歌手常常一屏放不下）
+                title={`${it.track.title || "(无标题)"}${it.track.singer ? ` — ${it.track.singer}` : ""}`}
+                className="grid w-full grid-cols-[minmax(0,1fr)_minmax(0,42%)_auto] items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors hover:bg-secondary/60"
               >
-                <span className="flex min-w-0 flex-1 items-center gap-1.5">
-                  <span className="truncate text-xs text-foreground/90">{it.track.title}</span>
+                <span className="flex min-w-0 items-center gap-1.5">
+                  <span className="min-w-0 truncate text-xs text-foreground/90">
+                    {it.track.title || "(无标题)"}
+                  </span>
                   <SourceTag platform={it.track.platform} size="xs" />
                 </span>
-                <span className="min-w-0 shrink truncate text-[11px] text-muted-foreground">
-                  {it.track.singer}
+                <span className="min-w-0 truncate text-right text-2xs text-muted-foreground">
+                  {/* 没有歌手就退回专辑，总比留一列空白有用 */}
+                  {it.track.singer || it.track.album}
+                </span>
+                <span className="justify-self-end text-2xs tabular-nums text-muted-foreground/70">
+                  {it.track.duration > 0 ? formatTime(it.track.duration * 1000) : ""}
                 </span>
               </button>
             ))}

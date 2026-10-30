@@ -5,6 +5,8 @@
 //! - 自然播完（auto）：ListLoop 循环回开头；OneLoop 重播当前；Random 随机换曲
 //! - 手动 next / previous：均按列表顺序移动并循环（OneLoop 也不例外），
 //!   仅 Random 随机挑一首不同的曲子
+//! - 「下一首播放」写一次性 pin（`pinned_next`）：下一跳先播它，随机/单曲循环
+//!   都不例外 —— 用户显式指定的顺序优先于模式掷骰
 //!
 //! 屏蔽规则的适用范围只有「自动推进」：`next_index_skipping` 供 next 用（引擎线程带
 //! DislikeMatcher 调用），`previous_index` 不带跳过参数 —— 屏蔽语义是「别让它自动出现」，
@@ -19,10 +21,20 @@ pub struct Queue {
     pub tracks: Vec<Track>,
     /// 当前曲目下标；None 表示未在播放
     pub index: Option<usize>,
+    /// 「下一首播放」插进来的那一首所在下标（一次性，不落库）。
+    ///
+    /// 随机 / 单曲循环下引擎原本按模式掷骰选下一首，会直接跳过用户刚插进来的
+    /// 那首（2026-10-30 用户反馈：随机播放时「下一首播放」不生效）。这里记下它的
+    /// 位置，由 [`Self::pinned_next_index`] 现算有效性：只有它仍紧跟在当前曲目
+    /// 之后（`pin == index + 1`）才算数 —— 播放推进到它身上后 `index` 变成该
+    /// 下标，条件自然失效，不需要额外的"消费"钩子，也就不会把后面几次 next 钉死。
+    pinned_next: Option<usize>,
 }
 
 impl Queue {
     pub fn set(&mut self, tracks: Vec<Track>, index: usize) {
+        // 换整条队列（播放新列表 / 恢复会话）：上一轮插进来的「下一首」不再有效
+        self.pinned_next = None;
         self.tracks = tracks;
         self.index = if self.tracks.is_empty() {
             None
@@ -54,6 +66,11 @@ impl Queue {
         if len == 1 {
             // 单曲队列：OneLoop 自然播完重播；手动/其他模式重播（无别的可去）
             return Some(0);
+        }
+        // 「下一首播放」优先于任何模式：随机不掷骰、单曲循环也先播它一次。
+        // 放在模式分支之前，next_index_skipping 的屏蔽判断才仍有机会否掉它
+        if let Some(pin) = self.pinned_next_index() {
+            return Some(pin);
         }
         match mode {
             PlayMode::OneLoop if auto => Some(cur),
@@ -161,12 +178,34 @@ impl Queue {
     // ---------- 队列编辑（DESIGN §11.5 队列 2.0） ----------
 
     /// 在当前曲目之后插入一首（「下一首播放」）。
-    /// 队列为空或尚未定位时退化为追加到队尾。
+    /// 队列为空或尚未定位时退化为追加到队尾（此时没有「下一跳」可指定，不写 pin）。
     pub fn insert_next(&mut self, track: Track) {
         match self.index {
-            Some(i) if i < self.tracks.len() => self.tracks.insert(i + 1, track),
+            Some(i) if i < self.tracks.len() => {
+                self.tracks.insert(i + 1, track);
+                // 反复插入时最后一次者胜出：它插在当前位置之后，最先播
+                self.pinned_next = Some(i + 1);
+            }
             _ => self.tracks.push(track),
         }
+    }
+
+    /// 播放推进到某一下标（引擎的唯一「现在播这首」入口）。
+    ///
+    /// 顺带消费「下一首播放」：无论落到 pin 上（已完成）还是被手动/随机带去
+    /// 别处（指示过期），这条一次性指示都该作废 —— 不清的话，用户播完那首再点
+    /// 「上一首」回到别的位置，旧的 pin 可能因为又凑成 `index + 1` 而复活。
+    pub fn commit_index(&mut self, i: usize) {
+        self.index = Some(i);
+        self.pinned_next = None;
+    }
+
+    /// 「下一首播放」待消费的下标。仍紧跟当前曲目之后才算数：
+    /// 被播到（`index` 落到该位置）、被移除、或当前曲目换到别处，
+    /// 条件都不再成立，自动失效。
+    pub fn pinned_next_index(&self) -> Option<usize> {
+        let (pin, cur) = (self.pinned_next?, self.index?);
+        (pin == cur + 1 && pin < self.tracks.len()).then_some(pin)
     }
 
     /// 追加到队尾（「加入播放队列」）。不改变当前播放位置。
@@ -203,6 +242,12 @@ impl Queue {
         self.index = match self.index {
             Some(cur) if cur > i => Some(cur - 1),
             Some(cur) if cur == i => Some(cur),
+            other => other,
+        };
+        // pin 跟着同一条平移规则走；被移除的正好是 pin 时直接作废
+        self.pinned_next = match self.pinned_next {
+            Some(pin) if pin == i => None,
+            Some(pin) if pin > i => Some(pin - 1),
             other => other,
         };
         self.clamp_index();
@@ -243,6 +288,13 @@ impl Queue {
             Some(cur) if from > cur && to <= cur => Some(cur + 1),
             other => other,
         };
+        // 「下一首播放」必须跟着这首歌本身走，不能留在原位置指向别人
+        self.pinned_next = match self.pinned_next {
+            Some(pin) if pin == from => Some(to),
+            Some(pin) if from < pin && pin <= to => Some(pin - 1),
+            Some(pin) if to <= pin && pin < from => Some(pin + 1),
+            other => other,
+        };
         self.clamp_index();
         true
     }
@@ -255,6 +307,9 @@ impl Queue {
         let keep = cur + 1;
         let removed = self.tracks.len().saturating_sub(keep);
         self.tracks.truncate(keep);
+        if self.pinned_next.is_some_and(|pin| pin >= keep) {
+            self.pinned_next = None;
+        }
         removed
     }
 
@@ -294,6 +349,7 @@ mod tests {
         Queue {
             tracks,
             index: Some(0),
+            ..Default::default()
         }
     }
 
@@ -603,6 +659,7 @@ mod tests {
         let mut q = Queue {
             tracks: vec![track_of("7")],
             index: Some(0),
+            ..Default::default()
         };
         let mut other = track_of("7");
         other.platform = crate::provider::types::SourceId::new("kw");
@@ -611,11 +668,124 @@ mod tests {
         assert_eq!(q.len(), 2);
     }
 
+    // ---------- 「下一首播放」的一次性 pin（随机 / 单曲循环优先） ----------
+
+    #[test]
+    fn play_next_wins_over_random_mode() {
+        let mut q = queue_of(3);
+        q.insert_next(track_of("x"));
+        for mode in [PlayMode::ListLoop, PlayMode::OneLoop, PlayMode::Random] {
+            assert_eq!(
+                q.next_index(mode, true),
+                Some(1),
+                "插进来的那首必须下一跳播（自动推进，{mode:?}）"
+            );
+            assert_eq!(
+                q.next_index(mode, false),
+                Some(1),
+                "手动 next 同样先播它（{mode:?}）"
+            );
+        }
+        assert_eq!(ids(&q), vec!["0", "x", "1", "2"]);
+    }
+
+    #[test]
+    fn play_next_pin_is_one_shot() {
+        let mut q = queue_of(3);
+        q.insert_next(track_of("x"));
+        // 模拟已经播到它：此后不再钉死，随机继续按随机走
+        q.commit_index(1);
+        assert!(
+            q.pinned_next_index().is_none(),
+            "播过即失效，不能把后面的 next 都钉在这首上"
+        );
+        // 再点「上一首」回到 0 也不该复活（否则下一跳又被拽回这首）
+        q.commit_index(0);
+        assert!(q.pinned_next_index().is_none(), "消费过的 pin 不能复活");
+    }
+
+    #[test]
+    fn play_next_pin_follows_adjacency() {
+        // 只挪动别的行：pin 仍紧跟当前曲目，继续生效
+        let mut q = queue_of(4);
+        q.insert_next(track_of("x"));
+        assert_eq!(q.pinned_next_index(), Some(1));
+        assert!(q.move_item(2, 3), "把后面一首拖到队尾");
+        assert_eq!(q.pinned_next_index(), Some(1), "pin 没被这次拖动影响");
+        assert_eq!(q.next_index(PlayMode::Random, true), Some(1));
+
+        // 把 pin 那首自己拖走：它不再是「下一首」，pin 失效（不留一个指向别人的下标）
+        let mut q = queue_of(3);
+        q.insert_next(track_of("x"));
+        assert!(q.move_item(1, 2), "把「下一首」那首拖到后面");
+        assert!(
+            q.pinned_next_index().is_none(),
+            "用户亲手把它挪走了，就不再强制下一跳播它"
+        );
+    }
+
+    #[test]
+    fn play_next_pin_dropped_when_track_removed() {
+        let mut q = queue_of(3);
+        q.insert_next(track_of("x"));
+        assert!(q.remove_at(1).is_some());
+        assert!(
+            q.pinned_next_index().is_none(),
+            "被移除的那首不能留下一个指向别人的 pin"
+        );
+    }
+
+    #[test]
+    fn play_next_pin_dropped_when_current_moves_elsewhere() {
+        let mut q = queue_of(4);
+        q.insert_next(track_of("x"));
+        // 用户直接点了另一首：原来的「下一首」不再紧跟当前曲目
+        q.index = Some(2);
+        assert!(q.pinned_next_index().is_none());
+    }
+
+    #[test]
+    fn play_next_pin_survives_append_and_clear_after_drops_it() {
+        let mut q = queue_of(3);
+        q.insert_next(track_of("x"));
+        q.append(vec![track_of("y")]);
+        assert_eq!(
+            q.next_index(PlayMode::Random, true),
+            Some(1),
+            "队尾追加不影响「下一首」"
+        );
+        assert_eq!(q.clear_after_current(), 4, "清空后续会连 pin 一起清掉");
+        assert!(q.pinned_next_index().is_none());
+    }
+
+    #[test]
+    fn play_next_does_not_override_dislike_skip() {
+        let mut q = queue_of(3);
+        q.insert_next(track_of("x"));
+        // 插进来的恰好是屏蔽项：屏蔽优先，随机重掷到别人
+        let pick = q
+            .next_index_skipping(PlayMode::Random, true, |t| t.id == "x")
+            .unwrap();
+        assert_ne!(pick, 1);
+    }
+
+    #[test]
+    fn play_next_on_empty_queue_just_appends_without_pin() {
+        let mut q = Queue::default();
+        q.insert_next(track_of("a"));
+        assert_eq!(ids(&q), vec!["a"]);
+        assert!(
+            q.pinned_next_index().is_none(),
+            "没有当前曲目时谈不上「下一首」"
+        );
+    }
+
     #[test]
     fn append_or_find_on_empty_queue_starts_at_zero() {
         let mut q = Queue {
             tracks: Vec::new(),
             index: None,
+            ..Default::default()
         };
         assert_eq!(q.append_or_find(track_of("a")), 0);
         assert_eq!(ids(&q), vec!["a"]);

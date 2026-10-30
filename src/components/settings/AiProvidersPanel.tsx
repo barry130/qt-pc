@@ -68,7 +68,7 @@ const ICON_BY_NAME = new Map(ICON_CHOICES.map((item) => [item.name, item.Icon]))
 
 const INPUT_CLASS =
   "h-8 w-full rounded-lg border border-input bg-background px-2.5 text-xs outline-none transition-colors focus:border-primary/60";
-const LABEL_CLASS = "text-[11px] font-medium text-muted-foreground";
+const LABEL_CLASS = "text-2xs font-medium text-muted-foreground";
 const GHOST_BUTTON_CLASS =
   "inline-flex h-7 items-center gap-1 rounded-md px-2 text-xs text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground disabled:cursor-not-allowed disabled:opacity-50";
 const PRIMARY_BUTTON_CLASS =
@@ -189,7 +189,7 @@ function SwitchButton(props: {
       }`}
     >
       <span
-        className={`absolute top-[0.125rem] h-4 w-4 rounded-full bg-background shadow transition-[left,transform] duration-200 ${
+        className={`absolute top-[0.125rem] h-4 w-4 rounded-full bg-background shadow transition-[left,transform] duration-base ${
           checked ? "left-[1.125rem]" : "left-[0.125rem]"
         }`}
       />
@@ -561,14 +561,14 @@ export function AiProvidersPanel(): JSX.Element {
                         <span className="truncate text-sm font-medium">
                           {profile.name || profile.baseUrl}
                         </span>
-                        <span className="shrink-0 text-[11px] text-muted-foreground">
+                        <span className="shrink-0 text-2xs text-muted-foreground">
                           {textOf(profile.baseUrl)}
                         </span>
                       </span>
-                      <span className="flex items-center gap-2 text-[11px] text-muted-foreground">
+                      <span className="flex items-center gap-2 text-2xs text-muted-foreground">
                         <span>{profile.models.length} 个模型</span>
                         {maskOf(profile) ? (
-                          <span className="truncate font-mono text-[10px]">{maskOf(profile)}</span>
+                          <span className="truncate font-mono text-3xs">{maskOf(profile)}</span>
                         ) : (
                           <span>未设 Key</span>
                         )}
@@ -654,7 +654,7 @@ export function AiProvidersPanel(): JSX.Element {
                 key={option.value}
                 type="button"
                 onClick={() => patchDraft({ protocol: option.value })}
-                className={`inline-flex h-7 items-center rounded-md border px-2 text-[11px] transition-colors ${
+                className={`inline-flex h-7 items-center rounded-md border px-2 text-2xs transition-colors ${
                   draft.protocol === option.value
                     ? "border-primary/60 bg-secondary text-foreground"
                     : "border-transparent bg-secondary/40 text-muted-foreground hover:bg-secondary"
@@ -692,18 +692,18 @@ export function AiProvidersPanel(): JSX.Element {
                 key={`key-${item.index}`}
                 className="flex items-center gap-2 rounded-md border border-border px-2 py-1"
               >
-                <span className="flex-1 truncate font-mono text-[11px] text-muted-foreground">
+                <span className="flex-1 truncate font-mono text-2xs text-muted-foreground">
                   {item.mask || "空 Key"}
                 </span>
                 {active ? (
-                  <span className="rounded bg-secondary px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                  <span className="rounded bg-secondary px-1.5 py-0.5 text-3xs text-muted-foreground">
                     使用中
                   </span>
                 ) : (
                   <button
                     type="button"
                     onClick={() => patchDraft({ activeKeyIndex: item.index })}
-                    className="text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+                    className="text-2xs text-muted-foreground transition-colors hover:text-foreground"
                   >
                     设为使用中
                   </button>
@@ -728,10 +728,10 @@ export function AiProvidersPanel(): JSX.Element {
               key={`pending-${index}`}
               className="flex items-center gap-2 rounded-md border border-dashed border-border px-2 py-1"
             >
-              <span className="flex-1 truncate font-mono text-[11px] text-muted-foreground">
+              <span className="flex-1 truncate font-mono text-2xs text-muted-foreground">
                 {key.length <= 4 ? "••••" : `••••••${key.slice(-2)}`}
               </span>
-              <span className="rounded bg-secondary px-1.5 py-0.5 text-[10px] text-muted-foreground">
+              <span className="rounded bg-secondary px-1.5 py-0.5 text-3xs text-muted-foreground">
                 待保存
               </span>
               <button
@@ -791,7 +791,7 @@ export function AiProvidersPanel(): JSX.Element {
               </button>
             )}
           </div>
-          <span className="text-[10px] text-muted-foreground">
+          <span className="text-3xs text-muted-foreground">
             Key 明文只存在本机数据库，不回到前端；列表里只显示掩码。
           </span>
         </div>
@@ -840,7 +840,7 @@ export function AiProvidersPanel(): JSX.Element {
         <div className="flex items-center justify-between gap-2">
           <span className="flex flex-col">
             <span className={LABEL_CLASS}>跳过证书校验</span>
-            <span className="text-[10px] text-muted-foreground">
+            <span className="text-3xs text-muted-foreground">
               本机自签 / 自建中转连不上 HTTPS 时打开，只影响这一家供应商
             </span>
           </span>
@@ -900,14 +900,14 @@ export function AiProvidersPanel(): JSX.Element {
               </button>
             </span>
           </div>
-          <span className="text-[10px] text-muted-foreground">
+          <span className="text-3xs text-muted-foreground">
             {draft.vendorModels === null
               ? `已选 ${draft.models.length} 个（点「获取列表」拉供应商的模型）`
               : `供应商返回 ${vendorModels.length} 个，已选 ${draft.models.length} 个`}
           </span>
           <div className="flex max-h-40 flex-wrap gap-1.5 overflow-y-auto">
             {modelChoices.length === 0 ? (
-              <span className="text-[11px] text-muted-foreground">还没有模型，先获取列表</span>
+              <span className="text-2xs text-muted-foreground">还没有模型，先获取列表</span>
             ) : (
               modelChoices.map((name) => {
                 const selected = draft.models.includes(name);
@@ -916,7 +916,7 @@ export function AiProvidersPanel(): JSX.Element {
                     key={name}
                     type="button"
                     onClick={() => toggleModel(name)}
-                    className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-mono text-[10px] transition-colors ${
+                    className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 font-mono text-3xs transition-colors ${
                       selected
                         ? "border-primary/60 bg-secondary text-foreground"
                         : "border-border text-muted-foreground hover:bg-secondary"
@@ -930,7 +930,7 @@ export function AiProvidersPanel(): JSX.Element {
             )}
           </div>
           {draft.models.length > 1 ? (
-            <span className="text-[10px] text-muted-foreground">
+            <span className="text-3xs text-muted-foreground">
               第一个「{draft.models[0]}」是默认模型
             </span>
           ) : null}
@@ -1014,7 +1014,7 @@ export function AiProvidersDialog(props: { onClose: () => void }): JSX.Element {
         role="dialog"
         aria-modal="true"
         aria-labelledby={titleId}
-        className="flex max-h-[calc(100dvh-2rem)] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-border bg-card/95 shadow-2xl backdrop-blur-xl"
+        className="flex max-h-[calc(100dvh-2rem)] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-border bg-card/95 shadow-overlay backdrop-blur-xl"
       >
         <header className="flex shrink-0 items-center gap-2 border-b border-border px-5 py-3.5">
           <div className="min-w-0 flex-1">

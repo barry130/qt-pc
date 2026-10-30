@@ -135,7 +135,7 @@ export function StatsPage(): React.JSX.Element {
                   <button type="button" className="min-w-0 flex-1 text-left" onClick={() => playTrack(item.track)}>
                     <span className="flex min-w-0 items-center gap-1.5 text-sm"><span className="truncate">{item.track.title}</span><SourceTag platform={item.track.platform} size="xs" /></span><span className="block truncate text-xs text-muted-foreground">{item.track.singer}</span>
                   </button>
-                  <span className="shrink-0 text-right text-xs tabular-nums text-muted-foreground">{item.playCount} 次<span className="mt-0.5 block text-[11px]">{formatReportDuration(item.totalPlayedMs)}</span></span>
+                  <span className="shrink-0 text-right text-xs tabular-nums text-muted-foreground">{item.playCount} 次<span className="mt-0.5 block text-2xs">{formatReportDuration(item.totalPlayedMs)}</span></span>
                   <IconButton label={`查看 ${item.track.title} 的统计`} onClick={() => setDetail({ kind: "tracks", entry: trackEntry(item) })}><ChevronRight /></IconButton>
                 </li>)}
               </ul>
@@ -180,13 +180,13 @@ function TrackStatCard(props: { item: PlayStatItem; rank: number; onPlay: () => 
   return <div className="group min-w-0 rounded-xl border border-border bg-card/60 p-2.5 transition-colors hover:border-primary/40">
     <button type="button" className="block w-full text-left" onClick={props.onPlay} aria-label={`播放 ${item.track.title}`}>
       <div className="relative aspect-square overflow-hidden rounded-lg bg-secondary">
-        {cover ? <img src={cover} alt="" loading="lazy" className="h-full w-full object-cover transition-transform duration-150 group-hover:scale-[1.03]" /> : <span className="flex h-full w-full items-center justify-center text-2xl text-muted-foreground">{Array.from(item.track.title)[0] || "?"}</span>}
-        <span className="absolute left-1.5 top-1.5 rounded-md bg-background/80 px-1.5 py-0.5 text-[11px] font-semibold tabular-nums backdrop-blur-sm">{props.rank}</span>
+        {cover ? <img src={cover} alt="" loading="lazy" className="h-full w-full object-cover transition-transform duration-fast group-hover:scale-[1.03]" /> : <span className="flex h-full w-full items-center justify-center text-2xl text-muted-foreground">{Array.from(item.track.title)[0] || "?"}</span>}
+        <span className="absolute left-1.5 top-1.5 rounded-md bg-background/80 px-1.5 py-0.5 text-2xs font-semibold tabular-nums backdrop-blur-sm">{props.rank}</span>
       </div>
       <div className="mt-2 flex min-w-0 items-center gap-1.5 text-sm font-medium"><span className="truncate">{item.track.title}</span><SourceTag platform={item.track.platform} size="xs" /></div>
       <div className="mt-0.5 truncate text-xs text-muted-foreground">{item.track.singer}</div>
     </button>
-    <div className="mt-1 flex items-center justify-between gap-1 text-[11px] tabular-nums text-muted-foreground"><span className="truncate">{item.playCount} 次 · {formatReportDuration(item.totalPlayedMs)}</span><IconButton label={`查看 ${item.track.title} 的统计`} onClick={props.onDetail}><ChevronRight /></IconButton></div>
+    <div className="mt-1 flex items-center justify-between gap-1 text-2xs tabular-nums text-muted-foreground"><span className="truncate">{item.playCount} 次 · {formatReportDuration(item.totalPlayedMs)}</span><IconButton label={`查看 ${item.track.title} 的统计`} onClick={props.onDetail}><ChevronRight /></IconButton></div>
   </div>;
 }
 
@@ -198,8 +198,8 @@ function GroupRow(props: { item: ListenReportEntry; rank: number; name: string; 
     {props.source
       ? <SourceLogo platform={item.id} size={36} />
       : <ArtistAvatar platform={item.platform} name={props.name} size={36} />}
-    <span className="min-w-0 flex-1"><span className="block truncate text-sm">{props.name}</span><span className="mt-0.5 block text-[11px] text-muted-foreground">{item.trackCount} 首 · {formatReportDuration(item.totalPlayedMs)}</span></span>
-    <span className="w-20 shrink-0 text-right text-[11px] tabular-nums text-muted-foreground"><span>{item.playCount} 次{props.totalPlays > 0 ? ` · ${Math.round(percent)}%` : ""}</span><span className="mt-1 block h-1 overflow-hidden rounded bg-secondary"><span className="block h-full rounded bg-primary/60" style={{ width: `${Math.min(100, percent)}%` }} /></span></span>
+    <span className="min-w-0 flex-1"><span className="block truncate text-sm">{props.name}</span><span className="mt-0.5 block text-2xs text-muted-foreground">{item.trackCount} 首 · {formatReportDuration(item.totalPlayedMs)}</span></span>
+    <span className="w-20 shrink-0 text-right text-2xs tabular-nums text-muted-foreground"><span>{item.playCount} 次{props.totalPlays > 0 ? ` · ${Math.round(percent)}%` : ""}</span><span className="mt-1 block h-1 overflow-hidden rounded bg-secondary"><span className="block h-full rounded bg-primary/60" style={{ width: `${Math.min(100, percent)}%` }} /></span></span>
     <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground" />
   </button></li>;
 }

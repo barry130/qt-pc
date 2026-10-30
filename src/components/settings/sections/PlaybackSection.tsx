@@ -10,17 +10,20 @@ export function PlaybackSection(): React.JSX.Element {
   const [current, setCurrent] = useState<string>("");
   const [speed, setSpeedState] = useState(1);
   const [gapless, setGaplessState] = useState(false);
+  const [localFirst, setLocalFirstState] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async (): Promise<void> => {
     try {
-      const [list, snap, savedGapless] = await Promise.all([
+      const [list, snap, savedGapless, savedLocalFirst] = await Promise.all([
         ipc.listOutputDevices(),
         ipc.getPlaybackState(),
         ipc.getSetting(GAPLESS_KEY),
+        ipc.getLocalFirst().catch(() => true),
       ]);
       setGaplessState(savedGapless === "true");
+      setLocalFirstState(savedLocalFirst);
       setDevices(list);
       setCurrent(snap?.outputDevice ?? "");
       if (snap?.speed) setSpeedState(snap.speed);
@@ -53,6 +56,19 @@ export function PlaybackSection(): React.JSX.Element {
     try {
       await ipc.setGapless(!gapless);
       setGaplessState(!gapless);
+    } catch (err) {
+      setError(errMsg(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const chooseLocalFirst = async (): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    try {
+      await ipc.setLocalFirst(!localFirst);
+      setLocalFirstState(!localFirst);
     } catch (err) {
       setError(errMsg(err));
     } finally {
@@ -100,6 +116,16 @@ export function PlaybackSection(): React.JSX.Element {
         description="提前加载下一首，缩短连续播放时的间隔。默认关闭；在线歌曲的衔接效果取决于网络和音源响应。"
       >
         <Switch checked={gapless} disabled={busy} onToggle={() => void chooseGapless()} />
+      </SettingRow>
+      <SettingRow
+        title="本地优先播放"
+        description="开启后，播放前先在下载文件、本地曲库里找同名歌曲（标题+歌手+时长都对上才算），找到就直接放本地文件：断网、播放地址过期都不影响；本地收藏指向的文件被移动/删除时，会自动找替身接着播，不改收藏内容。关闭则始终走在线播放（包括已下载的歌曲），适合要在线高音质的情况。默认开启。"
+      >
+        <Switch
+          checked={localFirst}
+          disabled={busy}
+          onToggle={() => void chooseLocalFirst()}
+        />
       </SettingRow>
       <SettingRow
         title="默认倍速"

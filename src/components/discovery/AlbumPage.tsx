@@ -13,7 +13,7 @@ import { TrackList } from "./TrackList";
 import { TrackSortSelect } from "@/components/TrackSortSelect";
 import { DEFAULT_TRACK_SORT, parseTrackSort, sortTracks } from "@/lib/track-sort";
 import { BatchBar } from "./BatchBar";
-import { ErrorRetry, TrackRowsSkeleton } from "./Skeletons";
+import { ErrorRetry, ListLoadProgress, TrackRowsSkeleton } from "./Skeletons";
 import { BackButton } from "@/components/layout/BackButton";
 import { IconButton } from "@/components/common/IconButton";
 
@@ -134,15 +134,7 @@ function AlbumPageContent({
     [id, name, platform, pageSize],
   );
 
-  const {
-    items: songs,
-    loading,
-    loadingMore,
-    error,
-    hasMore,
-    sentinelRef,
-    reload,
-  } = usePagedList<Track>({
+  const { items: songs, loading, error, finished, reload } = usePagedList<Track>({
     fetchPage,
     keyOf: (t) => `${t.platform}:${t.id}`,
     // pageSize 也进 resetKey：注册表异步到达，首帧可能是兜底值 50，
@@ -150,6 +142,15 @@ function AlbumPageContent({
     // 且 useFilterRef 的「第一页定一次」判断会基于错误的分页粒度）。
     resetKey: `${platform}:${name}:${pageSize}`,
     pageSize,
+    // 一次拉全量（用户 m05614：不要滚动续页，底部不要「已经到底了」）。
+    // 命中专辑 id 时本来就是本地切页，all 模式只是把切片一次铺满；
+    // 走名字搜索时才是真发请求，40 页 × 50 首封顶只是防上游撒谎。
+    mode: "all",
+    cacheKey: `album:${platform}:${name}:${pageSize}`,
+    maxPages: 40,
+    // 名字搜索那条路会用 sameAlbum 过滤整页：某一页整页都不是本专辑时列表不涨，
+    // 但包里 hasMore 仍为真 —— 那不是上游翻页失效，容忍一页再收。
+    emptyStreakLimit: 2,
   });
 
   // 批量管理的已勾选曲目 id 集合（见 BatchBar）
@@ -216,7 +217,7 @@ function AlbumPageContent({
         </div>
 
         <div className="relative flex gap-5 px-6 pb-6 pt-4">
-          <div className="h-36 w-36 shrink-0 overflow-hidden rounded-2xl bg-secondary shadow-xl ring-1 ring-border">
+          <div className="h-36 w-36 shrink-0 overflow-hidden rounded-2xl bg-secondary shadow-surface ring-1 ring-border">
             {coverUrl ? (
               <img
                 src={coverUrl}
@@ -231,7 +232,7 @@ function AlbumPageContent({
             )}
           </div>
           <div className="flex min-w-0 flex-1 flex-col justify-end pb-1">
-            <p className="text-[11px] font-medium uppercase tracking-[0.2em] text-muted-foreground">
+            <p className="text-2xs font-medium uppercase tracking-[0.2em] text-muted-foreground">
               专辑
             </p>
             <h1 className="mt-1 truncate text-2xl font-bold tracking-tight">{title}</h1>
@@ -240,7 +241,7 @@ function AlbumPageContent({
                 ? "加载中…"
                 : query.trim()
                   ? `显示 ${visibleSongs.length} / ${songs.length} 首`
-                  : `${songs.length} 首歌曲${hasMore ? "（继续下拉加载更多）" : ""}`}
+                  : `${songs.length} 首歌曲${finished ? "" : "，正在取完其余…"}`}
             </p>
             {songs.length > 0 && (
               <div className="mt-3">
@@ -331,11 +332,7 @@ function AlbumPageContent({
                 selection={{ ids: visibleSelected, onToggle: toggleSelect, onChange: setSelected }}
               />
             )}
-            {/* 与检索结果共用同一个哨兵：无匹配项时仍能继续拉取后续页。 */}
-            <div ref={sentinelRef} className="h-1" />
-            <div className="py-4 text-center text-xs text-muted-foreground">
-              {loadingMore ? "加载中…" : hasMore ? "继续下拉加载更多" : "已经到底了"}
-            </div>
+            <ListLoadProgress finished={finished} count={songs.length} />
           </>
         )}
       </div>

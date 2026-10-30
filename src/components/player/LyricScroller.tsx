@@ -1,6 +1,20 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import { formatTime, type LyricLine, type LyricWord } from "@/lib/lrc";
+import {
+  LYRIC_FONT_SIZE_DEFAULT,
+  LYRIC_INACTIVE_RATIO,
+  LYRIC_ROMANIZATION_RATIO,
+  LYRIC_TRANSLATION_RATIO,
+} from "@/hooks/useLyricFontSize";
 import { cn } from "@/lib/utils";
+
+/** 行高统一按字号的 1.4 倍算：字号调大时行距跟着放大，不会被行高裁掉 */
+const LYRIC_LINE_HEIGHT = 1.4;
+
+/** 把 px 换成 rem，外观里的全局字体缩放（html font-size）才能一起生效 */
+function remOf(px: number): string {
+  return `${(px / 16).toFixed(3)}rem`;
+}
 
 const DRAG_THRESHOLD_PX = 8;
 
@@ -17,7 +31,7 @@ interface LyricDrag {
   targetIndex: number;
   /** 激活拖动时缓存的行几何量：move 里逐行读 offsetTop/clientHeight 会强制同步布局。 */
   rowGeometry: Array<{ top: number; half: number } | null> | null;
-  /** 建缓存时的 active 行；换行会改行高布局（text-xl ↔ text-base），届时整组重建。 */
+  /** 建缓存时的 active 行；换行会改行高布局（高亮行字号更大），届时整组重建。 */
   geometryAtIndex: number;
 }
 
@@ -46,12 +60,31 @@ export function LyricScroller(props: {
   positionMs: number;
   /** 预览显示实际播放时间；提交仍返回原始行时间，由调用方统一加偏移。 */
   seekOffsetMs?: number;
+  /** 高亮行字号（px）。译文/罗马音/非高亮行按固定比例跟随，见 useLyricFontSize */
+  fontSize?: number;
 }): React.JSX.Element {
-  const { lines, activeIndex, onSeekMs, positionMs, seekOffsetMs = 0 } = props;
+  const {
+    lines,
+    activeIndex,
+    onSeekMs,
+    positionMs,
+    seekOffsetMs = 0,
+    fontSize = LYRIC_FONT_SIZE_DEFAULT,
+  } = props;
   const containerRef = useRef<HTMLDivElement | null>(null);
   const itemRefs = useRef<Array<HTMLDivElement | null>>([]);
   const dragRef = useRef<LyricDrag | null>(null);
   const suppressClickRef = useRef(false);
+  /**
+   * 手动滚动后暂停「自动跟随」的截止时间（performance.now 基准）。
+   *
+   * 以前只挡「按住拖拽」（dragRef）：容器是 overflow-y-auto + scroll-smooth，
+   * 滚轮/触控板上滚完全不走 dragRef，于是用户刚往上翻看后面的词，下一次换行
+   * （2~4 秒一次）就被 smooth 拽回当前行——后段歌词根本看不了
+   * （评审 2026-10-29）。滚轮/触控板/滚动条一动手就暂停 4 秒。
+   */
+  const followPausedUntilRef = useRef(0);
+  const [followPaused, setFollowPaused] = useState(false);
   const [holding, setHolding] = useState(false);
   const [dragging, setDragging] = useState(false);
   const [targetIndex, setTargetIndex] = useState(-1);
@@ -112,14 +145,40 @@ export function LyricScroller(props: {
     };
   }, [cancelDrag]);
 
+  /** 手动滚动 → 暂停跟随（滚动条、滚轮、触控板都会走到这里） */
+  const pauseFollow = useCallback((): void => {
+    followPausedUntilRef.current = performance.now() + 4000;
+    setFollowPaused(true);
+  }, []);
+
+  /** 「回到当前行」：清掉暂停标记，让下面那个 effect 立刻重新对齐 */
+  const resumeFollow = useCallback((): void => {
+    followPausedUntilRef.current = 0;
+    setFollowPaused(false);
+  }, []);
+
   useEffect(() => {
     const el = itemRefs.current[activeIndex];
     const container = containerRef.current;
     if (!el || !container || dragRef.current) return;
+    // 用户正在自己翻词：别抢滚动位置（4 秒后或点「回到当前行」再接管）
+    if (performance.now() < followPausedUntilRef.current) return;
     // 相对定位的容器让 offsetTop 不包含上方曲目信息区的高度。
     const target = el.offsetTop - container.clientHeight / 2 + el.clientHeight / 2;
     container.scrollTo({ top: target, behavior: "smooth" });
-  }, [activeIndex, lines, holding]);
+  }, [activeIndex, lines, holding, fontSize]);
+
+  // 暂停到期后把状态复位（按钮/遮罩靠它决定是否显示「回到当前行」）
+  useEffect(() => {
+    if (!followPaused) return;
+    const remain = followPausedUntilRef.current - performance.now();
+    if (remain <= 0) {
+      setFollowPaused(false);
+      return;
+    }
+    const id = window.setTimeout(() => setFollowPaused(false), remain);
+    return () => window.clearTimeout(id);
+  }, [followPaused]);
 
   const startDrag = (event: React.PointerEvent<HTMLDivElement>): void => {
     if (event.button !== 0 || event.isPrimary === false || dragRef.current) return;
@@ -234,6 +293,8 @@ export function LyricScroller(props: {
           dragging && "cursor-grabbing",
         )}
         style={{ touchAction: "none" }}
+        onWheel={pauseFollow}
+        onTouchMove={pauseFollow}
         onPointerDown={startDrag}
         onPointerMove={moveDrag}
         onPointerUp={endDrag}
@@ -262,6 +323,7 @@ export function LyricScroller(props: {
               itemRefs={itemRefs}
               onSeekMs={seekLine}
               cancelDrag={cancelDrag}
+              fontSize={fontSize}
             />
           ))}
         </div>
@@ -279,6 +341,16 @@ export function LyricScroller(props: {
             <span className="ml-2 text-muted-foreground">松开定位 · Esc 取消</span>
           </span>
         </div>
+      )}
+      {followPaused && !dragging && (
+        // 手动翻词期间不给「自动拽回」，但得留一条回去的路：点一下立刻回到当前行
+        <button
+          type="button"
+          onClick={resumeFollow}
+          className="absolute bottom-3 left-1/2 -translate-x-1/2 rounded-full border border-border/70 bg-background/95 px-3 py-1 text-2xs text-muted-foreground shadow-surface transition-colors duration-fast hover:text-foreground"
+        >
+          回到当前行
+        </button>
       )}
     </div>
   );
@@ -299,8 +371,25 @@ const LyricLineRow = memo(function LyricLineRow(props: {
   itemRefs: React.RefObject<Array<HTMLDivElement | null>>;
   onSeekMs: (ms: number) => void;
   cancelDrag: () => void;
+  fontSize: number;
 }): React.JSX.Element {
-  const { line, index, active, dragging, target, positionMs, itemRefs, onSeekMs, cancelDrag } = props;
+  const {
+    line,
+    index,
+    active,
+    dragging,
+    target,
+    positionMs,
+    itemRefs,
+    onSeekMs,
+    cancelDrag,
+    fontSize,
+  } = props;
+  // 非高亮行按比例缩小；译文/罗马音统一挂在高亮字号的 0.7 / 0.6 上，
+  // 与改造前 20 / 16 / 14 / 12 的实际观感一致，调字号只等比缩放。
+  const basePx = active ? fontSize : fontSize * LYRIC_INACTIVE_RATIO;
+  const translationPx = fontSize * LYRIC_TRANSLATION_RATIO;
+  const romanizationPx = fontSize * LYRIC_ROMANIZATION_RATIO;
   // 行自己的 ref 回调：itemRefs 对象身份稳定、index 不变，回调身份随之稳定，
   // memo 比较才会通过（写在父组件 map 里的内联 ref 每次渲染都是新函数）。
   const setItemRef = useCallback((el: HTMLDivElement | null): void => {
@@ -321,15 +410,16 @@ const LyricLineRow = memo(function LyricLineRow(props: {
         onSeekMs(line.timeMs);
       } : undefined}
       className={cn(
-        "rounded-md text-center transition-[transform,color,background-color] duration-300",
+        "rounded-md text-center transition-[transform,color,background-color] duration-slow",
         line.timeMs >= 0 && (dragging
           ? "cursor-grabbing"
           : "cursor-pointer hover:text-lyric-highlight/70 focus-visible:outline-none"),
         active
-          ? "scale-105 text-xl font-semibold text-lyric-highlight"
-          : "text-base text-lyric-inactive",
+          ? "qt-lyric-active scale-105 font-semibold text-lyric-highlight"
+          : "text-lyric-inactive",
         target && "bg-primary/10 ring-1 ring-primary/30",
       )}
+      style={{ fontSize: remOf(basePx), lineHeight: LYRIC_LINE_HEIGHT }}
     >
       {active && line.words !== undefined && line.words.length > 0 ? (
         <div>
@@ -341,14 +431,20 @@ const LyricLineRow = memo(function LyricLineRow(props: {
         <div>{line.text || "…"}</div>
       )}
       {line.romanization && (
-        <div className={cn("mt-0.5 text-xs", active
-          ? "text-lyric-highlight/60" : "text-lyric-inactive/50")}>
+        <div
+          className={cn("mt-0.5", active
+            ? "text-lyric-highlight/60" : "text-lyric-inactive/50")}
+          style={{ fontSize: remOf(romanizationPx), lineHeight: LYRIC_LINE_HEIGHT }}
+        >
           {line.romanization}
         </div>
       )}
       {line.translation && (
-        <div className={cn("mt-1 text-sm", active
-          ? "text-lyric-highlight/80" : "text-lyric-inactive/70")}>
+        <div
+          className={cn("mt-1", active
+            ? "text-lyric-highlight/80" : "text-lyric-inactive/70")}
+          style={{ fontSize: remOf(translationPx), lineHeight: LYRIC_LINE_HEIGHT }}
+        >
           {line.translation}
         </div>
       )}

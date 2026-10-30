@@ -95,7 +95,7 @@ function Switch(props: { checked: boolean; onToggle: () => void; disabled?: bool
       }`}
     >
       <span
-        className={`absolute top-[0.125rem] h-4 w-4 rounded-full bg-background shadow transition-[left,transform] duration-200 ${
+        className={`absolute top-[0.125rem] h-4 w-4 rounded-full bg-background shadow transition-[left,transform] duration-base ${
           props.checked ? "left-[1.125rem]" : "left-[0.125rem]"
         }`}
       />
@@ -511,7 +511,7 @@ export function SourceAccountsPage(): React.JSX.Element {
     <div className="flex h-full min-w-0 flex-col">
       <div className="flex items-start justify-between gap-3 border-b border-border px-4 py-3">
         <div className="min-w-0">
-          <h1 className="text-base font-medium">音源账号</h1>
+          <h1 className="text-xl font-bold tracking-tight">音源账号</h1>
           <p className="mt-1 text-xs text-muted-foreground">
             扫码登录音源官方账号，凭据只存本机；每个音源单独决定数据/播放请求是否使用登录态。
           </p>
@@ -571,20 +571,20 @@ export function SourceAccountsPage(): React.JSX.Element {
                       />
                       <span className="shrink-0 text-sm font-medium">{item.name}</span>
                       {item.orphan ? (
-                        <span className="shrink-0 text-[11px] text-amber-500 dark:text-amber-400">
+                        <span className="shrink-0 text-2xs text-amber-500 dark:text-amber-400">
                           {registryReady ? "音源包已卸载" : "音源包未就绪"}
                         </span>
                       ) : null}
                       {account ? (
                         stale[item.id] ? (
-                          <span className="shrink-0 text-[11px] text-amber-500 dark:text-amber-400">
+                          <span className="shrink-0 text-2xs text-amber-500 dark:text-amber-400">
                             凭据已过期
                           </span>
                         ) : (
-                          <span className="shrink-0 text-[11px] text-muted-foreground">已登录</span>
+                          <span className="shrink-0 text-2xs text-muted-foreground">已登录</span>
                         )
                       ) : (
-                        <span className="shrink-0 text-[11px] text-muted-foreground">未登录</span>
+                        <span className="shrink-0 text-2xs text-muted-foreground">未登录</span>
                       )}
                     </button>
                     {account ? (
@@ -782,11 +782,11 @@ export function SourceAccountsPage(): React.JSX.Element {
 
       {qr !== null ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-xs rounded-xl border border-border bg-card/90 p-4 shadow-lg backdrop-blur-xl">
+          <div className="w-full max-w-xs rounded-xl border border-border bg-card/90 p-4 shadow-raised backdrop-blur-xl">
             <div className="text-sm font-medium text-foreground">
               {qr.sourceName} · 扫码登录
             </div>
-            <p className="mt-1 text-[11px] text-muted-foreground">
+            <p className="mt-1 text-2xs text-muted-foreground">
               {qr.hint.length > 0
                 ? `${qr.hint}；二维码几分钟内有效，过期可刷新。`
                 : `用${qr.sourceName}官方 App 扫码；二维码几分钟内有效，过期可刷新。`}
@@ -830,11 +830,11 @@ export function SourceAccountsPage(): React.JSX.Element {
 
       {cookieSource !== null ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-md rounded-xl border border-border bg-card/90 p-4 shadow-lg backdrop-blur-xl">
+          <div className="w-full max-w-md rounded-xl border border-border bg-card/90 p-4 shadow-raised backdrop-blur-xl">
             <div className="text-sm font-medium text-foreground">
               {cards.find((c) => c.id === cookieSource)?.name ?? cookieSource} · 导入 Cookie
             </div>
-            <p className="mt-1 text-[11px] text-muted-foreground">
+            <p className="mt-1 text-2xs text-muted-foreground">
               粘贴浏览器里该音源官网的 Cookie 串（如 SESSDATA=…; bili_jct=… 或 MUSIC_U=…），
               导入前会先经官方接口校验有效性。
             </p>
@@ -873,13 +873,13 @@ export function SourceAccountsPage(): React.JSX.Element {
 
       {sms !== null ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-sm rounded-xl border border-border bg-card/90 p-4 shadow-lg backdrop-blur-xl">
+          <div className="w-full max-w-sm rounded-xl border border-border bg-card/90 p-4 shadow-raised backdrop-blur-xl">
             <div className="text-sm font-medium text-foreground">
               {sms.sourceName} · 短信登录
             </div>
             {sms.stage === "phone" ? (
               <>
-                <p className="mt-1 text-[11px] text-muted-foreground">
+                <p className="mt-1 text-2xs text-muted-foreground">
                   输入{sms.sourceName}绑定的手机号，验证码由官方下发。
                 </p>
                 <input
@@ -912,7 +912,7 @@ export function SourceAccountsPage(): React.JSX.Element {
               </>
             ) : (
               <>
-                <p className="mt-1 text-[11px] text-muted-foreground">
+                <p className="mt-1 text-2xs text-muted-foreground">
                   {sms.message.length > 0 ? sms.message : "验证码已发送，请查看短信。"}
                 </p>
                 <input
@@ -950,11 +950,11 @@ export function SourceAccountsPage(): React.JSX.Element {
 
       {pwd !== null ? (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-sm rounded-xl border border-border bg-card/90 p-4 shadow-lg backdrop-blur-xl">
+          <div className="w-full max-w-sm rounded-xl border border-border bg-card/90 p-4 shadow-raised backdrop-blur-xl">
             <div className="text-sm font-medium text-foreground">
               {pwd.sourceName} · 密码登录
             </div>
-            <p className="mt-1 text-[11px] text-muted-foreground">
+            <p className="mt-1 text-2xs text-muted-foreground">
               使用{pwd.sourceName}官方客户端账号密码登录，凭据不出本机。
             </p>
             <input

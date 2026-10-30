@@ -81,7 +81,7 @@ export function QtNoticeDialog(): React.JSX.Element | null {
         role="dialog"
         aria-modal="true"
         aria-labelledby="qt-notice-title"
-        className="flex max-h-[min(680px,calc(100vh-48px))] w-[560px] max-w-full flex-col overflow-hidden rounded-2xl border border-border bg-background shadow-2xl"
+        className="flex max-h-[min(680px,calc(100vh-48px))] w-[560px] max-w-full flex-col overflow-hidden rounded-2xl border border-border bg-background shadow-overlay"
       >
         {notice.title && (
           <div className="shrink-0 px-6 pb-2 pt-6 text-center">

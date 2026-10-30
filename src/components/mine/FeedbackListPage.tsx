@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { BackButton } from "@/components/layout/BackButton";
 import { usePagedList } from "@/hooks/usePagedList";
+import { ListLoadProgress } from "@/components/discovery/Skeletons";
 import * as ipc from "@/services/ipc";
 import {
   FEEDBACK_PAGE_SIZE,
@@ -36,9 +37,7 @@ export function FeedbackListPage(): React.JSX.Element {
   const navigate = useNavigate();
   const [tab, setTab] = useState<TabKey>("mine");
 
-  const { items, loading, loadingMore, error, hasMore, sentinelRef, reload } = usePagedList<
-    FeedbackItem
-  >({
+  const { items, loading, error, finished, reload } = usePagedList<FeedbackItem>({
     resetKey: tab,
     pageSize: FEEDBACK_PAGE_SIZE,
     keyOf: (f) => String(f.id),
@@ -50,6 +49,10 @@ export function FeedbackListPage(): React.JSX.Element {
       const { records, total } = normalizePage(raw);
       return { list: records, hasMore: records.length < total };
     },
+    // 一次拉全量（用户 m05614）：接口本来就回 total，翻到够数就停。
+    // 反馈量不大（几十条），20 页只是安全阀。
+    mode: "all",
+    maxPages: 20,
   });
 
   return (
@@ -57,7 +60,7 @@ export function FeedbackListPage(): React.JSX.Element {
       <div className="px-5 pb-4 pt-6">
         <div className="mb-4 flex items-center gap-2">
           <BackButton />
-          <h1 className="text-base font-semibold">意见反馈</h1>
+          <h1 className="text-xl font-bold tracking-tight">意见反馈</h1>
           <button
             type="button"
             onClick={() => void navigate({ to: "/feedback/submit" })}
@@ -116,7 +119,7 @@ export function FeedbackListPage(): React.JSX.Element {
                     >
                       <div className="flex items-center gap-2">
                         <span
-                          className={`shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium ${feedbackTypeClass(f.type)}`}
+                          className={`shrink-0 rounded px-1.5 py-0.5 text-2xs font-medium ${feedbackTypeClass(f.type)}`}
                         >
                           {feedbackTypeLabel(f.type)}
                         </span>
@@ -124,7 +127,7 @@ export function FeedbackListPage(): React.JSX.Element {
                           {f.title}
                         </span>
                         <span
-                          className={`shrink-0 rounded px-1.5 py-0.5 text-[11px] font-medium ${feedbackStatusClass(f.status)}`}
+                          className={`shrink-0 rounded px-1.5 py-0.5 text-2xs font-medium ${feedbackStatusClass(f.status)}`}
                         >
                           {feedbackStatusLabel(f.status)}
                         </span>
@@ -132,7 +135,7 @@ export function FeedbackListPage(): React.JSX.Element {
                       <p className="mt-1.5 line-clamp-2 text-xs leading-relaxed text-muted-foreground">
                         {f.content}
                       </p>
-                      <div className="mt-1.5 flex items-center justify-between text-[11px] text-muted-foreground">
+                      <div className="mt-1.5 flex items-center justify-between text-2xs text-muted-foreground">
                         <span>{formatFeedbackTime(f.createTime)}</span>
                         {tab === "mine" && f.isPublic && (
                           <span className="text-emerald-500">已公开</span>
@@ -142,9 +145,7 @@ export function FeedbackListPage(): React.JSX.Element {
                   </li>
                 ))}
               </ul>
-              <div ref={sentinelRef} className="py-3 text-center text-xs text-muted-foreground">
-                {loadingMore ? "加载中…" : hasMore ? "加载更多" : "没有更多了"}
-              </div>
+              <ListLoadProgress finished={finished} count={items.length} noun="反馈" unit="条" />
             </>
           )}
         </div>

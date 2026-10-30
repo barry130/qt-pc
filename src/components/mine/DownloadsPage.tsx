@@ -259,7 +259,7 @@ export function DownloadsPage(): React.JSX.Element {
     <div className="flex h-full min-w-0 flex-col">
       <div className="border-b border-border px-4 py-3">
         <div className="flex items-center justify-between gap-3">
-          <h1 className="text-base font-medium">下载管理</h1>
+          <h1 className="text-xl font-bold tracking-tight">下载管理</h1>
           <div className="flex items-center gap-1">
             {playable.length > 0 && (
               <IconButton
@@ -596,7 +596,7 @@ function TaskRow(props: {
       {inFlight && (
         <div className="mt-2 h-1 w-full overflow-hidden rounded bg-secondary">
           <div
-            className="h-full bg-primary transition-[width] duration-300 ease-out"
+            className="h-full bg-primary transition-[width] duration-slow ease-soft"
             style={{ width: `${pct}%` }}
           />
         </div>

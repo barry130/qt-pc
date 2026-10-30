@@ -46,6 +46,11 @@ export function usePagedList<T>(options: {
   /** all 模式的页数上限（安全阀），默认 120 页 */
   maxPages?: number;
   /**
+   * all 模式容忍连续几页「一条都没新增」，默认 1（第 2 页零新增即收尾）。
+   * 在 fetchPage 里做客户端过滤的页面（专辑名回填）取 2，免得整页被过滤掉就丢掉后面的页。
+   */
+  emptyStreakLimit?: number;
+  /**
    * all 模式的缓存键（如 `artist:kw:周杰伦:50:`）。
    * 给了就按 key 复用任务：组件卸载后后台继续跑完，下次进同页直接拿全量；
    * reload 会丢掉这个 key 重拉。不给就一次性（卸载即取消）。
@@ -81,6 +86,7 @@ export function usePagedList<T>(options: {
   const sizeRef = useRef(pageSize);
   const concurrency = options.concurrency ?? 6;
   const maxPages = options.maxPages ?? 120;
+  const emptyStreakLimit = options.emptyStreakLimit ?? 1;
   const cacheKey = options.cacheKey;
   const cacheKeyRef = useRef(cacheKey);
   useEffect(() => {
@@ -125,6 +131,7 @@ export function usePagedList<T>(options: {
         pageSize: sizeRef.current,
         concurrency,
         maxPages,
+        emptyStreakLimit,
       };
       const job =
         cacheKey !== undefined && cacheKey.length > 0

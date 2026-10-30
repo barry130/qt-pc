@@ -98,7 +98,7 @@ export function ListenTrendSection(props: {
                 <span className={cn("w-full rounded-t transition-colors", point.playCount > 0 ? "bg-primary/60 group-hover/bar:bg-primary" : "bg-secondary")} style={{ height: point.playCount > 0 ? `${Math.max(8, point.playCount / maxPlays * 100)}%` : "3px" }} />
               </span>)}
           </div>
-          <div className="mt-1 flex h-3 items-center gap-1 text-[10px] text-muted-foreground">
+          <div className="mt-1 flex h-3 items-center gap-1 text-3xs text-muted-foreground">
             {points.map((point, index) => <span key={point.day} className="min-w-0 flex-1 truncate text-center">{!loading && (index % labelEvery === 0 || index === points.length - 1) ? formatDayAxis(point.day, todayKey, days) : ""}</span>)}
           </div>
 
@@ -109,9 +109,9 @@ export function ListenTrendSection(props: {
                 <EntryPicture entry={entry} kind={kind} name={nameOf(entry)} size={32} />
                 <span className="min-w-0 flex-1">
                   <span className="flex min-w-0 items-center gap-1.5 text-sm"><span className="truncate">{nameOf(entry)}</span>{entry.track ? <SourceTag platform={entry.track.platform} size="xs" /> : null}</span>
-                  <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">{kind === "tracks" ? entry.track?.singer || "未知歌手" : `${entry.trackCount} 首歌曲`}</span>
+                  <span className="mt-0.5 block truncate text-2xs text-muted-foreground">{kind === "tracks" ? entry.track?.singer || "未知歌手" : `${entry.trackCount} 首歌曲`}</span>
                 </span>
-                <span className="shrink-0 text-right text-[11px] tabular-nums text-muted-foreground">{entry.playCount} 次<span className="mt-0.5 block">{formatReportDuration(entry.totalPlayedMs)}</span></span>
+                <span className="shrink-0 text-right text-2xs tabular-nums text-muted-foreground">{entry.playCount} 次<span className="mt-0.5 block">{formatReportDuration(entry.totalPlayedMs)}</span></span>
                 <ChevronRight className="h-3 w-3 shrink-0 text-muted-foreground" />
               </button>
             </li>

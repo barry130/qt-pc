@@ -40,7 +40,7 @@ export function ScrollTopLayer(props: {
           onClick={() => {
             target?.scrollTo({ top: 0, behavior: "smooth" });
           }}
-          className="pointer-events-auto absolute bottom-4 right-4 flex h-9 w-9 items-center justify-center rounded-full border border-border bg-card/90 text-foreground shadow-lg backdrop-blur-sm transition-colors hover:bg-accent"
+          className="pointer-events-auto absolute bottom-4 right-4 flex h-9 w-9 items-center justify-center rounded-full border border-border bg-card/90 text-foreground shadow-raised backdrop-blur-sm transition-colors hover:bg-accent"
         >
           <ArrowUp className="h-4 w-4" />
         </button>

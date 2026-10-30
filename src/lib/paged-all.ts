@@ -82,6 +82,15 @@ export interface PagedAllOptions<T> {
   concurrency?: number;
   /** 页数上限（安全阀），默认 120 */
   maxPages?: number;
+  /**
+   * 连续几页「一条都没新增」才认定上游翻页失效并收尾，默认 1（第 2 页零新增就停）。
+   *
+   * 默认 1 是为「上游无视 page、一直返回同一页」准备的：那种情况多打一页都是浪费。
+   * 但调用方若在 `fetchPage` 里做了客户端过滤（专辑名回填、歌手名过滤），整页被过滤掉
+   * 时列表不涨、包里 `hasMore` 却仍为真 —— 那不是上游失效。这类列表把阈值放宽到 2，
+   * 只容忍一页，真失效时最多多打 1 页就收尾，仍然不会空转到 maxPages。
+   */
+  emptyStreakLimit?: number;
 }
 
 export interface PagedAllJob<T> {
@@ -198,8 +207,11 @@ async function runJob<T>(job: Job<T>, options: PagedAllOptions<T>): Promise<void
   const concurrency = options.concurrency ?? 6;
   const maxPages = options.maxPages ?? 120;
   const pageSize = options.pageSize;
+  const emptyStreakLimit = Math.max(1, options.emptyStreakLimit ?? 1);
 
   let done = 0;
+  /** 连续「一条都没新增」的页数（到 emptyStreakLimit 就收尾） */
+  let zeroStreak = 0;
   let total: number | null = null;
   let failed: string | null = null;
   let acc: T[] = [];
@@ -235,9 +247,14 @@ async function runJob<T>(job: Job<T>, options: PagedAllOptions<T>): Promise<void
     acc = appendUnique(acc, secondPage.list, keyOf, seen);
     done = 2;
     publish();
-    // 上游翻页失效时会一直返回同一页：这一页一条都没新增就别再往下探，
+    // 上游翻页失效时会一直返回同一页：连续几页一条都没新增就别再往下探，
     // 否则要空转到 maxPages（用户看到的就是「条数不变但一直在转」）。
-    if (!secondPage.hasMore || acc.length === before) return finish();
+    // 阈值默认 1（本页零新增即停）；做了客户端过滤的调用方取 2，见 emptyStreakLimit。
+    if (!secondPage.hasMore) return finish();
+    if (acc.length === before) {
+      zeroStreak = 1;
+      if (zeroStreak >= emptyStreakLimit) return finish();
+    }
 
     let nextPage = 3;
     while (nextPage <= maxPages) {
@@ -254,7 +271,6 @@ async function runJob<T>(job: Job<T>, options: PagedAllOptions<T>): Promise<void
       );
       if (job.cancelled) return;
 
-      let added = 0;
       let stop = false;
       for (const entry of settled) {
         if (entry.result === null) {
@@ -265,7 +281,7 @@ async function runJob<T>(job: Job<T>, options: PagedAllOptions<T>): Promise<void
         const pageData = splitPage(entry.result, pageSize);
         const prevLen = acc.length;
         acc = appendUnique(acc, pageData.list, keyOf, seen);
-        added += acc.length - prevLen;
+        zeroStreak = acc.length === prevLen ? zeroStreak + 1 : 0;
         done++;
         // 每拿完一页就发一次：并发 6 页在飞期间条数也要往上走
         publish();
@@ -278,7 +294,7 @@ async function runJob<T>(job: Job<T>, options: PagedAllOptions<T>): Promise<void
           break;
         }
       }
-      if (stop || added === 0) break;
+      if (stop || zeroStreak >= emptyStreakLimit) break;
     }
     finish();
   } catch (err) {

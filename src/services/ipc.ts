@@ -765,6 +765,40 @@ export async function setGapless(enabled: boolean): Promise<void> {
   return invoke("set_gapless", { enabled });
 }
 
+// ---------- 本地优先播放（DESIGN §7.6） ----------
+
+/** 本地优先播放总开关（settings key `play.localFirst`，Rust 侧读库）。
+ *  键不存在按开（默认开）；无数据库也按开。 */
+export async function getLocalFirst(): Promise<boolean> {
+  return invoke("get_local_first");
+}
+
+/** 写本地优先总开关：只落库，引擎每次加载曲目现读、立即生效。 */
+export async function setLocalFirst(enabled: boolean): Promise<void> {
+  return invoke("set_local_first", { enabled });
+}
+
+/** 本地优先命中项：文件绝对路径 + 命中层（ledger=下载账本 / task=下载任务兜底 /
+ *  orphan=孤儿文件索引 / library=本地曲库元数据匹配 / local=本地曲目本身）。 */
+export interface LocalFileHit {
+  path: string;
+  kind: string;
+}
+
+/**
+ * 这条曲目**此刻会播的本地文件**（管理端「播放地址」面板用）。
+ *
+ * 本地优先命中时引擎走本地分支，快照 `playUrl` 是空的（真的没有在线地址），
+ * 真正在播的是磁盘文件——那份路径只有 Rust 侧知道。纯只读查询，与引擎同一条
+ * 解析链（local_first.rs），不触发播放、不改播放状态。
+ *
+ * null = 没命中本地 / 本地优先开关关 / 无数据库（面板据此显示「未命中本地」，
+ * 不要编一个地址出来）。
+ */
+export async function resolveLocalFile(track: Track): Promise<LocalFileHit | null> {
+  return invoke("resolve_local_file", { track });
+}
+
 /** 武装 / 取消睡眠定时。remainingMs=倒计时毫秒（null 取消）；afterTrack=播完当前歌停 */
 export async function setSleepTimer(
   remainingMs: number | null,
@@ -1145,11 +1179,13 @@ export async function sourceWebLoginClose(): Promise<void> {
 }
 
 /**
- * 诊断用：把校验失败时的捕获 Cookie 写到本地临时文件
- * （%TEMP%/qt-weblogin-debug.txt），只落本机，供开发者离线复现校验失败原因。
+ * 诊断用（已脱敏）：只取捕获到 Cookie 的**名称**清单，供定位「缺哪个键」。
+ *
+ * 不写盘、不回传值：旧实现把 Cookie 原文落到 %TEMP% 且从不清理，
+ * 等于把可复用的登录态长期明文留在磁盘上（安全评审 P0，2026-10-29 改）。
  */
-export async function sourceWebLoginDebugDump(cookie: string): Promise<string> {
-  return invoke("source_web_login_debug_dump", { cookie });
+export async function sourceWebLoginCookieNames(cookie: string): Promise<string[]> {
+  return invoke("source_web_login_diagnose_names", { cookie });
 }
 
 /**

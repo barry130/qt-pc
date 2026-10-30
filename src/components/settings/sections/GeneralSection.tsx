@@ -577,7 +577,7 @@ export function GeneralSection(): React.JSX.Element {
           >
             {clearing ? "清理中…" : armedStats ? "再点一次确认清除" : "清理"}
           </button>
-          <p className="basis-full text-right text-[11px] text-muted-foreground">
+          <p className="basis-full text-right text-2xs text-muted-foreground">
             进程内缓存可重新获取；清理歌词只清内存候选与当前歌词，不删除已保存歌词。听歌统计不可再生，勾上后需点两次「清理」；想留个底可以先「导出备份」。
           </p>
         </div>
@@ -643,7 +643,7 @@ export function GeneralSection(): React.JSX.Element {
                   取消
                 </button>
               </div>
-              <span className="max-w-72 text-right text-[11px] text-muted-foreground">
+              <span className="max-w-72 text-right text-2xs text-muted-foreground">
                 合并＝只补进缺的记录，现有数据不动；覆盖＝用备份整体替换当前数据（会先自动快照一份）
               </span>
             </div>

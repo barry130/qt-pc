@@ -146,7 +146,7 @@ export function AiAssistantPage(): React.JSX.Element {
           </div>
           <div className="min-h-0 flex-1 overflow-y-auto px-1.5 pb-2">
             {chat.conversations.length === 0 ? (
-              <div className="px-2 py-6 text-center text-[11px] text-muted-foreground">
+              <div className="px-2 py-6 text-center text-2xs text-muted-foreground">
                 还没有对话
               </div>
             ) : (
@@ -185,12 +185,12 @@ export function AiAssistantPage(): React.JSX.Element {
               <Sparkles className="h-3.5 w-3.5 text-primary" />
               <span className="truncate text-sm font-semibold">{chat.agentName}</span>
             </div>
-            <div className="truncate text-[11px] text-muted-foreground">
+            <div className="truncate text-2xs text-muted-foreground">
               {MODE_SUBTITLE[chat.mode]}
             </div>
           </div>
           {serverMode ? (
-            <span className="ml-auto shrink-0 rounded-full bg-secondary px-2 py-0.5 text-[10px] text-muted-foreground">
+            <span className="ml-auto shrink-0 rounded-full bg-secondary px-2 py-0.5 text-3xs text-muted-foreground">
               {chat.agent?.agentCode ?? "music_assistant"}
             </span>
           ) : null}
@@ -209,7 +209,7 @@ export function AiAssistantPage(): React.JSX.Element {
           >
             <Info className="h-3.5 w-3.5 shrink-0" />
             <span className="min-w-0 flex-1">{chat.modeHint}</span>
-            <span className="shrink-0 text-[11px] opacity-70">设置 → AI 可切换</span>
+            <span className="shrink-0 text-2xs opacity-70">设置 → AI 可切换</span>
           </div>
         )}
 
@@ -297,7 +297,7 @@ export function AiAssistantPage(): React.JSX.Element {
               </button>
             )}
           </div>
-          <div className="mx-auto mt-1.5 w-full max-w-3xl text-[10px] text-muted-foreground">
+          <div className="mx-auto mt-1.5 w-full max-w-3xl text-3xs text-muted-foreground">
             {MODE_FOOTNOTE[chat.mode]}
           </div>
         </div>
@@ -329,7 +329,7 @@ function ConversationRow(props: {
         {props.title}
       </button>
       {props.count > 0 ? (
-        <span className="shrink-0 text-[10px] text-muted-foreground group-hover:hidden">
+        <span className="shrink-0 text-3xs text-muted-foreground group-hover:hidden">
           {props.count}
         </span>
       ) : null}

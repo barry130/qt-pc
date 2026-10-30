@@ -98,15 +98,24 @@ pub async fn source_web_login_close(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
-/// 诊断用：把校验失败时的捕获 Cookie 原文写到本地临时文件（只落本机磁盘，
-/// 不上传），供开发者在同一台机器上用真实凭据离线复现官方校验失败原因。
-/// 返回写入的文件路径。
+/// 诊断用（已脱敏）：只回报捕获到的 Cookie **名称**，不写盘、不回传任何值。
+///
+/// 2026-10-29 改：旧实现把整条 Cookie 原文（含平台会话凭据）写进
+/// `%TEMP%/qt-weblogin-debug.txt` 且从不清理 —— 相当于把可复用的登录态明文
+/// 长期留在磁盘上（安全评审 P0）。诊断需要的是「缺了哪几个键」，
+/// 名称足够定位问题，值一律不出进程。
 #[tauri::command]
-pub async fn source_web_login_debug_dump(cookie: String) -> Result<String, String> {
-    let path = std::env::temp_dir().join("qt-weblogin-debug.txt");
-    std::fs::write(&path, cookie.as_bytes())
-        .map_err(|e| format!("写调试文件失败 {}: {e}", path.display()))?;
-    Ok(path.display().to_string())
+pub async fn source_web_login_diagnose_names(cookie: String) -> Result<Vec<String>, String> {
+    let mut names: Vec<String> = cookie
+        .split(';')
+        .filter_map(|pair| pair.split('=').next())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names.dedup();
+    Ok(names)
 }
 
 /// 建登录窗（只在主线程调用）：约 480×640、居中、可缩放的常规窗口。

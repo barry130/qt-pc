@@ -249,6 +249,7 @@ pub(crate) const MIGRATIONS: &[(i64, &str)] = &[
     (16, V16),
     (17, V17),
     (18, V18),
+    (19, V19),
 ];
 
 const V1: &str = r#"
@@ -620,8 +621,49 @@ CREATE TABLE play_days (
 CREATE INDEX idx_play_days_day ON play_days(day DESC);
 "#;
 
+/// V19：本地优先播放——「文件账本」`download_files` 与「孤儿索引」`orphan_files`。
+///
+/// 背景（DESIGN §7.13 本地优先播放）：下载列表的行会随「清空列表 / 删除任务」
+/// 消失，但文件还留在磁盘上；行没了之后 `download_tasks` 再也查不到这首歌
+/// 「其实已经有文件」，播放只能回落在线。账本把「哪个身份有哪个文件」从
+/// 下载列表的生命周期里解耦出来：
+///
+/// - `download_files`：键 = 曲目库主键（`platform:music_id`，与 `tracks.id`
+///   同口径），值 = 文件绝对路径 + 冗余元数据。下载完成写、文件被删时清、
+///   播放前查（身份级命中，零误判）。
+/// - `orphan_files`：下载目录里**不属于任何已完成任务**的音频文件（账本
+///   上线前就被清掉记录的存量、用户手动拷进来的文件），只有标签元数据
+///   没有身份。启动对账时读内嵌标签建索引，播放前按「标题+歌手+时长」
+///   严格匹配（元数据级命中，见 `local_first::matcher`）。
+///
+/// 迁移本身只建表不回填：存量救援（done 任务补进账本、孤儿文件扫描）由
+/// 启动对账 `local_first::reconcile` 完成——那是 IO + 标签读取的重活，
+/// 放迁移里会把冷启动卡住。
+const V19: &str = r#"
+CREATE TABLE download_files (
+  key         TEXT PRIMARY KEY,
+  file_path   TEXT NOT NULL UNIQUE,
+  title       TEXT,
+  singer      TEXT,
+  duration_ms INTEGER,
+  size        INTEGER,
+  saved_at    INTEGER NOT NULL
+);
+CREATE INDEX idx_download_files_meta ON download_files(title, singer);
+
+CREATE TABLE orphan_files (
+  file_path   TEXT PRIMARY KEY,
+  title       TEXT,
+  singer      TEXT,
+  duration_ms INTEGER,
+  size        INTEGER,
+  indexed_at  INTEGER NOT NULL
+);
+CREATE INDEX idx_orphan_files_meta ON orphan_files(title, singer);
+"#;
+
 /// 当前程序支持的最新 schema 版本。
-pub(crate) const CURRENT_VERSION: i64 = 18;
+pub(crate) const CURRENT_VERSION: i64 = 19;
 
 /// 建表 schema_migrations 并把所有未应用版本按序执行。
 pub(crate) fn run(conn: &Connection) -> Result<(), rusqlite::Error> {

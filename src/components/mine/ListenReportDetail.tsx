@@ -93,7 +93,7 @@ export function ListenReportDetail(props: {
         }
       }}
     >
-      <section ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-labelledby={titleId} className="flex max-h-[calc(100dvh-2rem)] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-border bg-card/95 shadow-2xl outline-none backdrop-blur-xl">
+      <section ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-labelledby={titleId} className="flex max-h-[calc(100dvh-2rem)] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-border bg-card/95 shadow-overlay outline-none backdrop-blur-xl">
         <header className="flex shrink-0 items-center gap-2 border-b border-border px-5 py-4">
           {selected && <IconButton label="返回上一层报告" size="md" onClick={back}><ArrowLeft /></IconButton>}
           <div className="min-w-0 flex-1">
@@ -139,7 +139,7 @@ export function ListenReportDetail(props: {
                 <span className="w-6 shrink-0 text-center text-xs tabular-nums text-muted-foreground">{offset + index + 1}</span>
                 <EntryPicture entry={entry} name={nameOf(entry)} kind={kind} />
                 <span className="min-w-0 flex-1"><span className="flex min-w-0 items-center gap-1.5 text-sm font-medium"><span className="truncate">{nameOf(entry)}</span>{entry.track ? <SourceTag platform={entry.track.platform} size="xs" /> : null}</span><span className="mt-0.5 block truncate text-xs text-muted-foreground">{entry.track ? `${entry.track.singer || "未知歌手"} · ${reportSourceLabel(sourceLabel, entry.platform)}` : `${entry.trackCount} 首歌曲`}</span></span>
-                <span className="shrink-0 text-right text-xs tabular-nums text-muted-foreground"><span className="block">{entry.playCount} 次</span><span className="mt-0.5 block text-[11px]">{formatReportDuration(entry.totalPlayedMs)}</span></span>
+                <span className="shrink-0 text-right text-xs tabular-nums text-muted-foreground"><span className="block">{entry.playCount} 次</span><span className="mt-0.5 block text-2xs">{formatReportDuration(entry.totalPlayedMs)}</span></span>
                 <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
               </button>
             </li>)}</ul> : <p className="py-16 text-center text-sm text-muted-foreground">暂无听歌记录</p>}

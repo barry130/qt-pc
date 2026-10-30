@@ -176,7 +176,7 @@ export class ErrorBoundary extends Component<Props, State> {
 
     return (
       <div className="flex h-full min-h-0 items-center justify-center overflow-auto p-6">
-        <div className="w-full max-w-lg rounded-2xl border border-border bg-card/90 p-5 text-card-foreground shadow-xl backdrop-blur-xl">
+        <div className="w-full max-w-lg rounded-2xl border border-border bg-card/90 p-5 text-card-foreground shadow-overlay backdrop-blur-xl">
           <h2 className="text-sm font-medium">
             这块内容出错了{this.props.label ? `（${this.props.label}）` : ""}
           </h2>
@@ -191,7 +191,7 @@ export class ErrorBoundary extends Component<Props, State> {
             <summary className="cursor-pointer text-xs text-muted-foreground">
               错误详情
             </summary>
-            <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-secondary p-2 text-[11px] leading-relaxed">
+            <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap rounded-md bg-secondary p-2 text-2xs leading-relaxed">
               {error.message}
               {error.stack ? `\n\n${error.stack}` : ""}
             </pre>

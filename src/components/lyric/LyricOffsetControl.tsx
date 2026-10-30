@@ -63,7 +63,7 @@ export function LyricOffsetControl(props: {
         <div
           data-testid="lyric-offset-panel"
           className={cn(
-            "absolute right-0 z-20 mt-1 rounded-lg border border-border bg-popover p-3 shadow-lg",
+            "absolute right-0 z-20 mt-1 rounded-xl border border-border bg-popover/95 backdrop-blur-xl p-3 shadow-raised",
             compact ? "w-56" : "w-72",
           )}
         >
@@ -133,7 +133,7 @@ export function LyricOffsetControl(props: {
             </button>
           </div>
 
-          <p className="mt-2 text-[11px] leading-snug text-muted-foreground">
+          <p className="mt-2 text-2xs leading-snug text-muted-foreground">
             歌词比声音快 → 调正（延后）；歌词比声音慢 → 调负（提前）。按曲目保存。
           </p>
         </div>

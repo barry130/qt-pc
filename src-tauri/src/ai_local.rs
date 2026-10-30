@@ -3,6 +3,7 @@
 //! 为什么不走前端 `fetch`：
 //! 1. WebView 里直接请求第三方地址会被 CORS 拦（模型服务商基本不回 `Access-Control-Allow-Origin`）；
 //! 2. API Key 会落到前端 JS 作用域与 DevTools 网络面板里，等于半公开。
+//!
 //! 所以模型调用统一走这里，Key 只存在 settings 表、只在本模块内读出使用，
 //! 前端拿到的永远是 `hasKey` 布尔值 / 掩码，拿不到明文。
 //!
@@ -1524,10 +1525,9 @@ fn parse_model_ids(body: &str) -> Vec<String> {
         } else {
             resp.models
         }
-    } else if let Ok(list) = serde_json::from_str::<Vec<ModelEntry>>(trimmed) {
-        list
     } else {
-        Vec::new()
+        // 兼容「直接返回数组」的服务端：解析失败就当作空列表（随后回退静态表）
+        serde_json::from_str::<Vec<ModelEntry>>(trimmed).unwrap_or_default()
     };
     let mut ids: Vec<String> = Vec::with_capacity(entries.len());
     for entry in entries {
