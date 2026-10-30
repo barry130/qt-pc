@@ -25,7 +25,7 @@ const SECTION_TITLES: Record<string, string> = {
   sound: "音效",
   download: "下载",
   network: "网络",
-  ai: "AI",
+  ai: "AI 与模型",
   dislike: "不喜欢列表",
   "source-package": "音源包",
   shortcut: "快捷键",
@@ -91,7 +91,7 @@ export function SettingsPage(props: { section: string }): React.JSX.Element {
       ) : props.section === "network" ? (
         <NetworkSection />
       ) : props.section === "ai" ? (
-        // 全局 AI 模式 + 客户端直连模型的接口配置（详见文件末尾 AiSection）
+        // 两步一页：AI 引擎 + （仅本地模型精选时展开的）模型配置，详见 AiSection
         <AiSection />
       ) : props.section === "dislike" ? (
         <DislikeSection />

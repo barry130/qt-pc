@@ -18,10 +18,15 @@ const DAILY_TASTE_OPTIONS: { value: DailyTaste; label: string }[] = DAILY_TASTE_
 /**
  * AI 设置（`/settings/ai`）。
  *
- * 这个分区分成两块：上面那行「AI 模式」是**全局 AI 模式**（存储键沿用
- * `dailyRecommend.mode`），「音乐助手」（`/ai-assistant`）与「每日推荐」
- * （`/daily-recommend`）都按它执行；下面的「接口配置」只服务本地模型精选 ——
- * 只有模式选「本地模型精选」时那套地址/Key 才用得到。
+ * 分**两步**摆（2026-10-30 用户要求：原来「AI 模式」与「接口配置」是两行并列
+ * 入口，看不出后者只服务于其中一档）：
+ * - 第 1 步「AI 引擎」= **全局 AI 模式**（存储键沿用 `dailyRecommend.mode`），
+ *   「音乐助手」（`/ai-assistant`）与「每日推荐」（`/daily-recommend`）都按它执行；
+ * - 第 2 步「模型配置」= 供应商列表/详情弹窗（原「接口配置」），**只在
+ *   「本地模型精选」下展开**，其余引擎收起并给一句可行动的说明。
+ *
+ * 顺序上把「推荐口味」放在两步之后：口味影响候选怎么搜怎么排，与选哪个引擎
+ * 无关，夹在两步中间会打断「引擎 → 模型」这条视线。
  *
  * ---------------------------------------------------------------------------
  * 多套配置档，任选其一生效
@@ -147,7 +152,7 @@ export function AiSection(): React.JSX.Element {
   return (
     <div className="max-w-4xl divide-y divide-border">
       <SettingRow
-        title="AI 模式"
+        title="第 1 步 · AI 引擎"
         description="音乐助手和每日推荐共用这一个模式。纯规则不联网、永远可用；本地模型精选调用下面配置的接口，只让模型在已搜好的候选里挑，挂了自动退回规则；服务端 AI 走登录后的 astral 音乐助手，每日推荐与助手都用服务端生成，需要登录、且仅管理员可选，失败同样退回规则。"
       >
         {mode === null ? (
@@ -156,17 +161,6 @@ export function AiSection(): React.JSX.Element {
           // 非管理员只看到 rule/local：服务端 AI 的入口从设置页就藏掉，
           // 执行层再各自降级一次（见 lib/ai-mode.ts 的 resolveAiMode）
           <Segmented value={mode} options={aiModeOptionsFor(canUseServer)} onChange={pickMode} />
-        )}
-      </SettingRow>
-
-      <SettingRow
-        title="推荐口味"
-        description="决定候选怎么搜、怎么排序，和上面「AI 模式」互不影响（三种模式都能配三种口味）。心动＝从收藏（喜欢的单曲 + 在线收藏歌单 + 本地自建歌单）和最近在听出发；常听＝以常听歌手为主轴；探索＝尽量推你没听过的歌手。三种口味都会把同一歌手的歌摊开，不会连着排。"
-      >
-        {taste === null ? (
-          <span className="text-xs text-muted-foreground">载入中…</span>
-        ) : (
-          <Segmented value={taste} options={DAILY_TASTE_OPTIONS} onChange={pickTaste} />
         )}
       </SettingRow>
 
@@ -180,17 +174,49 @@ export function AiSection(): React.JSX.Element {
         </p>
       )}
 
-      <SettingRow
-        title="接口配置"
-        description="AI 供应商按「列表 → 详情」管理：Base URL、协议（OpenAI / OpenAI Responses / Anthropic / Gemini）、多把密钥（第一把生效）、模型多选、图标与证书校验都在弹窗里改。密钥保存后前端不再回显明文，只显示掩码。"
-      >
-        <button
-          type="button"
-          onClick={() => setProvidersOpen(true)}
-          className="rounded-lg border border-border bg-background px-3 py-1.5 text-xs text-foreground transition-colors hover:bg-secondary"
+      {/* 第 2 步只在「本地模型精选」下展开：其余引擎根本用不到接口地址与 Key，
+          常显会让人以为这两行是并列的两件事（用户 2026-10-30 反馈）。 */}
+      {mode === "local" ? (
+        <SettingRow
+          title="第 2 步 · 模型配置"
+          description="AI 供应商按「列表 → 详情」管理：Base URL、协议（OpenAI / OpenAI Responses / Anthropic / Gemini）、多把密钥（第一把生效）、模型多选、图标与证书校验都在弹窗里改。密钥保存后前端不再回显明文，只显示掩码。"
         >
-          管理供应商…
-        </button>
+          <button
+            type="button"
+            onClick={() => setProvidersOpen(true)}
+            className="rounded-lg border border-border bg-background px-3 py-1.5 text-xs text-foreground transition-colors hover:bg-secondary"
+          >
+            管理模型…
+          </button>
+        </SettingRow>
+      ) : (
+        <SettingRow
+          title="第 2 步 · 模型配置"
+          description={
+            mode === null
+              ? "选好引擎后这里会显示需不需要配模型。"
+              : `当前是「${AI_MODE_LABEL[mode]}」，用不到模型配置，所以这段收起来了。改成「本地模型精选」后在这里填接口地址与密钥。`
+          }
+        >
+          <button
+            type="button"
+            onClick={() => pickMode("local")}
+            className="rounded-lg border border-border bg-background px-3 py-1.5 text-xs text-foreground transition-colors hover:bg-secondary"
+          >
+            改用本地模型精选
+          </button>
+        </SettingRow>
+      )}
+
+      <SettingRow
+        title="推荐口味"
+        description="决定候选怎么搜、怎么排序，和上面「AI 引擎」互不影响（三种引擎都能配三种口味）。心动＝从收藏（喜欢的单曲 + 在线收藏歌单 + 本地自建歌单）和最近在听出发；常听＝以常听歌手为主轴；探索＝尽量推你没听过的歌手。三种口味都会把同一歌手的歌摊开，不会连着排。"
+      >
+        {taste === null ? (
+          <span className="text-xs text-muted-foreground">载入中…</span>
+        ) : (
+          <Segmented value={taste} options={DAILY_TASTE_OPTIONS} onChange={pickTaste} />
+        )}
       </SettingRow>
 
       {providersOpen ? <AiProvidersDialog onClose={() => setProvidersOpen(false)} /> : null}
