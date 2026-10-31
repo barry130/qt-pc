@@ -4,17 +4,23 @@ import type { ListenDayReport, ListenReportEntry, ListenReportKind } from "@/typ
 import * as ipc from "@/services/ipc";
 import { cn, errMsg } from "@/lib/utils";
 
-import { formatDayAxis, formatReportDuration, listenDayKey, reportSourceLabel } from "@/lib/listen-report";
+import { formatReportDuration, listenDayKey, reportSourceLabel } from "@/lib/listen-report";
+import { ListenHeatmap } from "./ListenHeatmap";
 import { useSourceLabelFn } from "@/stores/sourceRegistry";
 import { SourceTag } from "@/components/common/SourceTag";
 import { EntryPicture } from "./ListenReportBits";
 import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
+import { Button, Segmented } from "@/components/ui";
+import { LoadBar } from "@/components/discovery/Skeletons";
 
 /** 时间档，与 Rust 侧 `days` 窗口一一对应（1 = 今天）。 */
 const WINDOWS = [
   { days: 1, label: "今天" },
   { days: 7, label: "近 7 天" },
   { days: 30, label: "近 30 天" },
+  // 365 是 Rust 侧 window_days 的上限（见 src-tauri/src/listen_report.rs），
+  // 热力图要整年的日历骨架才有意义，所以把这一档也给出来。
+  { days: 365, label: "近一年" },
 ] as const;
 
 const KINDS = [
@@ -26,11 +32,21 @@ const KINDS = [
 /** 日榜只展示前 N 条，与移动端 pages/stats 的 Top 10 对齐。 */
 const ROW_LIMIT = 10;
 
+/** 骨架列数跟着时间档走：一年 53 列，30 天 5 列，今天 1 列。 */
+function skeletonWeeksFor(days: number): number {
+  return Math.max(1, Math.ceil((days + 1) / 7));
+}
+
 /**
  * 日榜：逐日趋势 + 窗口总量 + 前 N 条排行。
  *
  * 和上面的累计榜刻意分开：累计榜回答「我最常听什么」，这里回答「我最近在听什么」。
  * 两者的分组与排序口径在 Rust 侧是同一条 SQL 分支，所以点进去看到的明细必定对得上。
+ *
+ * 切档时**不清空旧数据**（用户 m09915 报的「点这几个 tag 会屏闪」就是清空造成的）：
+ * 把热力图和榜单整块抽掉会让卡片高度骤降，滚动容器随之把位置夹回、背景重排，
+ * 看上去就是闪一下。现在旧内容原地留着、压到 70% 透明，顶部一条细进度条表示正在换档，
+ * 新数据到达后直接替换 —— 高度不塌，就没有闪。
  */
 export function ListenTrendSection(props: {
   onOpenDetail: (kind: ListenReportKind, days: number, entry?: ListenReportEntry) => void;
@@ -38,7 +54,7 @@ export function ListenTrendSection(props: {
   const { onOpenDetail } = props;
   const active = useKeepAliveActive();
   const sourceLabel = useSourceLabelFn();
-  const [days, setDays] = useState<number>(7);
+  const [days, setDays] = useState<number>(365);
   const [kind, setKind] = useState<ListenReportKind>("tracks");
   const [report, setReport] = useState<ListenDayReport | null>(null);
   const [loading, setLoading] = useState(true);
@@ -50,8 +66,6 @@ export function ListenTrendSection(props: {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    // 清空旧数据：窗口一换，趋势轴的格数和刻度就整套不同，留着旧值会画错。
-    setReport(null);
     void ipc.getListenDayReport({ kind, order: "count", days, limit: ROW_LIMIT })
       .then((value) => { if (!cancelled) setReport(value); })
       .catch((reason: unknown) => { if (!cancelled) setError(errMsg(reason)); })
@@ -62,10 +76,9 @@ export function ListenTrendSection(props: {
   const windowLabel = WINDOWS.find((item) => item.days === days)?.label ?? "";
   const kindLabel = KINDS.find((item) => item.kind === kind)?.label ?? "";
   const points = report?.daily ?? [];
-  const maxPlays = Math.max(1, ...points.map((point) => point.playCount));
-  // 30 天窗口下 30 个刻度会糊成一片，抽稀到 6 个左右，末位必留。
-  const labelEvery = points.length <= 7 ? 1 : Math.ceil(points.length / 6);
   const todayKey = listenDayKey(Date.now());
+  /** 有旧数据还在换档：内容压暗 + 顶部进度条，而不是抽掉重画 */
+  const stale = loading && report !== null;
   const nameOf = (entry: ListenReportEntry): string =>
     kind === "sources" ? reportSourceLabel(sourceLabel, entry.id) : entry.track?.title ?? entry.name;
 
@@ -79,28 +92,31 @@ export function ListenTrendSection(props: {
         </div>
       </div>
 
-      <div className="rounded-2xl border border-border bg-card/60 p-4">
+      <div
+        aria-busy={loading || undefined}
+        className={cn("rounded-2xl border border-border bg-card/60 p-4 transition-opacity duration-base", stale && "opacity-70")}
+      >
         <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
           <p className="text-xs text-muted-foreground">{windowLabel} · 常听{kindLabel}</p>
           {report && <p className="text-xs tabular-nums text-muted-foreground">共 <span className="text-sm font-semibold text-foreground">{report.totalPlays}</span> 次播放 · {formatReportDuration(report.totalPlayedMs)} · 活跃 {report.activeDays} 天</p>}
         </div>
 
+        {/* 常驻 2px 高度：进度条出现/消失都不推动下面的内容（否则换档时又是一次跳变） */}
+        <div className="mt-1 h-0.5 overflow-hidden rounded-full">{loading ? <LoadBar /> : null}</div>
+
         {error ? (
           <div role="alert" className="flex flex-col items-center gap-2 py-10 text-center text-xs text-destructive">
             <p>趋势读取失败：{error}</p>
-            <button type="button" className="rounded-md border border-border px-3 py-1 text-xs text-foreground hover:bg-secondary" onClick={() => setRevision((value) => value + 1)}>重试</button>
+            <Button variant="outline" size="xs" onClick={() => setRevision((value) => value + 1)}>重试</Button>
           </div>
         ) : <>
-          <div className="mt-3 flex h-24 items-end gap-1" role="img" aria-label={`${windowLabel}逐日播放次数`}>
-            {loading
-              ? Array.from({ length: 7 }, (_, index) => <span key={index} className="h-1/3 flex-1 animate-pulse rounded-t bg-secondary/60" />)
-              : points.map((point) => <span key={point.day} title={`${formatDayAxis(point.day, todayKey, days)} · ${point.playCount} 次 · ${formatReportDuration(point.totalPlayedMs)}`} className="group/bar flex h-full min-w-0 flex-1 flex-col justify-end">
-                <span className={cn("w-full rounded-t transition-colors", point.playCount > 0 ? "bg-primary/60 group-hover/bar:bg-primary" : "bg-secondary")} style={{ height: point.playCount > 0 ? `${Math.max(8, point.playCount / maxPlays * 100)}%` : "3px" }} />
-              </span>)}
-          </div>
-          <div className="mt-1 flex h-3 items-center gap-1 text-3xs text-muted-foreground">
-            {points.map((point, index) => <span key={point.day} className="min-w-0 flex-1 truncate text-center">{!loading && (index % labelEvery === 0 || index === points.length - 1) ? formatDayAxis(point.day, todayKey, days) : ""}</span>)}
-          </div>
+          <ListenHeatmap
+            points={points}
+            todayKey={todayKey}
+            loading={loading && report === null}
+            skeletonWeeks={skeletonWeeksFor(days)}
+            days={days}
+          />
 
           {report && report.items.length > 0 ? <ul className="mt-2">{report.items.map((entry, index) => (
             <li key={entry.id} className="border-b border-border/50 last:border-b-0">
@@ -118,23 +134,12 @@ export function ListenTrendSection(props: {
           ))}</ul> : !loading && <p className="py-6 text-center text-xs text-muted-foreground">这个范围内还没有播放记录。</p>}
 
           {report && <div className="mt-3 flex justify-end">
-            <button type="button" className="flex items-center gap-0.5 text-xs text-primary hover:underline" aria-label={`查看全部${windowLabel}${kindLabel}`} onClick={() => onOpenDetail(kind, days)}>查看全部{kindLabel}<ChevronRight className="h-3 w-3" /></button>
+            <Button variant="link" size="xs" iconRight={<ChevronRight className="h-3 w-3" />} aria-label={`查看全部${windowLabel}${kindLabel}`} onClick={() => onOpenDetail(kind, days)}>查看全部{kindLabel}</Button>
           </div>}
         </>}
       </div>
     </section>
   );
-}
-
-function Segmented<T extends string | number>(props: {
-  label: string;
-  value: T;
-  options: { value: T; label: string }[];
-  onChange: (value: T) => void;
-}): React.JSX.Element {
-  return <div role="group" aria-label={props.label} className="flex items-center gap-0.5 rounded-lg border border-border bg-card/60 p-0.5">
-    {props.options.map((option) => <button key={option.value} type="button" aria-pressed={option.value === props.value} onClick={() => props.onChange(option.value)} className={cn("rounded-md px-2 py-1 text-xs transition-colors", option.value === props.value ? "bg-secondary font-medium text-foreground" : "text-muted-foreground hover:text-foreground")}>{option.label}</button>)}
-  </div>;
 }
 
 // EntryPicture 合并到 `./ListenReportBits`（与收听详情页同一实现，这里传 size={32}）。

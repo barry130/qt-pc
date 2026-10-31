@@ -1,9 +1,8 @@
-import { useEffect, useId, useRef, useState } from "react";
-import { createPortal } from "react-dom";
-import { ArrowLeft, ChevronRight, Music4, Play, X } from "lucide-react";
+import { useEffect, useState } from "react";
+import { ArrowLeft, ChevronRight, Music4, Play } from "lucide-react";
 import type { ListenReportEntry, ListenReportKind, ListenReportOrder, ListenReportPage } from "@/types";
 import * as ipc from "@/services/ipc";
-import { cn, errMsg } from "@/lib/utils";
+import { errMsg } from "@/lib/utils";
 import { formatReportDate, formatReportDuration, reportSourceLabel } from "@/lib/listen-report";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { useSourceLabelFn } from "@/stores/sourceRegistry";
@@ -11,6 +10,7 @@ import { usePlayerStore } from "@/stores/player";
 import { toastError } from "@/stores/toast";
 import { IconButton } from "@/components/common/IconButton";
 import { SourceTag } from "@/components/common/SourceTag";
+import { Button, EmptyState, LoadingState, Modal, Segmented } from "@/components/ui";
 import { EntryPicture } from "./ListenReportBits";
 
 const PAGE_SIZE = 30;
@@ -31,8 +31,6 @@ export function ListenReportDetail(props: {
   const days = props.days ?? null;
   const sourceLabel = useSourceLabelFn();
   const play = usePlayerStore((state) => state.play);
-  const dialogRef = useRef<HTMLElement>(null);
-  const titleId = useId();
   const [path, setPath] = useState<ListenReportEntry[]>(() => props.initialEntry ? [props.initialEntry] : []);
   const [order, setOrder] = useState<ListenReportOrder>("count");
   const [offset, setOffset] = useState(0);
@@ -60,12 +58,6 @@ export function ListenReportDetail(props: {
     return () => { cancelled = true; };
   }, [queryKind, order, offset, singer, platform, song, days, revision]);
 
-  useEffect(() => {
-    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    dialogRef.current?.focus();
-    return () => { if (previousFocus?.isConnected) previousFocus.focus(); };
-  }, []);
-
   const nameOf = (entry: ListenReportEntry): string =>
     !entry.track && kind === "sources" ? reportSourceLabel(sourceLabel, entry.id) : entry.name;
   const select = (entry: ListenReportEntry): void => { setPath((value) => [...value, entry]); setOffset(0); };
@@ -76,85 +68,78 @@ export function ListenReportDetail(props: {
   const title = selected ? nameOf(selected) : `全部${KIND_TITLE[kind]}`;
   const cover = song ? qtresCoverUrl(song.picUrl, 180) : "";
 
-  return createPortal(
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4"
-      onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}
-      onKeyDown={(event) => {
-        if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); onClose(); }
-        if (event.key !== "Tab") return;
-        const controls = Array.from(dialogRef.current?.querySelectorAll<HTMLElement>("button:not(:disabled), [href], [tabindex='0']") ?? []);
-        const first = controls[0];
-        const last = controls.at(-1);
-        if (event.shiftKey && (document.activeElement === first || document.activeElement === dialogRef.current)) {
-          event.preventDefault(); last?.focus();
-        } else if (!event.shiftKey && (document.activeElement === last || document.activeElement === dialogRef.current)) {
-          event.preventDefault(); first?.focus();
-        }
-      }}
-    >
-      <section ref={dialogRef} tabIndex={-1} role="dialog" aria-modal="true" aria-labelledby={titleId} className="flex max-h-[calc(100dvh-2rem)] w-full max-w-2xl flex-col overflow-hidden rounded-2xl border border-border bg-card/95 shadow-overlay outline-none backdrop-blur-xl">
-        <header className="flex shrink-0 items-center gap-2 border-b border-border px-5 py-4">
-          {selected && <IconButton label="返回上一层报告" size="md" onClick={back}><ArrowLeft /></IconButton>}
-          <div className="min-w-0 flex-1">
-            <h2 id={titleId} className="truncate text-base font-semibold">{title}</h2>
-            <p className="mt-0.5 text-xs text-muted-foreground">{song ? "单曲听歌统计" : selected ? "该分组下听过的歌曲" : days ? `${days === 1 ? "今天" : `近 ${days} 天`}的听歌记录` : "全部累计记录"}</p>
-          </div>
-          <IconButton label="关闭报告" size="md" onClick={onClose}><X /></IconButton>
-        </header>
-        <div className="min-h-0 overflow-y-auto px-5">
-          {selected && <div className="border-b border-border/60 py-5">
-            {song && <div className="mb-4 flex items-center gap-4">
-              <span className="flex h-20 w-20 shrink-0 items-center justify-center overflow-hidden rounded-xl bg-secondary">
-                {cover ? <img src={cover} alt="" className="h-full w-full object-cover" /> : <Music4 className="h-8 w-8 text-muted-foreground" />}
-              </span>
-              <div className="min-w-0 flex-1 text-xs leading-relaxed text-muted-foreground">
-                <p className="truncate">歌手：{song.singer || "未知歌手"}</p>
-                <p className="truncate">专辑：{song.album || "未知专辑"}</p>
-                <p className="truncate">音源：{reportSourceLabel(sourceLabel, song.platform)}</p>
-              </div>
-              <IconButton label={`播放 ${song.title}`} variant="primary" size="lg" onClick={playSelected}><Play /></IconButton>
-            </div>}
-            <div className="grid grid-cols-2 gap-3 rounded-xl bg-secondary/50 p-4">
-              <div><p className="text-xs text-muted-foreground">有效播放</p><p className="mt-1 text-xl font-semibold tabular-nums">{selected.playCount} 次</p></div>
-              <div><p className="text-xs text-muted-foreground">实际收听时长</p><p className="mt-1 text-xl font-semibold tabular-nums">{formatReportDuration(selected.totalPlayedMs)}</p></div>
-            </div>
-            <p className="mt-3 text-xs text-muted-foreground">{song ? "最近播放" : `听过 ${selected.trackCount} 首 · 最近播放`} {formatReportDate(selected.lastPlayedAt)}</p>
-          </div>}
-          {!song && <>
-            <div className="flex items-center justify-between gap-3 py-3">
-              <span className="text-xs text-muted-foreground">{selected ? "听过的歌曲" : "排行明细"}</span>
-              <div className="flex rounded-lg bg-secondary/60 p-0.5" aria-label="报告排序">
-                {(["count", "duration"] as const).map((value) => <button key={value} type="button" aria-pressed={order === value} onClick={() => { setOrder(value); setOffset(0); }} className={cn("rounded-md px-2.5 py-1 text-xs transition-colors", order === value ? "bg-primary/15 font-medium text-primary" : "text-muted-foreground hover:text-foreground")}>
-                  {value === "count" ? "播放次数" : "收听时长"}
-                </button>)}
-              </div>
-            </div>
-            {loading ? <p role="status" className="py-16 text-center text-sm text-muted-foreground">正在读取报告…</p> : error ? (
-              <div role="alert" className="flex flex-col items-center gap-3 py-16 text-center text-sm text-destructive">
-                <p>{error}</p><button type="button" onClick={() => setRevision((value) => value + 1)} className="rounded-md border border-border px-3 py-1 text-xs text-foreground hover:bg-secondary">重试</button>
-              </div>
-            ) : page?.items.length ? <ul>{page.items.map((entry, index) => <li key={entry.id}>
-              <button type="button" className="flex w-full items-center gap-3 border-b border-border/50 py-3 text-left hover:bg-secondary/40" onClick={() => select(entry)}>
-                <span className="w-6 shrink-0 text-center text-xs tabular-nums text-muted-foreground">{offset + index + 1}</span>
-                <EntryPicture entry={entry} name={nameOf(entry)} kind={kind} />
-                <span className="min-w-0 flex-1"><span className="flex min-w-0 items-center gap-1.5 text-sm font-medium"><span className="truncate">{nameOf(entry)}</span>{entry.track ? <SourceTag platform={entry.track.platform} size="xs" /> : null}</span><span className="mt-0.5 block truncate text-xs text-muted-foreground">{entry.track ? `${entry.track.singer || "未知歌手"} · ${reportSourceLabel(sourceLabel, entry.platform)}` : `${entry.trackCount} 首歌曲`}</span></span>
-                <span className="shrink-0 text-right text-xs tabular-nums text-muted-foreground"><span className="block">{entry.playCount} 次</span><span className="mt-0.5 block text-2xs">{formatReportDuration(entry.totalPlayedMs)}</span></span>
-                <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-              </button>
-            </li>)}</ul> : <p className="py-16 text-center text-sm text-muted-foreground">暂无听歌记录</p>}
-          </>}
-        </div>
-        {!song && <footer className="flex shrink-0 items-center justify-between gap-2 border-t border-border/60 px-5 py-3 text-xs text-muted-foreground">
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      size="lg"
+      title={title}
+      description={song ? "单曲听歌统计" : selected ? "该分组下听过的歌曲" : days ? `${days === 1 ? "今天" : `近 ${days} 天`}的听歌记录` : "全部累计记录"}
+      headerLeft={
+        selected ? (
+          <IconButton label="返回上一层报告" size="md" onClick={back}>
+            <ArrowLeft />
+          </IconButton>
+        ) : undefined
+      }
+      closeLabel="关闭报告"
+      bodyClassName="px-5 py-0"
+      footer={
+        !song ? (
+          <>
           <span>{!loading && page ? `共 ${page.total} 条 · ${page.items.length ? `${offset + 1}-${offset + page.items.length}` : "暂无"}` : ""}</span>
           <div className="flex gap-2">
-            <button type="button" disabled={offset === 0 || loading || !!error} onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))} className="rounded-md border border-border px-2.5 py-1 hover:bg-secondary disabled:opacity-40">上一页</button>
-            <button type="button" disabled={!page || offset + PAGE_SIZE >= page.total || loading || !!error} onClick={() => setOffset(offset + PAGE_SIZE)} className="rounded-md border border-border px-2.5 py-1 hover:bg-secondary disabled:opacity-40">下一页</button>
+            <Button variant="outline" size="xs" disabled={offset === 0 || loading || !!error} onClick={() => setOffset(Math.max(0, offset - PAGE_SIZE))}>上一页</Button>
+            <Button variant="outline" size="xs" disabled={!page || offset + PAGE_SIZE >= page.total || loading || !!error} onClick={() => setOffset(offset + PAGE_SIZE)}>下一页</Button>
           </div>
-        </footer>}
-      </section>
-    </div>,
-    document.body,
+          </>
+        ) : undefined
+      }
+      footerClassName="justify-between border-border/60 text-xs text-muted-foreground"
+    >
+      {selected && <div className="border-b border-border/60 py-5">
+        {song && <div className="mb-4 flex items-center gap-4">
+          <span className="flex h-20 w-20 shrink-0 items-center justify-center overflow-hidden rounded-xl bg-secondary">
+            {cover ? <img src={cover} alt="" className="h-full w-full object-cover" /> : <Music4 className="h-8 w-8 text-muted-foreground" />}
+          </span>
+          <div className="min-w-0 flex-1 text-xs leading-relaxed text-muted-foreground">
+            <p className="truncate">歌手：{song.singer || "未知歌手"}</p>
+            <p className="truncate">专辑：{song.album || "未知专辑"}</p>
+            <p className="truncate">音源：{reportSourceLabel(sourceLabel, song.platform)}</p>
+          </div>
+          <IconButton label={`播放 ${song.title}`} variant="primary" size="lg" onClick={playSelected}><Play /></IconButton>
+        </div>}
+        <div className="grid grid-cols-2 gap-3 rounded-xl bg-secondary/50 p-4">
+          <div><p className="text-xs text-muted-foreground">有效播放</p><p className="mt-1 text-xl font-semibold tabular-nums">{selected.playCount} 次</p></div>
+          <div><p className="text-xs text-muted-foreground">实际收听时长</p><p className="mt-1 text-xl font-semibold tabular-nums">{formatReportDuration(selected.totalPlayedMs)}</p></div>
+        </div>
+        <p className="mt-3 text-xs text-muted-foreground">{song ? "最近播放" : `听过 ${selected.trackCount} 首 · 最近播放`} {formatReportDate(selected.lastPlayedAt)}</p>
+      </div>}
+      {!song && <>
+        <div className="flex items-center justify-between gap-3 py-3">
+          <span className="text-xs text-muted-foreground">{selected ? "听过的歌曲" : "排行明细"}</span>
+          <Segmented
+            value={order}
+            options={[{ value: "count", label: "播放次数" }, { value: "duration", label: "收听时长" }]}
+            onChange={(value) => { setOrder(value); setOffset(0); }}
+            label="报告排序"
+          />
+        </div>
+        {loading ? <LoadingState className="py-16" label="正在读取报告…" /> : error ? (
+          <div role="alert" className="flex flex-col items-center gap-3 py-16 text-center text-sm text-destructive">
+            <p>{error}</p><Button variant="outline" size="xs" onClick={() => setRevision((value) => value + 1)}>重试</Button>
+          </div>
+        ) : page?.items.length ? <ul>{page.items.map((entry, index) => <li key={entry.id}>
+          <button type="button" className="flex w-full items-center gap-3 border-b border-border/50 py-3 text-left hover:bg-secondary/40" onClick={() => select(entry)}>
+            <span className="w-6 shrink-0 text-center text-xs tabular-nums text-muted-foreground">{offset + index + 1}</span>
+            <EntryPicture entry={entry} name={nameOf(entry)} kind={kind} />
+            <span className="min-w-0 flex-1"><span className="flex min-w-0 items-center gap-1.5 text-sm font-medium"><span className="truncate">{nameOf(entry)}</span>{entry.track ? <SourceTag platform={entry.track.platform} size="xs" /> : null}</span><span className="mt-0.5 block truncate text-xs text-muted-foreground">{entry.track ? `${entry.track.singer || "未知歌手"} · ${reportSourceLabel(sourceLabel, entry.platform)}` : `${entry.trackCount} 首歌曲`}</span></span>
+            <span className="shrink-0 text-right text-xs tabular-nums text-muted-foreground"><span className="block">{entry.playCount} 次</span><span className="mt-0.5 block text-2xs">{formatReportDuration(entry.totalPlayedMs)}</span></span>
+            <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+          </button>
+        </li>)}</ul> : <EmptyState className="py-16" title="暂无听歌记录" />}
+      </>}
+    </Modal>
   );
 }
 
