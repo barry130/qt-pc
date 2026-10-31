@@ -47,6 +47,7 @@ import {
   type LyricLine,
 } from "@/lib/lrc";
 import { crossSourceHitFromLine, dropCachedLyric, getPlaybackLyric } from "@/lib/localOnline";
+import { requestPlayUrlLine } from "@/lib/play-url-broadcast";
 import type { PlayUrlLine } from "@/source-engine/client";
 
 /**
@@ -318,7 +319,12 @@ export function LyricWindow(): React.JSX.Element {
         // cause 保留原始异常，ErrorBoundary / 日志能看到完整失败链路
         throw new Error(`桌面歌词事件订阅注册失败：${String(e)}`, { cause: e });
       }
-    })();
+
+      // 订阅齐了才向主窗口要「当前命中线路」的补发：本窗口可能是在取链**之后**
+      // 才打开的（事件早已发过），只等事件会让 crossLineByTrack 一直是空的，
+      // 于是桌面歌词永远按原平台取词 —— 用户报的「换了源歌词没换」。
+      // 放在所有 listen 注册之后，避免主窗口的应答比监听更早到达而丢掉。
+      requestPlayUrlLine();    })();
 
     return () => {
       disposed = true;
@@ -328,7 +334,20 @@ export function LyricWindow(): React.JSX.Element {
 
   // —— rAF 插值：仅可见时运行（R4） ——
   useEffect(() => {
-    const tick = (): void => {
+    /**
+     * 资源优化（2026-10-30）：歌词时间轴的分辨率是 100ms 级，60fps 重算
+     * 纯属空转；暂停且没有 seek 时更没有新信息。两道闸：
+     * 30fps 上限 + 「暂停且锚点没换」直接跳过（baseRef 每次 tick / seek
+     * 都会换成新对象，比对象身份就够，不用额外 dirty 标记）。
+     */
+    let lastAt = 0;
+    let lastBase: unknown = null;
+    const tick = (at: number): void => {
+      rafRef.current = requestAnimationFrame(tick);
+      if (at - lastAt < 33) return;
+      lastAt = at;
+      if (!playingRef.current && baseRef.current === lastBase) return;
+      lastBase = baseRef.current;
       const ls = linesRef.current;
       if (ls.length > 0) {
         const { positionMs, receivedAt } = baseRef.current;
@@ -352,7 +371,6 @@ export function LyricWindow(): React.JSX.Element {
           setFillRatio(nextFill);
         }
       }
-      rafRef.current = requestAnimationFrame(tick);
     };
     rafRef.current = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(rafRef.current);

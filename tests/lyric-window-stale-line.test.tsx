@@ -133,7 +133,10 @@ vi.mock("@/lib/localOnline", () => ({
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => ({})) }));
-vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn(async () => vi.fn()) }));
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(async () => vi.fn()),
+  emit: vi.fn(async () => {}),
+}));
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
     label: "lyrics",
@@ -259,5 +262,19 @@ describe("桌面歌词当前行越界", () => {
 
     expect(screen.getByTestId("lyric-window-root")).toBeTruthy();
     expect(mainLine()).toBe("… 间奏 …");
+  });
+
+  /**
+   * 「换了源歌词没换」的跨窗口那一段：本窗口是独立 WebView，读不到主窗口的
+   * 线路记忆，只订阅 `play-url-line` 事件。而它常常是在取链**之后**才打开的
+   * （事件早已发过），于是 crossLineByTrack 永远是空的 → 一直按原平台取词。
+   * 所以挂载时必须在订阅齐之后，主动向主窗口要一次补发。
+   */
+  it("挂载后向主窗口请求一次当前命中线路（后打开也能跟随换源）", async () => {
+    render(<LyricWindow />);
+    await settle();
+
+    const { emit } = await import("@tauri-apps/api/event");
+    expect(vi.mocked(emit)).toHaveBeenCalledWith("request-play-url-line");
   });
 });

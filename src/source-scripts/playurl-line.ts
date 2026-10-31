@@ -15,6 +15,9 @@ import type { PlayUrlLine } from "@/source-engine/client";
 const lines = new Map<string, string>();
 const misses = new Map<string, string>();
 
+/** 原始线路记忆（含跨源命中的 targetSong）：「歌词跟随换源」要按精确歌曲取词 */
+const rawLines = new Map<string, PlayUrlLine>();
+
 /** 记忆键：与取链缓存同口径（platform:id:quality） */
 export function playUrlLineKey(track: Track, quality: Quality): string {
   return `${track.platform}:${track.id}:${quality}`;
@@ -44,12 +47,31 @@ export function rememberPlayUrlLine(
   if (line === null) return;
   const key = playUrlLineKey(track, quality);
   lines.set(key, formatPlayUrlLine(line));
+  // 原始结构单独记一份：展示文本拼完就丢了 targetSong，而「歌词跟随换源」
+  // 要按目标源的**精确那首歌**取词（见 crossSourceHitFromLine）。
+  rawLines.set(key, line);
   if (missNote !== undefined && missNote.length > 0) misses.set(key, missNote);
   else misses.delete(key);
 }
 
-/** 原始线路记忆（含跨源命中的 targetSong）：「歌词跟随换源」要按精确歌曲取词 */
-const rawLines = new Map<string, PlayUrlLine>();
+/**
+ * 把「实际出链档位」的线路记忆镜像到**请求档**上。
+ *
+ * 为什么会缺这一步：`resolvePlayUrlWithFallback` 降档命中时，只把地址补写进请求档
+ * 的缓存键（`ipc.setResolvedPlayUrl(track, wanted, …)`），线路记忆却留在实际档位上。
+ * 而播放页/桌面歌词是按 `state.quality`（**请求档**）查 `playUrlHitLine` 的，于是
+ * 降档播放时「换源后歌词跟着换」整条链路又被绕断 —— 用户报的「换了源歌词没换」
+ * 里，降档是最难复现的那条路径。
+ *
+ * 只镜像原始结构、不镜像展示文本：展示文本说的是「这一档真正用的那条线」，
+ * 冒认到更高档位会骗人；而歌词只关心「跨源命中的是哪首歌」。
+ */
+export function mirrorPlayUrlLine(track: Track, from: Quality, to: Quality): void {
+  if (from === to) return;
+  const line = rawLines.get(playUrlLineKey(track, from));
+  if (line === undefined) return;
+  rawLines.set(playUrlLineKey(track, to), line);
+}
 
 /** 读最近一次命中线路的原始结构（含 targetSong；未知返回 null） */
 export function playUrlHitLine(track: Track | null, quality: Quality | null): PlayUrlLine | null {

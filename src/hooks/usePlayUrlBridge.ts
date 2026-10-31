@@ -1,11 +1,15 @@
 import { useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen, emit, type UnlistenFn } from "@tauri-apps/api/event";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { peekQualityCeiling, normalizeQualityForSource, resolvePlayUrlWithFallback } from "@/lib/quality-fallback";
+import {
+  broadcastPlayUrlLine,
+  PLAY_URL_LINE_REQUEST_EVENT,
+} from "@/lib/play-url-broadcast";
 import { qualityShortLabel } from "@/lib/quality";
 import { toast } from "@/stores/toast";
-import { playUrlHitLine } from "@/source-scripts/playurl-line";
+import { usePlayerStore } from "@/stores/player";
 import type { Quality, Track } from "@/types";
 import { MAIN_WINDOW_LABEL } from "@/lib/window-labels";
 
@@ -82,12 +86,9 @@ async function answer(req: PlayUrlRequest): Promise<void> {
     actualQuality,
   }).catch(() => {});
   // 桌面歌词窗口读不到宿主侧的线路记忆（各窗口独立 JS 上下文），广播命中线路供它
-  // 判断「当前地址是否跨源兜底」并按目标源重取歌词；主窗口自己读 playurl-line 即可
-  void emit("play-url-line", {
-    platform: req.track.platform,
-    id: req.track.id,
-    line: playUrlHitLine(req.track, hitQuality),
-  }).catch(() => {});
+  // 判断「当前地址是否跨源兜底」并按目标源重取歌词（取链漏斗里也已广播一次，这里
+  // 是引擎主导换歌时的即时一次；重复广播幂等，对端按曲目 id 覆盖）。
+  broadcastPlayUrlLine(req.track, hitQuality as Quality);
 }
 
 export function usePlayUrlBridge(): void {
@@ -95,6 +96,7 @@ export function usePlayUrlBridge(): void {
     if (getCurrentWindow().label !== MAIN_WINDOW_LABEL) return;
     let disposed = false;
     let unlisten: UnlistenFn | null = null;
+    let unlistenRequest: UnlistenFn | null = null;
     void (async () => {
       try {
         const u = await listen<PlayUrlRequest>("play_url_request", (event) => {
@@ -105,6 +107,18 @@ export function usePlayUrlBridge(): void {
           return;
         }
         unlisten = u;
+        // 桌面歌词窗口在取链**之后**才打开时，`play-url-line` 事件早已发过，它的
+        // crossLineByTrack 永远是空的 → 桌面歌词一直按原源取词（用户报的「换了源
+        // 歌词没换」里最常踩的一条）。窗口启动时发这条请求，主窗口按当前曲目补发。
+        unlistenRequest = await listen(PLAY_URL_LINE_REQUEST_EVENT, () => {
+          const state = usePlayerStore.getState().state;
+          if (state === null) return;
+          broadcastPlayUrlLine(state.track ?? null, state.quality);
+        });
+        if (disposed) {
+          unlistenRequest();
+          return;
+        }
         await invoke("script_bridge_ready").catch(() => {});
       } catch (e) {
         // 架桥失败 = 引擎主导的每一次换歌（自动切歌/随机下一首/失败重取）都取不到
@@ -118,6 +132,7 @@ export function usePlayUrlBridge(): void {
     return () => {
       disposed = true;
       unlisten?.();
+      unlistenRequest?.();
     };
   }, []);
 }

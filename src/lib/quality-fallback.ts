@@ -22,7 +22,9 @@
 import * as ipc from "@/services/ipc";
 import { resolvePlayUrlDetailed } from "@/source-scripts";
 import { normalizeQualityForSource, qualityRanksOf, useSourceRegistryStore } from "@/stores/sourceRegistry";
-import type { Track } from "@/types";
+import { mirrorPlayUrlLine } from "@/source-scripts/playurl-line";
+import { broadcastPlayUrlLine } from "@/lib/play-url-broadcast";
+import type { Quality, Track } from "@/types";
 
 /** 一次回退取链的完整结果（失败时 url 为空串，其余字段为「没测出来」） */
 export interface FallbackResolveResult {
@@ -177,11 +179,19 @@ export async function resolvePlayUrlWithFallback(
         await ipc
           .setResolvedPlayUrl(track, wanted, res.url, res.referer, res.size, res.actualQuality)
           .catch(() => {});
+        // 线路记忆也镜像到请求档：否则播放页按请求档查 playUrlHitLine 查不到，
+        // 「换源后歌词跟着换」在降档播放时不生效（见 mirrorPlayUrlLine 注释）。
+        mirrorPlayUrlLine(track, quality as Quality, wanted as Quality);
       }
       // 只在**真实观测到降档**时记上限。以请求档命中时不能记：那只证明「这一档能出」，
       // 并不证明更高档出不了 —— 记了会把 flac 也一起挡在门外（请求 320 成功 ≠ 这张
       // 专辑没有无损）。
       if (quality !== wanted) rememberCeiling(track.platform, track.album, quality);
+      // 出链即广播命中线路：桌面歌词窗口是独立 WebView，读不到主窗口的线路记忆，
+      // 只能靠这条事件判断「当前地址是否被跨源兜底接走」并按目标源重取歌词。
+      // 放在这个漏斗里而不是只放在引擎取链桥上 —— 用户点播放时地址由前端预解析，
+      // 引擎不会再问前端，那条路径以前根本发不出事件（见 play-url-broadcast.ts）。
+      broadcastPlayUrlLine(track, quality as Quality);
       return { ...res, quality };
     }
     if (res.stalled) stalled = true;
