@@ -25,12 +25,21 @@ const ID_QUIT: &str = "tray-quit";
 struct DesktopLyricItem(CheckMenuItem<Wry>);
 /// 「锁定歌词」同样是勾选项：锁定状态在工具条/设置页/快捷键都可能被改
 struct LockLyricItem(CheckMenuItem<Wry>);
+/// 「迷你模式」也是勾选项：迷你窗可能从播放条按钮、快捷键或托盘自己切换，
+/// 勾选态必须在弹出菜单前按真实窗口状态刷新（2026-10-31 用户反馈缺 ✔）。
+struct MiniItem(CheckMenuItem<Wry>);
 
 /// 构建托盘菜单（§14.1 的固定结构 + §10.7 锁定/解锁歌词）。
-/// 返回菜单本身和两个勾选框（要存进 app state 以便随时刷新）。
-fn build_menu(
-    app: &AppHandle,
-) -> tauri::Result<(Menu<Wry>, CheckMenuItem<Wry>, CheckMenuItem<Wry>)> {
+/// 返回菜单本身和三个勾选框（要存进 app state 以便随时刷新）。
+/// 菜单本身 + 三个勾选框，取个别名压住 clippy::type_complexity。
+type TrayMenuParts = (
+    Menu<Wry>,
+    CheckMenuItem<Wry>,
+    CheckMenuItem<Wry>,
+    CheckMenuItem<Wry>,
+);
+
+fn build_menu(app: &AppHandle) -> tauri::Result<TrayMenuParts> {
     let play_pause = MenuItem::with_id(app, ID_PLAY_PAUSE, "播放 / 暂停", true, None::<&str>)?;
     let previous = MenuItem::with_id(app, ID_PREVIOUS, "上一首", true, None::<&str>)?;
     let next = MenuItem::with_id(app, ID_NEXT, "下一首", true, None::<&str>)?;
@@ -56,7 +65,16 @@ fn build_menu(
     let show_main = MenuItem::with_id(app, ID_SHOW_MAIN, "显示主窗口", true, None::<&str>)?;
     // 迷你模式（§3.21.7.2）：托盘是主窗收起时唯一的总入口，这里必须留着——
     // 用迷你窗期间主窗是隐藏状态，没有托盘菜单就只能在迷你窗里点回主窗。
-    let mini = MenuItem::with_id(app, ID_MINI, "迷你模式", true, None::<&str>)?;
+    // 2026-10-31：改成勾选项。迷你模式开着时菜单要显示 ✔，判据是迷你窗是否
+    // 还在（退出迷你模式会 destroy 窗口），见 mini_window::is_active。
+    let mini = CheckMenuItem::with_id(
+        app,
+        ID_MINI,
+        "迷你模式",
+        true,
+        crate::mini_window::is_active(app),
+        None::<&str>,
+    )?;
     let quit = MenuItem::with_id(app, ID_QUIT, "退出", true, None::<&str>)?;
     // MenuItem 与 CheckMenuItem 是不同类型，统一成 trait object 才能放进同一个菜单
     let items: [&dyn IsMenuItem<Wry>; 8] = [
@@ -70,7 +88,7 @@ fn build_menu(
         &quit,
     ];
     let menu = Menu::with_items(app, &items)?;
-    Ok((menu, desktop_lyric, lock_lyric))
+    Ok((menu, desktop_lyric, lock_lyric, mini))
 }
 
 /// 按真实状态刷新「显示桌面歌词」的勾选
@@ -92,6 +110,17 @@ fn sync_lock_checked(app: &AppHandle) {
     let locked = lyric_window::get_state(app).locked;
     if let Err(e) = item.0.set_checked(locked) {
         log::warn!("[tray] 刷新锁定勾选失败: {e}");
+    }
+}
+
+/// 按真实状态刷新「迷你模式」的勾选。
+/// 迷你窗可能在播放条按钮、快捷键或托盘菜单里被切换，不能只在点击时取反。
+pub fn sync_mini_checked(app: &AppHandle) {
+    let Some(item) = app.try_state::<MiniItem>() else {
+        return;
+    };
+    if let Err(e) = item.0.set_checked(crate::mini_window::is_active(app)) {
+        log::warn!("[tray] 刷新迷你模式勾选失败: {e}");
     }
 }
 
@@ -123,7 +152,7 @@ fn show_main_window(app: &AppHandle) {
 /// 关闭语义从「收进托盘」改成「直接退出」——没有托盘时藏窗口等于杀不掉。
 /// Windows/macOS 下托盘始终可用，实际走不到 false 分支。
 pub fn create_tray(app: &AppHandle) -> bool {
-    let (menu, desktop_lyric, lock_lyric) = match build_menu(app) {
+    let (menu, desktop_lyric, lock_lyric, mini) = match build_menu(app) {
         Ok(v) => v,
         Err(e) => {
             log::error!("[tray] 菜单构建失败: {e}");
@@ -133,6 +162,7 @@ pub fn create_tray(app: &AppHandle) -> bool {
     // 存进 state：菜单闭包拿不到这个变量，且歌词也能从主窗口/快捷键开关
     app.manage(DesktopLyricItem(desktop_lyric));
     app.manage(LockLyricItem(lock_lyric));
+    app.manage(MiniItem(mini));
 
     let builder = TrayIconBuilder::with_id("quietmusic-tray")
         .tooltip("轻听")
@@ -155,6 +185,7 @@ pub fn create_tray(app: &AppHandle) -> bool {
                 TrayIconEvent::Click { .. } => {
                     sync_lyric_checked(tray.app_handle());
                     sync_lock_checked(tray.app_handle());
+                    sync_mini_checked(tray.app_handle());
                 }
                 _ => {}
             }
@@ -174,12 +205,17 @@ pub fn create_tray(app: &AppHandle) -> bool {
                 }
                 sync_lock_checked(app);
             }
-            ID_SHOW_MAIN => show_main_window(app),
+            ID_SHOW_MAIN => {
+                // 从迷你模式点「显示主窗口」会顺带退出迷你模式，勾选要跟着刷新
+                show_main_window(app);
+                sync_mini_checked(app);
+            }
             ID_MINI => {
                 // 与播放条按钮同一条命令：进迷你收主窗、退迷你唤回主窗
                 if let Err(e) = crate::mini_window::toggle(app) {
                     log::error!("[tray] 迷你模式切换失败: {e}");
                 }
+                sync_mini_checked(app);
             }
             ID_QUIT => {
                 log::info!("[tray] 退出");
