@@ -64,7 +64,7 @@ export function AboutSection(): React.JSX.Element {
           {version ? `${version.versionName} (versionCode ${version.versionCode})` : "…"}
         </span>
       </SettingRow>
-      <SettingRow title="检查更新" description="启动时自动检查一次，也可手动立即检查">
+      <SettingRow title="检查更新" description="启动时自动检查">
         <button
           type="button"
           onClick={() => void checkUpdate()}
@@ -80,22 +80,22 @@ export function AboutSection(): React.JSX.Element {
           不给打不开的链接 */}
       {siteUrl ? (
         <>
-          <SettingRow title="项目介绍与开源地址" description="功能说明、截图与三个仓库的地址">
+          <SettingRow title="项目介绍与开源地址" description="功能介绍与开源地址">
             <ExternalLinkButton label="打开官网" url={siteUrl} />
           </SettingRow>
-          <SettingRow title="用户协议" description="使用本软件前请先阅读">
+          <SettingRow title="用户协议" description="建议先读一遍">
             <ExternalLinkButton
               label="查看"
               url={officialSitePath(siteUrl, OFFICIAL_AGREEMENT_PATH)}
             />
           </SettingRow>
-          <SettingRow title="隐私政策" description="收集哪些数据、如何使用与保留">
+          <SettingRow title="隐私政策" description="数据收集与保留说明">
             <ExternalLinkButton
               label="查看"
               url={officialSitePath(siteUrl, OFFICIAL_PRIVACY_PATH)}
             />
           </SettingRow>
-          <SettingRow title="意见反馈" description="GitHub / CNB 双渠道提交 Issue 或 PR">
+          <SettingRow title="意见反馈" description="Issue 与 PR 入口">
             <ExternalLinkButton
               label="前往反馈"
               url={officialSitePath(siteUrl, OFFICIAL_FEEDBACK_PATH)}
@@ -104,7 +104,7 @@ export function AboutSection(): React.JSX.Element {
         </>
       ) : null}
       {/* 免责声明正文由后端下发（后台「消息管理」的开屏公告），所以这一行不受 siteUrl 约束 */}
-      <SettingRow title="重新查看免责声明" description="安装后首次启动时的那份声明">
+      <SettingRow title="重新查看免责声明" description="首次启动时的声明">
         <button
           type="button"
           onClick={() => void handleReopenDisclaimer()}

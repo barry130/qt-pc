@@ -43,9 +43,9 @@ export const AI_MODE_LABEL: Record<AiEngineMode, string> = {
 
 /** 设置页每个模式的一句话说明（悬停 title 与行内提示共用） */
 export const AI_MODE_HINT: Record<AiEngineMode, string> = {
-  rule: "不联网、不调模型：每日推荐按口味规则排，音乐助手按关键词规则选歌。永远可用。",
-  local: "调用下面配置的接口，只让模型在已搜好的候选里挑；模型挂了自动退回规则。",
-  server: "走登录后的 astral 音乐助手：每日推荐与音乐助手都按服务端会话生成，需要登录。",
+  rule: "不联网、不调模型，永远可用",
+  local: "调用下面配置的接口挑选候选；失败退回规则",
+  server: "走登录后的 astral 服务端，需要登录",
 };
 
 /** 设置页按钮组的数据源（与 `AI_MODE_LABEL` 一一对应） */

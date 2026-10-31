@@ -48,7 +48,7 @@ export function DislikeSection(): React.JSX.Element {
     <div className="max-w-4xl divide-y divide-border">
       <SettingRow
         title="屏蔽规则"
-        description="屏蔽后，这些歌 / 这个人的歌不会再出现在列表与自动播放里（手动点播仍可播放）。"
+        description="不再出现在列表与自动播放里；手动点播不受限"
       >
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
           <span>{loaded ? `${rules.length} 条` : "…"}</span>
@@ -79,7 +79,7 @@ export function DislikeSection(): React.JSX.Element {
           <p className="text-xs text-muted-foreground">加载中…</p>
         ) : rules.length === 0 ? (
           <p className="text-xs text-muted-foreground">
-            还没有屏蔽任何歌曲。在曲目行悬停时的「屏蔽」按钮可以加进来。
+            还没有屏蔽任何歌曲
           </p>
         ) : (
           <ul className="flex flex-col divide-y divide-border">
@@ -122,7 +122,7 @@ export function DislikeSection(): React.JSX.Element {
       </div>
       {confirming && (
         <p className="pb-2 text-xs text-muted-foreground">
-          清空后全部规则不可恢复；点空白处切换到别的分区会自动取消这次确认。
+          不可恢复；切换分区会自动取消
         </p>
       )}
       {error && <p className="py-2 text-xs text-destructive">{error}</p>}

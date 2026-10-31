@@ -4,12 +4,14 @@ import { useTauriEvent } from "@/hooks/useTauriEvent";
 import { readAggregateSources, saveAggregateSources } from "@/lib/aggregate-sources";
 import { OFFICIAL_SOURCE_SETUP_PATH, officialSitePath } from "@/lib/official-site";
 import { stripErrorUrls } from "@/lib/utils";
+import * as ipc from "@/services/ipc";
 import { SOURCE_META_CHANGED_EVENT, SOURCE_PACK_CHANGED_EVENT } from "@/services/ipc";
 import { activateSourcePack, applySourceUpdate, discoverSourceUpdates, getSourceState, installSourceLabel, installStagedSource, isPackLinkUrl, kindLabel, lastErrorSummary, offerLabel, packDisplayName, packVersionLabel, shortUpdateDate, stageSourceFromFile, stageSourceFromUrl, uninstallSourcePack, type PackPreviewVo, type SourcePackVo } from "@/source-scripts/source-update";
 import { useSourceUpdateStore } from "@/stores/source-update";
 import { useSourceRegistryStore } from "@/stores/sourceRegistry";
 import { toast, toastError, toastSuccess } from "@/stores/toast";
-import { ExternalLinkButton, SettingRow, Switch } from "../controls";
+import { ExternalLink } from "lucide-react";
+import { SettingRow, Switch } from "../controls";
 import { Button, Modal } from "@/components/ui";
 import { SourceAccountSection } from "./SourceAccountSection";
 import { buttonClass } from "@/components/ui";
@@ -89,8 +91,8 @@ export function AggregateSourcesRow(): React.JSX.Element {
       title="聚合搜索音源"
       description={
         allIds.length === 0
-          ? "搜索页「全部音源」、AI 找歌、手动换源、每日推荐跨源共用这份选择；单源搜索（某个源的页签、榜单、歌单、歌手页）不受影响。"
-          : `搜索页「全部音源」、AI 找歌、手动换源、每日推荐跨源只查勾选的源（已选 ${enabledCount}/${allIds.length}）；关掉的源不再被请求。单源搜索不受影响；新装的音源默认不参与，需要在这里打开。`
+          ? "跨源搜索、AI 找歌、换源与每日推荐共用；单源搜索不受影响"
+          : `跨源搜索、AI 找歌、换源与每日推荐只查勾选的源（已选 ${enabledCount}/${allIds.length}）；新装源默认不参与`
       }
     >
       <div className="flex w-full flex-col gap-1.5">
@@ -359,27 +361,49 @@ export function SourcePackageSection(): React.JSX.Element {
 
   return (
     <div className="max-w-4xl divide-y divide-border">
+      {/* 用户 m11501：教程入口置顶强调，其余行从它下方开始 */}
+      {siteUrl ? (
+        <a
+          href="#"
+          onClick={(e) => {
+            e.preventDefault();
+            void ipc.openExternalUrl(officialSitePath(siteUrl, OFFICIAL_SOURCE_SETUP_PATH)).catch(() => undefined);
+          }}
+          className="mb-4 flex items-center justify-between gap-4 rounded-xl border border-primary/25 bg-primary/8 px-4 py-3 transition-colors hover:bg-primary/12"
+        >
+          <span className="min-w-0">
+            <span className="block text-sm font-medium text-foreground">如何设置音源</span>
+            <span className="mt-0.5 block text-xs text-muted-foreground">
+              安装、换源、音质与排查
+            </span>
+          </span>
+          <span className="flex shrink-0 items-center gap-1.5 rounded-lg border border-primary/30 px-3 py-1.5 text-xs font-medium text-primary">
+            查看教程
+            <ExternalLink className="h-3.5 w-3.5" aria-hidden />
+          </span>
+        </a>
+      ) : null}
       <SettingRow
         title="数据包"
-        description="搜索/歌单/歌词/封面等数据源。不随应用分发，可从链接或本地文件安装。"
+        description="搜索 / 歌单 / 歌词 / 封面的数据源"
       >
         <span className="font-mono text-xs text-muted-foreground">{metaStatus}</span>
       </SettingRow>
       <SettingRow
         title="播放包"
-        description="在线播放（取链）必需；高风险源不随应用分发，由用户自行安装。"
+        description="在线播放取链必需"
       >
         <span className="font-mono text-xs text-muted-foreground">{playStatus}</span>
       </SettingRow>
       <SourceAccountSection />
       <SettingRow
         title="已安装的音源包"
-        description={`共 ${packs.length} 个（数据 ${metaPacks.length} / 播放 ${playPacks.length}）。启用即热切换；卸载两击确认。`}
+        description={`共 ${packs.length} 个（数据 ${metaPacks.length} / 播放 ${playPacks.length}）；卸载两击确认`}
       >
         <div className="flex w-full flex-col gap-2">
           {packs.length === 0 && (
             <span className="text-xs text-muted-foreground">
-              还没有安装任何音源包（在线搜索/歌单不可用，本地音乐不受影响）
+              还没有安装任何音源包
             </span>
           )}
           {metaPacks.length > 0 && (
@@ -434,7 +458,7 @@ export function SourcePackageSection(): React.JSX.Element {
       <AggregateSourcesRow />
       <SettingRow
         title="可用更新"
-        description="更新只提示不自动安装；应用失败会自动回滚到原版本并跳过该版本。"
+        description="只提示不自动安装；失败自动回滚并跳过该版本"
       >
         <div className="flex w-full flex-col items-end gap-2">
           {offers.length === 0 ? (
@@ -471,7 +495,7 @@ export function SourcePackageSection(): React.JSX.Element {
       </SettingRow>
       <SettingRow
         title="安装音源包"
-        description="从链接粘贴 .js 直链（https），或从本地选择文件；数据包/播放包自动识别。"
+        description="https 直链或本地文件，自动识别包类型"
       >
         <div className="flex w-full flex-col gap-2">
           <div className="flex items-center gap-2">
@@ -524,20 +548,6 @@ export function SourcePackageSection(): React.JSX.Element {
           </button>
         </div>
       </SettingRow>
-      {/* 装包/换源/音质/排错的完整说明只在官网维护一份，客户端给个入口即可。
-          官网地址是自有地址（只在 Rust 侧持有），未配置时整行不渲染 —— 宁可没有入口，
-          也不要给一个打不开的链接 */}
-      {siteUrl ? (
-        <SettingRow
-          title="如何设置音源"
-          description="三种安装方式、切换默认音源、音质选择与装不上排查"
-        >
-          <ExternalLinkButton
-            label="查看教程"
-            url={officialSitePath(siteUrl, OFFICIAL_SOURCE_SETUP_PATH)}
-          />
-        </SettingRow>
-      ) : null}
       {clipTip !== null && !preview && (
         <Modal
           open
@@ -640,7 +650,7 @@ export function InstallPreviewDialog(props: {
         ) : null}
         {p.signatureVerified ? (
           <div className="mt-2 rounded-lg bg-primary/10 px-3 py-2 text-2xs leading-relaxed text-primary">
-            ✓ 官方签名校验通过（ed25519，与官方发布密钥匹配）
+            ✓ 官方签名校验通过
           </div>
         ) : null}
         <div className="mt-3 flex items-center justify-end gap-2">

@@ -93,7 +93,7 @@ export function PlaybackSection(): React.JSX.Element {
     <div className="max-w-4xl divide-y divide-border">
       <SettingRow
         title="音频输出设备"
-        description="连蓝牙耳机后自动无声？选「跟随系统默认」即可跟随设备变化；固定设备适合挂多套输出。主动切换时当前曲目从原进度续播；设备被拔掉（蓝牙断开）则暂停播放并保留进度。"
+        description="跟随系统可随设备切换；固定设备适合多路输出"
       >
         <select
           value={current}
@@ -113,13 +113,13 @@ export function PlaybackSection(): React.JSX.Element {
       {/* 默认播放音质已改为按平台独立设置（音源账号页），此处不再有全局入口 */}
       <SettingRow
         title="无缝播放"
-        description="提前加载下一首，缩短连续播放时的间隔。默认关闭；在线歌曲的衔接效果取决于网络和音源响应。"
+        description="提前加载下一首，缩短间隔"
       >
         <Switch checked={gapless} disabled={busy} onToggle={() => void chooseGapless()} />
       </SettingRow>
       <SettingRow
         title="本地优先播放"
-        description="开启后，播放前先在下载文件、本地曲库里找同名歌曲（标题+歌手+时长都对上才算），找到就直接放本地文件：断网、播放地址过期都不影响；本地收藏指向的文件被移动/删除时，会自动找替身接着播，不改收藏内容。关闭则始终走在线播放（包括已下载的歌曲），适合要在线高音质的情况。默认开启。"
+        description="优先播放已下载与本地文件；关掉则始终在线"
       >
         <Switch
           checked={localFirst}
@@ -129,7 +129,7 @@ export function PlaybackSection(): React.JSX.Element {
       </SettingRow>
       <SettingRow
         title="默认倍速"
-        description={`当前 ${speedLabel(speed)}。播放条上的倍速菜单与本处相同：立即生效并记忆，所有歌曲通用。`}
+        description={`当前 ${speedLabel(speed)}；立即生效并记忆`}
       >
         <select
           value={speed}

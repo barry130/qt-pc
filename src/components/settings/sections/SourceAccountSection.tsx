@@ -7,7 +7,7 @@ export function SourceAccountSection(): React.JSX.Element {
   return (
     <SettingRow
       title="音源账号"
-      description="扫码登录音源官方账号（凭据只存本机）；每个音源单独管理数据/播放请求是否使用登录态。"
+      description="扫码登录，凭据只存本机；每源独立管理登录态"
     >
       <button
         type="button"

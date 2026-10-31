@@ -27,11 +27,8 @@ export function PlayerBarSection(): React.JSX.Element {
   return (
     <div className="max-w-4xl">
       <p className="pb-2 pt-1 text-xs text-muted-foreground">
-        播放条上除「上一首 / 播放 / 下一首」以外的按钮都能自行开关；关掉后剩下的按钮按数量自动
-        分到播放键两侧，中间的播放键保持居中。默认只开收藏 / 播放模式 / 桌面歌词 / 下载 / 音质 /
-        音量，其余默认关闭。除音量外最多同时展示 {PLAYER_BAR_MAX_VISIBLE} 个，名额满了先关一个
-        再开。无曲目时不显示倍速 / 下载 / 音质，本地音乐不显示音质，与开关无关。当前已展示
-        {countedVisible}/{PLAYER_BAR_MAX_VISIBLE} 个。
+        除播放键外都能自由开关；除音量外最多展示 {PLAYER_BAR_MAX_VISIBLE} 个，当前已选
+        {countedVisible}/{PLAYER_BAR_MAX_VISIBLE}。
       </p>
       <div className="divide-y divide-border">
         {items.map((b) => {

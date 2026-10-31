@@ -170,7 +170,7 @@ export function DownloadSection(): React.JSX.Element {
     <div className="max-w-4xl divide-y divide-border">
       <SettingRow
         title="下载保存位置"
-        description="默认为安装目录下的 Download 文件夹；重名歌曲自动加序号，不会互相覆盖。"
+        description="默认在安装目录 Download；重名自动加序号"
       >
         <div className="flex items-center gap-2">
           <span
@@ -200,7 +200,7 @@ export function DownloadSection(): React.JSX.Element {
       {/* 默认下载音质已改为按平台独立设置（音源账号页），此处不再有全局入口 */}
       <SettingRow
         title="下载文件名格式"
-        description="下载歌曲的存盘文件名顺序：歌手-歌名 或 歌名-歌手。仅影响设置变更后新开始的下载。"
+        description="存盘文件名顺序；仅影响之后新开始的下载"
       >
         <select
           value={nameFormat}
@@ -217,8 +217,8 @@ export function DownloadSection(): React.JSX.Element {
         title="同时下载封面"
         description={
           storage === "embed"
-            ? "下载完成后把封面写进歌曲文件标签（MP3/FLAC/M4A/WAV 等；原文件已有封面则保留，不支持的格式自动存为同目录图片）。仅影响之后完成的任务。"
-            : "下载完成后把封面原图存到歌曲旁边（文件名与歌曲相同）。仅影响之后完成的任务。"
+            ? "写进音频标签；不支持的格式存同目录图片"
+            : "存到歌曲旁边，文件名与歌曲相同"
         }
       >
         <Switch checked={saveCover} onToggle={() => void chooseSaveCover(!saveCover)} />
@@ -227,15 +227,15 @@ export function DownloadSection(): React.JSX.Element {
         title="同时下载歌词"
         description={
           storage === "embed"
-            ? "下载完成后把歌词写进歌曲文件标签（优先用已缓存的词，没有才联网补取；不支持的格式自动存为同名 .lrc）。仅影响之后完成的任务。"
-            : "下载完成后把歌词存为同名 .lrc 文件（优先用已缓存的词，没有才联网补取）。仅影响之后完成的任务。"
+            ? "写进音频标签（优先用已缓存的词）；不支持的格式存同名 .lrc"
+            : "存为同名 .lrc（优先用已缓存的词）"
         }
       >
         <Switch checked={saveLyric} onToggle={() => void chooseSaveLyric(!saveLyric)} />
       </SettingRow>
       <SettingRow
         title="下载存储方式"
-        description="封面 / 歌词跟歌走的形式：内嵌进音频文件标签（部分播放器可直接读出），或存为歌曲旁边的独立文件。仅影响之后完成的任务，已落盘的不来回改。"
+        description="内嵌标签或存为独立文件；仅影响之后的任务"
       >
         <select
           value={storage}
@@ -250,7 +250,7 @@ export function DownloadSection(): React.JSX.Element {
       </SettingRow>
       <SettingRow
         title="同时下载数"
-        description="批量下载时最多同时进行几个任务，超出的排队等待。数字越大越快，但也更容易被音源限流甚至封 IP，建议不超过 3。"
+        description="并发任务数，超出排队；建议 ≤3，过高易被限流"
       >
         <div className="flex items-center gap-2">
           {CONCURRENCY_CHOICES.map((n) => {

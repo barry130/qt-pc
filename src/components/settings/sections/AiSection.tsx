@@ -153,7 +153,7 @@ export function AiSection(): React.JSX.Element {
     <div className="max-w-4xl divide-y divide-border">
       <SettingRow
         title="第 1 步 · AI 引擎"
-        description="音乐助手和每日推荐共用这一个模式。纯规则不联网、永远可用；本地模型精选调用下面配置的接口，只让模型在已搜好的候选里挑，挂了自动退回规则；服务端 AI 走登录后的 astral 音乐助手，每日推荐与助手都用服务端生成，需要登录、且仅管理员可选，失败同样退回规则。"
+        description="纯规则不联网；本地模型只做挑选；服务端需登录且仅管理员"
       >
         {mode === null ? (
           <span className="text-xs text-muted-foreground">载入中…</span>
@@ -167,10 +167,10 @@ export function AiSection(): React.JSX.Element {
       {mode !== null && (
         <p className="py-3 text-xs text-muted-foreground">
           {AI_MODE_HINT[mode]}
-          {mode === "server" && !loggedIn ? " 当前未登录服务端，实际会退回规则。" : ""}
+          {mode === "server" && !loggedIn ? " 未登录，实际按规则运行。" : ""}
           {/* 库里存过服务端、但当前账号不是管理员：说清楚为什么实际按规则跑，
               否则用户会发现「设置里没这个选项，结果却和以前不一样」 */}
-          {storedServer && !canUseServer ? " 服务端 AI 仅管理员可用，当前按纯规则运行。" : ""}
+          {storedServer && !canUseServer ? " 仅管理员可用，当前按规则运行。" : ""}
         </p>
       )}
 
@@ -179,7 +179,7 @@ export function AiSection(): React.JSX.Element {
       {mode === "local" ? (
         <SettingRow
           title="第 2 步 · 模型配置"
-          description="AI 供应商按「列表 → 详情」管理：Base URL、协议（OpenAI / OpenAI Responses / Anthropic / Gemini）、多把密钥（第一把生效）、模型多选、图标与证书校验都在弹窗里改。密钥保存后前端不再回显明文，只显示掩码。"
+          description="Base URL、协议、密钥与模型都在弹窗里配置"
         >
           <button
             type="button"
@@ -194,8 +194,8 @@ export function AiSection(): React.JSX.Element {
           title="第 2 步 · 模型配置"
           description={
             mode === null
-              ? "选好引擎后这里会显示需不需要配模型。"
-              : `当前是「${AI_MODE_LABEL[mode]}」，用不到模型配置，所以这段收起来了。改成「本地模型精选」后在这里填接口地址与密钥。`
+              ? "选好引擎后再看这里"
+              : `当前是「${AI_MODE_LABEL[mode]}」，用不到模型配置`
           }
         >
           <button
@@ -210,7 +210,7 @@ export function AiSection(): React.JSX.Element {
 
       <SettingRow
         title="推荐口味"
-        description="决定候选怎么搜、怎么排序，和上面「AI 引擎」互不影响（三种引擎都能配三种口味）。心动＝从收藏（喜欢的单曲 + 在线收藏歌单 + 本地自建歌单）和最近在听出发；常听＝以常听歌手为主轴；探索＝尽量推你没听过的歌手。三种口味都会把同一歌手的歌摊开，不会连着排。"
+        description="心动＝收藏与最近在听；常听＝常听歌手；探索＝没听过的歌手"
       >
         {taste === null ? (
           <span className="text-xs text-muted-foreground">载入中…</span>
@@ -222,8 +222,7 @@ export function AiSection(): React.JSX.Element {
       {providersOpen ? <AiProvidersDialog onClose={() => setProvidersOpen(false)} /> : null}
 
       <p className="py-3 text-xs text-muted-foreground">
-        每日推荐默认每天第一次进页面时生成一次，当天再进直接读缓存；「换一批」会立刻重算。
-        候选来自全部已装音源的搜索，近 7 天推过的歌会排到后面（不再硬排除，池子不够时也能兜底）。
+        每天首次进入生成一次，「换一批」立即重算。
         {mode !== null ? `当前 AI 模式：${AI_MODE_LABEL[mode]}。` : ""}
         {taste !== null ? `当前口味：${DAILY_TASTE_LABEL[taste]}。` : ""}
       </p>

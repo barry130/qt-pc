@@ -42,7 +42,7 @@ export function DesktopLyricSection(): React.JSX.Element {
 
   return (
     <div className="max-w-4xl divide-y divide-border pb-8">
-      <SettingRow title="显示桌面歌词" description="在桌面置顶显示逐行歌词，鼠标悬停歌词上方会出现工具条">
+      <SettingRow title="显示桌面歌词" description="桌面置顶显示逐行歌词">
         <Switch
           checked={visible}
           onToggle={() =>
@@ -52,7 +52,7 @@ export function DesktopLyricSection(): React.JSX.Element {
           }
         />
       </SettingRow>
-      <SettingRow title="总在最前" description="歌词窗口始终悬浮在所有窗口上层；关闭后可被其他窗口遮住">
+      <SettingRow title="总在最前" description="始终置顶；关闭后会被遮挡">
         <Switch
           checked={state.alwaysOnTop}
           onToggle={() => patch({ alwaysOnTop: !state.alwaysOnTop })}
@@ -60,7 +60,7 @@ export function DesktopLyricSection(): React.JSX.Element {
       </SettingRow>
       <SettingRow
         title="锁定歌词位置"
-        description="锁定后不能拖动窗口、鼠标点击穿透到下层窗口（歌词只读展示），并隐藏歌词工具条防止误触；解锁走托盘菜单勾选、这里或快捷键 Ctrl+Alt+K（无托盘的环境走这里或快捷键）"
+        description="不能拖动，点击穿透，隐藏工具条；Ctrl+Alt+K 解锁"
       >
         <Switch
           checked={state.locked}
@@ -88,7 +88,7 @@ export function DesktopLyricSection(): React.JSX.Element {
           <option value="Consolas">Consolas</option>
         </select>
       </SettingRow>
-      <SettingRow title={`字号（${state.fontSize}px）`} description="在歌词上滚动滚轮也可以调">
+      <SettingRow title={`字号（${state.fontSize}px）`} description="也可在歌词上滚轮调整">
         <input
           type="range"
           min={12}
@@ -124,7 +124,7 @@ export function DesktopLyricSection(): React.JSX.Element {
 
       <SettingRow
         title={`歌词窗口宽度（${state.width}px）`}
-        description="调窄后长行歌词会自动横向滚动（歌词滚动）；在歌词上悬停工具条里也有 窄/宽 按钮，拖动窗口边缘同样可调"
+        description="过窄时歌词自动横向滚动"
       >
         <input
           type="range"
@@ -152,7 +152,7 @@ export function DesktopLyricSection(): React.JSX.Element {
         />
       </SettingRow>
 
-      <SettingRow title="当前行配色" description="当前歌词行的渐变高亮色（两端）">
+      <SettingRow title="当前行配色" description="当前行高亮渐变（两端）">
         <div className="flex items-center gap-2">
           <input
             type="color"
@@ -171,7 +171,7 @@ export function DesktopLyricSection(): React.JSX.Element {
           />
         </div>
       </SettingRow>
-      <SettingRow title="非当前行颜色" description="上一句 / 下一句与翻译行的文字颜色">
+      <SettingRow title="非当前行颜色" description="上下文与翻译行的文字色">
         <input
           type="color"
           aria-label="非当前行文字颜色"
@@ -180,7 +180,7 @@ export function DesktopLyricSection(): React.JSX.Element {
           className="h-6 w-8 cursor-pointer rounded border border-border bg-transparent p-0"
         />
       </SettingRow>
-      <SettingRow title="文字描边" description="给歌词加一圈深色描边，防止被亮色壁纸盖住（桌面歌词刚需）">
+      <SettingRow title="文字描边" description="深色描边，亮色壁纸下也清晰">
         <div className="flex items-center gap-3">
           {state.stroke && (
             <input
@@ -201,7 +201,7 @@ export function DesktopLyricSection(): React.JSX.Element {
         <Switch checked={state.shadow} onToggle={() => patch({ shadow: !state.shadow })} />
       </SettingRow>
 
-      <SettingRow title="背景" description="透明 / 半透明圆角蒙版 / 纯色">
+      <SettingRow title="背景" description="无 / 半透明蒙版 / 纯色">
         <Segmented
           value={state.backgroundMode}
           options={[
@@ -259,7 +259,7 @@ export function DesktopLyricSection(): React.JSX.Element {
           onChange={(v) => patch({ align: v })}
         />
       </SettingRow>
-      <SettingRow title="歌词行数" description="三行 = 上一句 + 当前行 + 下一句">
+      <SettingRow title="歌词行数" description="三行＝上文 + 当前 + 下文">
         <Segmented
           value={state.lineMode}
           options={[
@@ -273,7 +273,7 @@ export function DesktopLyricSection(): React.JSX.Element {
 
       <SettingRow
         title="重置歌词位置"
-        description="窗口拖丢（拖到屏幕外）时一键复位到主屏底部居中；位置与样式会自动记忆，重启后恢复"
+        description="拖到屏幕外时一键复位到主屏底部"
       >
         <button
           type="button"

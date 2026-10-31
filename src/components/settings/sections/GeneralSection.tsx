@@ -81,14 +81,14 @@ export function FileAssociationSetting(): React.JSX.Element | null {
   return (
     <SettingRow
       title="默认播放器"
-      description="关联 MP3、FLAC、WAV、OGG、M4A。点击「设为默认」后，在 Windows 默认应用中选择轻听；取消关联前请先改选其他播放器。"
+      description="关联 MP3 / FLAC / WAV / OGG / M4A；取消关联前请先改选其他播放器"
     >
       <div className="flex max-w-sm flex-col items-end gap-2">
-        <span className="text-xs text-muted-foreground">
-          {state === null ? "正在读取关联状态…" : state.defaultExtensions.length > 0
-            ? `当前默认：${state.defaultExtensions.map((ext) => ext.toUpperCase()).join("、")}`
-            : state.registered ? "已注册为可选播放器" : "尚未注册"}
-        </span>
+        {state !== null && state.defaultExtensions.length > 0 && (
+          <span className="text-xs text-muted-foreground">
+            当前默认：{state.defaultExtensions.map((ext) => ext.toUpperCase()).join("、")}
+          </span>
+        )}
         <div className="flex gap-2">
           <button type="button" disabled={busy || state === null} onClick={() => void change(true)}
             className="rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground disabled:opacity-50">
@@ -408,7 +408,7 @@ export function GeneralSection(): React.JSX.Element {
   return (
     <div className="max-w-4xl divide-y divide-border">
       <FileAssociationSetting />
-      <SettingRow title="开机自启" description="登录系统后自动启动轻听（收起在托盘）">
+      <SettingRow title="开机自启" description="开机自动启动，最小化到托盘">
         {autostart === null ? (
           <span className="text-xs text-muted-foreground">…</span>
         ) : (
@@ -419,8 +419,8 @@ export function GeneralSection(): React.JSX.Element {
         title="播放缓存上限"
         description={
           cache
-            ? `在线播放的音频会先缓冲到磁盘（边下边播）。超过上限自动清理最旧的缓存文件，正在播放的不受影响。当前 ${formatBytes(cache.totalBytes)} · ${cache.fileCount} 个文件`
-            : "在线播放的音频会先缓冲到磁盘（边下边播）。超过上限自动清理最旧的缓存文件，正在播放的不受影响。"
+            ? `边下边播；超出上限清理最旧。当前 ${formatBytes(cache.totalBytes)} · ${cache.fileCount} 个文件`
+            : "边下边播；超出上限自动清理最旧"
         }
       >
         {limit === null ? (
@@ -467,7 +467,7 @@ export function GeneralSection(): React.JSX.Element {
       </SettingRow>
       <SettingRow
         title="缓存位置"
-        description="播放缓存与图片缓存的存放目录，默认在安装目录下的 cache 文件夹（不占用系统盘）。换到别的盘后已缓存的文件不会自动搬过去，需要时先在上面「清理缓存」再换。"
+        description="默认在安装目录 cache；换盘后旧缓存不会自动搬移"
       >
         <DirPicker
           path={cacheDir}
@@ -480,8 +480,8 @@ export function GeneralSection(): React.JSX.Element {
         title="清理缓存"
         description={
           cache
-            ? `默认只清理可再生缓存：播放 ${formatBytes(cache.totalBytes)} / 图片 ${formatBytes(cache.webBytes)}；不删除下载、登录、设置或已保存歌词。「听歌统计」是可选项，默认不勾`
-            : "默认只清理可再生缓存；不删除已下载音乐、登录状态、应用设置或已保存歌词。「听歌统计」是可选项，默认不勾"
+            ? `只清可再生缓存：播放 ${formatBytes(cache.totalBytes)} / 图片 ${formatBytes(cache.webBytes)}；不动下载、登录、设置与已保存歌词`
+            : "只清可再生缓存；不动下载、登录、设置与已保存歌词"
         }
       >
         <div className="flex max-w-md flex-wrap items-center justify-end gap-x-3 gap-y-2">
@@ -526,7 +526,7 @@ export function GeneralSection(): React.JSX.Element {
           ))}
           <label
             className="flex items-center gap-1 text-xs text-muted-foreground"
-            title="累计时长、有效播放、日榜与「最近播放」一起归零，不可恢复；勾上后需要点两次「清理」"
+            title="累计时长、日榜与最近播放一起归零，不可恢复"
           >
             <input
               type="checkbox"
@@ -578,7 +578,7 @@ export function GeneralSection(): React.JSX.Element {
             {clearing ? "清理中…" : armedStats ? "再点一次确认清除" : "清理"}
           </button>
           <p className="basis-full text-right text-2xs text-muted-foreground">
-            进程内缓存可重新获取；清理歌词只清内存候选与当前歌词，不删除已保存歌词。听歌统计不可再生，勾上后需点两次「清理」；想留个底可以先「导出备份」。
+            听歌统计不可再生，需点两次确认；想留底可先「导出备份」
           </p>
         </div>
       </SettingRow>
@@ -586,8 +586,8 @@ export function GeneralSection(): React.JSX.Element {
         title="数据备份"
         description={
           backupDir
-            ? `歌单、收藏、播放记录、设置与歌词可以导出成一个备份文件（不含已下载的音乐文件本体，它支持几十 GB）。上次导出到 ${backupDir}`
-            : "歌单、收藏、播放记录、设置与歌词可以导出成一个备份文件（不含已下载的音乐文件本体）。换机器或重装前导出一份，之后导入回来即可。"
+            ? `歌单、收藏、播放记录、设置与歌词；不含音乐文件本体。上次导出到 ${backupDir}`
+            : "歌单、收藏、播放记录、设置与歌词；不含音乐文件本体"
         }
       >
         <div className="flex flex-col items-end gap-2">
@@ -644,7 +644,7 @@ export function GeneralSection(): React.JSX.Element {
                 </button>
               </div>
               <span className="max-w-72 text-right text-2xs text-muted-foreground">
-                合并＝只补进缺的记录，现有数据不动；覆盖＝用备份整体替换当前数据（会先自动快照一份）
+                合并＝只补缺的记录；覆盖＝整体替换（自动快照）
               </span>
             </div>
           )}
@@ -654,10 +654,10 @@ export function GeneralSection(): React.JSX.Element {
         title="诊断日志"
         description={
           logCfg
-            ? `应用与播放的运行日志保存在本机（${logCfg.dir || "默认目录"}），反馈问题时可一并附上${
-                logCfg.enabled ? "" : "。当前未能写入文件（目录不可用），日志只输出到控制台"
+            ? `日志保存在本机（${logCfg.dir || "默认目录"}），反馈问题时附上${
+                logCfg.enabled ? "" : "；当前目录不可写，日志只到控制台"
               }`
-            : "应用与播放的运行日志保存在本机，反馈问题时可一并附上"
+            : "日志保存在本机，反馈问题时附上"
         }
       >
         <div className="flex items-center gap-2">
@@ -681,10 +681,10 @@ export function GeneralSection(): React.JSX.Element {
         <>
           <SettingRow
             title="日志级别"
-            description={`记录到哪个级别：调试最详细、错误最少。默认为${
+            description={`调试最详细、错误最少；默认为${
               LOG_LEVEL_OPTIONS.find((o) => o.value === logCfg.defaultLevel)?.label ??
               logCfg.defaultLevel
-            }（未设置时按版本自动选择）。级别改动立即生效，无需重启。`}
+            }，改动立即生效`}
           >
             <Segmented
               value={logCfg.level === "trace" ? "debug" : logCfg.level}
@@ -694,7 +694,7 @@ export function GeneralSection(): React.JSX.Element {
           </SettingRow>
           <SettingRow
             title="日志文件大小"
-            description={`单个日志文件的上限（${logCfg.minFileMb}–${logCfg.maxFileMb} MB），写满后自动开始新文件`}
+            description={`单个文件上限（${logCfg.minFileMb}–${logCfg.maxFileMb} MB），写满自动换新文件`}
           >
             <NumberField
               value={logCfg.fileMb}
@@ -706,7 +706,7 @@ export function GeneralSection(): React.JSX.Element {
           </SettingRow>
           <SettingRow
             title="日志保留份数"
-            description={`最多保留几个历史日志文件（${logCfg.minBackups}–${logCfg.maxBackups} 个），超出后自动删除最旧的`}
+            description={`最多保留 ${logCfg.minBackups}–${logCfg.maxBackups} 个，超出删最旧`}
           >
             <NumberField
               value={logCfg.backups}

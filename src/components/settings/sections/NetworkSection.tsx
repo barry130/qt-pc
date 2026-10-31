@@ -130,7 +130,7 @@ export function NetworkSection(): React.JSX.Element {
     <div className="max-w-4xl divide-y divide-border">
       <SettingRow
         title="代理模式"
-        description="音源、在线播放、封面、下载及账号与更新请求都使用此代理。改动对下一次请求生效，不打断正在播放的歌。"
+        description="音源、播放、封面、下载与账号请求都走此代理"
       >
         {cfg ? (
           <Segmented
@@ -145,7 +145,7 @@ export function NetworkSection(): React.JSX.Element {
       {cfg?.proxyMode === "custom" && (
         <SettingRow
           title="代理地址"
-          description="支持 http://、https://、socks5://、socks5h://，可带用户名密码（回车或失焦保存）"
+          description="支持 http / https / socks5，可带账号密码（回车即保存）"
         >
           <span className="flex w-full flex-col items-end gap-1">
             <input
@@ -168,7 +168,7 @@ export function NetworkSection(): React.JSX.Element {
       )}
       <SettingRow
         title="单源超时"
-        description="单个音源 HTTP 请求的默认超时；音源脚本显式声明的超时优先。网络差时调大可减少「音源不可用」。"
+        description="单请求默认超时；音源脚本声明优先"
       >
         {cfg && timeoutSeconds !== null ? (
           <div className="flex items-center gap-2">
@@ -218,7 +218,7 @@ export function NetworkSection(): React.JSX.Element {
       {saveError && <p role="alert" className="py-3 text-xs text-destructive">{saveError}</p>}
       <SettingRow
         title="测试连接"
-        description="按当前表单里的代理设置试连一次（不修改已保存的配置）"
+        description="按当前填写的代理试连（不保存）"
       >
         <span className="flex w-full flex-col items-end gap-1">
           <button

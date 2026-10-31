@@ -159,7 +159,7 @@ describe("设置页 · 通用 · 日志区", () => {
     expect(c.textContent).toContain("换源候选");
     expect(c.textContent).toContain("歌词候选");
     expect(c.textContent).toContain("榜单详情");
-    expect(c.textContent).toContain("不删除下载、登录、设置");
+    expect(c.textContent).toContain("不动下载、登录、设置");
 
     const checks = [...c.querySelectorAll('input[type="checkbox"]')] as HTMLInputElement[];
     expect(checks.length).toBeGreaterThanOrEqual(8);

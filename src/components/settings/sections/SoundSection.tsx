@@ -50,7 +50,7 @@ export function SoundSection(): React.JSX.Element {
     <div className="max-w-4xl divide-y divide-border">
       <SettingRow
         title="响度归一化"
-        description="不同音源的响度标准不一致，切歌忽大忽小？开启后按曲目实际响度自动调节增益（±12dB 内），音量更平稳。"
+        description="按曲目实际响度自动调增益（±12dB），切歌不再忽大忽小"
       >
         <Switch
           checked={fx.loudnorm}
@@ -63,7 +63,7 @@ export function SoundSection(): React.JSX.Element {
       </SettingRow>
       <SettingRow
         title="淡入淡出"
-        description="暂停时声音缓缓淡出，恢复播放时缓缓淡入，听感更柔和。"
+        description="暂停淡出、恢复淡入"
       >
         <div className="flex items-center gap-2">
           {fx.fade.enabled && (
@@ -93,7 +93,7 @@ export function SoundSection(): React.JSX.Element {
 
       <SettingRow
         title="频谱背景"
-        description="播放条底部随音乐频率跳动的方块（实时频谱）。关闭时引擎不做任何频谱计算，无额外开销。"
+        description="播放条实时频谱；关闭后不做计算"
       >
         <Switch
           checked={fx.spectrum}
@@ -110,7 +110,7 @@ export function SoundSection(): React.JSX.Element {
           <div className="min-w-0 flex-1">
             <p className="text-sm">均衡器</p>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              十段图示均衡器（±12dB）；开启时自动压低前置放大防削波
+              十段均衡（±12dB），自动防削波
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-2">
