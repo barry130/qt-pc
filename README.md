@@ -3,6 +3,7 @@
 Windows / Linux / macOS 桌面端轻量级**本地音乐播放器**。基于 **Tauri 2 + React 19 + Rust**（同一份代码按平台编译打包）：本地音乐库开箱即用，无损音质、桌面歌词、下载与云同步收藏；另提供可选的「音源包」机制，安装音源包后可扩展在线试听（本项目**不内置、不分发任何音源实现**）。
 
 > 仅供学习与技术交流使用。本项目不存储、不分发任何音乐内容；音源包由使用者自行获取并自担风险，请勿用于商业用途，并请尊重音乐版权。
+> **音源包及其接口、内容均来源于网络、由第三方提供**，本项目不内置、不分发，也不提供任何在线音源包服务。
 
 ## 功能特性
 
@@ -20,6 +21,26 @@ Windows / Linux / macOS 桌面端轻量级**本地音乐播放器**。基于 **T
 - **听歌统计**：播放次数、时长、热门曲目与歌手排行；分享卡片（歌曲 / 歌词卡片导出）
 - **自动更新**：官方版本校验 + 加速节点下载 + MD5 校验；首次启动引导页
 - **外观与快捷键**：浅色 / 深色 / 跟随系统、封面色取色主题、全局快捷键、缓存管理（上限与分项清理）
+- **列表体验**：歌单 / 榜单 / 专辑 / 歌手 / 搜索等列表一次性加载完毕（不再滑动续页、没有「已经到底了」），可按歌名 / 专辑名 / 歌手名正倒序排序
+- **通知与更新**：站内通告栏 + 消息中心；更新说明按富文本渲染（标题、列表、加粗、可点链接）
+- **低占用**：空闲时单核 1%–3%；迷你窗与桌面歌词窗隐藏即销毁，播放条频谱按需刷新
+- **界面入口**：标题栏「头像 → 通知 → 设置 → 皮肤」；外观（皮肤 / 背景图 / 字体缩放）是独立一级页
+
+## 界面预览
+
+> 以下均为真实客户端截图（Windows 版，1280 宽）。**截图里出现的在线内容全部来自使用者自行安装的音源包**：
+> 音源包及其接口、内容均**来源于网络**，由第三方提供；本项目**不内置、不分发，也不提供任何在线音源包服务**。
+> 未安装音源包时，应用是一个完整的本地音乐播放器。
+
+| 发现页 · 每日整理 / 榜单精选 | 歌单广场 · 分类浏览 |
+|---|---|
+| ![发现页](docs/screenshots/01-home.jpg) | ![歌单广场](docs/screenshots/02-playlists.jpg) |
+| **排行榜 · 多源热榜** | **播放页 · 唱片封面与逐行歌词** |
+| ![排行榜](docs/screenshots/03-charts.jpg) | ![播放页](docs/screenshots/05-playing.jpg) |
+| **每日推荐 · 按听歌口味** | **音源账号 · 扫码 / 网页登录** |
+| ![每日推荐](docs/screenshots/08-daily-recommend.jpg) | ![音源账号](docs/screenshots/04-source-accounts.jpg) |
+| **音源包 · 安装与更新** | **外观 · 皮肤与背景图** |
+| ![音源包设置](docs/screenshots/06-settings-source-pack.jpg) | ![外观](docs/screenshots/07-appearance.jpg) |
 
 ## 技术栈
 
@@ -112,7 +133,7 @@ cd src-tauri && cargo clippy --all-targets -- -D warnings && cargo test --lib
 ```
 
 ```bash
-# 只跑前端测试（Vitest，47 个测试文件）
+# 只跑前端测试（Vitest，129 个测试文件 / 1242 条用例）
 pnpm test
 pnpm typecheck
 pnpm lint                                     # 只跑 eslint（pnpm check 里带 --max-warnings 0）
@@ -172,7 +193,7 @@ qt-pc/
 │   └── tests/               # 集成测试（真实链路 live_astral + FLAC 定位回归 flac_seek）
 ├── scripts/                 # 构建与配置脚本：sync-config（唯一配置源同步）
 ├── tests/                   # 前端测试（含 config.test.ts 配置护栏）
-├── docs/                    # CONFIG.md（配置）/ PACKAGING.md（打包）/ 重构方案
+├── docs/                    # CONFIG.md（配置）/ PACKAGING.md（打包）/ UI-COMPONENTS.md / screenshots（界面截图）
 ├── tools/                   # 开发辅助脚本（registry-proxy.mjs）
 ├── DESIGN.md                # 设计文档
 └── REQUIREMENTS.md          # 需求文档
@@ -193,6 +214,7 @@ qt-pc/
 | [`docs/PACKAGING.md`](docs/PACKAGING.md) | 三平台打包流程（Windows NSIS / Linux deb+AppImage / macOS app+dmg）、自动发版与常见失败 |
 | [`docs/plan-playlist-merge.md`](docs/plan-playlist-merge.md) | 收藏 / 歌单模型重构方案 |
 | [`docs/UI-COMPONENTS.md`](docs/UI-COMPONENTS.md) | **共享 UI 组件清单与使用规则**：写界面前先查这里，按钮/输入/弹窗/空态/骨架全部走 `@/components/ui` |
+| [`docs/screenshots/`](docs/screenshots/) | 界面截图（JPEG，1280 宽），与上文「界面预览」对应；在线内容均来自使用者自行安装的音源包 |
 
 ## 已知限制
 
