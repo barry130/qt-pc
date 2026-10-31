@@ -1,11 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Download, Loader2, Share2 } from "lucide-react";
+import {
+  Download,
+  Share2,
+} from "lucide-react";
 import { getPlaybackLyric } from "@/lib/localOnline";
 import { parseLrc, qtresCoverUrl } from "@/lib/lrc";
 import * as ipc from "@/services/ipc";
 import type { Track } from "@/types";
 import { cn } from "@/lib/utils";
 import { toastSuccess } from "@/stores/toast";
+import { Spinner } from "@/components/ui";
+import { drawShareQr } from "@/components/player/share-qr";
 
 export const SHARE_CARD_BRAND = "轻听音乐";
 export const SHARE_CARD_BRAND_SUB = "QuietMusic";
@@ -31,6 +36,16 @@ const RADIUS = 16;
 
 /** 歌词卡片最多带几行词（与移动端一致） */
 const LYRIC_LINES = 6;
+
+/**
+ * 底部那一带（品牌 + 下载二维码）的高度。
+ * 二维码 64 + 上下各 16 = 96，比原来的 46 高出一半 —— 二维码小到 48 以下
+ * 在手机上就很难对焦了，宁可卡片长一点。
+ */
+const BOTTOM_H = 96;
+
+/** 二维码方块边长（含四周 4 格安静区，见 share-qr.ts） */
+const QR_BLOCK = 64;
 
 const FONT_SANS =
   '"PingFang SC","Microsoft YaHei","Noto Sans SC","Helvetica Neue",Arial,sans-serif';
@@ -193,7 +208,7 @@ export function ShareCardPanel(props: { track: Track }): React.JSX.Element {
     }
     const lyricH = mode === 1 ? 14 + lyricOut.length * 24 + (lyricOut.length > 0 ? 0 : 24) : 0;
     const bodyH = 8 + titleLines.length * 26 + 6 + 18 + lyricH;
-    const height = COVER + bodyH + 46;
+    const height = COVER + bodyH + BOTTOM_H;
 
     canvas.width = CARD_W * SCALE;
     canvas.height = height * SCALE;
@@ -250,16 +265,23 @@ export function ShareCardPanel(props: { track: Track }): React.JSX.Element {
       }
     }
 
-    // 品牌行
+    // 底部一带：品牌在左，下载二维码在右（用户 m10523 要的「右下角二维码」）
     ctx.restore();
+    const qrX = CARD_W - PAD - QR_BLOCK;
+    const qrY = height - PAD - QR_BLOCK;
+    drawShareQr(ctx, qrX, qrY, QR_BLOCK);
+
+    // 左侧文字与二维码垂直居中对齐，三行：品牌 / 引导语 / 英文名
+    const centerY = qrY + QR_BLOCK / 2;
     ctx.fillStyle = t.accent;
     ctx.font = `bold 13px ${FONT_SANS}`;
-    ctx.fillText(SHARE_CARD_BRAND, PAD, height - 18);
-    ctx.fillStyle = t.subtle;
+    ctx.fillText(SHARE_CARD_BRAND, PAD, centerY - 10);
+    ctx.fillStyle = t.text;
     ctx.font = `10px ${FONT_SANS}`;
-    ctx.textAlign = "right";
-    ctx.fillText(SHARE_CARD_BRAND_SUB, CARD_W - PAD, height - 18);
-    ctx.textAlign = "left";
+    ctx.fillText("扫码下载客户端", PAD, centerY + 6);
+    ctx.fillStyle = t.subtle;
+    ctx.font = `9px ${FONT_SANS}`;
+    ctx.fillText(SHARE_CARD_BRAND_SUB, PAD, centerY + 20);
     return canvas;
   };
 
@@ -383,7 +405,7 @@ export function ShareCardPanel(props: { track: Track }): React.JSX.Element {
           )}
         >
           {busy ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            <Spinner size="sm" className="h-3.5 w-3.5" />
           ) : (
             <Share2 className="h-3.5 w-3.5" />
           )}
@@ -399,7 +421,7 @@ export function ShareCardPanel(props: { track: Track }): React.JSX.Element {
           )}
         >
           {busy ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            <Spinner size="sm" className="h-3.5 w-3.5" />
           ) : (
             <Download className="h-3.5 w-3.5" />
           )}

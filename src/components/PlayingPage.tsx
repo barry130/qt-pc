@@ -18,6 +18,7 @@ import {
   RefreshCw,
   RotateCcw,
   Search,
+  Share2,
   ThumbsDown,
   User,
   ZoomIn,
@@ -56,6 +57,7 @@ import { WindowControls } from "@/components/WindowControls";
 import { SourceTag } from "@/components/common/SourceTag";
 import { errMsg } from "@/lib/utils";
 import { LyricScroller } from "@/components/player/LyricScroller";
+import { ShareCardPanel } from "@/components/player/ShareCardPanel";
 import { ContextMenu, FloatingPanel, type ContextMenuItem } from "@/components/common/ContextMenu";
 import { CollectMenu } from "@/components/mine/CollectMenu";
 import { replaceCurrentWithCandidate, SourceSwitchPanel } from "@/components/player/SourceSwitchPanel";
@@ -110,7 +112,7 @@ export function PlayingPage(): React.JSX.Element {
    * 菜单渲染会跟着一起消失（与 TrackList 同一套处理）。
    */
   const [panel, setPanel] = useState<{
-    kind: "collect" | "switch" | "lyric";
+    kind: "collect" | "switch" | "lyric" | "share";
     x: number;
     y: number;
   } | null>(null);
@@ -232,10 +234,20 @@ export function PlayingPage(): React.JSX.Element {
     const t = track;
     const noTrack = t === null;
     const items: ContextMenuItem[] = [
+      // 分享放第一项（用户 m10205）：右击播放页想做的事里「把这首发出去」最常见，
+      // 具体动作与播放条的分享按钮同一套 —— 弹 ShareCardPanel，出的是图片卡片。
+      {
+        key: "share",
+        label: "分享歌曲",
+        icon: Share2,
+        disabled: noTrack,
+        onSelect: () => setPanel({ kind: "share", x, y }),
+      },
       {
         key: "lyric-all",
         label: "查看全部歌词",
         icon: FileText,
+        separatorBefore: true,
         disabled: lrc.length === 0,
         onSelect: () => setPanel({ kind: "lyric", x, y }),
       },
@@ -739,6 +751,19 @@ export function PlayingPage(): React.JSX.Element {
           </div>
         </FloatingPanel>
       ) : null}
+      {panel?.kind === "share" && track !== null ? (
+        <FloatingPanel
+          x={panel.x}
+          y={panel.y}
+          width={352}
+          onClose={() => setPanel(null)}
+          closeOnScroll={false}
+        >
+          <div className="rounded-xl border border-border bg-popover/95 p-3 text-popover-foreground shadow-raised backdrop-blur-xl">
+            <ShareCardPanel track={track} />
+          </div>
+        </FloatingPanel>
+      ) : null}
       {panel?.kind === "lyric" ? (
         <FloatingPanel
           x={panel.x}
@@ -858,6 +883,9 @@ function VinylCover(props: { track: Track | null; playing: boolean }): React.JSX
 
 function TrackInfo(props: { track: Track | null; cross?: CrossSourceHit | null }): React.JSX.Element {
   const { track } = props;
+  // 本次实际播出来的码率（不是「请求了什么」）。测不出来就是 null，此时不渲染这段，
+  // 与播放条保持同一口径：宁可空着，也不写 0 kbps 冒充「码率极低」。
+  const bitrateKbps = usePlayerStore((s) => s.state?.bitrateKbps ?? null);
   return (
     <div className="min-w-0">
       <div className="flex min-w-0 items-center gap-x-2">
@@ -865,6 +893,11 @@ function TrackInfo(props: { track: Track | null; cross?: CrossSourceHit | null }
           {track ? track.title : "未在播放"}
         </span>
         {track && <SourceTag platform={props.cross?.target ?? track.platform} />}
+        {track && bitrateKbps !== null && (
+          <span className="shrink-0 whitespace-nowrap text-2xs tabular-nums text-muted-foreground">
+            {bitrateKbps} kbps
+          </span>
+        )}
       </div>
       {track ? (
         // 歌手在前（音乐 App 惯例），专辑可选展示，用「·」分隔替代全角空格；

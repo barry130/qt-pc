@@ -23,6 +23,13 @@ export interface ContextMenuItem {
 const MARGIN = 8;
 
 /**
+ * 跟随面板的高度上限：到顶到脚各留 `MARGIN`，超出的部分由面板自己滚。
+ * 夹坐标只能把「顶边」按进视口，面板比视口还高时底部仍会被切掉（用户 m10460
+ * 「展示不全」正是这个：分享卡的大封面把面板撑到比可视区还高）。
+ */
+const PANEL_MAX_HEIGHT = `calc(100vh - ${MARGIN * 2}px)`;
+
+/**
  * 先按鼠标位置渲染，量到真实尺寸后把坐标夹回视口内 —— 在屏幕右下角右键时，
  * 菜单 / 面板不会有一半在窗口外。尺寸要在渲染后才知道，所以是两拍。
  */
@@ -37,11 +44,26 @@ function useClampedPoint(
   useLayoutEffect(() => {
     const el = ref.current;
     if (!el) return;
-    const rect = el.getBoundingClientRect();
-    setPos({
-      left: Math.max(MARGIN, Math.min(x, window.innerWidth - rect.width - MARGIN)),
-      top: Math.max(MARGIN, Math.min(y, window.innerHeight - rect.height - MARGIN)),
+    const clamp = (): { left: number; top: number } => {
+      const rect = el.getBoundingClientRect();
+      return {
+        left: Math.max(MARGIN, Math.min(x, window.innerWidth - rect.width - MARGIN)),
+        top: Math.max(MARGIN, Math.min(y, window.innerHeight - rect.height - MARGIN)),
+      };
+    };
+    setPos(clamp());
+    // **夹一次不够**：首拍量到的是「内容还没长满」时的高度 —— 分享卡的封面图要等
+    // 加载 / 绘制完、换源面板先是"搜索中"一窄条再变成结果列表、收藏面板的歌单列表
+    // 也是异步到的。按首拍高度算出 top 之后内容再长高，面板下半截就落到窗口外，
+    // 底部按钮点不到（用户 m10460「展示不全」）。所以跟着尺寸持续夹。
+    if (typeof ResizeObserver === "undefined") return; // jsdom / 老内核：只量首拍
+    const ro = new ResizeObserver(() => {
+      const next = clamp();
+      // 尺寸没变就不 setState：ResizeObserver 在加载/动画期间会连着报，别白重渲染
+      setPos((prev) => (prev.left === next.left && prev.top === next.top ? prev : next));
     });
+    ro.observe(el);
+    return () => ro.disconnect();
   }, [ref, x, y, reflowKey]);
   return pos;
 }
@@ -181,14 +203,16 @@ export function FloatingPanel(props: {
   return createPortal(
     <div
       ref={boxRef}
-      style={{ left: pos.left, top: pos.top, width }}
+      style={{ left: pos.left, top: pos.top, width, maxHeight: PANEL_MAX_HEIGHT }}
       onContextMenu={(e) => {
         e.preventDefault();
         e.stopPropagation();
       }}
-      // 同 ContextMenu：面板在 React 树上挂在行里面，点击不能漏到行的 onClick（播放）
+      // 面板在 React 树上挂在行里面，点击不能漏到行的 onClick（播放）
       onClick={(e) => e.stopPropagation()}
-      className="fixed z-[60]"
+      // 比窗口还高的面板（分享卡带大封面、换源结果多）自己滚，而不是直接把底部
+      // 那排按钮甩到窗口外 —— 夹坐标只能保证「顶边可见」，兜底得靠这里
+      className="fixed z-[60] overflow-y-auto overscroll-contain"
     >
       {children}
     </div>,

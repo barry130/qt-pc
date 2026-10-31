@@ -92,6 +92,13 @@ vi.mock("@/components/player/SourceSwitchPanel", () => ({
   SourceSwitchPanel: () => <div data-testid="switch-panel">换源面板</div>,
   replaceCurrentWithCandidate: vi.fn(async () => undefined),
 }));
+// 分享面板要画 canvas 且带保存 PNG 的 IPC，不测它本身的绘制细节（另有
+// share-card-panel.test.tsx 专测），这里只验证右键能把面板叫出来。
+vi.mock("@/components/player/ShareCardPanel", () => ({
+  ShareCardPanel: (props: { track: { title: string } }) => (
+    <div data-testid="share-panel">分享「{props.track.title}」</div>
+  ),
+}));
 
 import { PlayingPage } from "@/components/PlayingPage";
 import { usePlayerStore } from "@/stores/player";
@@ -198,6 +205,7 @@ describe("播放页右键菜单", () => {
     render(<PlayingPage />);
     const menu = openMenu();
     for (const label of [
+      "分享歌曲",
       "查看全部歌词",
       "显示桌面歌词",
       "查看歌手",
@@ -223,6 +231,15 @@ describe("播放页右键菜单", () => {
     expect(item(menu, "打开文件所在位置").disabled).toBe(true);
     // 偏移为 0 时重置项置灰
     expect(item(menu, "重置歌词偏移（当前 0 ms）").disabled).toBe(true);
+  });
+
+  it("分享歌曲：右键叫出分享卡片面板，带的是当前曲目", () => {
+    render(<PlayingPage />);
+    const menu = openMenu();
+    fireEvent.click(item(menu, "分享歌曲"));
+    // 菜单收起，面板到手
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(screen.getByTestId("share-panel").textContent).toContain("歌1");
   });
 
   it("复制歌曲信息 / 封面地址 / 歌曲 ID 都进剪贴板，点完菜单收起", () => {
