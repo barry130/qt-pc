@@ -1,4 +1,4 @@
-import { ArrowLeft, Search, Settings } from "lucide-react";
+import { ArrowLeft, Palette, Search, Settings } from "lucide-react";
 import { Link, useRouter, useNavigate } from "@tanstack/react-router";
 import { useTitleBarDrag } from "@/hooks/useFramelessWindow";
 import { WindowControls } from "@/components/WindowControls";
@@ -13,7 +13,7 @@ import { cn } from "@/lib/utils";
 /**
  * 自定义标题栏（DESIGN §5.3）：
  * - 拖动区（按下即 startDragging）+ 双击最大化
- * - 返回 / Logo / 搜索入口（点击打开独立的搜索页）/ 音源切换器 / 消息中心·设置·账号 / 窗口控制
+ * - 返回 / Logo / 搜索入口（点击打开独立的搜索页）/ 音源切换器 / 账号·通知·设置·皮肤 / 窗口控制
  * - 按钮区 stopPropagation 防止误触发拖动
  */
 export function TitleBar(): React.JSX.Element {
@@ -40,6 +40,7 @@ export function TitleBar(): React.JSX.Element {
   // 两个圆形/方块图标按钮走自绘 tooltip：悬停 380ms 即出，深色皮肤下不再是系统白框
   const backHint = useHint("返回上一步");
   const settingsHint = useHint("设置");
+  const skinHint = useHint("皮肤");
   const goSearch = (): void => {
     void navigate({ to: "/search", search: { q: "", type: "song" } });
   };
@@ -96,23 +97,9 @@ export function TitleBar(): React.JSX.Element {
         <MusicSourceSwitcher />
       </div>
 
-      {/* 右：消息中心 / 设置 / 账号 + 窗口控制 */}
+      {/* 右：账号 / 通知 / 设置 / 皮肤 + 窗口控制
+          （顺序按用户 2026-10-31 要求：头像在最内、窗口控制贴右沿） */}
       <div className="flex h-full items-stretch">
-        <MessagesPopover />
-        <Link
-          to="/settings/$section"
-          params={{ section: "general" }}
-          {...settingsHint.hintProps}
-          aria-label="设置"
-          onMouseDown={(e) => e.stopPropagation()}
-          onDoubleClick={(e) => e.stopPropagation()}
-          // 圆角小块 hover，与中间返回键的圆形 hover 同一形状语言；
-          // 窗口控制仍是贴边全高矩形（Windows 惯例，命中区到窗沿）
-          className="mx-1 flex h-8 w-9 items-center justify-center self-center rounded-md text-foreground/80 transition-colors hover:bg-secondary hover:text-foreground"
-        >
-          <Settings className="h-4 w-4" />
-        </Link>
-        {settingsHint.hintLayer}
         <Link
           to={session ? "/profile" : "/login"}
           title={session ? displayName(profile, "账号") : "登录"}
@@ -129,6 +116,34 @@ export function TitleBar(): React.JSX.Element {
             draggable={false}
           />
         </Link>
+        <MessagesPopover />
+        <Link
+          to="/settings/$section"
+          params={{ section: "general" }}
+          {...settingsHint.hintProps}
+          aria-label="设置"
+          onMouseDown={(e) => e.stopPropagation()}
+          onDoubleClick={(e) => e.stopPropagation()}
+          // 圆角小块 hover，与中间返回键的圆形 hover 同一形状语言；
+          // 窗口控制仍是贴边全高矩形（Windows 惯例，命中区到窗沿）
+          className="mx-1 flex h-8 w-9 items-center justify-center self-center rounded-md text-foreground/80 transition-colors hover:bg-secondary hover:text-foreground"
+        >
+          <Settings className="h-4 w-4" />
+        </Link>
+        {settingsHint.hintLayer}
+        {/* 皮肤：原先藏在「设置 → 外观」两跳之后，换肤是高频操作，直接给一级入口 */}
+        <Link
+          to="/appearance"
+          {...skinHint.hintProps}
+          aria-label="皮肤"
+          title="皮肤与外观"
+          onMouseDown={(e) => e.stopPropagation()}
+          onDoubleClick={(e) => e.stopPropagation()}
+          className="mx-1 flex h-8 w-9 items-center justify-center self-center rounded-md text-foreground/80 transition-colors hover:bg-secondary hover:text-foreground"
+        >
+          <Palette className="h-4 w-4" />
+        </Link>
+        {skinHint.hintLayer}
         <WindowControls />
       </div>
     </div>

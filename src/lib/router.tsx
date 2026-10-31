@@ -3,6 +3,7 @@ import {
   createRootRoute,
   createRoute,
   createRouter,
+  redirect,
   useParams,
 } from "@tanstack/react-router";
 import { AppShell } from "@/components/layout/AppShell";
@@ -26,6 +27,7 @@ const SettingsPage = lazyPage<{ section: string }>(
   () => import("@/components/SettingsPage"),
   "SettingsPage",
 );
+const AppearancePage = lazyPage(() => import("@/components/AppearancePage"), "AppearancePage");
 const PlaylistDetailPage = lazyPage<{ platform: string; id: string; kind?: "playlist" | "chart" }>(
   () => import("@/components/discovery/PlaylistDetailPage"),
   "PlaylistDetailPage",
@@ -319,10 +321,27 @@ const profileEditRoute = createRoute({
 const settingsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/settings/$section",
+  // 旧入口兜底：`/settings/appearance` 曾是设置页的一个页签，现已提为一级页
+  // `/appearance`。留着这个跳转，老记法（或命令面板旧缓存）不会落到空分节。
+  beforeLoad: ({ params }) => {
+    if (params.section === "appearance") {
+      throw redirect({ to: "/appearance" });
+    }
+  },
   component: function SettingsRoutePage() {
     const { section } = useParams({ strict: false }) as { section: string };
     return <SettingsPage section={section} />;
   },
+});
+
+/**
+ * 外观独立页（标题栏右侧「皮肤」按钮进入）。
+ * 从设置的分节提到一级路由：换肤是高频操作，不该先跳设置再选页签。
+ */
+const appearanceRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/appearance",
+  component: AppearancePage,
 });
 
 const onboardingRoute = createRoute({
@@ -374,6 +393,7 @@ const routeTree = rootRoute.addChildren([
   loginRoute,
   forgotPasswordRoute,
   settingsRoute,
+  appearanceRoute,
   onboardingRoute,
   lyricsRoute,
 ]);

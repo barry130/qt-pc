@@ -10,6 +10,7 @@ import {
   KeyRound,
   ListMusic,
   Music,
+  Palette,
   Pause,
   Play,
   Radio,
@@ -74,12 +75,15 @@ const PAGES: PageEntry[] = [
   { label: "最近播放", to: "/history", icon: Clock, keywords: "history" },
   { label: "听歌报告", to: "/stats", icon: BarChart3, keywords: "stats report" },
   { label: "音乐助手", to: "/ai-assistant", icon: Sparkles, keywords: "ai assistant" },
+  // 外观不在侧栏（入口是标题栏右侧「皮肤」按钮），但它是高频目的地，
+  // 命令面板仍要能直达，故单列一条 —— 不再挂在设置的分节列表里。
+  { label: "外观与皮肤", to: "/appearance", icon: Palette, keywords: "appearance skin theme 皮肤 主题 配色 背景 字体" },
 ];
 
 /** 设置页各页签（components/SettingsPage.tsx 的 section 键） */
 const SETTINGS_SECTIONS: { label: string; section: string }[] = [
   { label: "通用", section: "general" },
-  { label: "外观", section: "appearance" },
+  // 「外观」已提为一级页 /appearance（见 PAGES），不再是设置页签
   { label: "桌面歌词", section: "desktop-lyric" },
   { label: "播放", section: "playback" },
   { label: "播放条", section: "player-bar" },

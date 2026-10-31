@@ -2,9 +2,9 @@ import { useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import {
   ArrowLeft,
+  Bell,
   CheckCheck,
   ChevronRight,
-  MessageSquare,
   RefreshCw,
   X,
 } from "lucide-react";
@@ -42,7 +42,8 @@ export function MessagesPopover(): React.JSX.Element {
           // 圆角小块 hover，与标题栏右侧其它入口同形状（窗口控制仍为贴边全高矩形）
           className="mx-1 flex h-8 w-9 items-center justify-center rounded-md text-foreground/80 transition-colors hover:bg-secondary hover:text-foreground"
         >
-          <MessageSquare className="h-4 w-4" />
+          {/* 铃铛：通知语义比气泡（消息）更准，与标题栏「通知」的定位一致 */}
+          <Bell className="h-4 w-4" />
           {unread > 0 && (
             // 角标定位在按钮右上角（外层包裹器 = 按钮 + 左右 4px 边距）
             <span className="absolute right-0 top-1 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-destructive px-0.5 text-3xs font-medium leading-none text-white">

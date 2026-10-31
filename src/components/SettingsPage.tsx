@@ -3,7 +3,6 @@ import { useSourceUpdateStore } from "@/stores/source-update";
 import { useNavigate } from "@tanstack/react-router";
 import { GenericSection } from "@/components/settings/controls";
 import { DesktopLyricSection } from "@/components/settings/sections/DesktopLyricSection";
-import { AppearanceSection } from "@/components/settings/sections/AppearanceSection";
 import { PlaybackSection } from "@/components/settings/sections/PlaybackSection";
 import { PlayerBarSection } from "@/components/settings/sections/PlayerBarSection";
 import { SoundSection } from "@/components/settings/sections/SoundSection";
@@ -18,7 +17,8 @@ import { AiSection } from "@/components/settings/sections/AiSection";
 
 const SECTION_TITLES: Record<string, string> = {
   general: "通用",
-  appearance: "外观",
+  // 「外观」不在这里：它已提为一级页面 /appearance，入口在标题栏右侧「皮肤」按钮
+  // （用户 2026-10-31 要求「把设置里面的外观删掉，改为这个按键进去」）
   "desktop-lyric": "桌面歌词",
   playback: "播放",
   "player-bar": "播放条",
@@ -75,8 +75,6 @@ export function SettingsPage(props: { section: string }): React.JSX.Element {
     >
       {props.section === "general" ? (
         <GeneralSection />
-      ) : props.section === "appearance" ? (
-        <AppearanceSection />
       ) : props.section === "desktop-lyric" ? (
         // 桌面歌词独立成一个标签页（配置够多，塞在外观里太挤）
         <DesktopLyricSection />
