@@ -32,7 +32,7 @@ function info(over: Partial<AppUpdateInfo> = {}): AppUpdateInfo {
     versionInfo: "",
     updateType: "1",
     downloadUrl: "https://example.com/app.exe",
-    browserUrl: "https://quietmusic.canace.cn/download",
+    browserUrl: "https://example.com/download",
     isGithub: 0,
     channel: "official",
     isForce: 0,
@@ -68,11 +68,11 @@ describe("更新弹窗的富文本更新说明", () => {
   it("列表与链接：结构保留，链接可点", () => {
     show(
       '<ul><li>支持分享图片二维码</li><li>更新说明支持富文本</li></ul>' +
-        '<p>详见 <a href="https://quietmusic.canace.cn/download">下载页</a></p>',
+        '<p>详见 <a href="https://example.com/download">下载页</a></p>',
     );
     expect(document.querySelectorAll("li").length).toBe(2);
     const link = screen.getByText("下载页").closest("a");
-    expect(link?.getAttribute("href")).toBe("https://quietmusic.canace.cn/download");
+    expect(link?.getAttribute("href")).toBe("https://example.com/download");
   });
 
   it("script 等危险片段被剔除，不进正文", () => {
@@ -82,11 +82,11 @@ describe("更新弹窗的富文本更新说明", () => {
   });
 
   it("纯文本说明仍按段落渲染（换行 / 链接可点）", () => {
-    show("第一行：修复闪退\n第二行：见 https://quietmusic.canace.cn/download");
+    show("第一行：修复闪退\n第二行：见 https://example.com/download");
     expect(screen.getByText(/第一行：修复闪退/)).toBeTruthy();
     expect(screen.getByText(/第二行：见/)).toBeTruthy();
-    const link = screen.getByText("https://quietmusic.canace.cn/download").closest("a");
-    expect(link?.getAttribute("href")).toBe("https://quietmusic.canace.cn/download");
+    const link = screen.getByText("https://example.com/download").closest("a");
+    expect(link?.getAttribute("href")).toBe("https://example.com/download");
   });
 
   it("说明为空：仍然显示「暂无更新说明」", () => {

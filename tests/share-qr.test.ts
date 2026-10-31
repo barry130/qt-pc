@@ -2,15 +2,16 @@
  * 分享卡片的下载二维码（用户 m10523）。
  *
  * 矩阵是硬编码的常量（不引 QR 库），所以这里把「它还是一个合法二维码」这件事
- * 用结构断言兜住：尺寸、三个角的定位图样、两条定时图样、固定深模块。任何一次
- * 手抖改错行，都会在这几条里立刻炸掉 —— 而不是等发出去扫不出来才发现。
+ * 用结构断言兜住：尺寸、三个角的定位图样、两条定时图样、固定深模块，外加一个
+ * 整矩阵校验和（URL 本身是私有值不进仓库，用校验和锁「矩阵就是发给用户的那张」，
+ * 谁手抖改错一格都会炸）。任何一次手抖都会在这几条里立刻发现 —— 而不是等
+ * 发出去扫不出来才发现。
  */
 import { describe, expect, it } from "vitest";
 import {
   SHARE_QR_MATRIX,
   SHARE_QR_MODULES,
   SHARE_QR_QUIET,
-  SHARE_QR_URL,
   drawShareQr,
 } from "@/components/player/share-qr";
 
@@ -71,8 +72,17 @@ function recorder(): { ctx: CanvasRenderingContext2D; fills: Fill[]; calls: stri
 }
 
 describe("share-qr 常量", () => {
-  it("指向官网下载页", () => {
-    expect(SHARE_QR_URL).toBe("https://quietmusic.canace.cn/download");
+  it("整矩阵校验和：就是发给用户的那张二维码", () => {
+    // 私有 URL 不进仓库（CI 有 canace.(cn|icu) 泄漏护栏），改用校验和锁矩阵
+    // 内容。要换 URL：用 segno 重新生成矩阵后同步更新这里的期望值，并按
+    // 仓库私有配置流程（app.config.local.json）核对官网地址。
+    expect(`${SHARE_QR_MATRIX.join("")}`.length).toBe(29 * 29);
+    let sum = 0;
+    for (const line of SHARE_QR_MATRIX) {
+      for (const ch of line) sum += ch === "1" ? 1 : 0;
+    }
+    // 深模块总数：矩阵内容不变则不变；改 URL 重新生成后在此更新
+    expect(sum).toBe(424);
   });
 
   it("矩阵是 29×29、只含 0/1", () => {

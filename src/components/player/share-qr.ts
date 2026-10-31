@@ -5,11 +5,15 @@
  * 不在运行时算，几百字节的常量换来零依赖 —— 卡片绘制那条路（ShareCardPanel）
  * 本来就不带任何图形依赖，加个 QR 编码器进去不值当。
  *
- * **改 URL 要重新生成矩阵**（`pip install segno` 后跑）：
+ * **改 URL 要重新生成矩阵**（`pip install segno` 后跑）。目标地址 = 官网根地址
+ * + `/download`：根地址是私有值（app.config.local.json 的 officialSiteUrl，
+ * 口径见 src/lib/official-site.ts，公开仓库不写字面量——CI 有泄漏护栏），
+ * 生成时把私有配置里的真值填进去：
  *
  * ```py
  * import segno
- * qr = segno.make_qr("https://quietmusic.canace.cn/download", error="m")
+ * url = "https://<官网根地址>/download"
+ * qr = segno.make_qr(url, error="m")
  * print(qr.version, len(qr.matrix))
  * print("\n".join("".join("1" if v else "0" for v in row) for row in qr.matrix))
  * ```
@@ -18,8 +22,14 @@
  * version 4 的 33×33，同一块地方每格更小反而更难扫，故取 M）。
  */
 
-/** 二维码指向的地址：官网下载页 */
-export const SHARE_QR_URL = "https://quietmusic.canace.cn/download";
+/**
+ * 二维码指向官网下载页（官网根地址 + `/download`）。
+ *
+ * 这里**故意没有** URL 常量：官网域名是私有值（见文件头），而矩阵在编译期
+ * 定死、绘制时不读 URL —— 留个常量只会诱惑人改了 URL 忘了重生成矩阵，
+ * 或反过来把私有域名字面量重新提交进公开仓库（CI 护栏会红）。要校验
+ * 矩阵内容请解码（jsQR）或比对 tests/share-qr.test.ts 的校验和。
+ */
 
 /** 符号边长（模块数，不含安静区） */
 export const SHARE_QR_MODULES = 29;
