@@ -9,6 +9,7 @@ import { usePlayerStore } from "@/stores/player";
 import { useSourceLabel, useSourceRegistryStore } from "@/stores/sourceRegistry";
 import { ChartSpotlightCard, SPOTLIGHT_TRACKS, useSpotlightColumns } from "./ChartSpotlight";
 
+import { EmptyState, GridSkeleton } from "@/components/ui";
 /**
  * 排行榜（路由 /charts，DESIGN §5.2）。
  *
@@ -165,13 +166,13 @@ export function ChartsPage(): React.JSX.Element {
 
       <div className="min-h-0 flex-1 overflow-y-auto p-4">
         {loading && charts.length === 0 && (
-          <div className="py-10 text-center text-sm text-muted-foreground">加载中…</div>
+          <GridSkeleton count={12} padded={false} />
         )}
         {!loading && error && (
           <div className="py-10 text-center text-sm text-destructive">加载失败：{error}</div>
         )}
         {!loading && !error && charts.length === 0 && (
-          <div className="py-10 text-center text-sm text-muted-foreground">该音源暂无榜单</div>
+          <EmptyState title="该音源暂无榜单" />
         )}
         {charts.length > 0 && (
           <div

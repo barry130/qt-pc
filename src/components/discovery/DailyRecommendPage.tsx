@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
-import { Play, RefreshCw, SlidersHorizontal } from "lucide-react";
+import { RefreshCw, SlidersHorizontal } from "lucide-react";
 import type { Track } from "@/types";
 import { usePlayerStore } from "@/stores/player";
 import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
@@ -14,6 +14,7 @@ import { TrackSortSelect } from "@/components/TrackSortSelect";
 import { DEFAULT_TRACK_SORT, parseTrackSort, sortTracks } from "@/lib/track-sort";
 import { BatchBar } from "./BatchBar";
 import { ErrorRetry, TrackRowsSkeleton } from "./Skeletons";
+import { DetailHero, HeroCover, HeroEyebrow, HeroPlayButton } from "@/components/ui";
 import {
   DAILY_HISTORY_DAYS,
   DAILY_MODE_LABEL,
@@ -257,45 +258,24 @@ export function DailyRecommendPage(): React.JSX.Element {
     <div className="flex h-full min-w-0 flex-col">
       {/* hero 与歌单 / 榜单详情页同一套；**不能加 overflow-hidden**（批量条面板是
           absolute 展开的，裁切只加在铺底图那一层） */}
-      <header className="relative shrink-0 border-b border-border">
-        {coverUrl ? (
-          <div className="absolute inset-0 overflow-hidden">
-            <img
-              src={coverUrl}
-              alt=""
-              aria-hidden
-              draggable={false}
-              className="absolute inset-0 h-full w-full scale-125 select-none object-cover opacity-45 blur-3xl saturate-150"
-            />
-            <div className="absolute inset-0 bg-gradient-to-b from-background/10 to-[color:var(--page-fade)]" />
-          </div>
-        ) : null}
+      
+        <DetailHero coverUrl={coverUrl}>
 
         <div className="relative flex gap-5 px-6 pb-6 pt-6">
           {/* 封面（h-44，176px）定义整块 hero 的高度：右侧内容必须塞进这个高度里，
               不能把页头撑得比封面高（用户 2026-10-24：「高度不要超过图片，内容
               全部往右边搭」）。比歌单/专辑页的 144px 大一号 —— 这页右侧信息更多。 */}
-          <div className="h-44 w-44 shrink-0 overflow-hidden rounded-2xl bg-secondary shadow-surface ring-1 ring-border">
-            {coverUrl ? (
-              <img src={coverUrl} alt="" className="h-full w-full object-cover" loading="lazy" />
-            ) : (
-              <span className="flex h-full w-full items-center justify-center text-4xl font-bold text-muted-foreground/50">
-                推
-              </span>
-            )}
-          </div>
+          <HeroCover src={coverUrl} fallback="推" size="lg" />
 
           <div className="flex min-w-0 flex-1 flex-col justify-end">
             {/* 元信息与「共 N 首」并成一行：hero 高度由封面定死，右侧每多一行就会
                 把页头撑得比封面高（用户 2026-10-24）。模型名长的时候靠 truncate 收住。 */}
-            <p className="truncate text-2xs font-medium uppercase tracking-[0.2em] text-muted-foreground">
-              {/* 本地模型精选时把模型名也写出来：用户要能看出「这次真的是哪个模型在挑」 */}
+            <HeroEyebrow className="truncate text-2xs">{/* 本地模型精选时把模型名也写出来：用户要能看出「这次真的是哪个模型在挑」 */}
               {result
                 ? `${result.date} · ${modeLabel}${result.model ? ` · ${result.model}` : ""} · ${tasteLabel} · ${
                     loading ? progress || "生成中…" : `共 ${songs.length} 首`
                   }`
-                : "全部已装音源"}
-            </p>
+                : "全部已装音源"}</HeroEyebrow>
             <h1 className="mt-1 truncate text-2xl font-bold tracking-tight">
               {result?.title || "每日推荐"}
             </h1>
@@ -365,16 +345,7 @@ export function DailyRecommendPage(): React.JSX.Element {
 
               <span className="mx-0.5 h-4 w-px shrink-0 bg-border" aria-hidden />
 
-              <IconButton
-                label="播放全部"
-                variant="primary"
-                size="lg"
-                disabled={songs.length === 0}
-                className="h-9 w-9 rounded-lg shadow-lg shadow-primary/25"
-                onClick={() => void playQueue(sortedTracks, 0)}
-              >
-                <Play className="h-4 w-4 fill-current" />
-              </IconButton>
+              <HeroPlayButton disabled={songs.length === 0} onClick={() => void playQueue(sortedTracks, 0)} />
               <IconButton
                 label="换一批"
                 variant="outline"
@@ -412,7 +383,7 @@ export function DailyRecommendPage(): React.JSX.Element {
             </div>
           ) : null}
         </div>
-      </header>
+      </DetailHero>
 
       {/* 冷启动：没有播放历史/收藏/风格种子时，先让用户点几个风格当画像起点。
           不选也能看下面这批平台新歌 —— 等于自动兜底"先给内容"，不让新用户对着空页面。 */}

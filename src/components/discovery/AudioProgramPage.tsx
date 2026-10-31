@@ -9,6 +9,7 @@ import { ErrorRetry, ListLoadProgress, TrackRowsSkeleton } from "./Skeletons";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { usePagedList, type PageResult } from "@/hooks/usePagedList";
 
+import { EmptyState } from "@/components/ui";
 /** 有声节目详情：章节是普通 Track，可沿用播放器、下载、收藏和批量操作。 */
 export function AudioProgramPage(props: { platform: SourceId; id: string }): React.JSX.Element {
   const { platform, id } = props;
@@ -79,7 +80,7 @@ export function AudioProgramPage(props: { platform: SourceId; id: string }): Rea
       <div className="min-h-0 flex-1 overflow-y-auto">
         {error ? <ErrorRetry message={`加载失败：${error}`} onRetry={reload} /> : null}
         {!error && loading ? <TrackRowsSkeleton rows={8} /> : null}
-        {!error && !loading && visibleTracks.length === 0 ? <div className="py-10 text-center text-sm text-muted-foreground">{tracks.length === 0 ? "暂无章节" : "没有匹配的章节"}</div> : null}
+        {!error && !loading && visibleTracks.length === 0 ? <EmptyState title={tracks.length === 0 ? "暂无章节" : "没有匹配的章节"} /> : null}
         {!error && !loading && visibleTracks.length > 0 ? <TrackList tracks={visibleTracks} showIndex showCollect showDownload /> : null}
         <ListLoadProgress finished={finished} count={tracks.length} noun="章节" unit="集" />
       </div>

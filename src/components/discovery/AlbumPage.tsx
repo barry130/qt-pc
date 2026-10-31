@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "@tanstack/react-router";
-import { Play, Search, X } from "lucide-react";
+import { Search, X } from "lucide-react";
 import type { SourceId, Track } from "@/types";
 import * as sourceApi from "@/source-scripts";
 import { usePlayerStore } from "@/stores/player";
@@ -15,8 +15,9 @@ import { DEFAULT_TRACK_SORT, parseTrackSort, sortTracks } from "@/lib/track-sort
 import { BatchBar } from "./BatchBar";
 import { ErrorRetry, ListLoadProgress, TrackRowsSkeleton } from "./Skeletons";
 import { BackButton } from "@/components/layout/BackButton";
-import { IconButton } from "@/components/common/IconButton";
 
+
+import { DetailHero, EmptyState, HeroCover, HeroEyebrow, HeroMeta, HeroPlayButton } from "@/components/ui";
 /**
  * 专辑页（路由 /album/$platform/$id）。
  *
@@ -198,63 +199,26 @@ function AlbumPageContent({
 
   return (
     <div className="flex h-full min-w-0 flex-col">
-      <header className="relative shrink-0 border-b border-border">
-        {coverUrl ? (
-          <div className="absolute inset-0 overflow-hidden">
-            <img
-              src={coverUrl}
-              alt=""
-              aria-hidden
-              draggable={false}
-              className="absolute inset-0 h-full w-full scale-125 select-none object-cover opacity-45 blur-3xl saturate-150"
-            />
-            <div className="absolute inset-0 bg-gradient-to-b from-background/10 to-[color:var(--page-fade)]" />
-          </div>
-        ) : null}
+      
+        <DetailHero coverUrl={coverUrl}>
 
         <div className="relative flex items-center px-6 pt-5">
           <BackButton />
         </div>
 
         <div className="relative flex gap-5 px-6 pb-6 pt-4">
-          <div className="h-36 w-36 shrink-0 overflow-hidden rounded-2xl bg-secondary shadow-surface ring-1 ring-border">
-            {coverUrl ? (
-              <img
-                src={coverUrl}
-                alt=""
-                className="h-full w-full object-cover"
-                loading="lazy"
-              />
-            ) : (
-              <span className="flex h-full w-full items-center justify-center text-4xl font-bold text-muted-foreground/50">
-                {title.slice(0, 1)}
-              </span>
-            )}
-          </div>
+          <HeroCover src={coverUrl} fallback={title} size="md" />
           <div className="flex min-w-0 flex-1 flex-col justify-end pb-1">
-            <p className="text-2xs font-medium uppercase tracking-[0.2em] text-muted-foreground">
-              专辑
-            </p>
+            <HeroEyebrow>专辑</HeroEyebrow>
             <h1 className="mt-1 truncate text-2xl font-bold tracking-tight">{title}</h1>
-            <p role="status" className="mt-1 text-xs text-muted-foreground">
-              {loading
+            <HeroMeta live>{loading
                 ? "加载中…"
                 : query.trim()
                   ? `显示 ${visibleSongs.length} / ${songs.length} 首`
-                  : `${songs.length} 首歌曲${finished ? "" : "，正在取完其余…"}`}
-            </p>
+                  : `${songs.length} 首歌曲${finished ? "" : "，正在取完其余…"}`}</HeroMeta>
             {songs.length > 0 && (
               <div className="mt-3">
-                <IconButton
-                  label="播放全部"
-                  variant="primary"
-                  size="lg"
-                  disabled={loading || visibleSongs.length === 0}
-                  className="h-9 w-9 rounded-lg shadow-lg shadow-primary/25"
-                  onClick={() => void playQueue(sortedSongs, 0)}
-                >
-                  <Play className="h-4 w-4 fill-current" />
-                </IconButton>
+                <HeroPlayButton disabled={loading || visibleSongs.length === 0} onClick={() => void playQueue(sortedSongs, 0)} />
               </div>
             )}
           </div>
@@ -303,7 +267,7 @@ function AlbumPageContent({
             </div>
           ) : null}
         </div>
-      </header>
+      </DetailHero>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         {actionError && (
@@ -316,13 +280,9 @@ function AlbumPageContent({
         ) : (
           <>
             {songs.length === 0 ? (
-              <div className="py-10 text-center text-sm text-muted-foreground">
-                没有找到该专辑的歌曲
-              </div>
+              <EmptyState title="没有找到该专辑的歌曲" />
             ) : visibleSongs.length === 0 ? (
-              <div role="status" className="py-10 text-center text-sm text-muted-foreground">
-                没有匹配的歌曲，试试其它标题、歌手或专辑
-              </div>
+              <EmptyState role="status" title="没有匹配的歌曲，试试其它标题、歌手或专辑" />
             ) : (
               <TrackList
                 tracks={sortedSongs}

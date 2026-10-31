@@ -7,6 +7,7 @@ import { BackButton } from "@/components/layout/BackButton";
 import { ErrorRetry } from "./Skeletons";
 import { qtresCoverUrl } from "@/lib/lrc";
 
+import { EmptyState, GridSkeleton } from "@/components/ui";
 /** QQ 有声榜：榜单返回节目容器，先浏览节目，再进入章节页播放。 */
 export function AudioChartPage(props: { platform: SourceId; id: string }): React.JSX.Element {
   const { platform, id } = props;
@@ -77,8 +78,8 @@ export function AudioChartPage(props: { platform: SourceId; id: string }): React
       </header>
       <div className="min-h-0 flex-1 overflow-y-auto p-6">
         {error ? <ErrorRetry message={`加载失败：${error}`} onRetry={() => setAttempt((n) => n + 1)} /> : null}
-        {!error && loading ? <div className="py-10 text-center text-sm text-muted-foreground">加载中…</div> : null}
-        {!error && !loading && programs.length === 0 ? <div className="py-10 text-center text-sm text-muted-foreground">暂无节目</div> : null}
+        {!error && loading ? <GridSkeleton count={6} minTile={220} padded={false} /> : null}
+        {!error && !loading && programs.length === 0 ? <EmptyState title="暂无节目" /> : null}
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
           {programs.map((program, index) => {
             const image = qtresCoverUrl(program.picUrl);

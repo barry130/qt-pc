@@ -29,6 +29,7 @@ import { IconButton } from "@/components/common/IconButton";
 import { SourceTag } from "@/components/common/SourceTag";
 import { isComposingEnter } from "@/lib/keyboard";
 
+import { EmptyState } from "@/components/ui";
 /**
  * 搜索页（路由 /search?q=，DESIGN §5.2：关键字走 URL query，前进 / 后退可复现）。
  *
@@ -684,9 +685,7 @@ function SearchLanding(props: {
   return (
     <div className="mx-auto w-full max-w-3xl px-6 py-7">
       {nothing && (
-        <p className="py-10 text-center text-sm text-muted-foreground">
-          输入歌名、歌手或专辑名开始搜索；搜过和听过的歌会自动出现在这里。
-        </p>
+        <EmptyState title="输入歌名、歌手或专辑名开始搜索；搜过和听过的歌会自动出现在这里。" />
       )}
 
       {props.history.length > 0 && (

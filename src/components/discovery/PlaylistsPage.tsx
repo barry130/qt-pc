@@ -11,6 +11,7 @@ import { CoverCard, CoverGrid } from "./CoverCard";
 import { CoverGridSkeleton, ErrorRetry, ListLoadProgress } from "./Skeletons";
 import { usePagedList, type PageResult } from "@/hooks/usePagedList";
 
+import { EmptyState } from "@/components/ui";
 /**
  * 歌单广场（路由 /playlists，DESIGN §5.2）。
  * 分类来自当前音源（wyy/qq/kw/kg 各有自己的分类体系），切换音源重新拉分类。
@@ -146,9 +147,7 @@ export function PlaylistsPage(): React.JSX.Element {
         ) : loading ? (
           <CoverGridSkeleton />
         ) : items.length === 0 ? (
-          <div className="py-10 text-center text-sm text-muted-foreground">
-            该分类暂无歌单
-          </div>
+          <EmptyState title="该分类暂无歌单" />
         ) : (
           <>
             <CoverGrid>

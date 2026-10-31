@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Play } from "lucide-react";
+
 import type { Track } from "@/types";
 import { DEFAULT_TRACK_SORT, parseTrackSort, sortTracks } from "@/lib/track-sort";
 import * as sourceApi from "@/source-scripts";
@@ -17,8 +17,9 @@ import { TrackList } from "./TrackList";
 import { BatchBar } from "./BatchBar";
 import { TrackSortSelect } from "@/components/TrackSortSelect";
 import { ErrorRetry, ListLoadProgress, TrackRowsSkeleton } from "./Skeletons";
-import { IconButton } from "@/components/common/IconButton";
 
+
+import { DetailHero, EmptyState, HeroCover, HeroEyebrow, HeroMeta, HeroPlayButton } from "@/components/ui";
 /**
  * 每页条数：沿用原实现的 50。
  *
@@ -194,61 +195,24 @@ export function DailyPage(): React.JSX.Element {
           + 大标题 + 共 N 首 + 大号「播放全部」+ 右端批量条），详见文件头。
           **不能加 overflow-hidden**：批量条的歌单面板是 absolute 展开的，
           裁切只加在铺底图那一层里。 */}
-      <header className="relative shrink-0 border-b border-border">
-        {coverUrl ? (
-          <div className="absolute inset-0 overflow-hidden">
-            <img
-              src={coverUrl}
-              alt=""
-              aria-hidden
-              draggable={false}
-              className="absolute inset-0 h-full w-full scale-125 select-none object-cover opacity-45 blur-3xl saturate-150"
-            />
-            <div className="absolute inset-0 bg-gradient-to-b from-background/10 to-[color:var(--page-fade)]" />
-          </div>
-        ) : null}
+      
+        <DetailHero coverUrl={coverUrl}>
 
         {/* 页内不摆返回键：每日新歌是侧栏一级页面（同级：歌单广场 / 首页），
             不是被推进来的详情页；标题栏里已经有全局返回。所以这里省掉详情页
             那条 `BackButton` 行，hero 直接从封面 + 信息开始。 */}
         <div className="relative flex gap-5 px-6 pb-6 pt-6">
-          <div className="h-36 w-36 shrink-0 overflow-hidden rounded-2xl bg-secondary shadow-surface ring-1 ring-border">
-            {coverUrl ? (
-              <img
-                src={coverUrl}
-                alt=""
-                className="h-full w-full object-cover"
-                loading="lazy"
-              />
-            ) : (
-              <span className="flex h-full w-full items-center justify-center text-4xl font-bold text-muted-foreground/50">
-                新
-              </span>
-            )}
-          </div>
+          <HeroCover src={coverUrl} fallback="新" size="md" />
 
           <div className="flex min-w-0 flex-1 flex-col justify-end pb-1">
-            <p className="text-2xs font-medium uppercase tracking-[0.2em] text-muted-foreground">
-              {sourceLabel}
-            </p>
+            <HeroEyebrow>{sourceLabel}</HeroEyebrow>
             <h1 className="mt-1 truncate text-2xl font-bold tracking-tight">每日新歌</h1>
-            <p className="mt-1 text-xs text-muted-foreground">
-              {loading ? "加载中…" : `共 ${songs.length} 首`}
-            </p>
+            <HeroMeta>{loading ? "加载中…" : `共 ${songs.length} 首`}</HeroMeta>
             <p className="mt-2 line-clamp-3 text-xs text-muted-foreground">
               跟随当前音源，切换音源会自动重取
             </p>
             <div className="mt-3 flex flex-wrap items-center gap-2">
-              <IconButton
-                label="播放全部"
-                variant="primary"
-                size="lg"
-                disabled={songs.length === 0}
-                className="h-9 w-9 rounded-lg shadow-lg shadow-primary/25"
-                onClick={() => void playQueue(sortedSongs, 0)}
-              >
-                <Play className="h-4 w-4 fill-current" />
-              </IconButton>
+              <HeroPlayButton disabled={songs.length === 0} onClick={() => void playQueue(sortedSongs, 0)} />
             </div>
           </div>
 
@@ -275,7 +239,7 @@ export function DailyPage(): React.JSX.Element {
             </div>
           ) : null}
         </div>
-      </header>
+      </DetailHero>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         {actionError && (
@@ -286,9 +250,7 @@ export function DailyPage(): React.JSX.Element {
         ) : loading ? (
           <TrackRowsSkeleton rows={8} />
         ) : songs.length === 0 ? (
-          <div className="py-10 text-center text-sm text-muted-foreground">
-            暂无新歌
-          </div>
+          <EmptyState title="暂无新歌" />
         ) : (
           <>
             <TrackList

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useParams, useSearch } from "@tanstack/react-router";
-import { Play, Search, X } from "lucide-react";
+import { Search, X } from "lucide-react";
 import type { SourceId, Track } from "@/types";
 import * as sourceApi from "@/source-scripts";
 import { usePlayerStore } from "@/stores/player";
@@ -16,8 +16,9 @@ import { DEFAULT_TRACK_SORT, parseTrackSort, sortTracks } from "@/lib/track-sort
 import { BatchBar } from "./BatchBar";
 import { ErrorRetry, ListLoadProgress, LoadBar, TrackRowsSkeleton } from "./Skeletons";
 import { BackButton } from "@/components/layout/BackButton";
-import { IconButton } from "@/components/common/IconButton";
 
+
+import { DetailHero, EmptyState, HeroCover, HeroEyebrow, HeroMeta, HeroPlayButton } from "@/components/ui";
 /**
  * 歌手页（路由 /artist/$platform/$id）。
  *
@@ -167,65 +168,28 @@ function ArtistPageContent({ platform, name, artistId }: {
           + 大标题 + 曲数 + 大号「播放全部」+ 右端批量条），详见文件头。
           **不能加 overflow-hidden**：批量条的歌单面板是 absolute 展开的，
           裁切只加在铺底图那一层里。 */}
-      <header className="relative shrink-0 border-b border-border">
-        {coverUrl ? (
-          <div className="absolute inset-0 overflow-hidden">
-            <img
-              src={coverUrl}
-              alt=""
-              aria-hidden
-              draggable={false}
-              className="absolute inset-0 h-full w-full scale-125 select-none object-cover opacity-45 blur-3xl saturate-150"
-            />
-            <div className="absolute inset-0 bg-gradient-to-b from-background/10 to-[color:var(--page-fade)]" />
-          </div>
-        ) : null}
+      
+        <DetailHero coverUrl={coverUrl}>
 
         <div className="relative flex items-center px-6 pt-5">
           <BackButton />
         </div>
 
         <div className="relative flex gap-5 px-6 pb-6 pt-4">
-          <div className="h-36 w-36 shrink-0 overflow-hidden rounded-2xl bg-secondary shadow-surface ring-1 ring-border">
-            {coverUrl ? (
-              <img
-                src={coverUrl}
-                alt=""
-                className="h-full w-full object-cover"
-                loading="lazy"
-              />
-            ) : (
-              <span className="flex h-full w-full items-center justify-center text-4xl font-bold text-muted-foreground/50">
-                {name.slice(0, 1)}
-              </span>
-            )}
-          </div>
+          <HeroCover src={coverUrl} fallback={name} size="md" />
           <div className="flex min-w-0 flex-1 flex-col justify-end pb-1">
-            <p className="text-2xs font-medium uppercase tracking-[0.2em] text-muted-foreground">
-              歌手
-            </p>
+            <HeroEyebrow>歌手</HeroEyebrow>
             <h1 className="mt-1 truncate text-2xl font-bold tracking-tight">{name}</h1>
             {/* 全量拉取时如实报进度，拉完才说「共 N 首歌」（与详情页同口径） */}
-            <p role="status" className="mt-1 text-xs text-muted-foreground">
-              {loading
+            <HeroMeta live>{loading
                 ? "加载中…"
                 : query.trim()
                   ? `显示 ${visibleSongs.length} / ${songs.length} 首${loadingAll ? "，正在取完其余…" : ""}`
                   : loadingAll
                     ? `已加载 ${songs.length} 首，正在取完其余…`
-                    : `共 ${songs.length} 首歌`}
-            </p>
+                    : `共 ${songs.length} 首歌`}</HeroMeta>
             <div className="mt-3 flex flex-wrap items-center gap-2">
-              <IconButton
-                label="播放全部"
-                variant="primary"
-                size="lg"
-                disabled={loading || visibleSongs.length === 0}
-                className="h-9 w-9 rounded-lg shadow-lg shadow-primary/25"
-                onClick={() => void playQueue(sortedSongs, 0)}
-              >
-                <Play className="h-4 w-4 fill-current" />
-              </IconButton>
+              <HeroPlayButton disabled={loading || visibleSongs.length === 0} onClick={() => void playQueue(sortedSongs, 0)} />
             </div>
           </div>
 
@@ -277,7 +241,7 @@ function ArtistPageContent({ platform, name, artistId }: {
 
         {/* 全量拉取进度：歌手页是「进页即全部」，拉完前顶部显示一条进度带 */}
         {loadingAll && !loading ? <LoadBar /> : null}
-      </header>
+      </DetailHero>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         {actionError && (
@@ -288,15 +252,11 @@ function ArtistPageContent({ platform, name, artistId }: {
         ) : loading ? (
           <TrackRowsSkeleton rows={8} />
         ) : songs.length === 0 ? (
-          <div className="py-10 text-center text-sm text-muted-foreground">
-            没有找到该歌手的歌曲
-          </div>
+          <EmptyState title="没有找到该歌手的歌曲" />
         ) : (
           <>
             {visibleSongs.length === 0 ? (
-              <div role="status" className="py-10 text-center text-sm text-muted-foreground">
-                没有匹配的歌曲，试试其它标题、歌手或专辑
-              </div>
+              <EmptyState role="status" title="没有匹配的歌曲，试试其它标题、歌手或专辑" />
             ) : (
               <TrackList
                 tracks={sortedSongs}

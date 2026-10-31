@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Heart, Play, Search, Share2, X } from "lucide-react";
+import { Heart, Search, Share2, X } from "lucide-react";
 import { useNavigate } from "@tanstack/react-router";
 import { errMsg } from "@/lib/utils";
 import { filterTracks, retainTrackSelection, trackSelectionKey } from "@/lib/track-selection";
@@ -19,6 +19,7 @@ import { IconButton } from "@/components/common/IconButton";
 import { useDismissOnOutside } from "@/hooks/useDismissOnOutside";
 import { toastSuccess } from "@/stores/toast";
 
+import { DetailHero, EmptyState, HeroCover, HeroEyebrow, HeroMeta, HeroPlayButton } from "@/components/ui";
 /**
  * 单首曲目的封面地址。在线曲目直接算 qtres:// 地址；本地曲目读音频内嵌封面
  * （Rust 转 data URL，没有则 null）。注意本地曲目也可能带 http 的 pic_url
@@ -397,24 +398,13 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
 
   return (
     <div className="flex h-full min-w-0 flex-col">
-      <div className="relative shrink-0 border-b border-border">
+      
         {/* 封面模糊铺底：封面本身当氛围背景，比纯色头好看，也不依赖取色算法。
             用的是走完回退链的那张（歌单没设封面时就是首曲封面）。
             裁切（`overflow-hidden`）落在这一层而不是整块 hero 上：铺底图放大
             了 125%，必须裁；但 hero 本身不能裁 —— 页头右侧批量条的歌单面板是
             absolute 展开的，hero 一裁就只剩一条缝，面板会被挡在页头里。 */}
-        {cover ? (
-          <div className="absolute inset-0 overflow-hidden">
-            <img
-              src={cover}
-              alt=""
-              aria-hidden
-              draggable={false}
-              className="absolute inset-0 h-full w-full scale-125 select-none object-cover opacity-45 blur-3xl saturate-150"
-            />
-            <div className="absolute inset-0 bg-gradient-to-b from-background/10 to-[color:var(--page-fade)]" />
-          </div>
-        ) : null}
+        <DetailHero as="div" coverUrl={cover}>
 
         <div className="relative flex items-center px-6 pt-5">
           <BackButton />
@@ -425,28 +415,16 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
               收在这个高度以内，不许把页头撑得比封面高（用户 2026-10-24：「左边图片，
               右边内容，高度不要超过图片，内容全部往右边搭」）。与每日推荐页同尺寸，
               两页 hero 模板保持一套；歌单/专辑页保持 144px 那套，不动。 */}
-          <div className="h-44 w-44 shrink-0 overflow-hidden rounded-2xl bg-secondary shadow-surface ring-1 ring-border">
-            {cover ? (
-              <img src={cover} alt="" className="h-full w-full object-cover" />
-            ) : (
-              <span className="flex h-full w-full items-center justify-center text-4xl font-bold text-muted-foreground/50">
-                {(name || (isChart ? "榜" : "歌")).slice(0, 1)}
-              </span>
-            )}
-          </div>
+          <HeroCover src={cover} fallback={name || (isChart ? "榜" : "歌")} size="lg" />
           <div className="flex min-w-0 flex-1 flex-col justify-end pb-1">
-            <p className="text-2xs font-medium uppercase tracking-[0.2em] text-muted-foreground">
-              {isLocal ? "我的歌单" : isChart ? "榜单" : "歌单"}
-            </p>
+            <HeroEyebrow>{isLocal ? "我的歌单" : isChart ? "榜单" : "歌单"}</HeroEyebrow>
             <h1 className="mt-1 truncate text-2xl font-bold tracking-tight">
               {name || fallbackTitle}
             </h1>
             {/* 只报「共 N 首歌」：各音源 playCount 口径不一（有的算累计播放、
                 有的直接给歌数），拿不到一致含义就不摆出来 */}
             {!loading ? (
-              <p role="status" className="mt-1 text-xs text-muted-foreground">
-                {query.trim() ? `显示 ${visibleTracks.length} / ${tracks.length} 首` : `共 ${tracks.length} 首歌`}
-              </p>
+              <HeroMeta live>{query.trim() ? `显示 ${visibleTracks.length} / ${tracks.length} 首` : `共 ${tracks.length} 首歌`}</HeroMeta>
             ) : null}
             {/* 榜单不带简介：它是榜单，简介位留给歌单（在线歌单的简介本来就长，
                 这里 line-clamp-2 兜住 —— 多一行就会把 hero 撑得比封面高） */}
@@ -454,16 +432,7 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
               <p className="mt-2 line-clamp-2 text-xs text-muted-foreground">{description}</p>
             ) : null}
             <div className="mt-3 flex flex-wrap items-center gap-2">
-              <IconButton
-                label="播放全部"
-                variant="primary"
-                size="lg"
-                disabled={loading || visibleTracks.length === 0}
-                className="h-9 w-9 rounded-lg shadow-lg shadow-primary/25"
-                onClick={() => void playQueue(sortedTracks, 0)}
-              >
-                <Play className="h-4 w-4 fill-current" />
-              </IconButton>
+              <HeroPlayButton disabled={loading || visibleTracks.length === 0} onClick={() => void playQueue(sortedTracks, 0)} />
               {/* 歌单级收藏只给歌单（榜单没有这个层级），且两颗来源点下去
                   不是一回事：
                   - 在线歌单：收藏 / 取消收藏（归属在音源，曲目不受影响）；
@@ -567,7 +536,7 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
             </div>
           ) : null}
         </div>
-      </div>
+      </DetailHero>
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         {/* 行级 / 批量操作失败的提示条：与整页加载失败分开，列表照常可用 */}
@@ -580,17 +549,9 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
           <ErrorRetry message={`加载失败：${error}`} onRetry={() => setReload((r) => r + 1)} />
         ) : tracks.length === 0 ? (
           // 空态必须由页面拦下来：TrackList 自己的「暂无歌曲」对本地歌单没有引导价值
-          <div className="py-10 text-center text-sm text-muted-foreground">
-            {isLocal
-              ? "歌单里还没有歌曲，在其它列表里点行尾的「收藏」加进来"
-              : isChart
-                ? "这个榜单还没有歌曲"
-                : "这个歌单还没有歌曲"}
-          </div>
+          <EmptyState title={isLocal ? "歌单里还没有歌曲，在其它列表里点行尾的「收藏」加进来" : isChart ? "这个榜单还没有歌曲" : "这个歌单还没有歌曲"} />
         ) : visibleTracks.length === 0 ? (
-          <div role="status" className="py-10 text-center text-sm text-muted-foreground">
-            没有匹配的歌曲，试试其它标题、歌手或专辑
-          </div>
+          <EmptyState role="status" title="没有匹配的歌曲，试试其它标题、歌手或专辑" />
         ) : (
           <TrackList
             tracks={sortedTracks}
