@@ -14,11 +14,14 @@ export default tseslint.config(
     // 产物 / 依赖缓存 / Rust 侧不归 ESLint 管：
     // - .vite-cache/：vite dev 的预打包依赖缓存（第三方产物）
     // - dist/、coverage/：构建与测试产物
+    // - _tmp/：会话级补丁脚本与本地预览构建（已在 .gitignore 里，里面是
+    //   打包产物，lint 它会刷出成片的 no-undef，与源码质量无关）
     // - src-tauri/：Rust，由 cargo clippy / fmt 管
     ignores: [
       "dist/**",
       "coverage/**",
       ".vite-cache/**",
+      "_tmp/**",
       "src-tauri/**",
       "node_modules/**",
     ],

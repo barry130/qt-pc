@@ -192,6 +192,7 @@ qt-pc/
 | [`docs/CONFIG.md`](docs/CONFIG.md) | **唯一配置源 `app.config.json`**：字段表、同步器用法、发布流程、音源包机制、安装包行为与护栏 |
 | [`docs/PACKAGING.md`](docs/PACKAGING.md) | 三平台打包流程（Windows NSIS / Linux deb+AppImage / macOS app+dmg）、自动发版与常见失败 |
 | [`docs/plan-playlist-merge.md`](docs/plan-playlist-merge.md) | 收藏 / 歌单模型重构方案 |
+| [`docs/UI-COMPONENTS.md`](docs/UI-COMPONENTS.md) | **共享 UI 组件清单与使用规则**：写界面前先查这里，按钮/输入/弹窗/空态/骨架全部走 `@/components/ui` |
 
 ## 已知限制
 

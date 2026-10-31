@@ -30,6 +30,7 @@ src-tauri/gen/schemas/
 # 这里显式列出目录名以免误提交）
 tmp/
 .tmp/
+_tmp/
 
 # 编辑器 / 系统
 .vscode/
