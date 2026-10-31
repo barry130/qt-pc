@@ -939,6 +939,165 @@ impl Source for DspSource {
     }
 }
 
+// ---------- 多声道降混 ----------
+
+/// 多声道（5.1 / 7.1 / quad …）→ 立体声的降混 `Source`。
+///
+/// 为什么必须自己降混：rodio 的 `ChannelCountConverter` 在 `from > to` 时**只取前
+/// `to` 个声道、其余直接丢弃**（rodio-0.22.2 `src/conversions/channels.rs:51-90`）。
+/// 于是 5.1 环绕曲目播到声卡只剩 FL/FR —— 中置（人声与主旋律常在这里）、环绕、
+/// LFE 全部消失，混音电平还比立体声母带低 6~10 dB。2026-10-31 用户报的
+/// 「某首全景声曲目在线首播几乎没声音、下一首再回来就正常」正是此：
+/// 首播 probe 到 5.1 FLAC 被砍成前两声道，重播时上游回退成 mp3 立体声，所以"正常"。
+///
+/// 权重取常用降混矩阵：`L = FL + 0.7071·(FC + SL) + 0.5·LFE`，R 对称；其他声道数
+/// 按各自缺失的声位移除对应项（见 `mix_frame`）。降混后峰值可能超过 1.0，
+/// 用 `soft_limit` 压回 ±1（与 EQ / 响度归一化同一条膝点，直通路径仍逐位不变）。
+///
+/// 矩阵与 LFE 权重的实测依据（用户报的那首 5.1 FLAC，取 60s）：各声道 rms
+/// FL −25.1 / FR −24.7 / FC −20.8 / LFE −23.0 / RL −24.8 / RR −25.2 dBFS。
+/// 中置最响（人声与主旋律在这里），只留 FL/FR 还低了 ~6 dB；降混后整段
+/// −16.9 dBFS、峰值 1.057（60s 内仅 0.001% 样本越过 0.95 膝点）。LFE 的低频
+/// 比主声道高 8.8 dB，按 0.5 并入后低频只补 ~1.6 dB，既补回下潜又不会轰头，
+/// 因此保留 LFE 项（ITU-R BS.775 的电影降混是直接丢 LFE，音乐场景不同）。
+pub struct DownmixToStereo {
+    inner: Box<dyn Source + Send>,
+    src_ch: usize,
+    frame: Vec<f32>,
+    out: [f32; 2],
+    /// 2 = 下一帧还没算出来
+    out_pos: usize,
+}
+
+impl DownmixToStereo {
+    pub fn new(inner: Box<dyn Source + Send>) -> Self {
+        let src_ch = (inner.channels().get() as usize).max(1);
+        Self {
+            inner,
+            src_ch,
+            frame: vec![0.0; src_ch],
+            out: [0.0, 0.0],
+            out_pos: 2,
+        }
+    }
+
+    /// 读满一帧。流结束（不足一帧）返回 false：半帧整帧丢弃，不能切在半帧上。
+    fn fill_frame(&mut self) -> bool {
+        for slot in self.frame.iter_mut() {
+            match self.inner.next() {
+                Some(v) => *slot = v,
+                None => return false,
+            }
+        }
+        true
+    }
+}
+
+/// 一帧（按声道交织的整帧）→ 一帧立体声。
+///
+/// 声道顺序按 WAV/FLAC 的默认通道分配：5.1(side) = FL FR FC LFE SL SR，
+/// 7.1 = FL FR FC LFE BL BR SL SR，6.1 = FL FR FC LFE BC SL SR，
+/// quad = FL FR BL BR，5.0 = FL FR FC BL BR，3.0 = FL FR FC。
+fn mix_frame(frame: &[f32]) -> [f32; 2] {
+    // 中置 / 环绕 → 左右，-3dB 功率守恒（1/√2）
+    const C: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    const LFE: f32 = 0.5;
+    let at = |i: usize| frame.get(i).copied().unwrap_or(0.0);
+    match frame.len() {
+        0 => [0.0, 0.0],
+        // 单声道：双声道复制，不再走 rodio 的复制路径（保持一致的电平）
+        1 => [at(0), at(0)],
+        2 => [at(0), at(1)],
+        3 => [at(0) + C * at(2), at(1) + C * at(2)],
+        4 => [at(0) + C * at(2), at(1) + C * at(3)],
+        5 => [
+            at(0) + C * (at(2) + at(3)),
+            at(1) + C * (at(2) + at(4)),
+        ],
+        6 => [
+            at(0) + C * (at(2) + at(4)) + LFE * at(3),
+            at(1) + C * (at(2) + at(5)) + LFE * at(3),
+        ],
+        7 => [
+            at(0) + C * (at(2) + at(4) + at(5)) + LFE * at(3),
+            at(1) + C * (at(2) + at(4) + at(6)) + LFE * at(3),
+        ],
+        8 => [
+            at(0) + C * (at(2) + at(4) + at(6)) + LFE * at(3),
+            at(1) + C * (at(2) + at(5) + at(7)) + LFE * at(3),
+        ],
+        // 未知宽布局：前两个当左右，其余按 1/√k 功率守恒并入两侧（宁可糊也不要丢内容）。
+        // 不能用固定系数：12 声道这类最坏情形会把 10 条声道各按 0.353 叠起来 →
+        // 总和 3.5 倍满幅，soft_limit 被推到底，听感是糊而响的失真。
+        n => {
+            let g = C / ((n - 2) as f32).sqrt();
+            let mut l = at(0);
+            let mut r = at(1);
+            for i in 2..n {
+                let v = at(i) * g;
+                l += v;
+                r += v;
+            }
+            [l, r]
+        }
+    }
+}
+
+impl Iterator for DownmixToStereo {
+    type Item = f32;
+
+    /// 下界/上界都换算成「帧数 × 2」：留半帧会让 rodio 的 Take 切在帧中间，
+    /// 之后的样本全部错位一个声道（听感是持续的爆音）。
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let ch = self.src_ch.max(1);
+        let (lower, upper) = self.inner.size_hint();
+        (lower / ch * 2, upper.map(|n| n / ch * 2))
+    }
+
+    fn next(&mut self) -> Option<f32> {
+        if self.out_pos >= 2 {
+            if !self.fill_frame() {
+                return None;
+            }
+            let [l, r] = mix_frame(&self.frame);
+            self.out = [soft_limit(l), soft_limit(r)];
+            self.out_pos = 0;
+        }
+        let v = self.out[self.out_pos];
+        self.out_pos += 1;
+        Some(v)
+    }
+}
+
+impl Source for DownmixToStereo {
+    fn current_span_len(&self) -> Option<usize> {
+        // 样本数按声道数同比例缩小：不折算的话 rodio 的 Take 会切在半帧上，
+        // 每次块边界都错位一个声道，声音会变成一堆爆音。
+        self.inner
+            .current_span_len()
+            .map(|n| (n / self.src_ch.max(1)) * 2)
+    }
+
+    fn channels(&self) -> ChannelCount {
+        ChannelCount::new(2).expect("2 声道恒有效")
+    }
+
+    fn sample_rate(&self) -> SampleRate {
+        self.inner.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.inner.total_duration()
+    }
+
+    fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
+        // 丢掉未播完的输出帧，避免 seek 后先响一声旧位置
+        self.out_pos = 2;
+        self.inner.try_seek(pos)
+    }
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1158,5 +1317,153 @@ mod tests {
         assert!(soft_limit(1.7) > 0.95, "削峰不改变符号且保留响度");
         // 连续性：膝点处不跳变
         assert!((soft_limit(0.95) - 0.95).abs() < 1e-6);
+    }
+
+    // ---------- 多声道降混 ----------
+
+    /// 最简单的定长交织源：给降混测试喂确定样本（不够一帧时提前结束）。
+    struct RawSource {
+        data: Vec<f32>,
+        pos: usize,
+        channels: ChannelCount,
+        rate: SampleRate,
+        span: Option<usize>,
+    }
+
+    impl RawSource {
+        fn new(data: Vec<f32>, channels: u16, span: Option<usize>) -> Self {
+            Self {
+                data,
+                pos: 0,
+                channels: ChannelCount::new(channels).expect("声道数非零"),
+                rate: SampleRate::new(44_100).expect("采样率非零"),
+                span,
+            }
+        }
+    }
+
+    impl Iterator for RawSource {
+        type Item = f32;
+
+        fn next(&mut self) -> Option<f32> {
+            let v = self.data.get(self.pos).copied();
+            if v.is_some() {
+                self.pos += 1;
+            }
+            v
+        }
+    }
+
+    impl Source for RawSource {
+        fn current_span_len(&self) -> Option<usize> {
+            self.span
+        }
+
+        fn channels(&self) -> ChannelCount {
+            self.channels
+        }
+
+        fn sample_rate(&self) -> SampleRate {
+            self.rate
+        }
+
+        fn total_duration(&self) -> Option<Duration> {
+            None
+        }
+    }
+
+    #[test]
+    fn downmix_51_folds_center_and_surround() {
+        // 5.1(side) = FL FR FC LFE SL SR
+        let [l, r] = mix_frame(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let c = std::f32::consts::FRAC_1_SQRT_2;
+        let want_l = 1.0 + c * (3.0 + 5.0) + 0.5 * 4.0;
+        let want_r = 2.0 + c * (3.0 + 6.0) + 0.5 * 4.0;
+        assert!((l - want_l).abs() < 1e-4, "左声道应含中置与左环绕: {l} vs {want_l}");
+        assert!((r - want_r).abs() < 1e-4, "右声道应含中置与右环绕: {r} vs {want_r}");
+        // 只取前两声道的旧行为会得到 1.0 / 2.0（约低 18dB），这里必须明显更大
+        assert!(l > 1.0 + c * 3.0, "中置必须参与降混");
+    }
+
+    #[test]
+    fn downmix_reports_stereo_and_halves_frame_count() {
+        // 3 帧 6 声道 = 18 个样本 → 3 帧 2 声道 = 6 个样本
+        // 数值压在膝点以下，避免被 soft_limit 削峰干扰断言
+        let src = RawSource::new((0..18).map(|i| i as f32 / 20.0).collect(), 6, None);
+        let mut dm = DownmixToStereo::new(Box::new(src));
+        assert_eq!(dm.channels().get(), 2, "输出的声道数必须是 2");
+        let out: Vec<f32> = dm.by_ref().collect();
+        assert_eq!(out.len(), 6, "样本数按帧折算，不能留半帧");
+        // 第一帧 FL=0 FR=.05 FC=.1 LFE=.15 SL=.2 SR=.25
+        let c = std::f32::consts::FRAC_1_SQRT_2;
+        let want_l = 0.0 + c * (0.1 + 0.2) + 0.5 * 0.15;
+        let want_r = 0.05 + c * (0.1 + 0.25) + 0.5 * 0.15;
+        assert!((out[0] - want_l).abs() < 1e-4, "{} vs {}", out[0], want_l);
+        assert!((out[1] - want_r).abs() < 1e-4, "{} vs {}", out[1], want_r);
+    }
+
+    #[test]
+    fn downmix_span_len_is_frame_aligned() {
+        let src = RawSource::new(vec![0.0; 12], 6, Some(12));
+        let dm = DownmixToStereo::new(Box::new(src));
+        assert_eq!(dm.current_span_len(), Some(4), "12 个 6 声道样本 = 2 帧 = 4 个立体声样本");
+    }
+
+    #[test]
+    fn downmix_tames_overshoot() {
+        // 满幅 5.1 降混后峰值会超过 1.0，必须被软限幅压住
+        let src = RawSource::new(vec![1.0; 6], 6, None);
+        let mut dm = DownmixToStereo::new(Box::new(src));
+        let out: Vec<f32> = dm.by_ref().collect();
+        assert_eq!(out.len(), 2);
+        assert!(out[0] <= 1.0 && out[0] > 0.95, "超幅应压回 ±1 内且保留响度: {}", out[0]);
+    }
+
+    #[test]
+    fn downmix_quad_and_50_map_expected_channels() {
+        let c = std::f32::consts::FRAC_1_SQRT_2;
+        // quad = FL FR BL BR
+        let [l, r] = mix_frame(&[1.0, 2.0, 3.0, 4.0]);
+        assert!((l - (1.0 + c * 3.0)).abs() < 1e-4, "quad 左: {l}");
+        assert!((r - (2.0 + c * 4.0)).abs() < 1e-4, "quad 右: {r}");
+        // 5.0 = FL FR FC BL BR（没有 LFE，构型里第 3 个样本是中置）
+        let [l, r] = mix_frame(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        assert!((l - (1.0 + c * (3.0 + 4.0))).abs() < 1e-4, "5.0 左: {l}");
+        assert!((r - (2.0 + c * (3.0 + 5.0))).abs() < 1e-4, "5.0 右: {r}");
+    }
+
+    #[test]
+    fn downmix_61_and_71_use_back_and_side_channels() {
+        let c = std::f32::consts::FRAC_1_SQRT_2;
+        // 6.1 = FL FR FC LFE BC SL SR：后中置需同时进左右，环绕各归一侧
+        let [l, r] = mix_frame(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        let want = 0.5 * 4.0;
+        assert!((l - (1.0 + c * (3.0 + 5.0 + 6.0) + want)).abs() < 1e-4, "6.1 左: {l}");
+        assert!((r - (2.0 + c * (3.0 + 5.0 + 7.0) + want)).abs() < 1e-4, "6.1 右: {r}");
+        // 7.1 = FL FR FC LFE BL BR SL SR
+        let [l, r] = mix_frame(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        assert!((l - (1.0 + c * (3.0 + 5.0 + 7.0) + want)).abs() < 1e-4, "7.1 左: {l}");
+        assert!((r - (2.0 + c * (3.0 + 6.0 + 8.0) + want)).abs() < 1e-4, "7.1 右: {r}");
+    }
+
+    #[test]
+    fn downmix_wide_layout_is_power_normalized() {
+        // 12 声道未知布局：多出来的 10 条按 1/√10 并入，不能线性叠成 3.5 倍
+        let c = std::f32::consts::FRAC_1_SQRT_2;
+        let mut frame = vec![0.0f32; 12];
+        frame[2..].iter_mut().for_each(|s| *s = 1.0);
+        let [l, r] = mix_frame(&frame);
+        let want = 10.0 * c / 10.0f32.sqrt();
+        assert!((l - want).abs() < 1e-4, "宽布局左: {l} vs {want}");
+        assert!((r - want).abs() < 1e-4, "宽布局右: {r} vs {want}");
+    }
+
+    #[test]
+    fn downmix_drops_partial_frame_at_eof() {
+        // 不到一帧的尾巴整帧丢弃，宁可少一个样本也不要错位
+        let src = RawSource::new(vec![0.1, 0.2, 0.3], 6, None);
+        let mut dm = DownmixToStereo::new(Box::new(src));
+        let out: Vec<f32> = dm.by_ref().collect();
+        assert!(out.is_empty(), "不足一帧不应产出任何样本");
     }
 }

@@ -3434,7 +3434,7 @@ fn build_decoder(
             // TryFrom<File> 会用文件长度自动填 byte_len，FLAC 的二分定位才可用
             let decoder = Decoder::try_from(file).map_err(|e| format!("解码失败: {e}"))?;
             let duration = resolve_duration_ms(&decoder, track);
-            track_interval(Box::new(decoder), None, duration, track)
+            track_interval(maybe_downmix(Box::new(decoder)), None, duration, track)
         }
         PlaySource::Online { url, referer, .. } => {
             let (reader, shared) =
@@ -3449,8 +3449,22 @@ fn build_decoder(
             };
             let decoder = builder.build().map_err(|e| format!("解码失败: {e}"))?;
             let duration = resolve_duration_ms(&decoder, track);
-            track_interval(Box::new(decoder), Some(shared), duration, track)
+            track_interval(maybe_downmix(Box::new(decoder)), Some(shared), duration, track)
         }
+    }
+}
+
+/// 多声道源先降混到立体声再进效果链。
+///
+/// rodio 的声道转换只会丢掉多余声道（见 `fx::DownmixToStereo` 的注释），
+/// 5.1/7.1 曲目必须在这里桥接，否则中置/环绕全丢、电平低 6~10 dB。
+fn maybe_downmix(source: Box<dyn Source + Send>) -> Box<dyn Source + Send> {
+    let channels = source.channels().get();
+    if channels > 2 {
+        log::info!("[audio] 多声道源 {channels}ch → 立体声降混");
+        Box::new(crate::audio::fx::DownmixToStereo::new(source))
+    } else {
+        source
     }
 }
 
