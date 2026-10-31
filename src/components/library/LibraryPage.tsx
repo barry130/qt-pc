@@ -22,6 +22,7 @@ import { BatchDeleteButton } from "../common/RowActions";
 import { IconButton } from "../common/IconButton";
 import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 
+import { EmptyState, RowsSkeleton } from "@/components/ui";
 /**
  * 本地音乐（路由 /library，DESIGN §5.2 / §13）。
  *
@@ -675,17 +676,11 @@ export function LibraryPage(): React.JSX.Element {
           </div>
         )}
         {loading ? (
-          <div className="py-10 text-center text-sm text-muted-foreground">
-            加载中…
-          </div>
+          <RowsSkeleton rows={10} />
         ) : !error && tracks.length === 0 ? (
-          <div className="py-10 text-center text-sm text-muted-foreground">
-            暂无本地歌曲
-          </div>
+          <EmptyState title="暂无本地歌曲" />
         ) : visible.length === 0 ? (
-          <div className="py-10 text-center text-sm text-muted-foreground">
-            没有匹配的歌曲
-          </div>
+          <EmptyState title="没有匹配的歌曲" />
         ) : view === "songs" ? (
           <TrackList tracks={visible} local={local} />
         ) : (

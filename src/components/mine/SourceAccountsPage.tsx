@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronsDownUp, ChevronsUpDown } from "lucide-react";
 import { stripErrorUrls } from "@/lib/utils";
+import { qtresImageSrc } from "@/lib/lrc";
 import {
   mergeCredentialExtras,
   readSourceAuthAccounts,
@@ -37,6 +38,7 @@ import {
   sourcePlayQualityOf,
 } from "@/lib/source-quality";
 import type { Quality } from "@/types";
+import { buttonClass, Modal } from "@/components/ui";
 
 /**
  * 音源账号（路由 /source-accounts，侧边栏「我的」组、我的歌单下方）。
@@ -550,6 +552,8 @@ export function SourceAccountsPage(): React.JSX.Element {
               const account = accounts[item.id];
               const tg = toggles[item.id] ?? { useMeta: true, usePlay: false };
               const isCollapsed = collapsed[item.id] ?? allCollapsed;
+              // 平台头像也是上游 https 地址，必须走 qtres 代理（CSP 只放开 qtres）
+              const avatarSrc = qtresImageSrc(account?.user.avatar, 40);
               return (
                 <div
                   key={item.id}
@@ -601,9 +605,9 @@ export function SourceAccountsPage(): React.JSX.Element {
                         >
                           同步歌单
                         </button>
-                        {account.user.avatar ? (
+                        {avatarSrc ? (
                           <img
-                            src={account.user.avatar}
+                            src={avatarSrc}
                             alt=""
                             className="h-5 w-5 rounded-full object-cover"
                             referrerPolicy="no-referrer"
@@ -781,11 +785,14 @@ export function SourceAccountsPage(): React.JSX.Element {
       </div>
 
       {qr !== null ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-xs rounded-xl border border-border bg-card/90 p-4 shadow-raised backdrop-blur-xl">
-            <div className="text-sm font-medium text-foreground">
-              {qr.sourceName} · 扫码登录
-            </div>
+        <Modal
+          open
+          onClose={() => setQr(null)}
+          size="sm"
+          bodyClassName="p-4"
+          closeOnBackdrop={false}
+          title={`${qr.sourceName} · 扫码登录`}
+        >
             <p className="mt-1 text-2xs text-muted-foreground">
               {qr.hint.length > 0
                 ? `${qr.hint}；二维码几分钟内有效，过期可刷新。`
@@ -811,7 +818,7 @@ export function SourceAccountsPage(): React.JSX.Element {
                   type="button"
                   onClick={() => startQr(qr.source, qr.sourceName)}
                   disabled={qrBusy}
-                  className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+                  className={buttonClass({ variant: "outline" })}
                 >
                   {qrBusy ? "刷新中…" : "刷新二维码"}
                 </button>
@@ -819,21 +826,23 @@ export function SourceAccountsPage(): React.JSX.Element {
               <button
                 type="button"
                 onClick={() => setQr(null)}
-                className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent"
+                className={buttonClass({ variant: "outline" })}
               >
                 取消
               </button>
             </div>
-          </div>
-        </div>
+        </Modal>
       ) : null}
 
       {cookieSource !== null ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-md rounded-xl border border-border bg-card/90 p-4 shadow-raised backdrop-blur-xl">
-            <div className="text-sm font-medium text-foreground">
-              {cards.find((c) => c.id === cookieSource)?.name ?? cookieSource} · 导入 Cookie
-            </div>
+        <Modal
+          open
+          onClose={() => { setCookieSource(null); setCookieText(""); }}
+          size="md"
+          bodyClassName="p-4"
+          closeOnBackdrop={false}
+          title={`${cards.find((c) => c.id === cookieSource)?.name ?? cookieSource} · 导入 Cookie`}
+        >
             <p className="mt-1 text-2xs text-muted-foreground">
               粘贴浏览器里该音源官网的 Cookie 串（如 SESSDATA=…; bili_jct=… 或 MUSIC_U=…），
               导入前会先经官方接口校验有效性。
@@ -854,7 +863,7 @@ export function SourceAccountsPage(): React.JSX.Element {
                   setCookieText("");
                 }}
                 disabled={importing}
-                className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+                className={buttonClass({ variant: "outline" })}
               >
                 取消
               </button>
@@ -862,21 +871,23 @@ export function SourceAccountsPage(): React.JSX.Element {
                 type="button"
                 onClick={importCookie}
                 disabled={importing}
-                className="rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+                className={buttonClass({ variant: "primary" })}
               >
                 {importing ? "校验中…" : "导入"}
               </button>
             </div>
-          </div>
-        </div>
+        </Modal>
       ) : null}
 
       {sms !== null ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-sm rounded-xl border border-border bg-card/90 p-4 shadow-raised backdrop-blur-xl">
-            <div className="text-sm font-medium text-foreground">
-              {sms.sourceName} · 短信登录
-            </div>
+        <Modal
+          open
+          onClose={() => setSms(null)}
+          size="sm"
+          bodyClassName="p-4"
+          closeOnBackdrop={false}
+          title={`${sms.sourceName} · 短信登录`}
+        >
             {sms.stage === "phone" ? (
               <>
                 <p className="mt-1 text-2xs text-muted-foreground">
@@ -896,7 +907,7 @@ export function SourceAccountsPage(): React.JSX.Element {
                     type="button"
                     onClick={() => setSms(null)}
                     disabled={smsBusy}
-                    className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+                    className={buttonClass({ variant: "outline" })}
                   >
                     取消
                   </button>
@@ -904,7 +915,7 @@ export function SourceAccountsPage(): React.JSX.Element {
                     type="button"
                     onClick={sendSms}
                     disabled={smsBusy}
-                    className="rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+                    className={buttonClass({ variant: "primary" })}
                   >
                     {smsBusy ? "发送中…" : "发送验证码"}
                   </button>
@@ -929,7 +940,7 @@ export function SourceAccountsPage(): React.JSX.Element {
                     type="button"
                     onClick={() => setSms(null)}
                     disabled={smsBusy}
-                    className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+                    className={buttonClass({ variant: "outline" })}
                   >
                     取消
                   </button>
@@ -937,23 +948,25 @@ export function SourceAccountsPage(): React.JSX.Element {
                     type="button"
                     onClick={loginByPhone}
                     disabled={smsBusy}
-                    className="rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+                    className={buttonClass({ variant: "primary" })}
                   >
                     {smsBusy ? "登录中…" : "登录"}
                   </button>
                 </div>
               </>
             )}
-          </div>
-        </div>
+        </Modal>
       ) : null}
 
       {pwd !== null ? (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-sm rounded-xl border border-border bg-card/90 p-4 shadow-raised backdrop-blur-xl">
-            <div className="text-sm font-medium text-foreground">
-              {pwd.sourceName} · 密码登录
-            </div>
+        <Modal
+          open
+          onClose={() => setPwd(null)}
+          size="sm"
+          bodyClassName="p-4"
+          closeOnBackdrop={false}
+          title={`${pwd.sourceName} · 密码登录`}
+        >
             <p className="mt-1 text-2xs text-muted-foreground">
               使用{pwd.sourceName}官方客户端账号密码登录，凭据不出本机。
             </p>
@@ -978,7 +991,7 @@ export function SourceAccountsPage(): React.JSX.Element {
                 type="button"
                 onClick={() => setPwd(null)}
                 disabled={pwdBusy}
-                className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+                className={buttonClass({ variant: "outline" })}
               >
                 取消
               </button>
@@ -986,13 +999,12 @@ export function SourceAccountsPage(): React.JSX.Element {
                 type="button"
                 onClick={loginByPassword}
                 disabled={pwdBusy}
-                className="rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+                className={buttonClass({ variant: "primary" })}
               >
                 {pwdBusy ? "登录中…" : "登录"}
               </button>
             </div>
-          </div>
-        </div>
+        </Modal>
       ) : null}
 
       {syncDialog !== null ? (

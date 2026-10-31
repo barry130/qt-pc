@@ -2,6 +2,7 @@ import { Component, type ErrorInfo, type ReactNode } from "react";
 import * as ipc from "@/services/ipc";
 import { log } from "@/lib/logger";
 import { LAST_ERROR_KEY } from "@/lib/storageKeys";
+import { buttonClass } from "@/components/ui";
 
 type AutoResetOptions = {
   /** 出错后等多久自动重试（默认 1000ms） */
@@ -200,14 +201,14 @@ export class ErrorBoundary extends Component<Props, State> {
             <button
               type="button"
               onClick={() => window.location.reload()}
-              className="rounded-md border border-border px-3 py-1.5 text-xs transition-colors hover:bg-accent"
+              className={buttonClass({ variant: "outline" })}
             >
               重载界面
             </button>
             <button
               type="button"
               onClick={this.reset}
-              className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90"
+              className={buttonClass({ variant: "primary" })}
             >
               重试
             </button>

@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import * as ipc from "@/services/ipc";
 import { type AppearancePreference } from "@/types";
 import { ExternalLink } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/form";
 
 export const MODE_OPTIONS: { value: AppearancePreference["mode"]; label: string }[] = [
   { value: "light", label: "浅色" },
@@ -9,54 +11,11 @@ export const MODE_OPTIONS: { value: AppearancePreference["mode"]; label: string 
   { value: "system", label: "跟随系统" },
 ];
 
-export function SettingRow(props: {
-  title: string;
-  description?: string;
-  children: React.ReactNode;
-}): React.JSX.Element {
-  return (
-    <div className="flex items-center justify-between gap-6 py-3">
-      <div className="min-w-0 flex-1">
-        <p className="text-sm">{props.title}</p>
-        {props.description && (
-          <p className="mt-0.5 text-xs text-muted-foreground">{props.description}</p>
-        )}
-      </div>
-      {/* 右侧封顶 60%：否则长内容（如方案单选列表）会把左列压到一字一行 */}
-      <div className="min-w-0 max-w-[60%] shrink-0">{props.children}</div>
-    </div>
-  );
-}
-
-
-export function Switch(props: {
-  checked: boolean;
-  onToggle: () => void;
-  /** 置灰停用（如名额满了的「开启」动作）；停用时点按无效 */
-  disabled?: boolean;
-}): React.JSX.Element {
-  return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={props.checked}
-      aria-disabled={props.disabled}
-      disabled={props.disabled}
-      onClick={() => {
-        if (!props.disabled) props.onToggle();
-      }}
-      className={`relative h-5 w-9 rounded-full transition-colors disabled:opacity-40 disabled:hover:cursor-not-allowed ${
-        props.checked ? "bg-primary" : "bg-muted-foreground/30"
-      }`}
-    >
-      <span
-        className={`absolute top-[0.125rem] h-4 w-4 rounded-full bg-background shadow transition-[left,transform] duration-base ${
-          props.checked ? "left-[1.125rem]" : "left-[0.125rem]"
-        }`}
-      />
-    </button>
-  );
-}
+// 这三个原语已迁到 ui 层（`src/components/ui/`）。设置页内的相对导入保持不变，
+// 新代码请直接从 `@/components/ui` 引用，别再在这里加一份。
+export { FormRow as SettingRow } from "@/components/ui/form-row";
+export { Switch } from "@/components/ui/switch";
+export { Segmented } from "@/components/ui/segmented";
 
 /** 桌面歌词设置（DESIGN §10）：窗口开关 + 样式全量自定义；歌词工具条上的
  * 「歌词设置」按钮会唤起主窗口并跳到本页 */
@@ -77,34 +36,6 @@ export function cssToHex(color: string): string {
   }
   return "#ffffff";
 }
-
-/** 分段选择器（背景模式 / 对齐 / 行数等互斥小选项） */
-
-export function Segmented<T extends string>(props: {
-  value: T;
-  options: { value: T; label: string }[];
-  onChange: (v: T) => void;
-}): React.JSX.Element {
-  return (
-    <div className="flex rounded-md border border-border p-0.5">
-      {props.options.map((o) => (
-        <button
-          key={o.value}
-          type="button"
-          onClick={() => props.onChange(o.value)}
-          className={`rounded px-2.5 py-1 text-xs transition-colors ${
-            props.value === o.value
-              ? "bg-primary text-primary-foreground"
-              : "text-muted-foreground hover:text-foreground"
-          }`}
-        >
-          {o.label}
-        </button>
-      ))}
-    </div>
-  );
-}
-
 
 export function GenericSection(props: { hint: string }): React.JSX.Element {
   return (
@@ -135,22 +66,16 @@ export function DirPicker(props: {
       >
         {props.path || "…"}
       </span>
-      <button
-        type="button"
-        onClick={props.onChoose}
-        disabled={props.busy || props.disabled}
-        className="rounded-md border border-border px-3 py-1.5 text-xs transition-colors hover:bg-accent disabled:opacity-50"
-      >
+      <Button variant="outline" onClick={props.onChoose} disabled={props.busy || props.disabled}>
         更改位置
-      </button>
-      <button
-        type="button"
+      </Button>
+      <Button
+        variant="ghost"
         onClick={props.onReset}
         disabled={props.busy || props.disabled}
-        className="rounded-md border border-border px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
       >
         恢复默认
-      </button>
+      </Button>
     </div>
   );
 }
@@ -183,7 +108,7 @@ export function NumberField(props: {
 
   return (
     <span className="flex items-center gap-1">
-      <input
+      <Input
         type="number"
         inputMode="numeric"
         min={props.min}
@@ -194,7 +119,8 @@ export function NumberField(props: {
           if (e.key === "Enter") commit();
         }}
         onBlur={commit}
-        className="w-20 rounded-md border border-border bg-transparent px-2 py-1 text-xs outline-none focus:border-primary"
+        controlSize="xs"
+        className="w-20"
       />
       <span className="text-xs text-muted-foreground">{props.suffix}</span>
     </span>
@@ -207,13 +133,12 @@ export function ExternalLinkButton(props: {
   url: string;
 }): React.JSX.Element {
   return (
-    <button
-      type="button"
+    <Button
+      variant="outline"
       onClick={() => void ipc.openExternalUrl(props.url).catch(() => undefined)}
-      className="flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent"
+      iconRight={<ExternalLink className="h-3.5 w-3.5 text-muted-foreground" />}
     >
       {props.label}
-      <ExternalLink className="h-3.5 w-3.5 text-muted-foreground" />
-    </button>
+    </Button>
   );
 }

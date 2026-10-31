@@ -10,6 +10,8 @@ import { setSourceAuthToggle } from "@/lib/source-auth";
 import type { SourceAccountPlaylist } from "@/source-scripts";
 import { toast, toastError } from "@/stores/toast";
 import { errMsg } from "@/lib/utils";
+import { Modal } from "@/components/ui";
+import { qtresImageSrc } from "@/lib/lrc";
 
 /**
  * 账户歌单同步弹窗（2026-10-26 需求；2026-10-27 改版）：
@@ -166,13 +168,15 @@ export function SourcePlaylistSyncDialog(props: {
   const allChecked = total > 0 && checked.size === total;
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget && !busy) props.onClose();
-      }}
+    <Modal
+      open
+      onClose={props.onClose}
+      size="md"
+      tone="glass"
+      closeOnBackdrop={!busy}
+      className="max-w-[30rem]"
+      bodyClassName="p-5"
     >
-      <div className="w-[30rem] rounded-2xl border border-white/20 bg-white/70 p-5 text-card-foreground shadow-overlay backdrop-blur-xl dark:border-white/10 dark:bg-black/40">
         <div className="text-sm font-medium">{props.sourceName} · 同步歌单</div>
         <p className="mt-1 text-2xs text-muted-foreground">
           拉取该账户在平台侧的全部收藏歌单：勾选 = 收藏到本地「我的歌单」，把「已收藏」的取消勾选
@@ -233,9 +237,9 @@ export function SourcePlaylistSyncDialog(props: {
                     checked={checked.has(i)}
                     onChange={() => toggleOne(i)}
                   />
-                  {row.playlist.picUrl ? (
+                  {qtresImageSrc(row.playlist.picUrl, 64) ? (
                     <img
-                      src={row.playlist.picUrl}
+                      src={qtresImageSrc(row.playlist.picUrl, 64) ?? ""}
                       alt=""
                       referrerPolicy="no-referrer"
                       className="h-8 w-8 shrink-0 rounded object-cover"
@@ -282,7 +286,6 @@ export function SourcePlaylistSyncDialog(props: {
             </button>
           ) : null}
         </div>
-      </div>
-    </div>
+          </Modal>
   );
 }

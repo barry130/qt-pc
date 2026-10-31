@@ -7,6 +7,7 @@ import {
   parseLrc,
   parseWordByWordLrc,
   qtresCoverUrl,
+  qtresImageSrc,
   type LyricLine,
 } from "@/lib/lrc";
 
@@ -187,5 +188,27 @@ describe("qtresCoverUrl", () => {
   it("非 http 地址返回 null", () => {
     expect(qtresCoverUrl("")).toBeNull();
     expect(qtresCoverUrl("file:///x.png")).toBeNull();
+  });
+});
+
+describe("qtresImageSrc", () => {
+  it("上游 http(s) 地址走 qtres 代理（CSP 只放开 qtres，直连 <img> 会被拦成破图）", () => {
+    const url = "https://thirdqq.qlogo.cn/g?b=sdk&nk=123";
+    expect(qtresImageSrc(url, 40)).toBe(qtresCoverUrl(url, 40));
+    expect(qtresImageSrc(url, 40)).toMatch(/\?w=40$/);
+  });
+
+  it("内联图（data:/blob:）原样返回，不绕代理", () => {
+    const data = "data:image/png;base64,AAAA";
+    expect(qtresImageSrc(data)).toBe(data);
+    expect(qtresImageSrc("blob:http://tauri.localhost/abc")).toBe(
+      "blob:http://tauri.localhost/abc",
+    );
+  });
+
+  it("空值与非 web 地址返回 null", () => {
+    expect(qtresImageSrc("")).toBeNull();
+    expect(qtresImageSrc(undefined)).toBeNull();
+    expect(qtresImageSrc("file:///c:/x.png")).toBeNull();
   });
 });

@@ -13,6 +13,7 @@ import { IconButton } from "@/components/common/IconButton";
 import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 import { useDismissOnOutside } from "@/hooks/useDismissOnOutside";
 
+import { EmptyState, RowsSkeleton } from "@/components/ui";
 /**
  * 我的歌单（路由 /my/playlists，DESIGN §5.3）——「我的歌单」与「收藏」已合成一页。
  *
@@ -252,14 +253,9 @@ export function MyPlaylistsPage(): React.JSX.Element {
           </div>
         )}
         {loading ? (
-          <div className="py-10 text-center text-sm text-muted-foreground">
-            加载中…
-          </div>
+          <RowsSkeleton rows={6} />
         ) : !error && list.length === 0 ? (
-          <div className="py-10 text-center text-sm text-muted-foreground">
-            还没有歌单。可以新建一个，或点上方「导入」粘贴分享链接，
-            也可以在歌单详情页点「收藏」
-          </div>
+          <EmptyState title="还没有歌单。可以新建一个，或点上方「导入」粘贴分享链接， 也可以在歌单详情页点「收藏」" />
         ) : (
           <>
             <Group

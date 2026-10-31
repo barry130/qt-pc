@@ -1,5 +1,9 @@
 import { useState } from "react";
-import { Check, Download, HardDrive, Loader2 } from "lucide-react";
+import {
+  Check,
+  Download,
+  HardDrive,
+} from "lucide-react";
 import { cn, errMsg } from "@/lib/utils";
 import type { Quality, Track } from "@/types";
 import * as ipc from "@/services/ipc";
@@ -8,6 +12,7 @@ import { toastError, toastSuccess } from "@/stores/toast";
 import { clampQualityForPlatform } from "@/stores/sourceRegistry";
 import { sourceDownloadQualityOf } from "@/lib/source-quality";
 import { IconButton } from "@/components/common/IconButton";
+import { Spinner } from "@/components/ui";
 
 /**
  * 下载一首歌（DESIGN §5.3）。命令只负责发起，实际下载与进度写库都在 Rust 后台。
@@ -101,11 +106,11 @@ export function DownloadButton(props: {
         aria-label={label}
         className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-primary"
       >
-        {isDownloaded ? <Check className="h-4 w-4" /> : <Loader2 className="h-4 w-4 animate-spin" />}
+        {isDownloaded ? <Check className="h-4 w-4" /> : <Spinner size="md" className="h-4 w-4" />}
       </span>
     ) : (
       <StatusIcon label={label} className="text-primary">
-        {isDownloaded ? <Check /> : <Loader2 className="animate-spin" />}
+        {isDownloaded ? <Check /> : <Spinner size="sm" />}
       </StatusIcon>
     );
   }

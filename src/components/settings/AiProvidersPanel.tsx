@@ -1,6 +1,5 @@
-import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { JSX } from "react";
-import { createPortal } from "react-dom";
 import {
   Bot,
   Brain,
@@ -11,7 +10,6 @@ import {
   Cpu,
   Database,
   Image as ImageIcon,
-  Loader2,
   Plus,
   RefreshCw,
   Search,
@@ -30,6 +28,8 @@ import type {
 } from "@/types";
 import { errMsg } from "@/lib/utils";
 import { toast, toastError, toastSuccess } from "@/stores/toast";
+import { Modal } from "@/components/ui";
+import { Spinner } from "@/components/ui";
 
 /**
  * AI 供应商的主从配置（2026-10-24，用户要求按截图改造「接口配置」）：
@@ -502,7 +502,7 @@ export function AiProvidersPanel(): JSX.Element {
   if (loading) {
     return (
       <div className="flex items-center gap-2 py-3 text-xs text-muted-foreground">
-        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+        <Spinner size="sm" className="h-3.5 w-3.5" />
         正在读取 AI 配置…
       </div>
     );
@@ -669,7 +669,7 @@ export function AiProvidersPanel(): JSX.Element {
               disabled={testing}
               className={GHOST_BUTTON_CLASS}
             >
-              {testing ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+              {testing ? <Spinner size="xs" className="h-3 w-3" /> : null}
               检测协议
             </button>
           </div>
@@ -892,7 +892,7 @@ export function AiProvidersPanel(): JSX.Element {
                 className={GHOST_BUTTON_CLASS}
               >
                 {fetchingModels ? (
-                  <Loader2 className="h-3 w-3 animate-spin" />
+                  <Spinner size="xs" className="h-3 w-3" />
                 ) : (
                   <RefreshCw className="h-3 w-3" />
                 )}
@@ -973,7 +973,7 @@ export function AiProvidersPanel(): JSX.Element {
             disabled={saving}
             className={PRIMARY_BUTTON_CLASS}
           >
-            {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+            {saving ? <Spinner size="sm" className="h-3.5 w-3.5" /> : null}
             保存
           </button>
         </span>
@@ -988,58 +988,18 @@ export function AiProvidersPanel(): JSX.Element {
  * 一个标题栏和关闭行为；点遮罩、按 Esc、点右上角 X 都能关。
  */
 export function AiProvidersDialog(props: { onClose: () => void }): JSX.Element {
-  const { onClose } = props;
-  const titleId = useId();
-  const dialogRef = useRef<HTMLElement>(null);
-
-  useEffect(() => {
-    const handleKeyDown = (event: KeyboardEvent): void => {
-      if (event.key !== "Escape") return;
-      event.preventDefault();
-      onClose();
-    };
-    document.addEventListener("keydown", handleKeyDown);
-    return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
-
-  return createPortal(
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4"
-      onMouseDown={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
+  return (
+    <Modal
+      open
+      onClose={props.onClose}
+      title="AI 供应商"
+      description="外面只看到供应商列表，点一行进去改 API 地址、协议、密钥和模型；第一把密钥、第一个模型生效。"
+      closeLabel="关闭 AI 供应商设置"
+      size="lg"
+      className="max-w-3xl"
+      bodyClassName="px-5 pb-5"
     >
-      <section
-        ref={dialogRef}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby={titleId}
-        className="flex max-h-[calc(100dvh-2rem)] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-border bg-card/95 shadow-overlay backdrop-blur-xl"
-      >
-        <header className="flex shrink-0 items-center gap-2 border-b border-border px-5 py-3.5">
-          <div className="min-w-0 flex-1">
-            <h2 id={titleId} className="text-base font-semibold">
-              AI 供应商
-            </h2>
-            <p className="mt-0.5 text-xs text-muted-foreground">
-              外面只看到供应商列表，点一行进去改 API 地址、协议、密钥和模型；第一把密钥、第一个模型生效。
-            </p>
-          </div>
-          <button
-            type="button"
-            aria-label="关闭 AI 供应商设置"
-            title="关闭"
-            onClick={onClose}
-            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
-          >
-            <X className="h-4 w-4" />
-          </button>
-        </header>
-        <div className="min-h-0 flex-1 overflow-y-auto px-5 pb-5">
-          <AiProvidersPanel />
-        </div>
-      </section>
-    </div>,
-    document.body,
+      <AiProvidersPanel />
+    </Modal>
   );
 }

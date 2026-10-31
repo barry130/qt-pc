@@ -8,6 +8,7 @@ import { TrackList } from "../discovery/TrackList";
 import { IconButton } from "../common/IconButton";
 import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 
+import { EmptyState, RowsSkeleton } from "@/components/ui";
 /**
  * 最近播放（路由 /history，DESIGN §5.3）。
  *
@@ -180,13 +181,9 @@ export function HistoryPage(): React.JSX.Element {
           </div>
         )}
         {loading ? (
-          <div className="py-10 text-center text-sm text-muted-foreground">
-            加载中…
-          </div>
+          <RowsSkeleton rows={10} />
         ) : !error && tracks.length === 0 ? (
-          <div className="py-10 text-center text-sm text-muted-foreground">
-            还没有播放记录
-          </div>
+          <EmptyState title="还没有播放记录" />
         ) : (
           <TrackList
             tracks={tracks}

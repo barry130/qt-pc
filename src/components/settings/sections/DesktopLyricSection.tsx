@@ -5,6 +5,7 @@ import { getDesktopLyricState, hideDesktopLyric, onLyricWindowChanged, resetDesk
 import { type DesktopLyricState, type DesktopLyricStylePatch } from "@/types";
 import { Segmented, SettingRow, Switch, cssToHex } from "../controls";
 import { getAllWindows } from "@tauri-apps/api/window";
+import { buttonClass } from "@/components/ui";
 
 export function DesktopLyricSection(): React.JSX.Element {
   const [state, setState] = useState<DesktopLyricState | null>(null);
@@ -277,7 +278,7 @@ export function DesktopLyricSection(): React.JSX.Element {
         <button
           type="button"
           onClick={() => void resetDesktopLyric().then(setState).catch(() => {})}
-          className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90"
+          className={buttonClass({ variant: "primary" })}
         >
           复位到屏幕中心
         </button>

@@ -1,5 +1,13 @@
 import { useMemo, useState } from "react";
-import { Heart, ListPlus, Loader2, MoreHorizontal, Play, Sparkles, ThumbsDown, ThumbsUp } from "lucide-react";
+import {
+  Heart,
+  ListPlus,
+  MoreHorizontal,
+  Play,
+  Sparkles,
+  ThumbsDown,
+  ThumbsUp,
+} from "lucide-react";
 import type { AiAction, AiBlock, AiChatMessage, AiCitation } from "@/lib/ai";
 import { actionLabel, songsOfBlock, statusText } from "@/lib/ai";
 import { qtresCoverUrl } from "@/lib/lrc";
@@ -11,6 +19,7 @@ import { cn } from "@/lib/utils";
 import { SourceTag } from "@/components/common/SourceTag";
 import type { Track } from "@/types";
 import { AnswerText } from "./AnswerText";
+import { Spinner } from "@/components/ui";
 
 /**
  * 一条消息气泡。
@@ -57,7 +66,7 @@ export function MessageBubble(props: {
             <AnswerText content={message.content} />
           ) : message.streaming ? (
             <div className="flex items-center gap-2 text-sm text-muted-foreground">
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              <Spinner size="sm" className="h-3.5 w-3.5" />
               <span>{message.progress.length > 0 ? message.progress : "正在思考…"}</span>
             </div>
           ) : (
@@ -66,7 +75,7 @@ export function MessageBubble(props: {
 
           {message.streaming && message.content.length > 0 && message.progress.length > 0 ? (
             <div className="mt-2 flex items-center gap-1.5 text-2xs text-muted-foreground">
-              <Loader2 className="h-3 w-3 animate-spin" />
+              <Spinner size="xs" className="h-3 w-3" />
               <span>{message.progress}</span>
             </div>
           ) : null}

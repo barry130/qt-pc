@@ -9,6 +9,7 @@ import { toast, toastError, toastSuccess } from "@/stores/toast";
 import { useUpdateStore } from "@/stores/update";
 import { type AppVersion } from "@/types";
 import { ExternalLinkButton, SettingRow } from "../controls";
+import { buttonClass } from "@/components/ui";
 
 export function AboutSection(): React.JSX.Element {
   const [version, setVersion] = useState<AppVersion | null>(null);
@@ -68,7 +69,7 @@ export function AboutSection(): React.JSX.Element {
           type="button"
           onClick={() => void checkUpdate()}
           disabled={checking}
-          className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+          className={buttonClass({ variant: "outline" })}
         >
           {checking ? "检查中…" : "检查更新"}
         </button>
@@ -107,7 +108,7 @@ export function AboutSection(): React.JSX.Element {
         <button
           type="button"
           onClick={() => void handleReopenDisclaimer()}
-          className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent"
+          className={buttonClass({ variant: "outline" })}
         >
           查看
         </button>

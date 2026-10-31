@@ -7,6 +7,7 @@ import { BackButton } from "@/components/layout/BackButton";
 import { AddDirButtons } from "./AddDirButtons";
 import { IconButton } from "@/components/common/IconButton";
 
+import { RowsSkeleton } from "@/components/ui";
 /**
  * 本地音乐文件夹管理（路由 /library/folders，DESIGN §13）。
  * 目录选择走 tauri-plugin-dialog 的目录选择器，路径落在 scan_dirs 表；
@@ -114,9 +115,7 @@ export function LibraryFoldersPage(): React.JSX.Element {
       </div>
 
       {loading ? (
-        <p className="py-10 text-center text-sm text-muted-foreground">
-          加载中…
-        </p>
+        <RowsSkeleton rows={5} cover="none" />
       ) : dirs.length === 0 ? (
         <p className="py-16 text-center text-sm text-muted-foreground">
           还没有添加任何文件夹

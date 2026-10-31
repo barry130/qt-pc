@@ -3,7 +3,6 @@ import {
   ArrowUp,
   Check,
   Info,
-  Loader2,
   MessageSquarePlus,
   PanelLeftClose,
   PanelLeftOpen,
@@ -21,6 +20,7 @@ import { usePlayerStore } from "@/stores/player";
 import * as ipc from "@/services/ipc";
 import type { Track } from "@/types";
 import { MessageBubble } from "./MessageBubble";
+import { Spinner } from "@/components/ui";
 
 /** 顶栏副标题：说清这一轮的歌是怎么挑出来的（三种全局模式各一句） */
 const MODE_SUBTITLE: Record<AiEngineMode, string> = {
@@ -217,7 +217,7 @@ export function AiAssistantPage(): React.JSX.Element {
           <div className="mx-auto flex w-full max-w-3xl flex-col gap-4">
             {chat.loading ? (
               <div className="flex items-center justify-center gap-2 py-16 text-sm text-muted-foreground">
-                <Loader2 className="h-4 w-4 animate-spin" />
+                <Spinner size="md" className="h-4 w-4" />
                 <span>正在准备…</span>
               </div>
             ) : empty ? (
@@ -244,7 +244,7 @@ export function AiAssistantPage(): React.JSX.Element {
                 ))}
                 {chat.loadingMessages ? (
                   <div className="flex items-center justify-center gap-2 py-4 text-xs text-muted-foreground">
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    <Spinner size="sm" className="h-3.5 w-3.5" />
                     <span>正在载入历史…</span>
                   </div>
                 ) : null}

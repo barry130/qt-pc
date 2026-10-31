@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Loader2, Search } from "lucide-react";
+import {
+  Search,
+} from "lucide-react";
 
 import {
   applyPickedLyric,
@@ -15,6 +17,7 @@ import { Popover } from "@/components/common/Popover";
 import { cn, errMsg } from "@/lib/utils";
 import type { Lyric, SourceId, Track } from "@/types";
 import { isComposingEnter } from "@/lib/keyboard";
+import { Spinner } from "@/components/ui";
 
 /**
  * 播放页「搜索歌词」入口（2026-10-07，用户 m09160：方案同换源一样）。
@@ -268,7 +271,7 @@ function LyricSearchPanel(props: {
           )}
         >
           {loading ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            <Spinner size="sm" className="h-3.5 w-3.5" />
           ) : (
             <Search className="h-3.5 w-3.5" />
           )}
@@ -333,7 +336,7 @@ function LyricSearchPanel(props: {
                     </span>
                   )}
                   {picking === key && (
-                    <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-muted-foreground" />
+                    <Spinner size="sm" className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                   )}
                 </button>
               );

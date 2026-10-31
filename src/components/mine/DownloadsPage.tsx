@@ -15,6 +15,7 @@ import { useFavoriteFlags } from "@/hooks/useFavoriteFlags";
 import { useFavoritesStore } from "@/stores/favorites";
 import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 
+import { EmptyState, RowsSkeleton } from "@/components/ui";
 const STATUS_LABEL: Record<DownloadTask["status"], string> = {
   pending: "等待中",
   downloading: "下载中",
@@ -403,13 +404,9 @@ export function DownloadsPage(): React.JSX.Element {
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         {!loaded ? (
-          <div className="py-10 text-center text-sm text-muted-foreground">
-            加载中…
-          </div>
+          <RowsSkeleton rows={6} />
         ) : tasks.length === 0 ? (
-          <div className="py-10 text-center text-sm text-muted-foreground">
-            还没有下载任务
-          </div>
+          <EmptyState title="还没有下载任务" />
         ) : (
           <ul>
             {tasks.map((t) => (

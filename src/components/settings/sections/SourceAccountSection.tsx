@@ -1,5 +1,6 @@
 import { SettingRow } from "../controls";
 import { useNavigate } from "@tanstack/react-router";
+import { buttonClass } from "@/components/ui";
 
 export function SourceAccountSection(): React.JSX.Element {
   const navigate = useNavigate();
@@ -11,7 +12,7 @@ export function SourceAccountSection(): React.JSX.Element {
       <button
         type="button"
         onClick={() => void navigate({ to: "/source-accounts" })}
-        className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent"
+        className={buttonClass({ variant: "outline" })}
       >
         前往管理
       </button>

@@ -9,6 +9,7 @@ import {
 import { useSourceUpdateStore } from "@/stores/source-update";
 import { stripErrorUrls } from "@/lib/utils";
 import { toastSuccess } from "@/stores/toast";
+import { Button, IconButton, Modal } from "@/components/ui";
 
 /**
  * 音源包更新逐条确认提示（v3，与 qt-uniappx 的更新确认弹窗同口径）。
@@ -19,6 +20,9 @@ import { toastSuccess } from "@/stores/toast";
  *   /冒烟；失败 Rust 自动回滚 .prev 并把该版本拉黑）；
  * - 「暂不」→ 丢弃这条（4h 探测节流内不会再弹）；
  * - 全部处理完提示自动消失；安装类动作不在提示里做，去设置页。
+ *
+ * 外壳用统一的 `Modal`（不可通过 Esc/遮罩关闭：这条提示只应该由「更新 / 暂不」
+ * 推进，误触关掉会让用户以为已经处理过）。
  */
 export function SourceUpdatePrompt(): React.JSX.Element | null {
   const navigate = useNavigate();
@@ -61,70 +65,61 @@ export function SourceUpdatePrompt(): React.JSX.Element | null {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-      <div className="w-full max-w-sm rounded-xl border border-border bg-card/90 p-4 shadow-raised backdrop-blur-xl">
-        <div className="flex items-start gap-3">
-          <ArrowDownCircle className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
-          <div className="min-w-0 flex-1">
-            <div className="text-sm font-medium text-foreground">
-              {kindLabel(offer.kind)}更新可用
-            </div>
-            <div className="mt-1 text-xs leading-relaxed text-muted-foreground">
-              {offerLabel(offer)}
-              {offer.notes ? `。${offer.notes}` : ""}
-            </div>
-            <div className="mt-1 text-2xs text-muted-foreground/70">
-              共 {offers.length} 条待确认 ·{" "}
-              {offer.channel === "manifest" ? "官方通道" : "包自带更新直链"}
-            </div>
+    <Modal
+      open
+      onClose={onSkip}
+      size="sm"
+      dismissible={false}
+      closeOnBackdrop={false}
+      className="bg-card/90"
+      bodyClassName="p-4"
+    >
+      <div className="flex items-start gap-3">
+        <ArrowDownCircle className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+        <div className="min-w-0 flex-1">
+          <div className="text-sm font-medium text-foreground">
+            {kindLabel(offer.kind)}更新可用
           </div>
-          <button
-            type="button"
-            aria-label="暂不更新"
-            onClick={onSkip}
-            className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
-          >
-            <X className="h-3.5 w-3.5" />
-          </button>
-        </div>
-        {error ? (
-          <div className="mt-2 rounded-lg bg-destructive/10 px-3 py-2 text-2xs leading-relaxed text-destructive">
-            {error}（已自动回滚到原版本）
+          <div className="mt-1 text-xs leading-relaxed text-muted-foreground">
+            {offerLabel(offer)}
+            {offer.notes ? `。${offer.notes}` : ""}
           </div>
-        ) : null}
-        <div className="mt-3 flex items-center justify-end gap-2">
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => {
-              onSkip();
-              void navigate({
-                to: "/settings/$section",
-                params: { section: "source-package" },
-              });
-            }}
-            className="rounded-full px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
-          >
-            去设置页管理
-          </button>
-          <button
-            type="button"
-            disabled={busy}
-            onClick={onSkip}
-            className="rounded-full border border-border px-3 py-1.5 text-xs text-foreground transition-colors hover:bg-accent disabled:opacity-50"
-          >
-            暂不
-          </button>
-          <button
-            type="button"
-            disabled={busy}
-            onClick={onApply}
-            className="rounded-full bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
-          >
-            {busy ? "更新中…" : "更新"}
-          </button>
+          <div className="mt-1 text-2xs text-muted-foreground/70">
+            共 {offers.length} 条待确认 ·{" "}
+            {offer.channel === "manifest" ? "官方通道" : "包自带更新直链"}
+          </div>
         </div>
+        <IconButton label="暂不更新" onClick={onSkip}>
+          <X />
+        </IconButton>
       </div>
-    </div>
+      {error ? (
+        <div className="mt-2 rounded-lg bg-destructive/10 px-3 py-2 text-2xs leading-relaxed text-destructive">
+          {error}（已自动回滚到原版本）
+        </div>
+      ) : null}
+      <div className="mt-3 flex items-center justify-end gap-2">
+        <Button
+          variant="ghost"
+          shape="pill"
+          disabled={busy}
+          onClick={() => {
+            onSkip();
+            void navigate({
+              to: "/settings/$section",
+              params: { section: "source-package" },
+            });
+          }}
+        >
+          去设置页管理
+        </Button>
+        <Button variant="outline" shape="pill" disabled={busy} onClick={onSkip}>
+          暂不
+        </Button>
+        <Button variant="primary" shape="pill" loading={busy} onClick={onApply}>
+          {busy ? "更新中…" : "更新"}
+        </Button>
+      </div>
+    </Modal>
   );
 }

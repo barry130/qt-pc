@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import { Database, Settings2 } from "lucide-react";
+import { Button, Modal } from "@/components/ui";
 import { getSourceState } from "@/source-scripts/source-update";
 import { useTauriEvent } from "@/hooks/useTauriEvent";
 import { SOURCE_META_CHANGED_EVENT, SOURCE_PACK_CHANGED_EVENT } from "@/services/ipc";
@@ -66,8 +67,17 @@ export function MetaPackGuide(): React.JSX.Element | null {
   if (dismissed || activeMetaId === undefined || activeMetaId !== null) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm">
-      <div className="mx-4 flex w-full max-w-md flex-col gap-5 rounded-2xl border border-border bg-card/90 p-7 shadow-overlay backdrop-blur-xl">
+    <Modal
+      open
+      onClose={() => setDismissed(true)}
+      size="md"
+      dismissible={false}
+      closeOnBackdrop={false}
+      backdropClassName="bg-background/80 backdrop-blur-sm"
+      className="bg-card/90"
+      bodyClassName="flex flex-col gap-5 p-7"
+    >
+      <div className="flex flex-col gap-5">
         <div className="flex items-center gap-3">
           <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-primary/10">
             <Database className="h-5 w-5 text-primary" />
@@ -84,23 +94,24 @@ export function MetaPackGuide(): React.JSX.Element | null {
         </p>
 
         <div className="flex flex-col gap-2">
-          <button
-            type="button"
+          <Button
+            size="lg"
+            shape="block"
             onClick={goSettings}
-            className="flex items-center justify-center gap-2 rounded-xl bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
+            icon={<Settings2 className="h-4 w-4" />}
           >
-            <Settings2 className="h-4 w-4" />
             去设置页安装
-          </button>
-          <button
-            type="button"
+          </Button>
+          <Button
+            variant="ghost"
+            shape="block"
             onClick={() => setDismissed(true)}
-            className="rounded-xl px-4 py-2 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
+            className="text-muted-foreground"
           >
             暂不安装（仅使用本地音乐，下次启动会再次提醒）
-          </button>
+          </Button>
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }

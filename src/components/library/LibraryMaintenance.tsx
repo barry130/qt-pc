@@ -1,9 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
-import { FolderOpen, LoaderCircle } from "lucide-react";
+import {
+  FolderOpen,
+} from "lucide-react";
 import * as ipc from "@/services/ipc";
 import { errMsg } from "@/lib/utils";
 import { IconButton } from "@/components/common/IconButton";
+import { Spinner } from "@/components/ui";
 
 const PAGE_SIZE = 25;
 const buttonClass = "rounded-md border border-border px-3 py-1.5 text-xs hover:bg-secondary disabled:opacity-50";
@@ -120,7 +123,7 @@ export default function LibraryMaintenance(): React.JSX.Element {
       </p>
       <div className="flex items-center gap-2">
         <button type="button" disabled={busy} className={buttonClass} onClick={() => void (tab === "duplicates" ? detect() : plan())}>
-          {busy ? <span className="flex items-center gap-1"><LoaderCircle className="h-3.5 w-3.5 animate-spin" />处理中…</span> : tab === "duplicates" ? "开始检测" : "选择目标文件夹并预览"}
+          {busy ? <span className="flex items-center gap-1"><Spinner size="sm" className="h-3.5 w-3.5" />处理中…</span> : tab === "duplicates" ? "开始检测" : "选择目标文件夹并预览"}
         </button>
         {busy && tab === "duplicates" && <button type="button" disabled={cancelling} className={buttonClass} onClick={() => void cancel()}>{cancelling ? "正在取消…" : "取消检测"}</button>}
         {progress && <span role="status" className="truncate text-xs text-muted-foreground" title={progress.current}>正在核对内容 {progress.checked} / {progress.total}</span>}

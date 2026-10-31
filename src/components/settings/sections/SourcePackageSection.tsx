@@ -10,7 +10,9 @@ import { useSourceUpdateStore } from "@/stores/source-update";
 import { useSourceRegistryStore } from "@/stores/sourceRegistry";
 import { toast, toastError, toastSuccess } from "@/stores/toast";
 import { ExternalLinkButton, SettingRow, Switch } from "../controls";
+import { Button, Modal } from "@/components/ui";
 import { SourceAccountSection } from "./SourceAccountSection";
+import { buttonClass } from "@/components/ui";
 
 export function packLabel(p: SourcePackVo): string {
   return `${packDisplayName(p)} · ${packVersionLabel(p)} (code ${p.versionCode})`;
@@ -461,7 +463,7 @@ export function SourcePackageSection(): React.JSX.Element {
             type="button"
             onClick={() => void run(check)}
             disabled={busy}
-            className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+            className={buttonClass({ variant: "outline" })}
           >
             {busy ? "处理中…" : "检查更新"}
           </button>
@@ -516,7 +518,7 @@ export function SourcePackageSection(): React.JSX.Element {
             disabled={
               busy || installing || confirming || (installMode === "url" && !url.trim())
             }
-            className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+            className={buttonClass({ variant: "outline" })}
           >
             {installing ? "获取包信息…" : installMode === "url" ? "安装" : "选择文件…"}
           </button>
@@ -537,8 +539,16 @@ export function SourcePackageSection(): React.JSX.Element {
         </SettingRow>
       ) : null}
       {clipTip !== null && !preview && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-          <div className="w-full max-w-sm rounded-xl border border-border bg-card/90 p-4 shadow-raised backdrop-blur-xl">
+        <Modal
+          open
+          onClose={() => setClipTip(null)}
+          size="sm"
+          dismissible={false}
+          closeOnBackdrop={false}
+          className="bg-card/90"
+          bodyClassName="p-4"
+        >
+          <div>
             <div className="text-sm font-medium text-foreground">
               检测到剪贴板有音源包链接
             </div>
@@ -547,27 +557,22 @@ export function SourcePackageSection(): React.JSX.Element {
             </p>
             <p className="mt-1 text-xs text-muted-foreground">是否安装？</p>
             <div className="mt-3 flex items-center justify-end gap-2">
-              <button
-                type="button"
-                onClick={() => setClipTip(null)}
-                className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent"
-              >
+              <Button variant="outline" onClick={() => setClipTip(null)}>
                 取消
-              </button>
-              <button
-                type="button"
+              </Button>
+              <Button
+                variant="outline"
                 onClick={() => {
                   const link = clipTip;
                   setClipTip(null);
                   if (link) stageFromLink(link);
                 }}
-                className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent"
               >
                 安装
-              </button>
+              </Button>
             </div>
           </div>
-        </div>
+        </Modal>
       )}
       {preview && (
         <InstallPreviewDialog
@@ -610,8 +615,15 @@ export function InstallPreviewDialog(props: {
     ],
   ];
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
-      <div className="w-full max-w-sm rounded-xl border border-border bg-card/90 p-4 shadow-raised backdrop-blur-xl">
+    <Modal
+      open
+      onClose={props.onCancel}
+      size="sm"
+      dismissible={!props.busy}
+      className="bg-card/90"
+      bodyClassName="p-4"
+    >
+      <div>
         <div className="text-sm font-medium text-foreground">安装音源包</div>
         <div className="mt-2 flex flex-col gap-1 text-xs">
           {rows.map(([key, value]) => (
@@ -632,25 +644,15 @@ export function InstallPreviewDialog(props: {
           </div>
         ) : null}
         <div className="mt-3 flex items-center justify-end gap-2">
-          <button
-            type="button"
-            onClick={props.onCancel}
-            disabled={props.busy}
-            className="rounded-md border border-border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
-          >
+          <Button variant="outline" onClick={props.onCancel} disabled={props.busy}>
             取消
-          </button>
-          <button
-            type="button"
-            onClick={props.onConfirm}
-            disabled={props.busy}
-            className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:opacity-90 disabled:opacity-50"
-          >
+          </Button>
+          <Button variant="primary" onClick={props.onConfirm} loading={props.busy}>
             {props.busy ? "安装中…" : "安装"}
-          </button>
+          </Button>
         </div>
       </div>
-    </div>
+    </Modal>
   );
 }
 

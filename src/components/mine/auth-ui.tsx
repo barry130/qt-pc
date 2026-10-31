@@ -1,6 +1,11 @@
 import type React from "react";
-import { Check, Eye, EyeOff, Loader2 } from "lucide-react";
+import {
+  Check,
+  Eye,
+  EyeOff,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
+import { Spinner } from "@/components/ui";
 
 /**
  * 认证类页面共用的表面件（登录/注册、找回密码）。
@@ -107,7 +112,7 @@ export function AuthButton(props: {
           : "bg-primary text-primary-foreground hover:opacity-90",
       )}
     >
-      {busy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : null}
+      {busy ? <Spinner size="sm" className="h-3.5 w-3.5" /> : null}
       {busy && props.busyLabel ? props.busyLabel : props.label}
     </button>
   );

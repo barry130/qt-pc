@@ -18,6 +18,9 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => vi.fn(),
+  // 首页通告栏走 useRouter({ warn: false }) 拿导航器；没有上下文时返回 undefined，
+  // 组件会跳过内跳（见 lib/notice-open），所以这里给 undefined 就够。
+  useRouter: () => undefined,
 }));
 vi.mock("@/source-scripts", async (importOriginal) => ({
   ...(await importOriginal<typeof import("@/source-scripts")>()),

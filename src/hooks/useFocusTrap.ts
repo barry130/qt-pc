@@ -67,9 +67,20 @@ export function useFocusTrap(
       }
     };
 
+    // Esc 额外挂到 document：焦点万一不在弹层内（点了不可聚焦的区域、外层组件抢回焦点），
+    // 键盘用户仍然能关掉。旧的手写弹窗都是在 document 上监听，换壳不能退化。
+    // 弹层内的 Esc 由上面的 onKeyDown 处理并 stopPropagation，不会重复触发。
+    const onDocKeyDown = (event: KeyboardEvent): void => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      onClose();
+    };
+
     node.addEventListener("keydown", onKeyDown);
+    document.addEventListener("keydown", onDocKeyDown);
     return () => {
       node.removeEventListener("keydown", onKeyDown);
+      document.removeEventListener("keydown", onDocKeyDown);
       // 关闭后焦点回到打开它的按钮，键盘用户不会「丢位置」
       if (restore !== null && document.contains(restore)) restore.focus();
     };

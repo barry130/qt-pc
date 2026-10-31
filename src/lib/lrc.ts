@@ -245,6 +245,23 @@ export function formatTime(ms: number): string {
  * `px` 可选：目标边长（Rust 侧会按它向上游要缩略图，缺省 300 = 列表卡片 2×）。
  * 播放页大图传 900。不传时不追加查询串，输出与旧版逐字节一致。
  */
+/**
+ * `<img>` 用的图片 src：内联图（data:/blob:）原样返回，上游 http(s) 地址走
+ * qtres 代理。
+ *
+ * 为什么必须走代理：`tauri.conf.json` 的 CSP 里 `img-src` 只放开
+ * `'self' / asset: / qtres: / data: / blob:`，把上游 https 地址直接塞进
+ * `<img>` 会被拦掉——表现就是整排破图（2026-10-31 用户截图：音源账号页的
+ * 头像、同步歌单弹窗的封面都这样）。封面早就走 qtresCoverUrl 了，头像/歌单
+ * 封面这类「顺手直接用上游 URL」的地方漏了包装。
+ */
+export function qtresImageSrc(url: string | null | undefined, px?: number): string | null {
+  if (!url) return null;
+  if (/^(data|blob):/i.test(url)) return url;
+  if (!/^https?:\/\//i.test(url)) return null;
+  return qtresCoverUrl(url, px);
+}
+
 export function qtresCoverUrl(picUrl: string, px?: number): string | null {
   if (!picUrl) return null;
   if (!/^https?:\/\//i.test(picUrl)) return null;

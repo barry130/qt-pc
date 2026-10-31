@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { errMsg } from "@/lib/utils";
+import { qtresImageSrc } from "@/lib/lrc";
 import type { Playlist, Track } from "@/types";
 import {
   useSourceRegistryStore,
@@ -10,6 +11,7 @@ import {
   importPlaylistSongs,
 } from "@/lib/playlist-import";
 import * as sourceApi from "@/source-scripts";
+import { Modal } from "@/components/ui";
 import * as ipc from "@/services/ipc";
 
 /**
@@ -214,13 +216,15 @@ export function ImportPlaylistDialog(props: {
   const primaryDisabled = mode === "songs" ? !preview || busy : !text.trim() || busy;
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget && !busy) props.onClose();
-      }}
+    <Modal
+      open
+      onClose={props.onClose}
+      size="md"
+      tone="glass"
+      closeOnBackdrop={!busy}
+      className="max-w-[30rem]"
+      bodyClassName="p-5"
     >
-      <div className="w-[30rem] rounded-2xl border border-white/20 bg-white/70 p-5 text-card-foreground shadow-overlay backdrop-blur-xl dark:border-white/10 dark:bg-black/40">
         <h2 className="text-base font-medium">导入歌单</h2>
         <div className="mt-2 flex gap-1 rounded-md bg-muted p-0.5 text-xs">
           {(
@@ -305,9 +309,9 @@ export function ImportPlaylistDialog(props: {
         {mode === "songs" && preview && (
           <div className="mt-3 rounded-md border border-border p-3">
             <div className="flex items-center gap-3">
-              {preview.picUrl ? (
+              {qtresImageSrc(preview.picUrl, 112) ? (
                 <img
-                  src={preview.picUrl}
+                  src={qtresImageSrc(preview.picUrl, 112) ?? ""}
                   alt=""
                   className="h-14 w-14 shrink-0 rounded-md object-cover"
                 />
@@ -406,7 +410,6 @@ export function ImportPlaylistDialog(props: {
             </button>
           )}
         </div>
-      </div>
-    </div>
+          </Modal>
   );
 }

@@ -1,5 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Check, Download, Heart, Loader2, Plus, X } from "lucide-react";
+import {
+  Check,
+  Download,
+  Heart,
+  Plus,
+  X,
+} from "lucide-react";
 import { cn, errMsg } from "@/lib/utils";
 import { findCrossSourceDup } from "@/lib/collect-dup";
 import { legacyTrackSelectionKey, trackSelectionKey, type TrackSelectionKey } from "@/lib/track-selection";
@@ -12,6 +18,7 @@ import type { MyPlaylistSummary, Track } from "@/types";
 import * as ipc from "@/services/ipc";
 import { IconButton } from "@/components/common/IconButton";
 import { Popover } from "@/components/common/Popover";
+import { Spinner } from "@/components/ui";
 
 /**
  * 列表批量管理条（**歌单详情 / 榜单详情 / 每日新歌 / 歌手页 / 专辑页共用**）。
@@ -499,7 +506,7 @@ export function BatchBar(props: {
         disabled={busy !== null || count === 0}
         onClick={() => void download()}
       >
-        {busy === "download" ? <Loader2 className="animate-spin" /> : <Download />}
+        {busy === "download" ? <Spinner size="sm" /> : <Download />}
       </IconButton>
 
       {/* 收藏必须落在某个歌单上（Rust 侧没 pid 直接报参数错误），所以这里

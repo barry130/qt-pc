@@ -1,6 +1,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
-import { ArrowLeft, Loader2, Play, RefreshCw } from "lucide-react";
+import {
+  ArrowLeft,
+  Play,
+  RefreshCw,
+} from "lucide-react";
 import type { LocalMixSummary, Track } from "@/types";
 import * as ipc from "@/services/ipc";
 import { errMsg } from "@/lib/utils";
@@ -8,6 +12,7 @@ import { usePlayerStore } from "@/stores/player";
 import { TrackList } from "@/components/discovery/TrackList";
 import { TrackSortSelect } from "@/components/TrackSortSelect";
 import { DEFAULT_TRACK_SORT, parseTrackSort, sortTracks } from "@/lib/track-sort";
+import { Spinner } from "@/components/ui";
 
 /** 合辑详情实时重算，不把动态规则合辑保存成静态歌单。 */
 export function LocalMixPage({ mixKey }: { mixKey: string }): React.JSX.Element {
@@ -85,7 +90,7 @@ export function LocalMixPage({ mixKey }: { mixKey: string }): React.JSX.Element 
           onClick={() => void playAll()}
           className="flex items-center gap-2 rounded-full bg-primary px-4 py-2 text-sm font-medium text-primary-foreground disabled:opacity-50"
         >
-          {playing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+          {playing ? <Spinner size="md" className="h-4 w-4" /> : <Play className="h-4 w-4" />}
           播放全部
         </button>
       </header>
