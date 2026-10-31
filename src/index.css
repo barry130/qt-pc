@@ -48,7 +48,12 @@
      默认等同 --background，外观零变化；设了背景图时由 useAppearanceEffect
      覆写成 ~80% 不透明，壁纸能连过页头，同时仍压住底下的模糊封面。 */
   --page-fade: var(--background);
-  --lyric-highlight: var(--primary);
+  /*
+   * 歌词高亮色。跟随封面时由 usePlayingCoverBg 写成 --lyric-hl-light / --lyric-hl-dark
+   * （同一个封面醒目色，按各自底色校过 WCAG 对比度）；没有封面或取色失败时回退主色。
+   * 按主题分两份存：切主题只换读哪一份，不用回 JS 重算。
+   */
+  --lyric-highlight: var(--lyric-hl-light, var(--primary));
   --lyric-inactive: oklch(0.55 0.02 265);
   /*
    * 动效令牌：时长三档 + 两条缓动。组件里统一用
@@ -91,8 +96,8 @@
   --sidebar-accent-foreground: #f8fafc;
   --sidebar-border: #23233c;
   --sidebar-ring: #6366f1;
-  /* 歌词高亮用亮一档的 indigo-400，深底上才够跳 */
-  --lyric-highlight: #818cf8;
+  /* 歌词高亮用亮一档的 indigo-400，深底上才够跳（跟随封面时同上，读深色那份） */
+  --lyric-highlight: var(--lyric-hl-dark, #818cf8);
   --lyric-inactive: #64748b;
 }
 
@@ -407,6 +412,28 @@
   }
 }
 
+/* 首页通告栏（components/notice/qt-NoticeBar.tsx）：文字比容器宽时连续左移循环，
+ * 悬停或聚焦时暂停。位移量与时长由组件量出来后分别写进 --nb-shift 与
+ * animation-duration；第二份文案紧跟在第一份之后，所以位移量 = 文案宽 + 间隔，
+ * 循环回到起点时正好接上，看不出接缝。html.reduce-motion 下组件直接走 truncate
+ * 分支、根本不进入这条动画，这里就不再兜底。
+ * 用长写属性：内联 style 只覆盖 duration / play-state，短写会把它一起重置。 */
+@keyframes qt-notice-scroll {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(var(--nb-shift));
+  }
+}
+
+.qt-notice-scroll {
+  animation-name: qt-notice-scroll;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+  will-change: transform;
+}
+
 /* 长列表行级跳绘（曲目列表等）。
  *
  * content-visibility: auto 让**视口外**的行跳过布局与绘制（浏览器保留其占位），
@@ -577,6 +604,25 @@
 .reduce-motion .qt-eq-bar {
   animation: none;
   transform: scaleY(0.6);
+}
+
+/* 降低动效时顺带收敛毛玻璃（2026-10-30 资源优化，用户 m06536）：
+ * backdrop-filter 是 GPU 合成里最贵的一项（实测播放态 gpu-process 占用
+ * 156MB / 16.6% 单核，全站 67 处毛玻璃是主要来源）。开关打开后一律换成
+ * 不透明表面。前提与 prefers-reduced-transparency 那条相同：凡加
+ * backdrop-blur 的表面都必须自带 >=40% 不透明底色，关掉模糊后正文才可读。 */
+.reduce-motion [class*="backdrop-blur"] {
+  backdrop-filter: none !important;
+}
+
+/* 窗口不可见（最小化 / 收进托盘 / 被完全遮挡）时暂停全部 CSS 动画与过渡：
+ * 渲染进程被系统降权后时间轴仍会推进，白烧 CPU。class 由
+ * src/entries/boot.ts 的 installHiddenPause 按 document.hidden 切换。 */
+html.qt-window-hidden *,
+html.qt-window-hidden *::before,
+html.qt-window-hidden *::after {
+  animation-play-state: paused !important;
+  transition: none !important;
 }
 
 /* 降低透明度偏好（Windows 关闭「透明效果」/ macOS「降低透明度」）：

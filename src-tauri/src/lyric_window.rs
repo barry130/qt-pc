@@ -307,7 +307,8 @@ fn build_window(app: &AppHandle, state: &LyricWindowState) -> tauri::Result<taur
     WebviewWindowBuilder::new(
         app,
         LYRIC_WINDOW_LABEL,
-        WebviewUrl::App("index.html".into()),
+        // 独立入口（2026-10-30）：歌词窗只渲染一条歌词，不该背主窗 SPA。
+        WebviewUrl::App("lyric.html".into()),
     )
     .title("轻听桌面歌词")
     .position(state.x as f64, state.y as f64)
@@ -320,6 +321,8 @@ fn build_window(app: &AppHandle, state: &LyricWindowState) -> tauri::Result<taur
     .resizable(true)
     .focused(false)
     .visible(false)
+    // 见 mini_window::build_window 的同一处注释
+    .additional_browser_args(crate::webview_mem::BROWSER_ARGS)
     .build()
 }
 

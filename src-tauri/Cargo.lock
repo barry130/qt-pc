@@ -3654,6 +3654,7 @@ dependencies = [
  "tauri-plugin-single-instance",
  "thiserror 2.0.21",
  "tokio",
+ "webview2-com",
  "windows 0.62.2",
 ]
 

@@ -3281,6 +3281,20 @@ pub async fn cmd_reset_download_dir(state: State<'_, AppState>) -> Result<String
 /// 内存里的闸门是**权威值**：命令会立刻改它，所以用户刚点完设置就再打开设置页，
 /// 不该被库里那条还没写完（或写失败）的记录盖回去。数据库只是持久化副本。
 /// 启动时由 `lib.rs` 从库里读一次喂给闸门（`load_download_concurrency`）。
+/// 设置「本窗口」WebView2 的内存目标档位（Windows）。
+///
+/// 前端在 `document.hidden` 变 true 时传 low=true，恢复可见传 false
+/// （src/entries/boot.ts 的 installHiddenPause）。降档期间浏览器会主动
+/// 回收可丢弃的缓存，代价是恢复后头一两帧重绘；这是拿一点延迟换后台内存。
+///
+/// 失败一律吞掉：`with_webview` 在窗口销毁竞态里会返回 Err，老运行时
+/// （< 1.0.2210）没有 ICoreWebView2_19，cast 也会失败。档位只是顺手省点
+/// 内存，不该让前端看到报错。
+#[tauri::command(rename = "set_webview_memory_low")]
+pub fn cmd_set_webview_memory_low(window: tauri::WebviewWindow, low: bool) {
+    crate::webview_mem::set_low(&window, low);
+}
+
 #[tauri::command(rename = "get_download_concurrency")]
 pub async fn cmd_get_download_concurrency(state: State<'_, AppState>) -> Result<usize, String> {
     Ok(state.downloads.concurrency())

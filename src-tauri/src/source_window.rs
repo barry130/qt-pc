@@ -38,6 +38,11 @@ fn build(app: &AppHandle, smoke: bool) -> tauri::Result<tauri::WebviewWindow> {
     .skip_taskbar(true)
     .focused(false)
     .shadow(false)
+    // 必须与主窗/小窗用同一套 WebView2 参数：同一 user data 目录下的多个
+    // WebView2 环境参数不一致时，**后创建的那个直接失败**（2026-10-30 实测：
+    // 只给主窗加参数，引擎窗创建报 HRESULT(0x8007139F)「没有注册类」，
+    // 在线取链整体不可用）。新增窗口时别漏这一行。
+    .additional_browser_args(crate::webview_mem::BROWSER_ARGS)
     .build()
 }
 

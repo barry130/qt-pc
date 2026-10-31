@@ -125,6 +125,8 @@ fn build_login_window(app: &AppHandle, url: tauri::Url) -> Result<(), String> {
         .inner_size(480.0, 640.0)
         .center()
         .resizable(true)
+        // 同 source_window::build 的注释：参数要和其它窗口完全一致
+        .additional_browser_args(crate::webview_mem::BROWSER_ARGS)
         .build()
         .map_err(|e| format!("登录窗口创建失败: {e}"))?;
     Ok(())

@@ -92,6 +92,10 @@ souvlaki = { version = "0.8.3", default-features = false, features = ["use_zbus"
 # GDI 现场生成图标 + 窗口过程替换接收按钮点击。
 # 版本与 tauri 2.12 链条锁定的 windows 0.62 对齐，避免引入第二份副本。
 [target.'cfg(windows)'.dependencies]
+# WebView2 的 ICoreWebView2_19::SetMemoryUsageTargetLevel（webview_mem.rs）。
+# 版本必须与 tauri 2.12.1 锁定的那份对齐（Cargo.lock 里已是 0.39.1），
+# 否则 PlatformWebview::controller() 返回的接口类型对不上、cast 失败。
+webview2-com = "0.39"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

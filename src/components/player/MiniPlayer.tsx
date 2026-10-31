@@ -3,7 +3,6 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { LogicalSize } from "@tauri-apps/api/dpi";
 import {
   ListMusic,
-  Loader2,
   Maximize2,
   Music,
   Pause,
@@ -22,6 +21,7 @@ import { useNowPlayingCover } from "@/hooks/useNowPlayingLocalMedia";
 import { toggleMiniPlayer } from "@/services/ipc";
 import { cn } from "@/lib/utils";
 import { log } from "@/lib/logger";
+import { Spinner } from "@/components/ui";
 
 /**
  * 迷你播放器窗口（REQUIREMENTS §3.21.7.2 / DESIGN §4.3）。
@@ -184,7 +184,7 @@ export function MiniPlayer(): React.JSX.Element {
             onClick={() => void toggle().catch(() => {})}
           >
             {loading ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
+              <Spinner size="md" className="h-4 w-4" />
             ) : playing ? (
               <Pause className="h-4 w-4" />
             ) : (

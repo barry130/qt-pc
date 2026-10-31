@@ -2217,3 +2217,13 @@ export async function aiLocalChat(
     temperature: temperature ?? null,
   });
 }
+
+/**
+ * 设置本窗口 WebView2 的内存目标档位（窗口隐藏时降档）。
+ *
+ * 只是省内存的锦上添花：非 Windows 平台、或 WebView2 运行时版本太老
+ * （无 ICoreWebView2_19）时 Rust 侧会静默跳过，不会报错。
+ */
+export function setWebviewMemoryLow(low: boolean): Promise<void> {
+  return invoke<void>("set_webview_memory_low", { low });
+}

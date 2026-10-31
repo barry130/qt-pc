@@ -50,6 +50,7 @@ pub mod runtime_config;
 pub mod search_bridge;
 pub mod settings_keys;
 pub mod shortcuts;
+pub mod webview_mem;
 pub mod smtc;
 pub mod source_bundle;
 pub mod source_install;
@@ -724,6 +725,8 @@ pub fn run() {
             cmd_register_file_associations,
             cmd_unregister_file_associations,
             cmd_open_default_apps_settings,
+            // 资源优化（2026-10-30）：窗口隐藏时降 WebView2 内存档位
+            cmd_set_webview_memory_low,
         ]))
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

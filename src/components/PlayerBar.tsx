@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { SourceTag } from "@/components/common/SourceTag";
 import { useHint } from "@/components/common/Hint";
 import {
   AudioWaveform,
@@ -430,11 +431,16 @@ export function PlayerBar(): React.JSX.Element {
           <div className="truncate text-xs text-muted-foreground">
             {track ? track.singer : "未知"}
           </div>
-          {/* 实际播的码率（不是"请求了什么"，是"真在播什么"）。
-              测不出来就整行不渲染：宁可空着，也不写个 0 kbps 冒充"码率极低"。 */}
-          {track && bitrateKbps !== null ? (
-            <div className="truncate text-2xs tabular-nums text-muted-foreground/80">
-              {bitrateKbps} kbps
+          {/* 平台徽标 + 实际播的码率（不是"请求了什么"，是"真在播什么"）。
+              码率测不出来就只留平台：宁可空着，也不写个 0 kbps 冒充"码率极低"。 */}
+          {track ? (
+            <div className="flex min-w-0 items-center gap-1.5 text-muted-foreground/80">
+              <SourceTag platform={track.platform} size="xs" />
+              {bitrateKbps !== null ? (
+                <span className="truncate text-2xs tabular-nums">
+                  {bitrateKbps} kbps
+                </span>
+              ) : null}
             </div>
           ) : null}
         </div>
@@ -698,6 +704,9 @@ function SpectrumBackground(): React.JSX.Element {
   const displayRef = useRef<Float32Array>(new Float32Array(SPECTRUM_BARS));
   const lastAtRef = useRef(0);
   const colorRef = useRef({ rgb: "120,120,120", at: 0 });
+  // 绘制循环的唤醒柄：静默后循环会自己停掉（见下面的零态分支），
+  // 由「新数据到达」把它重新踢起来，待机时零空转。
+  const kickRef = useRef<(() => void) | null>(null);
 
   // 频谱数据订阅：Rust 引擎每帧写入 SharedArrayBuffer 后广播，这里拷进 ref，
   // 绘制循环只读 ref —— 订阅与绘制两个 effect 各自独立清理（useTauriEvent
@@ -707,13 +716,22 @@ function SpectrumBackground(): React.JSX.Element {
     const src = e.payload.bands ?? [];
     for (let i = 0; i < bands.length; i++) bands[i] = src[i] ?? 0;
     lastAtRef.current = performance.now();
+    kickRef.current?.();
   });
 
   useEffect(() => {
     const canvas = canvasRef.current;
     let raf = 0;
     let wasActive = false;
-    const draw = (): void => {
+    let lastAt = 0;
+    const draw = (at: number): void => {
+      // 30fps 上限（2026-10-30 资源优化）：频谱是观感装饰，30fps 与 60fps
+      // 肉眼无差别，而整窗画布重绘是 GPU 进程的主要开销之一。
+      if (at - lastAt < 33) {
+        raf = window.requestAnimationFrame(draw);
+        return;
+      }
+      lastAt = at;
       raf = window.requestAnimationFrame(draw);
       const w = canvas?.clientWidth ?? 0;
       const h = canvas?.clientHeight ?? 0;
@@ -748,12 +766,16 @@ function SpectrumBackground(): React.JSX.Element {
         if (display[i] > max) max = display[i];
       }
 
-      // 零态只清一次屏，之后不再产生绘制调用
+      // 零态只清一次屏，然后**停掉循环**（2026-10-30 资源优化）：以前是每帧
+      // 空转 return，暂停播放或关掉频谱时照样每秒醒 60 次。现在等下一次
+      // spectrum 事件经 kickRef 把循环重新踢起来，待机零成本。
       if (!fresh && max < 0.004) {
         if (wasActive) {
           ctx.clearRect(0, 0, w, h);
           wasActive = false;
         }
+        window.cancelAnimationFrame(raf);
+        raf = 0;
         return;
       }
       wasActive = true;
@@ -791,9 +813,13 @@ function SpectrumBackground(): React.JSX.Element {
       }
       ctx.fill();
     };
+    kickRef.current = () => {
+      if (raf === 0) raf = window.requestAnimationFrame(draw);
+    };
     raf = window.requestAnimationFrame(draw);
 
     return () => {
+      kickRef.current = null;
       window.cancelAnimationFrame(raf);
     };
   }, []);

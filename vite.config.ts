@@ -43,6 +43,17 @@ export default defineConfig({
   envPrefix: ["VITE_", "TAURI_ENV_"],
   build: {
     target: process.env.TAURI_ENV_PLATFORM == "windows" ? "chrome105" : "es2021",
+    // 三个入口（2026-10-30 资源优化）：主窗 index.html、桌面歌词窗
+    // lyric.html、迷你播放器窗 mini.html。后两者原来复用 index.html，
+    // 于是各自的渲染进程都要跑一遍主窗的启动代码；拆开后它们只加载
+    // 自己那棵子树（App.tsx 里按 label 的分流保留作兜底）。
+    rollupOptions: {
+      input: {
+        main: path.resolve(__dirname, "index.html"),
+        lyric: path.resolve(__dirname, "lyric.html"),
+        mini: path.resolve(__dirname, "mini.html"),
+      },
+    },
     minify: !process.env.TAURI_ENV_DEBUG ? "esbuild" : false,
     sourcemap: !!process.env.TAURI_ENV_DEBUG,
     outDir: "dist",

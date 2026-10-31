@@ -19,7 +19,6 @@ export function useInterpolatedPosition(): number {
   // 锚点：seek / 切歌 / 每次 tick 都会改写它
   const anchorValue = usePlayerStore((s) => s.positionAnchorValue);
   const [value, setValue] = useState(0);
-  const rafRef = useRef(0);
   // 上一次真正进 state 的量化值。用 ref 而不是 effect 局部变量：rAF 循环与
   // 锚点同步是两处写入，必须共享同一个「已提交值」，否则会各自记账。
   const lastRef = useRef(0);
@@ -51,10 +50,14 @@ export function useInterpolatedPosition(): number {
         lastRef.current = next;
         setValue(next);
       }
-      rafRef.current = requestAnimationFrame(loop);
     };
-    rafRef.current = requestAnimationFrame(loop);
-    return () => cancelAnimationFrame(rafRef.current);
+    // 资源优化（2026-10-30）：原来是 60fps 的 rAF，只为了每 16ms 比对一次
+    // 「量化值有没有跨过 100ms 桶」—— 真正落 state 的步长本来就是 QUANTUM_MS，
+    // 等于每秒白醒 50 次，而播放条/播放页/迷你窗各有一份。直接按量子步长定时，
+    // 唤醒次数降到 1/6；窗口隐藏时浏览器本来就会节流定时器，回来时下一次触发
+    // 自然对齐到新位置，不会积累漂移。
+    const timer = window.setInterval(loop, QUANTUM_MS);
+    return () => window.clearInterval(timer);
   }, [status, interpolated]);
 
   return value;

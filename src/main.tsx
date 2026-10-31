@@ -6,6 +6,7 @@ import "./index.css";
 import * as ipc from "./services/ipc";
 import { ErrorBoundary } from "./components/common/ErrorBoundary";
 import { LAST_ERROR_KEY } from "./lib/storageKeys";
+import { installHiddenPause } from "./entries/boot";
 
 /**
  * React 挂载之前/之外的兜底提示。
@@ -152,6 +153,9 @@ window.addEventListener("unhandledrejection", (e) => {
     `未处理的 Promise 拒绝（${currentLabel()}）：\n${describeReason(e.reason)}`,
   );
 });
+
+// 窗口隐藏时暂停动效并降 WebView2 内存档位（2026-10-30 资源优化）
+installHiddenPause();
 
 try {
   ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(

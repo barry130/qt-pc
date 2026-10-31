@@ -98,7 +98,9 @@ fn build_window(app: &AppHandle) -> tauri::Result<tauri::WebviewWindow> {
     WebviewWindowBuilder::new(
         app,
         MINI_WINDOW_LABEL,
-        WebviewUrl::App("index.html".into()),
+        // 独立入口（2026-10-30）：迷你窗只要自己那一小块界面，
+        // 不再复用主窗的 index.html 把整套启动代码拖进这个渲染进程。
+        WebviewUrl::App("mini.html".into()),
     )
     .title("轻听迷你播放器")
     .inner_size(MINI_WIDTH, MINI_BAR_HEIGHT)
@@ -110,7 +112,21 @@ fn build_window(app: &AppHandle) -> tauri::Result<tauri::WebviewWindow> {
     .resizable(false)
     .focused(true)
     .visible(false)
+    // 与主窗共用同一套 WebView2 参数（tauri.conf.json 的 additionalBrowserArgs
+    // 只作用于配置里声明的窗口，代码创建的小窗要自己再传一次）
+    .additional_browser_args(crate::webview_mem::BROWSER_ARGS)
     .build()
+}
+
+/// 迷你模式是否处于激活态（托盘「迷你模式」勾选态的唯一判据）。
+///
+/// 退出迷你模式时窗口是 destroy 而不是 hide（见下方 hide），所以「窗口还在」
+/// 就等于「迷你模式开着」。不看持久化状态：进程被强杀时那份 visible 会留下
+/// 脏值，而启动时并不会自动恢复迷你模式（lib.rs 只恢复桌面歌词窗）。
+pub fn is_active(app: &AppHandle) -> bool {
+    app.get_webview_window(MINI_WINDOW_LABEL)
+        .and_then(|win| win.is_visible().ok())
+        .unwrap_or(false)
 }
 
 /// 显示迷你窗口并隐藏主窗（互切的一半）。返回应用后的可见性。
@@ -143,10 +159,18 @@ pub fn show(app: &AppHandle) -> Result<bool, String> {
     state.visible = true;
     save_state(db.as_deref(), &state);
     let _ = app.emit("mini-window-changed", true);
+    // 托盘「迷你模式」的勾选要跟着变（用户从播放条按钮或快捷键进来时也是这条路径）
+    crate::tray::sync_mini_checked(app);
     Ok(true)
 }
 
-/// 隐藏迷你窗口并唤回主窗。复用窗口，避免 CloseRequested 再次触发自身。
+/// 关闭迷你窗口（**销毁**，不常驻）并唤回主窗。
+///
+/// 2026-10-30 资源优化：原来是 `hide()` 只隐藏不销毁（注释写的是「复用窗口，
+/// 避免 CloseRequested 再次触发自身」），实测一个隐藏着的迷你窗仍占约
+/// 150 MB 渲染进程内存。改用 `destroy()`：它不触发 CloseRequested（所以
+/// 不会再被上面的分支接住），下次进迷你模式由 build_window 重建，代价约
+/// 300ms，但不用迷你模式时这份内存直接还给系统。
 pub fn hide(app: &AppHandle) -> Result<bool, String> {
     let state_guard = app.try_state::<AppState>();
     let db = state_guard.as_ref().and_then(|s| s.db.clone());
@@ -158,7 +182,9 @@ pub fn hide(app: &AppHandle) -> Result<bool, String> {
                 state.y = pos.y;
             }
         }
-        win.hide().map_err(|e| format!("收起迷你窗口失败: {e}"))?;
+        // destroy 而不是 close：close 会再发一次 CloseRequested，而
+        // lib.rs 的 on_window_event 正是用「收到关闭 → 调本函数」来兜底。
+        win.destroy().map_err(|e| format!("收起迷你窗口失败: {e}"))?;
     }
     state.visible = false;
     save_state(db.as_deref(), &state);
@@ -172,6 +198,7 @@ pub fn hide(app: &AppHandle) -> Result<bool, String> {
         }
     }
     let _ = app.emit("mini-window-changed", false);
+    crate::tray::sync_mini_checked(app);
     Ok(false)
 }
 
