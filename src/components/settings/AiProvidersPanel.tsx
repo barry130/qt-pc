@@ -232,6 +232,9 @@ export function AiProvidersPanel(): JSX.Element {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
+  const [checking, setChecking] = useState(false);
+  /** 「测试连接」的结果就地显示在详情页标题行（不放浮层——用户要能一直看着它） */
+  const [checkNote, setCheckNote] = useState<{ ok: boolean; text: string } | null>(null);
   const [fetchingModels, setFetchingModels] = useState(false);
   const [filter, setFilter] = useState("");
   const [draft, setDraft] = useState<EditingDraft | null>(null);
@@ -279,6 +282,8 @@ export function AiProvidersPanel(): JSX.Element {
 
   const patchDraft = useCallback((patch: Partial<EditingDraft>) => {
     setDraft((current) => (current ? { ...current, ...patch } : current));
+    // 改了任何字段，上一次「测试连接」的结论就过期了（用户看着标题行，别留旧结论）
+    setCheckNote(null);
   }, []);
 
   const buildInput = useCallback((current: EditingDraft): AiProfileInput => {
@@ -469,6 +474,52 @@ export function AiProvidersPanel(): JSX.Element {
     }
   }, [draft, patchDraft, testing]);
 
+  /**
+   * 「测试连接」：用表单里的值发一句「你好」，把成功/失败都讲清楚。
+   * 与「检测协议」的区别——检测协议是四路并发猜协议、只回一句通不通；
+   * 这里用**当前选中的协议**真发一次请求，成功回耗时与模型回复片段，
+   * 失败回具体原因（401 是 Key 不对、404 多半是 Base URL 少了 /v1），
+   * 让用户不用保存就能确认这套配置能不能用。
+   */
+  const checkConnect = useCallback(async (): Promise<void> => {
+    if (!draft || checking) return;
+    const baseUrl = draft.baseUrl.trim();
+    if (!baseUrl) {
+      toastError("请先填写 Base URL");
+      return;
+    }
+    const model = draft.models[0] ?? "";
+    if (!model) {
+      toastError("请先选一个模型，或点「获取列表」拉取");
+      return;
+    }
+    setChecking(true);
+    try {
+      const result = await ipc.aiLocalTest(
+        baseUrl,
+        model,
+        draft.keyDraft.trim() || undefined,
+        draft.protocol,
+        draft.skipCertVerify,
+      );
+      if (!alive.current) return;
+      if (result.ok) {
+        const reply = (result.reply ?? "").trim().replace(/\s+/g, " ");
+        const head = `连接正常 · ${model} · ${result.elapsedMs}ms`;
+        setCheckNote({
+          ok: true,
+          text: reply.length > 0 ? `${head} · 回复：${reply}` : head,
+        });
+      } else {
+        setCheckNote({ ok: false, text: `连接失败：${result.error ?? "未知错误"}` });
+      }
+    } catch (err) {
+      if (alive.current) setCheckNote({ ok: false, text: `连接失败：${errMsg(err)}` });
+    } finally {
+      if (alive.current) setChecking(false);
+    }
+  }, [checking, draft]);
+
   const pickIconFile = useCallback(
     (file: File | null) => {
       if (!file) return;
@@ -615,8 +666,30 @@ export function AiProvidersPanel(): JSX.Element {
           <ChevronLeft className="h-4 w-4" />
           返回
         </button>
-        <span className="truncate text-xs text-muted-foreground">
-          {draft.isNew ? "添加供应商" : `编辑「${draft.name || draft.baseUrl}」`}
+        {/* 测试连接的结论就地留在这行（用户要能一直看着它，浮层几秒就飘走了）。
+            不再放「编辑「某某」」标题：名称下面输入框里就有，重复且占地方。 */}
+        <span className="flex min-w-0 items-center">
+          {checking ? (
+            <span className="flex items-center gap-1 text-3xs text-muted-foreground">
+              <Spinner size="xs" className="h-2.5 w-2.5" />
+              正在测试连接…
+            </span>
+          ) : checkNote ? (
+            <span
+              role={checkNote.ok ? "status" : "alert"}
+              title={checkNote.text}
+              className={`flex max-w-[26rem] items-center gap-1 text-3xs ${
+                checkNote.ok ? "text-success" : "text-destructive"
+              }`}
+            >
+              {checkNote.ok ? (
+                <Check className="h-2.5 w-2.5 shrink-0" strokeWidth={3} />
+              ) : (
+                <X className="h-2.5 w-2.5 shrink-0" strokeWidth={3} />
+              )}
+              <span className="truncate">{checkNote.text}</span>
+            </span>
+          ) : null}
         </span>
       </div>
 
@@ -957,6 +1030,16 @@ export function AiProvidersPanel(): JSX.Element {
             <Copy className="h-3.5 w-3.5" />
             复制
           </button>
+          <button
+            type="button"
+            onClick={() => void checkConnect()}
+            disabled={checking || saving}
+            title="用当前填的地址、模型、Key 真发一句话，确认这套配置能不能用"
+            className={GHOST_BUTTON_CLASS}
+          >
+            {checking ? <Spinner size="xs" className="h-3 w-3" /> : <Zap className="h-3.5 w-3.5" />}
+            测试连接
+          </button>
         </span>
         <span className="flex items-center gap-1.5">
           <button
@@ -993,7 +1076,7 @@ export function AiProvidersDialog(props: { onClose: () => void }): JSX.Element {
       open
       onClose={props.onClose}
       title="AI 供应商"
-      description="外面只看到供应商列表，点一行进去改 API 地址、协议、密钥和模型；第一把密钥、第一个模型生效。"
+      description="点一行进去改地址、协议、密钥和模型；第一把密钥、第一个模型生效。"
       closeLabel="关闭 AI 供应商设置"
       size="lg"
       className="max-w-3xl"

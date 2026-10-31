@@ -237,6 +237,81 @@ describe("供应商详情", () => {
     expect(mocks.aiLocalSaveConfig).not.toHaveBeenCalled();
   });
 
+  it("测试连接：用当前表单值真发一次，结论就地显示在标题行（不进浮层）", async () => {
+    mocks.aiLocalTest.mockResolvedValue({
+      ok: true,
+      status: 200,
+      elapsedMs: 120,
+      reply: "你好，我是助手",
+      error: null,
+    });
+    render(<AiProvidersPanel />);
+    await openDetail("魔塔");
+    fireEvent.click(screen.getByText("测试连接"));
+    await waitFor(() => expect(mocks.aiLocalTest).toHaveBeenCalledTimes(1));
+    // 只发一次、用当前选中的协议（不是四路探测）
+    const call = mocks.aiLocalTest.mock.calls[0];
+    expect(call[0]).toBe("https://api.openai.com/v1");
+    expect(call[1]).toBe("gpt-4o-mini");
+    expect(call[2]).toBeUndefined();
+    expect(call[3]).toBe("openai");
+    expect(call[4]).toBe(false);
+    // 结论留在页内（role=status），不走 toast（浮层几秒就飘走，用户要能一直看着）
+    const note = await screen.findByRole("status");
+    expect(note.textContent).toContain("连接正常");
+    expect(note.textContent).toContain("120ms");
+    expect(note.textContent).toContain("你好，我是助手");
+    expect(note.className).toContain("text-success");
+    expect(mocks.toastSuccess).not.toHaveBeenCalled();
+    // 测试连接不写盘
+    expect(mocks.aiLocalSaveConfig).not.toHaveBeenCalled();
+  });
+
+  it("测试连接：失败回具体原因（红字留在页内），不写盘", async () => {
+    mocks.aiLocalTest.mockResolvedValue({
+      ok: false,
+      status: null,
+      elapsedMs: 300,
+      reply: null,
+      error: "401 未授权：Key 无效",
+    });
+    render(<AiProvidersPanel />);
+    await openDetail("魔塔");
+    fireEvent.click(screen.getByText("测试连接"));
+    const note = await screen.findByRole("alert");
+    expect(note.textContent).toContain("401 未授权：Key 无效");
+    expect(note.className).toContain("text-destructive");
+    expect(mocks.toastError).not.toHaveBeenCalled();
+    expect(mocks.aiLocalSaveConfig).not.toHaveBeenCalled();
+  });
+
+  it("测试连接后改任何字段，旧结论立刻清掉（不留过期结论）", async () => {
+    mocks.aiLocalTest.mockResolvedValue({
+      ok: true,
+      status: 200,
+      elapsedMs: 120,
+      reply: "好",
+      error: null,
+    });
+    render(<AiProvidersPanel />);
+    await openDetail("魔塔");
+    fireEvent.click(screen.getByText("测试连接"));
+    expect(await screen.findByRole("status")).toBeTruthy();
+    fireEvent.change(screen.getByPlaceholderText("https://api.openai.com/v1"), {
+      target: { value: "https://api.openai.com/v1/" },
+    });
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("测试连接：还没选模型时先提示，不发请求", async () => {
+    render(<AiProvidersPanel />);
+    await openDetail("魔塔");
+    fireEvent.click(screen.getByText("全不选"));
+    fireEvent.click(screen.getByText("测试连接"));
+    expect(mocks.toastError).toHaveBeenCalled();
+    expect(mocks.aiLocalTest).not.toHaveBeenCalled();
+  });
+
 describe("供应商标配弹窗（用户 2026-10-24 要求：不要一页展开，点开弹窗改）", () => {
   it("弹窗带标题与说明，内容还是供应商列表", async () => {
     const onClose = vi.fn();
