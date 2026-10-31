@@ -73,7 +73,8 @@ afterEach(cleanup);
 
 describe("音源包设置页的教程入口", () => {
   it("官网地址已配置时，教程强调条渲染在最顶部（先于「数据包」行）", async () => {
-    state.settings.set("__site", "https://quietmusic.canace.cn");
+    // 官网地址是私有配置（真值只在 app.config.local.json），测试夹具用假地址即可
+    state.settings.set("__site", "https://example.com");
     const { container } = render(<SourcePackageSection />);
     await waitFor(() => expect(container.textContent).toContain("如何设置音源"));
     const text = container.textContent ?? "";
