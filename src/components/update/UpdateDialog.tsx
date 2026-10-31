@@ -1,8 +1,11 @@
 import { useEffect, useState } from "react";
 import { errMsg } from "@/lib/utils";
+import { RichText } from "@/lib/richText";
 import type { AppUpdateInfo } from "@/types";
 import * as ipc from "@/services/ipc";
+import { Modal } from "@/components/ui";
 import { useUpdateStore } from "@/stores/update";
+import { buttonClass } from "@/components/ui";
 
 /**
  * 更新弹窗（§15.3 updateType=1 / isForce=1）：
@@ -86,8 +89,15 @@ export function UpdateDialog(): React.JSX.Element | null {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-      <div className="w-96 rounded-2xl border border-white/20 bg-white/70 p-5 text-card-foreground shadow-2xl backdrop-blur-xl dark:border-white/10 dark:bg-black/40">
+    <Modal
+      open
+      onClose={close}
+      size="sm"
+      tone="glass"
+      dismissible={false}
+      closeOnBackdrop={false}
+      bodyClassName="p-5"
+    >
         <h2 className="text-base font-medium">
           发现新版本 {info.versionName}
           {isForce(info) && (
@@ -96,9 +106,16 @@ export function UpdateDialog(): React.JSX.Element | null {
             </span>
           )}
         </h2>
-        <p className="mt-3 whitespace-pre-wrap text-sm text-muted-foreground">
-          {info.versionInfo || "暂无更新说明"}
-        </p>
+        {/* 更新说明支持富文本：后端 versionInfo 与移动端一致按 HTML 下发（qt-uniappx 的
+            qt-upgrade-popup 就是 :html="info.versionInfo"），PC 之前整段按纯文本渲染，
+            标签会原样露出来。说明可能很长，这里单独限高滚动，免得把按钮顶出可视区。 */}
+        <div className="mt-3 max-h-[40vh] overflow-y-auto pr-1">
+          {info.versionInfo.trim().length > 0 ? (
+            <RichText text={info.versionInfo} />
+          ) : (
+            <p className="text-sm text-muted-foreground">暂无更新说明</p>
+          )}
+        </div>
         {info.fileSize > 0 && (
           <p className="mt-2 text-xs text-muted-foreground">
             安装包大小：{(info.fileSize / 1024 / 1024).toFixed(1)} MB
@@ -137,7 +154,7 @@ export function UpdateDialog(): React.JSX.Element | null {
                 <button
                   type="button"
                   onClick={close}
-                  className="rounded-md border border-border px-3 py-1.5 text-xs transition-colors hover:bg-accent"
+                  className={buttonClass({ variant: "outline" })}
                 >
                   暂不更新
                 </button>
@@ -146,7 +163,7 @@ export function UpdateDialog(): React.JSX.Element | null {
                 <button
                   type="button"
                   onClick={() => void openBrowser()}
-                  className="rounded-md border border-border px-3 py-1.5 text-xs transition-colors hover:bg-accent"
+                  className={buttonClass({ variant: "outline" })}
                 >
                   浏览器下载
                 </button>
@@ -155,7 +172,7 @@ export function UpdateDialog(): React.JSX.Element | null {
                 <button
                   type="button"
                   onClick={() => void startDownload()}
-                  className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90"
+                  className={buttonClass({ variant: "primary" })}
                 >
                   立即更新
                 </button>
@@ -166,14 +183,13 @@ export function UpdateDialog(): React.JSX.Element | null {
             <button
               type="button"
               onClick={close}
-              className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90"
+              className={buttonClass({ variant: "primary" })}
             >
               完成
             </button>
           )}
         </div>
-      </div>
-    </div>
+    </Modal>
   );
 }
 
