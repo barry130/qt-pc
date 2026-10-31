@@ -22,6 +22,7 @@ import { HorizontalScroller } from "./HorizontalScroller";
 import { TrackCard } from "./TrackCard";
 import { LocalMixSection } from "@/components/mine/LocalMixSection";
 import { EmptyState } from "@/components/common/EmptyState";
+import { NoticeBarHost } from "@/components/notice/qt-NoticeBar";
 
 /**
  * 首页 / 发现（路由 /，DESIGN §5.2 / §5.3）。
@@ -292,6 +293,8 @@ export function DiscoverPage(): React.JSX.Element {
 
   return (
     <div className="h-full min-w-0 overflow-y-auto pb-6">
+      {/* 首页通告栏（后端 display & 2）：没通告时组件自己返回 null，不留空白 */}
+      <NoticeBarHost />
       {/* Hero：当前音源 + 快捷入口 */}
       <section className="px-5 pt-5">
         <div className="rounded-2xl border border-border bg-gradient-to-br from-primary/10 via-primary/5 to-transparent p-6">

@@ -8,12 +8,14 @@ import {
   RefreshCw,
   X,
 } from "lucide-react";
+import { noticeTypeLabel } from "@/lib/notice-data";
 import { useMessages, summary, type MessageItem } from "./messages-data";
 import { RichText } from "@/lib/richText";
 import * as ipc from "@/services/ipc";
 import { IconButton } from "@/components/common/IconButton";
 import { Popover } from "@/components/common/Popover";
 
+import { EmptyState, RowsSkeleton } from "@/components/ui";
 /**
  * 消息中心弹出面板（标题栏「消息中心」图标点开，参考主流播放器的邮件下拉）。
  *
@@ -179,14 +181,14 @@ function MessagesPanel(props: {
 
           <div className="min-h-0 flex-1 overflow-y-auto">
             {loading ? (
-              <p className="py-10 text-center text-sm text-muted-foreground">加载中…</p>
+              <RowsSkeleton rows={5} cover="none" />
             ) : error ? (
               <div className="px-4 py-10 text-center">
                 <p className="text-sm text-muted-foreground">暂时读不到消息</p>
                 <p className="mt-1 text-2xs text-muted-foreground">{error}</p>
               </div>
             ) : items.length === 0 ? (
-              <p className="py-10 text-center text-sm text-muted-foreground">还没有消息</p>
+              <EmptyState title="还没有消息" />
             ) : (
               <ul>
                 {items.map((it) => (
@@ -218,6 +220,10 @@ function MessagesPanel(props: {
                         )}
                         <span className="min-w-0 flex-1 truncate text-sm font-medium">
                           {it.title}
+                        </span>
+                        {/* 类型标签与移动端卡片一致：公告 / 反馈 / 需求 */}
+                        <span className="shrink-0 rounded-full bg-secondary px-1.5 py-0.5 text-2xs text-muted-foreground">
+                          {noticeTypeLabel(it.noticeType)}
                         </span>
                         <span className="shrink-0 text-2xs text-muted-foreground">
                           {it.time}

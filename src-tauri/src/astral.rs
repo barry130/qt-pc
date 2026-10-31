@@ -1489,12 +1489,17 @@ impl AstralClient {
 
     // ---------- 消息（§15.4）：固定 channel=pc ----------
 
+    // 三个消息端点都必须带 satoken（哪怕 /active 是公开端点）：后端拿它判断「谁在看」，
+    // 游客拿不到 audience=LOGGED_IN 的通告，也拿不到点对点（反馈回复）通知。
+    // 移动端 services/notice.ts 的 fetchActiveNotices 同样无条件带 token，这里对齐。
+
     pub async fn active_messages(&self, version_code: i64) -> Result<Value, String> {
         let code_str = version_code.to_string();
+        // auth=true：已登录就带 satoken（没有 token 时 request_once 不会加头，等同游客）
         self.get(
             "app/message/active",
             &[("versionCode", &code_str), ("channel", MESSAGE_CHANNEL)],
-            false,
+            true,
         )
         .await
     }

@@ -37,6 +37,8 @@ export interface MessageItem {
   url?: string;
   /** 解析后的跳转目标；null/undefined = 不可点 */
   link?: NoticeLink;
+  /** 后端 noticeType：announce / notice / 历史别名 feedback / request，见 noticeTypeLabel */
+  noticeType: string;
 }
 
 export interface MessagesData {
@@ -140,6 +142,7 @@ function normalizeMessages(data: unknown): MessageItem[] {
       read: bool(o.read ?? o.isRead ?? o.readed ?? o.hasRead),
       url: url.length > 0 ? url : undefined,
       link: link ?? undefined,
+      noticeType: str(o.noticeType).trim().toLowerCase(),
     };
   });
 }

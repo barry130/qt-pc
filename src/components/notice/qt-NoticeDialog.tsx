@@ -1,46 +1,54 @@
 import { useEffect, useMemo, useState } from "react";
-import { coerceNumber as numberValue, coerceString as stringValue } from "@/lib/coerce";
 import { markFirstLoginShown, migrateLegacyFirstLogin, readFirstLoginShown } from "@/lib/noticeFirstLogin";
+import { isNoticeLinkOpenable, useOpenNoticeLink } from "@/lib/notice-open";
+import {
+  DISPLAY_SPLASH,
+  hasDisplay,
+  pickSplashNotices,
+  useActiveNotices,
+  type ActiveNotice,
+} from "@/lib/notice-data";
 import { RichText } from "@/lib/richText";
-import * as ipc from "@/services/ipc";
 import { useAuthStore } from "@/stores/auth";
 
-const DISPLAY_SPLASH = 1;
-
-interface NoticeItem {
-  id: number;
-  title: string;
-  content: string;
-  url?: string;
-  dialogClosable: boolean;
-  firstLoginOnly: boolean;
-  isTop: boolean;
-  createTime: string;
-}
-
+/**
+ * 通用公告弹窗（后端展示位 `display & 1`）。
+ *
+ * 取数与过滤搬到 `lib/notice-data`（与首页通告栏共用一次请求），这里只负责：
+ * 一条一条弹、按 id 记「今天不显示」、按 id 记「首次登录已弹」、把 url 变成跳转。
+ * 跳转目标认 `astral://` 内跳（见 lib/notice-open），不再只认 http(s)。
+ */
 export function QtNoticeDialog(): React.JSX.Element | null {
   const session = useAuthStore((s) => s.session);
-  const [notices, setNotices] = useState<NoticeItem[]>([]);
+  const { notices } = useActiveNotices();
+  const openLink = useOpenNoticeLink();
   const [index, setIndex] = useState(0);
   const [hideToday, setHideToday] = useState(false);
 
-  useEffect(() => {
-    let disposed = false;
-    void ipc.astralActiveMessages().then((data) => {
-      if (disposed) return;
-      setNotices(normalizeSplashNotices(data, session != null));
-      setIndex(0);
-    }).catch(() => {
-      if (!disposed) setNotices([]);
-    });
-    return () => {
-      disposed = true;
-    };
-  }, [session]);
+  const loggedIn = session != null;
 
-  const notice = notices[index] ?? null;
+  const splash = useMemo(() => {
+    // 老版本用一个全局布尔记「已弹过首次登录公告」：升级后先把它迁移成按条标记，
+    // 否则老用户明明看过，新发布的公告也会因为老标记而永远不弹。
+    migrateLegacyFirstLogin(
+      notices
+        .filter((notice) => hasDisplay(notice.display, DISPLAY_SPLASH) && notice.firstLoginOnly)
+        .map((notice) => notice.id),
+    );
+    return pickSplashNotices(notices, {
+      loggedIn,
+      isFirstLoginShown: readFirstLoginShown,
+    });
+  }, [notices, loggedIn]);
+
+  // 列表换了（刷新/换账号）就从头开始弹
+  useEffect(() => {
+    setIndex(0);
+  }, [splash]);
+
+  const notice: ActiveNotice | null = splash[index] ?? null;
   const hiddenToday = useMemo(
-    () => notice != null && readHiddenDate(notice.id) === todayStr(),
+    () => notice !== null && readHiddenDate(notice.id) === todayStr(),
     [notice],
   );
 
@@ -48,11 +56,12 @@ export function QtNoticeDialog(): React.JSX.Element | null {
     setHideToday(false);
   }, [notice?.id]);
 
+  // 今天已选过"不显示"的那条直接跳过，接着弹下一条
   useEffect(() => {
-    if (notice && hiddenToday) setIndex((value) => value + 1);
+    if (notice !== null && hiddenToday) setIndex((value) => value + 1);
   }, [notice, hiddenToday]);
 
-  if (!notice || hiddenToday) return null;
+  if (notice === null || hiddenToday) return null;
 
   const close = (): void => {
     if (!notice.dialogClosable) return;
@@ -65,10 +74,11 @@ export function QtNoticeDialog(): React.JSX.Element | null {
   };
 
   const jump = (): void => {
-    if (!notice.url || !/^https?:\/\//i.test(notice.url)) return;
-    void ipc.openExternalUrl(notice.url).catch(() => undefined);
+    openLink(notice.link);
     if (notice.dialogClosable) close();
   };
+
+  const jumpable = isNoticeLinkOpenable(notice.link);
 
   return (
     <div
@@ -99,7 +109,7 @@ export function QtNoticeDialog(): React.JSX.Element | null {
           >
             {notice.dialogClosable ? "我知道了" : "请阅读公告"}
           </button>
-          {notice.url && /^https?:\/\//i.test(notice.url) && (
+          {jumpable && (
             <button
               type="button"
               onClick={jump}
@@ -123,55 +133,6 @@ export function QtNoticeDialog(): React.JSX.Element | null {
     </div>
   );
 }
-
-function normalizeSplashNotices(data: unknown, loggedIn: boolean): NoticeItem[] {
-  if (!Array.isArray(data)) return [];
-  const items = data.map((item) => (item ?? {}) as Record<string, unknown>);
-  // 老版本用一个全局布尔记「已弹过首次登录公告」：升级后先把它迁移成按条标记，
-  // 否则老用户明明看过，新公告也会因为老标记而永远不弹。
-  migrateLegacyFirstLogin(
-    items
-      .filter((o) => (numberValue(o.display) & DISPLAY_SPLASH) !== 0 && numberValue(o.firstLoginOnly) === 1)
-      .map((o) => numberValue(o.id)),
-  );
-  const seen = new Set<string>();
-  return items
-    .filter((o) => {
-      if ((numberValue(o.display) & DISPLAY_SPLASH) === 0) return false;
-      // 首次启动免责声明（termsVersion 非空）由 FirstRunDisclaimer 单独渲染：
-      // 它有读秒和「改了条款重新确认」的语义，混进这个通用公告弹窗会两个弹窗叠着弹
-      if (stringValue(o.termsVersion).trim().length > 0) return false;
-      const audience = stringValue(o.audience || "ALL");
-      if (audience === "LOGGED_IN" && !loggedIn) return false;
-      if (audience === "NOT_LOGGED_IN" && loggedIn) return false;
-      // 每条公告各自记已弹：用户看过旧的那条，新发布的这条仍然应当弹出
-      if (numberValue(o.firstLoginOnly) === 1 && (!loggedIn || readFirstLoginShown(numberValue(o.id)))) {
-        return false;
-      }
-      return true;
-    })
-    .map((o) => {
-      return {
-        id: numberValue(o.id),
-        title: stringValue(o.title),
-        content: stringValue(o.content),
-        url: stringValue(o.url) || undefined,
-        dialogClosable: numberValue(o.dialogClosable ?? 1) === 1,
-        firstLoginOnly: numberValue(o.firstLoginOnly) === 1,
-        isTop: numberValue(o.isTop) === 1,
-        createTime: stringValue(o.createTime),
-      };
-    })
-    .sort((a, b) => Number(b.isTop) - Number(a.isTop) || b.createTime.localeCompare(a.createTime))
-    .filter((notice) => {
-      const key = `${notice.title}\n${notice.content}`;
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-}
-
-// stringValue/numberValue 的实现合并到 `@/lib/coerce`（coerceString/coerceNumber）。
 
 function todayStr(): string {
   const d = new Date();
