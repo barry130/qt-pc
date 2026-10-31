@@ -343,3 +343,137 @@ export async function extractCoverAccent(url: string): Promise<string | null> {
     return record(null);
   }
 }
+
+
+/** sRGB 三元组（每个通道 0–255） */
+export type Rgb = [number, number, number];
+
+/**
+ * 估算对比度用的参考底色：浅色主题取纯白、深色主题取最深那档（#0f0f23）。
+ * 都取极端值 —— 底色越接近白/黑，算出来的补偿越保守（宁可深一点也别看不清）。
+ */
+export const LIGHT_BACKDROP: Rgb = [255, 255, 255];
+export const DARK_BACKDROP: Rgb = [15, 15, 35];
+
+/**
+ * 解析 CSS 颜色串为 sRGB。
+ * 先吃十六进制 / rgb() / rgba()：内部调用与单测都走这条，不依赖 DOM。
+ * 其它写法（oklch() / color-mix() / var()）交给浏览器算 —— 临时元素设一次
+ * background-color 再读计算值，这是唯一能把任意合法 CSS 颜色解析成 rgb 的口径。
+ */
+export function parseCssColor(value: string): Rgb | null {
+  const text = value.trim();
+  const hex = hexToRgb(text);
+  if (hex) return hex;
+  const direct = text.match(/^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/i);
+  if (direct) {
+    return [
+      Math.round(Number(direct[1])),
+      Math.round(Number(direct[2])),
+      Math.round(Number(direct[3])),
+    ];
+  }
+  if (typeof document === "undefined") return null;
+  const probe = document.createElement("div");
+  probe.style.display = "none";
+  probe.style.backgroundColor = text;
+  document.body.appendChild(probe);
+  const computed = getComputedStyle(probe).backgroundColor;
+  probe.remove();
+  const resolved = computed.match(/^rgba?\(\s*([\d.]+)[,\s]+([\d.]+)[,\s]+([\d.]+)/i);
+  if (!resolved) return null;
+  return [
+    Math.round(Number(resolved[1])),
+    Math.round(Number(resolved[2])),
+    Math.round(Number(resolved[3])),
+  ];
+}
+
+/** WCAG 2.1 单通道线性化 */
+function channelLuminance(channel: number): number {
+  const c = channel / 255;
+  return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+}
+
+/** WCAG 2.1 相对亮度（0–1） */
+export function relativeLuminance([r, g, b]: Rgb): number {
+  return (
+    0.2126 * channelLuminance(r) +
+    0.7152 * channelLuminance(g) +
+    0.0722 * channelLuminance(b)
+  );
+}
+
+/** WCAG 2.1 对比度（1–21），入参顺序无关 */
+export function contrastRatio(a: Rgb, b: Rgb): number {
+  const la = relativeLuminance(a);
+  const lb = relativeLuminance(b);
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+}
+
+/** 两色线性混合：weight 是 a 的占比（0–1），用来估算「主色轻染过的底色」 */
+export function mixRgb(a: Rgb, b: Rgb, weight: number): Rgb {
+  const w = Math.min(1, Math.max(0, weight));
+  return [
+    Math.round(a[0] * w + b[0] * (1 - w)),
+    Math.round(a[1] * w + b[1] * (1 - w)),
+    Math.round(a[2] * w + b[2] * (1 - w)),
+  ];
+}
+
+/** hsl（h 度、s/l 0–1）→ sRGB */
+function hslToRgb(h: number, s: number, l: number): Rgb {
+  const hue = ((h % 360) + 360) % 360;
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((hue / 60) % 2) - 1));
+  const m = l - c / 2;
+  const seg: [number, number, number] =
+    hue < 60
+      ? [c, x, 0]
+      : hue < 120
+        ? [x, c, 0]
+        : hue < 180
+          ? [0, c, x]
+          : hue < 240
+            ? [0, x, c]
+            : hue < 300
+              ? [x, 0, c]
+              : [c, 0, x];
+  return [
+    Math.round((seg[0] + m) * 255),
+    Math.round((seg[1] + m) * 255),
+    Math.round((seg[2] + m) * 255),
+  ];
+}
+
+/**
+ * 把封面「醒目主色」校正成在该底色上读得清的文字色。
+ *
+ * 只沿明度轴移动，色相与饱和度原样保留 —— 用户认的是「这首歌的颜色」，
+ * 能改的只有深浅。底色亮就往暗处走、底色暗就往亮处走，取第一个达标的明度，
+ * 所以本来就够对比度的颜色会原样返回（不会无谓地改变观感）。
+ *
+ * target 默认 5:1（WCAG AA 的白底正文 4.5 之上留一点余量）：当前行还有一条
+ * 呼吸动画（opacity 最低 0.86），合成到背景上会把有效对比度再压掉一档。
+ *
+ * 解析不出 hsl() 时返回 null，调用方回退主题主色。
+ */
+export function readableOnBackdrop(accent: string, backdrop: Rgb, target = 5): string | null {
+  const parsed = accent
+    .trim()
+    .match(/^hsla?\(\s*([\d.]+)(?:deg)?[,\s]+([\d.]+)%[,\s]+([\d.]+)%/i);
+  if (!parsed) return null;
+  const h = Math.min(360, Math.max(0, Number(parsed[1])));
+  const s = Math.min(100, Math.max(0, Number(parsed[2])));
+  const start = Math.min(100, Math.max(0, Number(parsed[3])));
+  const step = relativeLuminance(backdrop) > 0.5 ? -1 : 1;
+  for (let i = 0; i <= 100; i++) {
+    const l = start + step * i;
+    if (l < 0 || l > 100) break;
+    if (contrastRatio(hslToRgb(h, s / 100, l / 100), backdrop) >= target) {
+      return `hsl(${Math.round(h)}, ${Math.round(s)}%, ${Math.round(l)}%)`;
+    }
+  }
+  // 明度轴走到头还是不够（纯白/纯黑底 + 极小 target 才会发生）：给绝对色
+  return step < 0 ? "hsl(0, 0%, 0%)" : "hsl(0, 0%, 100%)";
+}
