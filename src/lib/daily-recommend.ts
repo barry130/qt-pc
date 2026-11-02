@@ -149,8 +149,12 @@ export type { DailyTaste };
  * 风格歌单搜索、以及用户自己的搜索历史；每首歌带上「来自哪条风格线」的 provenance，
  * 排序改成按风格线交织，提示词要求覆盖 3–5 条线、AI 结果按线放宽「非主语种」的硬剔。
  * 池子/排序/提示词全变，当天的旧缓存必须作废重算。
+ *
+ * v10（2026-11-01）：用户反馈「为什么我心动模式也有换种口味的推荐歌曲」。入选规则没动，
+ * 是「没听过」这条理由的措辞不分口味 —— 心动/常听档挂一句「换个口味试试」与自己的
+ * 定位矛盾。`reasonFor` 改成按口味给措辞后，缓存里存的是旧措辞字符串，必须重算才能看见。
  */
-export const DAILY_RULE_VERSION = 9;
+export const DAILY_RULE_VERSION = 10;
 
 /** 目标条数 */
 export const DAILY_TARGET = 50;
@@ -1482,7 +1486,7 @@ export function rankCandidates(
 }
 
 /** 规则模式的推荐理由：只陈述能验证的事实，不编故事 */
-export function ruleReason(track: Track, pref: DailyPreference): string {
+export function ruleReason(track: Track, pref: DailyPreference, taste: DailyTaste): string {
   const profile = pref.style ?? buildStyleProfile({ samples: samplesFromPreference(pref) });
   const style = trackStyle(track);
   const key = trackKey(track);
@@ -1513,7 +1517,7 @@ export function ruleReason(track: Track, pref: DailyPreference): string {
   // 没听过要单独说出来：旧实现漏了这个命中，导致空画像时所有歌都落到
   // 兜底的「换一批看看」，理由成了没有信息量的噪声。
   if (!isPlayed(track, pref)) hits.push("unplayed");
-  return reasonFor({ track, style, score: 0, hits }, profile, "heart");
+  return reasonFor({ track, style, score: 0, hits }, profile, taste);
 }
 
 /**
@@ -2189,7 +2193,7 @@ export function limitAiPicks(
       if (!hasProfileGrounding(trackEvidence(track, snapshot), laneGrounded(track, lanes))) continue;
       offCore += 1;
     }
-    items.push({ track, reason: pick.reason || ruleReason(track, pref) });
+    items.push({ track, reason: pick.reason || ruleReason(track, pref, taste) });
   }
   return items;
 }
@@ -2283,7 +2287,7 @@ async function pickByServer(
     const index = indexOf.get(trackKey(track));
     if (index === undefined) continue;
     if (picks.some((pick) => pick.index === index)) continue;
-    picks.push({ index, reason: ruleReason(track, pref) });
+    picks.push({ index, reason: ruleReason(track, pref, taste) });
   }
   if (picks.length === 0) throw new Error(parsed.error ?? "服务端没挑出可用的歌");
   return { parsed: { title: "", summary: "", picks, error: null }, model: reply.model };
@@ -2451,7 +2455,7 @@ export async function generateDailyRecommend(
   // 规则结果永远只取前 DAILY_TARGET 首（降级与补齐都用它）
   const ruleItems: DailyRecommendItem[] = rulePicked.slice(0, DAILY_TARGET).map((track) => ({
     track,
-    reason: ruleReason(track, pref),
+    reason: ruleReason(track, pref, taste),
   }));
   // 画像的人话描述：页面上要显示"系统认为你是什么口味"，用户才能判断推荐得准不准。
   // 冷启动时画像一定是空的（没有样本），显示「口味还不明显」不如直接让他去选风格。
@@ -2537,7 +2541,7 @@ export async function generateDailyRecommend(
       if (items.length >= DAILY_TARGET) break;
       if (used.has(trackKey(track))) continue;
       used.add(trackKey(track));
-      items.push({ track, reason: ruleReason(track, pref) });
+      items.push({ track, reason: ruleReason(track, pref, taste) });
       filled += 1;
     }
     // 模型给的是它自己的顺序，可能把同一个歌手连着排 —— 只做最小相邻交换，

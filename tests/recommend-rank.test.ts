@@ -453,9 +453,20 @@ describe("reasonFor", () => {
       reasonFor(candidate(track("1", "t", "谁"), ["main-lang"]), profile(), "heart"),
     ).toBe("符合你常听的华语");
     expect(
-      reasonFor(candidate(track("2", "t", "谁"), ["unplayed"]), profile(), "heart"),
+      reasonFor(candidate(track("2", "t", "谁"), ["unplayed"]), profile(), "explore"),
     ).toBe("你没听过，换个口味试试");
-    expect(reasonFor(candidate(track("3", "t", "谁"), []), profile(), "heart")).toBe("换一批看看");
+    expect(
+      reasonFor(candidate(track("3", "t", "谁"), []), profile(), "heart"),
+    ).toBe("换一批看看");
+  });
+
+  it("「没听过」的措辞按口味区分：只有探索模式才说「换个口味」", () => {
+    // 2026-11-01 用户反馈：心动模式里出现「你没听过，换个口味试试」，与自己承诺的
+    // 「按口味画像找同款」矛盾 —— 心动档的入选规则没变，只是措辞要跟着口味走。
+    const never = candidate(track("1", "t", "谁"), ["new-singer", "unplayed"]);
+    expect(reasonFor(never, profile(), "heart")).toBe("风格贴近，你还没听过");
+    expect(reasonFor(never, profile(), "familiar")).toBe("和你常听的相近，还没播过");
+    expect(reasonFor(never, profile(), "explore")).toBe("你没听过，换个口味试试");
   });
 
   it("只收藏过这个歌手（没有任何播放证据）时不说「常听」", () => {

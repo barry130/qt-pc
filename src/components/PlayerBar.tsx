@@ -5,6 +5,7 @@ import {
   AudioWaveform,
   Captions,
   Check,
+  Infinity as InfinityIcon,
   Link2,
   ListMusic,
   Minimize2,
@@ -32,6 +33,7 @@ import type {
   PointerEvent as ReactPointerEvent,
 } from "react";
 import { usePlayerStore } from "@/stores/player";
+import { useRadioStore } from "@/stores/radio";
 import { useAuthStore, isAdmin } from "@/stores/auth";
 import { useDislikesStore } from "@/stores/dislikes";
 import { CollectButton } from "@/components/player/CollectButton";
@@ -55,6 +57,7 @@ import { useNowPlayingCover } from "@/hooks/useNowPlayingLocalMedia";
 import { formatTime } from "@/lib/lrc";
 import { playUrlLine, playUrlMiss } from "@/source-scripts/playurl-line";
 import { cn } from "@/lib/utils";
+import { useT } from "@/lib/i18n";
 import {
   checkDisliked,
   getDesktopLyricState,
@@ -98,6 +101,7 @@ const PlayUrlButtonMemo = memo(PlayUrlButton);
  * 封面 / 歌名歌手 / 上一首 / 播放 / 下一首 / 模式 / 队列 / 进度条 / 音量
  * 进度拖动期间暂停插值（isDraggingProgress），松手即 seek */
 export function PlayerBar(): React.JSX.Element {
+  const t = useT();
   const toggle = usePlayerStore((s) => s.toggle);
   const nextTrack = usePlayerStore((s) => s.nextTrack);
   const prevTrack = usePlayerStore((s) => s.prevTrack);
@@ -130,6 +134,9 @@ export function PlayerBar(): React.JSX.Element {
   const status = usePlayerStore((s) => s.state?.status ?? null);
   const quality = usePlayerStore((s) => s.state?.quality ?? null);
   const playMode = usePlayerStore((s) => s.state?.playMode ?? "listLoop");
+  // 私人 FM 接管队列期间（A7，2026-11-02）：播放模式由 FM 自己管（无限循环），
+  // 队列面板也不给开 —— 见下面 mode / queue 两个按钮分支。
+  const radioActive = useRadioStore((s) => s.active);
   const speed = usePlayerStore((s) => s.state?.speed ?? 1);
   const sleepTimerMs = usePlayerStore((s) => s.state?.sleepTimerMs ?? null);
   const sleepAfterTrack = usePlayerStore((s) => s.state?.sleepAfterTrack ?? false);
@@ -255,6 +262,7 @@ export function PlayerBar(): React.JSX.Element {
           <PlayModeButtonMemo
             key="mode"
             mode={playMode}
+            fm={radioActive}
             onCycle={handleCyclePlayMode}
           />
         );
@@ -270,13 +278,22 @@ export function PlayerBar(): React.JSX.Element {
         // 播放页禁用（用户 m04913）：QueuePanel 是 AppShell 主区里的布局级面板，
         // 而播放页走 isPlayingPage 分支根本不渲染它 —— 在那儿点这个按钮只会有
         // 一个亮起来的图标、面板永远不出现，等同于坏按钮，故直接置灰不可点。
+        // 私人 FM 期间禁用（用户 m18755「私人 FM 时将播放列表禁止打开」）：FM 用的是
+        // 它自己往下补的那条队列，给用户看"播放列表"只会误导（面板里的内容也不属于
+        // 任何歌单），故与播放页同一处理 —— 置灰不可点。
         return (
           <ControlButton
             key="queue"
-            label={isPlayingPage ? "播放队列（播放页不可用）" : "播放队列"}
+            label={
+              isPlayingPage
+                ? "播放队列（播放页不可用）"
+                : radioActive
+                  ? "播放队列（私人 FM 期间不可用）"
+                  : "播放队列"
+            }
             active={queueOpen}
-            emphasis={!isPlayingPage}
-            disabled={isPlayingPage}
+            emphasis={!isPlayingPage && !radioActive}
+            disabled={isPlayingPage || radioActive}
             onClick={toggleQueue}
           >
             <ListMusic className="h-4 w-4" />
@@ -405,7 +422,7 @@ export function PlayerBar(): React.JSX.Element {
       {/* 封面 + 歌名/歌手（点击打开/收起播放页） */}
       <button
         type="button"
-        aria-label={pathname === "/playing" ? "返回之前页面" : "打开播放页"}
+        aria-label={pathname === "/playing" ? t("player.backFromPlaying") : t("player.openPlaying")}
         onClick={togglePlayingPage}
         className="flex w-56 min-w-0 items-center gap-3 rounded-md text-left transition-colors hover:bg-secondary/60"
       >
@@ -462,7 +479,7 @@ export function PlayerBar(): React.JSX.Element {
             </ControlButton>
             <button
               type="button"
-              aria-label={playing ? "暂停" : "播放"}
+              aria-label={playing ? t("player.pause") : t("player.play")}
               onClick={handleToggle}
               disabled={!track}
               className={cn(
@@ -1139,11 +1156,28 @@ function SleepTimerMenu(props: {
 }
 
 /** 播放模式三态：列表循环 → 单曲循环 → 随机（REQUIREMENTS §3.2）。
- *  「顺序播放」已删除（放完就停的用法一般音乐播放器都没有，用户确认去掉）。 */
+ *  「顺序播放」已删除（放完就停的用法一般音乐播放器都没有，用户确认去掉）。
+ *  私人 FM 期间模式归 FM 管（用户 m18755「播放模式改为无限循环」）：FM 会一边放
+ *  一边往下补歌，等价于无限循环，所以这里显示「无限循环」并置灰 —— 既不让用户
+ *  在这儿改坏 FM，也表明"这不是你原来那个播放模式"。退出 FM 时 FM 会把用户原来
+ *  的模式还回去（见 stores/radio.ts 的 restorePlayMode）。 */
 function PlayModeButton(props: {
   mode: "listLoop" | "oneLoop" | "random";
+  fm: boolean;
   onCycle: () => void;
 }): React.JSX.Element {
+  if (props.fm) {
+    return (
+      <ControlButton
+        label="播放模式：无限循环（私人 FM）"
+        active
+        disabled
+        onClick={props.onCycle}
+      >
+        <InfinityIcon className="h-4 w-4" />
+      </ControlButton>
+    );
+  }
   const meta = {
     listLoop: { label: "列表循环", Icon: Repeat },
     oneLoop: { label: "单曲循环", Icon: Repeat1 },
@@ -1562,6 +1596,7 @@ function ControlButton(props: {
 }
 
 function VolumeControl(): React.JSX.Element {
+  const t = useT();
   const state = usePlayerStore((s) => s.state);
   const setVolume = usePlayerStore((s) => s.setVolume);
   const toggleMute = usePlayerStore((s) => s.toggleMute);
@@ -1614,8 +1649,8 @@ function VolumeControl(): React.JSX.Element {
     <div className="flex w-32 items-center gap-2">
       <button
         type="button"
-        aria-label={muted ? "取消静音" : "静音"}
-        title={muted ? "取消静音" : "静音"}
+        aria-label={muted ? t("player.unmute") : t("player.mute")}
+        title={muted ? t("player.unmute") : t("player.mute")}
         onClick={() => void toggleMute()}
         className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
       >
@@ -1632,7 +1667,7 @@ function VolumeControl(): React.JSX.Element {
           role=slider + 方向键兜底键盘操作，focus-visible 由全局 base 层接管 */}
       <div
         role="slider"
-        aria-label="音量"
+        aria-label={t("player.volume")}
         aria-valuemin={0}
         aria-valuemax={100}
         aria-valuenow={Math.round(effective * 100)}

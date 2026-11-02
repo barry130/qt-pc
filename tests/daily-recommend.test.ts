@@ -320,7 +320,7 @@ describe("rankCandidates", () => {
 
 describe("ruleReason", () => {
   it("常听歌手给「你常听 X」", () => {
-    expect(ruleReason(track("1", "晴天", "周杰伦"), pref({ topSingers: ["周杰伦"] }))).toBe(
+    expect(ruleReason(track("1", "晴天", "周杰伦"), pref({ topSingers: ["周杰伦"] }), "heart")).toBe(
       "你常听 周杰伦",
     );
   });
@@ -330,6 +330,7 @@ describe("ruleReason", () => {
       ruleReason(
         track("1", "晴天", "周杰伦"),
         pref({ favoriteTracks: [track("9", "稻香", "周杰伦")] }),
+        "heart",
       ),
     ).toBe("和你的收藏口味相近");
   });
@@ -337,7 +338,17 @@ describe("ruleReason", () => {
   it("完全不认识时给「没听过」的中性理由，不编造", () => {
     // 引擎的兜底文案分两档：查得到「没听过」这个事实就说出来，什么事实都没有才说「换一批看看」。
     // 这两种都是中性的，不许出现「你会喜欢」这类推断。
-    expect(ruleReason(track("1", "晴天", "周杰伦"), pref())).toBe("你没听过，换个口味试试");
+    expect(ruleReason(track("1", "晴天", "周杰伦"), pref(), "explore")).toBe(
+      "你没听过，换个口味试试",
+    );
+  });
+
+  it("心动/常听档的「没听过」不说「换个口味」（2026-11-01 用户反馈）", () => {
+    // 心动模式是「按你的口味画像找同款」，挂一句「换个口味试试」等于自己拆台；
+    // 只有探索模式才是真的要换，所以这句措辞必须跟着口味走。
+    const track1 = track("1", "晴天", "周杰伦");
+    expect(ruleReason(track1, pref(), "heart")).toBe("风格贴近，你还没听过");
+    expect(ruleReason(track1, pref(), "familiar")).toBe("和你常听的相近，还没播过");
   });
 });
 
@@ -824,7 +835,7 @@ describe("心动模式吃收藏歌单", () => {
     // 所以理由统一说「你收藏里的歌」，不再区分来源渠道。
     // 「只在收藏里、从没播过」的歌手不说「常听」这件事，由 ruleReason 组里的
     // 「收藏歌手但不在常听列表时给收藏口径」负责。
-    expect(ruleReason(pool[4], pref({ playlistTracks: [pool[4]] }))).toBe("你收藏里的歌");
+    expect(ruleReason(pool[4], pref({ playlistTracks: [pool[4]] }), "heart")).toBe("你收藏里的歌");
   });
 });
 

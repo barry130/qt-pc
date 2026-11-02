@@ -13,14 +13,17 @@ import {
 } from "lucide-react";
 import * as ipc from "@/services/ipc";
 import { usePlayerStore } from "@/stores/player";
+import { useRadioStore } from "@/stores/radio";
 import { qtresCoverUrl, formatTime } from "@/lib/lrc";
 import { cn, errMsg } from "@/lib/utils";
 import { SourceTag } from "@/components/common/SourceTag";
+import { EqBars } from "@/components/common/EqBars";
 import { log } from "@/lib/logger";
 import { toastError } from "@/stores/toast";
 import { LocalCover } from "@/components/library/LocalCover";
 import { IconButton } from "@/components/common/IconButton";
 import { PlayNextIcon } from "@/components/common/PlayNextIcon";
+import { useT } from "@/lib/i18n";
 import type { Track } from "@/types";
 
 type QueueSnapshot = {
@@ -74,17 +77,33 @@ const EMPTY_SELECTION = new Set<number>();
  * 拖动排序走 **pointer 事件自绘**，不用 draggable / dragover / drop（见下方
  * startPointerDrag 的注释）：Tauri 在 Windows 上会把整个窗口的 OLE IDropTarget
  * 换成自己的，页面内的 HTML5 拖放事件被它压掉，表现为「拖了没反应」。
+ *
+ * 私人 FM 期间（A7，2026-11-02，用户 m18755「私人 FM 时将播放列表禁止打开」）：
+ * 面板不给开 —— 入口那头播放条的队列按钮置灰（PlayerBar，与播放页同一套禁用），
+ * 这里再兜一句：FM 开始时面板正开着就直接收起来。FM 用的是它自己往下补的那条
+ * 队列，没有"用户的播放列表"可言，展示出来只会误导。
  */
 export function QueuePanel(): React.JSX.Element | null {
+  const tr = useT();
   const queue = usePlayerStore((s) => s.queue);
   const queueIndex = usePlayerStore((s) => s.queueIndex);
   const currentTrackId = usePlayerStore((s) => s.state?.trackId ?? null);
+  // 当前行要不要让跳动条动起来（暂停时 stops，静止也能区分"这一首"与"别的首"）
+  const isPlaying = usePlayerStore((s) => s.state?.status === "playing");
   const currentPlatform = usePlayerStore(
     (s) => s.state?.track?.platform ?? s.state?.sourceId ?? null,
   );
   const playAt = usePlayerStore((s) => s.playAt);
   const open = usePlayerStore((s) => s.queueOpen);
   const setQueueOpen = usePlayerStore((s) => s.setQueueOpen);
+  // FM 持有队列期间，这个面板展示的是 FM 的无限队列，不是用户的播放列表。
+  const radioActive = useRadioStore((s) => s.active);
+
+  // 私人 FM 期间不给开播放列表（用户 m18755「私人 FM 时将播放列表禁止打开」）：
+  // 入口那头由 PlayerBar 的队列按钮置灰，这里兜住"FM 开始时面板正开着"的情况。
+  useEffect(() => {
+    if (radioActive && open) setQueueOpen(false);
+  }, [radioActive, open, setQueueOpen]);
 
   // 优先使用有效的引擎下标；镜像尚未同步时以 platform + id 回退，避免跨源同 ID 误命中。
   const fallbackIndex = queue.findIndex(
@@ -475,11 +494,11 @@ export function QueuePanel(): React.JSX.Element | null {
         {selecting ? (
           <>
             <div className="flex items-center gap-2 text-sm font-medium">
-              已选 {selected.size} / {queue.length}
+              {tr("queue.selected", { n: selected.size, total: queue.length })}
             </div>
             <div className="flex items-center gap-1">
               <IconButton
-                label="定位当前播放"
+                label={tr("queue.locate")}
                 size="md"
                 hover="secondary"
                 disabled={activeIndex === null}
@@ -488,7 +507,7 @@ export function QueuePanel(): React.JSX.Element | null {
                 <LocateFixed />
               </IconButton>
               <IconButton
-                label={selected.size === queue.length ? "全不选" : "全选"}
+                label={selected.size === queue.length ? tr("queue.selectNone") : tr("queue.selectAll")}
                 size="lg"
                 hover="secondary"
                 onClick={() =>
@@ -508,7 +527,7 @@ export function QueuePanel(): React.JSX.Element | null {
                 )}
               </IconButton>
               <IconButton
-                label={deleting ? "删除中…" : `删除已选（${selected.size}）`}
+                label={deleting ? tr("queue.deleting") : tr("queue.deleteSelected", { n: selected.size })}
                 size="lg"
                 hover="secondary"
                 danger
@@ -518,7 +537,7 @@ export function QueuePanel(): React.JSX.Element | null {
                 <Trash2 />
               </IconButton>
               <IconButton
-                label="退出批量管理"
+                label={tr("queue.exitBatch")}
                 size="lg"
                 hover="secondary"
                 onClick={() => setSelecting(false)}
@@ -531,11 +550,11 @@ export function QueuePanel(): React.JSX.Element | null {
           <>
             <div className="flex items-center gap-2 text-sm font-medium">
               <ListMusic className="h-4 w-4" />
-              播放队列（{queue.length}）
+              {tr("queue.title", { count: queue.length })}
             </div>
             <div className="flex items-center gap-1">
               <IconButton
-                label="定位当前播放"
+                label={tr("queue.locate")}
                 size="md"
                 hover="secondary"
                 disabled={activeIndex === null}
@@ -545,7 +564,7 @@ export function QueuePanel(): React.JSX.Element | null {
               </IconButton>
               {queue.length > 1 && (
                 <IconButton
-                  label="批量管理"
+                  label={tr("queue.batch")}
                   size="lg"
                   hover="secondary"
                   onClick={() => {
@@ -558,7 +577,7 @@ export function QueuePanel(): React.JSX.Element | null {
               )}
               {activeIndex !== null && activeIndex < queue.length - 1 && (
                 <IconButton
-                  label="清空后续"
+                  label={tr("queue.clearAfter")}
                   size="lg"
                   hover="secondary"
                   onClick={() =>
@@ -573,7 +592,7 @@ export function QueuePanel(): React.JSX.Element | null {
               )}
               {queue.length > 0 && (
                 <IconButton
-                  label="清空队列"
+                  label={tr("queue.clear")}
                   size="lg"
                   hover="secondary"
                   danger
@@ -593,7 +612,7 @@ export function QueuePanel(): React.JSX.Element | null {
                 </IconButton>
               )}
               <IconButton
-                label="关闭队列"
+                label={tr("queue.close")}
                 size="lg"
                 hover="secondary"
                 onClick={() => setQueueOpen(false)}
@@ -607,7 +626,7 @@ export function QueuePanel(): React.JSX.Element | null {
       <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto">
         {queue.length === 0 ? (
           <p className="p-6 text-center text-sm text-muted-foreground">
-            队列为空
+            {tr("queue.empty")}
           </p>
         ) : (
           queue.map((t, i) => (
@@ -617,6 +636,7 @@ export function QueuePanel(): React.JSX.Element | null {
               track={t}
               index={i}
               active={i === activeIndex}
+              playing={i === activeIndex && isPlaying}
               selecting={selecting}
               checked={selected.has(i)}
               dragging={dragIndex === i}
@@ -642,6 +662,8 @@ type QueueRowProps = {
   track: Track;
   index: number;
   active: boolean;
+  /** 只有当前行会拿到 true：播放中才让跳动条动，暂停时静止 */
+  playing: boolean;
   selecting: boolean;
   checked: boolean;
   dragging: boolean;
@@ -667,6 +689,7 @@ const QueueRow = memo(function QueueRow({
   track: t,
   index: i,
   active,
+  playing,
   selecting,
   checked,
   dragging,
@@ -681,6 +704,7 @@ const QueueRow = memo(function QueueRow({
   onPlayNext,
   onRemove,
 }: QueueRowProps): React.JSX.Element {
+  const tr = useT();
   const cover = t.platform === "local" ? null : qtresCoverUrl(t.picUrl);
   return (
     <div
@@ -703,8 +727,8 @@ const QueueRow = memo(function QueueRow({
       className={cn(
         // cv-row：视口外的行跳过布局与绘制（见 index.css）。队列可长达数百条，
         // 拖拽 / 多选时每次重渲都要处理全部行，跳绘能明显减轻滚动与拖拽的掉帧。
-        "cv-row group flex w-full cursor-pointer items-center gap-2 px-2 py-2 text-left transition-colors hover:bg-secondary",
-        active && "bg-secondary/60",
+        "cv-row group relative flex w-full cursor-pointer items-center gap-2 px-2 py-2 text-left transition-colors hover:bg-secondary",
+        active && "bg-primary/10 hover:bg-primary/10",
         checked && "bg-primary/5",
         dragging && "opacity-50",
         dropTarget
@@ -712,6 +736,13 @@ const QueueRow = memo(function QueueRow({
           : "border-t-2 border-transparent",
       )}
     >
+      {/* 当前曲目：左侧主色竖条 —— 列表滚起来时最先被眼睛抓住的就是这一条 */}
+      {active && (
+        <span
+          aria-hidden
+          className="absolute inset-y-1 left-0 w-[3px] rounded-r-full bg-primary"
+        />
+      )}
       {selecting ? (
         <span
           aria-hidden
@@ -756,10 +787,19 @@ const QueueRow = memo(function QueueRow({
       </div>
       <div className="min-w-0 flex-1">
         <div className="flex min-w-0 items-center gap-1.5">
+          {active && (
+            <span
+              className="flex h-3 shrink-0 items-center text-primary"
+              role="img"
+              aria-label={tr("queue.nowPlaying")}
+            >
+              <EqBars playing={playing} />
+            </span>
+          )}
           <span
             className={cn(
               "truncate text-xs",
-              active ? "text-primary" : "text-foreground",
+              active ? "font-medium text-primary" : "text-foreground",
             )}
           >
             {t.title}
@@ -779,7 +819,7 @@ const QueueRow = memo(function QueueRow({
       {!selecting && (
         <div className="flex shrink-0 items-center gap-0.5 opacity-0 transition-opacity group-hover:opacity-100">
           <IconButton
-            label="下一首播放"
+            label={tr("queue.playNext")}
             disabled={active}
             onClick={(e) => {
               e.stopPropagation();
@@ -790,7 +830,7 @@ const QueueRow = memo(function QueueRow({
             <PlayNextIcon />
           </IconButton>
           <IconButton
-            label="从队列移除"
+            label={tr("queue.remove")}
             danger
             onClick={(e) => {
               e.stopPropagation();

@@ -5,6 +5,7 @@ import * as ipc from "@/services/ipc";
 import { useFavoritesStore } from "@/stores/favorites";
 import { CollectMenu } from "@/components/mine/CollectMenu";
 import { Popover } from "@/components/common/Popover";
+import { useT } from "@/lib/i18n";
 
 /**
  * 收藏选择器（播放条上的红心）。
@@ -20,6 +21,7 @@ import { Popover } from "@/components/common/Popover";
  */
 export function CollectButton(props: { track: Track | null }): React.JSX.Element {
   const { track } = props;
+  const tr = useT();
   const [open, setOpen] = useState(false);
   const version = useFavoritesStore((s) => s.version);
 
@@ -55,8 +57,8 @@ export function CollectButton(props: { track: Track | null }): React.JSX.Element
       trigger={(t) => (
         <button
           type="button"
-          aria-label="收藏到歌单"
-          title="收藏到歌单"
+          aria-label={tr("player.collect")}
+          title={tr("player.collect")}
           disabled={!track}
           onClick={t.toggle}
           className={[
