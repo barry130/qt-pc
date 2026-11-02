@@ -10,7 +10,9 @@ import {
   KeyRound,
   ListMusic,
   Music,
+  Podcast,
   Radio,
+  RadioTower,
   Sparkles,
 } from "lucide-react";
 import { useMusicSourceStore } from "@/stores/musicSource";
@@ -18,6 +20,7 @@ import { useAppearanceStore } from "@/stores/appearance";
 import { useSourceLabel, useSourceSupports, useAnySourceSupports } from "@/stores/sourceRegistry";
 import { cn } from "@/lib/utils";
 import { migrateLegacyStorageKey } from "@/lib/legacy-storage";
+import { useT, type MessageKey } from "@/lib/i18n";
 
 /**
  * 侧边栏（DESIGN §5.4）：两组导航，可折叠为 64px 图标条（持久化）。
@@ -26,31 +29,39 @@ import { migrateLegacyStorageKey } from "@/lib/legacy-storage";
  */
 
 type Item = {
-  label: string;
+  /** 词条键（B6）：文案在 lib/i18n 里，渲染时才按当前语言取 */
+  labelKey: MessageKey;
   to: string;
   icon: React.ComponentType<{ className?: string }>;
   params?: Record<string, string>;
 };
 
+/** 已取好文案的导航项（NavLink 只认这个） */
+type NavItem = Item & { label: string };
+
 const ONLINE_ITEMS: Item[] = [
-  { label: "首页", to: "/", icon: Radio },
+  { labelKey: "nav.home", to: "/", icon: Radio },
   // 「每日推荐」与「每日新歌」是两个功能，入口刻意相邻但分开：
   // 每日新歌 = 当前音源的最新流（谁发新歌就有什么）；每日推荐 = 按你自己的播放历史挑的。
-  { label: "每日推荐", to: "/daily-recommend", icon: Compass },
-  { label: "每日新歌", to: "/daily", icon: Clock },
-  { label: "歌单广场", to: "/playlists", icon: ListMusic },
-  { label: "排行榜", to: "/charts", icon: BarChart3 },
+  { labelKey: "nav.dailyRecommend", to: "/daily-recommend", icon: Compass },
+  { labelKey: "nav.dailyNew", to: "/daily", icon: Clock },
+  { labelKey: "nav.playlists", to: "/playlists", icon: ListMusic },
+  { labelKey: "nav.charts", to: "/charts", icon: BarChart3 },
 ];
 
 const MINE_ITEMS: Item[] = [
   // 「我的歌单」与「收藏」已合成一页（/my/playlists），不再分两个入口
-  { label: "我的歌单", to: "/my/playlists", icon: ListMusic },
+  { labelKey: "nav.myPlaylists", to: "/my/playlists", icon: ListMusic },
   // 音源账号登录与各源「数据/播放是否使用登录态」开关，紧跟我的歌单（用户指定位置）
-  { label: "音源账号", to: "/source-accounts", icon: KeyRound },
-  { label: "本地音乐", to: "/library", icon: Music },
-  { label: "下载管理", to: "/downloads", icon: Download },
-  { label: "最近播放", to: "/history", icon: Clock },
-  { label: "听歌报告", to: "/stats", icon: BarChart3 },
+  { labelKey: "nav.sourceAccounts", to: "/source-accounts", icon: KeyRound },
+  // 私人 FM 依赖的是本地画像（收藏/歌单/历史），本地模式一样能用，所以放「我的」组
+  { labelKey: "nav.radio", to: "/radio", icon: RadioTower },
+  // 播客是本地订阅（RSS），不依赖任何在线音源，同样归「我的」
+  { labelKey: "nav.podcast", to: "/podcast", icon: Podcast },
+  { labelKey: "nav.library", to: "/library", icon: Music },
+  { labelKey: "nav.downloads", to: "/downloads", icon: Download },
+  { labelKey: "nav.history", to: "/history", icon: Clock },
+  { labelKey: "nav.stats", to: "/stats", icon: BarChart3 },
 ];
 
 /**
@@ -62,7 +73,7 @@ const MINE_ITEMS: Item[] = [
  * 后端 `APP_USER` 角色本来就有 `user:ai:music:use`，前端再按权限显隐只会把入口藏错。
  * 「服务端 AI」模式才是管理员专属，那条闸在设置页与执行层（`isAdmin`），不在入口这里。
  */
-const ASSISTANT_ITEMS: Item[] = [{ label: "音乐助手", to: "/ai-assistant", icon: Sparkles }];
+const ASSISTANT_ITEMS: Item[] = [{ labelKey: "nav.assistant", to: "/ai-assistant", icon: Sparkles }];
 
 /** 更名前的前缀是 lightlisten.*（见 lib/legacy-storage） */
 const COLLAPSE_KEY = "quietmusic.sidebar-collapsed";
@@ -99,19 +110,22 @@ export function Sidebar(): React.JSX.Element {
   const supportsPlaylists = useSourceSupports(activeSourceId, "playlists");
   // 榜单页内可以切换音源，只要还有其他源支持榜单，在线模式就保留可用入口。
   const supportsCharts = useAnySourceSupports("charts");
+  const t = useT();
+  const withLabel = (item: Item): NavItem => ({ ...item, label: t(item.labelKey) });
   const onlineItems = ONLINE_ITEMS.map((item) => {
+    const nav = withLabel(item);
     let disabledReason: string | undefined;
     if (isLocal) {
       disabledReason = "本地模式下不可用，请切换在线音源";
     } else if (
-      (item.to === "/daily" && !supportsDaily) ||
-      (item.to === "/playlists" && !supportsPlaylists)
+      (nav.to === "/daily" && !supportsDaily) ||
+      (nav.to === "/playlists" && !supportsPlaylists)
     ) {
-      disabledReason = `当前音源不支持${item.label}`;
-    } else if (item.to === "/charts" && !supportsCharts) {
+      disabledReason = `当前音源不支持${nav.label}`;
+    } else if (nav.to === "/charts" && !supportsCharts) {
       disabledReason = "当前音源均不支持排行榜";
     }
-    return { ...item, disabledReason };
+    return { ...nav, disabledReason };
   });
 
   useEffect(() => {
@@ -129,25 +143,32 @@ export function Sidebar(): React.JSX.Element {
       {/* flex-1：导航整体撑满侧边栏高度，折叠按钮跟在「我的」最后一项后面，
           不再单独一节 + 横向隔离线。内容超出时靠 overflow 滚动。 */}
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto px-2 py-3">
-        <NavGroup title={isLocal ? "在线 · 不可用" : `在线 · ${sourceName}`} collapsed={collapsed}>
+        <NavGroup
+          title={
+            isLocal
+              ? t("sidebar.group.onlineUnavailable")
+              : t("sidebar.group.online", { source: sourceName })
+          }
+          collapsed={collapsed}
+        >
           {onlineItems.map((item) => (
             <NavLink key={item.to} item={item} collapsed={collapsed} disabledReason={item.disabledReason} />
           ))}
         </NavGroup>
-        <NavGroup title="我的" collapsed={collapsed}>
-          {MINE_ITEMS.map((item) => (
+        <NavGroup title={t("sidebar.group.mine")} collapsed={collapsed}>
+          {MINE_ITEMS.map(withLabel).map((item) => (
             <NavLink key={item.to} item={item} collapsed={collapsed} />
           ))}
         </NavGroup>
-        <NavGroup title="助手" collapsed={collapsed}>
-          {ASSISTANT_ITEMS.map((item) => (
+        <NavGroup title={t("sidebar.group.assistant")} collapsed={collapsed}>
+          {ASSISTANT_ITEMS.map(withLabel).map((item) => (
             <NavLink key={item.to} item={item} collapsed={collapsed} />
           ))}
         </NavGroup>
         <button
           type="button"
           onClick={() => setCollapsed((c) => !c)}
-          aria-label={collapsed ? "展开侧边栏" : "折叠侧边栏"}
+          aria-label={collapsed ? t("sidebar.expand") : t("sidebar.collapse")}
           className="mt-1 flex w-full items-center gap-3 rounded-md px-2 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
         >
           {collapsed ? (
@@ -186,7 +207,7 @@ function NavGroup(props: {
   );
 }
 
-function NavLink(props: { item: Item; collapsed: boolean; disabledReason?: string }): React.JSX.Element {
+function NavLink(props: { item: NavItem; collapsed: boolean; disabledReason?: string }): React.JSX.Element {
   const { item, collapsed, disabledReason } = props;
   const Icon = item.icon;
   const className = cn(

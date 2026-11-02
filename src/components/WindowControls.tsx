@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Copy, Minus, Square, X } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { cn } from "@/lib/utils";
+import { useT } from "@/lib/i18n";
 
 /** 窗口控制按钮的两种外观：标题栏内嵌（贴边无圆角）、悬浮（圆角胶囊） */
 export type WindowControlsVariant = "titlebar" | "floating";
@@ -92,7 +93,8 @@ export function WindowControls(props: {
   closeLabel?: string;
 }): React.JSX.Element {
   const styles = VARIANT[props.variant ?? "titlebar"];
-  const closeLabel = props.closeLabel ?? "关闭";
+  const t = useT();
+  const closeLabel = props.closeLabel ?? t("window.close");
   const maximized = useWindowMaximized();
   const win = getCurrentWindow();
 
@@ -105,7 +107,7 @@ export function WindowControls(props: {
     <div className={cn(styles.group, props.className)}>
       <button
         type="button"
-        aria-label="最小化"
+        aria-label={t("window.minimize")}
         title="最小化"
         onMouseDown={stop}
         onDoubleClick={stop}
@@ -116,7 +118,7 @@ export function WindowControls(props: {
       </button>
       <button
         type="button"
-        aria-label={maximized ? "还原" : "最大化"}
+        aria-label={maximized ? t("window.restore") : t("window.maximize")}
         title={maximized ? "还原" : "最大化"}
         onMouseDown={stop}
         onDoubleClick={stop}
