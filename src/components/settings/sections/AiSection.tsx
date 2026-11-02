@@ -1,18 +1,32 @@
 import { useCallback, useEffect, useState } from "react";
 import { AiProvidersDialog } from "@/components/settings/AiProvidersPanel";
-import { AI_MODE_HINT, AI_MODE_LABEL, aiModeOptionsFor, readAiMode, resolveAiMode, type AiEngineMode } from "@/lib/ai-mode";
-import { DAILY_TASTE_LABEL, DAILY_TASTE_ORDER, readTaste, saveMode, saveTaste, type DailyTaste } from "@/lib/daily-recommend";
+import { aiModeOptionsFor, readAiMode, resolveAiMode, type AiEngineMode } from "@/lib/ai-mode";
+import { DAILY_TASTE_ORDER, readTaste, saveMode, saveTaste, type DailyTaste } from "@/lib/daily-recommend";
 import { errMsg } from "@/lib/utils";
 import { isAdmin, isSessionValid, useAuthStore } from "@/stores/auth";
 import { toastError } from "@/stores/toast";
 import { Segmented, SettingRow } from "../controls";
+import { useT, type MessageKey } from "@/lib/i18n";
 
 // ---------- AI 设置（全局 AI 模式 + 客户端直连模型） ----------
 
+/** 「AI 模式」按钮组与说明的文案键（`lib/ai-mode.ts` 里的常量只管中文，界面按语言取） */
+const MODE_LABEL_KEY: Record<AiEngineMode, MessageKey> = {
+  rule: "settings.ai.modeRule",
+  local: "settings.ai.modeLocal",
+  server: "settings.ai.modeServer",
+};
+const MODE_HINT_KEY: Record<AiEngineMode, MessageKey> = {
+  rule: "settings.ai.hintRule",
+  local: "settings.ai.hintLocal",
+  server: "settings.ai.hintServer",
+};
 /** 推荐口味（推荐策略）：与上面的「AI 模式」（要不要叫模型）互相独立 */
-const DAILY_TASTE_OPTIONS: { value: DailyTaste; label: string }[] = DAILY_TASTE_ORDER.map(
-  (value) => ({ value, label: DAILY_TASTE_LABEL[value] }),
-);
+const TASTE_LABEL_KEY: Record<DailyTaste, MessageKey> = {
+  heart: "settings.ai.tasteHeart",
+  familiar: "settings.ai.tasteFamiliar",
+  explore: "settings.ai.tasteExplore",
+};
 
 
 /**
@@ -63,6 +77,7 @@ const DAILY_TASTE_OPTIONS: { value: DailyTaste; label: string }[] = DAILY_TASTE_
  */
 
 export function AiSection(): React.JSX.Element {
+  const tr = useT();
   /**
    * 当前显示的模式 / 口味。
    *
@@ -99,6 +114,11 @@ export function AiSection(): React.JSX.Element {
    */
   const profile = useAuthStore((s) => s.profile);
   const canUseServer = isAdmin(profile);
+  const modeOptions = aiModeOptionsFor(canUseServer).map((option) => ({
+    ...option,
+    label: tr(MODE_LABEL_KEY[option.value]),
+  }));
+  const tasteOptions = DAILY_TASTE_ORDER.map((value) => ({ value, label: tr(TASTE_LABEL_KEY[value]) }));
   /** 供应商配置弹窗：设置页只留一行入口，点开是一个弹窗（用户 2026-10-24 要求）。 */
   const [providersOpen, setProvidersOpen] = useState(false);
 
@@ -135,42 +155,45 @@ export function AiSection(): React.JSX.Element {
       setMode(chosen);
       setStoredServer(chosen === "server");
       void saveMode(chosen).catch((e: unknown) => {
-        toastError(`保存 AI 模式失败：${errMsg(e)}`);
+        toastError(tr("settings.ai.saveModeFailed", { message: errMsg(e) }));
       });
     },
-    [canUseServer],
+    [canUseServer, tr],
   );
 
-  const pickTaste = useCallback((next: DailyTaste): void => {
-    setTaste(next);
-    void saveTaste(next).catch((e: unknown) => {
-      toastError(`保存推荐口味失败：${errMsg(e)}`);
-    });
-  }, []);
+  const pickTaste = useCallback(
+    (next: DailyTaste): void => {
+      setTaste(next);
+      void saveTaste(next).catch((e: unknown) => {
+        toastError(tr("settings.ai.saveTasteFailed", { message: errMsg(e) }));
+      });
+    },
+    [tr],
+  );
 
 
   return (
     <div className="max-w-4xl divide-y divide-border">
       <SettingRow
-        title="第 1 步 · AI 引擎"
-        description="纯规则不联网；本地模型只做挑选；服务端需登录且仅管理员"
+        title={tr("settings.ai.engineTitle")}
+        description={tr("settings.ai.engineHint")}
       >
         {mode === null ? (
-          <span className="text-xs text-muted-foreground">载入中…</span>
+          <span className="text-xs text-muted-foreground">{tr("settings.ai.loading")}</span>
         ) : (
           // 非管理员只看到 rule/local：服务端 AI 的入口从设置页就藏掉，
           // 执行层再各自降级一次（见 lib/ai-mode.ts 的 resolveAiMode）
-          <Segmented value={mode} options={aiModeOptionsFor(canUseServer)} onChange={pickMode} />
+          <Segmented value={mode} options={modeOptions} onChange={pickMode} />
         )}
       </SettingRow>
 
       {mode !== null && (
         <p className="py-3 text-xs text-muted-foreground">
-          {AI_MODE_HINT[mode]}
-          {mode === "server" && !loggedIn ? " 未登录，实际按规则运行。" : ""}
+          {tr(MODE_HINT_KEY[mode])}
+          {mode === "server" && !loggedIn ? tr("settings.ai.notLoggedIn") : ""}
           {/* 库里存过服务端、但当前账号不是管理员：说清楚为什么实际按规则跑，
               否则用户会发现「设置里没这个选项，结果却和以前不一样」 */}
-          {storedServer && !canUseServer ? " 仅管理员可用，当前按规则运行。" : ""}
+          {storedServer && !canUseServer ? tr("settings.ai.adminOnly") : ""}
         </p>
       )}
 
@@ -178,24 +201,24 @@ export function AiSection(): React.JSX.Element {
           常显会让人以为这两行是并列的两件事（用户 2026-10-30 反馈）。 */}
       {mode === "local" ? (
         <SettingRow
-          title="第 2 步 · 模型配置"
-          description="Base URL、协议、密钥与模型都在弹窗里配置"
+          title={tr("settings.ai.modelsTitle")}
+          description={tr("settings.ai.modelsHint")}
         >
           <button
             type="button"
             onClick={() => setProvidersOpen(true)}
             className="rounded-lg border border-border bg-background px-3 py-1.5 text-xs text-foreground transition-colors hover:bg-secondary"
           >
-            管理模型…
+            {tr("settings.ai.manageModels")}
           </button>
         </SettingRow>
       ) : (
         <SettingRow
-          title="第 2 步 · 模型配置"
+          title={tr("settings.ai.modelsTitle")}
           description={
             mode === null
-              ? "选好引擎后再看这里"
-              : `当前是「${AI_MODE_LABEL[mode]}」，用不到模型配置`
+              ? tr("settings.ai.modelsHintPending")
+              : tr("settings.ai.modelsHintUnused", { mode: tr(MODE_LABEL_KEY[mode]) })
           }
         >
           <button
@@ -203,28 +226,28 @@ export function AiSection(): React.JSX.Element {
             onClick={() => pickMode("local")}
             className="rounded-lg border border-border bg-background px-3 py-1.5 text-xs text-foreground transition-colors hover:bg-secondary"
           >
-            改用本地模型精选
+            {tr("settings.ai.switchToLocal")}
           </button>
         </SettingRow>
       )}
 
       <SettingRow
-        title="推荐口味"
-        description="心动＝收藏与最近在听；常听＝常听歌手；探索＝没听过的歌手"
+        title={tr("settings.ai.tasteTitle")}
+        description={tr("settings.ai.tasteHint")}
       >
         {taste === null ? (
-          <span className="text-xs text-muted-foreground">载入中…</span>
+          <span className="text-xs text-muted-foreground">{tr("settings.ai.loading")}</span>
         ) : (
-          <Segmented value={taste} options={DAILY_TASTE_OPTIONS} onChange={pickTaste} />
+          <Segmented value={taste} options={tasteOptions} onChange={pickTaste} />
         )}
       </SettingRow>
 
       {providersOpen ? <AiProvidersDialog onClose={() => setProvidersOpen(false)} /> : null}
 
       <p className="py-3 text-xs text-muted-foreground">
-        每天首次进入生成一次，「换一批」立即重算。
-        {mode !== null ? `当前 AI 模式：${AI_MODE_LABEL[mode]}。` : ""}
-        {taste !== null ? `当前口味：${DAILY_TASTE_LABEL[taste]}。` : ""}
+        {tr("settings.ai.footnote")}
+        {mode !== null ? tr("settings.ai.footnoteMode", { mode: tr(MODE_LABEL_KEY[mode]) }) : ""}
+        {taste !== null ? tr("settings.ai.footnoteTaste", { taste: tr(TASTE_LABEL_KEY[taste]) }) : ""}
       </p>
     </div>
   );

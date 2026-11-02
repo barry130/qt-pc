@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import { useT } from "@/lib/i18n";
 import { errMsg } from "@/lib/utils";
 import * as ipc from "@/services/ipc";
 import { type NetConfigView, type NetTestResult } from "@/types";
@@ -6,16 +7,11 @@ import { Segmented, SettingRow } from "../controls";
 
 // ---------- 网络设置（第二波：代理与单源超时） ----------
 
-const PROXY_MODE_OPTIONS: { value: string; label: string }[] = [
-  { value: "system", label: "跟随系统" },
-  { value: "none", label: "直连" },
-  { value: "custom", label: "自定义" },
-];
-
 /** 单源超时预设（秒）；不在预设里的存量值走自定义输入 */
 const SOURCE_TIMEOUT_PRESETS = [5, 10, 15, 30, 60];
 
 export function NetworkSection(): React.JSX.Element {
+  const tr = useT();
   const [cfg, setCfg] = useState<NetConfigView | null>(null);
   const [urlDraft, setUrlDraft] = useState("");
   const [saveError, setSaveError] = useState<string | null>(null);
@@ -38,12 +34,12 @@ export function NetworkSection(): React.JSX.Element {
         setUrlDraft(c.proxyUrl);
       })
       .catch((e: unknown) => {
-        if (alive) setSaveError(`读取网络设置失败：${errMsg(e)}`);
+        if (alive) setSaveError(tr("settings.network.loadFailed", { error: errMsg(e) }));
       });
     return () => {
       alive = false;
     };
-  }, []);
+  }, [tr]);
 
   const save = useCallback(
     async (patch: Partial<NetConfigView>): Promise<void> => {
@@ -55,7 +51,7 @@ export function NetworkSection(): React.JSX.Element {
       setSaveError(null);
       // 首次选择自定义时先露出地址框，填好后再应用，避免空地址被拒后入口消失。
       if (next.proxyMode === "custom" && !next.proxyUrl.trim()) {
-        setSaveError("填入代理地址后应用自定义代理");
+        setSaveError(tr("settings.network.customNeedsUrl"));
         return;
       }
       // 顺序发送，且仅最后一次响应回写表单，避免失焦保存覆盖紧接着的模式/超时选择。
@@ -82,7 +78,7 @@ export function NetworkSection(): React.JSX.Element {
       saveChain.current = pending;
       await pending;
     },
-    [],
+    [tr],
   );
 
   const applyUrlDraft = useCallback(async (): Promise<void> => {
@@ -96,14 +92,14 @@ export function NetworkSection(): React.JSX.Element {
     if (!cfg) return;
     const seconds = Number(timeoutDraft);
     if (!Number.isFinite(seconds)) {
-      setSaveError("超时秒数需要是数字");
+      setSaveError(tr("settings.network.timeoutNotNumber"));
       return;
     }
     // 与 Rust 侧 net_config 的钳制范围一致（2–60 秒），前端先钳省一次来回
     const clamped = Math.min(60, Math.max(2, Math.round(seconds)));
     setTimeoutCustom(false);
     await save({ sourceTimeoutMs: clamped * 1000 });
-  }, [cfg, save, timeoutDraft]);
+  }, [cfg, save, timeoutDraft, tr]);
 
   const runTest = useCallback(async (): Promise<void> => {
     if (testing) return;
@@ -129,13 +125,17 @@ export function NetworkSection(): React.JSX.Element {
   return (
     <div className="max-w-4xl divide-y divide-border">
       <SettingRow
-        title="代理模式"
-        description="音源、播放、封面、下载与账号请求都走此代理"
+        title={tr("settings.network.proxyMode.title")}
+        description={tr("settings.network.proxyMode.description")}
       >
         {cfg ? (
           <Segmented
             value={cfg.proxyMode}
-            options={PROXY_MODE_OPTIONS}
+            options={[
+              { value: "system", label: tr("settings.network.proxyMode.system") },
+              { value: "none", label: tr("settings.network.proxyMode.none") },
+              { value: "custom", label: tr("settings.network.custom") },
+            ]}
             onChange={(v) => void save({ proxyMode: v })}
           />
         ) : (
@@ -144,8 +144,8 @@ export function NetworkSection(): React.JSX.Element {
       </SettingRow>
       {cfg?.proxyMode === "custom" && (
         <SettingRow
-          title="代理地址"
-          description="支持 http / https / socks5，可带账号密码（回车即保存）"
+          title={tr("settings.network.proxyUrl.title")}
+          description={tr("settings.network.proxyUrl.description")}
         >
           <span className="flex w-full flex-col items-end gap-1">
             <input
@@ -167,16 +167,19 @@ export function NetworkSection(): React.JSX.Element {
         </SettingRow>
       )}
       <SettingRow
-        title="单源超时"
-        description="单请求默认超时；音源脚本声明优先"
+        title={tr("settings.network.timeout.title")}
+        description={tr("settings.network.timeout.description")}
       >
         {cfg && timeoutSeconds !== null ? (
           <div className="flex items-center gap-2">
             <Segmented
               value={isPreset && !timeoutCustom ? String(timeoutSeconds) : "custom"}
               options={[
-                ...SOURCE_TIMEOUT_PRESETS.map((s) => ({ value: String(s), label: `${s} 秒` })),
-                { value: "custom", label: "自定义" },
+                ...SOURCE_TIMEOUT_PRESETS.map((s) => ({
+                  value: String(s),
+                  label: tr("settings.network.timeoutSeconds", { n: s }),
+                })),
+                { value: "custom", label: tr("settings.network.custom") },
               ]}
               onChange={(v) => {
                 if (v === "custom") {
@@ -207,7 +210,9 @@ export function NetworkSection(): React.JSX.Element {
                   onBlur={() => void applyTimeoutDraft()}
                   className="w-16 rounded-md border border-border bg-transparent px-2 py-1 text-xs outline-none focus:border-primary"
                 />
-                <span className="text-xs text-muted-foreground">秒</span>
+                <span className="text-xs text-muted-foreground">
+                  {tr("settings.network.secondsUnit")}
+                </span>
               </span>
             )}
           </div>
@@ -217,8 +222,8 @@ export function NetworkSection(): React.JSX.Element {
       </SettingRow>
       {saveError && <p role="alert" className="py-3 text-xs text-destructive">{saveError}</p>}
       <SettingRow
-        title="测试连接"
-        description="按当前填写的代理试连（不保存）"
+        title={tr("settings.network.test.title")}
+        description={tr("settings.network.test.description")}
       >
         <span className="flex w-full flex-col items-end gap-1">
           <button
@@ -227,7 +232,7 @@ export function NetworkSection(): React.JSX.Element {
             onClick={() => void runTest()}
             className="rounded-md border border-border px-3 py-1 text-xs transition-colors hover:border-primary disabled:opacity-40"
           >
-            {testing ? "测试中…" : "测试"}
+            {testing ? tr("settings.network.testing") : tr("settings.network.test")}
           </button>
           {testResult && (
             <p
@@ -236,10 +241,14 @@ export function NetworkSection(): React.JSX.Element {
               }`}
             >
               {testResult.ok
-                ? `连通 · ${
-                    testResult.status !== null ? `HTTP ${testResult.status} · ` : ""
-                  }${testResult.elapsedMs} ms`
-                : `失败 · ${testResult.error ?? "未知错误"}`}
+                ? tr("settings.network.testOk", {
+                    status:
+                      testResult.status !== null ? `HTTP ${testResult.status} · ` : "",
+                    ms: testResult.elapsedMs,
+                  })
+                : tr("settings.network.testFailed", {
+                    error: testResult.error ?? tr("settings.network.unknownError"),
+                  })}
             </p>
           )}
         </span>

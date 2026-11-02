@@ -30,6 +30,7 @@ import { errMsg } from "@/lib/utils";
 import { toast, toastError, toastSuccess } from "@/stores/toast";
 import { Modal } from "@/components/ui";
 import { Spinner } from "@/components/ui";
+import { useT, type MessageKey } from "@/lib/i18n";
 
 /**
  * AI 供应商的主从配置（2026-10-24，用户要求按截图改造「接口配置」）：
@@ -38,30 +39,31 @@ import { Spinner } from "@/components/ui";
  * - 数据仍走 `ipc.aiLocal*`，字段见 `AiProfileView` / `AiProfileInput`（Rust 侧 `ai_local.rs`）。
  */
 
-const PROTOCOL_OPTIONS: { value: AiProviderProtocol; label: string }[] = [
-  { value: "openai", label: "OpenAI 兼容" },
-  { value: "openai-responses", label: "OpenAI Responses" },
-  { value: "anthropic", label: "Anthropic 兼容" },
-  { value: "gemini", label: "Gemini 兼容" },
+/** 协议选项：`labelKey` 是词条键，`value` 才是发给 Rust / 存库的值 */
+const PROTOCOL_OPTIONS: { value: AiProviderProtocol; labelKey: MessageKey }[] = [
+  { value: "openai", labelKey: "settings.ai.protocolOpenAI" },
+  { value: "openai-responses", labelKey: "settings.ai.protocolOpenAIResponses" },
+  { value: "anthropic", labelKey: "settings.ai.protocolAnthropic" },
+  { value: "gemini", labelKey: "settings.ai.protocolGemini" },
 ];
 
-const PROTOCOL_LABEL: Record<AiProviderProtocol, string> = {
-  openai: "OpenAI 兼容",
-  "openai-responses": "OpenAI Responses",
-  anthropic: "Anthropic 兼容",
-  gemini: "Gemini 兼容",
+const PROTOCOL_LABEL_KEY: Record<AiProviderProtocol, MessageKey> = {
+  openai: "settings.ai.protocolOpenAI",
+  "openai-responses": "settings.ai.protocolOpenAIResponses",
+  anthropic: "settings.ai.protocolAnthropic",
+  gemini: "settings.ai.protocolGemini",
 };
 
 /** 内置图标：名字存进 `AiProfileView.icon`，前端按名字渲染（不落 SVG 字符串） */
-const ICON_CHOICES: { name: string; label: string; Icon: typeof Sparkles }[] = [
-  { name: "sparkles", label: "星芒", Icon: Sparkles },
-  { name: "bot", label: "机器人", Icon: Bot },
-  { name: "zap", label: "闪电", Icon: Zap },
-  { name: "brain", label: "大脑", Icon: Brain },
-  { name: "cloud", label: "云", Icon: Cloud },
-  { name: "cpu", label: "芯片", Icon: Cpu },
-  { name: "wand", label: "魔杖", Icon: Wand2 },
-  { name: "database", label: "数据库", Icon: Database },
+const ICON_CHOICES: { name: string; labelKey: MessageKey; Icon: typeof Sparkles }[] = [
+  { name: "sparkles", labelKey: "settings.ai.iconSparkles", Icon: Sparkles },
+  { name: "bot", labelKey: "settings.ai.iconBot", Icon: Bot },
+  { name: "zap", labelKey: "settings.ai.iconZap", Icon: Zap },
+  { name: "brain", labelKey: "settings.ai.iconBrain", Icon: Brain },
+  { name: "cloud", labelKey: "settings.ai.iconCloud", Icon: Cloud },
+  { name: "cpu", labelKey: "settings.ai.iconChip", Icon: Cpu },
+  { name: "wand", labelKey: "settings.ai.iconWand", Icon: Wand2 },
+  { name: "database", labelKey: "settings.ai.iconDatabase", Icon: Database },
 ];
 
 const ICON_BY_NAME = new Map(ICON_CHOICES.map((item) => [item.name, item.Icon]));
@@ -81,8 +83,8 @@ function letterOf(profile: Pick<AiProfileView, "name" | "baseUrl">): string {
   return (Array.from(source)[0] ?? "A").toUpperCase();
 }
 
-function maskOf(profile: AiProfileView): string {
-  return profile.keyMask || (profile.hasKey ? "已保存" : "");
+function maskOf(profile: AiProfileView, savedLabel: string): string {
+  return profile.keyMask || (profile.hasKey ? savedLabel : "");
 }
 
 /** 列表行里的一行文字，避免 null/undefined 拼进字符串 */
@@ -148,11 +150,11 @@ function draftFromView(profile: AiProfileView): EditingDraft {
   };
 }
 
-function emptyDraft(): EditingDraft {
+function emptyDraft(defaultName: string): EditingDraft {
   return {
     isNew: true,
     id: "",
-    name: "新供应商",
+    name: defaultName,
     baseUrl: "https://api.openai.com/v1",
     protocol: "openai",
     models: [],
@@ -228,6 +230,7 @@ function IconBadge(props: { icon: string; name: string; baseUrl: string }): JSX.
  * 不自己管理 AI 模式 / 推荐口味（那些仍由设置页管）。
  */
 export function AiProvidersPanel(): JSX.Element {
+  const tr = useT();
   const [view, setView] = useState<AiLocalConfigView | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -257,12 +260,12 @@ export function AiProvidersPanel(): JSX.Element {
       applyView(next);
       return next;
     } catch (err) {
-      toastError(`读取 AI 配置失败：${errMsg(err)}`);
+      toastError(tr("settings.ai.loadFailed", { message: errMsg(err) }));
       return null;
     } finally {
       if (alive.current) setLoading(false);
     }
-  }, [applyView]);
+  }, [applyView, tr]);
 
   useEffect(() => {
     void reload();
@@ -319,7 +322,7 @@ export function AiProvidersPanel(): JSX.Element {
   const saveDraft = useCallback(async (): Promise<void> => {
     if (!draft || saving) return;
     if (!draft.baseUrl.trim()) {
-      toastError("请先填写 Base URL");
+      toastError(tr("settings.ai.baseUrlRequired"));
       return;
     }
     setSaving(true);
@@ -345,14 +348,14 @@ export function AiProvidersPanel(): JSX.Element {
           applyView(activated);
         }
       }
-      toastSuccess("AI 配置已保存");
+      toastSuccess(tr("settings.ai.saveSuccess"));
       setDraft(null);
     } catch (err) {
-      toastError(`保存失败：${errMsg(err)}`);
+      toastError(tr("settings.ai.saveFailed", { message: errMsg(err) }));
     } finally {
       if (alive.current) setSaving(false);
     }
-  }, [applyView, buildInput, draft, profiles, saving, view?.activeId]);
+  }, [applyView, buildInput, draft, profiles, saving, tr, view?.activeId]);
 
   const removeDraft = useCallback(async (): Promise<void> => {
     if (!draft || saving) return;
@@ -361,7 +364,7 @@ export function AiProvidersPanel(): JSX.Element {
       return;
     }
     if (profiles.length <= 1) {
-      toast("至少要保留一个供应商");
+      toast(tr("settings.ai.keepOneProvider"));
       return;
     }
     setSaving(true);
@@ -372,23 +375,23 @@ export function AiProvidersPanel(): JSX.Element {
         view?.activeId === draft.id ? (remain[0]?.id ?? "") : (view?.activeId ?? ""),
       );
       applyView(saved);
-      toastSuccess("已移除该供应商");
+      toastSuccess(tr("settings.ai.removedProvider"));
       setDraft(null);
     } catch (err) {
-      toastError(`移除失败：${errMsg(err)}`);
+      toastError(tr("settings.ai.removeFailed", { message: errMsg(err) }));
     } finally {
       if (alive.current) setSaving(false);
     }
-  }, [applyView, draft, profiles, saving, view?.activeId]);
+  }, [applyView, draft, profiles, saving, tr, view?.activeId]);
 
   const duplicateDraft = useCallback(() => {
     if (!draft) return;
-    const base = draft.name.trim() || "供应商";
+    const base = draft.name.trim() || tr("settings.ai.providerDefaultName");
     setDraft({
       ...draft,
       isNew: true,
       id: "",
-      name: `${base} 副本`,
+      name: tr("settings.ai.copyName", { name: base }),
       pendingKeys: [],
       keyMasks: [],
       removedKeyIndexes: [],
@@ -397,7 +400,7 @@ export function AiProvidersPanel(): JSX.Element {
       clearSavedKey: false,
       vendorModels: null,
     });
-  }, [draft]);
+  }, [draft, tr]);
 
   const setActive = useCallback(
     async (profile: AiProfileView): Promise<void> => {
@@ -408,12 +411,14 @@ export function AiProvidersPanel(): JSX.Element {
           profile.id,
         );
         applyView(saved);
-        toastSuccess(`已切换到「${profile.name || profile.baseUrl}」`);
+        toastSuccess(
+          tr("settings.ai.switchedTo", { name: profile.name || profile.baseUrl }),
+        );
       } catch (err) {
-        toastError(`切换失败：${errMsg(err)}`);
+        toastError(tr("settings.ai.switchFailed", { message: errMsg(err) }));
       }
     },
-    [applyView, view],
+    [applyView, tr, view],
   );
 
   const fetchModels = useCallback(async (): Promise<void> => {
@@ -427,19 +432,19 @@ export function AiProvidersPanel(): JSX.Element {
         draft.skipCertVerify,
       );
       patchDraft({ vendorModels: names });
-      if (names.length === 0) toast("接口没返回任何模型");
+      if (names.length === 0) toast(tr("settings.ai.noModelsReturned"));
     } catch (err) {
-      toastError(`获取模型失败：${errMsg(err)}`);
+      toastError(tr("settings.ai.fetchModelsFailed", { message: errMsg(err) }));
     } finally {
       if (alive.current) setFetchingModels(false);
     }
-  }, [draft, fetchingModels, patchDraft]);
+  }, [draft, fetchingModels, patchDraft, tr]);
 
   const detectProtocol = useCallback(async (): Promise<void> => {
     if (!draft || testing) return;
     const baseUrl = draft.baseUrl.trim();
     if (!baseUrl) {
-      toastError("请先填写 Base URL");
+      toastError(tr("settings.ai.baseUrlRequired"));
       return;
     }
     setTesting(true);
@@ -465,14 +470,16 @@ export function AiProvidersPanel(): JSX.Element {
         results.find((v): v is AiProviderProtocol => v !== null) ?? null;
       if (matched) {
         patchDraft({ protocol: matched });
-        toastSuccess(`协议检测通过：${PROTOCOL_LABEL[matched]}`);
+        toastSuccess(
+          tr("settings.ai.protocolDetected", { protocol: tr(PROTOCOL_LABEL_KEY[matched]) }),
+        );
       } else {
-        toastError("四种协议都没连通，检查地址 / Key / 网络");
+        toastError(tr("settings.ai.protocolNoneWorked"));
       }
     } finally {
       if (alive.current) setTesting(false);
     }
-  }, [draft, patchDraft, testing]);
+  }, [draft, patchDraft, testing, tr]);
 
   /**
    * 「测试连接」：用表单里的值发一句「你好」，把成功/失败都讲清楚。
@@ -485,12 +492,12 @@ export function AiProvidersPanel(): JSX.Element {
     if (!draft || checking) return;
     const baseUrl = draft.baseUrl.trim();
     if (!baseUrl) {
-      toastError("请先填写 Base URL");
+      toastError(tr("settings.ai.baseUrlRequired"));
       return;
     }
     const model = draft.models[0] ?? "";
     if (!model) {
-      toastError("请先选一个模型，或点「获取列表」拉取");
+      toastError(tr("settings.ai.pickModelFirst"));
       return;
     }
     setChecking(true);
@@ -505,26 +512,36 @@ export function AiProvidersPanel(): JSX.Element {
       if (!alive.current) return;
       if (result.ok) {
         const reply = (result.reply ?? "").trim().replace(/\s+/g, " ");
-        const head = `连接正常 · ${model} · ${result.elapsedMs}ms`;
+        const head = tr("settings.ai.connectionOk", { model, ms: result.elapsedMs });
         setCheckNote({
           ok: true,
-          text: reply.length > 0 ? `${head} · 回复：${reply}` : head,
+          text: reply.length > 0 ? tr("settings.ai.connectionReply", { head, reply }) : head,
         });
       } else {
-        setCheckNote({ ok: false, text: `连接失败：${result.error ?? "未知错误"}` });
+        setCheckNote({
+          ok: false,
+          text: tr("settings.ai.connectionFailed", {
+            message: result.error ?? tr("settings.ai.unknownError"),
+          }),
+        });
       }
     } catch (err) {
-      if (alive.current) setCheckNote({ ok: false, text: `连接失败：${errMsg(err)}` });
+      if (alive.current) {
+        setCheckNote({
+          ok: false,
+          text: tr("settings.ai.connectionFailed", { message: errMsg(err) }),
+        });
+      }
     } finally {
       if (alive.current) setChecking(false);
     }
-  }, [checking, draft]);
+  }, [checking, draft, tr]);
 
   const pickIconFile = useCallback(
     (file: File | null) => {
       if (!file) return;
       if (file.size > 512 * 1024) {
-        toastError("图标图片不要超过 512KB");
+        toastError(tr("settings.ai.iconTooLarge"));
         return;
       }
       const reader = new FileReader();
@@ -534,7 +551,7 @@ export function AiProvidersPanel(): JSX.Element {
       };
       reader.readAsDataURL(file);
     },
-    [patchDraft],
+    [patchDraft, tr],
   );
 
   const toggleModel = useCallback(
@@ -554,7 +571,7 @@ export function AiProvidersPanel(): JSX.Element {
     return (
       <div className="flex items-center gap-2 py-3 text-xs text-muted-foreground">
         <Spinner size="sm" className="h-3.5 w-3.5" />
-        正在读取 AI 配置…
+        {tr("settings.ai.loadingConfig")}
       </div>
     );
   }
@@ -563,7 +580,7 @@ export function AiProvidersPanel(): JSX.Element {
     return (
       <div className="flex flex-col gap-2 py-2">
         <div className="flex items-center justify-between gap-2">
-          <span className="text-xs font-medium">供应商</span>
+          <span className="text-xs font-medium">{tr("settings.ai.providers")}</span>
           <span className="flex items-center gap-1.5">
             <span className="relative inline-flex items-center">
               <Search className="pointer-events-none absolute left-2 h-3 w-3 text-muted-foreground" />
@@ -571,17 +588,17 @@ export function AiProvidersPanel(): JSX.Element {
                 type="text"
                 value={filter}
                 onChange={(event) => setFilter(event.target.value)}
-                placeholder="查找供应商"
+                placeholder={tr("settings.ai.searchProviders")}
                 className="h-7 w-40 rounded-md border border-input bg-background pl-7 pr-2 text-xs outline-none transition-colors focus:border-primary/60"
               />
             </span>
             <button
               type="button"
-              onClick={() => setDraft(emptyDraft())}
+              onClick={() => setDraft(emptyDraft(tr("settings.ai.newProviderName")))}
               className={PRIMARY_BUTTON_CLASS}
             >
               <Plus className="h-3.5 w-3.5" />
-              添加供应商
+              {tr("settings.ai.addProvider")}
             </button>
           </span>
         </div>
@@ -590,8 +607,8 @@ export function AiProvidersPanel(): JSX.Element {
           {filtered.length === 0 ? (
             <li className="px-3 py-6 text-center text-xs text-muted-foreground">
               {profiles.length === 0
-                ? "还没有配置供应商，点右上角「添加供应商」开始"
-                : "没有匹配的供应商"}
+                ? tr("settings.ai.emptyProviders")
+                : tr("settings.ai.noMatchProviders")}
             </li>
           ) : (
             filtered.map((profile) => {
@@ -617,25 +634,29 @@ export function AiProvidersPanel(): JSX.Element {
                         </span>
                       </span>
                       <span className="flex items-center gap-2 text-2xs text-muted-foreground">
-                        <span>{profile.models.length} 个模型</span>
-                        {maskOf(profile) ? (
-                          <span className="truncate font-mono text-3xs">{maskOf(profile)}</span>
+                        <span>{tr("settings.ai.modelCount", { count: profile.models.length })}</span>
+                        {maskOf(profile, tr("settings.ai.keySaved")) ? (
+                          <span className="truncate font-mono text-3xs">
+                            {maskOf(profile, tr("settings.ai.keySaved"))}
+                          </span>
                         ) : (
-                          <span>未设 Key</span>
+                          <span>{tr("settings.ai.noKeySet")}</span>
                         )}
-                        <span>{PROTOCOL_LABEL[profile.protocol]}</span>
+                        <span>{tr(PROTOCOL_LABEL_KEY[profile.protocol])}</span>
                       </span>
                     </button>
                     <SwitchButton
                       checked={active}
                       onChange={() => void setActive(profile)}
-                      label={active ? "正在使用" : "设为使用中"}
+                      label={active ? tr("settings.ai.inUse") : tr("settings.ai.setInUse")}
                     />
                     <button
                       type="button"
                       onClick={() => setDraft(draftFromView(profile))}
                       className="rounded p-1 text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
-                      aria-label={`配置 ${profile.name || profile.baseUrl}`}
+                      aria-label={tr("settings.ai.configAria", {
+                        name: profile.name || profile.baseUrl,
+                      })}
                     >
                       <ChevronLeft className="h-4 w-4 rotate-180" />
                     </button>
@@ -664,7 +685,7 @@ export function AiProvidersPanel(): JSX.Element {
           className={GHOST_BUTTON_CLASS}
         >
           <ChevronLeft className="h-4 w-4" />
-          返回
+          {tr("settings.ai.back")}
         </button>
         {/* 测试连接的结论就地留在这行（用户要能一直看着它，浮层几秒就飘走了）。
             不再放「编辑「某某」」标题：名称下面输入框里就有，重复且占地方。 */}
@@ -672,7 +693,7 @@ export function AiProvidersPanel(): JSX.Element {
           {checking ? (
             <span className="flex items-center gap-1 text-3xs text-muted-foreground">
               <Spinner size="xs" className="h-2.5 w-2.5" />
-              正在测试连接…
+              {tr("settings.ai.testingConnection")}
             </span>
           ) : checkNote ? (
             <span
@@ -696,12 +717,12 @@ export function AiProvidersPanel(): JSX.Element {
       <div className="flex flex-col gap-3 rounded-xl border border-border p-3">
         <div className="grid gap-3 sm:grid-cols-2">
           <label className="flex flex-col gap-1">
-            <span className={LABEL_CLASS}>名称</span>
+            <span className={LABEL_CLASS}>{tr("settings.ai.nameLabel")}</span>
             <input
               type="text"
               value={draft.name}
               onChange={(event) => patchDraft({ name: event.target.value })}
-              placeholder="例如 官方 / 中转 / 本机"
+              placeholder={tr("settings.ai.namePlaceholder")}
               spellCheck={false}
               className={INPUT_CLASS}
             />
@@ -712,7 +733,7 @@ export function AiProvidersPanel(): JSX.Element {
               type="text"
               value={draft.id}
               readOnly
-              placeholder="保存后自动生成"
+              placeholder={tr("settings.ai.idPlaceholder")}
               spellCheck={false}
               className={`${INPUT_CLASS} font-mono text-muted-foreground`}
             />
@@ -733,7 +754,7 @@ export function AiProvidersPanel(): JSX.Element {
                     : "border-transparent bg-secondary/40 text-muted-foreground hover:bg-secondary"
                 }`}
               >
-                {option.label}
+                {tr(option.labelKey)}
               </button>
             ))}
             <button
@@ -743,7 +764,7 @@ export function AiProvidersPanel(): JSX.Element {
               className={GHOST_BUTTON_CLASS}
             >
               {testing ? <Spinner size="xs" className="h-3 w-3" /> : null}
-              检测协议
+              {tr("settings.ai.detectProtocol")}
             </button>
           </div>
           <input
@@ -757,7 +778,7 @@ export function AiProvidersPanel(): JSX.Element {
         </div>
 
         <div className="flex flex-col gap-1.5">
-          <span className={LABEL_CLASS}>账号 · 密钥（第一把生效）</span>
+          <span className={LABEL_CLASS}>{tr("settings.ai.accountKeys")}</span>
           {visibleKeys.map((item) => {
             const active = item.index === 0 && draft.removedKeyIndexes.length === 0;
             return (
@@ -766,11 +787,11 @@ export function AiProvidersPanel(): JSX.Element {
                 className="flex items-center gap-2 rounded-md border border-border px-2 py-1"
               >
                 <span className="flex-1 truncate font-mono text-2xs text-muted-foreground">
-                  {item.mask || "空 Key"}
+                  {item.mask || tr("settings.ai.emptyKey")}
                 </span>
                 {active ? (
                   <span className="rounded bg-secondary px-1.5 py-0.5 text-3xs text-muted-foreground">
-                    使用中
+                    {tr("settings.ai.inUse")}
                   </span>
                 ) : (
                   <button
@@ -778,7 +799,7 @@ export function AiProvidersPanel(): JSX.Element {
                     onClick={() => patchDraft({ activeKeyIndex: item.index })}
                     className="text-2xs text-muted-foreground transition-colors hover:text-foreground"
                   >
-                    设为使用中
+                    {tr("settings.ai.setInUse")}
                   </button>
                 )}
                 <button
@@ -789,7 +810,7 @@ export function AiProvidersPanel(): JSX.Element {
                     })
                   }
                   className="rounded p-0.5 text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
-                  aria-label="删除这把 Key"
+                  aria-label={tr("settings.ai.removeKeyAria")}
                 >
                   <Trash2 className="h-3 w-3" />
                 </button>
@@ -805,7 +826,7 @@ export function AiProvidersPanel(): JSX.Element {
                 {key.length <= 4 ? "••••" : `••••••${key.slice(-2)}`}
               </span>
               <span className="rounded bg-secondary px-1.5 py-0.5 text-3xs text-muted-foreground">
-                待保存
+                {tr("settings.ai.pendingSave")}
               </span>
               <button
                 type="button"
@@ -815,7 +836,7 @@ export function AiProvidersPanel(): JSX.Element {
                   })
                 }
                 className="rounded p-0.5 text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
-                aria-label="移除这把待保存的 Key"
+                aria-label={tr("settings.ai.removePendingKeyAria")}
               >
                 <X className="h-3 w-3" />
               </button>
@@ -828,7 +849,11 @@ export function AiProvidersPanel(): JSX.Element {
               onChange={(event) =>
                 patchDraft({ keyDraft: event.target.value, clearSavedKey: false })
               }
-              placeholder={draft.keyMasks.length > 0 ? "输入新 Key（保存后追加）" : "粘贴 API Key"}
+              placeholder={
+                draft.keyMasks.length > 0
+                  ? tr("settings.ai.keyPlaceholderExisting")
+                  : tr("settings.ai.keyPlaceholderNew")
+              }
               spellCheck={false}
               autoComplete="off"
               className={`${INPUT_CLASS} font-mono`}
@@ -845,7 +870,7 @@ export function AiProvidersPanel(): JSX.Element {
               className={GHOST_BUTTON_CLASS}
             >
               <Plus className="h-3.5 w-3.5" />
-              添加另一个密钥
+              {tr("settings.ai.addAnotherKey")}
             </button>
             {(draft.keyMasks.length > 0 || draft.pendingKeys.length > 0) && (
               <button
@@ -860,25 +885,25 @@ export function AiProvidersPanel(): JSX.Element {
                 }
                 className={DANGER_BUTTON_CLASS}
               >
-                清空
+                {tr("settings.ai.clear")}
               </button>
             )}
           </div>
           <span className="text-3xs text-muted-foreground">
-            Key 明文只存在本机数据库，不回到前端；列表里只显示掩码。
+            {tr("settings.ai.keyStorageHint")}
           </span>
         </div>
 
         <div className="flex flex-col gap-1.5">
-          <span className={LABEL_CLASS}>图标</span>
+          <span className={LABEL_CLASS}>{tr("settings.ai.iconLabel")}</span>
           <div className="flex flex-wrap items-center gap-1.5">
             <IconBadge icon={draft.icon} name={draft.name} baseUrl={draft.baseUrl} />
-            {ICON_CHOICES.map(({ name, label, Icon }) => (
+            {ICON_CHOICES.map(({ name, labelKey, Icon }) => (
               <button
                 key={name}
                 type="button"
                 onClick={() => patchDraft({ icon: name })}
-                title={label}
+                title={tr(labelKey)}
                 className={`flex h-7 w-7 items-center justify-center rounded-md border transition-colors ${
                   draft.icon === name
                     ? "border-primary/60 bg-secondary text-foreground"
@@ -890,7 +915,7 @@ export function AiProvidersPanel(): JSX.Element {
             ))}
             <label className={`${GHOST_BUTTON_CLASS} cursor-pointer`}>
               <ImageIcon className="h-3.5 w-3.5" />
-              选择图片
+              {tr("settings.ai.chooseImage")}
               <input
                 type="file"
                 accept="image/*"
@@ -904,7 +929,7 @@ export function AiProvidersPanel(): JSX.Element {
                 onClick={() => patchDraft({ icon: "" })}
                 className={GHOST_BUTTON_CLASS}
               >
-                清除图标
+                {tr("settings.ai.clearIcon")}
               </button>
             ) : null}
           </div>
@@ -912,21 +937,21 @@ export function AiProvidersPanel(): JSX.Element {
 
         <div className="flex items-center justify-between gap-2">
           <span className="flex flex-col">
-            <span className={LABEL_CLASS}>跳过证书校验</span>
+            <span className={LABEL_CLASS}>{tr("settings.ai.skipCertVerify")}</span>
             <span className="text-3xs text-muted-foreground">
-              本机自签 / 自建中转连不上 HTTPS 时打开，只影响这一家供应商
+              {tr("settings.ai.skipCertVerifyHint")}
             </span>
           </span>
           <SwitchButton
             checked={draft.skipCertVerify}
             onChange={(next) => patchDraft({ skipCertVerify: next })}
-            label="跳过证书校验"
+            label={tr("settings.ai.skipCertVerify")}
           />
         </div>
 
         <div className="flex flex-col gap-1.5">
           <div className="flex items-center justify-between gap-2">
-            <span className={LABEL_CLASS}>模型</span>
+            <span className={LABEL_CLASS}>{tr("settings.ai.modelsLabel")}</span>
             <span className="flex items-center gap-1.5">
               <button
                 type="button"
@@ -934,7 +959,7 @@ export function AiProvidersPanel(): JSX.Element {
                 className={GHOST_BUTTON_CLASS}
                 disabled={draft.vendorModels === null}
               >
-                仅所选
+                {tr("settings.ai.selectedOnly")}
               </button>
               <button
                 type="button"
@@ -945,7 +970,7 @@ export function AiProvidersPanel(): JSX.Element {
                 className={GHOST_BUTTON_CLASS}
                 disabled={draft.models.length === 0}
               >
-                全不选
+                {tr("settings.ai.selectNone")}
               </button>
               <button
                 type="button"
@@ -956,7 +981,7 @@ export function AiProvidersPanel(): JSX.Element {
                 className={GHOST_BUTTON_CLASS}
                 disabled={modelChoices.length === 0}
               >
-                全选
+                {tr("settings.ai.selectAll")}
               </button>
               <button
                 type="button"
@@ -969,18 +994,21 @@ export function AiProvidersPanel(): JSX.Element {
                 ) : (
                   <RefreshCw className="h-3 w-3" />
                 )}
-                获取列表
+                {tr("settings.ai.fetchModels")}
               </button>
             </span>
           </div>
           <span className="text-3xs text-muted-foreground">
             {draft.vendorModels === null
-              ? `已选 ${draft.models.length} 个（点「获取列表」拉供应商的模型）`
-              : `供应商返回 ${vendorModels.length} 个，已选 ${draft.models.length} 个`}
+              ? tr("settings.ai.selectedCount", { count: draft.models.length })
+              : tr("settings.ai.vendorCount", {
+                  total: vendorModels.length,
+                  count: draft.models.length,
+                })}
           </span>
           <div className="flex max-h-40 flex-wrap gap-1.5 overflow-y-auto">
             {modelChoices.length === 0 ? (
-              <span className="text-2xs text-muted-foreground">还没有模型，先获取列表</span>
+              <span className="text-2xs text-muted-foreground">{tr("settings.ai.noModelsYet")}</span>
             ) : (
               modelChoices.map((name) => {
                 const selected = draft.models.includes(name);
@@ -1004,7 +1032,7 @@ export function AiProvidersPanel(): JSX.Element {
           </div>
           {draft.models.length > 1 ? (
             <span className="text-3xs text-muted-foreground">
-              第一个「{draft.models[0]}」是默认模型
+              {tr("settings.ai.defaultModelHint", { model: draft.models[0] ?? "" })}
             </span>
           ) : null}
         </div>
@@ -1019,7 +1047,7 @@ export function AiProvidersPanel(): JSX.Element {
             className={DANGER_BUTTON_CLASS}
           >
             <Trash2 className="h-3.5 w-3.5" />
-            移除
+            {tr("settings.ai.remove")}
           </button>
           <button
             type="button"
@@ -1028,17 +1056,17 @@ export function AiProvidersPanel(): JSX.Element {
             className={GHOST_BUTTON_CLASS}
           >
             <Copy className="h-3.5 w-3.5" />
-            复制
+            {tr("settings.ai.duplicate")}
           </button>
           <button
             type="button"
             onClick={() => void checkConnect()}
             disabled={checking || saving}
-            title="用当前填的地址、模型、Key 真发一句话，确认这套配置能不能用"
+            title={tr("settings.ai.testConnectionTitle")}
             className={GHOST_BUTTON_CLASS}
           >
             {checking ? <Spinner size="xs" className="h-3 w-3" /> : <Zap className="h-3.5 w-3.5" />}
-            测试连接
+            {tr("settings.ai.testConnection")}
           </button>
         </span>
         <span className="flex items-center gap-1.5">
@@ -1048,7 +1076,7 @@ export function AiProvidersPanel(): JSX.Element {
             disabled={saving}
             className={GHOST_BUTTON_CLASS}
           >
-            取消
+            {tr("common.cancel")}
           </button>
           <button
             type="button"
@@ -1057,7 +1085,7 @@ export function AiProvidersPanel(): JSX.Element {
             className={PRIMARY_BUTTON_CLASS}
           >
             {saving ? <Spinner size="sm" className="h-3.5 w-3.5" /> : null}
-            保存
+            {tr("common.save")}
           </button>
         </span>
       </div>
@@ -1071,13 +1099,14 @@ export function AiProvidersPanel(): JSX.Element {
  * 一个标题栏和关闭行为；点遮罩、按 Esc、点右上角 X 都能关。
  */
 export function AiProvidersDialog(props: { onClose: () => void }): JSX.Element {
+  const tr = useT();
   return (
     <Modal
       open
       onClose={props.onClose}
-      title="AI 供应商"
-      description="点一行进去改地址、协议、密钥和模型；第一把密钥、第一个模型生效。"
-      closeLabel="关闭 AI 供应商设置"
+      title={tr("settings.ai.providersDialogTitle")}
+      description={tr("settings.ai.providersDialogDesc")}
+      closeLabel={tr("settings.ai.providersDialogClose")}
       size="lg"
       className="max-w-3xl"
       bodyClassName="px-5 pb-5"

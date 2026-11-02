@@ -1,23 +1,30 @@
 import { useCallback, useEffect, useState } from "react";
+import { useT, type MessageKey } from "@/lib/i18n";
 import { errMsg } from "@/lib/utils";
 import * as ipc from "@/services/ipc";
 import { Switch } from "../controls";
 
-/** 快捷键动作 id → 中文名（模块级常量：原先定义在组件体内，每次渲染都重建一遍） */
-const LABELS: Record<string, string> = {
-  play_pause: "播放 / 暂停",
-  previous: "上一首",
-  next: "下一首",
-  volume_up: "音量加",
-  volume_down: "音量减",
-  mute: "静音",
-  desktop_lyric: "桌面歌词开关",
-  lock_lyric: "锁定 / 解锁桌面歌词",
+/** 快捷键动作 id → 词条键（模块级常量：原先定义在组件体内，每次渲染都重建一遍） */
+const LABEL_KEYS: Record<string, MessageKey> = {
+  play_pause: "settings.shortcut.playPause",
+  previous: "player.prev",
+  next: "player.next",
+  volume_up: "settings.shortcut.volumeUp",
+  volume_down: "settings.shortcut.volumeDown",
+  mute: "player.mute",
+  desktop_lyric: "settings.shortcut.desktopLyric",
+  lock_lyric: "settings.shortcut.lockLyric",
 };
+
+function actionLabel(id: string, tr: ReturnType<typeof useT>): string {
+  const key = LABEL_KEYS[id];
+  return key ? tr(key) : id;
+}
 
 /** 播放设置：全局快捷键（可改键 / 可禁用，保存即热重载） */
 
 export function ShortcutSection(): React.JSX.Element {
+  const tr = useT();
   const [entries, setEntries] = useState<ipc.ShortcutEntry[]>([]);
   const [draft, setDraft] = useState<
     Record<string, { key: string; enabled: boolean }>
@@ -113,7 +120,7 @@ export function ShortcutSection(): React.JSX.Element {
   return (
     <div className="max-w-4xl divide-y divide-border">
       {entries.length === 0 && !error && (
-        <p className="py-4 text-sm text-muted-foreground">加载中…</p>
+        <p className="py-4 text-sm text-muted-foreground">{tr("common.loading")}</p>
       )}
       {entries.map((e) => {
         const d = draft[e.id] ?? { key: e.accelerator, enabled: e.enabled };
@@ -121,30 +128,34 @@ export function ShortcutSection(): React.JSX.Element {
         return (
           <div key={e.id} className="flex items-center justify-between gap-6 py-3">
             <div className="min-w-0">
-              <p className="text-sm">{LABELS[e.id] ?? e.id}</p>
+              <p className="text-sm">{actionLabel(e.id, tr)}</p>
               {listening === e.id && (
                 <p className="mt-0.5 text-xs text-[var(--primary)]">
-                  按下新的快捷键组合（Esc 取消）…
+                  {tr("settings.shortcut.listening")}
                 </p>
               )}
               {/* 注册失败 = 这个键被别的程序占着（Windows 上是 RegisterHotKey 1409）。
                   不提示的话表现就是"按了没反应"，会被当成播放器的 bug。 */}
               {e.conflict && listening !== e.id && (
                 <p className="mt-0.5 text-xs text-destructive">
-                  该快捷键已被其它程序占用，当前无效；请点右侧输入框改绑一个组合。
+                  {tr("settings.shortcut.conflict")}
                 </p>
               )}
             </div>
             <div className="flex shrink-0 items-center gap-2">
               <input
                 readOnly
-                value={listening === e.id ? "按下新组合…" : d.key}
+                value={
+                  listening === e.id ? tr("settings.shortcut.pressNew") : d.key
+                }
                 onFocus={() => setListening(e.id)}
                 onClick={() => setListening(e.id)}
                 onKeyDown={(ev) => {
                   if (ev.key === "Escape") setListening(null);
                 }}
-                aria-label={`${LABELS[e.id] ?? e.id} 快捷键`}
+                aria-label={tr("settings.shortcut.ariaLabel", {
+                  name: actionLabel(e.id, tr),
+                })}
                 className={`w-36 rounded-md border px-2 py-1.5 text-center text-xs outline-none transition-colors ${
                   listening === e.id
                     ? "border-[var(--primary)] ring-2 ring-ring"
@@ -173,7 +184,7 @@ export function ShortcutSection(): React.JSX.Element {
                   }
                   className="rounded px-2 py-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
                 >
-                  还原
+                  {tr("settings.shortcut.revert")}
                 </button>
               )}
             </div>
@@ -190,7 +201,7 @@ export function ShortcutSection(): React.JSX.Element {
           disabled={saving}
           className="rounded-md border border-border px-3 py-1.5 text-xs transition-colors hover:bg-accent disabled:opacity-50"
         >
-          恢复默认
+          {tr("common.restoreDefault")}
         </button>
         <button
           type="button"
@@ -201,7 +212,7 @@ export function ShortcutSection(): React.JSX.Element {
           })}
           className="rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-50"
         >
-          {saving ? "保存中…" : "保存并生效"}
+          {saving ? tr("settings.shortcut.saving") : tr("settings.shortcut.save")}
         </button>
       </div>
     </div>

@@ -50,6 +50,11 @@ const mocks = vi.hoisted(() => {
     listDislikes: vi.fn(async () => []),
     // SettingsPage 改级别后会同步前端过滤（@/lib/logger → writeLog）
     writeLog: vi.fn(async () => undefined),
+    // 「链接唤起」（B4）：本文件只关心日志区，按「非 Windows」返回让整行不渲染，
+    // 免得给下面按行数/按钮数断言的用例添噪音（该行自身有 uri-scheme-section.test.tsx）
+    getUriSchemeState: vi.fn(async () => ({ supported: false, registered: false, example: "" })),
+    registerUriScheme: vi.fn(),
+    unregisterUriScheme: vi.fn(),
   };
 });
 

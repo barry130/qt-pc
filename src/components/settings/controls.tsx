@@ -4,12 +4,19 @@ import { type AppearancePreference } from "@/types";
 import { ExternalLink } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/form";
+import { useT } from "@/lib/i18n";
 
-export const MODE_OPTIONS: { value: AppearancePreference["mode"]; label: string }[] = [
-  { value: "light", label: "浅色" },
-  { value: "dark", label: "深色" },
-  { value: "system", label: "跟随系统" },
-];
+/** 外观模式的选项。文案随语言变，所以是函数而不是常量（组件里传 `useT()` 进来）。 */
+export function modeOptions(tr: (key: "appearance.mode.light" | "appearance.mode.dark" | "appearance.mode.system") => string): {
+  value: AppearancePreference["mode"];
+  label: string;
+}[] {
+  return [
+    { value: "light", label: tr("appearance.mode.light") },
+    { value: "dark", label: tr("appearance.mode.dark") },
+    { value: "system", label: tr("appearance.mode.system") },
+  ];
+}
 
 // 这三个原语已迁到 ui 层（`src/components/ui/`）。设置页内的相对导入保持不变，
 // 新代码请直接从 `@/components/ui` 引用，别再在这里加一份。
@@ -38,11 +45,12 @@ export function cssToHex(color: string): string {
 }
 
 export function GenericSection(props: { hint: string }): React.JSX.Element {
+  const tr = useT();
   return (
     <div className="flex h-full min-h-40 flex-col items-center justify-center">
       <div className="text-center text-sm text-muted-foreground">
-        <p>「{props.hint}」还没开发</p>
-        <p className="mt-1 text-xs">将在后续里程碑交付</p>
+        <p>{tr("common.notDeveloped", { hint: props.hint })}</p>
+        <p className="mt-1 text-xs">{tr("common.comingSoon")}</p>
       </div>
     </div>
   );
@@ -58,6 +66,7 @@ export function DirPicker(props: {
   onChoose: () => void;
   onReset: () => void;
 }): React.JSX.Element {
+  const tr = useT();
   return (
     <div className="flex items-center gap-2">
       <span
@@ -67,14 +76,14 @@ export function DirPicker(props: {
         {props.path || "…"}
       </span>
       <Button variant="outline" onClick={props.onChoose} disabled={props.busy || props.disabled}>
-        更改位置
+        {tr("common.changeLocation")}
       </Button>
       <Button
         variant="ghost"
         onClick={props.onReset}
         disabled={props.busy || props.disabled}
       >
-        恢复默认
+        {tr("common.restoreDefault")}
       </Button>
     </div>
   );

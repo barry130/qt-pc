@@ -1,10 +1,12 @@
 import { useEffect, useState } from "react";
+import { useT } from "@/lib/i18n";
 import { errMsg } from "@/lib/utils";
 import { useDislikesStore } from "@/stores/dislikes";
 import { SettingRow } from "../controls";
 import { Ban, X } from "lucide-react";
 
 export function DislikeSection(): React.JSX.Element {
+  const tr = useT();
   const rules = useDislikesStore((s) => s.rules);
   const loaded = useDislikesStore((s) => s.loaded);
   const refresh = useDislikesStore((s) => s.refresh);
@@ -47,11 +49,11 @@ export function DislikeSection(): React.JSX.Element {
   return (
     <div className="max-w-4xl divide-y divide-border">
       <SettingRow
-        title="屏蔽规则"
-        description="不再出现在列表与自动播放里；手动点播不受限"
+        title={tr("settings.dislike.rules.title")}
+        description={tr("settings.dislike.rules.description")}
       >
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          <span>{loaded ? `${rules.length} 条` : "…"}</span>
+          <span>{loaded ? tr("settings.dislike.count", { n: rules.length }) : "…"}</span>
           {rules.length > 0 && (
             <button
               type="button"
@@ -69,18 +71,16 @@ export function DislikeSection(): React.JSX.Element {
                   : "border-border text-muted-foreground hover:bg-accent hover:text-foreground"
               }`}
             >
-              {confirming ? "确认清空全部？" : "清空"}
+              {confirming ? tr("settings.dislike.clearConfirm") : tr("settings.dislike.clear")}
             </button>
           )}
         </div>
       </SettingRow>
       <div className="py-3">
         {!loaded ? (
-          <p className="text-xs text-muted-foreground">加载中…</p>
+          <p className="text-xs text-muted-foreground">{tr("common.loading")}</p>
         ) : rules.length === 0 ? (
-          <p className="text-xs text-muted-foreground">
-            还没有屏蔽任何歌曲
-          </p>
+          <p className="text-xs text-muted-foreground">{tr("settings.dislike.empty")}</p>
         ) : (
           <ul className="flex flex-col divide-y divide-border">
             {rules.map((r) => (
@@ -99,16 +99,18 @@ export function DislikeSection(): React.JSX.Element {
                   className="shrink-0 rounded bg-secondary px-1 py-px text-3xs text-muted-foreground"
                   title={
                     r.kind === "singer"
-                      ? "这位歌手的所有歌都不会自动出现"
-                      : "这首歌（含同名不同版本）不会自动出现"
+                      ? tr("settings.dislike.kindTitle.singer")
+                      : tr("settings.dislike.kindTitle.song")
                   }
                 >
-                  {r.kind === "singer" ? "歌手" : "歌曲"}
+                  {r.kind === "singer"
+                    ? tr("settings.dislike.kind.singer")
+                    : tr("settings.dislike.kind.song")}
                 </span>
                 <button
                   type="button"
-                  aria-label={`取消屏蔽 ${r.nameRaw}`}
-                  title="取消屏蔽"
+                  aria-label={tr("settings.dislike.unbanAria", { name: r.nameRaw })}
+                  title={tr("settings.dislike.unban")}
                   disabled={busy}
                   onClick={() => void unban(r.id)}
                   className="shrink-0 rounded p-1 text-muted-foreground transition-colors hover:bg-background hover:text-foreground disabled:opacity-50"
@@ -122,7 +124,7 @@ export function DislikeSection(): React.JSX.Element {
       </div>
       {confirming && (
         <p className="pb-2 text-xs text-muted-foreground">
-          不可恢复；切换分区会自动取消
+          {tr("settings.dislike.clearHint")}
         </p>
       )}
       {error && <p className="py-2 text-xs text-destructive">{error}</p>}

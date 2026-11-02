@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { useT } from "@/lib/i18n";
 import { LYRICS_WINDOW_LABEL } from "@/lib/window-labels";
 import * as ipc from "@/services/ipc";
 import { getDesktopLyricState, hideDesktopLyric, onLyricWindowChanged, resetDesktopLyric, setDesktopLyricLocked, setDesktopLyricStyle, showDesktopLyric } from "@/services/ipc";
@@ -8,6 +9,7 @@ import { getAllWindows } from "@tauri-apps/api/window";
 import { buttonClass } from "@/components/ui";
 
 export function DesktopLyricSection(): React.JSX.Element {
+  const tr = useT();
   const [state, setState] = useState<DesktopLyricState | null>(null);
 
   useEffect(() => {
@@ -37,12 +39,15 @@ export function DesktopLyricSection(): React.JSX.Element {
   const visible = state?.visible ?? false;
 
   if (!state) {
-    return <p className="py-6 text-xs text-muted-foreground">正在读取歌词设置…</p>;
+    return <p className="py-6 text-xs text-muted-foreground">{tr("settings.desktopLyric.loading")}</p>;
   }
 
   return (
     <div className="max-w-4xl divide-y divide-border pb-8">
-      <SettingRow title="显示桌面歌词" description="桌面置顶显示逐行歌词">
+      <SettingRow
+        title={tr("settings.desktopLyric.show")}
+        description={tr("settings.desktopLyric.showHint")}
+      >
         <Switch
           checked={visible}
           onToggle={() =>
@@ -52,15 +57,18 @@ export function DesktopLyricSection(): React.JSX.Element {
           }
         />
       </SettingRow>
-      <SettingRow title="总在最前" description="始终置顶；关闭后会被遮挡">
+      <SettingRow
+        title={tr("settings.desktopLyric.alwaysOnTop")}
+        description={tr("settings.desktopLyric.alwaysOnTopHint")}
+      >
         <Switch
           checked={state.alwaysOnTop}
           onToggle={() => patch({ alwaysOnTop: !state.alwaysOnTop })}
         />
       </SettingRow>
       <SettingRow
-        title="锁定歌词位置"
-        description="不能拖动，点击穿透，隐藏工具条；Ctrl+Alt+K 解锁"
+        title={tr("settings.desktopLyric.lock")}
+        description={tr("settings.desktopLyric.lockHint")}
       >
         <Switch
           checked={state.locked}
@@ -70,25 +78,28 @@ export function DesktopLyricSection(): React.JSX.Element {
         />
       </SettingRow>
 
-      <SettingRow title="字体">
+      <SettingRow title={tr("settings.desktopLyric.font")}>
         <select
           value={state.fontFamily}
           onChange={(e) => patch({ fontFamily: e.target.value })}
           className="w-36 rounded-md border border-border bg-background px-2 py-1 text-xs"
         >
-          <option value="">系统默认</option>
-          <option value="Microsoft YaHei">微软雅黑</option>
-          <option value="SimSun">宋体</option>
-          <option value="SimHei">黑体</option>
-          <option value="KaiTi">楷体</option>
-          <option value="STXingkai">行楷（华文行楷）</option>
-          <option value="FangSong">仿宋</option>
+          <option value="">{tr("settings.desktopLyric.fontSystemDefault")}</option>
+          <option value="Microsoft YaHei">{tr("settings.desktopLyric.fontMicrosoftYaHei")}</option>
+          <option value="SimSun">{tr("settings.desktopLyric.fontSimSun")}</option>
+          <option value="SimHei">{tr("settings.desktopLyric.fontSimHei")}</option>
+          <option value="KaiTi">{tr("settings.desktopLyric.fontKaiTi")}</option>
+          <option value="STXingkai">{tr("settings.desktopLyric.fontSTXingkai")}</option>
+          <option value="FangSong">{tr("settings.desktopLyric.fontFangSong")}</option>
           <option value="Arial">Arial</option>
           <option value="Georgia">Georgia</option>
           <option value="Consolas">Consolas</option>
         </select>
       </SettingRow>
-      <SettingRow title={`字号（${state.fontSize}px）`} description="也可在歌词上滚轮调整">
+      <SettingRow
+        title={tr("settings.desktopLyric.fontSize", { size: state.fontSize })}
+        description={tr("settings.desktopLyric.fontSizeHint")}
+      >
         <input
           type="range"
           min={12}
@@ -99,7 +110,11 @@ export function DesktopLyricSection(): React.JSX.Element {
           className="w-40 accent-[var(--primary)]"
         />
       </SettingRow>
-      <SettingRow title={`字间距（${state.letterSpacing.toFixed(1)}px）`}>
+      <SettingRow
+        title={tr("settings.desktopLyric.letterSpacing", {
+          spacing: state.letterSpacing.toFixed(1),
+        })}
+      >
         <input
           type="range"
           min={0}
@@ -110,7 +125,9 @@ export function DesktopLyricSection(): React.JSX.Element {
           className="w-40 accent-[var(--primary)]"
         />
       </SettingRow>
-      <SettingRow title={`行间距（${state.lineGap.toFixed(2)} 倍）`}>
+      <SettingRow
+        title={tr("settings.desktopLyric.lineGap", { gap: state.lineGap.toFixed(2) })}
+      >
         <input
           type="range"
           min={1}
@@ -123,8 +140,8 @@ export function DesktopLyricSection(): React.JSX.Element {
       </SettingRow>
 
       <SettingRow
-        title={`歌词窗口宽度（${state.width}px）`}
-        description="过窄时歌词自动横向滚动"
+        title={tr("settings.desktopLyric.width", { width: state.width })}
+        description={tr("settings.desktopLyric.widthHint")}
       >
         <input
           type="range"
@@ -152,11 +169,14 @@ export function DesktopLyricSection(): React.JSX.Element {
         />
       </SettingRow>
 
-      <SettingRow title="当前行配色" description="当前行高亮渐变（两端）">
+      <SettingRow
+        title={tr("settings.desktopLyric.currentLineColor")}
+        description={tr("settings.desktopLyric.currentLineColorHint")}
+      >
         <div className="flex items-center gap-2">
           <input
             type="color"
-            aria-label="当前行渐变起始色"
+            aria-label={tr("settings.desktopLyric.gradientStart")}
             value={state.gradient[0]}
             onChange={(e) => patch({ gradient: [e.target.value, state.gradient[1]] })}
             className="h-6 w-8 cursor-pointer rounded border border-border bg-transparent p-0"
@@ -164,23 +184,29 @@ export function DesktopLyricSection(): React.JSX.Element {
           <span className="text-xs text-muted-foreground">→</span>
           <input
             type="color"
-            aria-label="当前行渐变结束色"
+            aria-label={tr("settings.desktopLyric.gradientEnd")}
             value={state.gradient[1]}
             onChange={(e) => patch({ gradient: [state.gradient[0], e.target.value] })}
             className="h-6 w-8 cursor-pointer rounded border border-border bg-transparent p-0"
           />
         </div>
       </SettingRow>
-      <SettingRow title="非当前行颜色" description="上下文与翻译行的文字色">
+      <SettingRow
+        title={tr("settings.desktopLyric.inactiveColor")}
+        description={tr("settings.desktopLyric.inactiveColorHint")}
+      >
         <input
           type="color"
-          aria-label="非当前行文字颜色"
+          aria-label={tr("settings.desktopLyric.inactiveColorAria")}
           value={cssToHex(state.inactiveColor)}
           onChange={(e) => patch({ inactiveColor: e.target.value })}
           className="h-6 w-8 cursor-pointer rounded border border-border bg-transparent p-0"
         />
       </SettingRow>
-      <SettingRow title="文字描边" description="深色描边，亮色壁纸下也清晰">
+      <SettingRow
+        title={tr("settings.desktopLyric.stroke")}
+        description={tr("settings.desktopLyric.strokeHint")}
+      >
         <div className="flex items-center gap-3">
           {state.stroke && (
             <input
@@ -191,29 +217,36 @@ export function DesktopLyricSection(): React.JSX.Element {
               value={state.strokeWidth}
               onChange={(e) => patch({ strokeWidth: Number(e.target.value) })}
               className="w-24 accent-[var(--primary)]"
-              aria-label="描边宽度"
+              aria-label={tr("settings.desktopLyric.strokeWidth")}
             />
           )}
           <Switch checked={state.stroke} onToggle={() => patch({ stroke: !state.stroke })} />
         </div>
       </SettingRow>
-      <SettingRow title="文字阴影">
+      <SettingRow title={tr("settings.desktopLyric.shadow")}>
         <Switch checked={state.shadow} onToggle={() => patch({ shadow: !state.shadow })} />
       </SettingRow>
 
-      <SettingRow title="背景" description="无 / 半透明蒙版 / 纯色">
+      <SettingRow
+        title={tr("settings.desktopLyric.background")}
+        description={tr("settings.desktopLyric.backgroundHint")}
+      >
         <Segmented
           value={state.backgroundMode}
           options={[
-            { value: "none", label: "无" },
-            { value: "mask", label: "蒙版" },
-            { value: "solid", label: "纯色" },
+            { value: "none", label: tr("settings.desktopLyric.bgNone") },
+            { value: "mask", label: tr("settings.desktopLyric.bgMask") },
+            { value: "solid", label: tr("settings.desktopLyric.bgSolid") },
           ]}
           onChange={(v) => patch({ backgroundMode: v })}
         />
       </SettingRow>
       {state.backgroundMode === "mask" && (
-        <SettingRow title={`蒙版浓度（${Math.round(state.backgroundOpacity * 100)}%）`}>
+        <SettingRow
+          title={tr("settings.desktopLyric.maskOpacity", {
+            percent: Math.round(state.backgroundOpacity * 100),
+          })}
+        >
           <input
             type="range"
             min={0}
@@ -226,17 +259,17 @@ export function DesktopLyricSection(): React.JSX.Element {
         </SettingRow>
       )}
       {state.backgroundMode === "solid" && (
-        <SettingRow title="背景颜色">
+        <SettingRow title={tr("settings.desktopLyric.backgroundColor")}>
           <input
             type="color"
-            aria-label="背景颜色"
+            aria-label={tr("settings.desktopLyric.backgroundColor")}
             value={cssToHex(state.backgroundColor)}
             onChange={(e) => patch({ backgroundColor: e.target.value })}
             className="h-6 w-8 cursor-pointer rounded border border-border bg-transparent p-0"
           />
         </SettingRow>
       )}
-      <SettingRow title={`窗口圆角（${state.borderRadius}px）`}>
+      <SettingRow title={tr("settings.desktopLyric.radius", { radius: state.borderRadius })}>
         <input
           type="range"
           min={0}
@@ -248,39 +281,42 @@ export function DesktopLyricSection(): React.JSX.Element {
         />
       </SettingRow>
 
-      <SettingRow title="对齐方式">
+      <SettingRow title={tr("settings.desktopLyric.align")}>
         <Segmented
           value={state.align}
           options={[
-            { value: "left", label: "左" },
-            { value: "center", label: "中" },
-            { value: "right", label: "右" },
+            { value: "left", label: tr("settings.desktopLyric.alignLeft") },
+            { value: "center", label: tr("settings.desktopLyric.alignCenter") },
+            { value: "right", label: tr("settings.desktopLyric.alignRight") },
           ]}
           onChange={(v) => patch({ align: v })}
         />
       </SettingRow>
-      <SettingRow title="歌词行数" description="三行＝上文 + 当前 + 下文">
+      <SettingRow
+        title={tr("settings.desktopLyric.lineCount")}
+        description={tr("settings.desktopLyric.lineCountHint")}
+      >
         <Segmented
           value={state.lineMode}
           options={[
-            { value: "single", label: "单行" },
-            { value: "two-lines", label: "双行" },
-            { value: "three-lines", label: "三行" },
+            { value: "single", label: tr("settings.desktopLyric.linesSingle") },
+            { value: "two-lines", label: tr("settings.desktopLyric.linesTwo") },
+            { value: "three-lines", label: tr("settings.desktopLyric.linesThree") },
           ]}
           onChange={(v) => patch({ lineMode: v })}
         />
       </SettingRow>
 
       <SettingRow
-        title="重置歌词位置"
-        description="拖到屏幕外时一键复位到主屏底部"
+        title={tr("settings.desktopLyric.resetPosition")}
+        description={tr("settings.desktopLyric.resetPositionHint")}
       >
         <button
           type="button"
           onClick={() => void resetDesktopLyric().then(setState).catch(() => {})}
           className={buttonClass({ variant: "primary" })}
         >
-          复位到屏幕中心
+          {tr("settings.desktopLyric.resetButton")}
         </button>
       </SettingRow>
     </div>

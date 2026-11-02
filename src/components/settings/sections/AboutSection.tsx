@@ -1,19 +1,25 @@
 import { useEffect, useState } from "react";
 import { useOfficialSiteUrl } from "@/hooks/useOfficialSiteUrl";
 import { runCheck } from "@/hooks/useUpdateCheck";
+import { useT } from "@/lib/i18n";
 import { OFFICIAL_AGREEMENT_PATH, OFFICIAL_FEEDBACK_PATH, OFFICIAL_PRIVACY_PATH, officialSitePath } from "@/lib/official-site";
 import { stripErrorUrls } from "@/lib/utils";
-import { getAppVersion } from "@/services/ipc";
+import { getAppPaths, getAppVersion, buildDiagnostics, pickSavePath, saveBinaryFile } from "@/services/ipc";
 import { useDisclaimerStore } from "@/stores/disclaimer";
 import { toast, toastError, toastSuccess } from "@/stores/toast";
 import { useUpdateStore } from "@/stores/update";
-import { type AppVersion } from "@/types";
+import { type AppPaths, type AppVersion } from "@/types";
 import { ExternalLinkButton, SettingRow } from "../controls";
 import { buttonClass } from "@/components/ui";
 
 export function AboutSection(): React.JSX.Element {
+  const tr = useT();
   const [version, setVersion] = useState<AppVersion | null>(null);
+  /** 数据目录快照（§8.2 便携模式）：拿不到就不显示路径，不留空行 */
+  const [paths, setPaths] = useState<AppPaths | null>(null);
   const [checking, setChecking] = useState(false);
+  /** 诊断包正在打包（读日志 + 组 zip，几百毫秒级，给个忙碌态防连点） */
+  const [exporting, setExporting] = useState(false);
   const setUpdate = useUpdateStore((s) => s.setUpdate);
   /** 官网根地址（未配置时为空串 → 下面四行整块不渲染） */
   const siteUrl = useOfficialSiteUrl();
@@ -26,11 +32,12 @@ export function AboutSection(): React.JSX.Element {
    */
   const handleReopenDisclaimer = async (): Promise<void> => {
     const shown = await reopenDisclaimer();
-    if (!shown) toast("暂时取不到声明内容，请检查网络后重试");
+    if (!shown) toast(tr("settings.about.disclaimerUnavailable"));
   };
 
   useEffect(() => {
     void getAppVersion().then(setVersion).catch(() => {});
+    void getAppPaths().then(setPaths).catch(() => {});
   }, []);
 
   const checkUpdate = async (): Promise<void> => {
@@ -45,33 +52,102 @@ export function AboutSection(): React.JSX.Element {
             ? ` · ${(update.fileSize / 1024 / 1024).toFixed(1)} MB`
             : "";
         // 发现新版本走 UpdateDialog 弹窗，这里只留一条 toast 说明更新说明在哪看
-        toast(`发现新版本 ${update.versionName}${sizeStr}，稍后弹窗确认`);
+        toast(tr("settings.about.updateFound", { version: update.versionName, size: sizeStr }));
       } else {
-        toastSuccess("当前已是最新版本");
+        toastSuccess(tr("settings.about.upToDate"));
       }
     } catch (e) {
-      toastError(`检查失败：${stripErrorUrls(String(e))}`);
+      toastError(tr("settings.about.updateCheckFailed", { error: stripErrorUrls(String(e)) }));
       setUpdate(null);
     } finally {
       setChecking(false);
     }
   };
 
+  /**
+   * 导出诊断包（§18 / B8）：先打包、再让用户选路径 —— 用户点取消时一个字节都不落盘。
+   */
+  const exportDiagnostics = async (): Promise<void> => {
+    setExporting(true);
+    try {
+      const bundle = await buildDiagnostics();
+      const path = await pickSavePath(bundle.fileName, tr("settings.about.saveDiagnosticsTitle"), ["zip"]);
+      if (path === null) return;
+      await saveBinaryFile(path, bundle.base64);
+      toastSuccess(
+        tr("settings.about.exported", {
+          files: bundle.files,
+          size: (bundle.bytes / 1024).toFixed(1),
+        }),
+      );
+    } catch (e) {
+      toastError(tr("settings.about.exportFailed", { error: stripErrorUrls(String(e)) }));
+    } finally {
+      setExporting(false);
+    }
+  };
+
   return (
     <div className="max-w-4xl divide-y divide-border">
-      <SettingRow title="当前版本" description="轻听 PC 版">
+      <SettingRow
+        title={tr("settings.about.currentVersion")}
+        description={tr("settings.about.appEdition")}
+      >
         <span className="font-mono text-xs text-muted-foreground">
-          {version ? `${version.versionName} (versionCode ${version.versionCode})` : "…"}
+          {version
+            ? tr("settings.about.versionValue", {
+                name: version.versionName,
+                code: version.versionCode,
+              })
+            : "…"}
         </span>
       </SettingRow>
-      <SettingRow title="检查更新" description="启动时自动检查">
+      <SettingRow
+        title={tr("settings.about.checkUpdate")}
+        description={tr("settings.about.autoCheck")}
+      >
         <button
           type="button"
           onClick={() => void checkUpdate()}
           disabled={checking}
           className={buttonClass({ variant: "outline" })}
         >
-          {checking ? "检查中…" : "检查更新"}
+          {checking ? tr("settings.about.checking") : tr("settings.about.checkUpdate")}
+        </button>
+      </SettingRow>
+      {/* 数据目录（§8.2）：便携版下就在程序旁边，换机直接整个文件夹拷走 */}
+      <SettingRow
+        title={tr("settings.about.dataDir")}
+        description={
+          paths?.portable
+            ? tr("settings.about.dataDirHintPortable")
+            : tr("settings.about.dataDirHint")
+        }
+      >
+        <div className="flex flex-col items-end gap-1">
+          {paths?.portable ? (
+            <span className="rounded border border-border px-1.5 py-0.5 text-2xs text-muted-foreground">
+              {tr("settings.about.portable")}
+            </span>
+          ) : null}
+          <span className="max-w-80 break-all text-right font-mono text-2xs text-muted-foreground">
+            {paths?.dataRoot ?? "…"}
+          </span>
+        </div>
+      </SettingRow>
+      {/* 诊断包（§18 / B8）：排障时让用户一键把日志与配置发过来，不用一步步教抓文件。
+          不含曲库路径清单与历史明细；凭据在 Rust 侧替换成 *** */}
+      <SettingRow
+        title={tr("settings.about.diagnostics")}
+        description={tr("settings.about.diagnosticsHint")}
+      >
+        <button
+          type="button"
+          onClick={() => void exportDiagnostics()}
+          disabled={exporting}
+          className={buttonClass({ variant: "outline" })}
+        >
+          {exporting ? tr("settings.about.exporting") : tr("settings.about.exportDiagnostics")}
         </button>
       </SettingRow>
       {/* 官网条款与开源信息：协议正文、隐私说明与仓库地址都只在官网维护一份，
@@ -80,37 +156,52 @@ export function AboutSection(): React.JSX.Element {
           不给打不开的链接 */}
       {siteUrl ? (
         <>
-          <SettingRow title="项目介绍与开源地址" description="功能介绍与开源地址">
-            <ExternalLinkButton label="打开官网" url={siteUrl} />
+          <SettingRow
+            title={tr("settings.about.projectIntro")}
+            description={tr("settings.about.projectIntroHint")}
+          >
+            <ExternalLinkButton label={tr("settings.about.openSite")} url={siteUrl} />
           </SettingRow>
-          <SettingRow title="用户协议" description="建议先读一遍">
+          <SettingRow
+            title={tr("settings.about.agreement")}
+            description={tr("settings.about.agreementHint")}
+          >
             <ExternalLinkButton
-              label="查看"
+              label={tr("settings.about.view")}
               url={officialSitePath(siteUrl, OFFICIAL_AGREEMENT_PATH)}
             />
           </SettingRow>
-          <SettingRow title="隐私政策" description="数据收集与保留说明">
+          <SettingRow
+            title={tr("settings.about.privacy")}
+            description={tr("settings.about.privacyHint")}
+          >
             <ExternalLinkButton
-              label="查看"
+              label={tr("settings.about.view")}
               url={officialSitePath(siteUrl, OFFICIAL_PRIVACY_PATH)}
             />
           </SettingRow>
-          <SettingRow title="意见反馈" description="Issue 与 PR 入口">
+          <SettingRow
+            title={tr("settings.about.feedback")}
+            description={tr("settings.about.feedbackHint")}
+          >
             <ExternalLinkButton
-              label="前往反馈"
+              label={tr("settings.about.goFeedback")}
               url={officialSitePath(siteUrl, OFFICIAL_FEEDBACK_PATH)}
             />
           </SettingRow>
         </>
       ) : null}
       {/* 免责声明正文由后端下发（后台「消息管理」的开屏公告），所以这一行不受 siteUrl 约束 */}
-      <SettingRow title="重新查看免责声明" description="首次启动时的声明">
+      <SettingRow
+        title={tr("settings.about.reopenDisclaimer")}
+        description={tr("settings.about.firstRunDisclaimer")}
+      >
         <button
           type="button"
           onClick={() => void handleReopenDisclaimer()}
           className={buttonClass({ variant: "outline" })}
         >
-          查看
+          {tr("settings.about.view")}
         </button>
       </SettingRow>
     </div>

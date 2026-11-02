@@ -1,11 +1,25 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { EQ_BANDS, EQ_GAIN_LIMIT_DB, EQ_PRESETS, FADE_DURATION_OPTIONS, eqBandLabel } from "@/lib/fx";
+import { type MessageKey, useT } from "@/lib/i18n";
 import { errMsg } from "@/lib/utils";
 import * as ipc from "@/services/ipc";
 import { type EqParams, type FxState } from "@/types";
 import { Segmented, SettingRow, Switch } from "../controls";
 
+/** 预设名在 lib/fx.ts 里是中文标识（下拉 value 必须与之一致），显示时再查词条 */
+const PRESET_KEYS: Record<string, MessageKey> = {
+  平直: "settings.sound.preset.flat",
+  流行: "settings.sound.preset.pop",
+  摇滚: "settings.sound.preset.rock",
+  古典: "settings.sound.preset.classical",
+  爵士: "settings.sound.preset.jazz",
+  人声: "settings.sound.preset.vocal",
+  低音增强: "settings.sound.preset.bassBoost",
+  电子: "settings.sound.preset.electronic",
+};
+
 export function SoundSection(): React.JSX.Element {
+  const tr = useT();
   const [fx, setFx] = useState<FxState | null>(null);
   const [error, setError] = useState<string | null>(null);
   // 滑条拖动会高频触发，统一走本地状态 + 120ms 防抖下发
@@ -35,7 +49,7 @@ export function SoundSection(): React.JSX.Element {
         {error ? (
           <p className="py-4 text-xs text-destructive">{error}</p>
         ) : (
-          <p className="py-4 text-xs text-muted-foreground">正在读取音效设置…</p>
+          <p className="py-4 text-xs text-muted-foreground">{tr("settings.sound.loading")}</p>
         )}
       </div>
     );
@@ -49,8 +63,8 @@ export function SoundSection(): React.JSX.Element {
   return (
     <div className="max-w-4xl divide-y divide-border">
       <SettingRow
-        title="响度归一化"
-        description="按曲目实际响度自动调增益（±12dB），切歌不再忽大忽小"
+        title={tr("settings.sound.loudnorm.title")}
+        description={tr("settings.sound.loudnorm.desc")}
       >
         <Switch
           checked={fx.loudnorm}
@@ -62,8 +76,26 @@ export function SoundSection(): React.JSX.Element {
         />
       </SettingRow>
       <SettingRow
-        title="淡入淡出"
-        description="暂停淡出、恢复淡入"
+        title={tr("settings.sound.replayGain.title")}
+        description={tr("settings.sound.replayGain.desc")}
+      >
+        <Segmented<"off" | "track" | "album">
+          label={tr("settings.sound.replayGain.mode")}
+          value={fx.replayGain}
+          options={[
+            { value: "off", label: tr("settings.sound.replayGain.off") },
+            { value: "track", label: tr("settings.sound.replayGain.track") },
+            { value: "album", label: tr("settings.sound.replayGain.album") },
+          ]}
+          onChange={(next) => {
+            setFx({ ...fx, replayGain: next });
+            void ipc.setReplayGainMode(next).catch((err) => setError(errMsg(err)));
+          }}
+        />
+      </SettingRow>
+      <SettingRow
+        title={tr("settings.sound.fade.title")}
+        description={tr("settings.sound.fade.desc")}
       >
         <div className="flex items-center gap-2">
           {fx.fade.enabled && (
@@ -92,8 +124,8 @@ export function SoundSection(): React.JSX.Element {
       </SettingRow>
 
       <SettingRow
-        title="频谱背景"
-        description="播放条实时频谱；关闭后不做计算"
+        title={tr("settings.sound.spectrum.title")}
+        description={tr("settings.sound.spectrum.desc")}
       >
         <Switch
           checked={fx.spectrum}
@@ -108,16 +140,16 @@ export function SoundSection(): React.JSX.Element {
       <div className="py-3">
         <div className="flex items-center justify-between">
           <div className="min-w-0 flex-1">
-            <p className="text-sm">均衡器</p>
+            <p className="text-sm">{tr("settings.sound.eq.title")}</p>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              十段均衡（±12dB），自动防削波
+              {tr("settings.sound.eq.desc")}
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-2">
             <select
               value={activePreset?.name ?? "自定义"}
               disabled={!eq.enabled}
-              aria-label="均衡器预设"
+              aria-label={tr("settings.sound.eq.preset")}
               onChange={(e) => {
                 const preset = EQ_PRESETS.find((p) => p.name === e.target.value);
                 if (preset) pushEq({ ...eq, gainsDb: [...preset.gains] });
@@ -126,10 +158,12 @@ export function SoundSection(): React.JSX.Element {
             >
               {EQ_PRESETS.map((p) => (
                 <option key={p.name} value={p.name}>
-                  {p.name}
+                  {PRESET_KEYS[p.name] ? tr(PRESET_KEYS[p.name]) : p.name}
                 </option>
               ))}
-              {!activePreset && <option value="自定义">自定义</option>}
+              {!activePreset && (
+                <option value="自定义">{tr("settings.sound.eq.custom")}</option>
+              )}
             </select>
             <Switch
               checked={eq.enabled}
@@ -141,7 +175,7 @@ export function SoundSection(): React.JSX.Element {
         {eq.enabled && (
           <div className="mt-4">
             <div className="flex items-center justify-between gap-4 text-xs">
-              <span className="shrink-0 text-muted-foreground">前置放大</span>
+              <span className="shrink-0 text-muted-foreground">{tr("settings.sound.eq.preamp")}</span>
               <input
                 type="range"
                 min={-EQ_GAIN_LIMIT_DB}
@@ -150,7 +184,7 @@ export function SoundSection(): React.JSX.Element {
                 value={eq.preampDb}
                 onChange={(e) => pushEq({ ...eq, preampDb: Number(e.target.value) })}
                 className="w-48 accent-[var(--primary)]"
-                aria-label="前置放大"
+                aria-label={tr("settings.sound.eq.preamp")}
               />
               <span className="w-12 shrink-0 text-right tabular-nums text-muted-foreground">
                 {eq.preampDb > 0 ? "+" : ""}
@@ -175,7 +209,7 @@ export function SoundSection(): React.JSX.Element {
                       pushEq({ ...eq, gainsDb });
                     }}
                     className="min-w-0 flex-1 accent-[var(--primary)]"
-                    aria-label={`${eqBandLabel(hz)}Hz 增益`}
+                    aria-label={tr("settings.sound.eq.bandGain", { band: eqBandLabel(hz) })}
                   />
                   <span className="w-10 shrink-0 text-right tabular-nums text-muted-foreground">
                     {(eq.gainsDb[i] ?? 0) > 0 ? "+" : ""}

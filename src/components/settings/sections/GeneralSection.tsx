@@ -4,48 +4,72 @@ import { setLogLevel } from "@/lib/logger";
 import { clearRuntimeCache, type RuntimeCacheKind } from "@/lib/runtime-cache";
 import { CACHE_AUDIO_LIMIT_MB_KEY } from "@/lib/storageKeys";
 import { errMsg } from "@/lib/utils";
+import { changeLocale, normalizeLocale, t, useLocaleStore, useT } from "@/lib/i18n";
 import * as ipc from "@/services/ipc";
 import { isAdmin, useAuthStore } from "@/stores/auth";
 import { useDislikesStore } from "@/stores/dislikes";
 import { useFavoritesStore } from "@/stores/favorites";
 import { toast, toastSuccess } from "@/stores/toast";
-import { type AudioCacheClearResult, type AudioCacheStats } from "@/types";
+import { type AudioCacheClearResult, type AudioCacheStats, type UriSchemeState } from "@/types";
 import { DirPicker, NumberField, Segmented, SettingRow, Switch } from "../controls";
 
 /** 通用设置：开机自启 / 缓存管理（播放缓存上限 + 分项清理） */
 
 /** 播放缓存上限档位（MB；"0" = 不限）。与 cache.rs 的语义一致；
  *  "custom" = 手工输入档（非数字值，点它出输入框，实际值存 settings 的数字串） */
-const CACHE_LIMIT_OPTIONS: { value: string; label: string }[] = [
+const cacheLimitOptions = (tr: typeof t): { value: string; label: string }[] => [
   { value: "1024", label: "1G" },
   { value: "2048", label: "2G" },
   { value: "4096", label: "4G" },
-  { value: "0", label: "不限" },
-  { value: "custom", label: "自定义" },
+  { value: "0", label: tr("settings.general.cache.unlimited") },
+  { value: "custom", label: tr("settings.general.cache.custom") },
 ];
 /** settings 里没有上限记录时的默认档（cache.rs DEFAULT_AUDIO_CACHE_LIMIT_MB） */
 const CACHE_LIMIT_DEFAULT = "1024";
 /** 手工输入档的取值范围：非负整数 MB（0 = 不限），上界 1TB 够任何磁盘用 */
 const CACHE_LIMIT_CUSTOM_MAX_MB = 1048576;
 
-const RUNTIME_CACHE_OPTIONS: { kind: RuntimeCacheKind; label: string; description: string }[] = [
-  { kind: "playUrl", label: "播放地址", description: "各平台解析出的播放链接与「某张专辑只能出到哪一档」的记录，清除后下次播放重新取链" },
-  { kind: "sourceCandidates", label: "换源候选", description: "换源弹层中的临时搜索结果" },
-  { kind: "lyricCandidates", label: "歌词候选", description: "歌词搜索候选与当前播放页歌词缓存；不删除已保存歌词" },
-  { kind: "chartDetails", label: "榜单详情", description: "首页与榜单页的临时榜单曲目列表" },
-  { kind: "pageResults", label: "列表结果", description: "歌手 ID、歌手头像、全量分页与本地曲目在线元数据缓存" },
+const runtimeCacheOptions = (
+  tr: typeof t,
+): { kind: RuntimeCacheKind; label: string; description: string }[] => [
+  {
+    kind: "playUrl",
+    label: tr("settings.general.runtime.playUrl.label"),
+    description: tr("settings.general.runtime.playUrl.desc"),
+  },
+  {
+    kind: "sourceCandidates",
+    label: tr("settings.general.runtime.sourceCandidates.label"),
+    description: tr("settings.general.runtime.sourceCandidates.desc"),
+  },
+  {
+    kind: "lyricCandidates",
+    label: tr("settings.general.runtime.lyricCandidates.label"),
+    description: tr("settings.general.runtime.lyricCandidates.desc"),
+  },
+  {
+    kind: "chartDetails",
+    label: tr("settings.general.runtime.chartDetails.label"),
+    description: tr("settings.general.runtime.chartDetails.desc"),
+  },
+  {
+    kind: "pageResults",
+    label: tr("settings.general.runtime.pageResults.label"),
+    description: tr("settings.general.runtime.pageResults.desc"),
+  },
 ];
 
-const LOG_LEVEL_OPTIONS: { value: ipc.LogLevel; label: string }[] = [
-  { value: "debug", label: "调试" },
-  { value: "info", label: "信息" },
-  { value: "warn", label: "警告" },
-  { value: "error", label: "错误" },
+const logLevelOptions = (tr: typeof t): { value: ipc.LogLevel; label: string }[] => [
+  { value: "debug", label: tr("settings.general.logLevel.debug") },
+  { value: "info", label: tr("settings.general.logLevel.info") },
+  { value: "warn", label: tr("settings.general.logLevel.warn") },
+  { value: "error", label: tr("settings.general.logLevel.error") },
 ];
 
 /** 目录选择行（日志 / 缓存共用）：只读路径 + 更改位置 + 恢复默认 */
 
 export function FileAssociationSetting(): React.JSX.Element | null {
+  const tr = useT();
   const [state, setState] = useState<import("@/types").FileAssociationState | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -80,24 +104,105 @@ export function FileAssociationSetting(): React.JSX.Element | null {
   if (state?.supported === false) return null;
   return (
     <SettingRow
-      title="默认播放器"
-      description="关联 MP3 / FLAC / WAV / OGG / M4A；取消关联前请先改选其他播放器"
+      title={tr("settings.general.fileAssociation.title")}
+      description={tr("settings.general.fileAssociation.desc")}
     >
       <div className="flex max-w-sm flex-col items-end gap-2">
         {state !== null && state.defaultExtensions.length > 0 && (
           <span className="text-xs text-muted-foreground">
-            当前默认：{state.defaultExtensions.map((ext) => ext.toUpperCase()).join("、")}
+            {tr("settings.general.fileAssociation.currentDefault", {
+              list: state.defaultExtensions
+                .map((ext) => ext.toUpperCase())
+                .join(tr("settings.general.listSeparator")),
+            })}
           </span>
         )}
         <div className="flex gap-2">
           <button type="button" disabled={busy || state === null} onClick={() => void change(true)}
             className="rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground disabled:opacity-50">
-            设为默认
+            {tr("settings.general.fileAssociation.setDefault")}
           </button>
           <button type="button" disabled={busy || state === null || (!state.registered && state.defaultExtensions.length === 0)}
             onClick={() => void change(false)}
             className="rounded-md border border-input px-3 py-1.5 text-xs hover:bg-secondary disabled:opacity-50">
-            取消关联
+            {tr("settings.general.fileAssociation.unassociate")}
+          </button>
+        </div>
+        {error && <p role="alert" className="text-xs text-destructive">{error}</p>}
+      </div>
+    </SettingRow>
+  );
+}
+
+
+/**
+ * 链接唤起（B4，§4.13）：注册 `quietmusic://` 后，浏览器/脚本/快捷方式点一下就播放
+ * 对应本地文件。只写 `HKCU\Software\Classes`，取消注册只删自己那棵子树。
+ *
+ * 与「默认播放器」分开摆：文件关联动的是扩展名（影响右键「打开方式」），这里动的是
+ * 协议（影响链接），互不影响，所以是两个独立开关。
+ */
+export function UriSchemeSetting(): React.JSX.Element | null {
+  const tr = useT();
+  const [state, setState] = useState<UriSchemeState | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const refresh = useCallback((): void => {
+    void ipc.getUriSchemeState().then(setState).catch((e: unknown) => setError(errMsg(e)));
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    // 别处（另一个窗口、系统设置）改过注册表时，切回来要能刷新
+    window.addEventListener("focus", refresh);
+    return () => window.removeEventListener("focus", refresh);
+  }, [refresh]);
+
+  const change = async (enable: boolean): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    try {
+      setState(enable ? await ipc.registerUriScheme() : await ipc.unregisterUriScheme());
+    } catch (e) {
+      setError(errMsg(e));
+      refresh();
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // 非 Windows 平台没有系统级协议注册，整行不显示（与「默认播放器」同口径）
+  if (state?.supported === false) return null;
+  return (
+    <SettingRow
+      title={tr("settings.general.uriScheme.title")}
+      description={tr("settings.general.uriScheme.desc")}
+    >
+      <div className="flex max-w-sm flex-col items-end gap-2">
+        {state !== null && (
+          <span className="font-mono text-2xs break-all text-muted-foreground">{state.example}</span>
+        )}
+        {state?.registered && (
+          <span className="text-xs text-muted-foreground">
+            {tr("settings.general.uriScheme.registered")}
+          </span>
+        )}
+        <div className="flex gap-2">
+          <button
+            type="button"
+            disabled={busy || state === null}
+            onClick={() => void change(true)}
+            className="rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground disabled:opacity-50"
+          >
+            {tr("settings.general.uriScheme.register")}
+          </button>
+          <button
+            type="button"
+            disabled={busy || state === null || !state.registered}
+            onClick={() => void change(false)}
+            className="rounded-md border border-input px-3 py-1.5 text-xs hover:bg-secondary disabled:opacity-50"
+          >
+            {tr("settings.general.uriScheme.unregister")}
           </button>
         </div>
         {error && <p role="alert" className="text-xs text-destructive">{error}</p>}
@@ -108,6 +213,8 @@ export function FileAssociationSetting(): React.JSX.Element | null {
 
 
 export function GeneralSection(): React.JSX.Element {
+  const tr = useT();
+  const runtimeOptions = runtimeCacheOptions(tr);
   const [autostart, setAutostartState] = useState<boolean | null>(null);
   const [cache, setCache] = useState<AudioCacheStats | null>(null);
   const [limit, setLimit] = useState<string | null>(null);
@@ -118,7 +225,7 @@ export function GeneralSection(): React.JSX.Element {
   const [clearAudio, setClearAudio] = useState(true);
   const [clearWeb, setClearWeb] = useState(true);
   const [clearRuntime, setClearRuntime] = useState<RuntimeCacheKind[]>(
-    RUNTIME_CACHE_OPTIONS.map((option) => option.kind),
+    runtimeOptions.map((option) => option.kind),
   );
   // 听歌统计不可再生（累计时长、日榜、最近播放删了就没了），所以默认不勾，
   // 且勾上后「清理」按钮要走两击确认，不能像可再生缓存那样一键执行。
@@ -161,7 +268,7 @@ export function GeneralSection(): React.JSX.Element {
       .then((raw) => {
         const v = raw && raw.trim() ? raw.trim() : CACHE_LIMIT_DEFAULT;
         setLimit(v);
-        const preset = CACHE_LIMIT_OPTIONS.some((o) => o.value !== "custom" && o.value === v);
+        const preset = cacheLimitOptions(t).some((o) => o.value !== "custom" && o.value === v);
         setCustomMode(!preset);
         setCustomDraft(preset ? "" : v);
       })
@@ -203,12 +310,12 @@ export function GeneralSection(): React.JSX.Element {
   const applyCustomLimit = async (): Promise<void> => {
     const raw = customDraft.trim();
     if (!/^\d+$/.test(raw)) {
-      if (raw.length > 0) setError("缓存上限需为非负整数（MB，0 = 不限）");
+      if (raw.length > 0) setError(tr("settings.general.cache.errorNonNegative"));
       return;
     }
     const mb = Number(raw);
     if (mb > CACHE_LIMIT_CUSTOM_MAX_MB) {
-      setError(`缓存上限最大 ${CACHE_LIMIT_CUSTOM_MAX_MB} MB`);
+      setError(tr("settings.general.cache.errorTooLarge", { max: CACHE_LIMIT_CUSTOM_MAX_MB }));
       return;
     }
     if (limit !== null && mb === Number(limit)) return; // 没改不重复下发
@@ -243,20 +350,34 @@ export function GeneralSection(): React.JSX.Element {
         (sum: number, result) => sum + (typeof result === "number" ? result : 0),
         0,
       );
-      const summary = runtimeCount > 0 ? `，进程内缓存 ${runtimeCount} 项` : "";
+      const summary =
+        runtimeCount > 0 ? tr("settings.general.clear.runtimeNote", { n: runtimeCount }) : "";
       // 统计单独走：它返回删掉的曲目数，混不进上面的字节 / 文件统计
       const statsRemoved = clearStats ? await ipc.clearListenStats() : 0;
       const statsNote =
-        clearStats && statsRemoved > 0 ? `；听歌统计 ${statsRemoved} 首已归零` : "";
+        clearStats && statsRemoved > 0
+          ? tr("settings.general.clear.statsNote", { n: statsRemoved })
+          : "";
       // 清理结果是一次性回执（表单校验那种要停留的错误走上面的 error 行内提示）
       if (freed === 0 && failed === 0 && runtimeCount === 0 && statsNote === "") {
-        toast("没有可清理的内容");
+        toast(tr("settings.general.clear.empty"));
       } else if (failed > 0) {
         toastSuccess(
-          `已清理 ${formatBytes(freed)}${summary}${statsNote}；${failed} 个文件被占用跳过（正在播放的不会删）`,
+          tr("settings.general.clear.doneSkipped", {
+            freed: formatBytes(freed),
+            summary,
+            stats: statsNote,
+            failed,
+          }),
         );
       } else {
-        toastSuccess(`已清理 ${formatBytes(freed)}${summary}${statsNote}`);
+        toastSuccess(
+          tr("settings.general.clear.done", {
+            freed: formatBytes(freed),
+            summary,
+            stats: statsNote,
+          }),
+        );
       }
       await refreshCache();
     } catch (err) {
@@ -357,14 +478,18 @@ export function GeneralSection(): React.JSX.Element {
   /** 导出备份：先让用户选目录（系统对话框），再落一份快照 + JSON 清单 */
   const exportBackup = async (): Promise<void> => {
     setError(null);
-    const dir = await ipc.pickFolder("选择备份保存目录");
+    const dir = await ipc.pickFolder(tr("settings.general.backup.pickFolder"));
     if (!dir) return; // 用户取消
     setBackupBusy(true);
     try {
       const info = await ipc.exportBackup(dir);
       setBackupDir(dir);
       toastSuccess(
-        `已导出备份：曲目 ${info.tracks} / 歌单 ${info.playlists} / 记录 ${info.history}`,
+        tr("settings.general.backup.exported", {
+          tracks: info.tracks,
+          playlists: info.playlists,
+          history: info.history,
+        }),
       );
     } catch (err) {
       setError(errMsg(err));
@@ -393,11 +518,18 @@ export function GeneralSection(): React.JSX.Element {
       void useDislikesStore.getState().refresh();
       setPendingImport("");
       toastSuccess(
-        `已${mode === "replace" ? "覆盖" : "合并"}导入：写入 ${summary.rows} 行（曲目 ${summary.tracks} / 歌单 ${summary.playlists}）`,
+        tr(
+          mode === "replace"
+            ? "settings.general.backup.importedReplace"
+            : "settings.general.backup.importedMerge",
+          { rows: summary.rows, tracks: summary.tracks, playlists: summary.playlists },
+        ),
       );
       // 覆盖模式会自动留一份"导入前"快照，路径必须告诉用户，否则等于没留退路
-      if (summary.safetyCopy) toast(`导入前的数据已快照到 ${summary.safetyCopy}`);
-      toast("界面数据会在切换页面后刷新");
+      if (summary.safetyCopy) {
+        toast(tr("settings.general.backup.snapshot", { path: summary.safetyCopy }));
+      }
+      toast(tr("settings.general.backup.refreshHint"));
     } catch (err) {
       setError(errMsg(err));
     } finally {
@@ -407,8 +539,13 @@ export function GeneralSection(): React.JSX.Element {
 
   return (
     <div className="max-w-4xl divide-y divide-border">
+      <LocaleSetting />
       <FileAssociationSetting />
-      <SettingRow title="开机自启" description="开机自动启动，最小化到托盘">
+      <UriSchemeSetting />
+      <SettingRow
+        title={tr("settings.general.autostart.title")}
+        description={tr("settings.general.autostart.desc")}
+      >
         {autostart === null ? (
           <span className="text-xs text-muted-foreground">…</span>
         ) : (
@@ -416,11 +553,14 @@ export function GeneralSection(): React.JSX.Element {
         )}
       </SettingRow>
       <SettingRow
-        title="播放缓存上限"
+        title={tr("settings.general.cacheLimit.title")}
         description={
           cache
-            ? `边下边播；超出上限清理最旧。当前 ${formatBytes(cache.totalBytes)} · ${cache.fileCount} 个文件`
-            : "边下边播；超出上限自动清理最旧"
+            ? tr("settings.general.cacheLimit.descWithStats", {
+                size: formatBytes(cache.totalBytes),
+                count: cache.fileCount,
+              })
+            : tr("settings.general.cacheLimit.desc")
         }
       >
         {limit === null ? (
@@ -429,7 +569,7 @@ export function GeneralSection(): React.JSX.Element {
           <div className="flex items-center gap-2">
             <Segmented
               value={customMode ? "custom" : limit}
-              options={CACHE_LIMIT_OPTIONS}
+              options={cacheLimitOptions(tr)}
               onChange={(v) => {
                 if (v === "custom") {
                   // 只切到输入态、不改值：当前数字带进输入框方便微调
@@ -466,8 +606,8 @@ export function GeneralSection(): React.JSX.Element {
         )}
       </SettingRow>
       <SettingRow
-        title="缓存位置"
-        description="默认在安装目录 cache；换盘后旧缓存不会自动搬移"
+        title={tr("settings.general.cacheDir.title")}
+        description={tr("settings.general.cacheDir.desc")}
       >
         <DirPicker
           path={cacheDir}
@@ -477,11 +617,14 @@ export function GeneralSection(): React.JSX.Element {
         />
       </SettingRow>
       <SettingRow
-        title="清理缓存"
+        title={tr("settings.general.clear.title")}
         description={
           cache
-            ? `只清可再生缓存：播放 ${formatBytes(cache.totalBytes)} / 图片 ${formatBytes(cache.webBytes)}；不动下载、登录、设置与已保存歌词`
-            : "只清可再生缓存；不动下载、登录、设置与已保存歌词"
+            ? tr("settings.general.clear.descWithStats", {
+                size: formatBytes(cache.totalBytes),
+                webSize: formatBytes(cache.webBytes),
+              })
+            : tr("settings.general.clear.desc")
         }
       >
         <div className="flex max-w-md flex-wrap items-center justify-end gap-x-3 gap-y-2">
@@ -492,7 +635,7 @@ export function GeneralSection(): React.JSX.Element {
               onChange={(e) => setClearAudio(e.target.checked)}
               className="h-3.5 w-3.5 accent-primary"
             />
-            播放
+            {tr("settings.general.clear.audio")}
           </label>
           <label className="flex items-center gap-1 text-xs text-muted-foreground">
             <input
@@ -501,9 +644,9 @@ export function GeneralSection(): React.JSX.Element {
               onChange={(e) => setClearWeb(e.target.checked)}
               className="h-3.5 w-3.5 accent-primary"
             />
-            图片
+            {tr("settings.general.clear.images")}
           </label>
-          {RUNTIME_CACHE_OPTIONS.map((option) => (
+          {runtimeOptions.map((option) => (
             <label
               key={option.kind}
               className="flex items-center gap-1 text-xs text-muted-foreground"
@@ -526,7 +669,7 @@ export function GeneralSection(): React.JSX.Element {
           ))}
           <label
             className="flex items-center gap-1 text-xs text-muted-foreground"
-            title="累计时长、日榜与最近播放一起归零，不可恢复"
+            title={tr("settings.general.clear.statsHint")}
           >
             <input
               type="checkbox"
@@ -538,7 +681,7 @@ export function GeneralSection(): React.JSX.Element {
               }}
               className="h-3.5 w-3.5 accent-primary"
             />
-            听歌统计
+            {tr("settings.general.clear.stats")}
           </label>
           <button
             type="button"
@@ -548,11 +691,11 @@ export function GeneralSection(): React.JSX.Element {
               const allOn =
                 clearAudio &&
                 clearWeb &&
-                clearRuntime.length === RUNTIME_CACHE_OPTIONS.length &&
+                clearRuntime.length === runtimeOptions.length &&
                 clearStats;
               setClearAudio(!allOn);
               setClearWeb(!allOn);
-              setClearRuntime(allOn ? [] : RUNTIME_CACHE_OPTIONS.map((option) => option.kind));
+              setClearRuntime(allOn ? [] : runtimeOptions.map((option) => option.kind));
               setClearStats(!allOn);
               if (!allOn) setArmedStats(false);
             }}
@@ -560,10 +703,10 @@ export function GeneralSection(): React.JSX.Element {
           >
             {clearAudio &&
             clearWeb &&
-            clearRuntime.length === RUNTIME_CACHE_OPTIONS.length &&
+            clearRuntime.length === runtimeOptions.length &&
             clearStats
-              ? "全不选"
-              : "全选"}
+              ? tr("settings.general.clear.selectNone")
+              : tr("settings.general.clear.selectAll")}
           </button>
           <button
             type="button"
@@ -575,19 +718,23 @@ export function GeneralSection(): React.JSX.Element {
                 : "border-border hover:bg-accent"
             }`}
           >
-            {clearing ? "清理中…" : armedStats ? "再点一次确认清除" : "清理"}
+            {clearing
+              ? tr("settings.general.clear.clearing")
+              : armedStats
+                ? tr("settings.general.clear.confirmAgain")
+                : tr("settings.general.clear.action")}
           </button>
           <p className="basis-full text-right text-2xs text-muted-foreground">
-            听歌统计不可再生，需点两次确认；想留底可先「导出备份」
+            {tr("settings.general.clear.footnote")}
           </p>
         </div>
       </SettingRow>
       <SettingRow
-        title="数据备份"
+        title={tr("settings.general.backup.title")}
         description={
           backupDir
-            ? `歌单、收藏、播放记录、设置与歌词；不含音乐文件本体。上次导出到 ${backupDir}`
-            : "歌单、收藏、播放记录、设置与歌词；不含音乐文件本体"
+            ? tr("settings.general.backup.descWithDir", { dir: backupDir })
+            : tr("settings.general.backup.desc")
         }
       >
         <div className="flex flex-col items-end gap-2">
@@ -598,7 +745,9 @@ export function GeneralSection(): React.JSX.Element {
               disabled={backupBusy}
               className="rounded-md border border-border px-3 py-1.5 text-xs transition-colors hover:bg-accent disabled:opacity-50"
             >
-              {backupBusy ? "处理中…" : "导出备份"}
+              {backupBusy
+                ? tr("settings.general.backup.exporting")
+                : tr("settings.general.backup.export")}
             </button>
             <button
               type="button"
@@ -606,7 +755,7 @@ export function GeneralSection(): React.JSX.Element {
               disabled={backupBusy}
               className="rounded-md border border-border px-3 py-1.5 text-xs transition-colors hover:bg-accent disabled:opacity-50"
             >
-              从备份导入
+              {tr("settings.general.backup.import")}
             </button>
           </div>
           {pendingImport && (
@@ -615,7 +764,7 @@ export function GeneralSection(): React.JSX.Element {
                 className="max-w-72 truncate text-xs text-muted-foreground"
                 title={pendingImport}
               >
-                已选：{pendingImport}
+                {tr("settings.general.backup.selected", { path: pendingImport })}
               </span>
               <div className="flex items-center gap-2">
                 <button
@@ -624,7 +773,7 @@ export function GeneralSection(): React.JSX.Element {
                   disabled={backupBusy}
                   className="rounded-md border border-border px-3 py-1.5 text-xs transition-colors hover:bg-accent disabled:opacity-50"
                 >
-                  合并导入
+                  {tr("settings.general.backup.merge")}
                 </button>
                 <button
                   type="button"
@@ -632,7 +781,7 @@ export function GeneralSection(): React.JSX.Element {
                   disabled={backupBusy}
                   className="rounded-md border border-destructive px-3 py-1.5 text-xs text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
                 >
-                  覆盖导入
+                  {tr("settings.general.backup.replace")}
                 </button>
                 <button
                   type="button"
@@ -640,24 +789,25 @@ export function GeneralSection(): React.JSX.Element {
                   disabled={backupBusy}
                   className="rounded-md px-2 py-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground disabled:opacity-50"
                 >
-                  取消
+                  {tr("common.cancel")}
                 </button>
               </div>
               <span className="max-w-72 text-right text-2xs text-muted-foreground">
-                合并＝只补缺的记录；覆盖＝整体替换（自动快照）
+                {tr("settings.general.backup.modeHint")}
               </span>
             </div>
           )}
         </div>
       </SettingRow>
       <SettingRow
-        title="诊断日志"
+        title={tr("settings.general.log.title")}
         description={
           logCfg
-            ? `日志保存在本机（${logCfg.dir || "默认目录"}），反馈问题时附上${
-                logCfg.enabled ? "" : "；当前目录不可写，日志只到控制台"
-              }`
-            : "日志保存在本机，反馈问题时附上"
+            ? tr("settings.general.log.descWithDir", {
+                dir: logCfg.dir || tr("settings.general.log.defaultDir"),
+                note: logCfg.enabled ? "" : tr("settings.general.log.notWritable"),
+              })
+            : tr("settings.general.log.desc")
         }
       >
         <div className="flex items-center gap-2">
@@ -673,28 +823,32 @@ export function GeneralSection(): React.JSX.Element {
             disabled={!logCfg?.enabled}
             className="rounded-md border border-border px-3 py-1.5 text-xs transition-colors hover:bg-accent disabled:opacity-50"
           >
-            打开文件夹
+            {tr("settings.general.log.openFolder")}
           </button>
         </div>
       </SettingRow>
       {admin && logCfg && (
         <>
           <SettingRow
-            title="日志级别"
-            description={`调试最详细、错误最少；默认为${
-              LOG_LEVEL_OPTIONS.find((o) => o.value === logCfg.defaultLevel)?.label ??
-              logCfg.defaultLevel
-            }，改动立即生效`}
+            title={tr("settings.general.log.level.title")}
+            description={tr("settings.general.log.level.desc", {
+              level:
+                logLevelOptions(tr).find((o) => o.value === logCfg.defaultLevel)?.label ??
+                logCfg.defaultLevel,
+            })}
           >
             <Segmented
               value={logCfg.level === "trace" ? "debug" : logCfg.level}
-              options={LOG_LEVEL_OPTIONS}
+              options={logLevelOptions(tr)}
               onChange={(v) => void patchLog({ level: v })}
             />
           </SettingRow>
           <SettingRow
-            title="日志文件大小"
-            description={`单个文件上限（${logCfg.minFileMb}–${logCfg.maxFileMb} MB），写满自动换新文件`}
+            title={tr("settings.general.log.fileSize.title")}
+            description={tr("settings.general.log.fileSize.desc", {
+              min: logCfg.minFileMb,
+              max: logCfg.maxFileMb,
+            })}
           >
             <NumberField
               value={logCfg.fileMb}
@@ -705,14 +859,17 @@ export function GeneralSection(): React.JSX.Element {
             />
           </SettingRow>
           <SettingRow
-            title="日志保留份数"
-            description={`最多保留 ${logCfg.minBackups}–${logCfg.maxBackups} 个，超出删最旧`}
+            title={tr("settings.general.log.backups.title")}
+            description={tr("settings.general.log.backups.desc", {
+              min: logCfg.minBackups,
+              max: logCfg.maxBackups,
+            })}
           >
             <NumberField
               value={logCfg.backups}
               min={logCfg.minBackups}
               max={logCfg.maxBackups}
-              suffix="个"
+              suffix={tr("settings.general.log.backups.suffix")}
               onCommit={(n) => void patchLog({ backups: n })}
             />
           </SettingRow>
@@ -726,3 +883,24 @@ export function GeneralSection(): React.JSX.Element {
 // formatBytes 合并到 `@/lib/format`（与下载页同一实现：自动单位 + 空值给空串）。
 
 /** 包列表单行文案：包名 · 版本 · code */
+
+/**
+ * 界面语言（B6）：只切界面词条，正文内容（歌名 / 歌单名 / 简介）不译。
+ * 切换即时生效并写入设置（`ui.locale`），下次启动 `loadLocale()` 读回。
+ */
+function LocaleSetting(): React.JSX.Element {
+  const locale = useLocaleStore((s) => s.locale);
+  return (
+    <SettingRow title={t("settings.language")} description={t("settings.languageHint")}>
+      <Segmented
+        label={t("settings.language")}
+        value={locale}
+        options={[
+          { value: "zh-CN", label: t("locale.zh") },
+          { value: "en-US", label: t("locale.en") },
+        ]}
+        onChange={(value) => void changeLocale(normalizeLocale(value))}
+      />
+    </SettingRow>
+  );
+}

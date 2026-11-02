@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { useT } from "@/lib/i18n";
 import { errMsg } from "@/lib/utils";
 import * as ipc from "@/services/ipc";
 import { SettingRow, Switch } from "../controls";
@@ -17,6 +18,7 @@ const CONCURRENCY_CHOICES = [1, 2, 3, 4, 5, 6];
 /** 下载设置：保存位置（默认安装目录/Download，可选任意位置） */
 
 export function DownloadSection(): React.JSX.Element {
+  const tr = useT();
   const [dir, setDir] = useState("");
   const [nameFormat, setNameFormat] = useState<"artist" | "song">("artist");
   const [concurrency, setConcurrency] = useState(ipc.DEFAULT_DOWNLOAD_CONCURRENCY);
@@ -169,8 +171,8 @@ export function DownloadSection(): React.JSX.Element {
   return (
     <div className="max-w-4xl divide-y divide-border">
       <SettingRow
-        title="下载保存位置"
-        description="默认在安装目录 Download；重名自动加序号"
+        title={tr("settings.download.dir.title")}
+        description={tr("settings.download.dir.description")}
       >
         <div className="flex items-center gap-2">
           <span
@@ -185,7 +187,7 @@ export function DownloadSection(): React.JSX.Element {
             disabled={busy}
             className="rounded-md border border-border px-3 py-1.5 text-xs transition-colors hover:bg-accent disabled:opacity-50"
           >
-            更改位置
+            {tr("common.changeLocation")}
           </button>
           <button
             type="button"
@@ -193,64 +195,64 @@ export function DownloadSection(): React.JSX.Element {
             disabled={busy}
             className="rounded-md border border-border px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
           >
-            恢复默认
+            {tr("common.restoreDefault")}
           </button>
         </div>
       </SettingRow>
       {/* 默认下载音质已改为按平台独立设置（音源账号页），此处不再有全局入口 */}
       <SettingRow
-        title="下载文件名格式"
-        description="存盘文件名顺序；仅影响之后新开始的下载"
+        title={tr("settings.download.nameFormat.title")}
+        description={tr("settings.download.nameFormat.description")}
       >
         <select
           value={nameFormat}
           disabled={busy}
-          aria-label="下载文件名格式"
+          aria-label={tr("settings.download.nameFormat.title")}
           onChange={(e) => void chooseNameFormat(e.target.value as "artist" | "song")}
           className="rounded-md border border-input bg-background px-2 py-1.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
         >
-          <option value="artist">歌手 - 歌名</option>
-          <option value="song">歌名 - 歌手</option>
+          <option value="artist">{tr("settings.download.nameFormat.artistFirst")}</option>
+          <option value="song">{tr("settings.download.nameFormat.songFirst")}</option>
         </select>
       </SettingRow>
       <SettingRow
-        title="同时下载封面"
+        title={tr("settings.download.saveCover.title")}
         description={
           storage === "embed"
-            ? "写进音频标签；不支持的格式存同目录图片"
-            : "存到歌曲旁边，文件名与歌曲相同"
+            ? tr("settings.download.saveCover.descriptionEmbed")
+            : tr("settings.download.saveCover.descriptionSidecar")
         }
       >
         <Switch checked={saveCover} onToggle={() => void chooseSaveCover(!saveCover)} />
       </SettingRow>
       <SettingRow
-        title="同时下载歌词"
+        title={tr("settings.download.saveLyric.title")}
         description={
           storage === "embed"
-            ? "写进音频标签（优先用已缓存的词）；不支持的格式存同名 .lrc"
-            : "存为同名 .lrc（优先用已缓存的词）"
+            ? tr("settings.download.saveLyric.descriptionEmbed")
+            : tr("settings.download.saveLyric.descriptionSidecar")
         }
       >
         <Switch checked={saveLyric} onToggle={() => void chooseSaveLyric(!saveLyric)} />
       </SettingRow>
       <SettingRow
-        title="下载存储方式"
-        description="内嵌标签或存为独立文件；仅影响之后的任务"
+        title={tr("settings.download.storage.title")}
+        description={tr("settings.download.storage.description")}
       >
         <select
           value={storage}
           disabled={busy}
-          aria-label="下载存储方式"
+          aria-label={tr("settings.download.storage.title")}
           onChange={(e) => void chooseStorage(e.target.value as ipc.DownloadStorageMode)}
           className="rounded-md border border-input bg-background px-2 py-1.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
         >
-          <option value="embed">音乐内嵌</option>
-          <option value="sidecar">同目录文件</option>
+          <option value="embed">{tr("settings.download.storage.embed")}</option>
+          <option value="sidecar">{tr("settings.download.storage.sidecar")}</option>
         </select>
       </SettingRow>
       <SettingRow
-        title="同时下载数"
-        description="并发任务数，超出排队；建议 ≤3，过高易被限流"
+        title={tr("settings.download.concurrency.title")}
+        description={tr("settings.download.concurrency.description")}
       >
         <div className="flex items-center gap-2">
           {CONCURRENCY_CHOICES.map((n) => {
@@ -263,7 +265,11 @@ export function DownloadSection(): React.JSX.Element {
                 type="button"
                 onClick={() => chooseConcurrency(n)}
                 disabled={busy}
-                aria-label={confirming ? `确认将同时下载数改为 ${n}` : `同时下载数 ${n}`}
+                aria-label={
+                  confirming
+                    ? tr("settings.download.concurrency.ariaConfirm", { n })
+                    : tr("settings.download.concurrency.ariaSet", { n })
+                }
                 aria-pressed={active}
                 className={
                   confirming
@@ -273,7 +279,9 @@ export function DownloadSection(): React.JSX.Element {
                       : "rounded-md border border-border px-3 py-1.5 text-xs transition-colors hover:bg-accent disabled:opacity-50"
                 }
               >
-                {confirming ? `${n} 个？` : String(n)}
+                {confirming
+                  ? tr("settings.download.concurrency.pendingLabel", { n })
+                  : String(n)}
               </button>
             );
           })}
@@ -281,8 +289,7 @@ export function DownloadSection(): React.JSX.Element {
       </SettingRow>
       {pendingConcurrency !== null && (
         <p className="py-2 text-xs text-destructive">
-          同时下载 {pendingConcurrency} 个可能被音源判定为异常流量并临时封禁 IP，再点一次「
-          {pendingConcurrency} 个？」确认。
+          {tr("settings.download.concurrency.warning", { n: pendingConcurrency })}
         </p>
       )}
       {error && <p className="py-2 text-xs text-destructive">{error}</p>}

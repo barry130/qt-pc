@@ -14,32 +14,37 @@ import { DownloadSection } from "@/components/settings/sections/DownloadSection"
 import { DislikeSection } from "@/components/settings/sections/DislikeSection";
 import { NetworkSection } from "@/components/settings/sections/NetworkSection";
 import { AiSection } from "@/components/settings/sections/AiSection";
+import { ScrobbleSection } from "@/components/settings/sections/ScrobbleSection";
+import { useT, type MessageKey } from "@/lib/i18n";
 
-const SECTION_TITLES: Record<string, string> = {
-  general: "通用",
+// 页签文案走 i18n（B6 第二轮，R84）：这里只存键，显示时再取当前语言的词条
+const SECTION_TITLES: Record<string, MessageKey> = {
+  general: "settings.section.general",
   // 「外观」不在这里：它已提为一级页面 /appearance，入口在标题栏右侧「皮肤」按钮
   // （用户 2026-10-31 要求「把设置里面的外观删掉，改为这个按键进去」）
-  "desktop-lyric": "桌面歌词",
-  playback: "播放",
-  "player-bar": "播放条",
-  sound: "音效",
-  download: "下载",
-  network: "网络",
-  ai: "AI 与模型",
-  dislike: "不喜欢列表",
-  "source-package": "音源包",
-  shortcut: "快捷键",
-  about: "关于",
+  "desktop-lyric": "settings.section.desktopLyric",
+  playback: "settings.section.playback",
+  "player-bar": "settings.section.playerBar",
+  sound: "settings.section.sound",
+  download: "settings.section.download",
+  network: "settings.section.network",
+  scrobble: "settings.section.scrobble",
+  ai: "settings.section.ai",
+  dislike: "settings.section.dislike",
+  "source-package": "settings.section.sourcePackage",
+  shortcut: "settings.section.shortcut",
+  about: "settings.section.about",
 };
 
 function SettingsTabs(props: { active: string }): React.JSX.Element {
   const navigate = useNavigate();
+  const tr = useT();
   // 音源包有可用更新时标签亮红点（发现只提示，进设置页逐条应用）
   const offers = useSourceUpdateStore((s) => s.offers);
   const sourceDot = offers.length > 0;
   return (
     <div className="mb-4 flex gap-1 border-b border-border">
-      {Object.entries(SECTION_TITLES).map(([key, label]) => (
+      {Object.entries(SECTION_TITLES).map(([key, labelKey]) => (
         <button
           key={key}
           type="button"
@@ -52,7 +57,7 @@ function SettingsTabs(props: { active: string }): React.JSX.Element {
               : "text-muted-foreground hover:text-foreground"
           }`}
         >
-          {label}
+          {tr(labelKey)}
           {key === "source-package" && sourceDot && (
             <span
               aria-label="有可用更新"
@@ -66,11 +71,13 @@ function SettingsTabs(props: { active: string }): React.JSX.Element {
 }
 
 export function SettingsPage(props: { section: string }): React.JSX.Element {
-  const title = SECTION_TITLES[props.section] ?? "设置";
+  const tr = useT();
+  const labelKey = SECTION_TITLES[props.section];
+  const title = labelKey ? tr(labelKey) : tr("settings.title");
   return (
     // 分节标签固定在顶部（滚动区外），内容滚动时始终可见
     <PageContainer
-      title={`设置 · ${title}`}
+      title={tr("settings.titleWithSection", { section: title })}
       stickyHeader={<SettingsTabs active={props.section} />}
     >
       {props.section === "general" ? (
@@ -88,6 +95,8 @@ export function SettingsPage(props: { section: string }): React.JSX.Element {
         <DownloadSection />
       ) : props.section === "network" ? (
         <NetworkSection />
+      ) : props.section === "scrobble" ? (
+        <ScrobbleSection />
       ) : props.section === "ai" ? (
         // 两步一页：AI 引擎 + （仅本地模型精选时展开的）模型配置，详见 AiSection
         <AiSection />

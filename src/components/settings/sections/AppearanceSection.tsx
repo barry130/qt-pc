@@ -1,9 +1,12 @@
 import { useState } from "react";
 import { SKINS, getSkin } from "@/lib/skins";
 import { useAppearanceStore } from "@/stores/appearance";
-import { MODE_OPTIONS, SettingRow, Switch } from "../controls";
+import { SettingRow, Switch, modeOptions } from "../controls";
+import { useT } from "@/lib/i18n";
 
 export function AppearanceSection(): React.JSX.Element {
+  const tr = useT();
+  const modes = modeOptions(tr);
   const preference = useAppearanceStore((s) => s.preference);
   const update = useAppearanceStore((s) => s.update);
   const saveError = useAppearanceStore((s) => s.saveError);
@@ -16,7 +19,7 @@ export function AppearanceSection(): React.JSX.Element {
     const file = e.target.files?.[0];
     if (!file) return;
     if (file.size > 5 * 1024 * 1024) {
-      setBgError("图片过大，请选择 5MB 以内的图片");
+      setBgError(tr("appearance.bgTooLarge"));
       return;
     }
     setBgError(null);
@@ -42,13 +45,13 @@ export function AppearanceSection(): React.JSX.Element {
             onClick={() => void retrySave()}
             className="shrink-0 rounded border border-destructive/40 px-2 py-0.5 transition-colors hover:bg-destructive/10"
           >
-            重试
+            {tr("common.retry")}
           </button>
         </div>
       )}
-      <SettingRow title="亮暗模式" description="深色、浅色或跟随系统">
+      <SettingRow title={tr("appearance.mode")} description={tr("appearance.modeHint")}>
         <div className="flex overflow-hidden rounded-md border border-border">
-          {MODE_OPTIONS.map((opt) => (
+          {modes.map((opt) => (
             <button
               key={opt.value}
               type="button"
@@ -66,8 +69,8 @@ export function AppearanceSection(): React.JSX.Element {
       </SettingRow>
 
       <SettingRow
-        title="字体缩放"
-        description={`当前 ${(preference.fontScale * 100).toFixed(0)}%（85%–125%）`}
+        title={tr("appearance.fontScale")}
+        description={tr("appearance.fontScaleHint", { percent: (preference.fontScale * 100).toFixed(0) })}
       >
         <div className="flex w-[200px] shrink-0 items-center gap-[12px]">
           <input
@@ -78,7 +81,7 @@ export function AppearanceSection(): React.JSX.Element {
             value={preference.fontScale}
             onChange={(e) => void update({ fontScale: Number(e.target.value) })}
             className="w-full accent-[var(--primary)]"
-            aria-label="字体缩放"
+            aria-label={tr("appearance.fontScale")}
           />
           <span className="w-[46px] shrink-0 text-right text-xs tabular-nums text-muted-foreground">
             {Math.round(preference.fontScale * 100)}%
@@ -86,7 +89,7 @@ export function AppearanceSection(): React.JSX.Element {
         </div>
       </SettingRow>
 
-      <SettingRow title="减弱动效" description="关闭过渡与动画">
+      <SettingRow title={tr("appearance.reduceMotion")} description={tr("appearance.reduceMotionHint")}>
         <Switch
           checked={preference.reduceMotion}
           onToggle={() => void update({ reduceMotion: !preference.reduceMotion })}
@@ -94,8 +97,8 @@ export function AppearanceSection(): React.JSX.Element {
       </SettingRow>
 
       <SettingRow
-        title="跟随封面取色"
-        description="按封面调整界面主色"
+        title={tr("appearance.followCover")}
+        description={tr("appearance.followCoverHint")}
       >
         <Switch
           checked={preference.followCoverColor}
@@ -104,11 +107,11 @@ export function AppearanceSection(): React.JSX.Element {
       </SettingRow>
 
       <div className="border-t border-border py-4">
-        <h3 className="text-sm font-medium">皮肤</h3>
+        <h3 className="text-sm font-medium">{tr("appearance.skins")}</h3>
         <p className="mt-0.5 text-xs text-muted-foreground">
           {followCover
-            ? "跟随封面取色中，皮肤不生效"
-            : "选择主题配色"}
+            ? tr("appearance.skinsFollowCover")
+            : tr("appearance.skinsHint")}
         </p>
 
         <div
@@ -158,14 +161,14 @@ export function AppearanceSection(): React.JSX.Element {
                   void update({ skinId: "custom", customColor: e.target.value })
                 }
                 className="absolute inset-0 h-full w-full cursor-pointer opacity-0"
-                aria-label="自定义主色"
+                aria-label={tr("appearance.customColor")}
               />
               <div
                 className="h-7 w-7 rounded-lg"
                 style={{ backgroundColor: preference.customColor }}
               />
             </label>
-            <span className="text-xs font-medium">自定义</span>
+            <span className="text-xs font-medium">{tr("appearance.custom")}</span>
           </div>
         </div>
       </div>
@@ -173,9 +176,9 @@ export function AppearanceSection(): React.JSX.Element {
       <div className="border-t border-border py-4">
         <div className="flex items-center justify-between">
           <div>
-            <h3 className="text-sm font-medium">背景图片</h3>
+            <h3 className="text-sm font-medium">{tr("appearance.bgImage")}</h3>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              覆盖内容区、侧边栏与标题栏（最大 5MB）
+              {tr("appearance.bgImageHint")}
             </p>
           </div>
           {preference.bgImage && (
@@ -184,7 +187,7 @@ export function AppearanceSection(): React.JSX.Element {
               onClick={() => void update({ bgImage: "" })}
               className="rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
             >
-              清除
+              {tr("appearance.bgClear")}
             </button>
           )}
         </div>
@@ -193,7 +196,7 @@ export function AppearanceSection(): React.JSX.Element {
           <div className="mt-3 overflow-hidden rounded-lg border border-border">
             <img
               src={preference.bgImage}
-              alt="背景预览"
+              alt={tr("appearance.bgPreview")}
               className="h-32 w-full object-cover"
             />
           </div>
@@ -206,8 +209,8 @@ export function AppearanceSection(): React.JSX.Element {
               className="hidden"
             />
             <div className="text-center text-xs text-muted-foreground">
-              <p>点击选择图片</p>
-              <p className="mt-1 text-3xs">支持 JPG / PNG / WebP</p>
+              <p>{tr("appearance.bgPick")}</p>
+              <p className="mt-1 text-3xs">{tr("appearance.bgFormats")}</p>
             </div>
           </label>
         )}

@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
 import { SPEED_OPTIONS, speedLabel } from "@/lib/fx";
 import { GAPLESS_KEY } from "@/lib/storageKeys";
+import { useT } from "@/lib/i18n";
 import { errMsg } from "@/lib/utils";
 import * as ipc from "@/services/ipc";
 import { SettingRow, Switch } from "../controls";
 
 export function PlaybackSection(): React.JSX.Element {
+  const tr = useT();
   const [devices, setDevices] = useState<string[]>([]);
   const [current, setCurrent] = useState<string>("");
   const [speed, setSpeedState] = useState(1);
@@ -92,17 +94,17 @@ export function PlaybackSection(): React.JSX.Element {
   return (
     <div className="max-w-4xl divide-y divide-border">
       <SettingRow
-        title="音频输出设备"
-        description="跟随系统可随设备切换；固定设备适合多路输出"
+        title={tr("settings.playback.outputDevice.title")}
+        description={tr("settings.playback.outputDevice.desc")}
       >
         <select
           value={current}
           disabled={busy}
           onChange={(e) => void choose(e.target.value)}
           className="max-w-52 rounded-md border border-input bg-background px-2 py-1.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
-          aria-label="音频输出设备"
+          aria-label={tr("settings.playback.outputDevice.title")}
         >
-          <option value="">跟随系统默认</option>
+          <option value="">{tr("settings.playback.outputDevice.followSystem")}</option>
           {devices.map((d) => (
             <option key={d} value={d}>
               {d}
@@ -112,14 +114,14 @@ export function PlaybackSection(): React.JSX.Element {
       </SettingRow>
       {/* 默认播放音质已改为按平台独立设置（音源账号页），此处不再有全局入口 */}
       <SettingRow
-        title="无缝播放"
-        description="提前加载下一首，缩短间隔"
+        title={tr("settings.playback.gapless.title")}
+        description={tr("settings.playback.gapless.desc")}
       >
         <Switch checked={gapless} disabled={busy} onToggle={() => void chooseGapless()} />
       </SettingRow>
       <SettingRow
-        title="本地优先播放"
-        description="优先播放已下载与本地文件；关掉则始终在线"
+        title={tr("settings.playback.localFirst.title")}
+        description={tr("settings.playback.localFirst.desc")}
       >
         <Switch
           checked={localFirst}
@@ -128,13 +130,13 @@ export function PlaybackSection(): React.JSX.Element {
         />
       </SettingRow>
       <SettingRow
-        title="默认倍速"
-        description={`当前 ${speedLabel(speed)}；立即生效并记忆`}
+        title={tr("settings.playback.speed.title")}
+        description={tr("settings.playback.speed.desc", { speed: speedLabel(speed) })}
       >
         <select
           value={speed}
           disabled={busy}
-          aria-label="默认倍速"
+          aria-label={tr("settings.playback.speed.title")}
           onChange={(e) => void chooseSpeed(Number(e.target.value))}
           className="rounded-md border border-input bg-background px-2 py-1.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
         >
