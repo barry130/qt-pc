@@ -748,6 +748,21 @@ pub async fn cmd_set_loudnorm(state: State<'_, AppState>, enabled: bool) -> Resu
     Ok(())
 }
 
+/// ReplayGain 静态增益模式（`off` / `track` / `album`，A1）并持久化。
+///
+/// 收字符串而不是枚举：模式本来就是设置表里的一行文本，解析只在后端做一处
+/// （`ReplayGainMode::from_setting`，认不出的值当关闭）。切完引擎会按当前曲目
+/// 立刻重算增益，正在播的那首当场生效。
+#[tauri::command(rename = "set_replay_gain_mode")]
+pub async fn cmd_set_replay_gain_mode(
+    state: State<'_, AppState>,
+    mode: String,
+) -> Result<(), String> {
+    let mode = crate::audio::ReplayGainMode::from_setting(&mode);
+    state.engine.send(AudioCmd::SetReplayGain(mode));
+    Ok(())
+}
+
 /// 淡入淡出参数（开关 + 时长）并持久化。
 #[tauri::command(rename = "set_fade")]
 pub async fn cmd_set_fade(state: State<'_, AppState>, fade: FadeParams) -> Result<(), String> {
@@ -1562,6 +1577,96 @@ pub async fn cmd_get_app_version() -> std::collections::HashMap<String, serde_js
     map
 }
 
+// ---------- 数据目录 / 便携模式（DESIGN §8.2） ----------
+
+/// 数据目录快照：设置页「关于 → 数据目录」与诊断包（B8）共用。
+///
+/// 只读、不含隐私（都是本机路径），因此不需要脱敏。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppPathsView {
+    /// 是否便携模式（exe 同目录有 `portable.txt`，或 `QUIETMUSIC_PORTABLE=1`）
+    pub portable: bool,
+    /// 数据根：库（`data/music.db`）、音源包（`source-bundle/`）、歌单封面都在其下
+    pub data_root: String,
+    /// 播放缓存根
+    pub cache_root: String,
+    /// 日志目录（文件日志没启用时给默认落点，界面不留空）
+    pub logs_root: String,
+}
+
+#[tauri::command(rename = "get_app_paths")]
+pub async fn cmd_get_app_paths(app: tauri::AppHandle) -> AppPathsView {
+    let show = |p: std::path::PathBuf| p.to_string_lossy().to_string();
+    AppPathsView {
+        portable: crate::app_paths::is_portable(),
+        data_root: show(crate::app_paths::data_root(&app)),
+        cache_root: show(crate::app_paths::cache_root(&app)),
+        logs_root: crate::file_logger::effective_dir()
+            .or_else(crate::app_paths::logs_root_from_env)
+            .map(show)
+            .unwrap_or_default(),
+    }
+}
+
+// ---------- URI scheme（B4，DESIGN §4.13） ----------
+
+/// `quietmusic://` 注册状态：设置页「通用 → 链接唤起」回显用。
+#[tauri::command(rename = "get_uri_scheme_state")]
+pub async fn cmd_get_uri_scheme_state() -> Result<crate::uri_scheme::UriSchemeState, String> {
+    crate::uri_scheme::state()
+}
+
+/// 注册 `quietmusic://`（只写 HKCU，无需管理员），返回注册后的状态。
+#[tauri::command(rename = "register_uri_scheme")]
+pub async fn cmd_register_uri_scheme() -> Result<crate::uri_scheme::UriSchemeState, String> {
+    crate::uri_scheme::register()
+}
+
+/// 取消注册：删掉 `HKCU\Software\Classes\quietmusic` 整棵子树。
+#[tauri::command(rename = "unregister_uri_scheme")]
+pub async fn cmd_unregister_uri_scheme() -> Result<crate::uri_scheme::UriSchemeState, String> {
+    crate::uri_scheme::unregister()
+}
+
+// ---------- 诊断包（B8，DESIGN §18） ----------
+
+/// 诊断包（B8）：日志 + 脱敏配置 + 数据库版本 + 设备信息，打包成 stored zip。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticBundleView {
+    /// 建议文件名（前端拿去调「另存为」的默认名）
+    pub file_name: String,
+    /// zip 的 base64（不含 `data:` 前缀，直接喂 `saveBinaryFile`）
+    pub base64: String,
+    /// 条目数（含 README / summary / settings）
+    pub files: usize,
+    /// 字节数
+    pub bytes: usize,
+}
+
+/// 打包诊断包。落盘交给前端（先让用户选路径，再 `save_binary_file`），
+/// 这样后端只负责「打包」这一件事，不会在用户没同意时往磁盘写文件。
+#[tauri::command(rename = "build_diagnostics")]
+pub async fn cmd_build_diagnostics(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<DiagnosticBundleView, String> {
+    let db = state.db.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let bundle = crate::diagnostics::build(&app, db.as_deref())?;
+        use base64::Engine as _;
+        Ok(DiagnosticBundleView {
+            file_name: bundle.file_name,
+            base64: base64::engine::general_purpose::STANDARD.encode(&bundle.bytes),
+            files: bundle.files,
+            bytes: bundle.bytes.len(),
+        })
+    })
+    .await
+    .map_err(|e| format!("诊断包任务失败: {e}"))?
+}
+
 // ---------- 桌面歌词窗口（DESIGN §4.2 / §10 / §11.7） ----------
 
 #[tauri::command(rename = "show_desktop_lyric")]
@@ -1728,6 +1833,63 @@ pub async fn cmd_get_lyric(
     .map_err(|e| format!("读取歌词失败: {e}"))?
 }
 
+// ---------- 评分（A6，2026-11-01，track_ratings 表） ----------
+//
+// 五星制，`rating <= 0` = 清除（DELETE，表里只留真正打过分的曲目）。
+// 键 = `platform:id`，与 `tracks.id` / `download_files.key` 同口径；刻意不挂
+// 外键 —— 评分是用户偏好，曲目被清出曲库后重新扫回来，评分要还在。
+//
+// 写入不做去抖：一次点击 = 一次 IPC，行内按钮也会乐观更新，失败再回滚。
+
+/// 写入 / 更新 / 清除一首歌的评分（`rating <= 0` = 清除）。
+#[tauri::command(rename = "set_track_rating")]
+pub async fn cmd_set_track_rating(
+    state: State<'_, AppState>,
+    key: String,
+    rating: i64,
+) -> Result<(), String> {
+    let Some(db) = state.db.clone() else {
+        return Err("数据库未就绪".into());
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| crate::db::store::set_track_rating(conn, &key, rating))
+    })
+    .await
+    .map_err(|e| format!("写入评分失败: {e}"))?
+}
+
+/// 批量读取评分（只返回有评分的键；列表页一次取一屏，避免 N 次 IPC）。
+#[tauri::command(rename = "get_track_ratings")]
+pub async fn cmd_get_track_ratings(
+    state: State<'_, AppState>,
+    keys: Vec<String>,
+) -> Result<HashMap<String, i64>, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(HashMap::new());
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| crate::db::store::get_track_ratings(conn, &keys))
+    })
+    .await
+    .map_err(|e| format!("读取评分失败: {e}"))?
+}
+
+/// 评分不低于 `minRating` 的曲目键（智能歌单的 `rating >= N`、按星级筛选）。
+#[tauri::command(rename = "list_rated_keys")]
+pub async fn cmd_list_rated_keys(
+    state: State<'_, AppState>,
+    min_rating: i64,
+) -> Result<Vec<String>, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(Vec::new());
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| crate::db::store::rated_keys_at_least(conn, min_rating))
+    })
+    .await
+    .map_err(|e| format!("读取评分列表失败: {e}"))?
+}
+
 // ---------- 不喜欢列表（屏蔽规则，dislike_rules 表） ----------
 //
 // 规则按「歌名 + 歌手」匹配，不按曲目 id —— id 是平台私有的，换源兜底后同一首歌
@@ -1881,9 +2043,18 @@ pub async fn cmd_scan_library(
         return Err("数据库不可用，无法扫描本地音乐库".to_string());
     };
     tauri::async_runtime::spawn_blocking(move || {
-        crate::library_scan::scan_and_persist(&db, &request, |progress| {
+        let result = crate::library_scan::scan_and_persist(&db, &request, |progress| {
             let _ = app.emit(crate::local::EVENT_LIBRARY_SCAN_PROGRESS, progress);
-        })
+        });
+        // 扫描会写入新的 ReplayGain 列：入库后立刻重载内存表，
+        // 否则新扫到的增益要等下次启动才生效（A1）。
+        if result.is_ok() {
+            match db.with(crate::audio::replay_gain::reload) {
+                Ok(total) => log::debug!("[fx] 扫描后 ReplayGain 表已刷新：{total} 首"),
+                Err(e) => log::warn!("[fx] 扫描后 ReplayGain 表刷新失败: {e}"),
+            }
+        }
+        result
     })
     .await
     .map_err(|error| format!("扫描任务失败: {error}"))?
@@ -2090,7 +2261,11 @@ pub async fn cmd_get_scan_dirs(state: State<'_, AppState>) -> Result<Vec<String>
 
 /// 添加扫描目录（已存在则幂等刷新 last_scan_at）。
 #[tauri::command(rename = "add_scan_dir")]
-pub async fn cmd_add_scan_dir(state: State<'_, AppState>, path: String) -> Result<(), String> {
+pub async fn cmd_add_scan_dir(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<(), String> {
     if !std::path::Path::new(&path).exists() {
         return Err(format!("目录不存在: {path}"));
     }
@@ -2101,12 +2276,19 @@ pub async fn cmd_add_scan_dir(state: State<'_, AppState>, path: String) -> Resul
         db.with(|conn| crate::db::store::add_scan_dir(conn, &path))
     })
     .await
-    .map_err(|e| format!("添加扫描目录失败: {e}"))?
+    .map_err(|e| format!("添加扫描目录失败: {e}"))??;
+    // 目录清单变了，监听要跟着重建（A3）：新增的目录立刻纳入监听范围
+    crate::library_watch::restart_from_db(&app);
+    Ok(())
 }
 
 /// 移除扫描目录（只删清单条目，不动已入库曲目）。
 #[tauri::command(rename = "remove_scan_dir")]
-pub async fn cmd_remove_scan_dir(state: State<'_, AppState>, path: String) -> Result<(), String> {
+pub async fn cmd_remove_scan_dir(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<(), String> {
     let Some(db) = state.db.clone() else {
         return Ok(());
     };
@@ -2114,7 +2296,52 @@ pub async fn cmd_remove_scan_dir(state: State<'_, AppState>, path: String) -> Re
         db.with(|conn| crate::db::store::remove_scan_dir(conn, &path))
     })
     .await
-    .map_err(|e| format!("移除扫描目录失败: {e}"))?
+    .map_err(|e| format!("移除扫描目录失败: {e}"))??;
+    crate::library_watch::restart_from_db(&app);
+    Ok(())
+}
+
+/// 文件夹监听（A3）是否开启。缺省开启；这里返回的是**开关**，不是"此刻真的
+/// 有目录在被监听"（没配置扫描目录时开着也不会监听）。
+#[tauri::command(rename = "get_library_watch")]
+pub async fn cmd_get_library_watch(state: State<'_, AppState>) -> Result<bool, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(false);
+    };
+    let raw = tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| {
+            crate::db::store::get_setting(conn, crate::library_watch::SETTING_LIBRARY_WATCH)
+        })
+    })
+    .await
+    .map_err(|e| format!("读取监听设置失败: {e}"))?
+    .map_err(|e| format!("读取监听设置失败: {e}"))?;
+    Ok(raw.map(|v| v.trim() != "false").unwrap_or(true))
+}
+
+/// 开关文件夹监听（A3）。写完立刻按新状态重建监听，不用重启应用。
+#[tauri::command(rename = "set_library_watch")]
+pub async fn cmd_set_library_watch(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let Some(db) = state.db.clone() else {
+        return Err("数据库未就绪，无法保存监听开关".to_string());
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| {
+            crate::db::store::set_setting(
+                conn,
+                crate::library_watch::SETTING_LIBRARY_WATCH,
+                if enabled { "true" } else { "false" },
+            )
+        })
+    })
+    .await
+    .map_err(|e| format!("保存监听开关失败: {e}"))??;
+    crate::library_watch::restart_from_db(&app);
+    Ok(())
 }
 
 /// 在资源管理器中定位本地曲目文件（本地 Track.id 即文件绝对路径）。
@@ -2703,6 +2930,94 @@ pub async fn cmd_create_playlist(
     // (uid, platform, pid) 唯一键，upsert 幂等；失败不阻塞本地建单
     push_like_playlist(&state, "local", &pid, &name, None, "add").await;
     Ok(pid)
+}
+
+// ---------- 智能歌单（A5，对照分析文档 §4.5） ----------
+// 规则存 smart_playlists，曲目每次按规则现算（get_playlist_tracks 内部自动分流），
+// 所以这里只需要维护「规则 + 限制 + 排序」三样东西。
+// 不上送云端：其他端还不认识智能歌单，推过去只会多出一张没有曲目的空卡片。
+
+/// 新建智能歌单，返回 pid。
+#[tauri::command(rename = "create_smart_playlist")]
+pub async fn cmd_create_smart_playlist(
+    state: State<'_, AppState>,
+    name: String,
+    rules: crate::smart_playlist::SmartRules,
+    limit: Option<i64>,
+    sort: Option<String>,
+) -> Result<String, String> {
+    let Some(db) = state.db.clone() else {
+        return Err("数据库不可用".to_string());
+    };
+    let sort = sort.unwrap_or_else(|| "added_desc".to_string());
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| {
+            crate::smart_playlist::create_smart_playlist(conn, &name, &rules, limit, &sort)
+        })
+    })
+    .await
+    .map_err(|e| format!("新建智能歌单失败: {e}"))?
+    .map_err(|e| format!("新建智能歌单失败: {e}"))
+}
+
+/// 改规则 / 限制 / 排序（改完下次打开即生效，无需刷新成员）。
+#[tauri::command(rename = "update_smart_playlist")]
+pub async fn cmd_update_smart_playlist(
+    state: State<'_, AppState>,
+    pid: String,
+    rules: crate::smart_playlist::SmartRules,
+    limit: Option<i64>,
+    sort: Option<String>,
+) -> Result<(), String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(());
+    };
+    let sort = sort.unwrap_or_else(|| "added_desc".to_string());
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| {
+            crate::smart_playlist::update_smart_playlist(conn, &pid, &rules, limit, &sort)
+        })
+    })
+    .await
+    .map_err(|e| format!("保存智能歌单失败: {e}"))?
+    .map_err(|e| format!("保存智能歌单失败: {e}"))?;
+    Ok(())
+}
+
+/// 读智能歌单的规则（打开详情页/编辑器时用）。非智能歌单返回 null。
+#[tauri::command(rename = "get_smart_playlist")]
+pub async fn cmd_get_smart_playlist(
+    state: State<'_, AppState>,
+    pid: String,
+) -> Result<Option<crate::smart_playlist::SmartPlaylistMeta>, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(None);
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| crate::smart_playlist::smart_playlist(conn, &pid))
+    })
+    .await
+    .map_err(|e| format!("读取智能歌单失败: {e}"))?
+    .map_err(|e| format!("读取智能歌单失败: {e}"))
+}
+
+/// 另存为静态歌单：把此刻现算的结果固化成一张普通歌单，返回新 pid。
+#[tauri::command(rename = "save_smart_playlist_as_static")]
+pub async fn cmd_save_smart_playlist_as_static(
+    state: State<'_, AppState>,
+    pid: String,
+    name: String,
+) -> Result<String, String> {
+    let Some(db) = state.db.clone() else {
+        return Err("数据库不可用".to_string());
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| crate::smart_playlist::save_as_static(conn, &pid, &name))
+    })
+    .await
+    .map_err(|e| format!("另存为歌单失败: {e}"))?
+    .map_err(|e| format!("另存为歌单失败: {e}"))?
+    .ok_or_else(|| "这张歌单不是智能歌单，无需另存".to_string())
 }
 
 #[tauri::command(rename = "rename_playlist")]
@@ -5686,6 +6001,311 @@ pub async fn cmd_unregister_file_associations() -> Result<crate::file_assoc::Fil
 #[tauri::command(rename = "open_default_apps_settings")]
 pub async fn cmd_open_default_apps_settings() -> Result<(), String> {
     crate::file_assoc::open_settings()
+}
+
+// ---- A2 · 标签编辑（对照分析文档 §4.2） ----
+
+/// 单条写入失败的原因（逐条回报，不打断同批其它文件）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagWriteFailure {
+    pub path: String,
+    pub reason: String,
+}
+
+/// 一次保存的结果。`batch` 是撤销凭据：传回 `undo_tag_edit` 就能恢复这批文件的原值。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagWriteSummary {
+    pub batch: String,
+    pub updated: usize,
+    pub failed: Vec<TagWriteFailure>,
+}
+
+/// 读一个本地曲目在**文件里**的标签（编辑面板打开时调；不读库）。
+#[tauri::command(rename = "read_local_tags")]
+pub async fn cmd_read_local_tags(path: String) -> Result<crate::tags::TagValues, String> {
+    if crate::tags::is_cue_virtual(&path) {
+        return Err("CUE 分轨是虚拟曲目，标签来自 CUE 表，不能单独改".to_string());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::tags::read_tags(std::path::Path::new(&path))
+    })
+    .await
+    .map_err(|e| format!("读取标签任务失败: {e}"))?
+}
+
+/// 写标签（单曲 / 批量共用）：先记撤销清单，再改文件，最后刷库。
+///
+/// 顺序不能反：清单没落盘就动文件，等于放弃了「写坏了能退回去」这条底线。
+#[tauri::command(rename = "write_local_tags")]
+pub async fn cmd_write_local_tags(
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+    patch: crate::tags::TagPatch,
+) -> Result<TagWriteSummary, String> {
+    if paths.is_empty() {
+        return Err("没有选中任何曲目".to_string());
+    }
+    if patch.is_empty() {
+        return Err("没有任何要修改的字段".to_string());
+    }
+    let Some(db) = state.db.clone() else {
+        return Err("数据库未就绪，无法记录撤销清单".to_string());
+    };
+    let batch = format!(
+        "tag-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    );
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut updated = 0usize;
+        let mut failed: Vec<TagWriteFailure> = Vec::new();
+        for path in paths {
+            let file = std::path::Path::new(&path);
+            // 1) 原值先落清单
+            let before = match crate::tags::read_tags(file) {
+                Ok(v) => v,
+                Err(why) => {
+                    failed.push(TagWriteFailure { path, reason: why });
+                    continue;
+                }
+            };
+            let before_json = serde_json::to_string(&before)
+                .map_err(|e| format!("原值序列化失败: {e}"))?;
+            if let Err(e) = db.with(|conn| {
+                crate::db::store::record_tag_edit(conn, &batch, &path, &before_json)
+            }) {
+                failed.push(TagWriteFailure {
+                    path,
+                    reason: format!("记录撤销清单失败: {e}"),
+                });
+                continue;
+            }
+            // 2) 改文件（同目录临时副本 + rename，失败不动原文件）
+            if let Err(why) = crate::tags::write_tags(file, &patch) {
+                failed.push(TagWriteFailure { path, reason: why });
+                continue;
+            }
+            // 3) 重扫这一个文件刷库（标题 / 歌手 / 专辑 / 时长都按扫描口径重算）
+            let (rows, _skipped) = crate::local::scan_files(std::slice::from_ref(&path));
+            if !rows.is_empty() {
+                if let Err(e) = db.with(|conn| {
+                    crate::db::store::upsert_local_tracks(conn, &rows)
+                }) {
+                    // 文件已经改好了：算成功，但把「曲库没跟上」如实回报
+                    updated += 1;
+                    failed.push(TagWriteFailure {
+                        path,
+                        reason: format!("文件已修改，但曲库刷新失败: {e}"),
+                    });
+                    continue;
+                }
+            }
+            updated += 1;
+        }
+        // 4) 只留最近若干批撤销清单
+        let _ = db.with(crate::db::store::prune_tag_edits);
+        Ok(TagWriteSummary {
+            batch,
+            updated,
+            failed,
+        })
+    })
+    .await
+    .map_err(|e| format!("写标签任务失败: {e}"))?
+}
+
+/// 最近一批标签修改的凭据：重启应用后「撤销上次修改」还要用它。
+#[tauri::command(rename = "last_tag_edit_batch")]
+pub async fn cmd_last_tag_edit_batch(
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    let Some(db) = state.db.clone() else {
+        return Ok(None);
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(crate::db::store::latest_tag_edit_batch)
+    })
+    .await
+    .map_err(|e| format!("读取撤销记录失败: {e}"))?
+}
+
+/// 撤销一批标签修改：按撤销清单把原值写回文件并刷库，成功后销毁清单。
+///
+/// 部分文件恢复失败（被删 / 被占用 / 只读）时保留清单，用户可以修好环境再点一次。
+#[tauri::command(rename = "undo_tag_edit")]
+pub async fn cmd_undo_tag_edit(
+    state: State<'_, AppState>,
+    batch: String,
+) -> Result<usize, String> {
+    let Some(db) = state.db.clone() else {
+        return Err("数据库未就绪，无法撤销".to_string());
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        let rows = db.with(|conn| crate::db::store::tag_edit_batch(conn, &batch))?;
+        if rows.is_empty() {
+            return Err("这一批修改已经撤销过，或已超出保留范围".to_string());
+        }
+        let total = rows.len();
+        let mut restored = 0usize;
+        for row in rows {
+            let Ok(values) =
+                serde_json::from_str::<crate::tags::TagValues>(&row.before_json)
+            else {
+                continue;
+            };
+            let file = std::path::Path::new(&row.path);
+            if crate::tags::restore_tags(file, &values).is_err() {
+                continue;
+            }
+            let (new_rows, _) = crate::local::scan_files(std::slice::from_ref(&row.path));
+            if !new_rows.is_empty() {
+                let _ = db.with(|conn| {
+                    crate::db::store::upsert_local_tracks(conn, &new_rows)
+                });
+            }
+            restored += 1;
+        }
+        if restored == total {
+            let _ = db.with(|conn| crate::db::store::drop_tag_edit_batch(conn, &batch));
+        }
+        Ok(restored)
+    })
+    .await
+    .map_err(|e| format!("撤销任务失败: {e}"))?
+}
+
+// ---------- 外部 scrobble（A8）：Last.fm / ListenBrainz ----------
+
+/// 取 scrobble 设置与队列概览（设置页一次读齐）。
+#[tauri::command(rename = "get_scrobble_settings")]
+pub async fn cmd_get_scrobble_settings(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::scrobble::ScrobbleView, String> {
+    let db = scrobble_db(&state)?;
+    tauri::async_runtime::spawn_blocking(move || db.with(crate::scrobble::view))
+        .await
+        .map_err(|e| format!("读取 scrobble 设置失败: {e}"))?
+}
+
+/// 填 Last.fm 应用的 api key / secret（用户自备）。
+///
+/// 换掉 key 会顺带清掉已有的 session：session 是绑定在这对凭据上的，
+/// 留着会让后续所有请求都以「Invalid API key」失败。
+#[tauri::command(rename = "set_lastfm_credentials")]
+pub async fn cmd_set_lastfm_credentials(
+    state: tauri::State<'_, AppState>,
+    api_key: String,
+    api_secret: String,
+) -> Result<(), String> {
+    let db = scrobble_db(&state)?;
+    let api_key = api_key.trim().to_string();
+    let api_secret = api_secret.trim().to_string();
+    if api_key.is_empty() || api_secret.is_empty() {
+        return Err("API key 与 Secret 都要填".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| {
+            let changed = crate::db::store::get_setting(conn, crate::scrobble::KEY_LASTFM_API_KEY)?
+                .as_deref()
+                != Some(api_key.as_str());
+            crate::db::store::set_setting(conn, crate::scrobble::KEY_LASTFM_API_KEY, &api_key)?;
+            crate::db::store::set_setting(conn, crate::scrobble::KEY_LASTFM_SECRET, &api_secret)?;
+            if changed {
+                conn.execute(
+                    "DELETE FROM settings WHERE key IN (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        crate::scrobble::KEY_LASTFM_SESSION,
+                        crate::scrobble::KEY_LASTFM_USER,
+                        crate::scrobble::KEY_LASTFM_ENABLED,
+                        crate::scrobble::KEY_LASTFM_TOKEN
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|e| format!("保存凭据失败: {e}"))?
+}
+
+/// 开始 Last.fm 授权：返回要让用户打开的授权页地址。
+#[tauri::command(rename = "begin_lastfm_auth")]
+pub async fn cmd_begin_lastfm_auth(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let db = scrobble_db(&state)?;
+    crate::scrobble::lastfm_begin(&crate::scrobble::HttpTransport, &db).await
+}
+
+/// 完成 Last.fm 授权（用户在网页点完「允许」后回来点）：返回用户名。
+#[tauri::command(rename = "finish_lastfm_auth")]
+pub async fn cmd_finish_lastfm_auth(state: tauri::State<'_, AppState>) -> Result<String, String> {
+    let db = scrobble_db(&state)?;
+    crate::scrobble::lastfm_finish(&crate::scrobble::HttpTransport, &db).await
+}
+
+/// 断开 Last.fm：清 session 与开关，保留 api key / secret（重连不用重填）。
+#[tauri::command(rename = "disconnect_lastfm")]
+pub async fn cmd_disconnect_lastfm(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let db = scrobble_db(&state)?;
+    crate::scrobble::disconnect_lastfm(&db)
+}
+
+/// 连接 ListenBrainz（user token 校验通过才保存）：返回用户名。
+#[tauri::command(rename = "connect_listenbrainz")]
+pub async fn cmd_connect_listenbrainz(
+    state: tauri::State<'_, AppState>,
+    token: String,
+) -> Result<String, String> {
+    let db = scrobble_db(&state)?;
+    crate::scrobble::listenbrainz_connect(&crate::scrobble::HttpTransport, &db, &token).await
+}
+
+/// 断开 ListenBrainz。
+#[tauri::command(rename = "disconnect_listenbrainz")]
+pub async fn cmd_disconnect_listenbrainz(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let db = scrobble_db(&state)?;
+    crate::scrobble::disconnect_listenbrainz(&db)
+}
+
+/// 开关某个目标的上报（连接状态保留）。
+#[tauri::command(rename = "set_scrobble_enabled")]
+pub async fn cmd_set_scrobble_enabled(
+    state: tauri::State<'_, AppState>,
+    target: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let db = scrobble_db(&state)?;
+    let key = match target.trim() {
+        "lastfm" => crate::scrobble::KEY_LASTFM_ENABLED,
+        "listenbrainz" => crate::scrobble::KEY_LISTENBRAINZ_ENABLED,
+        other => return Err(format!("未知的上报目标：{other}")),
+    };
+    let value = if enabled { "1" } else { "0" };
+    tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| crate::db::store::set_setting(conn, key, value))
+    })
+    .await
+    .map_err(|e| format!("保存开关失败: {e}"))?
+}
+
+/// 立刻冲刷一次队列（设置页「立即重试」）。
+#[tauri::command(rename = "scrobble_flush")]
+pub async fn cmd_scrobble_flush(
+    state: tauri::State<'_, AppState>,
+) -> Result<crate::scrobble::FlushOutcome, String> {
+    let db = scrobble_db(&state)?;
+    crate::scrobble::flush_now(&db).await
+}
+
+fn scrobble_db(state: &AppState) -> Result<std::sync::Arc<crate::db::Database>, String> {
+    state
+        .db
+        .clone()
+        .ok_or_else(|| "数据库未初始化，无法上报".to_string())
 }
 
 #[cfg(test)]

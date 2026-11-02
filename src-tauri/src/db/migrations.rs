@@ -230,6 +230,159 @@ UPDATE tracks SET id = (SELECT new_id FROM kg_rename WHERE old_id = id) WHERE id
 DROP TABLE kg_rename;
 "#;
 
+/// v21：标签编辑的撤销清单（A2）。
+///
+/// 写文件标签是破坏性操作，分析文档要求「写前留存原值以便撤销」：每写一个
+/// 文件之前把它的标签整份存成 JSON，撤销时按 `batch` 取回、逐字段写回。
+/// `batch` 是一次「保存」共用的标识（单曲编辑就是一个文件一条）。
+const V21: &str = r#"
+CREATE TABLE IF NOT EXISTS tag_edits (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch       TEXT NOT NULL,
+  path        TEXT NOT NULL,
+  before_json TEXT NOT NULL,
+  at          INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tag_edits_batch ON tag_edits(batch);
+CREATE INDEX IF NOT EXISTS idx_tag_edits_at ON tag_edits(at DESC);
+"#;
+
+/// v22：智能歌单（A5）+ 曲目流派/年份（筛选字段）。
+///
+/// `smart_playlists` 只存**规则**，不存曲目快照：打开时按规则现算，所以歌单
+/// 永远跟着曲库变化，不需要在扫描/评分/播放之后去刷新任何一张成员表。
+/// `id` 直接复用 `playlists.id`（一类歌单一行元数据，名字/封面/排序仍在
+/// `playlists` 表里），级联删除保证删歌单时规则跟着走。
+///
+/// `tracks.genre` / `tracks.year` 是扫描时从标签读出来的筛选字段（A2 编辑
+/// 标签后单文件重扫也会同步）。两列可空、不回填：存量曲目要等下次扫描。
+const V22: &str = r#"
+CREATE TABLE IF NOT EXISTS smart_playlists (
+  id         TEXT PRIMARY KEY,
+  rules_json TEXT NOT NULL,
+  limit_n    INTEGER,
+  sort       TEXT NOT NULL DEFAULT 'added_desc',
+  updated_at INTEGER NOT NULL,
+  FOREIGN KEY (id) REFERENCES playlists(id) ON DELETE CASCADE
+);
+ALTER TABLE tracks ADD COLUMN genre TEXT;
+ALTER TABLE tracks ADD COLUMN year INTEGER;
+CREATE INDEX IF NOT EXISTS idx_tracks_genre ON tracks(genre);
+"#;
+
+/// V23：外部 scrobble 队列（A8）。
+///
+/// ## 为什么单独落库
+/// Last.fm / ListenBrainz 都是第三方 HTTP 服务：断网、对方 5xx、token 过期都会
+/// 失败。把「听过一首」先写进这张表，发送交给 `scrobble.rs` 的冲刷器按
+/// `status = 'pending' AND next_at <= now` 取，播放链路就永远不会被网络拖住，
+/// 失败的收听也不会丢。
+///
+/// ## `UNIQUE (target, track_id, played_at)`
+/// 一次收听会话可能被引擎多次结算（每 30s 落一次库 + 暂停 + 结束），入队必须幂等，
+/// 否则同一遍听歌会变成好几条 scrobble。开始时间相同的同曲同目标 = 同一次收听。
+///
+/// ## `next_at` / `attempts` / `reason`
+/// 退避重试用：失败一次 `next_at` 往后推指数分钟数，`attempts` 到 `MAX_ATTEMPTS`
+/// 就转 `dead` 不再重试；`reason` 只留最后一次失败原因，给设置页显示。
+const V23: &str = r#"
+CREATE TABLE IF NOT EXISTS scrobbles (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  target      TEXT NOT NULL,
+  track_id    TEXT NOT NULL,
+  artist      TEXT NOT NULL,
+  title       TEXT NOT NULL,
+  album       TEXT NOT NULL DEFAULT '',
+  duration_ms INTEGER NOT NULL DEFAULT 0,
+  played_at   INTEGER NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'pending',
+  attempts    INTEGER NOT NULL DEFAULT 0,
+  next_at     INTEGER NOT NULL DEFAULT 0,
+  reason      TEXT,
+  UNIQUE (target, track_id, played_at)
+);
+CREATE INDEX IF NOT EXISTS idx_scrobbles_due ON scrobbles(status, next_at);
+"#;
+
+/// V24：曲目 BPM（B10）。
+///
+/// ## 只存标签里已有的值
+/// 自己分析 BPM（起拍检测）是另一档工作量，且对变速 / 无鼓点的曲子准确率很难看；
+/// 分析文档里 B10 的结论就是「先读标签，不自己分析」。所以这一列只做**搬运**：
+/// 扫描时读 `TBPM` / Vorbis `BPM`，读不到就留 0（= 未知），之后按 `bpm > 0` 过滤。
+///
+/// ## 为什么不建索引
+/// 曲库在这台机器上是万级，`WHERE bpm BETWEEN ?` 全表扫也就毫秒级；等真出现
+/// 十万级曲库、且用户拿 BPM 当主筛选项时再加索引不迟（A5 的 `genre` 同理）。
+const V24: &str = r#"
+ALTER TABLE tracks ADD COLUMN bpm INTEGER NOT NULL DEFAULT 0;
+"#;
+
+/// 库体检的「忽略」清单（B11）。
+///
+/// 体检本身是只读查询，唯一需要落库的就是「这条我不想再看到」——
+/// 没有这张表，用户每次打开体检页都会被同一批整轨文件和零播放曲目糊一脸。
+///
+/// ## 为什么主键是两列而不是只记 track_id
+/// 同一首歌可能既超长又零播放。只按 `track_id` 记，用户在「超长」组点一次
+/// 忽略，「零播放」组的这一首也一起消失——等于用一次点击顺手改掉一个他没看过
+/// 的结论。`(track_id, kind)` 让三组各记各的。
+///
+/// ## 为什么不放在 tracks 上加标记列
+/// 忽略是**体检页面的显示偏好**，不是曲目属性：它不该跟着曲目同步到别处，
+/// 曲目被删/重新扫描后旧标记也就是一条孤儿记录，整表清空即可，无需级联约束。
+const V25: &str = r#"
+CREATE TABLE IF NOT EXISTS library_health_ignored (
+    track_id   TEXT NOT NULL,
+    kind       TEXT NOT NULL,
+    created_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (track_id, kind)
+);
+"#;
+
+/// 播客订阅（B9）。
+///
+/// ## 为什么单集单独一张表
+/// 一个订阅动辄几百集，塞进 `tracks` 会和「能不能播」的曲目表混在一起：
+/// 曲库统计、去重、整理都会被播客污染，而这些能力对播客毫无意义。
+/// 播客只在**播放链路**上借用曲目结构（见 `audio/engine.rs` 的播客分支），
+/// 元数据始终留在自己的表里。
+///
+/// ## `position_ms` / `played` 归属播放进度
+/// 刷新订阅时用 `ON CONFLICT(id) DO UPDATE` 只覆盖标题/描述/时长/发布时间，
+/// 这两列不出现在更新列表里——否则每次刷新都会把「听到一半」擦回 0。
+///
+/// ## 为什么 `url` 唯一而 `id` 是哈希
+/// 用户反复粘贴同一地址不该出现两条订阅（`url UNIQUE` 兜底）；
+/// `id` 用地址的 sha1 好处是「取消订阅再重新订阅」拿回同一个 id，
+/// 进度不会因为一次误删就全部作废。
+const V26: &str = r#"
+CREATE TABLE IF NOT EXISTS podcast_shows (
+    id              TEXT PRIMARY KEY,
+    url             TEXT NOT NULL UNIQUE,
+    title           TEXT NOT NULL DEFAULT '',
+    author          TEXT NOT NULL DEFAULT '',
+    description     TEXT NOT NULL DEFAULT '',
+    image           TEXT NOT NULL DEFAULT '',
+    last_fetched_at INTEGER NOT NULL DEFAULT 0,
+    created_at      INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS podcast_episodes (
+    id           TEXT PRIMARY KEY,
+    show_id      TEXT NOT NULL,
+    title        TEXT NOT NULL DEFAULT '',
+    description  TEXT NOT NULL DEFAULT '',
+    audio_url    TEXT NOT NULL,
+    duration_ms  INTEGER NOT NULL DEFAULT 0,
+    published_at INTEGER NOT NULL DEFAULT 0,
+    played       INTEGER NOT NULL DEFAULT 0,
+    position_ms  INTEGER NOT NULL DEFAULT 0,
+    created_at   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_podcast_episodes_show
+    ON podcast_episodes(show_id, published_at DESC);
+"#;
+
 pub(crate) const MIGRATIONS: &[(i64, &str)] = &[
     (1, V1),
     (2, V2),
@@ -250,6 +403,13 @@ pub(crate) const MIGRATIONS: &[(i64, &str)] = &[
     (17, V17),
     (18, V18),
     (19, V19),
+    (20, V20),
+    (21, V21),
+    (22, V22),
+    (23, V23),
+    (24, V24),
+    (25, V25),
+    (26, V26),
 ];
 
 const V1: &str = r#"
@@ -662,8 +822,41 @@ CREATE TABLE orphan_files (
 CREATE INDEX idx_orphan_files_meta ON orphan_files(title, singer);
 "#;
 
+/// V20：评分（A6）与 ReplayGain 静态增益（A1）。
+///
+/// ## `track_ratings`：为什么单独一张表、键是 `platform:id`
+/// 评分是**用户偏好**，和曲目是否还在库里没有关系：本地文件被移走、在线曲目
+/// 被清出 `tracks`，用户打的五星不该跟着消失（所以不挂 `REFERENCES tracks(id)`）。
+/// 键用 `platform:id` 与 `tracks.id` / `download_files.key` 同一口径 —— 同一首歌
+/// 换源后 platform 会变，评分不跨源继承，这一点与收藏的取舍一致（跨源合并只会
+/// 制造"我在 QQ 打了五星，WYY 也五星"的假数据）。
+///
+/// 行数上限是「用户真正打过分的曲目数」，与曲库规模无关，所以不需要额外索引：
+/// `rating` 上的索引留给「按星级筛选 / 智能歌单」这类查询。
+///
+/// ## `tracks.track_gain_db` 等三列：ReplayGain 标签
+/// 扫描时从文件标签里读出的**静态增益**（dB）：`track_gain_db` / `track_peak`
+/// 来自 `REPLAYGAIN_TRACK_GAIN` / `REPLAYGAIN_TRACK_PEAK`，`album_gain_db` 来自
+/// `REPLAYGAIN_ALBUM_GAIN`。NULL = 文件没写增益（绝大多数存量文件），播放时
+/// 回落到原有的运行时 RMS 归一（`audio::fx` 的 `loudnorm`），行为与升级前一致。
+///
+/// 三列都可空，不需要回填：增益只能从文件标签里读，没有标签就没有值；下次扫描
+/// （含监听触发的增量扫描）会补齐。
+const V20: &str = r#"
+CREATE TABLE track_ratings (
+  key        TEXT PRIMARY KEY,
+  rating     INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX idx_track_ratings_rating ON track_ratings(rating);
+
+ALTER TABLE tracks ADD COLUMN track_gain_db REAL;
+ALTER TABLE tracks ADD COLUMN track_peak REAL;
+ALTER TABLE tracks ADD COLUMN album_gain_db REAL;
+"#;
+
 /// 当前程序支持的最新 schema 版本。
-pub(crate) const CURRENT_VERSION: i64 = 19;
+pub(crate) const CURRENT_VERSION: i64 = 26;
 
 /// 建表 schema_migrations 并把所有未应用版本按序执行。
 pub(crate) fn run(conn: &Connection) -> Result<(), rusqlite::Error> {

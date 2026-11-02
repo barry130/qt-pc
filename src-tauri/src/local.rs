@@ -48,6 +48,21 @@ pub struct FileMeta {
     pub duration_secs: f64,
     /// 内嵌歌词正文（ID3v2 USLT / Vorbis `LYRICS` / `UNSYNCEDLYRICS`），取不到为 None。
     pub lyrics: Option<String>,
+    /// 流派标签（ID3v2 TCON / Vorbis `GENRE`），取不到为 None。
+    pub genre: Option<String>,
+    /// 年份（`DATE` / `RELEASEDATE` / `ORIGINALDATE` 里的四位年），取不到为 None。
+    pub year: Option<u32>,
+    /// 速度（BPM，ID3v2 `TBPM` / Vorbis `BPM`），取不到为 None。
+    ///
+    /// 只搬标签，不自己分析：文档 B10 的结论是「先读标签」，起拍检测是另一档工作量。
+    pub bpm: Option<u32>,
+    /// ReplayGain 单曲增益（dB，来自 `REPLAYGAIN_TRACK_GAIN`）。没写标签 = None。
+    pub track_gain_db: Option<f32>,
+    /// ReplayGain 单曲峰值（线性振幅，来自 `REPLAYGAIN_TRACK_PEAK`；标签若写成
+    /// `-1.2 dB` 会先换算回线性）。用来给增益封顶，避免削波。
+    pub track_peak: Option<f32>,
+    /// ReplayGain 专辑增益（dB，来自 `REPLAYGAIN_ALBUM_GAIN`）。
+    pub album_gain_db: Option<f32>,
 }
 
 /// 判断是否为受支持的音频文件（按扩展名，大小写不敏感）。
@@ -321,6 +336,38 @@ pub fn list_drives() -> Vec<String> {
     roots
 }
 
+/// 从日期字符串里取四位年份：`"2019"` / `"2019-05-01"` / `"2019/05"` 都取 2019。
+///
+/// 只认真实存在的年份区间（1800–2200），`"0000"`、`"9999"` 这类垃圾标签一律
+/// 当没有年份——智能歌单按年份筛选时，一个假年份比空值更坏。
+fn parse_year(raw: &str) -> Option<u32> {
+    let digits: String = raw
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.len() < 4 {
+        return None;
+    }
+    let year: u32 = digits[..4].parse().ok()?;
+    (1800..=2200).contains(&year).then_some(year)
+}
+
+/// 从 BPM 字符串里取整数：`"128"` / `"128 BPM"` / `"128.5"` 都取 128。
+///
+/// 只认 20–400 这个区间：标签里常见 `0`、`1`（打错）或 `9999`（占位），
+/// 这些值进库只会让按 BPM 筛选的歌单莫名其妙多出几首。
+fn parse_bpm(raw: &str) -> Option<u32> {
+    let digits: String = raw
+        .trim()
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let head = digits.split('.').next().unwrap_or_default();
+    let bpm: u32 = head.parse().ok()?;
+    (20..=400).contains(&bpm).then_some(bpm)
+}
+
 /// 组装入库行：优先 symphonia 元数据，缺失字段回落到文件名解析。
 fn build_row(path: &Path, path_str: String) -> LocalTrackRow {
     let stem = path
@@ -328,16 +375,31 @@ fn build_row(path: &Path, path_str: String) -> LocalTrackRow {
         .and_then(|s| s.to_str())
         .unwrap_or_default();
     let (fallback_singer, fallback_title) = parse_file_stem(stem);
-    let (title, singer, album, duration_secs, embedded_lyric) = match read_metadata(path) {
-        Some(m) => (
-            non_empty(m.title).unwrap_or(fallback_title),
-            non_empty(m.artist).unwrap_or(fallback_singer),
-            non_empty(m.album).unwrap_or_default(),
-            m.duration_secs,
-            non_empty(m.lyrics),
-        ),
-        None => (fallback_title, fallback_singer, String::new(), 0.0, None),
-    };
+    let (title, singer, album, duration_secs, embedded_lyric, gains, genre, year, bpm) =
+        match read_metadata(path) {
+            Some(m) => (
+                non_empty(m.title).unwrap_or(fallback_title),
+                non_empty(m.artist).unwrap_or(fallback_singer),
+                non_empty(m.album).unwrap_or_default(),
+                m.duration_secs,
+                non_empty(m.lyrics),
+                (m.track_gain_db, m.track_peak, m.album_gain_db),
+                non_empty(m.genre),
+                m.year,
+                m.bpm,
+            ),
+            None => (
+                fallback_title,
+                fallback_singer,
+                String::new(),
+                0.0,
+                None,
+                (None, None, None),
+                None,
+                None,
+                None,
+            ),
+        };
     let (file_size, mtime) = file_stats(path);
     LocalTrackRow {
         id: path_str.clone(),
@@ -353,6 +415,12 @@ fn build_row(path: &Path, path_str: String) -> LocalTrackRow {
         mtime,
         format: extension_of(path),
         embedded_lyric,
+        track_gain_db: gains.0,
+        track_peak: gains.1,
+        album_gain_db: gains.2,
+        genre,
+        year: year.map(i64::from),
+        bpm: bpm.map(i64::from),
     }
 }
 
@@ -413,6 +481,14 @@ pub fn read_metadata(path: &Path) -> Option<FileMeta> {
 /// `AlbumArtist` 仅在 `Artist` 缺失时作为歌手兜底。
 fn pick_tags(rev: &MetadataRevision, meta: &mut FileMeta) {
     for tag in rev.tags() {
+        // ReplayGain 是**自定义**键，没有 `StandardTagKey` 映射，只能比原始键。
+        // 各家写法不统一：Vorbis 是 `REPLAYGAIN_TRACK_GAIN`，ID3v2 的 TXXX 帧
+        // 会带出 `TXXX:REPLAYGAIN_TRACK_GAIN` 这种带前缀的键，所以先归一化
+        // （取最后一个分隔符之后、去空格、转大写）再比。
+        if let Some(gain) = parse_replay_gain_key(&tag.key, &tag.value) {
+            gain.fill(meta);
+            continue;
+        }
         let Some(value) = non_empty(tag_string(&tag.value)) else {
             continue;
         };
@@ -436,6 +512,23 @@ fn pick_tags(rev: &MetadataRevision, meta: &mut FileMeta) {
             // 与 vorbis.rs 各有一条映射），这里不必自己解析标签帧。
             Some(StandardTagKey::Lyrics) => {
                 meta.lyrics.get_or_insert(value);
+            }
+            Some(StandardTagKey::Genre) => {
+                meta.genre.get_or_insert(value);
+            }
+            // BPM：symphonia 把 ID3v2 的 TBPM 与 Vorbis 的 BPM 都归到 `Bpm`
+            // （symphonia-metadata 的 id3v2/frames.rs 与 vorbis.rs 各有一条映射）。
+            Some(StandardTagKey::Bpm) if meta.bpm.is_none() => {
+                meta.bpm = parse_bpm(&value);
+            }
+            // 年份：各家写 `DATE`（"2019" / "2019-05-01"）、`RELEASEDATE` 或
+            // `ORIGINALDATE`（重发盘的原始年），统一只取开头的四位数字。
+            Some(StandardTagKey::Date)
+            | Some(StandardTagKey::ReleaseDate)
+            | Some(StandardTagKey::OriginalDate)
+                if meta.year.is_none() =>
+            {
+                meta.year = parse_year(&value);
             }
             _ => {}
         }
@@ -628,6 +721,106 @@ fn tag_string(value: &Value) -> Option<String> {
 /// 去掉空串与纯空白。
 fn non_empty(s: Option<String>) -> Option<String> {
     s.filter(|v| !v.trim().is_empty())
+}
+
+// ---------- ReplayGain（A1） ----------
+
+/// 一条标签认出来的 ReplayGain 字段。
+#[derive(Debug, PartialEq)]
+enum GainTag {
+    TrackGain(f32),
+    TrackPeak(f32),
+    AlbumGain(f32),
+}
+
+impl GainTag {
+    /// 写回元数据；**先到先得**（与标题 / 歌手一致的口径：多个标签版本里第一条生效）。
+    fn fill(self, meta: &mut FileMeta) {
+        match self {
+            GainTag::TrackGain(v) => {
+                meta.track_gain_db.get_or_insert(v);
+            }
+            GainTag::TrackPeak(v) => {
+                meta.track_peak.get_or_insert(v);
+            }
+            GainTag::AlbumGain(v) => {
+                meta.album_gain_db.get_or_insert(v);
+            }
+        }
+    }
+}
+
+/// 认出这条标签是不是 ReplayGain / R128 字段，并解析它的数值。
+///
+/// 键的写法各家不同：
+/// - Vorbis / FLAC：`REPLAYGAIN_TRACK_GAIN`
+/// - ID3v2 的 TXXX 帧：`TXXX:REPLAYGAIN_TRACK_GAIN`（symphonia 把帧描述拼在键里）
+/// - MP4 的 freeform：`----:com.apple.iTunes:REPLAYGAIN_TRACK_GAIN`
+/// - Opus/EBU R128：`R128_TRACK_GAIN`（单位是 Q7.8 dB，即 1/256 dB）
+///
+/// 所以先取最后一段、转大写、把空格和连字符统一成下划线，再按白名单比。
+fn parse_replay_gain_key(key: &str, value: &Value) -> Option<GainTag> {
+    let name = replay_gain_name(key)?;
+    let raw = tag_string(value)?;
+    match name.as_str() {
+        "REPLAYGAIN_TRACK_GAIN" => parse_gain_db(&raw).map(GainTag::TrackGain),
+        "REPLAYGAIN_ALBUM_GAIN" => parse_gain_db(&raw).map(GainTag::AlbumGain),
+        "REPLAYGAIN_TRACK_PEAK" => parse_peak(&raw).map(GainTag::TrackPeak),
+        // R128 是整数 Q7.8 dB：`R128_TRACK_GAIN = -512` 即 −2.0 dB。
+        "R128_TRACK_GAIN" => parse_r128(&raw).map(GainTag::TrackGain),
+        "R128_ALBUM_GAIN" => parse_r128(&raw).map(GainTag::AlbumGain),
+        _ => None,
+    }
+}
+
+/// 归一化标签键；不是增益类标签的一律返回 None（走常规的标题 / 歌手分支）。
+fn replay_gain_name(key: &str) -> Option<String> {
+    let tail = key.rsplit([':', '/', '\u{0}']).next().unwrap_or(key);
+    let name = tail.trim().to_ascii_uppercase().replace([' ', '-'], "_");
+    let known = matches!(
+        name.as_str(),
+        "REPLAYGAIN_TRACK_GAIN"
+            | "REPLAYGAIN_ALBUM_GAIN"
+            | "REPLAYGAIN_TRACK_PEAK"
+            | "R128_TRACK_GAIN"
+            | "R128_ALBUM_GAIN"
+    );
+    known.then_some(name)
+}
+
+/// 解析 `-7.23 dB` / `-7.23db` / `-7.23`。超出 ±40 dB 的值当脏数据处理成 None
+/// （真音乐不会要 40 dB 的增益，出现基本是标签写错了，照做会把耳朵炸了）。
+fn parse_gain_db(raw: &str) -> Option<f32> {
+    let text = raw.trim();
+    let text = text
+        .strip_suffix("dB")
+        .or_else(|| text.strip_suffix("db"))
+        .or_else(|| text.strip_suffix("DB"))
+        .unwrap_or(text)
+        .trim();
+    let value: f32 = text.parse().ok()?;
+    (value.is_finite() && value.abs() <= 40.0).then_some(value)
+}
+
+/// 解析峰值。标准是线性振幅（`0.987`），但不少文件写成 dB（`-0.11 dB`），
+/// 两种都收；换算成线性后用于给增益封顶。
+fn parse_peak(raw: &str) -> Option<f32> {
+    let text = raw.trim();
+    let lowered = text.to_ascii_lowercase();
+    let value = if let Some(db) = lowered.strip_suffix("db") {
+        let db: f32 = db.trim().parse().ok()?;
+        10f32.powf(db / 20.0)
+    } else {
+        text.parse().ok()?
+    };
+    (value.is_finite() && value > 0.0 && value <= 8.0).then_some(value)
+}
+
+/// R128 增益：整数，单位 1/256 dB。
+fn parse_r128(raw: &str) -> Option<f32> {
+    let value: f32 = raw.trim().parse().ok()?;
+    let db = value / 256.0;
+    (db.is_finite() && db.abs() <= 40.0).then_some(db)
 }
 
 /// 扩展名（小写、不含点）；取不到返回空串。
@@ -837,6 +1030,19 @@ mod tests {
         mark_missing_local_tracks, query_local_tracks, remove_scan_dir, upsert_local_tracks,
     };
     use rusqlite::Connection;
+
+    #[test]
+    fn bpm_parsing_takes_integers_and_rejects_junk() {
+        // 各家写法：纯整数、带单位、带小数、前后空白
+        assert_eq!(parse_bpm("128"), Some(128));
+        assert_eq!(parse_bpm(" 128 BPM "), Some(128));
+        assert_eq!(parse_bpm("128.5"), Some(128));
+        assert_eq!(parse_bpm("0"), None);
+        assert_eq!(parse_bpm("1"), None);
+        assert_eq!(parse_bpm("9999"), None);
+        assert_eq!(parse_bpm(""), None);
+        assert_eq!(parse_bpm("快"), None);
+    }
 
     /// 建一个进程唯一的临时目录（不联网、不依赖真实音乐目录）
     fn temp_dir(tag: &str) -> PathBuf {
@@ -1129,6 +1335,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // ---------- ReplayGain 标签解析（A1） ----------
+
+    fn utf8(value: &str) -> Value {
+        Value::from(value)
+    }
+
+    #[test]
+    fn replay_gain_key_normalizes_writer_differences() {
+        // Vorbis / FLAC 原生写法
+        assert_eq!(
+            parse_replay_gain_key("REPLAYGAIN_TRACK_GAIN", &utf8("-7.23 dB")),
+            Some(GainTag::TrackGain(-7.23))
+        );
+        // ID3v2 的 TXXX 帧：symphonia 把帧描述拼进键
+        assert_eq!(
+            parse_replay_gain_key("TXXX:REPLAYGAIN_TRACK_GAIN", &utf8("-7.23 dB")),
+            Some(GainTag::TrackGain(-7.23))
+        );
+        // MP4 freeform
+        assert_eq!(
+            parse_replay_gain_key("----:com.apple.iTunes:REPLAYGAIN_ALBUM_GAIN", &utf8("-5.1 dB")),
+            Some(GainTag::AlbumGain(-5.1))
+        );
+        // 小写 / 连字符 / 空格都归一化
+        assert_eq!(
+            parse_replay_gain_key("replaygain-track gain", &utf8("-3 dB")),
+            Some(GainTag::TrackGain(-3.0))
+        );
+        // 不是 ReplayGain 的键一律不认
+        assert_eq!(parse_replay_gain_key("TITLE", &utf8("-7.23 dB")), None);
+    }
+
+    #[test]
+    fn replay_gain_values_are_parsed_and_validated() {
+        // dB 后缀可有可无，大小写都认
+        assert_eq!(parse_gain_db("-7.23 dB"), Some(-7.23));
+        assert_eq!(parse_gain_db("+2.50DB"), Some(2.5));
+        assert_eq!(parse_gain_db("-4"), Some(-4.0));
+        // 峰值写成线性
+        assert_eq!(parse_peak("0.988525"), Some(0.988525));
+        // 峰值写成 dB 时换算回线性（−0.1 dB ≈ 0.9886）
+        assert!((parse_peak("-0.1 dB").unwrap() - 0.98855).abs() < 1e-3);
+        // 垃圾值不采信（宁可当没标签，也不要瞎调音量）
+        assert_eq!(parse_gain_db("loud"), None);
+        assert_eq!(parse_gain_db(""), None);
+        assert_eq!(parse_gain_db("-999 dB"), None);
+        assert_eq!(parse_peak("0"), None);
+        assert_eq!(parse_peak("-2"), None);
+        // R128 是 Q7.8 定点（1/256 dB）
+        assert_eq!(parse_r128("-1536"), Some(-6.0));
+        assert_eq!(parse_r128("256"), Some(1.0));
+        assert_eq!(parse_r128("huh"), None);
+    }
+
+    #[test]
+    fn replay_gain_tags_fill_meta_first_wins() {
+        let mut meta = FileMeta::default();
+        // 先到先得：后面的标签不能覆盖前面已经认到的值
+        parse_replay_gain_key("REPLAYGAIN_TRACK_GAIN", &utf8("-7.00 dB"))
+            .unwrap()
+            .fill(&mut meta);
+        parse_replay_gain_key("REPLAYGAIN_TRACK_GAIN", &utf8("-3.00 dB"))
+            .unwrap()
+            .fill(&mut meta);
+        parse_replay_gain_key("REPLAYGAIN_TRACK_PEAK", &utf8("0.95"))
+            .unwrap()
+            .fill(&mut meta);
+        parse_replay_gain_key("REPLAYGAIN_ALBUM_GAIN", &utf8("-5.00 dB"))
+            .unwrap()
+            .fill(&mut meta);
+        assert_eq!(meta.track_gain_db, Some(-7.0));
+        assert_eq!(meta.track_peak, Some(0.95));
+        assert_eq!(meta.album_gain_db, Some(-5.0));
+    }
+
     #[test]
     fn duration_filter_only_drops_known_short_tracks() {
         let row = |duration_ms: i64| LocalTrackRow {
@@ -1145,6 +1426,12 @@ mod tests {
             mtime: 0,
             format: "mp3".to_string(),
             embedded_lyric: None,
+            track_gain_db: None,
+            track_peak: None,
+            album_gain_db: None,
+            genre: None,
+            year: None,
+            bpm: None,
         };
         // 关闭过滤：一律保留
         assert!(!is_too_short(&row(1_000), 0));
@@ -1660,6 +1947,43 @@ mod tests {
             vec![arg(&text), arg(&missing), arg(&empty)],
             "跳过项要如实回传，界面才能提示「N 个条目没打开」"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn delete_local_tracks_under_clears_whole_subtree_but_not_siblings() {
+        let conn = test_conn();
+        let root = temp_dir("watch-subtree");
+        let keep = root.join("keep");
+        let drop = root.join("drop");
+        std::fs::create_dir_all(&keep).unwrap();
+        std::fs::create_dir_all(&drop).unwrap();
+        touch(&keep, "a.flac");
+        touch(&drop, "b.flac");
+        touch(&drop, "c.flac");
+        let dirs = [root.to_string_lossy().into_owned()];
+        upsert_local_tracks(&conn, &scan_dirs(&dirs)).unwrap();
+        assert_eq!(query_local_tracks(&conn).unwrap().len(), 3);
+
+        // 整目录被删：它下面的曲目一起清掉，兄弟目录不受牵连
+        let removed = crate::db::store::delete_local_tracks_under(
+            &conn,
+            &drop.to_string_lossy(),
+        )
+        .unwrap();
+        assert_eq!(removed, 2);
+        let left: Vec<String> = query_local_tracks(&conn)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(left.len(), 1);
+        assert!(left[0].contains("keep"), "兄弟目录里的曲目不该被清掉: {left:?}");
+
+        // 前缀过短（盘符根）拒绝清理，防一次误调用清空整盘记录
+        let guard = crate::db::store::delete_local_tracks_under(&conn, "F:").unwrap();
+        assert_eq!(guard, 0);
 
         let _ = std::fs::remove_dir_all(&root);
     }

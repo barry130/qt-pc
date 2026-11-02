@@ -38,9 +38,12 @@ pub(crate) mod likes;
 pub(crate) mod local;
 pub(crate) mod lyrics;
 pub(crate) mod playlists;
+pub(crate) mod ratings;
+pub(crate) mod scrobbles;
 pub(crate) mod session;
 pub(crate) mod settings;
 pub(crate) mod stats;
+pub(crate) mod tags;
 pub(crate) mod tracks;
 
 // 各域条目原样再导出：`crate::db::store::upsert_tracks` 这类既有调用路径因此保持不变，
@@ -52,9 +55,12 @@ pub(crate) use likes::*;
 pub(crate) use local::*;
 pub(crate) use lyrics::*;
 pub(crate) use playlists::*;
+pub(crate) use ratings::*;
+pub(crate) use scrobbles::*;
 pub(crate) use session::*;
 pub(crate) use settings::*;
 pub(crate) use stats::*;
+pub(crate) use tags::*;
 pub(crate) use tracks::*;
 
 // 播放状态存档类型要能被 `crate::db::PlayState` 拿到（db/mod.rs 有 pub use）。
@@ -71,5 +77,10 @@ fn now_ms() -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
+
+/// 当前 unix 秒。scrobble 的时间戳（Last.fm / ListenBrainz 都要秒）。
+pub(crate) fn now_unix() -> i64 {
+    now_ms() / 1000
+}
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

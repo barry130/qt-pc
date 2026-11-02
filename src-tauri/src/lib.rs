@@ -10,6 +10,8 @@ pub mod cache;
 pub mod commands;
 pub mod cue;
 pub mod db;
+/// 诊断包导出（B8，对照分析文档 §4.13）：日志 + 脱敏配置 + 库版本 + 设备信息 zip
+pub mod diagnostics;
 pub mod download;
 /// 下载成品内嵌封面 / 歌词（「下载存储方式 = 音乐内嵌」，lofty 读写标签）
 pub mod embed;
@@ -19,9 +21,13 @@ pub mod external_open;
 pub mod file_assoc;
 pub mod file_logger;
 pub mod ipc_guard;
+/// 库体检（B11）：丢文件 / 零播放 / 超长未分轨三张清单，只读查询 + 忽略清单
+pub mod library_health;
 /// 重复文件检测与只读整理预览
 pub mod library_maintenance;
 pub mod library_scan;
+/// 扫描目录的文件监听（A3）：增删改就地增量入库，不用手动「重新扫描」
+pub mod library_watch;
 /// 听歌报告只读分页查询
 pub mod listen_report;
 /// 本地优先播放（DESIGN §7.13）：解析链 / 替身链 / 启动对账
@@ -37,6 +43,7 @@ pub mod net_guard;
 pub mod pack_safety;
 pub mod pack_signature;
 pub mod playlist_io;
+pub mod podcast;
 pub mod playurl_bridge;
 /// 私有配置的编译期常量（由 scripts/sync-config.mjs 生成；缺失时 build.rs 补空壳）
 pub mod private_config;
@@ -50,6 +57,13 @@ pub mod runtime_config;
 pub mod search_bridge;
 pub mod settings_keys;
 pub mod shortcuts;
+/// 音频文件标签的读 / 写（A2，对照分析文档 §4.2）。
+pub mod tags;
+/// 智能歌单（A5，对照分析文档 §4.5）：规则存库、曲目现算。
+pub mod smart_playlist;
+/// 外部收听上报（A8，对照分析文档 §4.8）：Last.fm / ListenBrainz。
+/// 阈值判定与签名在这里，队列在 `db::store::scrobbles`。
+pub mod scrobble;
 pub mod webview_mem;
 pub mod smtc;
 pub mod source_bundle;
@@ -58,6 +72,9 @@ pub mod source_pack_header;
 pub mod source_window;
 pub mod taskbar;
 pub mod tray;
+/// 自定义 URI scheme（B4，对照分析文档 §4.13）：`quietmusic://play?path=...`
+/// 唤起播放本地文件，注册走 HKCU 的 `Software\Classes`。
+pub mod uri_scheme;
 /// 音源账号网页登录（v17 契约 auth.webLogin：官方登录页 + Cookie 捕获）
 pub mod web_login;
 
@@ -94,6 +111,9 @@ pub struct AppState {
     pub astral: Arc<astral::AstralClient>,
     /// 下载任务登记表（暂停 / 取消时置停止旗标，§5.3 下载 2.0）
     pub downloads: Arc<download::DownloadManager>,
+    /// 扫描目录的文件监听（A3）。`None` = 没在监听（开关关掉 / 没有扫描目录 /
+    /// 平台不支持）。换目录或切开关时整体替换：丢掉旧的会自动关掉系统句柄。
+    pub library_watch: std::sync::Mutex<Option<library_watch::LibraryWatcher>>,
 }
 
 type CmdResult<T> = Result<T, ProviderError>;
@@ -173,6 +193,12 @@ pub fn run() {
                 crate::external_open::push(paths);
                 crate::external_open::notify(app);
             }
+            // B4：`quietmusic://play?path=...` 链接由浏览器拉起（同样可能是第二实例），
+            // 校验通过后走同一条待取队列 —— 前端只认「有文件要打开」，不区分来源。
+            let actions = crate::uri_scheme::actions_from_args(&args);
+            if !actions.is_empty() {
+                crate::uri_scheme::dispatch(app, actions);
+            }
             let _ = crate::mini_window::hide(app);
         }))
         .register_asynchronous_uri_scheme_protocol("qtres", qtres::handle_qtres)
@@ -221,6 +247,13 @@ pub fn run() {
             if !startup_paths.is_empty() {
                 log::info!("[open] 命令行待打开 {} 个条目", startup_paths.len());
                 crate::external_open::push(startup_paths);
+            }
+            // B4：首实例直接被链接拉起（例如把它设成默认浏览器/快捷方式），
+            // 与上面同口径入队；此刻前端还没起来，它挂载时会主动来取。
+            let startup_actions =
+                crate::uri_scheme::actions_from_args(&crate::external_open::argv_from_env());
+            if !startup_actions.is_empty() {
+                crate::uri_scheme::dispatch(&handle, startup_actions);
             }
             // 数据库：DESIGN §8.1 %APPDATA%/QuietMusic/data/music.db
             // 口径集中在 app_paths::data_root（含 LightListen 旧目录迁移）
@@ -314,6 +347,13 @@ pub fn run() {
                 db.clone(),
             );
 
+            // 外部上报（A8）：起一个后台线程每 5 分钟冲一次失败队列。没连
+            // 任何服务时它只读一次 settings 就睡，不做条件启动 —— 用户随时
+            // 可能在设置页连上 Last.fm / ListenBrainz。
+            if let Some(db) = db.clone() {
+                crate::scrobble::spawn_retry_loop(db);
+            }
+
             // 系统媒体控制（Windows SMTC / Linux MPRIS / macOS 正在播放）：
             // 系统媒体面板 + 硬件媒体键 / 蓝牙耳机按键。需要主窗口 HWND 的只有
             // Windows（SMTC 绑定窗口），其他平台忽略；取不到或初始化失败就
@@ -391,7 +431,12 @@ pub fn run() {
                 db,
                 astral,
                 downloads: Arc::new(download::DownloadManager::new()),
+                library_watch: std::sync::Mutex::new(None),
             });
+
+            // 文件夹监听（A3）：按设置与已配置的扫描目录启动。放在 manage 之后
+            // ——`restart_from_db` 要拿 AppState 里的 db 和监听槽位。
+            library_watch::restart_from_db(&handle);
 
             // 下载 2.0 收尾：上次退出时还在 pending / downloading 的任务已无工作线程，
             // 统一落成 paused（可「继续」），避免界面永远停在「下载中」
@@ -517,6 +562,7 @@ pub fn run() {
             cmd_get_fx_state,
             cmd_set_eq,
             cmd_set_loudnorm,
+            cmd_set_replay_gain_mode,
             cmd_set_fade,
             cmd_set_spectrum,
             cmd_audio_cache_stats,
@@ -541,6 +587,11 @@ pub fn run() {
             cmd_get_appearance,
             cmd_set_appearance,
             cmd_get_app_version,
+            cmd_get_app_paths,
+            cmd_get_uri_scheme_state,
+            cmd_register_uri_scheme,
+            cmd_unregister_uri_scheme,
+            cmd_build_diagnostics,
             cmd_official_site_url,
             cmd_show_desktop_lyric,
             cmd_hide_desktop_lyric,
@@ -555,6 +606,9 @@ pub fn run() {
             cmd_save_lyric,
             cmd_get_lyric,
             cmd_save_binary_file,
+            cmd_set_track_rating,
+            cmd_get_track_ratings,
+            cmd_list_rated_keys,
             cmd_list_dislikes,
             cmd_add_dislike_song,
             cmd_add_dislike_singer,
@@ -645,9 +699,40 @@ pub fn run() {
             cmd_delete_local_tracks,
             cmd_get_missing_local_tracks,
             cmd_purge_missing_local_tracks,
+            // 文件夹监听（A3）
+            cmd_get_library_watch,
+            cmd_set_library_watch,
+            // A2 · 标签编辑
+            cmd_read_local_tags,
+            cmd_write_local_tags,
+            cmd_undo_tag_edit,
+            cmd_last_tag_edit_batch,
+            // A8 · 外部收听上报
+            cmd_get_scrobble_settings,
+            cmd_set_lastfm_credentials,
+            cmd_begin_lastfm_auth,
+            cmd_finish_lastfm_auth,
+            cmd_disconnect_lastfm,
+            cmd_connect_listenbrainz,
+            cmd_disconnect_listenbrainz,
+            cmd_set_scrobble_enabled,
+            cmd_scrobble_flush,
             library_maintenance::cmd_find_library_duplicates,
             library_maintenance::cmd_cancel_library_duplicate_scan,
             library_maintenance::cmd_preview_library_organization,
+            library_maintenance::cmd_apply_library_organization,
+            library_maintenance::cmd_undo_library_organization,
+            library_maintenance::cmd_library_organize_undo_state,
+            library_health::cmd_scan_library_health,
+            library_health::cmd_ignore_library_health,
+            library_health::cmd_restore_library_health_ignored,
+            podcast::cmd_list_podcast_shows,
+            podcast::cmd_add_podcast_show,
+            podcast::cmd_refresh_podcast_show,
+            podcast::cmd_remove_podcast_show,
+            podcast::cmd_list_podcast_episodes,
+            podcast::cmd_save_podcast_progress,
+            podcast::cmd_podcast_episode_audio,
             cmd_get_local_cover,
             cmd_read_local_lyric,
             cmd_open_local_paths,
@@ -685,6 +770,11 @@ pub fn run() {
             cmd_add_tracks_to_playlist,
             cmd_remove_track_from_playlist,
             cmd_remove_tracks_from_playlist,
+            // 智能歌单（A5，对照分析文档 §4.5）
+            cmd_create_smart_playlist,
+            cmd_update_smart_playlist,
+            cmd_get_smart_playlist,
+            cmd_save_smart_playlist_as_static,
             // 下载管理（DESIGN §5.3）
             cmd_start_download,
             cmd_list_downloads,

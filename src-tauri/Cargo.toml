@@ -67,6 +67,10 @@ fastrand = "2"
 # std/alloc：set_boxed_logger（file_logger 自定义 Logger 用）默认特性集下被裁掉
 log = { version = "0.4", features = ["std", "alloc"] }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+# 本地库文件夹监听（A3）：Windows 走 ReadDirectoryChangesW、macOS 走 FSEvents、
+# Linux 走 inotify（notify 自己按平台挑后端）。只监听扫描目录，事件在
+# library_watch.rs 里合并去抖后再增量入库。
+notify = { version = "8.2.0", default-features = false, features = ["macos_fsevent"] }
 tauri-plugin-global-shortcut = "2.3.2"
 tauri-plugin-dialog = "2.7"
 # 单实例：第二个实例拉起时把已有主窗口带到前台（必须最先注册，见 lib.rs）

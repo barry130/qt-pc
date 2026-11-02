@@ -67,6 +67,7 @@ pub(crate) fn list_my_playlists(conn: &Connection) -> Result<Vec<MyPlaylist>, ru
                     created_at: row.get(4)?,
                     updated_at: row.get(5)?,
                     is_local: false,
+                    is_smart: false,
                 },
             );
         }
@@ -85,7 +86,7 @@ pub(crate) fn list_my_playlists(conn: &Connection) -> Result<Vec<MyPlaylist>, ru
                         WHERE pt.playlist_id = p.id
                           AND NOT EXISTS (SELECT 1 FROM liked_songs ls2
                                            WHERE ls2.id = pt.track_id AND ls2.deleted_at IS NULL)),
-                    p.created_at
+                    p.created_at, p.is_smart
                FROM playlists p
               ORDER BY p.created_at DESC",
         )?;
@@ -104,6 +105,7 @@ pub(crate) fn list_my_playlists(conn: &Connection) -> Result<Vec<MyPlaylist>, ru
                     created_at: row.get(5)?,
                     updated_at: row.get(5)?,
                     is_local: true,
+                    is_smart: row.get::<_, i64>(6)? != 0,
                 },
             );
         }
@@ -137,6 +139,9 @@ pub struct PlaylistSummary {
     pub updated_at: i64,
     /// 是否本地自建（可改名/删除）；false = 云端同步卡片（「移除」= 取消收藏）
     pub is_local: bool,
+    /// 是否智能歌单（A5）：规则存在 `smart_playlists` 表，曲目每次现算
+    #[serde(default)]
+    pub is_smart: bool,
 }
 
 /// 新建歌单，返回 pid。
@@ -144,6 +149,17 @@ pub struct PlaylistSummary {
 /// pid 用 UUID v4 生成（(platform=local, pid) 全局唯一，创建后永不变），
 /// 本地落库后由调用方上送云端登记；`id` 仍是纯本地主键（老表外键指着它）。
 pub(crate) fn create_playlist(conn: &Connection, name: &str) -> Result<String, rusqlite::Error> {
+    create_playlist_kind(conn, name, false)
+}
+
+/// 新建歌单（普通 / 智能两种），返回 pid。`is_smart` 只决定 `playlists.is_smart`
+/// 这个标记位：智能歌单的规则存在 `smart_playlists`，由
+/// [`crate::smart_playlist::create_smart_playlist`] 在这之后补写。
+pub(crate) fn create_playlist_kind(
+    conn: &Connection,
+    name: &str,
+    is_smart: bool,
+) -> Result<String, rusqlite::Error> {
     let now = now_ms();
     // pid 唯一索引兜底，撞了（概率可忽略）就重新生成
     let mut pid = String::new();
@@ -167,8 +183,8 @@ pub(crate) fn create_playlist(conn: &Connection, name: &str) -> Result<String, r
     let id = format!("pl_{}_{}", now, fastrand::u64(..));
     conn.execute(
         "INSERT INTO playlists (id, pid, name, is_smart, sort_order, is_favorite, created_at, updated_at)
-         VALUES (?1, ?2, ?3, 0, 0, 0, ?4, ?4)",
-        params![id, pid, name, now],
+         VALUES (?1, ?2, ?3, ?5, 0, 0, ?4, ?4)",
+        params![id, pid, name, now, i64::from(is_smart)],
     )?;
     Ok(pid)
 }
@@ -328,7 +344,7 @@ pub(crate) fn list_playlists(conn: &Connection) -> Result<Vec<PlaylistSummary>, 
                   WHERE ls.pid = p.pid AND ls.deleted_at IS NULL
                     AND ls.id IN (SELECT song_id FROM liked_song_playlists WHERE pid = p.pid)),
                 p.created_at, p.updated_at,
-                COALESCE(p.cover_path, '')
+                COALESCE(p.cover_path, ''), p.is_smart
            FROM playlists p
           ORDER BY p.updated_at DESC, p.created_at DESC",
     )?;
@@ -347,6 +363,7 @@ pub(crate) fn list_playlists(conn: &Connection) -> Result<Vec<PlaylistSummary>, 
             platform: LOCAL_PLATFORM.to_string(),
             pic_url: row.get(6)?,
             is_local: true,
+            is_smart: row.get::<_, i64>(7)? != 0,
         });
     }
     Ok(out)
@@ -361,6 +378,11 @@ pub(crate) fn get_playlist_tracks(
     conn: &Connection,
     pid: &str,
 ) -> Result<Vec<Track>, rusqlite::Error> {
+    // 智能歌单（A5）：没有成员行，曲目按规则现算。分流放在这里，
+    // 是为了让播放、批量操作、每日推荐候选等所有调用点自动拿到正确结果。
+    if crate::smart_playlist::is_smart_playlist(conn, pid)? {
+        return crate::smart_playlist::resolve_smart_playlist(conn, pid);
+    }
     let mut out = Vec::new();
     {
         let mut stmt = conn.prepare(

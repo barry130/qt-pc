@@ -13,7 +13,7 @@
 //! 拿不到锁就用上一块的参数快照继续（参数变化最多晚一块生效，约 25ms）。
 //! rodio 自己在渲染线程上也用 Mutex 同步音量/倍速（5ms 周期），先例一致。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -85,6 +85,8 @@ pub struct FxState {
     pub fade: FadeParams,
     /// 播放条频谱背景（前端画方块，数据来自 SpectrumTap 的实时频谱）
     pub spectrum: bool,
+    /// ReplayGain 静态增益模式："off" / "track" / "album"（A1）
+    pub replay_gain: String,
 }
 
 // ---------- 共享设置 ----------
@@ -109,6 +111,9 @@ struct FadeCommand {
 pub struct AudioFx {
     eq: RwLock<EqParams>,
     loudnorm: AtomicBool,
+    /// ReplayGain 静态增益（线性系数，1.0 = 不处理）。存 f32 的位模式：
+    /// 音频线程每次挂载曲目读一次，原子读比 RwLock 便宜且不可能阻塞。
+    static_gain: AtomicU32,
     /// 播放条频谱背景开关：关掉时 DspSource 的采样路径零开销直通
     spectrum: AtomicBool,
     fade: RwLock<FadeParams>,
@@ -120,6 +125,7 @@ impl AudioFx {
         Self {
             eq: RwLock::new(EqParams::default()),
             loudnorm: AtomicBool::new(false),
+            static_gain: AtomicU32::new(1.0f32.to_bits()),
             spectrum: AtomicBool::new(false),
             fade: RwLock::new(FadeParams::default()),
             fade_cmd: RwLock::new(FadeCommand {
@@ -146,6 +152,21 @@ impl AudioFx {
 
     pub fn loudnorm(&self) -> bool {
         self.loudnorm.load(Ordering::Relaxed)
+    }
+
+    /// 设置 ReplayGain 静态增益（线性系数）。挂载曲目时由引擎线程写入，
+    /// 音频线程在 `DspSource::refresh_span` 里快照一次。
+    pub fn set_static_gain(&self, linear: f32) {
+        let linear = if linear.is_finite() && linear > 0.0 {
+            linear
+        } else {
+            1.0
+        };
+        self.static_gain.store(linear.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn static_gain(&self) -> f32 {
+        f32::from_bits(self.static_gain.load(Ordering::Relaxed))
     }
 
     pub fn set_spectrum(&self, on: bool) {
@@ -216,6 +237,7 @@ impl AudioFx {
             loudnorm: self.loudnorm(),
             fade: self.fade_params(),
             spectrum: self.spectrum_enabled(),
+            replay_gain: super::replay_gain::mode().as_setting().to_string(),
         }
     }
 }
@@ -703,6 +725,8 @@ pub struct DspSource {
     eq_sig: Option<(EqParams, u32, usize)>,
     preamp: f32,
     loudnorm: bool,
+    /// ReplayGain 静态增益快照（1.0 = 不处理；见 `refresh_span`）
+    static_gain: f32,
     fade_kind: FadeKind,
     fade_start_ms: u64,
     fade_dur_ms: u64,
@@ -737,6 +761,7 @@ impl DspSource {
             eq_sig: None,
             preamp: 1.0,
             loudnorm: false,
+            static_gain: 1.0,
             fade_kind: FadeKind::None,
             fade_start_ms: 0,
             fade_dur_ms: 0,
@@ -768,6 +793,10 @@ impl DspSource {
             }
         }
         self.spectrum_on = on;
+
+        // ReplayGain 静态增益：换曲目时引擎线程写，这里每块读一次原子
+        // （块内保持一致，避免一个块里两种增益拼在一起）
+        self.static_gain = self.fx.static_gain();
 
         // 均衡器：参数 / 采样率 / 声道数任一变化都重建系数
         if let Ok(p) = self.fx.eq.try_read() {
@@ -871,18 +900,25 @@ impl Iterator for DspSource {
         }
 
         // 直通快路径：三种效果都没开，逐位透传
-        if self.eq.is_none() && !self.loudnorm && self.fade_kind == FadeKind::None {
+        if self.eq.is_none()
+            && !self.loudnorm
+            && self.static_gain == 1.0
+            && self.fade_kind == FadeKind::None
+        {
             return Some(x);
         }
 
-        let mut s = x;
+        // ReplayGain 静态增益在效果链最前面：它是「这首曲子本来就该多大」，
+        // 后面的均衡器 / 归一化都应当在已经对齐过的响度上工作。
+        let mut s = x * self.static_gain;
         if let Some(chs) = &mut self.eq {
             if let Some(c) = chs.get_mut(ch) {
                 s = c.process(s);
             }
             s *= self.preamp;
         }
-        let boosting = self.eq.is_some() || self.loudnorm;
+        // 只有「往外放大」才需要软限幅；静态增益 < 1 是压低，不可能削波
+        let boosting = self.eq.is_some() || self.loudnorm || self.static_gain > 1.0;
         if self.loudnorm {
             self.norm.accumulate(x);
             s = (s as f64 * self.norm.gain) as f32;

@@ -41,6 +41,21 @@ pub struct LocalTrackRow {
     /// 内嵌歌词（ID3v2 USLT / Vorbis LYRICS）。**不是 tracks 表的列**：扫描器读标签时
     /// 顺手带出来的中间产物，由 `library_scan` 落进 `lyrics` 表，写完即弃。
     pub embedded_lyric: Option<String>,
+    /// ReplayGain 单曲增益（dB，`REPLAYGAIN_TRACK_GAIN`）。没写标签 = None。
+    ///
+    /// 这三列**允许为空且不回填**：存量库里的老曲目要等文件 mtime 变了（重新扫描
+    /// 命中更新的那支分支）或整库重扫才会补上；没有增益的歌照样正常播放。
+    pub track_gain_db: Option<f32>,
+    /// ReplayGain 单曲峰值（线性振幅，`REPLAYGAIN_TRACK_PEAK`），用于给增益封顶。
+    pub track_peak: Option<f32>,
+    /// ReplayGain 专辑增益（dB，`REPLAYGAIN_ALBUM_GAIN`）。
+    pub album_gain_db: Option<f32>,
+    /// 流派（标签 `TCON` / Vorbis `GENRE`），智能歌单（A5）按它筛选。
+    pub genre: Option<String>,
+    /// 四位年份（标签 `DATE` 等），智能歌单按它筛选。
+    pub year: Option<i64>,
+    /// 速度（BPM，标签 `TBPM` / Vorbis `BPM`）。读不到标签 = None（库里落 0）。
+    pub bpm: Option<i64>,
 }
 
 /// 本地曲目入库/更新（§13.2 要点 4「新文件插入」/ 要点 5「老文件恢复，取消缺失标记」）。
@@ -63,8 +78,10 @@ pub fn upsert_local_tracks(
         tx.execute(
             "INSERT INTO tracks (id, platform, title, singer, album, pic_url, duration_ms,
                                  music_id, local_path, file_size, format, mtime, missing,
-                                 created_at, updated_at, start_ms, end_ms, cue_path)
-             VALUES (?1, 'local', ?2, ?3, ?4, NULL, ?5, NULL, ?6, ?7, ?8, ?9, 0, ?10, ?10, ?11, ?12, ?13)
+                                 created_at, updated_at, start_ms, end_ms, cue_path,
+                                 track_gain_db, track_peak, album_gain_db, genre, year, bpm)
+             VALUES (?1, 'local', ?2, ?3, ?4, NULL, ?5, NULL, ?6, ?7, ?8, ?9, 0, ?10, ?10, ?11, ?12, ?13,
+                     ?14, ?15, ?16, ?17, ?18, ?19)
              ON CONFLICT(id) DO UPDATE SET
                title       = excluded.title,
                singer      = excluded.singer,
@@ -77,6 +94,15 @@ pub fn upsert_local_tracks(
                start_ms    = excluded.start_ms,
                end_ms      = excluded.end_ms,
                cue_path    = excluded.cue_path,
+               -- 增益随文件标签走：重新扫描时标签改了要跟着改，没标签（NULL）也照写，
+               -- 免得删掉标签后旧增益还留在库里。
+               track_gain_db = excluded.track_gain_db,
+               track_peak    = excluded.track_peak,
+               album_gain_db = excluded.album_gain_db,
+               -- 流派/年份同理（智能歌单的筛选字段，标签改了要跟着变）
+               genre       = excluded.genre,
+               year        = excluded.year,
+               bpm         = excluded.bpm,
                missing     = 0,
                updated_at  = excluded.updated_at",
             params![
@@ -93,10 +119,47 @@ pub fn upsert_local_tracks(
                 r.start_ms.and_then(|v| i64::try_from(v).ok()),
                 r.end_ms.and_then(|v| i64::try_from(v).ok()),
                 r.cue_path,
+                r.track_gain_db,
+                r.track_peak,
+                r.album_gain_db,
+                r.genre,
+                r.year,
+                // bpm 列 NOT NULL，未知统一落 0（见 V24 注释）
+                r.bpm.unwrap_or(0),
             ],
         )?;
     }
     tx.commit()
+}
+
+/// 带 ReplayGain 的本地曲目（播放时用的内存查表来源，A1）。
+#[derive(Debug, Clone)]
+pub struct LocalGainRow {
+    /// `tracks.id`，即 `local:<路径>`（与 [`db_track_id`] 同口径）
+    pub key: String,
+    pub track_gain_db: Option<f32>,
+    pub track_peak: Option<f32>,
+    pub album_gain_db: Option<f32>,
+}
+
+/// 读出库里所有带增益的曲目。
+///
+/// 只查三列非空的行：正经打标过的本地库通常是几百到几千首，一次全读进内存
+/// （播放时按曲目键查表，不碰数据库 —— 音频线程不做 IO）。
+pub fn list_replay_gains(conn: &Connection) -> Result<Vec<LocalGainRow>, rusqlite::Error> {
+    let mut statement = conn.prepare(
+        "SELECT id, track_gain_db, track_peak, album_gain_db FROM tracks
+         WHERE track_gain_db IS NOT NULL OR album_gain_db IS NOT NULL OR track_peak IS NOT NULL",
+    )?;
+    let rows = statement.query_map([], |r| {
+        Ok(LocalGainRow {
+            key: r.get::<_, String>(0)?,
+            track_gain_db: r.get::<_, Option<f64>>(1)?.map(|v| v as f32),
+            track_peak: r.get::<_, Option<f64>>(2)?.map(|v| v as f32),
+            album_gain_db: r.get::<_, Option<f64>>(3)?.map(|v| v as f32),
+        })
+    })?;
+    rows.collect()
 }
 
 /// Retire old children after a complete CUE sheet was rescanned/opened. Call once
@@ -313,6 +376,84 @@ pub fn delete_local_tracks(conn: &Connection, paths: &[String]) -> Result<usize,
     Ok(removed)
 }
 
+/// 删除某个目录下的全部本地曲目记录（文件监听发现整目录被删 / 移走时用）。
+///
+/// 不用 `LIKE '前缀%'`：目录名里的 `_` / `%` 在 LIKE 里是通配符，得转义才安全；
+/// `substr` 比长度没有这个问题。返回删除条数。
+///
+/// 盘符根（`D:\`）这种超短前缀一律不清 —— 一个外接盘临时拔掉不该清空整个盘
+/// 的曲目记录，交给「文件缺失」与用户手动清理更稳。
+pub fn delete_local_tracks_under(conn: &Connection, dir: &str) -> Result<usize, rusqlite::Error> {
+    let trimmed = dir.trim_end_matches(['\\', '/']);
+    if trimmed.is_empty() {
+        return Ok(0);
+    }
+    let prefix = format!("{trimmed}{}", std::path::MAIN_SEPARATOR);
+    // substr 按字符计数（不是字节），中文目录名必须用 chars().count()
+    let prefix_chars = prefix.chars().count();
+    if prefix_chars <= 3 {
+        log::debug!("[local] 拒绝按前缀清库（前缀过短）: {prefix}");
+        return Ok(0);
+    }
+    conn.execute(
+        "DELETE FROM tracks WHERE platform = 'local' AND substr(local_path, 1, ?1) = ?2",
+        params![prefix_chars as i64, prefix],
+    )
+}
+
+/// 子表里跟着曲目主键走的外键列（`FOREIGN KEY (track_id) REFERENCES tracks(id)`）。
+///
+/// 曲目主键是 `local:<路径>`，文件一移动主键就得跟着换；那张表的外键是
+/// `ON DELETE CASCADE` 而不是 `ON UPDATE CASCADE`，所以**子表要自己改**，
+/// 否则 COMMIT 时外键校验失败（详见 [`relocate_local_track`]）。
+const TRACK_ID_CHILDREN: &[&str] = &[
+    "playlist_tracks",
+    "play_history",
+    "play_stats",
+    "download_tasks",
+    "lyrics",
+    "play_queue",
+    "play_days",
+];
+
+/// 曲目文件换位置后同步库里那条记录（A11 整理执行 / 撤销都用它）。
+///
+/// 主键 `local:<path>` 里嵌了路径，改主键会牵动所有 `REFERENCES tracks(id)`
+/// 子表，因此：
+/// 1. 事务内 `PRAGMA defer_foreign_keys = ON` —— 否则改父行那一刻子表还指旧 id，
+///    外键校验立刻失败（这个 pragma 只在事务内有效，见 migrations.rs 的同款注释）；
+/// 2. 先改个子表的 `track_id`，再改 `tracks.id` / `local_path`，COMMIT 时校验一次。
+///
+/// 返回更新的曲目行数（0 = 老路径不在库里，或目标路径已被占用）。
+pub fn relocate_local_track(
+    conn: &Connection,
+    from: &str,
+    to: &str,
+) -> Result<usize, rusqlite::Error> {
+    let old_id = format!("local:{from}");
+    let new_id = format!("local:{to}");
+    if old_id == new_id {
+        return Ok(0);
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("PRAGMA defer_foreign_keys = ON;")?;
+    for table in TRACK_ID_CHILDREN {
+        tx.execute(
+            &format!("UPDATE {table} SET track_id = ?1 WHERE track_id = ?2"),
+            params![new_id, old_id],
+        )?;
+    }
+    let moved = tx.execute(
+        "UPDATE tracks SET id = ?1, local_path = ?2, missing = 0
+         WHERE platform = 'local' AND id = ?3",
+        params![new_id, to, old_id],
+    )?;
+    if moved > 0 {
+        tx.commit()?;
+    }
+    Ok(moved)
+}
+
 /// 扫描目录清单（scan_dirs 表，§13.1「读取启用目录」）。
 pub fn list_scan_dirs(conn: &Connection) -> Result<Vec<String>, rusqlite::Error> {
     let mut stmt = conn.prepare("SELECT path FROM scan_dirs ORDER BY created_at, path")?;
@@ -429,4 +570,156 @@ pub fn local_candidates_by_meta(
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::store::tests::new_conn;
+
+    fn row(path: &str, title: &str) -> LocalTrackRow {
+        LocalTrackRow {
+            id: path.to_string(),
+            path: path.to_string(),
+            cue_path: None,
+            start_ms: None,
+            end_ms: None,
+            title: title.to_string(),
+            singer: "歌手".to_string(),
+            album: "专辑".to_string(),
+            duration_ms: 200_000,
+            file_size: 1024,
+            mtime: 1,
+            format: "flac".to_string(),
+            embedded_lyric: None,
+            track_gain_db: None,
+            track_peak: None,
+            album_gain_db: None,
+            genre: None,
+            year: None,
+            bpm: None,
+        }
+    }
+
+    fn count(conn: &Connection, sql: &str, value: &str) -> i64 {
+        conn.query_row(sql, params![value], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn bpm_column_round_trips_and_defaults_to_unknown() {
+        let conn = new_conn();
+        let mut with_bpm = row("D:/music/a.flac", "有速度");
+        with_bpm.bpm = Some(128);
+        upsert_local_tracks(&conn, &[with_bpm, row("D:/music/b.flac", "没速度")]).unwrap();
+
+        let tagged: i64 = conn
+            .query_row(
+                "SELECT bpm FROM tracks WHERE title = '有速度'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tagged, 128);
+
+        // 没标签 = 0（未知），不是 NULL：筛选 SQL 的数值比较不必到处 COALESCE
+        let unknown: i64 = conn
+            .query_row(
+                "SELECT bpm FROM tracks WHERE title = '没速度'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unknown, 0);
+
+        // 重新扫描时标签改了要跟着改
+        let mut again = row("D:/music/b.flac", "没速度");
+        again.bpm = Some(96);
+        upsert_local_tracks(&conn, &[again]).unwrap();
+        let updated: i64 = conn
+            .query_row(
+                "SELECT bpm FROM tracks WHERE title = '没速度'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated, 96);
+    }
+
+    #[test]
+    fn relocate_moves_primary_key_and_every_child_row() {
+        let conn = new_conn();
+        let old = "D:/music/乱七八糟/01.flac";
+        let new = "D:/sorted/歌手/专辑/歌曲.flac";
+        upsert_local_tracks(&conn, &[row(old, "歌曲")]).unwrap();
+        conn.execute(
+            "INSERT INTO playlists (id, name, created_at, updated_at) VALUES ('p1', '歌单', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO playlist_tracks (playlist_id, track_id, position, added_at)
+             VALUES ('p1', ?1, 0, 1)",
+            params![format!("local:{old}")],
+        )
+        .unwrap();
+        // 历史也挂在这条 id 上：换位置之后必须还找得到
+        conn.execute(
+            "INSERT INTO play_history (id, track_id, played_at, played_duration_ms, completed)
+             VALUES ('h1', ?1, 1, 1000, 1)",
+            params![format!("local:{old}")],
+        )
+        .unwrap();
+
+        assert_eq!(relocate_local_track(&conn, old, new).unwrap(), 1);
+
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM tracks WHERE id = ?1",
+                &format!("local:{old}")
+            ),
+            0
+        );
+        // local_path 列存的是纯路径，不带 local: 前缀
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM tracks WHERE local_path = ?1", new),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM playlist_tracks WHERE track_id = ?1",
+                &format!("local:{new}")
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM play_history WHERE track_id = ?1",
+                &format!("local:{new}")
+            ),
+            1
+        );
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM tracks WHERE id = ?1 AND missing = 0",
+                &format!("local:{new}")
+            ),
+            1
+        );
+
+        // 幂等：已经从老路径挪走的记录不会再把子表拽回去
+        assert_eq!(relocate_local_track(&conn, old, new).unwrap(), 0);
+    }
+
+    #[test]
+    fn relocate_reports_zero_for_unknown_path() {
+        let conn = new_conn();
+        assert_eq!(
+            relocate_local_track(&conn, "D:/not/in/library.flac", "D:/moved.flac").unwrap(),
+            0
+        );
+    }
 }

@@ -14,6 +14,16 @@
 //! 已装音源包全部保留。改名失败（被占用等）时**继续用旧目录**：宁可不迁移，也不能
 //! 让用户看起来像数据没了。（迁移逻辑只在 Windows 有历史目录需要搬，非 Windows
 //! 是全新口径，直接落新目录。）
+//!
+//! 便携模式（DESIGN §8.2）：exe 同目录放一个 `portable.txt`（或用环境变量
+//! `QUIETMUSIC_PORTABLE=1` 强制打开 / `=0` 强制关闭），数据根就改回 exe 目录
+//! —— 库、音源包、歌单封面全在 `./data` 与 `./source-bundle`，整个文件夹拷到新机
+//! 即可继续用，本机用户目录里不留任何东西。日志与缓存本来默认就在 exe 旁
+//! （见 [`install_base`]），因此便携模式下两者天然同源。
+//!
+//! 便携模式排在旧名迁移之前：便携版是「自带数据」的，不该去搬 `%APPDATA%` 里的
+//! 老库。反过来，只有 exe 目录**确认可写**才算便携（只读 U 盘上放 `portable.txt`
+//! 会被忽略并回落常规目录，否则整次运行都没有持久化）。
 
 use std::path::PathBuf;
 // 只被 install_base()（macOS 除外）用到，所以跟着它一起条件编译：
@@ -26,6 +36,11 @@ use tauri::Manager;
 const LEGACY_DIR_NAME: &str = "LightListen";
 /// 当前目录名（`runtime_config` 找 `app.config.local.json` 时也用这个口径）
 pub(crate) const DIR_NAME: &str = "QuietMusic";
+/// 便携标记：exe 同目录放这个文件即走便携模式（内容不关心）
+pub(crate) const PORTABLE_FLAG_FILE: &str = "portable.txt";
+/// 便携开关的环境变量：`1/true/yes/on` 强制开，`0/false/no/off` 强制关，
+/// 其余取值（含未设置）回到看标记文件 —— 覆盖装在只读介质、只想临时试一次的场景。
+pub(crate) const PORTABLE_ENV: &str = "QUIETMUSIC_PORTABLE";
 
 /// 安装目录（exe 所在目录）且**确认可写**；日志与缓存默认都挂在它下面。
 ///
@@ -42,6 +57,20 @@ pub(crate) const DIR_NAME: &str = "QuietMusic";
 ///
 /// macOS 排除在外：安装目录在 `.app` bundle 内部，往里写数据会破坏 bundle 的
 /// 签名封装，因此继续用系统惯例 `~/Library/Logs` / `app_cache_dir()`。
+/// 真写一个探针文件确认目录可写（探针用完即删）。
+///
+/// 「目录已存在」不等于可写：Program Files、AppImage 的只读挂载、`/usr/bin`
+/// 都可能建得出来却在写入时才被拒，所以必须真落一个字节。
+fn probe_writable(dir: &std::path::Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(".quietmusic-write-probe");
+    let ok = std::fs::write(&probe, b"").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    ok
+}
+
 #[cfg(not(target_os = "macos"))]
 fn install_base() -> Option<&'static PathBuf> {
     static PROBED: OnceLock<Option<PathBuf>> = OnceLock::new();
@@ -50,13 +79,7 @@ fn install_base() -> Option<&'static PathBuf> {
             let dir = std::env::current_exe()
                 .ok()
                 .and_then(|exe| exe.parent().map(PathBuf::from))?;
-            if std::fs::create_dir_all(&dir).is_err() {
-                return None;
-            }
-            let probe = dir.join(".quietmusic-write-probe");
-            let ok = std::fs::write(&probe, b"").is_ok();
-            let _ = std::fs::remove_file(&probe);
-            ok.then_some(dir)
+            probe_writable(&dir).then_some(dir)
         })
         .as_ref()
 }
@@ -66,8 +89,41 @@ fn install_base() -> Option<&'static PathBuf> {
     None
 }
 
+/// 便携开关判定：`env` 是 [`PORTABLE_ENV`] 的取值（`None` = 未设置）。
+///
+/// 环境变量优先于标记文件，好处是「同一份安装包，临时用环境变量试一次」不必
+/// 到处放文件；写错的取值不报错、静默回到看标记文件 —— 这个开关不值得让启动失败。
+fn portable_enabled_in(dir: &std::path::Path, env: Option<&str>) -> bool {
+    match env.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("1" | "true" | "yes" | "on") => return true,
+        Some("0" | "false" | "no" | "off") => return false,
+        _ => {}
+    }
+    dir.join(PORTABLE_FLAG_FILE).is_file()
+}
+
+/// 便携数据根（= exe 目录）；未开便携或安装目录不可写时 `None`。
+///
+/// 结果来自 [`install_base`]（已带可写探测与 `OnceLock` 缓存），所以这里不再
+/// 单独探一次：同一次运行里「日志挂在 exe 旁」与「数据挂在 exe 旁」必须同进同退。
+pub(crate) fn portable_base() -> Option<&'static PathBuf> {
+    let env = std::env::var(PORTABLE_ENV).ok();
+    install_base().filter(|dir| portable_enabled_in(dir, env.as_deref()))
+}
+
+/// 当前是否处于便携模式（设置页 / 诊断包展示用）。
+pub(crate) fn is_portable() -> bool {
+    portable_base().is_some()
+}
+
 /// 应用数据根目录；首次调用时顺带完成旧名目录迁移（幂等，仅 Windows）。
 pub(crate) fn data_root<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> PathBuf {
+    // 便携模式：数据根 = exe 目录，整包拷走就能用。必须排在 `%APPDATA%` 与旧名
+    // 迁移之前 —— 便携版自带数据，不该去动本机用户目录里的老库。
+    if let Some(base) = portable_base() {
+        let _ = std::fs::create_dir_all(base.join("data"));
+        return base.clone();
+    }
     #[cfg(target_os = "windows")]
     {
         let base = std::env::var_os("APPDATA")
@@ -153,4 +209,79 @@ fn cache_base<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> PathBuf {
     app.path()
         .app_cache_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 独立临时目录（并行测试不撞名；用完删）
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("qm-app-paths-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        dir
+    }
+
+    /// exe 同目录有 `portable.txt` → 便携
+    #[test]
+    fn portable_flag_file_opens_portable_mode() {
+        let dir = temp_dir("flag");
+        assert!(!portable_enabled_in(&dir, None), "没有标记文件不该是便携");
+        std::fs::write(dir.join(PORTABLE_FLAG_FILE), b"").expect("写标记");
+        assert!(portable_enabled_in(&dir, None));
+        // 目录（而不是文件）不算标记：别让同名目录误开便携
+        let other = temp_dir("flag-dir");
+        std::fs::create_dir_all(other.join(PORTABLE_FLAG_FILE)).expect("建同名目录");
+        assert!(!portable_enabled_in(&other, None));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other);
+    }
+
+    /// 环境变量优先于标记文件，取值不合法时回到看标记
+    #[test]
+    fn portable_env_overrides_flag() {
+        let dir = temp_dir("env");
+        // 没标记文件，环境变量打开
+        for on in ["1", "true", "YES", " on "] {
+            assert!(portable_enabled_in(&dir, Some(on)), "{on:?} 应开启便携");
+        }
+        std::fs::write(dir.join(PORTABLE_FLAG_FILE), b"").expect("写标记");
+        // 有标记文件，环境变量关闭
+        for off in ["0", "false", "No", "off"] {
+            assert!(!portable_enabled_in(&dir, Some(off)), "{off:?} 应关闭便携");
+        }
+        // 认不出来的取值不打断启动，回到标记文件口径
+        for junk in ["", "maybe", "2"] {
+            assert!(portable_enabled_in(&dir, Some(junk)), "{junk:?} 应回落标记文件");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 探针会建目录、真写一次就删掉；建不出来的路径返回 false
+    #[test]
+    fn probe_writable_checks_real_write() {
+        let dir = temp_dir("probe");
+        let nested = dir.join("a").join("b");
+        assert!(probe_writable(&nested), "新目录应可写");
+        assert!(nested.is_dir());
+        assert!(
+            !nested.join(".quietmusic-write-probe").exists(),
+            "探针必须删掉"
+        );
+        // 父路径是个文件 → 目录建不出来 → false（而不是 panic）
+        let blocked = dir.join("blocker");
+        std::fs::write(&blocked, b"").expect("写阻塞文件");
+        assert!(!probe_writable(&blocked.join("child")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 未开便携时不认 exe 目录；明确关掉时即便有标记文件也不是便携
+    #[test]
+    fn portable_base_requires_flag() {
+        // 测试进程的 exe 目录里不会有 portable.txt，也没有环境变量覆盖
+        if std::env::var(PORTABLE_ENV).is_err() {
+            assert!(!is_portable(), "干净环境不该判定为便携");
+        }
+    }
 }

@@ -478,6 +478,302 @@ pub async fn cmd_preview_library_organization(
     .map_err(|e| format!("生成整理预览失败：{e}"))?
 }
 
+// ---------------- 整理执行 + 撤销（A11） ----------------
+//
+// 预览是只读的，这里才真动文件。三条硬规矩：
+// 1. **先落撤销清单再搬文件**：搬一半崩了，重启后照样能撤（清单只保留最近一次）；
+// 2. 只搬预览里 `ready` 的项，`blocked` / `unchanged` 一概不碰；
+// 3. 文件搬成功但库没跟上就把文件搬回去，不留「文件在新位置、库里还在旧位置」的半截状态。
+
+/// 撤销清单文件名（应用数据根目录下）。只保留最近一次整理。
+const UNDO_FILE: &str = "organize-undo.json";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UndoMove {
+    source: String,
+    target: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UndoFile {
+    /// epoch 毫秒
+    at: i64,
+    moves: Vec<UndoMove>,
+}
+
+/// 一条搬失败的原因（逐条回报，不整批回滚）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizeFailure {
+    source: String,
+    target: String,
+    message: String,
+}
+
+/// 整理执行结果。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizeOutcome {
+    moved: usize,
+    blocked: usize,
+    unchanged: usize,
+    failed: Vec<OrganizeFailure>,
+    undo_available: bool,
+}
+
+/// 撤销清单的概要（前端用来决定要不要显示「撤销上次整理」）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizeUndoState {
+    /// epoch 毫秒
+    at: i64,
+    count: usize,
+}
+
+/// 撤销结果。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrganizeUndoOutcome {
+    restored: usize,
+    failed: Vec<OrganizeFailure>,
+}
+
+fn undo_file_path(dir: &Path) -> PathBuf {
+    dir.join(UNDO_FILE)
+}
+
+fn read_undo(dir: &Path) -> Option<UndoFile> {
+    let raw = fs::read(undo_file_path(dir)).ok()?;
+    let parsed: UndoFile = serde_json::from_slice(&raw).ok()?;
+    (!parsed.moves.is_empty()).then_some(parsed)
+}
+
+/// 原子写：先写 `.json.tmp` 再 `rename`，中途崩掉不会留下半个 JSON。
+fn write_undo(dir: &Path, undo: &UndoFile) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|e| format!("创建数据目录失败：{e}"))?;
+    let path = undo_file_path(dir);
+    let tmp = path.with_extension("json.tmp");
+    let json = serde_json::to_vec_pretty(undo).map_err(|e| format!("写入撤销记录失败：{e}"))?;
+    fs::write(&tmp, json).map_err(|e| format!("写入撤销记录失败：{e}"))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("写入撤销记录失败：{e}"))
+}
+
+fn clear_undo(dir: &Path) {
+    let _ = fs::remove_file(undo_file_path(dir));
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// 搬一个文件：同盘 `rename` 最快也最原子；跨盘（EXDEV）退化成复制 + 删源。
+fn move_file(source: &Path, target: &Path) -> Result<(), String> {
+    if target.exists() {
+        return Err("目标位置已存在同名文件".into());
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建目标文件夹失败：{e}"))?;
+    }
+    match fs::rename(source, target) {
+        Ok(()) => Ok(()),
+        Err(rename_err) => {
+            fs::copy(source, target).map_err(|e| format!("移动失败：{rename_err}；复制也失败：{e}"))?;
+            fs::remove_file(source).map_err(|e| format!("已复制到新位置，但原文件删不掉：{e}"))?;
+            Ok(())
+        }
+    }
+}
+
+/// 按 `ready` 清单搬文件，`sync` 负责把库里那条记录挪到新路径。
+/// 清单先落盘再动手；全部失败时把清单清掉（没什么可撤的）。
+fn apply_moves<F>(moves: &[UndoMove], undo_dir: &Path, mut sync: F) -> OrganizeOutcome
+where
+    F: FnMut(&str, &str) -> Result<(), String>,
+{
+    let mut outcome = OrganizeOutcome {
+        moved: 0,
+        blocked: 0,
+        unchanged: 0,
+        failed: Vec::new(),
+        undo_available: false,
+    };
+    if moves.is_empty() {
+        return outcome;
+    }
+    let at = now_ms();
+    // 先写「计划清单」：只要开始搬，就必须有据可撤。
+    if let Err(e) = write_undo(
+        undo_dir,
+        &UndoFile {
+            at,
+            moves: moves.to_vec(),
+        },
+    ) {
+        for m in moves {
+            outcome.failed.push(OrganizeFailure {
+                source: m.source.clone(),
+                target: m.target.clone(),
+                message: format!("写不了撤销记录，为安全起见没有移动：{e}"),
+            });
+        }
+        return outcome;
+    }
+    let mut done: Vec<UndoMove> = Vec::new();
+    for m in moves {
+        let source = PathBuf::from(&m.source);
+        let target = PathBuf::from(&m.target);
+        if let Err(e) = move_file(&source, &target) {
+            outcome.failed.push(OrganizeFailure {
+                source: m.source.clone(),
+                target: m.target.clone(),
+                message: e,
+            });
+            continue;
+        }
+        if let Err(e) = sync(&m.source, &m.target) {
+            // 文件已在新位置、库没跟上：搬回去，保持两边一致。
+            let back = move_file(&target, &source)
+                .err()
+                .map(|rollback| format!("；回退也失败：{rollback}"))
+                .unwrap_or_default();
+            outcome.failed.push(OrganizeFailure {
+                source: m.source.clone(),
+                target: m.target.clone(),
+                message: format!("更新曲库失败：{e}{back}"),
+            });
+            continue;
+        }
+        done.push(m.clone());
+        outcome.moved += 1;
+    }
+    if done.is_empty() {
+        clear_undo(undo_dir);
+    } else {
+        // 只留下真搬成功的项，撤销时才不会去搬没搬过的文件。
+        let _ = write_undo(
+            undo_dir,
+            &UndoFile {
+                at,
+                moves: done,
+            },
+        );
+        outcome.undo_available = true;
+    }
+    outcome
+}
+
+/// 撤销上一次整理：倒序搬回原位置并同步库。返回恢复条数与逐条失败原因。
+fn undo_moves<F>(undo_dir: &Path, mut sync: F) -> Result<OrganizeUndoOutcome, String>
+where
+    F: FnMut(&str, &str) -> Result<(), String>,
+{
+    let Some(state) = read_undo(undo_dir) else {
+        return Err("没有可撤销的整理记录".into());
+    };
+    let mut restored = 0usize;
+    let mut failed = Vec::new();
+    let mut remaining: Vec<UndoMove> = Vec::new();
+    for m in state.moves.iter().rev() {
+        let target = PathBuf::from(&m.target);
+        let source = PathBuf::from(&m.source);
+        let reason = if !target.is_file() {
+            Some("撤销时目标位置已找不到文件".to_string())
+        } else if source.exists() {
+            Some("原位置已被别的文件占用".to_string())
+        } else {
+            move_file(&target, &source)
+                .and_then(|()| sync(&m.target, &m.source))
+                .err()
+        };
+        match reason {
+            None => restored += 1,
+            Some(message) => {
+                failed.push(OrganizeFailure {
+                    source: m.source.clone(),
+                    target: m.target.clone(),
+                    message,
+                });
+                remaining.push(m.clone());
+            }
+        }
+    }
+    if remaining.is_empty() {
+        clear_undo(undo_dir);
+    } else {
+        write_undo(
+            undo_dir,
+            &UndoFile {
+                at: state.at,
+                moves: remaining,
+            },
+        )?;
+    }
+    Ok(OrganizeUndoOutcome { restored, failed })
+}
+
+#[tauri::command(rename = "apply_library_organization")]
+pub async fn cmd_apply_library_organization(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    destination: String,
+) -> Result<OrganizeOutcome, String> {
+    let db = state.db.clone().ok_or("数据库不可用")?;
+    let undo_dir = crate::app_paths::data_root(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        // 不信任前端传来的条目：重新算一次预览，只搬现在就 ready 的。
+        let files = db.with(library_files)?;
+        let preview = organize_preview(files, &PathBuf::from(&destination))?;
+        let moves: Vec<UndoMove> = preview
+            .entries
+            .iter()
+            .filter(|entry| entry.status == "ready")
+            .map(|entry| UndoMove {
+                source: entry.source.clone(),
+                target: entry.target.clone(),
+            })
+            .collect();
+        let mut outcome = apply_moves(&moves, &undo_dir, |from, to| {
+            db.with(|conn| crate::db::store::relocate_local_track(conn, from, to))
+                .map(|_| ())
+        });
+        outcome.blocked = preview.blocked;
+        outcome.unchanged = preview.unchanged;
+        Ok(outcome)
+    })
+    .await
+    .map_err(|e| format!("整理失败：{e}"))?
+}
+
+#[tauri::command(rename = "undo_library_organization")]
+pub async fn cmd_undo_library_organization(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<OrganizeUndoOutcome, String> {
+    let db = state.db.clone().ok_or("数据库不可用")?;
+    let undo_dir = crate::app_paths::data_root(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        undo_moves(&undo_dir, |from, to| {
+            db.with(|conn| crate::db::store::relocate_local_track(conn, from, to))
+                .map(|_| ())
+        })
+    })
+    .await
+    .map_err(|e| format!("撤销整理失败：{e}"))?
+}
+
+#[tauri::command(rename = "library_organize_undo_state")]
+pub fn cmd_library_organize_undo_state(app: tauri::AppHandle) -> Option<OrganizeUndoState> {
+    read_undo(&crate::app_paths::data_root(&app)).map(|undo| OrganizeUndoState {
+        at: undo.at,
+        count: undo.moves.len(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -615,5 +911,139 @@ mod tests {
         assert_eq!(safe_component("a/b\\c:*", "fallback"), "a_b_c__");
         assert_eq!(safe_component("  title. ", "fallback"), "title");
         assert!(organize_preview(vec![], Path::new("relative")).is_err());
+    }
+    // ---- A11 整理执行 / 撤销（文件搬运部分；库同步用闭包替身） ----
+
+    fn ready_moves(preview: &OrganizePreview) -> Vec<UndoMove> {
+        preview
+            .entries
+            .iter()
+            .filter(|entry| entry.status == "ready")
+            .map(|entry| UndoMove {
+                source: entry.source.clone(),
+                target: entry.target.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn apply_moves_the_file_and_leaves_an_undo_record() {
+        let temp = Temp::new();
+        let dest = temp.0.join("out");
+        fs::create_dir(&dest).unwrap();
+        let a = temp.file("a.flac", b"alpha");
+        let preview = organize_preview(vec![a.clone()], &dest).unwrap();
+        assert_eq!(preview.ready, 1);
+        let moves = ready_moves(&preview);
+
+        let mut synced: Vec<(String, String)> = Vec::new();
+        let dir = temp.0.join("data");
+        let outcome = apply_moves(&moves, &dir, |from, to| {
+            synced.push((from.to_string(), to.to_string()));
+            Ok(())
+        });
+        assert_eq!(outcome.moved, 1);
+        assert!(outcome.failed.is_empty());
+        assert!(outcome.undo_available);
+        assert_eq!(synced, vec![(a.path.clone(), moves[0].target.clone())]);
+        assert!(!Path::new(&a.path).exists(), "源文件应该已经搬走");
+        let target = Path::new(&moves[0].target);
+        assert_eq!(fs::read(target).unwrap(), b"alpha");
+
+        let undo = read_undo(&dir).expect("应该有撤销记录");
+        assert_eq!(undo.moves.len(), 1);
+        assert_eq!(undo.moves[0].source, a.path);
+        assert_eq!(undo.moves[0].target, moves[0].target);
+    }
+
+    #[test]
+    fn undo_moves_everything_back_then_forgets_itself() {
+        let temp = Temp::new();
+        let dest = temp.0.join("out");
+        fs::create_dir(&dest).unwrap();
+        let a = temp.file("a.flac", b"alpha");
+        let preview = organize_preview(vec![a.clone()], &dest).unwrap();
+        let moves = ready_moves(&preview);
+        let dir = temp.0.join("data");
+        let outcome = apply_moves(&moves, &dir, |_, _| Ok(()));
+        assert_eq!(outcome.moved, 1);
+
+        let mut synced: Vec<(String, String)> = Vec::new();
+        let undo = undo_moves(&dir, |from, to| {
+            synced.push((from.to_string(), to.to_string()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(undo.restored, 1);
+        assert!(undo.failed.is_empty());
+        assert_eq!(synced, vec![(moves[0].target.clone(), a.path.clone())]);
+        assert_eq!(fs::read(&a.path).unwrap(), b"alpha", "文件应该回到原位置");
+        assert!(!Path::new(&moves[0].target).exists());
+        assert!(read_undo(&dir).is_none(), "撤销成功后清单要清掉");
+        assert!(undo_moves(&dir, |_, _| Ok(())).is_err(), "没有清单时撤销要报错");
+    }
+
+    #[test]
+    fn apply_skips_vanished_sources_and_keeps_going() {
+        let temp = Temp::new();
+        let dest = temp.0.join("out");
+        fs::create_dir(&dest).unwrap();
+        let a = temp.file("a.flac", b"alpha");
+        // 两首文件名不同、标题也得不同，否则预览会把它们判成「映射到同一目标」
+        let mut b = temp.file("b.flac", b"beta");
+        b.title = "另一首歌".into();
+        let preview = organize_preview(vec![a.clone(), b.clone()], &dest).unwrap();
+        assert_eq!(preview.ready, 2);
+        let mut moves = ready_moves(&preview);
+        // 预览之后源文件被别人删了：一条失败，另一条照搬
+        fs::remove_file(&b.path).unwrap();
+        moves.sort_by(|x, y| x.source.cmp(&y.source));
+        let dir = temp.0.join("data");
+        let outcome = apply_moves(&moves, &dir, |_, _| Ok(()));
+        assert_eq!(outcome.moved, 1);
+        assert_eq!(outcome.failed.len(), 1);
+        assert!(outcome.failed[0].message.contains("目标位置已存在")
+            || outcome.failed[0].message.contains("移动失败")
+            || outcome.failed[0].message.contains("复制也失败"));
+        assert!(outcome.undo_available);
+        assert_eq!(read_undo(&dir).unwrap().moves.len(), 1, "撤销记录只留真搬成功的");
+    }
+
+    #[test]
+    fn apply_rolls_the_file_back_when_the_library_cannot_follow() {
+        let temp = Temp::new();
+        let dest = temp.0.join("out");
+        fs::create_dir(&dest).unwrap();
+        let a = temp.file("a.flac", b"alpha");
+        let preview = organize_preview(vec![a.clone()], &dest).unwrap();
+        let moves = ready_moves(&preview);
+        let dir = temp.0.join("data");
+        let outcome = apply_moves(&moves, &dir, |_, _| Err("库被锁住了".into()));
+        assert_eq!(outcome.moved, 0);
+        assert_eq!(outcome.failed.len(), 1);
+        assert!(outcome.failed[0].message.contains("库被锁住了"));
+        assert!(outcome.failed[0].message.contains("更新曲库失败"));
+        assert_eq!(fs::read(&a.path).unwrap(), b"alpha", "库没跟上就要把文件搬回去");
+        assert!(!Path::new(&moves[0].target).exists());
+        assert!(!outcome.undo_available);
+        assert!(read_undo(&dir).is_none(), "没有真搬成功的，清单要清掉");
+    }
+
+    #[test]
+    fn apply_refuses_to_move_anything_when_the_undo_record_cannot_be_written() {
+        let temp = Temp::new();
+        let dest = temp.0.join("out");
+        fs::create_dir(&dest).unwrap();
+        let a = temp.file("a.flac", b"alpha");
+        let preview = organize_preview(vec![a.clone()], &dest).unwrap();
+        let moves = ready_moves(&preview);
+        // 用一个「文件」当数据目录：create_dir_all 必然失败
+        let blocked = temp.0.join("not-a-dir");
+        fs::write(&blocked, b"x").unwrap();
+        let outcome = apply_moves(&moves, &blocked, |_, _| Ok(()));
+        assert_eq!(outcome.moved, 0);
+        assert_eq!(outcome.failed.len(), 1);
+        assert!(outcome.failed[0].message.contains("写不了撤销记录"));
+        assert_eq!(fs::read(&a.path).unwrap(), b"alpha", "没有撤销记录就不许动文件");
     }
 }

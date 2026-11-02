@@ -10,6 +10,16 @@ use serde::{Deserialize, Serialize};
 /// `Track.id` 即音频文件绝对路径（DESIGN §13），不参与在线取链。
 pub const LOCAL_SOURCE: &str = "local";
 
+/// 保留音源 id：**播客单集**（B9）。
+///
+/// 与 [`LOCAL_SOURCE`] 同性质——它代表宿主自带的「播客订阅」能力，不是在线音源包：
+/// `Track.id` 就是 RSS 里 `<enclosure>` 给的音频直链，播放时由
+/// `audio/engine.rs` 直接当在线流打开，**不经过音源脚本取链**、不进熔断与黑名单。
+///
+/// 之所以要单独一个值而不是复用 `local`：播客要边播边缓存（range_reader），
+/// 而且绝不能因为一次取链失败把用户订阅的节目拉黑。
+pub const PODCAST_SOURCE: &str = "podcast";
+
 /// 音源 id。
 ///
 /// **宿主不持有在线音源清单**（音源包全面开放）：有哪些在线音源、各自的线路、
@@ -62,6 +72,11 @@ impl SourceId {
     /// 本地曲目 id。
     pub fn local() -> Self {
         Self(LOCAL_SOURCE.to_string())
+    }
+
+    /// 是否播客单集（[`PODCAST_SOURCE`]，大小写不敏感，理由同 `is_local`）。
+    pub fn is_podcast(&self) -> bool {
+        self.0.eq_ignore_ascii_case(PODCAST_SOURCE)
     }
 }
 

@@ -158,6 +158,9 @@ pub enum AudioCmd {
     SetEq(EqParams),
     /// 响度归一化开关（设置页「音效」）。
     SetLoudNorm(bool),
+    /// ReplayGain 静态增益模式（关闭 / 单曲 / 专辑，A1）。切模式会立刻按当前
+    /// 曲目重算增益，正在播的那首当场变响度。
+    SetReplayGain(crate::audio::ReplayGainMode),
     /// 淡入淡出参数（设置页「音效」）。
     SetFade(FadeParams),
     /// 播放条频谱背景开关：开 = DspSource 采样做 FFT 推 `spectrum` 事件。
@@ -673,6 +676,8 @@ pub const SETTING_GAPLESS: &str = "playback.gapless";
 const SETTING_SPEED: &str = "playback.speed";
 const SETTING_FX_EQ: &str = "fx.eq";
 const SETTING_FX_LOUDNORM: &str = "fx.loudnorm";
+/// ReplayGain 静态增益模式：off / track / album（A1）
+const SETTING_FX_REPLAYGAIN: &str = "fx.replaygain";
 const SETTING_FX_FADE: &str = "fx.fade";
 const SETTING_FX_SPECTRUM: &str = "fx.spectrum";
 
@@ -915,6 +920,15 @@ fn run_engine(deps: EngineDeps) {
         }
         if let Some(raw) = load(SETTING_FX_LOUDNORM) {
             inner.fx.set_loudnorm(raw.trim() == "true");
+        }
+        // ReplayGain：先恢复模式，再把整张「键 → 增益」表灌进内存
+        // （音频线程查表，不碰数据库）
+        crate::audio::replay_gain::set_mode(crate::audio::ReplayGainMode::from_setting(
+            load(SETTING_FX_REPLAYGAIN).unwrap_or_default().as_str(),
+        ));
+        match db.with(crate::audio::replay_gain::reload) {
+            Ok(total) => log::debug!("[fx] ReplayGain 表已装载：{total} 首带增益"),
+            Err(e) => log::warn!("[fx] ReplayGain 表装载失败: {e}"),
         }
         if let Some(raw) = load(SETTING_FX_SPECTRUM) {
             inner.fx.set_spectrum(raw.trim() == "true");
@@ -1402,6 +1416,8 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             inner.current_progress = None;
             inner.pause_deadline = None;
             inner.fx.clear_fade();
+            // 没歌在播了，静态增益回中性（下次挂载时再按曲目设）
+            inner.fx.set_static_gain(1.0);
             *inner.cache_file.lock().unwrap_or_else(|e| e.into_inner()) = None;
             inner.mutate(|st| {
                 st.status = PlaybackStatus::Stopped;
@@ -1541,6 +1557,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             inner.current_progress = None;
             inner.pause_deadline = None;
             inner.fx.clear_fade();
+            inner.fx.set_static_gain(1.0);
             *inner.cache_file.lock().unwrap_or_else(|e| e.into_inner()) = None;
             {
                 let mut q = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
@@ -1749,6 +1766,22 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                 let val = if on { "true" } else { "false" };
                 if let Err(e) = db.with(|c| store::set_setting(c, SETTING_FX_LOUDNORM, val)) {
                     log::warn!("[db] 响度归一化设置入库失败: {e}");
+                }
+            }
+        }
+        AudioCmd::SetReplayGain(mode) => {
+            crate::audio::replay_gain::set_mode(mode);
+            // 立刻按当前曲目重算：正在播的那首当场变响度，不用等下一首
+            let current = inner.state.read().ok().and_then(|st| st.track.clone());
+            match current {
+                Some(track) => apply_replay_gain(inner, &track),
+                None => inner.fx.set_static_gain(1.0),
+            }
+            if let Some(db) = &inner.db {
+                if let Err(e) =
+                    db.with(|c| store::set_setting(c, SETTING_FX_REPLAYGAIN, mode.as_setting()))
+                {
+                    log::warn!("[db] ReplayGain 模式入库失败: {e}");
                 }
             }
         }
@@ -2448,6 +2481,12 @@ struct ListenSession {
     counted: bool,
     /// 完播次数是否已落库
     finished_written: bool,
+    /// 会话开始时刻（unix 秒）：外部上报（A8）的 scrobble 时间戳用起播时间，
+    /// 不是「跨过阈值那一刻」——Last.fm 的语义是「什么时候听的这首」。
+    started_at: i64,
+    /// 是否已经交给外部上报。一次会话最多报一次：settle_listen 会被反复调用
+    /// （每 30 秒 / 暂停 / 结束），没有这个旗标同一首会报好几遍。
+    scrobbled: bool,
 }
 
 /// 一次结算要写进库的量（借用结束后才异步落库）。
@@ -2526,7 +2565,12 @@ impl EngineInner {
             finished: false,
             counted: false,
             finished_written: false,
+            started_at: crate::db::store::now_unix(),
+            scrobbled: false,
         });
+        // 外部上报（A8）：起播就推一次 Now Playing，好友那边能立刻看到。
+        // 只对「新会话」做，上面的同曲重载分支不重复推。
+        crate::scrobble::now_playing(self.db.clone(), track.clone());
     }
 
     /// 位置 tick 里累计收听：只有位置**在推进**时才按墙钟时间记账。
@@ -2559,7 +2603,7 @@ impl EngineInner {
     /// 可反复调用：只有没落过库的增量会被写（pending 清零、两个旗标各管一次 +1），
     /// 所以「每 30 秒落一次 + 暂停时落一次 + 结束时落最后一次」不会重复计数。
     fn settle_listen(&mut self, finished: bool, end: bool) {
-        let payload = {
+        let (payload, scrobble) = {
             let Some(s) = self.listen.as_mut() else {
                 return;
             };
@@ -2580,20 +2624,43 @@ impl EngineInner {
             } else {
                 0
             };
-            ListenSettle {
-                track: s.track.clone(),
-                listened_ms: std::mem::take(&mut s.pending_ms),
-                plays,
-                finished_plays,
-                session_ms: s.listened_ms,
-                finished: s.finished,
-            }
+            // 外部上报（A8）：与「算一次有效播放」同门槛（听满一半或 4 分钟
+            // 且至少 15 秒），跨过就交给 scrobble 队列，网络失败由它自己退避
+            // 重试，绝不阻塞引擎线程。
+            let scrobble = if !s.scrobbled
+                && crate::scrobble::should_scrobble(s.listened_ms, s.duration_ms)
+            {
+                s.scrobbled = true;
+                Some((s.track.clone(), s.started_at, s.duration_ms))
+            } else {
+                None
+            };
+            (
+                ListenSettle {
+                    track: s.track.clone(),
+                    listened_ms: std::mem::take(&mut s.pending_ms),
+                    plays,
+                    finished_plays,
+                    session_ms: s.listened_ms,
+                    finished: s.finished,
+                },
+                scrobble,
+            )
         };
         if end {
             self.listen = None;
         }
         if payload.listened_ms > 0 || payload.plays > 0 || payload.finished_plays > 0 {
             write_listen(self.db.clone(), payload);
+        }
+        if let Some((track, started_at, duration_ms)) = scrobble {
+            crate::scrobble::record_listen(
+                self.app.clone(),
+                self.db.clone(),
+                track,
+                started_at,
+                duration_ms,
+            );
         }
     }
 
@@ -2682,6 +2749,28 @@ impl LoadJob {
         // 顶上一首接着播。预热任务不找替身（投机加载，真点播时才值得找）；
         // 总开关关（play.localFirst=false，find_local_substitute 内部查）
         // 也直接按原样失败。
+        // 播客单集（B9）：Track.id 就是 RSS 里给出的音频直链，平台记为
+        // `podcast`（见 provider::types::PODCAST_SOURCE）。这里直接当在线流
+        // 交给 range_reader —— 边播边缓存、可 seek，正是播客需要的行为。
+        //
+        // 不走 `resolve_play_url_script`：那不是用户订阅的音源包，没有换源顺序，
+        // 也不该进熔断/黑名单（一次网络抖动就把整档节目拉黑是不可接受的）。
+        // `referer` 留空串即「不发 Referer」，直链不需要防盗链头。
+        if self.track.platform.is_podcast() && self.track.id.starts_with("http") {
+            let fetched_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            log::debug!("[queue] podcast episode track={}", self.track.id);
+            let source = PlaySource::Online {
+                url: self.track.id.clone(),
+                fetchedAt: fetched_at,
+                referer: String::new(),
+            };
+            self.build_and_dispatch(source, false, Some(fetched_at)).await;
+            return;
+        }
+
         if self.track.platform.is_local() {
             let path = crate::cue::strip_cue_suffix(&self.track.id).to_string();
             if std::path::Path::new(&path).exists() {
@@ -3207,6 +3296,8 @@ fn sync_gapless_transition(inner: &mut EngineInner) {
     if !started { return; }
     let slot = inner.preload.take().unwrap();
     let ready = slot.ready.unwrap();
+    // gapless 接力同样是换曲：把预载那首的 ReplayGain 换上（否则会沿用上一首的）
+    apply_replay_gain(inner, &slot.track);
     // The old progress handle still points at the old source's final position.
     inner.accrue_listen(content_pos_ms(inner));
     inner.settle_listen(true, true);
@@ -3248,6 +3339,17 @@ fn sync_gapless_transition(inner: &mut EngineInner) {
     spawn_cache_prune(inner);
 }
 
+/// 把这首曲目的 ReplayGain 静态增益写进共享效果参数（A1）。
+///
+/// 查的是 `audio::replay_gain` 的内存表（启动 / 扫描后整表灌入），
+/// 引擎线程不碰数据库。没标签的曲目查不到 → 1.0（不处理）。
+fn apply_replay_gain(inner: &mut EngineInner, track: &Track) {
+    let key = crate::db::store::db_track_id(track);
+    inner
+        .fx
+        .set_static_gain(crate::audio::replay_gain::gain_for(&key));
+}
+
 /// 挂载已构建好的解码器（LoadReady 到达时调用）。
 /// 网络 IO（打开流 + 首包探测）已在 blocking 线程池完成，这里只剩纯内存
 /// 操作 —— 引擎线程绝不能阻塞，否则休眠唤醒后的死连接会卡死整个控制面。
@@ -3277,6 +3379,9 @@ fn mount_decoder(
     // 倍速挂在 rodio Player 的控制链上（对 append 进来的源全局生效）；
     // DspSource 包在解码器外提供 EQ / 响度归一化 / 淡入淡出
     inner.sink.set_speed(inner.speed);
+    // ReplayGain：挂载前把这支曲子该乘的静态增益放进共享效果参数，
+    // DspSource 在下一个块边界快照到它（换曲不漏、不早）
+    apply_replay_gain(inner, track);
     let progress = Arc::new(SourceProgress::default());
     inner.sink.append(DspSource::new(
         Box::new(TrackedSource::new(decoder, Arc::clone(&progress))
