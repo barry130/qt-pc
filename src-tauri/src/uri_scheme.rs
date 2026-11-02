@@ -24,6 +24,9 @@ use serde::Serialize;
 pub const SCHEME: &str = "quietmusic";
 
 /// 注册表里给这个协议起的名字（资源管理器「打开方式」里显示）
+// 只被 registration_entries 用到，跟它同一组 cfg；非 Windows 的非 test 构建里
+// 没有调用方，不跟着条件编译就是死码（CI -D warnings）。
+#[cfg(any(windows, test))]
 const PROTOCOL_LABEL: &str = "URL:轻听链接";
 
 /// 设置页展示给用户的示例链接（真实可用，指向一个不存在的占位路径也没关系 ——

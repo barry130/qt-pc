@@ -71,7 +71,7 @@
 | `gate` | `ubuntu-latest` | 校验 tag 与 `app.config.json` 版本一致 → `pnpm install` → `pnpm test`。不过门不构建 |
 | `windows` | `windows-latest` **矩阵 x64/x86/arm64** | 原生 MSVC `--target <triple>` 构建 NSIS → ed25519 签名并自验 → 各自上传产物 |
 | `linux` | `ubuntu-22.04` | 装系统依赖 → `--bundles deb,appimage` → 上传 `.deb` / `.AppImage` |
-| `macos` | `macos-14` | `--bundles app,dmg`（不签名不公证）→ 上传 `.dmg` |
+| `macos` | `macos-15` | `--bundles app,dmg`（不签名不公证）→ 上传 `.dmg` |
 | `publish` | `ubuntu-latest` | **唯一发布点**：汇总三个 job 的产物 → 校验齐全（3 exe / 3 sig / deb / AppImage / dmg）→ 生成说明 → 建 GitHub Release |
 
 三个 Windows 架构用**原生 MSVC 目标**并行构建（`x86_64-pc-windows-msvc` /
@@ -194,7 +194,7 @@ $r.assets | ForEach-Object { "$($_.name)`t$($_.size)`t$($_.browser_download_url)
 面向国内用户时，后台填的 downloadUrl 建议用 **CNB** 的
 `https://cnb.cool/canace/qt-pc/-/releases/download/<tag>/<文件名>`。
 
-> macOS 说明：CI 只出 **arm64** 的 dmg（`macos-14` 是 Apple Silicon 运行器）。
+> macOS 说明：CI 只出 **arm64** 的 dmg（`macos-15` 是 Apple Silicon 运行器）。
 > Intel 的 `_x64.dmg` 需要在 Intel Mac 上本地 `pnpm tauri build --target x86_64-apple-darwin --bundles dmg`
 > 打出后手动上传。deb 是 glibc 构建，装在较老的发行版上可能报缺 `GLIBC_2.32` 一类的错。
 
@@ -362,7 +362,7 @@ tauri 在既无 `APPLE_CERTIFICATE` / `APPLE_CERTIFICATE_PASSWORD` 又无 `signi
 其余能力与 Windows 对齐：系统媒体控制走 macOS 的「正在播放」（souvlaki 原生后端，无需额外
 feature）、托盘、开机自启（LaunchAgent）、全局快捷键均可用；同样**没有应用内自装**。
 
-**架构覆盖**：`release.yml` 的 `macos` job 跑在 `macos-14`（Apple Silicon）上，
+**架构覆盖**：`release.yml` 的 `macos` job 跑在 `macos-15`（Apple Silicon）上，
 **CI 只产 `_aarch64.dmg`**；Intel 机器需要的 `_x64.dmg` 要在 Intel Mac 上本地执行
 上面的构建命令自行产出。
 

@@ -244,11 +244,11 @@ jobs:
           retention-days: 7
 
   # ---------- macOS：dmg（无签名 / 无公证） ----------
-  # 产物是 arm64（macos-14 是 Apple Silicon 运行器）。Intel x64 的 dmg 需在
+  # 产物是 arm64（macos-15 是 Apple Silicon 运行器）。Intel x64 的 dmg 需在
   # Intel 机器上本地打包，CI 不产。
   macos:
     name: macOS dmg（无公证，arm64）
-    runs-on: macos-14
+    runs-on: macos-15
     needs: gate
     steps:
       - uses: actions/checkout@v4

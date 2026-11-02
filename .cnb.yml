@@ -15,7 +15,7 @@
 # （aws-lc-sys 的 C 代码在 x86/arm64 上分别要走 GNU clang 与 clang-cl 两种驱动模式）。
 #
 # 现在统一由 GitHub Actions 构建（.github/workflows/release.yml）：
-# windows-latest / ubuntu-22.04 / macos-14 都是原生 runner，不需要交叉编译，
+# windows-latest / ubuntu-22.04 / macos-15 都是原生 runner，不需要交叉编译，
 # 三个 Windows 架构还能并行出包，比串行交叉编译快得多。CNB 这条流水线退化成
 # 「等 GitHub → 下载 → 建 Release → 传附件」，构建节点只需 node + curl。
 #

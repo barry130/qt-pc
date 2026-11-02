@@ -61,6 +61,9 @@ pub(crate) const PORTABLE_ENV: &str = "QUIETMUSIC_PORTABLE";
 ///
 /// 「目录已存在」不等于可写：Program Files、AppImage 的只读挂载、`/usr/bin`
 /// 都可能建得出来却在写入时才被拒，所以必须真落一个字节。
+// cfg 门与唯一的普通调用方 install_base() 对齐（macOS 上它不存在），单测也用。
+// macOS 的非 test 构建里没有调用方，不跟着条件编译就是死码（CI -D warnings）。
+#[cfg(any(not(target_os = "macos"), test))]
 fn probe_writable(dir: &std::path::Path) -> bool {
     if std::fs::create_dir_all(dir).is_err() {
         return false;
