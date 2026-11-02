@@ -225,6 +225,49 @@ export interface MyPlaylistSummary {
   updatedAt: number;
   /** 是否本地自建（可改名/删除）；false = 云端同步卡片（「移除」= 取消收藏） */
   isLocal: boolean;
+  /** 是否智能歌单（A5）：曲目按规则现算，不存成员，不能手动增删 */
+  isSmart?: boolean;
+}
+
+/** 智能歌单的一条规则，对齐 Rust `SmartRule`（A5，对照分析文档 §4.5） */
+export interface SmartRule {
+  /**
+   * 字段：
+   * - 文本：`title` / `singer` / `album` / `genre` / `format`
+   * - 数字：`year` / `bitrate`（kbps）/ `duration`（秒）/ `playCount` / `rating`
+   * - 天数：`lastPlayed` / `added`
+   * - 布尔：`liked`
+   */
+  field: string;
+  /**
+   * 运算符，按字段类型取：
+   * - 文本：`contains` / `not_contains` / `is` / `is_not`
+   * - 数字：`gte` / `lte` / `eq`
+   * - 天数：`within`（最近 N 天内）/ `older_than`（超过 N 天）
+   * - 布尔：`is`（值 `true` / `false`）
+   */
+  op: string;
+  /** 值一律按字符串传，后端按字段类型解析；解析不了就忽略这条规则 */
+  value: string;
+}
+
+/** 智能歌单规则集合：一层 AND / OR，不做嵌套 */
+export interface SmartRules {
+  /** true = 所有条件都满足（AND）；false = 满足任意一条（OR） */
+  matchAll: boolean;
+  rules: SmartRule[];
+}
+
+/** 智能歌单元信息，对齐 Rust `SmartPlaylistMeta` */
+export interface SmartPlaylistMeta {
+  pid: string;
+  name: string;
+  rules: SmartRules;
+  /** 最多返回多少首；null = 不限 */
+  limit: number | null;
+  /** 排序键：added_desc / added_asc / title / singer / album / play_count / last_played / rating / random */
+  sort: string;
+  updatedAt: number;
 }
 
 /** 对齐 Rust `PlayUrl` */
@@ -580,6 +623,40 @@ export interface AppVersion {
   versionCode: number;
 }
 
+/** 数据目录快照（对齐 Rust AppPathsView，§8.2 便携模式） */
+export interface AppPaths {
+  /** exe 同目录有 `portable.txt`（或 `QUIETMUSIC_PORTABLE=1`）时为 true */
+  portable: boolean;
+  /** 数据根：`data/music.db`、`source-bundle/`、歌单封面都在其下 */
+  dataRoot: string;
+  /** 播放缓存根 */
+  cacheRoot: string;
+  /** 日志目录（未启用文件日志时是默认落点） */
+  logsRoot: string;
+}
+
+/** `quietmusic://` 注册状态（对齐 Rust UriSchemeState，§4.13 / B4） */
+export interface UriSchemeState {
+  /** 当前平台是否支持注册（只有 Windows） */
+  supported: boolean;
+  /** 注册表里的四条记录是否与当前 exe 一致 */
+  registered: boolean;
+  /** 设置页展示的示例链接 */
+  example: string;
+}
+
+/** 诊断包（对齐 Rust DiagnosticBundleView，§18 / B8） */
+export interface DiagnosticBundle {
+  /** 建议文件名（喂给「另存为」的默认名） */
+  fileName: string;
+  /** zip 内容的 base64（不含 `data:` 前缀） */
+  base64: string;
+  /** 条目数（含 README / summary / settings） */
+  files: number;
+  /** 字节数 */
+  bytes: number;
+}
+
 /** 桌面歌词窗口状态（对齐 Rust LyricWindowState，§4.2） */
 export interface DesktopLyricState {
   visible: boolean;
@@ -666,6 +743,8 @@ export interface FxState {
   fade: FadeParams;
   /** 播放条频谱背景（引擎侧 FFT 推 spectrum 事件，前端画方块） */
   spectrum: boolean;
+  /** ReplayGain 静态增益模式（A1）：off / track / album */
+  replayGain: "off" | "track" | "album";
 }
 
 /** 缓存统计：audio = 播放流缓存，web = 网页缓存（WebView2 封面/脚本等可再生内容） */
@@ -821,4 +900,87 @@ export interface AiLocalTestResult {
   elapsedMs: number;
   reply: string | null;
   error: string | null;
+}
+
+// ---------- 外部收听上报（A8）：Last.fm / ListenBrainz ----------
+
+/** 最近一条队列记录（设置页「最近上报」列表） */
+export interface ScrobbleRecentView {
+  /** `lastfm` | `listenbrainz` */
+  target: string;
+  artist: string;
+  title: string;
+  /** unix 秒 */
+  playedAt: number;
+}
+
+/** 上报队列概览 */
+export interface ScrobbleQueueView {
+  pending: number;
+  sent: number;
+  /** 放弃重试的条数（鉴权类错误 / 超过重试上限） */
+  dead: number;
+  lastError: string | null;
+  recent: ScrobbleRecentView[];
+}
+
+/** Last.fm 连接状态 */
+export interface LastfmView {
+  connected: boolean;
+  /** 是否已填 api key / secret（连不上时先要它） */
+  hasCredentials: boolean;
+  enabled: boolean;
+  user: string;
+  /** 已拿到 token 但还没换成 session（授权页开着 / 用户没回来点完成） */
+  awaitingAuth: boolean;
+}
+
+/** ListenBrainz 连接状态 */
+export interface ListenBrainzView {
+  connected: boolean;
+  enabled: boolean;
+  user: string;
+}
+
+/** 「听歌上报」设置页一次读齐的视图 */
+export interface ScrobbleView {
+  lastfm: LastfmView;
+  listenbrainz: ListenBrainzView;
+  queue: ScrobbleQueueView;
+}
+
+/** 一次立即重试的结果 */
+export interface ScrobbleFlushOutcome {
+  sent: number;
+  retrying: number;
+  dead: number;
+  error: string | null;
+}
+
+/** 播客订阅（B9），对齐 Rust `podcast::PodcastShow`（serde camelCase） */
+export interface PodcastShow {
+  id: string;
+  url: string;
+  title: string;
+  author: string;
+  description: string;
+  image: string;
+  /** 上次成功刷新的 unix 毫秒；0 = 还没刷过 */
+  lastFetchedAt: number;
+  episodeCount: number;
+}
+
+/** 播客单集（B9），对齐 Rust `podcast::PodcastEpisode` */
+export interface PodcastEpisode {
+  id: string;
+  showId: string;
+  title: string;
+  description: string;
+  /** 音频直链：播放时它就是 `Track.id`（平台 `podcast`） */
+  audioUrl: string;
+  durationMs: number;
+  publishedAt: number;
+  played: boolean;
+  /** 上次听到哪（毫秒），起播后 seek 回去 */
+  positionMs: number;
 }

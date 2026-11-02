@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Heart, Search, Share2, X } from "lucide-react";
+import { Heart, ImageDown, Search, Share2, SlidersHorizontal, X } from "lucide-react";
 import { useNavigate } from "@tanstack/react-router";
 import { errMsg } from "@/lib/utils";
 import { filterTracks, retainTrackSelection, trackSelectionKey } from "@/lib/track-selection";
 import { DEFAULT_TRACK_SORT, parseTrackSort, sortTracks } from "@/lib/track-sort";
-import type { Chart, MyPlaylistSummary, SourceId, Track } from "@/types";
+import type { Chart, MyPlaylistSummary, SmartPlaylistMeta, SourceId, Track } from "@/types";
 import * as ipc from "@/services/ipc";
 import * as sourceApi from "@/source-scripts";
 import { qtresCoverUrl } from "@/lib/lrc";
@@ -16,10 +16,21 @@ import { ErrorRetry, TrackRowsSkeleton } from "./Skeletons";
 import { TrackSortSelect } from "@/components/TrackSortSelect";
 import { BackButton } from "@/components/layout/BackButton";
 import { IconButton } from "@/components/common/IconButton";
+import { SmartPlaylistDialog, describeRules } from "@/components/mine/SmartPlaylistDialog";
+import { PlaylistShareCard } from "@/components/player/PlaylistShareCard";
 import { useDismissOnOutside } from "@/hooks/useDismissOnOutside";
 import { toastSuccess } from "@/stores/toast";
 
-import { DetailHero, EmptyState, HeroCover, HeroEyebrow, HeroMeta, HeroPlayButton } from "@/components/ui";
+import {
+  DetailHero,
+  EmptyState,
+  HeroCover,
+  HeroEyebrow,
+  HeroMeta,
+  HeroPlayButton,
+  Modal,
+  Button,
+} from "@/components/ui";
 /**
  * 单首曲目的封面地址。在线曲目直接算 qtres:// 地址；本地曲目读音频内嵌封面
  * （Rust 转 data URL，没有则 null）。注意本地曲目也可能带 http 的 pic_url
@@ -138,6 +149,29 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
   };
   const [favorited, setFavorited] = useState(false);
   const [favoriteBusy, setFavoriteBusy] = useState(false);
+  /** 智能歌单规则（A5）：非智能歌单恒为 null */
+  const [smart, setSmart] = useState<SmartPlaylistMeta | null>(null);
+  const [smartOpen, setSmartOpen] = useState(false);
+  /** 歌单分享卡弹层（A9）：出成一张图发出去 */
+  const [shareOpen, setShareOpen] = useState(false);
+  /**
+   * 智能歌单另存为静态歌单：把「此刻规则算出来的结果」固化成一张普通歌单，
+   * 之后就能手动增删了。规则本身不动，两边互不影响 —— 这是给「想再挑几首」
+   * 的人留的出口，也是规则写坏了时的降级手段。
+   */
+  const saveAsStatic = async (): Promise<void> => {
+    setActionError(null);
+    try {
+      const pid = await ipc.saveSmartPlaylistAsStatic(id, `${name || "歌单"}（静态）`);
+      toastSuccess("已另存为静态歌单");
+      await navigate({
+        to: "/playlist/$platform/$id",
+        params: { platform: ipc.LOCAL_PLATFORM, id: pid },
+      });
+    } catch (err) {
+      setActionError(errMsg(err));
+    }
+  };
   /** 本地歌单删单的二次确认态（红心第一下只换文案，第二下才真删） */
   const [confirmDelete, setConfirmDelete] = useState(false);
 
@@ -198,6 +232,15 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
           setDescription(null);
           setPicUrl("");
           setPlayCount("");
+          // 智能歌单的「成员」不需要取：getPlaylistTracks 已在后端按规则现算，
+          // 这里只多拿一份规则，给下面那条提示条和「编辑规则」用。
+          if (summary?.isSmart === true) {
+            const meta = await ipc.getSmartPlaylist(id).catch(() => null);
+            if (cancelled) return;
+            setSmart(meta);
+          } else {
+            setSmart(null);
+          }
           // 回退链第一环：歌单自设封面（未设置 / 文件丢了都是 null）
           const own = await ipc.getPlaylistCover(id).catch(() => null);
           // 第二环：第一首曲目的封面；一首歌都没有就留给默认占位
@@ -486,6 +529,20 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
                   <Share2 className="h-4 w-4" />
                 </IconButton>
               ) : null}
+              {/* 分享卡（A9）：封面拼图 + 歌单名 + 曲目数 + 二维码，出的是图不是链接。
+                  空歌单不给点 —— 分享一张没有歌的歌单没有意义，也没封面可拼。 */}
+              {tracks.length > 0 ? (
+                <IconButton
+                  label="分享歌单卡片"
+                  variant="outline"
+                  size="lg"
+                  hover="secondary"
+                  className="h-9 w-9 rounded-lg"
+                  onClick={() => setShareOpen(true)}
+                >
+                  <ImageDown className="h-4 w-4" />
+                </IconButton>
+              ) : null}
             </div>
           </div>
 
@@ -538,6 +595,22 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
         </div>
       </DetailHero>
 
+      {/* 智能歌单提示条：曲目是规则现算出来的，不能手动增删，只能改规则 */}
+      {smart && (
+        <div className="flex flex-wrap items-center gap-2 border-b border-border/60 px-6 py-2 text-xs text-muted-foreground">
+          <SlidersHorizontal className="h-3.5 w-3.5 shrink-0" aria-hidden />
+          <span className="min-w-0 flex-1 truncate" title={describeRules(smart.rules, smart.limit)}>
+            智能歌单：{describeRules(smart.rules, smart.limit)}
+          </span>
+          <Button variant="outline" size="xs" onClick={() => setSmartOpen(true)}>
+            编辑规则
+          </Button>
+          <Button variant="ghost" size="xs" onClick={() => void saveAsStatic()}>
+            另存为静态歌单
+          </Button>
+        </div>
+      )}
+
       <div className="min-h-0 flex-1 overflow-y-auto">
         {/* 行级 / 批量操作失败的提示条：与整页加载失败分开，列表照常可用 */}
         {actionError && (
@@ -558,11 +631,37 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
             showIndex={isChart}
             showCollect
             showDownload
-            onRemove={isLocal ? (t) => void removeTrack(t) : undefined}
+            onRemove={isLocal && smart === null ? (t) => void removeTrack(t) : undefined}
             selection={{ ids: visibleSelected, onToggle: toggleSelect, onChange: setSelected }}
           />
         )}
       </div>
+
+      {shareOpen && (
+        <Modal open onClose={() => setShareOpen(false)} title="分享歌单" size="sm">
+          <div className="flex justify-center py-1">
+            <PlaylistShareCard
+              name={name}
+              tracks={sortedTracks}
+              count={tracks.length}
+              description={description ?? undefined}
+            />
+          </div>
+        </Modal>
+      )}
+
+      {smartOpen && (
+        <SmartPlaylistDialog
+          playlist={{ pid: id, name }}
+          onClose={() => setSmartOpen(false)}
+          onSaved={() => {
+            setSmartOpen(false);
+            silentRef.current = true;
+            setReload((r) => r + 1);
+          }}
+          onError={setActionError}
+        />
+      )}
     </div>
   );
 }

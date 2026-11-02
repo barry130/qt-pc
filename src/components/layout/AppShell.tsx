@@ -1,7 +1,8 @@
-import { Suspense, useEffect } from "react";
+import { Suspense, useEffect, useRef } from "react";
 import { Outlet, useLocation, useNavigate } from "@tanstack/react-router";
 import * as ipc from "@/services/ipc";
 import { ONBOARDING_KEY } from "@/lib/storageKeys";
+import { loadLocale } from "@/lib/i18n";
 import { useAuthStore } from "@/stores/auth";
 import { TitleBar } from "@/components/TitleBar";
 import { Sidebar } from "@/components/layout/Sidebar";
@@ -44,6 +45,10 @@ import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { ToastHost } from "@/components/common/ToastHost";
 import { FirstRunDisclaimer } from "@/components/common/FirstRunDisclaimer";
 import { usePageEnter } from "@/hooks/usePageEnter";
+import { useTransportKeys } from "@/hooks/useTransportKeys";
+import { useRadioRefill } from "@/hooks/useRadioRefill";
+import { useContextMenuGuard } from "@/hooks/useContextMenuGuard";
+import { ScreenReaderAnnouncer } from "@/components/layout/ScreenReaderAnnouncer";
 import { PageFallback } from "@/lib/lazyPage";
 
 /**
@@ -61,6 +66,12 @@ export function AppShell(): React.JSX.Element {
   useLocalTrackOnlineMeta();
   // 在播本地文件：内嵌封面优先于在线封面（本地优先命中时 platform 仍是原平台）
   useNowPlayingLocalMedia();
+  // 窗口内播放键（B7）：空格播放/暂停、←/→ 快退快进 10s（输入框与控件自己会处理键位时让路）
+  useTransportKeys();
+  // 私人 FM 补歌心跳（A7）：不依赖 FM 页可见，离页也照常按余量补歌
+  useRadioRefill();
+  // 右键守卫：没用处的区域不再弹浏览器原生菜单（输入框与划选文本仍放行）
+  useContextMenuGuard();
   // 外部打开（拖拽入窗 / 命令行参数 / 第二实例转发）：只挂一次，返回值只用于拖拽提示浮层
   const { dragging: externalDragging, count: externalDragCount } = useExternalOpen();
   // 数据库自愈回执：启动体检发现库损坏、已隔离重建时如实提示一次（Rust 侧取过即消失）。
@@ -107,6 +118,23 @@ export function AppShell(): React.JSX.Element {
   // 非常驻路由的入场动画（常驻页由 display 切换自然重播，见 usePageEnter）
   const enterClass = usePageEnter(pathname);
   const isPlayingPage = pathname === "/playing";
+
+  // 切页后把焦点交给内容区（B7）：否则键盘用户切页时焦点还留在侧边栏那一条上，
+  // Tab 会继续在侧边栏里走，想操作新页面得先按十几次。首次挂载不抢焦点。
+  const mainRef = useRef<HTMLElement | null>(null);
+  const firstPathRef = useRef(true);
+  useEffect(() => {
+    if (firstPathRef.current) {
+      firstPathRef.current = false;
+      return;
+    }
+    mainRef.current?.focus();
+  }, [pathname]);
+
+  // 界面语言（B6）：启动读一次已存语言；读不到就按中文，不打扰用户
+  useEffect(() => {
+    void loadLocale();
+  }, []);
 
   // 首次启动免责声明（装完第一次启动弹一次，读完 3 秒才能确认）：只读一次库
   useEffect(() => {
@@ -266,7 +294,13 @@ export function AppShell(): React.JSX.Element {
 
       <div className="relative z-10 flex min-h-0 flex-1">
         {!isPlayingPage && <Sidebar />}
-        <main className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
+        <main
+          ref={mainRef}
+          // 可编程聚焦的落点（切页后焦点回到这里，见上面的 effect）；Tab 顺序不经过它
+          tabIndex={-1}
+          aria-label="主内容"
+          className="relative min-h-0 min-w-0 flex-1 overflow-hidden outline-none"
+        >
           <div className="relative z-10 h-full">
             {/* 内容区独立边界：页面崩掉不连累侧边栏/播放条，切路由会自动重试一次 */}
             <ErrorBoundary label="内容区" resetKey={pathname}>
@@ -302,6 +336,9 @@ export function AppShell(): React.JSX.Element {
       <ErrorBoundary label="播放条">
         <PlayerBar />
       </ErrorBoundary>
+
+      {/* 读屏播报：切歌 / 暂停时把当前曲目说出来（视觉上不可见，只在读屏里响） */}
+      <ScreenReaderAnnouncer />
 
       {/* 右上角轻提示（3 秒自动消失）：批量收藏这类「做完了」的一次性回执挂这儿，
           不塞进页头把控件左右挤（用户 m09470）。挂在对话框之前，弹窗盖住它 */}

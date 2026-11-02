@@ -7,6 +7,7 @@ import {
   Clock,
   Compass,
   Download,
+  Heart,
   KeyRound,
   ListMusic,
   Music,
@@ -24,6 +25,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { usePlayerStore } from "@/stores/player";
+import { useFavoritesStore } from "@/stores/favorites";
 import * as ipc from "@/services/ipc";
 
 /**
@@ -257,6 +259,25 @@ export function CommandPalette(): React.JSX.Element | null {
         keywords: "pause 暂停",
         run: () => {
           void usePlayerStore.getState().toggle();
+        },
+      },
+      {
+        // B7 无障碍：只用键盘也要能收藏。红心按钮在播放条上，键盘用户要 Tab 十几次，
+        // 命令面板给一条直达入口；状态与播放条红心同源（bump 后一起刷新）。
+        id: "action:collect",
+        kind: "action",
+        label: "喜欢 / 取消喜欢当前曲目",
+        hint: "收藏",
+        icon: Heart,
+        keywords: "favorite like collect heart 喜欢 收藏 红心",
+        run: () => {
+          const track = usePlayerStore.getState().state?.track ?? null;
+          if (!track) return;
+          void ipc
+            .isFavorite(track)
+            .then((liked) => (liked ? ipc.removeFavorite(track) : ipc.addFavorite(track)))
+            .then(() => useFavoritesStore.getState().bump())
+            .catch(() => undefined);
         },
       },
       {

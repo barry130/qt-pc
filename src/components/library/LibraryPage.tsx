@@ -18,6 +18,7 @@ import { useTauriEvent } from "@/hooks/useTauriEvent";
 import { usePlayerStore } from "@/stores/player";
 import { TrackList } from "../discovery/TrackList";
 import { AddDirButtons } from "./AddDirButtons";
+import { TagEditDialog } from "./TagEditDialog";
 import { BatchDeleteButton } from "../common/RowActions";
 import { IconButton } from "../common/IconButton";
 import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
@@ -101,6 +102,8 @@ export function LibraryPage(): React.JSX.Element {
   const [minSecs, setMinSecs] = useState(60);
   const [skipSmall, setSkipSmall] = useState(true);
   const [minSizeMb, setMinSizeMb] = useState(1);
+  /** 文件夹监听（DESIGN R62）：扫描目录里增删文件后由 Rust 侧增量入库 */
+  const [watchOn, setWatchOn] = useState(true);
 
   const [query, setQuery] = useState("");
   const [view, setView] = useState<ViewMode>("songs");
@@ -110,6 +113,8 @@ export function LibraryPage(): React.JSX.Element {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const allRef = useRef<HTMLInputElement | null>(null);
   const [missing, setMissing] = useState<Track[]>([]);
+  /** 标签编辑弹层要处理的那批曲目（null = 关着）。单曲与批量共用一层壳。 */
+  const [tagEdit, setTagEdit] = useState<Track[] | null>(null);
   const [missingOpen, setMissingOpen] = useState(false);
   /** 扫描设置面板默认收起：扫描按钮左侧的「扫描设置」下拉展开后才显示 */
   const [scanOpen, setScanOpen] = useState(false);
@@ -151,6 +156,13 @@ export function LibraryPage(): React.JSX.Element {
     setProgress(e.payload),
   );
 
+  // 文件夹监听：Rust 侧增量入库后广播，整页重拉一次（用户看到的就是"新歌自己出现了"）
+  useTauriEvent<ipc.LibraryChangedPayload>(ipc.LIBRARY_CHANGED_EVENT, (e) => {
+    const { added, removed } = e.payload;
+    if (added === 0 && removed === 0) return;
+    void load();
+  });
+
   // 读取扫描配置（沿用 settings 表，重启后保持）
   useEffect(() => {
     void (async () => {
@@ -168,6 +180,22 @@ export function LibraryPage(): React.JSX.Element {
         /* 读不到就用默认值（60 秒 / 1 MB、开启） */
       }
     })();
+    // 文件夹监听开关单独读：它属于 Rust 侧 watcher 状态，读失败就保持默认开启
+    void ipc
+      .getLibraryWatch()
+      .then(setWatchOn)
+      .catch(() => undefined);
+  }, []);
+
+  /** 开关文件夹监听：先动 UI 再落库，失败回滚并把错误显示在列表区 */
+  const toggleWatch = useCallback(async (on: boolean): Promise<void> => {
+    setWatchOn(on);
+    try {
+      await ipc.setLibraryWatch(on);
+    } catch (err) {
+      setWatchOn(!on);
+      setError(errMsg(err));
+    }
   }, []);
 
   /** 保存扫描配置（时长 + 体积）；写库失败不影响本次扫描 */
@@ -328,6 +356,8 @@ export function LibraryPage(): React.JSX.Element {
       selection: { ids: visibleSelected, onToggle: toggleSelect, onChange: setSelected, keyOf: legacyTrackSelectionKey },
       // 行模板对齐下载管理：本地行不带封面缩略图，也不显示「已下载」标记
       plainRow: true,
+      // 右键「编辑标签…」（A2）：单曲编辑，批量走下方批量条
+      onEditTags: (track: Track) => setTagEdit([track]),
     }),
     [load, visibleSelected, toggleSelect],
   );
@@ -484,6 +514,21 @@ export function LibraryPage(): React.JSX.Element {
           </span>
         </label>
 
+        {/* 文件夹监听（A3）：扫描目录里的增删由后台自动入库，不用手动重扫 */}
+        <label className="mt-1 flex flex-wrap items-center gap-1.5 text-xs text-muted-foreground">
+          <input
+            type="checkbox"
+            checked={watchOn}
+            disabled={scanning}
+            onChange={(e) => void toggleWatch(e.target.checked)}
+            className="h-3.5 w-3.5 accent-primary"
+          />
+          扫描目录变动时自动更新曲库
+          <span className="text-muted-foreground/70">
+            （丢进这些目录的新歌自动出现，移走的曲目自动从库里清掉）
+          </span>
+        </label>
+
         {scanning && (
           <p
             className="mt-2 truncate text-xs text-muted-foreground"
@@ -614,6 +659,16 @@ export function LibraryPage(): React.JSX.Element {
             />
             {visibleSelected.size > 0 && (
               <>
+                {/* 批量改标签（A2）：只对当前可见且被选中的曲目生效 */}
+                <button
+                  type="button"
+                  onClick={() =>
+                    setTagEdit(visible.filter((t) => visibleSelected.has(t.id)))
+                  }
+                  className="rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
+                >
+                  编辑标签…
+                </button>
                 <span className="text-xs text-muted-foreground">
                   已选 {visibleSelected.size} 首
                 </span>
@@ -697,6 +752,14 @@ export function LibraryPage(): React.JSX.Element {
           </div>
         )}
       </div>
+      {tagEdit ? (
+        <TagEditDialog
+          tracks={tagEdit}
+          onClose={() => setTagEdit(null)}
+          onChanged={() => void load()}
+          onError={(msg) => setError(msg)}
+        />
+      ) : null}
     </div>
   );
 }

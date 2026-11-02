@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
-import { Ban, Copy, Disc3, Download, Heart, ListEnd, Play, RefreshCw, User, X } from "lucide-react";
+import { Ban, Copy, Disc3, Download, Heart, ListEnd, Play, RefreshCw, Star, Tag, User, X } from "lucide-react";
 import type { Track } from "@/types";
 import { qtresCoverUrl, formatTime } from "@/lib/lrc";
 import { usePlayerStore } from "@/stores/player";
@@ -8,6 +8,7 @@ import { trackDbId, useDownloadsStore } from "@/stores/downloads";
 import { useDislikesStore } from "@/stores/dislikes";
 import { useDislikeFlags } from "@/hooks/useDislikeFlags";
 import { useFavoritesStore } from "@/stores/favorites";
+import { useTrackRatings, useRatingsStore } from "@/stores/ratings";
 import { useFavoriteFlags } from "@/hooks/useFavoriteFlags";
 import { useTrackSelection } from "@/hooks/useTrackSelection";
 import type { TrackSelection } from "@/lib/track-selection";
@@ -23,6 +24,7 @@ import { DownloadButton } from "../mine/DownloadButton";
 import { SourceSwitchPanel } from "../player/SourceSwitchPanel";
 import { LocalCover } from "../library/LocalCover";
 import { RowActions } from "../common/RowActions";
+import { RatingStars } from "../common/RatingStars";
 import { SourceTag } from "../common/SourceTag";
 import { IconButton } from "../common/IconButton";
 import { PlayNextIcon } from "../common/PlayNextIcon";
@@ -70,6 +72,11 @@ export interface LocalListOptions {
    * 封面缩略图在这一屏也没有信息量（专辑分组视图已用分组标题表达）。
    */
   plainRow?: boolean;
+  /**
+   * 右键「编辑标签…」（A2）。只对本地行生效；调用方没给就不出现这一项。
+   * 多选状态下的批量编辑不走这里 —— 由曲库页的批量条统一入口。
+   */
+  onEditTags?: (track: Track) => void;
 }
 
 export function TrackList(props: {
@@ -186,6 +193,9 @@ export function TrackList(props: {
     [unbanSong, handleDislikeError],
   );
 
+  // 评分（A6）：一次补齐这一屏的星级；已经查过的键不会重复请求。
+  useTrackRatings(tracks);
+
   // 行 key：`身份#第几次出现`。以前是 `身份-下标`——切排序（艺人页的
   // TrackSortSelect 会对全量列表重排）时下标全变，所有行 key 一起变，整表
   // unmount/remount（可见闪烁 + 重挂载卡顿）。带上出现序号是为了兼容
@@ -257,6 +267,7 @@ export function TrackList(props: {
             // 是否需要「移除」按钮必须由这个布尔决定，不能判 onRemove 是否存在
             showRemove={onRemove !== undefined}
             onRemove={handleRemove}
+            onEditTags={local?.onEditTags}
             removeLabel={removeLabel}
             onChanged={handleChanged}
             onError={handleError}
@@ -300,6 +311,8 @@ interface TrackRowProps {
   onSelect: ReturnType<typeof useTrackSelection>["select"];
   showRemove: boolean;
   onRemove: (track: Track) => void;
+  /** 右键「编辑标签…」（A2，仅本地行） */
+  onEditTags?: (track: Track) => void;
   /** 移除按钮的悬停提示（历史页与歌单页含义不同，文案由调用方给） */
   removeLabel: string;
   onChanged: () => void;
@@ -331,6 +344,7 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
     onSelect,
     showRemove,
     onRemove,
+    onEditTags,
     removeLabel,
     onChanged,
     onError,
@@ -351,6 +365,17 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
     x: number;
     y: number;
   } | null>(null);
+  /**
+   * 评分面板的位置（A6）。和上面两个面板不同：它不挂在右键菜单里，
+   * 悬停星标与右键「评分」都直接开它，所以位置单独一份 state。
+   */
+  const [ratingAt, setRatingAt] = useState<{ x: number; y: number } | null>(null);
+  /**
+   * 每行只订阅**自己**的星级：别人的评分变化不牵连本行重渲染，
+   * 列表滚到几百行时这点很关键（TrackRow 是 memo，但 store 订阅绕过了 memo）。
+   */
+  const rating = useRatingsStore((state) => state.ratings[trackDbId(t)] ?? 0);
+  const rateTrack = useRatingsStore((state) => state.set);
 
   /** 歌手 / 专辑跳转（行内文字按钮与右键菜单共用一份，避免两处口径漂移） */
   const openArtist = (): void => {
@@ -445,6 +470,15 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
       },
       { key: "copy", label: "复制歌曲信息", icon: Copy, onSelect: copyInfo },
       {
+        // 评分（A6）：行内悬停有星标，这里也给一条——悬停按钮只在自己那一行
+        // 显形，右键是更稳的入口（键盘/触控板用户也能到）。
+        key: "rate",
+        label: rating > 0 ? `评分：${rating} 星` : "评分…",
+        icon: Star,
+        separatorBefore: true,
+        onSelect: () => setRatingAt({ x, y }),
+      },
+      {
         key: "artist",
         label: "查看歌手",
         icon: User,
@@ -459,6 +493,16 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
         onSelect: openAlbum,
       },
     ];
+    // 「编辑标签…」（A2）：只有本地曲目能改文件标签，且调用方接了这个入口
+    if (localRow && onEditTags) {
+      items.push({
+        key: "tags",
+        label: "编辑标签…",
+        icon: Tag,
+        separatorBefore: true,
+        onSelect: () => onEditTags(t),
+      });
+    }
     // 「从歌单移除」只在可编辑列表里出现，且与上面那组动作分开一格
     if (showRemove) {
       items.push({
@@ -678,6 +722,21 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
         >
           <ListEnd className="h-3.5 w-3.5" />
         </button>
+        {/* 评分（A6）：星标常驻在悬停簇里，评过就点亮。面板定位用鼠标坐标，
+            而不是按钮坐标 —— 按钮藏在 group-hover 里，坐标更贴近用户眼睛的位置。 */}
+        <button
+          type="button"
+          title={rating > 0 ? `${rating} 星 · 点击修改` : "评分"}
+          aria-label={rating > 0 ? `评分 ${rating} 星` : "评分"}
+          data-testid="row-rating"
+          onClick={(e) => {
+            e.stopPropagation();
+            setRatingAt({ x: e.clientX, y: e.clientY });
+          }}
+          className="rounded p-1 text-muted-foreground transition-colors hover:bg-background hover:text-foreground"
+        >
+          <Star className={`h-3.5 w-3.5 ${rating > 0 ? "fill-amber-400 text-amber-400" : ""}`} />
+        </button>
         {/* 屏蔽：已命中规则时按钮变成「取消屏蔽」，让上一次误操作能就地回滚。
             屏蔽歌手的入口藏在 alt 点击里 —— 行已经很挤了，而屏蔽歌手是不可逆的
             重操作，给它一个裸露按钮会让人手滑。 */}
@@ -755,6 +814,21 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
               onPick={(candidate) => {
                 setPanel(null);
                 void play(candidate);
+              }}
+            />
+          </div>
+        </FloatingPanel>
+      ) : null}
+      {ratingAt ? (
+        <FloatingPanel x={ratingAt.x} y={ratingAt.y} width={188} onClose={() => setRatingAt(null)}>
+          <div className="rounded-xl border border-border bg-popover/95 p-3 text-popover-foreground shadow-raised backdrop-blur-xl">
+            <p className="mb-2 text-3xs text-muted-foreground">{rating > 0 ? `${rating} 星` : "未评分"}</p>
+            {/* 点当前那颗星 = 清空（RatingStars 内部把同值再点转成 0）。 */}
+            <RatingStars
+              value={rating}
+              size="sm"
+              onRate={(value) => {
+                void rateTrack(t, value);
               }}
             />
           </div>

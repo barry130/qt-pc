@@ -11,9 +11,22 @@ import { cn } from "@/lib/utils";
 import { toastSuccess } from "@/stores/toast";
 import { Spinner } from "@/components/ui";
 import { drawShareQr } from "@/components/player/share-qr";
+import {
+  CARD_W,
+  PAD,
+  RADIUS,
+  SCALE,
+  BOTTOM_H,
+  FONT_SANS,
+  drawBrandFooter,
+  drawCoverFill,
+  readTheme,
+  roundRect,
+  wrapText,
+} from "@/components/player/share-card-canvas";
 
-export const SHARE_CARD_BRAND = "轻听音乐";
-export const SHARE_CARD_BRAND_SUB = "QuietMusic";
+export { SHARE_CARD_BRAND, SHARE_CARD_BRAND_SUB } from "@/components/player/share-card-canvas";
+
 export const SHARE_CARD_NO_LYRIC = "暂无歌词";
 export const SHARE_CARD_LYRIC_LOADING = "歌词加载中…";
 
@@ -27,97 +40,13 @@ export const SHARE_CARD_LYRIC_LOADING = "歌词加载中…";
  * 「预览是一套样式、导出图是另一套」的偏差。
  */
 
-/** 卡片逻辑尺寸；导出按 2 倍像素出图，够清晰又不至于太大 */
-const CARD_W = 300;
-const COVER = 300;
-const SCALE = 2;
-const PAD = 18;
-const RADIUS = 16;
+/** 封面边 = 卡片宽（单曲卡是一整张大封面） */
+const COVER = CARD_W;
 
 /** 歌词卡片最多带几行词（与移动端一致） */
 const LYRIC_LINES = 6;
 
-/**
- * 底部那一带（品牌 + 下载二维码）的高度。
- * 二维码 64 + 上下各 16 = 96，比原来的 46 高出一半 —— 二维码小到 48 以下
- * 在手机上就很难对焦了，宁可卡片长一点。
- */
-const BOTTOM_H = 96;
-
-/** 二维码方块边长（含四周 4 格安静区，见 share-qr.ts） */
-const QR_BLOCK = 64;
-
-const FONT_SANS =
-  '"PingFang SC","Microsoft YaHei","Noto Sans SC","Helvetica Neue",Arial,sans-serif';
-
 type Mode = 0 | 1;
-
-function cssVar(name: string, fallback: string): string {
-  if (typeof window === "undefined") return fallback;
-  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
-  return v.length > 0 ? v : fallback;
-}
-
-/**
- * 画布不认 CSS 变量，也不接受 oklch 之外的随意字符串——这里统一取实值。
- * 主题切换（skins.ts 覆写 --primary 等）后重开弹层即可拿到新值。
- */
-function readTheme(): { bg: string; text: string; subtle: string; accent: string } {
-  return {
-    bg: cssVar("--card", "#ffffff"),
-    text: cssVar("--card-foreground", "#1f2937"),
-    subtle: cssVar("--muted-foreground", "#64748b"),
-    accent: cssVar("--primary", "#4f46e5"),
-  };
-}
-
-/** 按最大宽度断行（中文逐字、英文按空格/连字符，够用即可） */
-function wrapText(
-  ctx: CanvasRenderingContext2D,
-  text: string,
-  maxWidth: number,
-  maxLines: number,
-): string[] {
-  const out: string[] = [];
-  let line = "";
-  const push = (s: string): void => {
-    if (out.length < maxLines) out.push(s);
-  };
-  const tokens = text.match(/[A-Za-z0-9''-]+|\s+|[^\s]/g) ?? [];
-  for (const tk of tokens) {
-    const next = line + tk;
-    if (ctx.measureText(next).width > maxWidth && line.length > 0) {
-      push(line.trimEnd());
-      line = /^\s+$/.test(tk) ? "" : tk;
-      if (out.length >= maxLines) return out;
-    } else {
-      line = next;
-    }
-  }
-  if (line.trim().length > 0) push(line.trimEnd());
-  return out;
-}
-
-function roundRect(
-  ctx: CanvasRenderingContext2D,
-  x: number,
-  y: number,
-  w: number,
-  h: number,
-  r: number,
-): void {
-  ctx.beginPath();
-  ctx.moveTo(x + r, y);
-  ctx.lineTo(x + w - r, y);
-  ctx.quadraticCurveTo(x + w, y, x + w, y + r);
-  ctx.lineTo(x + w, y + h - r);
-  ctx.quadraticCurveTo(x + w, y + h, x + w - r, y + h);
-  ctx.lineTo(x + r, y + h);
-  ctx.quadraticCurveTo(x, y + h, x, y + h - r);
-  ctx.lineTo(x, y + r);
-  ctx.quadraticCurveTo(x, y, x + r, y);
-  ctx.closePath();
-}
 
 export function ShareCardPanel(props: { track: Track }): React.JSX.Element {
   const [mode, setMode] = useState<Mode>(0);
@@ -223,18 +152,7 @@ export function ShareCardPanel(props: { track: Track }): React.JSX.Element {
     ctx.clip();
 
     // 封面（aspectFill 等价：按长边铺满后居中裁）
-    if (coverRef.current !== null) {
-      const img = coverRef.current;
-      const scale = Math.max(COVER / img.width, COVER / img.height);
-      const dw = img.width * scale;
-      const dh = img.height * scale;
-      ctx.drawImage(img, (COVER - dw) / 2, (COVER - dh) / 2, dw, dh);
-    } else {
-      ctx.fillStyle = t.subtle;
-      ctx.globalAlpha = 0.18;
-      ctx.fillRect(0, 0, COVER, COVER);
-      ctx.globalAlpha = 1;
-    }
+    drawCoverFill(ctx, coverRef.current, 0, 0, COVER, COVER, t.subtle);
 
     let y = COVER + PAD + 16;
     ctx.fillStyle = t.text;
@@ -267,21 +185,7 @@ export function ShareCardPanel(props: { track: Track }): React.JSX.Element {
 
     // 底部一带：品牌在左，下载二维码在右（用户 m10523 要的「右下角二维码」）
     ctx.restore();
-    const qrX = CARD_W - PAD - QR_BLOCK;
-    const qrY = height - PAD - QR_BLOCK;
-    drawShareQr(ctx, qrX, qrY, QR_BLOCK);
-
-    // 左侧文字与二维码垂直居中对齐，三行：品牌 / 引导语 / 英文名
-    const centerY = qrY + QR_BLOCK / 2;
-    ctx.fillStyle = t.accent;
-    ctx.font = `bold 13px ${FONT_SANS}`;
-    ctx.fillText(SHARE_CARD_BRAND, PAD, centerY - 10);
-    ctx.fillStyle = t.text;
-    ctx.font = `10px ${FONT_SANS}`;
-    ctx.fillText("扫码下载客户端", PAD, centerY + 6);
-    ctx.fillStyle = t.subtle;
-    ctx.font = `9px ${FONT_SANS}`;
-    ctx.fillText(SHARE_CARD_BRAND_SUB, PAD, centerY + 20);
+    drawBrandFooter(ctx, height, t, drawShareQr);
     return canvas;
   };
 

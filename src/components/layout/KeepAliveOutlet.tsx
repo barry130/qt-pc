@@ -57,6 +57,8 @@ const DailyRecommendPage = lazyPage(
   () => import("@/components/discovery/DailyRecommendPage"),
   "DailyRecommendPage",
 );
+const RadioPage = lazyPage(() => import("@/components/mine/RadioPage"), "RadioPage");
+const PodcastPage = lazyPage(() => import("@/components/podcast/PodcastPage"), "PodcastPage");
 
 /** 一级页面清单：pathname → 页面元素工厂（新增一级页时在此登记） */
 export const KEEP_ALIVE_PAGES: Record<string, () => React.JSX.Element> = {
@@ -71,6 +73,8 @@ export const KEEP_ALIVE_PAGES: Record<string, () => React.JSX.Element> = {
   "/history": () => <HistoryPage />,
   "/stats": () => <StatsPage />,
   "/my/playlists": () => <MyPlaylistsPage />,
+  "/radio": () => <RadioPage />,
+  "/podcast": () => <PodcastPage />,
   "/ai-assistant": () => <AiAssistantPage />,
 };
 
@@ -90,6 +94,8 @@ const PAGE_SHAPE: Record<string, PageFallbackShape> = {
   "/history": "list",
   "/stats": "detail",
   "/my/playlists": "list",
+  "/radio": "detail",
+  "/podcast": "list",
   "/ai-assistant": "list",
 };
 

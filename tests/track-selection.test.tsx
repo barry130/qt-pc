@@ -47,8 +47,11 @@ vi.mock("@/services/ipc", () => ({
   getLocalTrackFiles: vi.fn(async () => []),
   getScanMinDuration: vi.fn(async () => 60),
   getScanMinSize: vi.fn(async () => 1048576),
+  getLibraryWatch: vi.fn(async () => true),
+  setLibraryWatch: vi.fn(async () => undefined),
   deleteLocalTracks: mocks.deleteLocalTracks,
   LIBRARY_SCAN_PROGRESS_EVENT: "library-scan-progress",
+  LIBRARY_CHANGED_EVENT: "library-changed",
 }));
 vi.mock("@/source-scripts", () => ({
   getPlaylistDetail: mocks.getPlaylistDetail,

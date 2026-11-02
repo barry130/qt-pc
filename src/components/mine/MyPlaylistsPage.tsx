@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ClipboardPaste, Heart, ImagePlus, Pencil, Plus } from "lucide-react";
+import { ClipboardPaste, Heart, ImagePlus, Pencil, Plus, SlidersHorizontal } from "lucide-react";
 import { errMsg } from "@/lib/utils";
 import { useNavigate } from "@tanstack/react-router";
 import type { MyPlaylistSummary } from "@/types";
@@ -9,6 +9,7 @@ import { pullLikes } from "@/stores/auth";
 import { useFavoritesStore } from "@/stores/favorites";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { ImportPlaylistDialog } from "./ImportPlaylistDialog";
+import { SmartPlaylistDialog } from "./SmartPlaylistDialog";
 import { IconButton } from "@/components/common/IconButton";
 import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 import { useDismissOnOutside } from "@/hooks/useDismissOnOutside";
@@ -49,6 +50,8 @@ export function MyPlaylistsPage(): React.JSX.Element {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [importOpen, setImportOpen] = useState(false);
+  /** 智能歌单编辑弹层：null = 关闭；{edit: null} = 新建；带 pid = 改规则 */
+  const [smartDialog, setSmartDialog] = useState<{ edit: { pid: string; name: string } | null } | null>(null);
   /** 正在等第二下确认的本地歌单 pid（删除不可逆，见下方 onRemoveClick） */
   const [confirmRemoveId, setConfirmRemoveId] = useState<string | null>(null);
   const bumpFavorites = useFavoritesStore((s) => s.bump);
@@ -243,6 +246,16 @@ export function MyPlaylistsPage(): React.JSX.Element {
           >
             <ClipboardPaste />
           </IconButton>
+          {/* 智能歌单：按规则现算，不需要往里塞歌 */}
+          <IconButton
+            label="新建智能歌单"
+            variant="outline"
+            size="lg"
+            hover="secondary"
+            onClick={() => setSmartDialog({ edit: null })}
+          >
+            <SlidersHorizontal />
+          </IconButton>
         </div>
       </div>
 
@@ -279,6 +292,7 @@ export function MyPlaylistsPage(): React.JSX.Element {
               confirmRemoveId={confirmRemoveId}
               confirmRef={confirmRef}
               onChangeCover={(p) => void changeCover(p)}
+              onEditRules={(p) => setSmartDialog({ edit: { pid: p.pid, name: p.name } })}
             />
             <Group
               title="收藏的在线歌单"
@@ -305,6 +319,14 @@ export function MyPlaylistsPage(): React.JSX.Element {
           onClose={() => setImportOpen(false)}
           onImported={onImported}
           onSongsImported={onSongsImported}
+        />
+      )}
+      {smartDialog && (
+        <SmartPlaylistDialog
+          playlist={smartDialog.edit}
+          onClose={() => setSmartDialog(null)}
+          onSaved={() => void load()}
+          onError={(msg) => setError(msg)}
         />
       )}
     </div>
@@ -336,6 +358,8 @@ function Group(props: {
   hideRename?: boolean;
   /** 本地自建歌单换封面；不传则不显示入口（在线歌单封面归音源/云端所有） */
   onChangeCover?: (p: MyPlaylistSummary) => void;
+  /** 智能歌单的「改规则」入口；不传则不显示 */
+  onEditRules?: (p: MyPlaylistSummary) => void;
 }): React.JSX.Element {
   // 在线歌单的源展示名走数据包注册表（stores/sourceRegistry）
   const sourceLabel = useSourceLabelFn();
@@ -376,15 +400,33 @@ function Group(props: {
                   onClick={() => props.onOpen(p)}
                   className="min-w-0 flex-1 text-left"
                 >
-                  <div className="truncate text-sm">{p.name}</div>
+                  <div className="flex items-center gap-1.5">
+                    <span className="truncate text-sm">{p.name}</span>
+                    {p.isSmart === true && (
+                      <span className="shrink-0 rounded bg-primary/10 px-1 py-0.5 text-2xs text-primary">
+                        智能
+                      </span>
+                    )}
+                  </div>
                   <div className="text-xs text-muted-foreground">
                     {p.platform === ipc.LOCAL_PLATFORM
-                      ? `${p.trackCount} 首`
+                      ? p.isSmart === true
+                        ? `按规则自动收集 · ${p.trackCount} 首`
+                        : `${p.trackCount} 首`
                       : `在线 · ${sourceLabel(p.platform)}`}
                   </div>
                 </button>
               )}
 
+              {p.isSmart === true && props.onEditRules !== undefined && (
+                <IconButton
+                  label="改规则"
+                  hover="secondary"
+                  onClick={() => props.onEditRules?.(p)}
+                >
+                  <SlidersHorizontal />
+                </IconButton>
+              )}
               {!props.hideRename && (
                 <IconButton
                   label="重命名"

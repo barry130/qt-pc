@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import type {
   AppearancePreference,
+  AppPaths,
   AppUpdateInfo,
   AppVersion,
   AudioCacheClearResult,
@@ -25,6 +26,8 @@ import type {
   HistoryItem,
   LyricRecord,
   MyPlaylistSummary,
+  SmartPlaylistMeta,
+  SmartRules,
   PlaybackState,
   PositionChanged,
   QueueChanged,
@@ -33,9 +36,15 @@ import type {
   Track,
   UpdateDownloadProgress,
   NetConfigView,
+  ScrobbleView,
+  ScrobbleFlushOutcome,
   NetTestResult,
   MiniPlayerState,
   FileAssociationState,
+  UriSchemeState,
+  DiagnosticBundle,
+  PodcastShow,
+  PodcastEpisode,
   LocalMixSummary,
   AiLocalConfigView,
   AiLocalMessage,
@@ -216,6 +225,86 @@ export interface OrganizePreview {
 export async function previewLibraryOrganization(destination: string): Promise<OrganizePreview> {
   return invoke("preview_library_organization", { destination });
 }
+/** 单条搬运失败：那条文件没动（或已搬回原位），message 是给用户看的原因。 */
+export interface OrganizeFailure {
+  source: string;
+  target: string;
+  message: string;
+}
+/** 整理执行结果（A11）。`undoAvailable` 为真表示落了一份撤销清单。 */
+export interface OrganizeOutcome {
+  moved: number;
+  blocked: number;
+  unchanged: number;
+  failed: OrganizeFailure[];
+  undoAvailable: boolean;
+}
+/** 撤销清单概要；`at` 是 epoch 毫秒，`count` 是可撤销的文件数。 */
+export interface OrganizeUndoState {
+  at: number;
+  count: number;
+}
+export interface OrganizeUndoOutcome {
+  restored: number;
+  failed: OrganizeFailure[];
+}
+/**
+ * 真动文件（A11）：后端会**重算一次预览**，只搬现在仍然「可整理」的项；
+ * 搬之前先把撤销清单落盘，库没跟上就把文件搬回原位。逐条失败不影响其他条目。
+ */
+export async function applyLibraryOrganization(destination: string): Promise<OrganizeOutcome> {
+  return invoke("apply_library_organization", { destination });
+}
+/** 撤销最近一次整理：倒序搬回原位置并同步曲库。没有清单时后端报错。 */
+export async function undoLibraryOrganization(): Promise<OrganizeUndoOutcome> {
+  return invoke("undo_library_organization");
+}
+/** 有没有可撤销的整理记录；没有返回 null。 */
+export async function libraryOrganizeUndoState(): Promise<OrganizeUndoState | null> {
+  return invoke("library_organize_undo_state");
+}
+
+/** 体检类别（B11）：丢文件 / 零播放 / 超长未分轨。 */
+export type HealthKindName = "missing" | "silent" | "long";
+/** 体检清单里的一首；`detail` 是后端拼好的原因文案（「加入 42 天从未播放」）。 */
+export interface HealthTrack {
+  id: string;
+  title: string;
+  singer: string;
+  album: string;
+  path: string;
+  durationMs: number;
+  detail: string;
+}
+/** 一类清单。`total` 可能大于 `items.length`（截断时后端给的是下限 501）。 */
+export interface HealthKind {
+  kind: HealthKindName;
+  total: number;
+  truncated: boolean;
+  items: HealthTrack[];
+}
+export interface LibraryHealthReport {
+  missing: HealthKind;
+  silent: HealthKind;
+  long: HealthKind;
+  /** 已被忽略的条数（按 (曲目, 类别) 计数） */
+  ignored: number;
+}
+/**
+ * 库体检（B11）：只读查询，不动文件。三类各回最多 500 条，
+ * 超出的用 `truncated` 标记（`total` 只保证「不少于」）。
+ */
+export async function scanLibraryHealth(): Promise<LibraryHealthReport> {
+  return invoke("scan_library_health");
+}
+/** 忽略若干条（后端按 (曲目, 类别) 去重，重复忽略返回 0）。 */
+export async function ignoreLibraryHealth(kind: HealthKindName, trackIds: string[]): Promise<number> {
+  return invoke("ignore_library_health", { kind, trackIds });
+}
+/** 清空忽略清单，返回恢复出来的条数。 */
+export async function restoreLibraryHealthIgnored(): Promise<number> {
+  return invoke("restore_library_health_ignored");
+}
 
 /** 读本地音频的内嵌封面（data URL）；没有封面返回 null。path 即本地 Track.id */
 export async function getLocalCover(path: string): Promise<string | null> {
@@ -329,6 +418,100 @@ export function onLibraryScanProgress(
   return listen<LibraryScanProgress>(LIBRARY_SCAN_PROGRESS_EVENT, (e) =>
     handler(e.payload),
   );
+}
+
+// ---------- 文件夹监听（DESIGN R62） ----------
+// Rust 侧 notify 监听扫描目录，攒 600ms 后增量入库，再广播这条事件让界面刷新。
+
+/** Rust library_watch.rs 广播：扫描目录里增删了曲目。 */
+export const LIBRARY_CHANGED_EVENT = "library-changed";
+
+export interface LibraryChangedPayload {
+  /** 本次新入库 / 更新了多少条 */
+  added: number;
+  /** 本次从库里清掉多少条 */
+  removed: number;
+}
+
+/** 读取「文件夹监听」开关（缺省开启）。 */
+export async function getLibraryWatch(): Promise<boolean> {
+  return invoke("get_library_watch");
+}
+
+/** 开关「文件夹监听」，Rust 侧会重建 watcher 并落库。 */
+export async function setLibraryWatch(enabled: boolean): Promise<void> {
+  return invoke("set_library_watch", { enabled });
+}
+
+export function onLibraryChanged(
+  handler: (p: LibraryChangedPayload) => void,
+): Promise<() => void> {
+  return listen<LibraryChangedPayload>(LIBRARY_CHANGED_EVENT, (e) =>
+    handler(e.payload),
+  );
+}
+
+// ---------- 本地曲目标签编辑（A2，对照分析文档 §4.2） ----------
+// 读写都直接落到音频文件本身（Rust `tags.rs`）；曲库那一份由 Rust 写完后就地重扫，
+// 前端不用自己拼 Track 再灌回列表。
+
+/** 一个文件里的可编辑标签（整份快照，撤销时原样写回）。 */
+export interface LocalTagValues {
+  title: string;
+  artist: string;
+  album: string;
+  albumArtist: string;
+  genre: string;
+  year: number | null;
+  trackNo: number | null;
+  discNo: number | null;
+}
+
+/** 要改的字段；省略 = 不动，文本给空串 / 数字给 0 = 清掉这个标签。 */
+export interface LocalTagPatch {
+  title?: string;
+  artist?: string;
+  album?: string;
+  albumArtist?: string;
+  genre?: string;
+  year?: number;
+  trackNo?: number;
+  discNo?: number;
+}
+
+export interface TagWriteFailure {
+  path: string;
+  reason: string;
+}
+
+export interface TagWriteSummary {
+  /** 撤销凭据，传给 undoTagEdit 就能把这批文件恢复原值 */
+  batch: string;
+  updated: number;
+  failed: TagWriteFailure[];
+}
+
+/** 读文件里的标签（CUE 虚拟分轨会直接报错）。 */
+export async function readLocalTags(path: string): Promise<LocalTagValues> {
+  return invoke("read_local_tags", { path });
+}
+
+/** 写标签：单曲传一条路径，批量传多条，共用同一个 patch 与撤销批次。 */
+export async function writeLocalTags(
+  paths: string[],
+  patch: LocalTagPatch,
+): Promise<TagWriteSummary> {
+  return invoke("write_local_tags", { paths, patch });
+}
+
+/** 撤销一批标签修改，返回成功恢复的文件数。 */
+export async function undoTagEdit(batch: string): Promise<number> {
+  return invoke("undo_tag_edit", { batch });
+}
+
+/** 最近一批标签修改的批次号（重启后界面还能提供「撤销上次修改」）。 */
+export async function lastTagEditBatch(): Promise<string | null> {
+  return invoke("last_tag_edit_batch");
 }
 
 // ---------- 用户数据：收藏 / 播放历史（DESIGN §5.3） ----------
@@ -504,6 +687,45 @@ export async function removeTracksFromPlaylist(
   tracks: Track[],
 ): Promise<number> {
   return invoke("remove_tracks_from_playlist", { id, tracks });
+}
+
+// ---------- 智能歌单（A5，对照分析文档 §4.5） ----------
+// 规则存 smart_playlists 表，曲目由后端每次现算；`getPlaylistTracks` 内部自动
+// 分流，所以这里的四个命令只负责「规则 + 限制 + 排序」的读写。
+
+/** 新建智能歌单，返回 pid */
+export async function createSmartPlaylist(
+  name: string,
+  rules: SmartRules,
+  limit: number | null,
+  sort: string,
+): Promise<string> {
+  return invoke("create_smart_playlist", { name, rules, limit, sort });
+}
+
+/** 改规则 / 限制 / 排序（改完下次打开即生效，不需要刷新成员） */
+export async function updateSmartPlaylist(
+  pid: string,
+  rules: SmartRules,
+  limit: number | null,
+  sort: string,
+): Promise<void> {
+  return invoke("update_smart_playlist", { pid, rules, limit, sort });
+}
+
+/** 读智能歌单的规则；不是智能歌单时返回 null */
+export async function getSmartPlaylist(
+  pid: string,
+): Promise<SmartPlaylistMeta | null> {
+  return invoke("get_smart_playlist", { pid });
+}
+
+/** 另存为静态歌单：把此刻现算的结果固化成普通歌单，返回新 pid */
+export async function saveSmartPlaylistAsStatic(
+  pid: string,
+  name: string,
+): Promise<string> {
+  return invoke("save_smart_playlist_as_static", { pid, name });
 }
 
 // ---------- 下载管理（DESIGN §5.3 下载 2.0） ----------
@@ -820,6 +1042,16 @@ export async function setEq(eq: EqParams): Promise<void> {
 /** 响度归一化开关并持久化 */
 export async function setLoudnorm(enabled: boolean): Promise<void> {
   return invoke("set_loudnorm", { enabled });
+}
+
+/**
+ * ReplayGain 静态增益模式并持久化（A1）。
+ *
+ * off = 不处理；track = 每首歌对齐到同一响度；album = 同专辑内保持相对响度。
+ * 切完引擎按当前曲目立刻重算，正在播的那首当场生效。
+ */
+export async function setReplayGainMode(mode: "off" | "track" | "album"): Promise<void> {
+  return invoke("set_replay_gain_mode", { mode });
 }
 
 /** 播放条频谱背景开关（开 = 引擎侧 FFT 推 spectrum 事件） */
@@ -1231,16 +1463,17 @@ export async function pickImage(title = "选择图片"): Promise<string | null> 
   return Array.isArray(result) ? (result[0] ?? null) : result;
 }
 
-/** 打开系统「另存为」对话框（分享卡片保存 PNG 用）；用户取消返回 null */
+/** 打开系统「另存为」对话框（分享卡片 PNG / 诊断包 zip 用）；用户取消返回 null */
 export async function pickSavePath(
   defaultPath: string,
   title = "保存文件",
+  extensions: string[] = ["png"],
 ): Promise<string | null> {
   const result = await invoke<string | string[] | null>("plugin:dialog|save", {
     options: {
       title,
       defaultPath,
-      filters: [{ name: "图片", extensions: ["png"] }],
+      filters: [{ name: extensions.map((e) => e.toUpperCase()).join(" / "), extensions }],
     },
   });
   return Array.isArray(result) ? (result[0] ?? null) : result;
@@ -1592,6 +1825,22 @@ export async function getAppVersion(): Promise<AppVersion> {
   return invoke("get_app_version");
 }
 
+/**
+ * 数据目录快照（§8.2 便携模式）：数据根 / 缓存 / 日志各自落在哪。
+ * 便携版下三者都在 exe 旁边，设置页据此提示「整包可拷走」。
+ */
+export async function getAppPaths(): Promise<AppPaths> {
+  return invoke("get_app_paths");
+}
+
+/**
+ * 打包诊断包（§18 / B8）：日志 + 脱敏配置 + 数据库版本 + 设备信息。
+ * 只返回内容，落盘由用户先选路径再 `saveBinaryFile` —— 不让后端偷偷写文件。
+ */
+export async function buildDiagnostics(): Promise<DiagnosticBundle> {
+  return invoke("build_diagnostics");
+}
+
 export async function astralAppUpdate(): Promise<AppUpdateInfo | null> {
   return invoke("astral_app_update");
 }
@@ -1933,6 +2182,27 @@ export async function checkDisliked(tracks: Track[]): Promise<boolean[]> {
   return invoke("check_disliked", { tracks });
 }
 
+// ---------- 评分（A6，track_ratings 表） ----------
+//
+// 五星制，`rating <= 0` = 清除（Rust 侧 DELETE，表里只留真正打过分的曲目）。
+// 键 = `platform:id`（前端用 `trackDbId`），与 `tracks.id` 同口径。
+// 批量读接口给列表页用：一屏上百首逐行查会把 IPC 通道打满。
+
+/** 写入 / 更新 / 清除一首歌的评分（`rating <= 0` = 清除） */
+export async function setTrackRating(key: string, rating: number): Promise<void> {
+  return invoke("set_track_rating", { key, rating });
+}
+
+/** 批量读取评分；只返回有评分的键（没有就是 0 星） */
+export async function getTrackRatings(keys: string[]): Promise<Record<string, number>> {
+  return invoke("get_track_ratings", { keys });
+}
+
+/** 评分不低于 `minRating` 的曲目键（智能歌单的 `rating >= N`、按星级筛选） */
+export async function listRatedKeys(minRating: number): Promise<string[]> {
+  return invoke("list_rated_keys", { minRating });
+}
+
 // ---------- 事件 ----------
 
 export function onPositionChanged(
@@ -2017,6 +2287,22 @@ export async function registerFileAssociations(): Promise<FileAssociationState> 
 
 export async function unregisterFileAssociations(): Promise<FileAssociationState> {
   return invoke("unregister_file_associations");
+}
+
+/**
+ * `quietmusic://` 注册状态（§4.13 / B4）：设置页「通用 → 链接唤起」。
+ * 只写 HKCU，不需要管理员，也不影响系统级默认程序。
+ */
+export async function getUriSchemeState(): Promise<UriSchemeState> {
+  return invoke("get_uri_scheme_state");
+}
+
+export async function registerUriScheme(): Promise<UriSchemeState> {
+  return invoke("register_uri_scheme");
+}
+
+export async function unregisterUriScheme(): Promise<UriSchemeState> {
+  return invoke("unregister_uri_scheme");
 }
 
 export async function openDefaultAppsSettings(): Promise<void> {
@@ -2227,3 +2513,93 @@ export async function aiLocalChat(
 export function setWebviewMemoryLow(low: boolean): Promise<void> {
   return invoke<void>("set_webview_memory_low", { low });
 }
+
+// ---------- 外部收听上报（A8）：Last.fm / ListenBrainz ----------
+
+/** 读「听歌上报」设置与队列概览 */
+export function getScrobbleSettings(): Promise<ScrobbleView> {
+  return invoke<ScrobbleView>("get_scrobble_settings");
+}
+
+/** 保存 Last.fm 应用凭据（用户自备 key/secret）；换 key 会清掉旧 session */
+export function setLastfmCredentials(apiKey: string, apiSecret: string): Promise<void> {
+  return invoke<void>("set_lastfm_credentials", { apiKey, apiSecret });
+}
+
+/** 开始 Last.fm 授权：返回要打开的授权页地址 */
+export function beginLastfmAuth(): Promise<string> {
+  return invoke<string>("begin_lastfm_auth");
+}
+
+/** 完成 Last.fm 授权（用户在网页点完「允许」后回来点）：返回用户名 */
+export function finishLastfmAuth(): Promise<string> {
+  return invoke<string>("finish_lastfm_auth");
+}
+
+/** 断开 Last.fm（保留 key/secret，方便重连） */
+export function disconnectLastfm(): Promise<void> {
+  return invoke<void>("disconnect_lastfm");
+}
+
+/** 连接 ListenBrainz（token 校验通过才保存）：返回用户名 */
+export function connectListenBrainz(token: string): Promise<string> {
+  return invoke<string>("connect_listenbrainz", { token });
+}
+
+/** 断开 ListenBrainz */
+export function disconnectListenBrainz(): Promise<void> {
+  return invoke<void>("disconnect_listenbrainz");
+}
+
+/** 开关某个目标的上报（`lastfm` | `listenbrainz`），连接状态保留 */
+export function setScrobbleEnabled(
+  target: "lastfm" | "listenbrainz",
+  enabled: boolean,
+): Promise<void> {
+  return invoke<void>("set_scrobble_enabled", { target, enabled });
+}
+
+/** 立刻冲刷一次队列（设置页「立即重试」） */
+export function scrobbleFlush(): Promise<ScrobbleFlushOutcome> {
+  return invoke<ScrobbleFlushOutcome>("scrobble_flush");
+}
+
+/** 全部播客订阅（B9） */
+export function listPodcastShows(): Promise<PodcastShow[]> {
+  return invoke<PodcastShow[]>("list_podcast_shows");
+}
+
+/** 订阅一个 RSS 地址：后端拉取并入库，返回订阅视图（失败带可直接展示的原因） */
+export function addPodcastShow(url: string): Promise<PodcastShow> {
+  return invoke<PodcastShow>("add_podcast_show", { url });
+}
+
+/** 刷新单个订阅（保留已听进度） */
+export function refreshPodcastShow(showId: string): Promise<PodcastShow> {
+  return invoke<PodcastShow>("refresh_podcast_show", { showId });
+}
+
+/** 取消订阅：连带删掉它的单集，返回是否删掉了订阅本身 */
+export function removePodcastShow(showId: string): Promise<number> {
+  return invoke<number>("remove_podcast_show", { showId });
+}
+
+/** 某个订阅下的单集（按发布时间倒序） */
+export function listPodcastEpisodes(showId: string): Promise<PodcastEpisode[]> {
+  return invoke<PodcastEpisode[]>("list_podcast_episodes", { showId });
+}
+
+/** 记住听到哪（毫秒）；`played` 表示这一集是否听完 */
+export function savePodcastProgress(
+  episodeId: string,
+  positionMs: number,
+  played: boolean,
+): Promise<boolean> {
+  return invoke<boolean>("save_podcast_progress", { episodeId, positionMs, played });
+}
+
+/** 单集音频直链（播放入口用；订阅已删则报错） */
+export function podcastEpisodeAudio(episodeId: string): Promise<string> {
+  return invoke<string>("podcast_episode_audio", { episodeId });
+}
+

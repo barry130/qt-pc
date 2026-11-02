@@ -210,6 +210,21 @@ const myPlaylistsRoute = createRoute({
   component: () => null,
 });
 
+// 私人 FM（A7）：与其它一级页一样由 KeepAliveOutlet 常驻渲染，
+// 这里只保留路由用于匹配与直接导航（路由 /radio）。
+const radioRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/radio",
+  component: () => null,
+});
+
+// 播客（B9）：同上，页面由 KeepAliveOutlet 常驻渲染（路由 /podcast）。
+const podcastRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/podcast",
+  component: () => null,
+});
+
 const myPlaylistDetailRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/my/playlist/$id",
@@ -377,6 +392,8 @@ const routeTree = rootRoute.addChildren([
   libraryRoute,
   libraryFoldersRoute,
   myPlaylistsRoute,
+  radioRoute,
+  podcastRoute,
   myPlaylistDetailRoute,
   sourceAccountsRoute,
   localMixRoute,
