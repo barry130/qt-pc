@@ -7,7 +7,14 @@ import { useSourceLabelFn } from "@/stores/sourceRegistry";
 import * as ipc from "@/services/ipc";
 import { pullLikes } from "@/stores/auth";
 import { useFavoritesStore } from "@/stores/favorites";
+import { useT } from "@/lib/i18n";
 import { qtresCoverUrl } from "@/lib/lrc";
+import {
+  cachedPlaylistCover,
+  hasCachedPlaylistCover,
+  invalidatePlaylistCoverCache,
+  setCachedPlaylistCover,
+} from "@/lib/playlist-cover-cache";
 import { ImportPlaylistDialog } from "./ImportPlaylistDialog";
 import { SmartPlaylistDialog } from "./SmartPlaylistDialog";
 import { IconButton } from "@/components/common/IconButton";
@@ -42,6 +49,7 @@ import { EmptyState, RowsSkeleton } from "@/components/ui";
  *   在线歌单的「取消收藏」只是摘掉一个引用、不动歌，一次点击完成。
  */
 export function MyPlaylistsPage(): React.JSX.Element {
+  const tr = useT();
   const navigate = useNavigate();
   const [list, setList] = useState<MyPlaylistSummary[]>([]);
   const [name, setName] = useState("");
@@ -188,21 +196,35 @@ export function MyPlaylistsPage(): React.JSX.Element {
   /**
    * 换本地歌单封面：选图 → Rust 复制进应用数据目录 → 登记 cover_path。
    * 成功后本页乐观替换 picUrl（即新封面路径），下次读列表以本地库为准。
-   * 仅本地自建歌单可换；在线歌单封面归音源/云端所有，不提供入口。
+   * 本地组的全部歌单都可换（含远程同步来的卡片歌单，后端会先认领成
+   * 本地行）；在线歌单封面归音源/云端所有，不提供入口。
+   * 云端同步失败（每日配额 2 次等）不回滚本地，但要把原因亮出来，
+   * 别让用户查库才发现没同步（用户 2026-11-02 反馈踩中配额上限）。
    */
   const changeCover = async (p: MyPlaylistSummary): Promise<void> => {
     const path = await ipc.pickImage("选择歌单封面");
     if (!path) return;
     setError(null);
     try {
-      const coverPath = await ipc.setPlaylistCover(p.pid, path);
+      const result = await ipc.setPlaylistCover(p.pid, path);
+      // 封面换了：废掉这张的封面缓存，让 PlaylistCoverImage 重新读文件
+      invalidatePlaylistCoverCache(p.pid);
       setList((prev) =>
         prev.map((it) =>
           it.platform === ipc.LOCAL_PLATFORM && it.pid === p.pid
-            ? { ...it, picUrl: coverPath }
+            ? { ...it, picUrl: result.path }
             : it,
         ),
       );
+      if (result.cloud === "failed") {
+        setError(
+          tr("playlist.edit.coverUpdatedCloudFailed", {
+            error: result.message ?? tr("playlist.edit.unknownError"),
+          }),
+        );
+      } else if (result.cloud === "offline") {
+        setError(tr("playlist.edit.coverOffline"));
+      }
     } catch (err) {
       setError(errMsg(err));
     }
@@ -436,8 +458,8 @@ function Group(props: {
                   <Pencil />
                 </IconButton>
               )}
-              {/* 换封面只给本地自建歌单（云端卡片「我喜欢的歌曲」与在线歌单都不给） */}
-              {props.onChangeCover && p.isLocal && (
+              {/* 换封面：本地组全部歌单都能换（含远程同步来的卡片歌单，后端会先认领） */}
+              {props.onChangeCover && p.platform === ipc.LOCAL_PLATFORM && (
                 <IconButton
                   label="换封面"
                   hover="secondary"
@@ -474,28 +496,29 @@ function Group(props: {
 
 /**
  * 歌单封面图：在线歌单走 qtres 代取；本地歌单按 pid 异步读封面文件
- * （Rust 转成 data URL，模块级按 pid 缓存），没有自设封面回退默认图。
+ * （Rust 转成 data URL，缓存挂在 lib/playlist-cover-cache，详情页换/清
+ * 封面后同样从那里废缓存），没有自设封面回退云端卡片封面（远程同步来的
+ * 本地歌单，封面在云端；合并视图把卡片 pic_url 填进了 summary），再没
+ * 有才落默认图。
  */
-const localCoverCache = new Map<string, string | null>();
-
 function PlaylistCoverImage({ p }: { p: MyPlaylistSummary }): React.JSX.Element {
   const isLocal = p.platform === ipc.LOCAL_PLATFORM;
   const onlineUrl = isLocal ? null : qtresCoverUrl(p.picUrl);
   const [localSrc, setLocalSrc] = useState<string | null>(
-    isLocal ? (localCoverCache.get(p.pid) ?? null) : null,
+    isLocal ? (cachedPlaylistCover(p.pid) ?? null) : null,
   );
 
   useEffect(() => {
     if (!isLocal || !p.picUrl) return;
-    if (localCoverCache.has(p.pid)) {
-      setLocalSrc(localCoverCache.get(p.pid) ?? null);
+    if (hasCachedPlaylistCover(p.pid)) {
+      setLocalSrc(cachedPlaylistCover(p.pid) ?? null);
       return;
     }
     let alive = true;
     void ipc
       .getPlaylistCover(p.pid)
       .then((v) => {
-        localCoverCache.set(p.pid, v);
+        setCachedPlaylistCover(p.pid, v);
         if (alive) setLocalSrc(v);
       })
       .catch(() => {});
@@ -504,7 +527,8 @@ function PlaylistCoverImage({ p }: { p: MyPlaylistSummary }): React.JSX.Element 
     };
   }, [isLocal, p.pid, p.picUrl]);
 
-  const src = isLocal ? localSrc : onlineUrl;
+  // 本地歌单：自设封面文件 → 云端卡片封面（qtres 代取）→ 默认图
+  const src = isLocal ? (localSrc ?? qtresCoverUrl(p.picUrl)) : onlineUrl;
   if (!src) {
     return (
       <img

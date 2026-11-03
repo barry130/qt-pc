@@ -1513,17 +1513,35 @@ export async function astralClearPlaylistCover(
   return invoke("astral_clear_playlist_cover", { pid, platform });
 }
 
-/** 设置本地自建歌单封面：选中的图片复制进应用数据目录并登记，返回封面文件路径 */
+/** 封面云端同步结果：synced=已上送云端；offline=未登录跳过；failed=失败（见 message） */
+export interface PlaylistCoverCloudResult {
+  cloud: "synced" | "offline" | "failed";
+  /** failed 时的后端原文（如「今日上传次数已达上限」） */
+  message?: string | null;
+}
+
+/** set_playlist_cover 回执：本地封面已生效，cloud 说明云端同步结果 */
+export interface PlaylistCoverSetResult extends PlaylistCoverCloudResult {
+  /** 本地封面文件路径 */
+  path: string;
+}
+
+/** 设置本地自建歌单封面：选中的图片复制进应用数据目录并登记；云端失败不回滚本地，见回执 */
 export async function setPlaylistCover(
   pid: string,
   filePath: string,
-): Promise<string> {
+): Promise<PlaylistCoverSetResult> {
   return invoke("set_playlist_cover", { pid, filePath });
 }
 
 /** 读本地歌单封面文件，转 data URL；未设置或读不到返回 null */
 export async function getPlaylistCover(pid: string): Promise<string | null> {
   return invoke("get_playlist_cover", { pid });
+}
+
+/** 清除本地歌单封面（回默认封面链）：清登记 + 删封面文件；登录时顺带清云端，结果见回执 */
+export async function clearPlaylistCover(pid: string): Promise<PlaylistCoverCloudResult> {
+  return invoke("clear_playlist_cover", { pid });
 }
 
 // ---------- 听歌统计（DESIGN §5.3） ----------

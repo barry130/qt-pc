@@ -475,6 +475,138 @@ fn my_playlist_crud_and_ordering() {
     assert!(get_playlist_tracks(&conn, &id).expect("tracks").is_empty());
 }
 
+/// 认领远程同步来的本地歌单卡片（adopt_card_playlist，2026-11-02）：
+/// 补本地行、名字/确认点继承卡片、幂等；在线歌单与不存在的 pid 不认领。
+#[test]
+fn adopt_card_playlist_creates_local_row_from_synced_card() {
+    let conn = test_conn();
+
+    // 他端建的歌单：本机只有云端卡片（liked_playlists），没有本地行
+    add_liked_playlist(&conn, "local", "pid-remote-1", "手机上的歌单", "https://cdn/x.png", "")
+        .expect("add card");
+    assert_eq!(adopt_card_playlist(&conn, "pid-remote-1").expect("adopt"), 1);
+
+    // 幂等：再认领仍是 1，且不重复建行
+    assert_eq!(adopt_card_playlist(&conn, "pid-remote-1").expect("adopt"), 1);
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM playlists WHERE pid = 'pid-remote-1'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert_eq!(n, 1);
+
+    // 名字继承卡片；改名从此有地方落（rename 返回受影响行数）
+    let name: String = conn
+        .query_row(
+            "SELECT name FROM playlists WHERE pid = 'pid-remote-1'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("name");
+    assert_eq!(name, "手机上的歌单");
+    assert_eq!(
+        rename_playlist(&conn, "pid-remote-1", "PC 改的名").expect("rename"),
+        1
+    );
+    let renamed: String = conn
+        .query_row(
+            "SELECT name FROM playlists WHERE pid = 'pid-remote-1'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("name");
+    assert_eq!(renamed, "PC 改的名");
+
+    // 在线音源卡片 / 完全不存在的 pid：不认领（返回 0）
+    add_liked_playlist(&conn, "wyy", "pid-online-1", "在线歌单", "", "").expect("add card");
+    assert_eq!(adopt_card_playlist(&conn, "pid-online-1").expect("adopt"), 0);
+    assert_eq!(adopt_card_playlist(&conn, "pid-none").expect("adopt"), 0);
+    let n: i64 = conn
+        .query_row("SELECT COUNT(*) FROM playlists", [], |r| r.get(0))
+        .expect("count");
+    assert_eq!(n, 1);
+}
+
+/// 合并视图封面回退链（2026-11-02）：本地行没自设封面时显示同 pid 云端
+/// 卡片的封面（远程同步来的本地歌单，封面在云端）；自设封面覆盖，清掉再回退。
+#[test]
+fn list_my_playlists_cover_falls_back_to_card_pic() {
+    let conn = test_conn();
+
+    add_liked_playlist(&conn, "local", "pid-card-cov", "云名", "https://cdn/card.png", "")
+        .expect("add card");
+    adopt_card_playlist(&conn, "pid-card-cov").expect("adopt");
+
+    let find = |conn: &Connection| {
+        list_my_playlists(conn)
+            .expect("list")
+            .into_iter()
+            .find(|p| p.pid == "pid-card-cov")
+            .expect("merged row")
+    };
+
+    // 本地行赢合并视图（is_local），封面回退到云端卡片的 pic_url
+    let p = find(&conn);
+    assert!(p.is_local);
+    assert_eq!(p.pic_url, "https://cdn/card.png");
+
+    // 自设封面后本地封面赢
+    set_playlist_cover_path(&conn, "pid-card-cov", "D:/covers/x.png").expect("set cover");
+    assert_eq!(find(&conn).pic_url, "D:/covers/x.png");
+
+    // 清掉自设封面 → 又回退到卡片封面
+    assert_eq!(
+        clear_playlist_cover_path(&conn, "pid-card-cov").expect("clear"),
+        1
+    );
+    assert_eq!(find(&conn).pic_url, "https://cdn/card.png");
+}
+
+/// 清封面登记（clear_playlist_cover_path，2026-11-02）：只动设过封面的行，
+/// 清完再清是 0；没设过封面的新建歌单也是 0。
+#[test]
+fn clear_playlist_cover_path_only_touches_covered_rows() {
+    let conn = test_conn();
+    let pid = create_playlist(&conn, "封面测试").expect("create");
+
+    assert_eq!(
+        clear_playlist_cover_path(&conn, &pid).expect("clear"),
+        0,
+        "没设过封面：0 行受影响"
+    );
+    set_playlist_cover_path(&conn, &pid, "D:/a.png").expect("set");
+    assert_eq!(clear_playlist_cover_path(&conn, &pid).expect("clear"), 1);
+    assert_eq!(playlist_cover_path(&conn, &pid).expect("read"), None);
+    assert_eq!(
+        clear_playlist_cover_path(&conn, &pid).expect("clear"),
+        0,
+        "清完再清：0 行受影响"
+    );
+    assert_eq!(playlist_cover_path(&conn, "pid-none").expect("read"), None);
+}
+
+/// like_apply 的改名跟随依赖这条语义：对没有本地行的 pid（纯云端卡片）
+/// rename_playlist 是无害 no-op —— 不报错也不造行。
+#[test]
+fn rename_playlist_is_noop_without_local_row() {
+    let conn = test_conn();
+    add_liked_playlist(&conn, "local", "pid-only-card", "纯卡片", "", "").expect("add card");
+    assert_eq!(
+        rename_playlist(&conn, "pid-only-card", "新名").expect("rename"),
+        0
+    );
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM playlists WHERE pid = 'pid-only-card'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count");
+    assert_eq!(n, 0, "no-op 改名不该把卡片认领成本地行");
+}
+
 /// 下载任务生命周期：创建 → 进度 → 完成 / 失败 → 删除（DESIGN §5.3）
 #[test]
 fn download_task_lifecycle() {

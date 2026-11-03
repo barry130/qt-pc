@@ -1,6 +1,6 @@
 {
-  "generatedAt": "2026-11-02T08:26:40.048Z",
-  "total": 2338,
+  "generatedAt": "2026-11-02T12:23:43.544Z",
+  "total": 2337,
   "files": {
     "src/App.tsx": 3,
     "src/components/AppearancePage.tsx": 1,
@@ -37,7 +37,7 @@
     "src/components/discovery/DailyRecommendPage.tsx": 46,
     "src/components/discovery/DiscoverPage.tsx": 34,
     "src/components/discovery/HorizontalScroller.tsx": 6,
-    "src/components/discovery/PlaylistDetailPage.tsx": 60,
+    "src/components/discovery/PlaylistDetailPage.tsx": 59,
     "src/components/discovery/PlaylistsPage.tsx": 13,
     "src/components/discovery/Skeletons.tsx": 6,
     "src/components/discovery/TrackCard.tsx": 3,

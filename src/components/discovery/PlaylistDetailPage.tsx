@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Heart, ImageDown, Search, Share2, SlidersHorizontal, X } from "lucide-react";
+import { Heart, ImageDown, Pencil, Search, Share2, SlidersHorizontal, X } from "lucide-react";
 import { useNavigate } from "@tanstack/react-router";
 import { errMsg } from "@/lib/utils";
 import { filterTracks, retainTrackSelection, trackSelectionKey } from "@/lib/track-selection";
@@ -17,6 +17,8 @@ import { TrackSortSelect } from "@/components/TrackSortSelect";
 import { BackButton } from "@/components/layout/BackButton";
 import { IconButton } from "@/components/common/IconButton";
 import { SmartPlaylistDialog, describeRules } from "@/components/mine/SmartPlaylistDialog";
+import { invalidatePlaylistCoverCache } from "@/lib/playlist-cover-cache";
+import { useT } from "@/lib/i18n";
 import { PlaylistShareCard } from "@/components/player/PlaylistShareCard";
 import { useDismissOnOutside } from "@/hooks/useDismissOnOutside";
 import { toastSuccess } from "@/stores/toast";
@@ -154,6 +156,8 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
   const [smartOpen, setSmartOpen] = useState(false);
   /** 歌单分享卡弹层（A9）：出成一张图发出去 */
   const [shareOpen, setShareOpen] = useState(false);
+  /** 本地歌单编辑弹层（改名 + 换封面）：智能歌单也能用，名称/封面与规则正交 */
+  const [editOpen, setEditOpen] = useState(false);
   /**
    * 智能歌单另存为静态歌单：把「此刻规则算出来的结果」固化成一张普通歌单，
    * 之后就能手动增删了。规则本身不动，两边互不影响 —— 这是给「想再挑几首」
@@ -243,9 +247,11 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
           }
           // 回退链第一环：歌单自设封面（未设置 / 文件丢了都是 null）
           const own = await ipc.getPlaylistCover(id).catch(() => null);
-          // 第二环：第一首曲目的封面；一首歌都没有就留给默认占位
-          const fallback = !own && list.length > 0 ? await trackCover(list[0]) : null;
-          if (!cancelled) setCover(own ?? fallback);
+          // 第二环：云端卡片封面（远程同步来的歌单只有 pic_url，列表页用的就是这张）
+          const shared = !own ? qtresCoverUrl(summary?.picUrl ?? "") ?? "" : "";
+          // 第三环：第一首曲目的封面；一首歌都没有就留给默认占位
+          const fallback = !own && !shared && list.length > 0 ? await trackCover(list[0]) : null;
+          if (!cancelled) setCover(own ?? (shared.length > 0 ? shared : fallback));
         } else {
           const pl = await sourceApi.getPlaylistDetail(platform as SourceId, id);
           if (cancelled) return;
@@ -437,6 +443,12 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
     // refresh 只写 ref + setState，依赖里放进来反而每渲染都跑
   }, [favVersion, isLocal]);
 
+  // 本地歌单封面挂「更换封面」蒙层（UPDATE_DESIGN §5.3）：hover 整张封面浮出按钮，
+  // 和标题旁的「编辑歌单」开同一个弹窗 —— 改名和封面是同一个编辑入口，不拆两个；
+  // 在线歌单/榜单的封面归音源所有，不挂。
+  // 编辑入口（本地歌单，含智能歌单）：改名 + 换封面同一个弹窗，远程同步来的卡片歌单
+  // 也能编辑 —— 后端会先认领成本地行再改。
+  const tr = useT();
   const fallbackTitle = isChart ? "榜单详情" : "歌单详情";
 
   return (
@@ -458,7 +470,19 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
               收在这个高度以内，不许把页头撑得比封面高（用户 2026-10-24：「左边图片，
               右边内容，高度不要超过图片，内容全部往右边搭」）。与每日推荐页同尺寸，
               两页 hero 模板保持一套；歌单/专辑页保持 144px 那套，不动。 */}
-          <HeroCover src={cover} fallback={name || (isChart ? "榜" : "歌")} size="lg" />
+          <div className="group/cover relative shrink-0">
+            <HeroCover src={cover} fallback={name || (isChart ? tr("playlist.detail.fallbackChart") : tr("playlist.detail.fallbackPlaylist"))} size="lg" />
+            {isLocal ? (
+              <button
+                type="button"
+                onClick={() => setEditOpen(true)}
+                aria-label={tr("playlist.edit.changeCover")}
+                className="absolute inset-0 flex items-end justify-center rounded-2xl bg-black/45 pb-3 text-xs font-medium text-white opacity-0 transition-opacity hover:opacity-100 group-hover/cover:opacity-100"
+              >
+                {tr("playlist.edit.changeCover")}
+              </button>
+            ) : null}
+          </div>
           <div className="flex min-w-0 flex-1 flex-col justify-end pb-1">
             <HeroEyebrow>{isLocal ? "我的歌单" : isChart ? "榜单" : "歌单"}</HeroEyebrow>
             <h1 className="mt-1 truncate text-2xl font-bold tracking-tight">
@@ -527,6 +551,19 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
                   onClick={() => void exportPlaylist()}
                 >
                   <Share2 className="h-4 w-4" />
+                </IconButton>
+              ) : null}
+              {isLocal ? (
+                <IconButton
+                  label={tr("playlist.edit.menu")}
+                  variant="outline"
+                  size="lg"
+                  hover="secondary"
+                  disabled={!name}
+                  className="h-9 w-9 rounded-lg"
+                  onClick={() => setEditOpen(true)}
+                >
+                  <Pencil className="h-4 w-4" />
                 </IconButton>
               ) : null}
               {/* 分享卡（A9）：封面拼图 + 歌单名 + 曲目数 + 二维码，出的是图不是链接。
@@ -650,6 +687,25 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
         </Modal>
       )}
 
+      {editOpen && (
+        <PlaylistEditDialog
+          pid={id}
+          name={name}
+          coverUrl={cover}
+          onClose={() => {
+            setEditOpen(false);
+            // 换/清封面在弹窗里即时生效，关窗（含取消/Esc/点遮罩）后必须重算一次，
+            // 否则 hero 还挂着打开弹窗前的封面，而列表页已经显示新封面（2026-11-02 审阅）。
+            refresh();
+          }}
+          onSaved={(nextName) => {
+            // 名字先就地上屏（hero 标题），再静默重载让封面回退链重算
+            if (nextName) setName(nextName);
+            refresh();
+          }}
+        />
+      )}
+
       {smartOpen && (
         <SmartPlaylistDialog
           playlist={{ pid: id, name }}
@@ -663,5 +719,143 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
         />
       )}
     </div>
+  );
+}
+
+/**
+ * 本地歌单编辑弹窗（改名 + 换封面，UPDATE_DESIGN §5.3 的「同一编辑入口」）。
+ *
+ * 换封面：pickImage 选图 → Rust 复制进应用数据目录并登记 cover_path（远程
+ * 同步来的卡片歌单后端会先认领成本地行），登录态下 Rust 顺带把封面上传云端
+ * （配额每日 2 次，失败只警告不阻塞本地）。「恢复默认封面」清掉自设封面，
+ * 回落回退链（首曲封面 → 占位）；登录态下连云端封面一起清。
+ * 改名：走 renamePlaylist，Rust 会把新名上送云端，他端同步跟随。
+ * 保存只在名字真的变了时才调改名接口 —— 封面操作是即时生效的，不需要等保存。
+ */
+function PlaylistEditDialog(props: {
+  pid: string;
+  name: string;
+  coverUrl: string | null;
+  onClose: () => void;
+  onSaved: (nextName: string) => void;
+}): React.JSX.Element {
+  const [draftName, setDraftName] = useState(props.name);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<string | null>(props.coverUrl);
+  const tr = useT();
+
+  const pickCover = async (): Promise<void> => {
+    setError(null);
+    const path = await ipc.pickImage(tr("playlist.edit.pickCover"));
+    if (!path) return;
+    try {
+      const result = await ipc.setPlaylistCover(props.pid, path);
+      invalidatePlaylistCoverCache(props.pid);
+      // 复制完读回 data URL 当预览（返回的只是文件路径，渲染不了）
+      const url = await ipc.getPlaylistCover(props.pid).catch(() => null);
+      setPreview(url);
+      // 云端失败不回滚本地，但要把原因亮出来（每日配额 2 次等）
+      if (result.cloud === "failed") {
+        setError(tr("playlist.edit.coverUpdatedCloudFailed", { error: result.message ?? tr("playlist.edit.unknownError") }));
+      } else if (result.cloud === "offline") {
+        setError(tr("playlist.edit.coverOffline"));
+      }
+    } catch (err) {
+      setError(tr("playlist.edit.coverChangeFailed", { error: errMsg(err) }));
+    }
+  };
+
+  const clearCover = async (): Promise<void> => {
+    setError(null);
+    try {
+      const result = await ipc.clearPlaylistCover(props.pid);
+      invalidatePlaylistCoverCache(props.pid);
+      // 预览先落回占位；真正的回退链（首曲封面）由关闭后的静默重载重算
+      setPreview(null);
+      if (result.cloud === "failed") {
+        setError(tr("playlist.edit.coverRestoredCloudFailed", { error: result.message ?? tr("playlist.edit.unknownError") }));
+      }
+    } catch (err) {
+      setError(tr("playlist.edit.coverRestoreFailed", { error: errMsg(err) }));
+    }
+  };
+
+  const save = async (): Promise<void> => {
+    const next = draftName.trim();
+    if (!next) {
+      setError(tr("playlist.edit.nameEmpty"));
+      return;
+    }
+    setBusy(true);
+    try {
+      if (next !== props.name) await ipc.renamePlaylist(props.pid, next);
+      props.onSaved(next);
+      props.onClose();
+    } catch (err) {
+      setError(tr("playlist.edit.saveFailed", { error: errMsg(err) }));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal open onClose={props.onClose} title={tr("playlist.edit.title")} size="sm">
+      <div className="flex flex-col gap-4 py-1">
+        <div className="flex items-center gap-4">
+          <div className="h-20 w-20 shrink-0 overflow-hidden rounded-xl bg-secondary shadow-surface ring-1 ring-border">
+            {preview ? (
+              <img src={preview} alt="" className="h-full w-full object-cover" />
+            ) : (
+              <span className="flex h-full w-full items-center justify-center text-2xl font-bold text-muted-foreground/50">
+                {(props.name || tr("playlist.detail.fallbackPlaylist")).slice(0, 1)}
+              </span>
+            )}
+          </div>
+          <div className="flex flex-col gap-2">
+            <div className="flex gap-2">
+              <Button variant="outline" size="xs" onClick={() => void pickCover()}>
+                {tr("playlist.edit.changeCover")}
+              </Button>
+              <Button variant="ghost" size="xs" onClick={() => void clearCover()}>
+                {tr("playlist.edit.restoreCover")}
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {tr("playlist.edit.coverHint")}
+            </p>
+          </div>
+        </div>
+        <label className="flex flex-col gap-1.5">
+          <span className="text-xs text-muted-foreground">{tr("playlist.edit.nameLabel")}</span>
+          <input
+            value={draftName}
+            onChange={(e) => setDraftName(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                void save();
+              }
+            }}
+            aria-label={tr("playlist.edit.nameLabel")}
+            maxLength={100}
+            className="h-8 rounded-lg border border-input bg-background px-3 text-sm outline-none focus:ring-1 focus:ring-ring"
+          />
+        </label>
+        {error ? (
+          <p role="alert" className="text-xs text-destructive">
+            {error}
+          </p>
+        ) : null}
+        <div className="flex justify-end gap-2">
+          <Button variant="outline" size="xs" onClick={props.onClose}>
+            {tr("playlist.edit.cancel")}
+          </Button>
+          <Button variant="primary" size="xs" disabled={busy} onClick={() => void save()}>
+            {tr("playlist.edit.save")}
+          </Button>
+        </div>
+      </div>
+    </Modal>
   );
 }

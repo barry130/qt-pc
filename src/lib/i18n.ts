@@ -13,6 +13,7 @@ import { messages as desktopLyricMessages } from "@/lib/i18n-fragments/settings-
 import { messages as scrobbleMessages } from "@/lib/i18n-fragments/settings-scrobble";
 import { messages as aiMessages } from "@/lib/i18n-fragments/settings-ai";
 import { messages as sourcePackageMessages } from "@/lib/i18n-fragments/settings-source-package";
+import { messages as playlistEditMessages } from "@/lib/i18n-fragments/playlist-edit";
 
 /**
  * 界面语言（B6）：先落一套「界面框架」翻译，正文内容（歌名、歌单名、简介）不译。
@@ -166,6 +167,7 @@ type FragmentMessageKey =
   | keyof (typeof scrobbleMessages)["zh"]
   | keyof (typeof aiMessages)["zh"]
   | keyof (typeof sourcePackageMessages)["zh"]
+  | keyof (typeof playlistEditMessages)["zh"]
 ;
 
 export type MessageKey = BaseMessageKey | FragmentMessageKey;
@@ -294,6 +296,7 @@ const FRAGMENTS = [
   scrobbleMessages,
   aiMessages,
   sourcePackageMessages,
+  playlistEditMessages,
 ] as const;
 
 const zhAll: Record<string, string> = Object.assign({}, zhCN, ...FRAGMENTS.map((f) => f.zh));

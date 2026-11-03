@@ -764,6 +764,7 @@ pub fn run() {
             cmd_rename_playlist,
             cmd_delete_playlist,
             cmd_set_playlist_cover,
+            cmd_clear_playlist_cover,
             cmd_get_playlist_cover,
             cmd_list_my_playlists,
             cmd_get_playlist_tracks,

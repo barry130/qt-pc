@@ -75,10 +75,13 @@ pub(crate) fn list_my_playlists(conn: &Connection) -> Result<Vec<MyPlaylist>, ru
 
     // 2) 本地自建歌单：覆盖同 pid 的云端卡片（本地行有老关系表/封面等信息）。
     //    曲目 = 挂在该 pid 下的收藏（liked_songs.pid）实时数。
+    //    封面回退：本地行没自设封面（cover_path 空）时显示同 pid 云端卡片的
+    //    封面（远程同步来的本地歌单，封面也在云端；UPDATE_DESIGN §5.3）。
+    //    JOIN 限定 platform='local'：同 pid 不会同时挂两个平台，但收紧不亏。
     {
         let mut stmt = conn.prepare(
             "SELECT p.id, p.pid, p.name,
-                    COALESCE(p.cover_path, ''),
+                    COALESCE(p.cover_path, c.pic_url, ''),
                     (SELECT COUNT(*) FROM liked_songs ls
                       WHERE ls.pid = p.pid AND ls.deleted_at IS NULL
                       AND ls.id IN (SELECT song_id FROM liked_song_playlists WHERE pid = p.pid))
@@ -88,6 +91,8 @@ pub(crate) fn list_my_playlists(conn: &Connection) -> Result<Vec<MyPlaylist>, ru
                                            WHERE ls2.id = pt.track_id AND ls2.deleted_at IS NULL)),
                     p.created_at, p.is_smart
                FROM playlists p
+               LEFT JOIN liked_playlists c
+                      ON c.pid = p.pid AND c.platform = 'local' AND c.deleted_at IS NULL
               ORDER BY p.created_at DESC",
         )?;
         let mut rows = stmt.query([])?;
@@ -208,16 +213,17 @@ pub(crate) fn playlist_pid_exists(conn: &Connection, pid: &str) -> Result<bool, 
     Ok(cloud > 0)
 }
 
+/// 改自建歌单名（按 pid 定位）。返回受影响行数：
+/// 0 = 该 pid 没有本地行（云端卡片 / 在线歌单），调用方自行决定是否报错。
 pub(crate) fn rename_playlist(
     conn: &Connection,
     pid: &str,
     name: &str,
-) -> Result<(), rusqlite::Error> {
+) -> Result<usize, rusqlite::Error> {
     conn.execute(
         "UPDATE playlists SET name = ?1, updated_at = ?2 WHERE pid = ?3",
         params![name, now_ms(), pid],
-    )?;
-    Ok(())
+    )
 }
 
 /// 登记本地自建歌单封面文件路径（playlists.cover_path）。按 pid 定位，
@@ -248,6 +254,72 @@ pub(crate) fn playlist_cover_path(
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// 清掉封面登记（cover_path = NULL，回到默认封面链）。返回受影响行数：
+/// 0 = 该 pid 没有本地行，或本来就没设过封面（都无需动作）。
+pub(crate) fn clear_playlist_cover_path(
+    conn: &Connection,
+    pid: &str,
+) -> Result<usize, rusqlite::Error> {
+    conn.execute(
+        "UPDATE playlists SET cover_path = NULL, updated_at = ?2
+          WHERE pid = ?1 AND cover_path IS NOT NULL",
+        params![pid, now_ms()],
+    )
+}
+
+/// 认领「他端创建、同步到本机」的本地歌单卡片（liked_playlists 有
+/// platform=local 卡片、playlists 无本地行）：补一条本地行，让改名 /
+/// 换封面这些自建歌单能力也能作用于它（用户 2026-11-02 需求：
+/// 本地歌单改名/换封面要覆盖远程同步来的本地歌单）。
+///
+/// 名字与 created_at 从卡片继承（认领不该把歌单挪到「我的歌单」顶部，
+/// 也不该丢名字）；卡片的 updated_seq 直接当作云端确认点（cloud_seq）
+/// 落下来 —— 卡片本来就是云端同步来的，「云端已确认」是事实。
+/// 幂等：playlists 已有行直接返回 1；连卡片都没有（在线歌单 / pid
+/// 不存在）返回 0，由调用方决定是否报错。
+pub(crate) fn adopt_card_playlist(
+    conn: &Connection,
+    pid: &str,
+) -> Result<usize, rusqlite::Error> {
+    let exists: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM playlists WHERE pid = ?1",
+        params![pid],
+        |r| r.get(0),
+    )?;
+    if exists > 0 {
+        return Ok(1);
+    }
+    let card: Option<(String, Option<i64>, i64)> = conn
+        .query_row(
+            "SELECT COALESCE(name, ''), updated_seq, COALESCE(created_at, 0)
+               FROM liked_playlists
+              WHERE pid = ?1 AND platform = ?2 AND deleted_at IS NULL",
+            params![pid, LOCAL_PLATFORM],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((card_name, card_seq, card_created)) = card else {
+        return Ok(0);
+    };
+    let now = now_ms();
+    let id = format!("pl_{}_{}", now, fastrand::u64(..));
+    // 卡片没名字就退回 pid（与 like_apply 落卡片名同口径），不造空名歌单
+    let name: &str = if card_name.is_empty() {
+        pid
+    } else {
+        card_name.as_str()
+    };
+    // 卡片的 updated_seq 是 0/NULL（没带确认点）时保持「从未确认」语义
+    let cloud_seq: Option<i64> = card_seq.filter(|s| *s > 0);
+    conn.execute(
+        "INSERT INTO playlists (id, pid, name, is_smart, sort_order, is_favorite,
+                                created_at, updated_at, cloud_seq)
+         VALUES (?1, ?2, ?3, 0, 0, 0, ?4, ?5, ?6)",
+        params![id, pid, name, card_created, now, cloud_seq],
+    )?;
+    Ok(1)
 }
 
 /// 删除歌单（按 pid 定位）：摘掉该歌单下所有归属；

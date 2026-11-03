@@ -3031,12 +3031,22 @@ pub async fn cmd_rename_playlist(
     };
     let (for_db, id) = (id.clone(), id);
     let value = name.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| crate::db::store::rename_playlist(conn, &for_db, &value))
+    let touched = tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| {
+            // 远程同步来的本地歌单（云端卡片、无本地行）：先认领成自建行，
+            // 改名才有落处；在线歌单 / 不存在的 pid 认领返回 0，下面统一报错
+            if crate::db::store::adopt_card_playlist(conn, &for_db)? == 0 {
+                return Ok(0usize);
+            }
+            crate::db::store::rename_playlist(conn, &for_db, &value)
+        })
     })
     .await
     .map_err(|e| format!("重命名歌单失败: {e}"))?
     .map_err(|e| format!("重命名歌单失败: {e}"))?;
+    if touched == 0 {
+        return Err("歌单不存在".to_string());
+    }
     // 歌单名是云端 qt_like_playlist 的元数据，改名要上送（后端按 pid upsert、
     // 非空覆盖）；不推的话其他端永远显示旧名 —— uniappx 没有改名功能，
     // 这是设计文档 §2 操作表里缺失的一行
@@ -3044,17 +3054,34 @@ pub async fn cmd_rename_playlist(
     Ok(())
 }
 
+/// set_playlist_cover 的回执：云端失败不改变「本地已生效」的事实，但必须
+/// 原样带回给前端提示——封面上传有每日配额（2 次/用户，全部歌单合计），
+/// 超限是常态而非异常，静默吞掉会让用户以为云端也换了（用户 2026-11-02
+/// 实测踩中「今日上传次数已达上限」，查库才发现没同步）。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistCoverSetResult {
+    /// 本地封面文件路径（本地已生效）
+    pub path: String,
+    /// 云端同步结果：synced=已上送并推卡片；offline=未登录跳过；failed=失败（见 message）
+    pub cloud: String,
+    /// failed 时的原因（后端原文，如「今日上传次数已达上限」）
+    pub message: Option<String>,
+}
+
 /// 设置本地自建歌单封面：把选中的图片复制进应用数据目录
 /// （playlist-covers/{pid}.{ext}，覆盖式；扩展名变化时清掉旧文件避免残留），
-/// 再登记 playlists.cover_path，返回封面文件新路径。
-/// 只对本地自建歌单生效；云端卡片 / 在线歌单没有本地封面字段，会拒绝。
+/// 再登记 playlists.cover_path。远程同步来的卡片歌单会先认领成本地行
+/// （adopt_card_playlist）；在线歌单没有本地封面字段，会拒绝。
+/// 登录时顺手把封面文件上送云端（qt_like_playlist.pic_url）；云端失败不
+/// 回滚本地，但通过回执把失败原因带回前端提示。
 #[tauri::command(rename = "set_playlist_cover")]
 pub async fn cmd_set_playlist_cover(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     pid: String,
     file_path: String,
-) -> Result<String, String> {
+) -> Result<PlaylistCoverSetResult, String> {
     // pid 直接拼文件名，先收紧字符集防路径穿越（本地 pid 本就是 [A-Za-z0-9_-]）
     if pid.is_empty()
         || pid.len() > 128
@@ -3083,6 +3110,25 @@ pub async fn cmd_set_playlist_cover(
     let covers_dir = crate::app_paths::data_root(&app).join("playlist-covers");
     let dest = covers_dir.join(format!("{pid}.{mime_ext}"));
 
+    let Some(db) = state.db.clone() else {
+        return Err("数据库不可用".to_string());
+    };
+    // 先认领再复制文件：远程同步来的本地歌单（云端卡片、无本地行）在这里
+    // 补上本地行，封面登记才不会落空（用户 2026-11-02：换封面要覆盖
+    // 远程同步来的本地歌单）；连卡片都没有（在线歌单 / pid 不存在）直接
+    // 拒绝，免得白复制一个文件再删
+    let pid_for_adopt = pid.clone();
+    let db_for_adopt = db.clone();
+    let adopted = tauri::async_runtime::spawn_blocking(move || {
+        db_for_adopt.with(|conn| crate::db::store::adopt_card_playlist(conn, &pid_for_adopt))
+    })
+    .await
+    .map_err(|e| format!("登记封面失败: {e}"))?
+    .map_err(|e| format!("登记封面失败: {e}"))?;
+    if adopted == 0 {
+        return Err("歌单不存在".to_string());
+    }
+
     let (pid_copy, file_path_copy, dest_copy) = (pid.clone(), file_path.clone(), dest.clone());
     tauri::async_runtime::spawn_blocking(move || {
         std::fs::create_dir_all(&covers_dir).map_err(|e| format!("创建封面目录失败: {e}"))?;
@@ -3099,12 +3145,10 @@ pub async fn cmd_set_playlist_cover(
     .await
     .map_err(|e| format!("复制封面失败: {e}"))??;
 
-    let Some(db) = state.db.clone() else {
-        return Err("数据库不可用".to_string());
-    };
     let dest_str = dest.to_string_lossy().to_string();
+    let pid_for_register = pid.clone();
     let updated = tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| crate::db::store::set_playlist_cover_path(conn, &pid, &dest_str))
+        db.with(|conn| crate::db::store::set_playlist_cover_path(conn, &pid_for_register, &dest_str))
     })
     .await
     .map_err(|e| format!("登记封面失败: {e}"))?
@@ -3114,7 +3158,129 @@ pub async fn cmd_set_playlist_cover(
         let _ = std::fs::remove_file(&dest);
         return Err("只有本地自建歌单可以更换封面".to_string());
     }
-    Ok(dest.to_string_lossy().to_string())
+    // 封面上云（UPDATE_DESIGN.md §5.3）：本地登记成功后顺手把封面文件传到
+    // 云端并刷新 qt_like_playlist.pic_url，其他端才能跟着换。上传有每日
+    // 配额（每用户 2 次，全部歌单合计），失败 / 离线是常态，只记日志不
+    // 阻塞本地生效——但结果要带回前端提示（静默吞掉会让用户以为云端也
+    // 换了，用户 2026-11-02 实测踩中配额上限后反馈「后端没变化」）。
+    let mut cloud = "offline".to_string();
+    let mut cloud_message: Option<String> = None;
+    if state.astral.has_token() {
+        let pid_for_upload = pid.clone();
+        let dest_for_upload = dest.to_string_lossy().to_string();
+        match state
+            .astral
+            .upload_cover_file(&pid_for_upload, "local", &dest_for_upload)
+            .await
+        {
+            Ok(url) => {
+                // 推封面要带着当前名字一起推（like_playlist 元数据 upsert 语义）
+                let pid_for_name = pid.clone();
+                let display_name = match state.db.clone() {
+                    Some(db2) => tauri::async_runtime::spawn_blocking(move || {
+                        db2.with(|conn| playlist_name_by_pid(conn, &pid_for_name))
+                    })
+                    .await
+                    .map_err(|e| format!("登记封面失败: {e}"))?
+                    .unwrap_or_default(),
+                    None => String::new(),
+                };
+                push_like_playlist(&state, "local", &pid, &display_name, Some(&url), "add").await;
+                cloud = "synced".to_string();
+            }
+            Err(e) => {
+                log::warn!("[like] 歌单封面上送云端失败（不影响本地封面）: {e}");
+                cloud = "failed".to_string();
+                cloud_message = Some(e);
+            }
+        }
+    }
+    Ok(PlaylistCoverSetResult {
+        path: dest.to_string_lossy().to_string(),
+        cloud,
+        message: cloud_message,
+    })
+}
+
+/// 清除本地歌单封面（回到默认封面链）：清 playlists.cover_path + 删封面
+/// 文件；登录时顺带清云端封面（DELETE qt_like_playlist 封面，其他端也回
+/// 默认）。对远程同步来的本地歌单（云端卡片）同样生效：它没有本地封面
+/// 文件，本地只是回退链变化，云端清除失败不影响本机观感——但结果要带回
+/// 前端提示（与 set_playlist_cover 同口径）。
+#[tauri::command(rename = "clear_playlist_cover")]
+pub async fn cmd_clear_playlist_cover(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    pid: String,
+) -> Result<PlaylistCoverClearResult, String> {
+    // pid 校验与 set_playlist_cover 同款（这里不拼文件名，但口径保持一致）
+    if pid.is_empty()
+        || pid.len() > 128
+        || !pid
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err("歌单标识非法".to_string());
+    }
+    let Some(db) = state.db.clone() else {
+        return Err("数据库不可用".to_string());
+    };
+    let pid_for_db = pid.clone();
+    let exists = tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| {
+            let exists = crate::db::store::playlist_pid_exists(conn, &pid_for_db)?;
+            if exists {
+                crate::db::store::clear_playlist_cover_path(conn, &pid_for_db)?;
+            }
+            Ok(exists)
+        })
+    })
+    .await
+    .map_err(|e| format!("清除封面失败: {e}"))?
+    .map_err(|e| format!("清除封面失败: {e}"))?;
+    if !exists {
+        return Err("歌单不存在".to_string());
+    }
+    // 删封面文件：登记的是当前路径，早年换格式可能留过别的扩展名，一并扫掉。
+    // 没登记过也扫一遍，兜「文件在、登记丢」的账。
+    let covers_dir = crate::app_paths::data_root(&app).join("playlist-covers");
+    let pid_for_rm = pid.clone();
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        for old_ext in ["png", "jpg", "webp"] {
+            let _ = std::fs::remove_file(covers_dir.join(format!("{pid_for_rm}.{old_ext}")));
+        }
+    })
+    .await;
+    // 云端封面一并清（app/user/like/playlist/{pid}/cover DELETE）；
+    // 未登录 / 失败只记日志：本机已经回默认了，别让云端抖动挡住本地操作，
+    // 但结果带回前端提示
+    let mut cloud = "offline".to_string();
+    let mut cloud_message: Option<String> = None;
+    if state.astral.has_token() {
+        match state.astral.cover_clear(&pid, "local").await {
+            Ok(()) => cloud = "synced".to_string(),
+            Err(e) => {
+                log::warn!("[like] 清除云端歌单封面失败（不影响本地）: {e}");
+                cloud = "failed".to_string();
+                cloud_message = Some(e);
+            }
+        }
+    }
+    Ok(PlaylistCoverClearResult {
+        cloud,
+        message: cloud_message,
+    })
+}
+
+/// clear_playlist_cover 的回执（与 PlaylistCoverSetResult 同口径，只是
+/// 清除动作没有本地路径要带）。
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistCoverClearResult {
+    /// synced=云端也已清除；offline=未登录跳过；failed=失败（见 message）
+    pub cloud: String,
+    /// failed 时的原因（后端原文）
+    pub message: Option<String>,
 }
 
 /// 读本地歌单封面（playlists.cover_path 指向的图片），转 data URL 返回。
@@ -4795,6 +4961,12 @@ pub async fn cmd_like_apply(
                         // 自建歌单的云端回声：记确认点，对账据此识别「他端删除」
                         if c.platform == crate::db::store::LOCAL_PLATFORM && c.updated_seq > 0 {
                             crate::db::store::mark_playlist_cloud_seq(conn, &c.id, c.updated_seq)?;
+                        }
+                        // 他端改名跟随（2026-11-02）：认领过 / 本机自建的本地行
+                        // 同步改名 —— 认领后本地行在合并视图里赢卡片，不跟的话
+                        // 他端改名在本机永不生效。0 行 = 纯卡片无行可改，无害。
+                        if c.platform == crate::db::store::LOCAL_PLATFORM && !c.name.is_empty() {
+                            crate::db::store::rename_playlist(conn, &c.id, &c.name)?;
                         }
                     }
                     applied += 1;
