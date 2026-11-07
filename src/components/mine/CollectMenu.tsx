@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, Plus } from "lucide-react";
 import { errMsg } from "@/lib/utils";
-import { buildCollectChoice, type CollectChoicePlan } from "@/lib/collect-choice";
+import { buildCollectChoiceAsync, type CollectChoicePlan } from "@/lib/collect-choice";
 import { applyCollectChoice } from "@/lib/apply-collect-choice";
 import { CollectChoice } from "./CollectChoice";
 import { useFavoritesStore } from "@/stores/favorites";
@@ -155,7 +155,9 @@ export function CollectMenu(props: {
       const epoch = await ipc.likeSessionEpoch();
       const existing = await ipc.getPlaylistTracks(p.pid);
       if (await ipc.likeSessionEpoch() !== epoch || !active(token)) return;
-      const plan = buildCollectChoice(existing, [track]);
+      const plan = await buildCollectChoiceAsync(existing, [track], () => active(token));
+      if (!plan || !active(token)) return;
+      if (await ipc.likeSessionEpoch() !== epoch || !active(token)) return;
       if (plan.groups.length > 0) {
         setPending({ playlist: p, plan, existing, epoch });
         return;

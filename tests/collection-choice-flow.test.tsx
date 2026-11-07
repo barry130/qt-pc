@@ -30,6 +30,7 @@ import { BatchBar } from "@/components/discovery/BatchBar";
 import { trackSelectionKey } from "@/lib/track-selection";
 import { CollectButton as PlayerCollectButton } from "@/components/player/CollectButton";
 import { CollectButton as RowCollectButton } from "@/components/mine/CollectButton";
+import * as choices from "@/lib/collect-choice";
 
 const song = (platform: string, id = "1", title = "稻香"): Track => ({
   platform, id, title, singer: "周杰伦", album: "魔杰座", duration: 220, picUrl: "",
@@ -178,6 +179,43 @@ describe("collection choice production flow", () => {
     await act(async () => { resolve([a]); });
     expect(ui.queryByTestId("collect-choice")).toBeNull();
     expect(io.add).not.toHaveBeenCalled();
+  });
+
+  it.each(["single", "batch", "new"] as const)("%s ignores a yielded check after the panel is unmounted", async (entry) => {
+    let finish!: (plan: choices.CollectChoicePlan) => void;
+    const planner = vi.spyOn(choices, "buildCollectChoiceAsync").mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    try {
+      const tracks = [b], selected = new Set(tracks.map(trackSelectionKey));
+      const ui = render(entry === "single" ? <CollectMenu track={b} onClose={() => {}} />
+        : <BatchBar tracks={tracks} selected={selected} selectionKey={trackSelectionKey} onSelectedChange={() => {}} />);
+      if (entry !== "single") fireEvent.click(ui.getByRole("button", { name: "批量收藏（1）" }));
+      await ui.findByText("回归歌单");
+      if (entry === "new") {
+        fireEvent.change(ui.getByPlaceholderText("新建歌单并收藏"), { target: { value: "新歌单" } });
+        fireEvent.click(ui.getByRole("button", { name: "新建歌单并收藏" }));
+      } else fireEvent.click(ui.getByText("回归歌单"));
+      await waitFor(() => expect(planner).toHaveBeenCalledOnce());
+      const active = planner.mock.calls[0][2];
+      expect(active()).toBe(true);
+      ui.unmount();
+      expect(active()).toBe(false);
+      await act(async () => { finish({ groups: [], adds: [b], removes: [] }); });
+      expect(io.add).not.toHaveBeenCalled(); expect(io.remove).not.toHaveBeenCalled();
+    } finally { planner.mockRestore(); }
+  });
+
+  it("rechecks the account after a yielded check before displaying a choice", async () => {
+    let finish!: (plan: choices.CollectChoicePlan) => void;
+    const planner = vi.spyOn(choices, "buildCollectChoiceAsync").mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    try {
+      const ui = render(<CollectMenu track={b} onClose={() => {}} />);
+      fireEvent.click(await ui.findByText("回归歌单"));
+      await waitFor(() => expect(planner).toHaveBeenCalledOnce());
+      session++;
+      await act(async () => { finish(choices.buildCollectChoice([a], [b])); });
+      expect(ui.queryByTestId("collect-choice")).toBeNull();
+      expect(io.add).not.toHaveBeenCalled(); expect(io.remove).not.toHaveBeenCalled();
+    } finally { planner.mockRestore(); }
   });
 
   it("batch save uses the same version selection and updates the host playlist", async () => {

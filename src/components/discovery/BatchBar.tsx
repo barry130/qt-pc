@@ -7,7 +7,7 @@ import {
   X,
 } from "lucide-react";
 import { cn, errMsg } from "@/lib/utils";
-import { buildCollectChoice, type CollectChoicePlan } from "@/lib/collect-choice";
+import { buildCollectChoiceAsync, type CollectChoicePlan } from "@/lib/collect-choice";
 import { applyCollectChoice } from "@/lib/apply-collect-choice";
 import { CollectChoice } from "@/components/mine/CollectChoice";
 import { legacyTrackSelectionKey, trackSelectionKey, type TrackSelectionKey } from "@/lib/track-selection";
@@ -420,7 +420,9 @@ export function BatchBar(props: {
       const epoch = await ipc.likeSessionEpoch();
       const existing = await ipc.getPlaylistTracks(p.pid);
       if (await ipc.likeSessionEpoch() !== epoch || version !== scopeVersion.current) return;
-      const plan = buildCollectChoice(existing, manageOnly ? targets : adds);
+      const plan = await buildCollectChoiceAsync(existing, manageOnly ? targets : adds, () => version === scopeVersion.current);
+      if (!plan || version !== scopeVersion.current) return;
+      if (await ipc.likeSessionEpoch() !== epoch || version !== scopeVersion.current) return;
       if (plan.groups.length > 0) { setPending({ playlist: p, plan, existing, epoch }); return; }
       if (manageOnly) { setMenuError("选中的歌曲没有跨源重复版本"); return; }
       await addTo(p, plan, existing, epoch, version);
@@ -456,7 +458,9 @@ export function BatchBar(props: {
       const pid = await ipc.createPlaylist(n);
       if (await ipc.likeSessionEpoch() !== epoch || version !== scopeVersion.current) return;
       setNewName("");
-      const plan = buildCollectChoice([], targets);
+      const plan = await buildCollectChoiceAsync([], targets, () => version === scopeVersion.current);
+      if (!plan || version !== scopeVersion.current) return;
+      if (await ipc.likeSessionEpoch() !== epoch || version !== scopeVersion.current) return;
       if (plan.groups.length > 0) {
         const fresh = await ipc.listMyPlaylists();
         if (version !== scopeVersion.current) return;
