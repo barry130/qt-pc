@@ -37,6 +37,7 @@ vi.mock("@/services/ipc", () => ({
   getPlaylistTracks: mocks.getPlaylistTracks,
   addTracksToPlaylist: mocks.addTracksToPlaylist,
   removeTracksFromPlaylist: mocks.removeTracksFromPlaylist,
+  likeSessionEpoch: vi.fn(async () => 1),
   checkFavoriteFlags: vi.fn(async (tracks: Track[]) => tracks.map(() => false)),
   checkDisliked: vi.fn(async (tracks: Track[]) => tracks.map(() => false)),
   isPlaylistFavorited: vi.fn(async () => false),

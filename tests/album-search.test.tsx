@@ -9,7 +9,8 @@ const mocks = vi.hoisted(() => ({
   getAlbumDetail: vi.fn(),
   playQueue: vi.fn(async () => ({ applied: true, ticket: 0, target: null })),
   startDownload: vi.fn(async (_track: Track, _quality: string) => undefined),
-  addTracksToPlaylist: vi.fn(async (_pid: string, tracks: Track[]) => tracks.length),
+  collected: [] as Track[],
+  addTracksToPlaylist: vi.fn(),
 }));
 vi.mock("@tanstack/react-router", () => ({
   useParams: () => mocks.route,
@@ -29,7 +30,8 @@ vi.mock("@/services/ipc", () => ({
   getDownloadQuality: vi.fn(async () => "320k"),
   startDownload: mocks.startDownload,
   listMyPlaylists: vi.fn(async () => [{ pid: "p1", name: "收藏目标", platform: "local", trackCount: 0 }]),
-  getPlaylistTracks: vi.fn(async () => []),
+  getPlaylistTracks: vi.fn(async () => mocks.collected.slice()),
+  likeSessionEpoch: vi.fn(async () => 1),
   addTracksToPlaylist: mocks.addTracksToPlaylist,
 }));
 
@@ -58,6 +60,11 @@ beforeEach(() => {
   mocks.searchMusic.mockReset().mockResolvedValue(songs);
   mocks.getAlbumDetail.mockReset().mockRejectedValue(new Error("no album api"));
   mocks.route = { platform: "qq", id: "Album" };
+  mocks.collected = [];
+  mocks.addTracksToPlaylist.mockReset().mockImplementation(async (_pid: string, tracks: Track[]) => {
+    mocks.collected.push(...tracks);
+    return tracks.length;
+  });
   usePlayerStore.setState({ playQueue: mocks.playQueue });
   seedPageSize(10);
   // all 模式的任务按 cacheKey 缓存在模块上（卸载也继续跑）：不清就会拿上一条用例的全量
@@ -84,7 +91,8 @@ describe("专辑内搜索", () => {
     expect(mocks.startDownload.mock.calls[0][0]).toEqual(songs[1]);
     fireEvent.click(screen.getByLabelText("批量收藏（1）"));
     fireEvent.click(await screen.findByText("收藏目标"));
-    await waitFor(() => expect(mocks.addTracksToPlaylist).toHaveBeenCalledWith("p1", [songs[1]]));
+    await waitFor(() => expect(mocks.addTracksToPlaylist).toHaveBeenCalledWith("p1", [songs[1]], 1));
+    expect(mocks.collected).toEqual([songs[1]]);
     expect(mocks.searchMusic).toHaveBeenCalledTimes(1);
   });
 

@@ -7,9 +7,11 @@ import {
   X,
 } from "lucide-react";
 import { cn, errMsg } from "@/lib/utils";
-import { findCrossSourceDup } from "@/lib/collect-dup";
+import { buildCollectChoice, type CollectChoicePlan } from "@/lib/collect-choice";
+import { applyCollectChoice } from "@/lib/apply-collect-choice";
+import { CollectChoice } from "@/components/mine/CollectChoice";
 import { legacyTrackSelectionKey, trackSelectionKey, type TrackSelectionKey } from "@/lib/track-selection";
-import { clampQualityForPlatform, useSourceLabelFn } from "@/stores/sourceRegistry";
+import { clampQualityForPlatform } from "@/stores/sourceRegistry";
 import { sourceDownloadQualityOf } from "@/lib/source-quality";
 import { useFavoritesStore } from "@/stores/favorites";
 import { toastSuccess, toastUndo } from "@/stores/toast";
@@ -18,7 +20,7 @@ import type { MyPlaylistSummary, Track } from "@/types";
 import * as ipc from "@/services/ipc";
 import { IconButton } from "@/components/common/IconButton";
 import { Popover } from "@/components/common/Popover";
-import { Spinner } from "@/components/ui";
+import { Button, Spinner } from "@/components/ui";
 
 /**
  * 列表批量管理条（**歌单详情 / 榜单详情 / 每日新歌 / 歌手页 / 专辑页共用**）。
@@ -108,19 +110,14 @@ export function BatchBar(props: {
    */
   const [members, setMembers] = useState<Record<string, Set<string>>>({});
   const [membersLoading, setMembersLoading] = useState(false);
-  /**
-   * 「同名不同源」待确认：目标歌单里已经有另一平台的同一首歌时先拦一下，
-   * 用户点「继续收藏」才真的写入（收藏表按 platform+id 唯一，两首能共存，
-   * 界面上就是重复的两行 —— 加入前提示比加完再删轻松得多）。
-   * `adds` 是这次真正要新增的那部分（已在歌单里的不算）。
-   */
+  /** 新旧及同批重复版本的待提交选择。 */
   const [pending, setPending] = useState<{
     playlist: MyPlaylistSummary;
-    adds: Track[];
-    dups: Track[];
+    plan: CollectChoicePlan;
+    existing: Track[];
+    epoch: number;
   } | null>(null);
 
-  const sourceLabel = useSourceLabelFn();
   const bump = useFavoritesStore((s) => s.bump);
   const favVersion = useFavoritesStore((s) => s.version);
   const scopeVersion = useRef(0);
@@ -128,6 +125,8 @@ export function BatchBar(props: {
     scopeVersion.current += 1;
     setMenuOpen(false);
     setPending(null);
+    setMenuBusy(false);
+    setMembersLoading(false);
   };
 
   const targets = useMemo(
@@ -147,6 +146,9 @@ export function BatchBar(props: {
     setPending(null);
     setMenuError(null);
     setNewName("");
+    setMenuBusy(false);
+    setMembersLoading(false);
+    return () => { scopeVersion.current += 1; };
   }, [tracks, selected]);
 
   /**
@@ -248,6 +250,16 @@ export function BatchBar(props: {
     }
   };
 
+  const refreshMembers = async (version: number): Promise<void> => {
+    const fresh = await ipc.listMyPlaylists();
+    if (version !== scopeVersion.current) return;
+    const list = fresh.filter(p => p.platform === ipc.LOCAL_PLATFORM);
+    const nextMembers = await computeMembers(list);
+    if (version !== scopeVersion.current) return;
+    setItems(list);
+    setMembers(nextMembers);
+  };
+
   /** 这个歌单里已包含几首选中曲目 */
   const inPlaylist = (p: MyPlaylistSummary): number => {
     const set = members[p.pid];
@@ -326,14 +338,17 @@ export function BatchBar(props: {
   /** 批量从某个歌单摘掉这些曲目（云端按 outcome 逐首推，与单曲版同一条路径） */
   const removeFrom = async (p: MyPlaylistSummary, list: Track[]): Promise<void> => {
     if (menuBusy || list.length === 0) return;
+    const version = scopeVersion.current;
     setMenuBusy(true);
     setMenuError(null);
     try {
-      await ipc.removeTracksFromPlaylist(p.pid, list);
+      const epoch = await ipc.likeSessionEpoch();
+      if (version !== scopeVersion.current) return;
+      await ipc.removeTracksFromPlaylist(p.pid, list, epoch);
       // 收藏态变了：让所有列表重新批量判定红心
       bump();
       // 面板里这行的勾要跟着变：重算一次归属，别让用户看到过期的勾
-      setMembers(await computeMembers(items));
+      await refreshMembers(version);
       // 摘的正是宿主页自己这个歌单 → 那几行必须从页面上消失
       if (hostPlaylistId !== undefined && p.pid === hostPlaylistId) onChanged?.();
       // 回执带「撤销」：取消收藏是高频低风险操作，弹二次确认太重，
@@ -341,28 +356,31 @@ export function BatchBar(props: {
       toastUndo(`已从「${p.name}」取消收藏 ${list.length} 首`, async () => {
         // 反向操作就是原样加回去。批量接口不接位置，这几首会排到歌单末尾 ——
         // 归属对了，顺序变了，这点代价写在报告里（歌单顺序不是用户会依赖的强语义）
-        await ipc.addTracksToPlaylist(p.pid, list);
+        if (await ipc.likeSessionEpoch() !== epoch) throw new Error("账号已变化，无法撤销旧账号的收藏");
+        await ipc.addTracksToPlaylist(p.pid, list, epoch);
         bump();
-        setMembers(await recomputeRef.current());
+        const latestMembers = await recomputeRef.current();
+        if (version === scopeVersion.current) setMembers(latestMembers);
         if (hostPlaylistId !== undefined && p.pid === hostPlaylistId) onChanged?.();
       });
     } catch (err) {
-      setMenuError(errMsg(err));
+      if (version === scopeVersion.current) setMenuError(errMsg(err));
     } finally {
-      setMenuBusy(false);
+      if (version === scopeVersion.current) setMenuBusy(false);
     }
   };
 
-  const addTo = async (p: MyPlaylistSummary, adds: Track[]): Promise<void> => {
-    if (menuBusy || adds.length === 0) return;
+  const addTo = async (p: MyPlaylistSummary, plan: CollectChoicePlan, existing: Track[], epoch: number, version: number): Promise<void> => {
+    if (version !== scopeVersion.current || plan.adds.length === 0) return;
     setMenuBusy(true);
     setMenuError(null);
     try {
       // 走批量收藏接口：已在歌单里的由后端 ON CONFLICT 跳过，返回的是真实新增数
-      const added = await ipc.addTracksToPlaylist(p.pid, adds);
-      const skipped = adds.length - added;
+      await applyCollectChoice(p.pid, plan, existing, epoch, () => version === scopeVersion.current);
+      const added = plan.adds.length;
       bump();
-      setMembers(await computeMembers(items));
+      await refreshMembers(version);
+      if (version !== scopeVersion.current) return;
       setPending(null);
       // 加的就是宿主页自己这个歌单（本地歌单页里选中的曲目其实都已在其中，
       // 走不到这里；但归属被别处改过时可能走到）→ 让页面重新对齐一次
@@ -370,15 +388,11 @@ export function BatchBar(props: {
       // 回执必须带「到哪儿」和「新增几首」：只说「已收藏 N 首」会被当成
       // 「这批里已收藏 N 首」的状态，跟左边的「已选 N 首」并列时尤其像
       // （只有 1 首是新的那次，就成了「已选 100 首 已收藏 1 首」）
-      report(
-        skipped > 0
-          ? `已收藏 ${added} 首到「${p.name}」，其余 ${skipped} 首已在里面`
-          : `已收藏 ${added} 首到「${p.name}」`,
-      );
+      report(`已收藏 ${added} 首到「${p.name}」`);
     } catch (err) {
-      setMenuError(errMsg(err));
+      if (version === scopeVersion.current) setMenuError(errMsg(err));
     } finally {
-      setMenuBusy(false);
+      if (version === scopeVersion.current) setMenuBusy(false);
     }
   };
 
@@ -387,72 +401,86 @@ export function BatchBar(props: {
    * 只加缺的那些（后端也会再兜一层跳过），所以「一部分在里面」时不会把已有的
    * 那几首重新插一遍（位置、加入时间都保住）。
    */
-  const toggleFor = async (p: MyPlaylistSummary): Promise<void> => {
-    if (menuBusy || count === 0) return;
+  const toggleFor = async (p: MyPlaylistSummary, manageOnly = false): Promise<void> => {
+    if (menuBusy || pending || count === 0) return;
     const have = inPlaylist(p);
     const adds = missingIn(p);
-    if (have === count) {
+    if (have === count && !manageOnly) {
       await removeFrom(p, targets);
       return;
     }
-    if (adds.length === 0) {
+    if (adds.length === 0 && !manageOnly) {
       // 归属刚被别处改过：重算一遍再让用户点，别拿旧勾做动作
       setMembers(await computeMembers(items));
       return;
     }
     const version = scopeVersion.current;
-    // 加入前查重一次（只查真正要新增的那部分）：查重失败不拦收藏 ——
-    // 重复顶多是两行，拦住是功能不可用（与单曲版同口径）
-    let existing: Track[] = [];
+    setMenuBusy(true); setMenuError(null);
     try {
-      existing = await ipc.getPlaylistTracks(p.pid);
-    } catch {
-      // 读不到就当作没重
-    }
-    // 查重等待期间可能已筛掉这些曲目，不能再恢复旧确认或提交旧 adds。
-    if (version !== scopeVersion.current) return;
-    const dups =
-      existing.length > 0
-        ? adds.flatMap((t) => findCrossSourceDup(t, Array.isArray(existing) ? existing : []))
-        : [];
-    if (dups.length > 0) {
-      // 同一首已存在的歌可能被多首选中项判成重复（比如选中的两首是同一首
-      // 不同平台），按「平台:id」去重后再报数，别把 1 首说成 3 首
-      const seen = new Set<string>();
-      const unique = dups.filter((d) => {
-        const k = keyOf(d);
-        if (seen.has(k)) return false;
-        seen.add(k);
-        return true;
-      });
-      setPending({ playlist: p, adds, dups: unique });
-      return;
-    }
-    await addTo(p, adds);
+      const epoch = await ipc.likeSessionEpoch();
+      const existing = await ipc.getPlaylistTracks(p.pid);
+      if (await ipc.likeSessionEpoch() !== epoch || version !== scopeVersion.current) return;
+      const plan = buildCollectChoice(existing, manageOnly ? targets : adds);
+      if (plan.groups.length > 0) { setPending({ playlist: p, plan, existing, epoch }); return; }
+      if (manageOnly) { setMenuError("选中的歌曲没有跨源重复版本"); return; }
+      await addTo(p, plan, existing, epoch, version);
+    } catch (err) { if (version === scopeVersion.current) setMenuError(errMsg(err)); }
+    finally { if (version === scopeVersion.current) setMenuBusy(false); }
+  };
+
+  const saveChoice = async (plan: CollectChoicePlan): Promise<void> => {
+    if (!pending || menuBusy) return;
+    const version = scopeVersion.current;
+    setMenuBusy(true); setMenuError(null);
+    try {
+      await applyCollectChoice(pending.playlist.pid, plan, pending.existing, pending.epoch, () => version === scopeVersion.current);
+      bump();
+      await refreshMembers(version);
+      if (version !== scopeVersion.current) return;
+      setPending(null);
+      if (pending.playlist.pid === hostPlaylistId) onChanged?.();
+      report('已更新「' + pending.playlist.name + '」中的歌曲版本');
+    } catch (err) { if (version === scopeVersion.current) setMenuError(errMsg(err)); }
+    finally { if (version === scopeVersion.current) setMenuBusy(false); }
   };
 
   const createAndCollect = async (): Promise<void> => {
     const n = newName.trim();
-    if (!n || menuBusy || count === 0) return;
+    if (!n || menuBusy || pending || count === 0) return;
+    const version = scopeVersion.current;
     setMenuBusy(true);
     setMenuError(null);
     try {
-      // 新建的歌单必然是空的，不需要查重，直接批量写入
+      const epoch = await ipc.likeSessionEpoch();
+      if (version !== scopeVersion.current) return;
       const pid = await ipc.createPlaylist(n);
+      if (await ipc.likeSessionEpoch() !== epoch || version !== scopeVersion.current) return;
       setNewName("");
-      const added = await ipc.addTracksToPlaylist(pid, targets);
+      const plan = buildCollectChoice([], targets);
+      if (plan.groups.length > 0) {
+        const fresh = await ipc.listMyPlaylists();
+        if (version !== scopeVersion.current) return;
+        setItems(fresh.filter(p => p.platform === ipc.LOCAL_PLATFORM));
+        const playlist = fresh.find(p => p.pid === pid);
+        if (!playlist) throw new Error("新歌单未找到，请刷新重试");
+        setPending({ playlist, plan, existing: [], epoch });
+        return;
+      }
+      const added = await ipc.addTracksToPlaylist(pid, targets, epoch);
       bump();
       const fresh = await ipc.listMyPlaylists();
       const list = (Array.isArray(fresh) ? fresh : []).filter(
         (p) => p.platform === ipc.LOCAL_PLATFORM,
       );
+      const nextMembers = await computeMembers(list);
+      if (version !== scopeVersion.current) return;
       setItems(list);
-      setMembers(await computeMembers(list));
+      setMembers(nextMembers);
       report(`已收藏 ${added} 首到「${n}」`);
     } catch (err) {
-      setMenuError(errMsg(err));
+      if (version === scopeVersion.current) setMenuError(errMsg(err));
     } finally {
-      setMenuBusy(false);
+      if (version === scopeVersion.current) setMenuBusy(false);
     }
   };
 
@@ -545,9 +573,9 @@ export function BatchBar(props: {
         {() => (
           <div className="absolute right-0 top-full z-20 mt-1 w-60 rounded-xl border border-border bg-popover/95 p-1 backdrop-blur-xl shadow-raised">
             <div className="px-2 py-1 text-xs text-muted-foreground">
-              {membersLoading ? "读取歌单…" : `收藏 / 取消收藏 ${count} 首`}
+              {pending ? `歌单：${pending.playlist.name}` : membersLoading ? "读取歌单…" : `收藏 / 取消收藏 ${count} 首`}
             </div>
-            <div className="max-h-56 overflow-y-auto">
+            {!pending ? <div className="max-h-56 overflow-y-auto">
               {items.length === 0 ? (
                 <div className="px-2 py-2 text-xs text-muted-foreground">
                   还没有本地歌单，下面新建一个
@@ -557,10 +585,11 @@ export function BatchBar(props: {
                   const have = inPlaylist(p);
                   const all = count > 0 && have === count;
                   return (
+                    <div key={p.pid} className="flex items-center">
                     <button
                       key={p.pid}
                       type="button"
-                      disabled={menuBusy || membersLoading}
+                      disabled={menuBusy || membersLoading || pending !== null}
                       // 全在里面 → 这一下是取消收藏；否则只加缺的那些
                       title={
                         all
@@ -570,7 +599,7 @@ export function BatchBar(props: {
                             : `收藏到「${p.name}」`
                       }
                       onClick={() => void toggleFor(p)}
-                      className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs transition-colors hover:bg-secondary disabled:opacity-50"
+                      className="flex min-w-0 flex-1 items-center gap-2 rounded px-2 py-1.5 text-left text-xs transition-colors hover:bg-secondary disabled:opacity-50"
                     >
                       <span className="min-w-0 flex-1 truncate">{p.name}</span>
                       {have > 0 && !all ? (
@@ -579,49 +608,20 @@ export function BatchBar(props: {
                       {all ? <Check className="h-3.5 w-3.5 shrink-0 text-primary" /> : null}
                       <span className="shrink-0 text-muted-foreground">{p.trackCount}</span>
                     </button>
+                    {have > 0 ? <Button variant="ghost" size="xs" disabled={menuBusy || membersLoading} aria-label={`整理「${p.name}」的重复版本`} title="选择保留哪些重复版本" onClick={() => { void toggleFor(p, true); }}>版本</Button> : null}
+                    </div>
                   );
                 })
               )}
-            </div>
+            </div> : null}
 
             {/* 同名不同源确认条：替换掉歌单列表，避免用户在下面又点另一个
                 歌单把这个提示顶掉（确认错对象） */}
             {pending !== null ? (
-              <div
-                data-testid="batch-collect-dup-confirm"
-                className="border-t border-border px-2 py-2"
-              >
-                <p className="text-2xs leading-snug text-foreground/90">
-                  「{pending.playlist.name}」里已经有了
-                  {pending.dups.length > 1 ? ` ${pending.dups.length} 首` : ""}同名的
-                  {sourceLabel(pending.dups[0].platform)}版本
-                  {pending.dups.length === 1 ? (
-                    <span className="text-muted-foreground">（{pending.dups[0].singer}）</span>
-                  ) : null}
-                  ，仍要收藏？
-                </p>
-                <div className="mt-2 flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    disabled={menuBusy}
-                    onClick={() => void addTo(pending.playlist, pending.adds)}
-                    className="flex-1 rounded border border-border px-2 py-1 text-2xs transition-colors hover:bg-secondary disabled:opacity-50"
-                  >
-                    继续收藏
-                  </button>
-                  <button
-                    type="button"
-                    disabled={menuBusy}
-                    onClick={() => setPending(null)}
-                    className="flex-1 rounded border border-border px-2 py-1 text-2xs text-muted-foreground transition-colors hover:bg-secondary disabled:opacity-50"
-                  >
-                    取消
-                  </button>
-                </div>
-              </div>
+              <CollectChoice key={pending.playlist.pid} plan={pending.plan} busy={menuBusy} onCancel={() => { setPending(null); setMenuError(null); }} onSave={(plan) => { void saveChoice(plan); }} />
             ) : null}
 
-            <div className="mt-1 flex items-center gap-1 border-t border-border pt-1">
+            {!pending ? <div className="mt-1 flex items-center gap-1 border-t border-border pt-1">
               <input
                 value={newName}
                 onChange={(e) => setNewName(e.target.value)}
@@ -640,7 +640,7 @@ export function BatchBar(props: {
               >
                 <Plus className="h-3.5 w-3.5" />
               </button>
-            </div>
+            </div> : null}
 
             {menuError && (
               <div className="px-2 py-1 text-2xs text-destructive">{menuError}</div>

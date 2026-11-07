@@ -29,8 +29,8 @@ export function CollectButton(props: {
   // 批量判定回来 / 别处收藏后，以列表层的结果为准
   useEffect(() => setLiked(favorited), [favorited]);
 
-  // 换了一首歌就把面板收起，别对着上一首操作
-  useEffect(() => setOpen(false), [track]);
+  // 列表数据刷新也会重建 track，只有歌曲身份改变才收起。
+  useEffect(() => setOpen(false), [track.platform, track.id]);
 
   return (
     <Popover

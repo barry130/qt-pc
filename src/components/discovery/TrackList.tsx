@@ -317,7 +317,7 @@ interface TrackRowProps {
   removeLabel: string;
   onChanged: () => void;
   onError: (msg: string) => void;
-  play: (track: Track) => Promise<void>;
+  play: (track: Track, beforeResolve?: Promise<unknown>) => Promise<void>;
   /** 行内补充说明（每日推荐的推荐理由）；空则不渲染 */
   reason?: string;
 }
@@ -811,9 +811,9 @@ const TrackRow = memo(function TrackRow(props: TrackRowProps): React.JSX.Element
           <div className="rounded-xl border border-border bg-popover/95 backdrop-blur-xl p-3 text-popover-foreground shadow-raised">
             <SourceSwitchPanel
               track={t}
-              onPick={(candidate) => {
+              onPick={(candidate, _original, beforeResolve) => {
                 setPanel(null);
-                void play(candidate);
+                return play(candidate, beforeResolve);
               }}
             />
           </div>

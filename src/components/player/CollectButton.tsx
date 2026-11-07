@@ -47,8 +47,8 @@ export function CollectButton(props: { track: Track | null }): React.JSX.Element
     // version 参与依赖：在列表行里收藏了同一首歌，播放条的红心也要跟着亮
   }, [track, version]);
 
-  // 曲目切了就把面板收起，避免对着上一首歌操作
-  useEffect(() => setOpen(false), [track]);
+  // 播放快照会重新创建 track；同一首的进度/元数据刷新不能清掉版本选择。
+  useEffect(() => setOpen(false), [track?.platform, track?.id]);
 
   return (
     <Popover
@@ -59,6 +59,8 @@ export function CollectButton(props: { track: Track | null }): React.JSX.Element
           type="button"
           aria-label={tr("player.collect")}
           title={tr("player.collect")}
+          aria-expanded={t.open}
+          aria-haspopup="menu"
           disabled={!track}
           onClick={t.toggle}
           className={[

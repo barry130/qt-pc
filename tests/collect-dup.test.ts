@@ -1,13 +1,14 @@
 /**
  * 收藏查重（lib/collect-dup.ts）：目标歌单里已有「同名不同源」的歌时报警。
  *
- * 判定要与换源（lib/source-switch.ts 的 scoreCandidate）保持同口径的归一化，
- * 但这里只关心「是不是同名」，不打分 —— 所以翻唱（同名不同歌手）不算重复，
+ * 按歌名、歌手、专辑相似度提供候选；所以翻唱（同名不同歌手）不算重复，
  * 同平台同名也不算（那是同一首歌，收藏本身幂等）。
  */
 import { describe, expect, it } from "vitest";
 
 import { findCrossSourceDup } from "@/lib/collect-dup";
+import { compareCollectMatch, prepareCollectMatch } from "@/lib/collect-match";
+import cases from "./fixtures/collect-match.json";
 import type { Track } from "@/types";
 
 function track(platform: string, title: string, singer: string): Track {
@@ -22,6 +23,26 @@ function track(platform: string, title: string, singer: string): Track {
     musicId: null,
   };
 }
+
+describe("收藏相似度：跨端共用用例", () => {
+  it.each(cases)("$label", ({ a, b, match }) => {
+    const left = { ...track("qq", a[0], a[1]), album: a[2] };
+    const right = { ...track("wyy", b[0], b[1]), album: b[2] };
+    const forward = compareCollectMatch(prepareCollectMatch(a[0], a[1], a[2]), prepareCollectMatch(b[0], b[1], b[2]));
+    expect(forward.matches).toBe(match);
+    expect(compareCollectMatch(prepareCollectMatch(b[0], b[1], b[2]), prepareCollectMatch(a[0], a[1], a[2]))).toEqual(forward);
+    expect(findCrossSourceDup(left, [right])).toEqual(match ? [right] : []);
+    expect(findCrossSourceDup(left, [{ ...right, platform: "qq" }])).toEqual([]);
+  });
+
+  it("缺失的歌手/专辑不冒充100%匹配，非精确短名称不参与模糊匹配", () => {
+    expect(compareCollectMatch(prepareCollectMatch("Hello", "", ""), prepareCollectMatch("Hello", "", "")))
+      .toEqual({ title: 100, singer: null, album: null, matches: true });
+    expect(compareCollectMatch(prepareCollectMatch("爱", "Adele", "25"), prepareCollectMatch("爱情", "Adele", "25")).matches).toBe(false);
+    expect(compareCollectMatch(prepareCollectMatch("晴天之后", "abcd", "Summer Days"), prepareCollectMatch("晴天以后", "abce", "Summer Dayz")))
+      .toEqual({ title: 75, singer: 75, album: 90, matches: true });
+  });
+});
 
 describe("收藏查重：同名不同源", () => {
   it("同名、不同源 → 冲突", () => {
