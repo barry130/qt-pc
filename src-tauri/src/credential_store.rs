@@ -157,7 +157,7 @@ mod platform {
 
     const SERVICE: &str = "qt-music.astral";
     static KEYCHAIN_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    fn classify(error: security_framework::Error) -> CredentialError {
+    fn classify(error: security_framework::base::Error) -> CredentialError {
         match error.code() {
             -25291 | -25308 | -128 => CredentialError::Unavailable,
             _ => CredentialError::Failed,
