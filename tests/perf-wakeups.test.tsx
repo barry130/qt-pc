@@ -90,4 +90,36 @@ describe("进度插值的调度方式（资源优化）", () => {
 
     expect(interval).not.toHaveBeenCalled();
   });
+
+  it("不需要时间轴的文字稿既不挂定时器，也不因播放锚点更新而重渲染；恢复时立即对齐", () => {
+    const renderCount = vi.fn();
+    function OptionalProbe({ enabled }: { enabled: boolean }): React.JSX.Element {
+      renderCount();
+      const ms = useInterpolatedPosition(enabled);
+      return <span data-testid="optional-pos">{ms}</span>;
+    }
+    const interval = vi.spyOn(window, "setInterval");
+    const ui = render(<OptionalProbe enabled={false} />);
+    const before = renderCount.mock.calls.length;
+    act(() => {
+      usePlayerStore.setState({ positionAnchorValue: 42_000 });
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(renderCount).toHaveBeenCalledTimes(before);
+    expect(interval).not.toHaveBeenCalled();
+    expect(calls).toBe(0);
+    act(() => { usePlayerStore.setState({ interpolatedPositionMs: () => 42_035 }); });
+    ui.rerender(<OptionalProbe enabled />);
+    expect(screen.getByTestId("optional-pos").textContent).toBe("42000");
+    expect(interval).toHaveBeenCalledTimes(1);
+    ui.rerender(<OptionalProbe enabled={false} />);
+    const after = renderCount.mock.calls.length;
+    act(() => {
+      usePlayerStore.setState({ positionAnchorValue: 43_000 });
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(renderCount).toHaveBeenCalledTimes(after);
+    expect(screen.getByTestId("optional-pos").textContent).toBe("0");
+    expect(vi.getTimerCount()).toBe(0);
+  });
 });

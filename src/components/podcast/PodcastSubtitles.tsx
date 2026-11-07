@@ -116,7 +116,7 @@ export function PodcastSubtitles(props: { audioUrl: string }): React.JSX.Element
 
 const SubtitleReader = memo(function SubtitleReader(props: { document: SubtitleDocument; mode: string }): React.JSX.Element {
   const { document: doc, mode } = props;
-  const position = useInterpolatedPosition();
+  const position = useInterpolatedPosition(doc.timed);
   const active = doc.timed ? subtitleIndex(doc.cues, position) : -1;
   const [resumeAt, setResumeAt] = useState(0);
   const follow = resumeAt === 0;
@@ -126,7 +126,7 @@ const SubtitleReader = memo(function SubtitleReader(props: { document: SubtitleD
   const current = useRef<HTMLButtonElement | null>(null);
   const seek = usePlayerStore((s) => s.seekTo);
   const pendingSeek = usePlayerStore((s) => s.pendingSeekMs);
-  const preceding = precedingSubtitleIndex(doc.cues, position);
+  const preceding = doc.timed ? precedingSubtitleIndex(doc.cues, position) : -1;
   const visiblePage = Math.min(Math.floor((doc.cues.length - 1) / PAGE_SIZE), follow && doc.timed ? Math.floor(Math.max(0, preceding) / PAGE_SIZE) : page);
   const offset = visiblePage * PAGE_SIZE;
   const target = Math.max(0, active >= 0 ? active : preceding);
