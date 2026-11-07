@@ -18,6 +18,7 @@
 - DLNA 作为原生 AudioEngine 的输出适配器接入，不复制队列或播放状态机。详见 [DLNA 实现](docs/DLNA_IMPLEMENTATION.md)。
 - 账号凭据留在原生系统凭据库，WebView 仅持有安全会话视图；登录代次约束上传、同步与配置回执。开发热更新保持同一个认证 store，已挂载标题栏和资料页不产生独立副本。
 - 原生测试入口 `scripts/check-native.mjs` 显式启用公开配置和独占临时目录；前端测试使用内存存储边界。CI 与本机共用门禁，不借用真实用户数据和凭据。
+- 收藏查重复用准备好的候选元数据并按约 8ms 分片；无时间轴文字稿停用位置插值订阅。本机资源、base 识别与轻量翻译数据见 [性能检查](docs/performance-2026-11-07.md)。
 
 ## 0. 基线核对与修订记录
 
@@ -2141,11 +2142,11 @@ struct PlayUrlKey { platform: SourceId, track_id: String, quality: Quality }
 | 层 | 频率 | 说明 |
 |---|---|---|
 | Rust `sink.get_pos()` | 250ms | 发 `position-changed { positionMs, monotonicMs }`，`monotonicMs` 为发送时刻单调时钟 |
-| 前端插值 | `requestAnimationFrame` | `pos = lastPos + (performance.now() - lastRecvAt)`，播放中才插值 |
-| 校正 | 每次收到 tick | 若插值值与真实值偏差 > 120ms 则硬跳，否则在 200ms 内平滑收敛，避免歌词抖动 |
-| seek / 切歌 | 立即 | 立即发一次 tick，取消插值 |
+| 主窗口前端插值 | 100ms 定时器 | `pos = lastPos + (performance.now() - lastRecvAt)`，按 100ms 量化；暂停及无时间轴文字稿不启动定时器 |
+| 校正 | 每次收到 tick | 更新位置与单调时钟锚点；待确认 seek 期间保留乐观目标，直到原生确认或超时 |
+| seek / 切歌 | 立即 | 更新锚点，通过 layout effect 在绘制前对齐展示 |
 
-误差来源与预算：音频输出缓冲延迟（约 20–40ms，可用固定偏移补偿）+ 事件传递（<5ms）+ 插值误差（<16ms），合计可控在 50ms 内。**桌面歌词窗口必须自行插值**，不能依赖主窗口转发（见 §10.2）。
+100ms 四舍五入的取整误差上界为 ±50ms，但定时器调度、音频输出缓冲及事件传递还会产生额外延迟，不能据此宣称端到端同步误差必然小于 50ms。**桌面歌词窗口必须自行插值**，不能依赖主窗口转发（见 §10.2）。
 
 ## 7.12 播放失败分类与自动切歌熔断（2026-10-03 弱网修复）
 

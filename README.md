@@ -224,6 +224,7 @@ qt-pc/
 | [`docs/plan-playlist-merge.md`](docs/plan-playlist-merge.md) | 收藏 / 歌单模型重构方案 |
 | [`docs/collection-matching.md`](docs/collection-matching.md) | 跨源同曲匹配阈值、版本选择与播放源偏好 |
 | [`docs/podcast-subtitles.md`](docs/podcast-subtitles.md) | 云端 / 本地识别、引擎模型下载、翻译、自动生成与桌面字幕 |
+| [`docs/performance-2026-11-07.md`](docs/performance-2026-11-07.md) | 开发版资源采样、大歌单优化、本地识别与翻译实测 |
 | [`docs/DLNA.md`](docs/DLNA.md) | 局域网投屏使用与设备能力限制 |
 | [`docs/DLNA_IMPLEMENTATION.md`](docs/DLNA_IMPLEMENTATION.md) | 投屏模块、控制代次与可复现协议联调 |
 | [`docs/UI-COMPONENTS.md`](docs/UI-COMPONENTS.md) | **共享 UI 组件清单与使用规则**：写界面前先查这里，按钮/输入/弹窗/空态/骨架全部走 `@/components/ui` |
