@@ -11,167 +11,19 @@ use tauri::webview::WebviewWindowBuilder;
 use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, WebviewUrl};
 
 #[cfg(target_os = "windows")]
-use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
-#[cfg(target_os = "windows")]
-use windows::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, FindWindowW, GetMessageW, IsWindowVisible, SetWindowLongPtrW, SetWindowPos,
-    TranslateMessage, EVENT_SYSTEM_FOREGROUND, GWLP_HWNDPARENT, HWND_TOPMOST, MSG, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, WINEVENT_OUTOFCONTEXT,
-};
+mod topmost;
 
 use crate::db::store::{get_setting, set_setting};
 use crate::db::Database;
 use crate::AppState;
 
-/// 在 Windows 上直接把歌词窗口放入系统 TOPMOST 层。
-/// Tauri 的 set_always_on_top 在无焦点透明窗口贴近任务栏时可能只维持进程内层级，
-/// 其他应用激活后仍会覆盖窗口，因此这里使用 Win32 SetWindowPos 强制系统级置顶。
-#[cfg(target_os = "windows")]
-fn force_windows_topmost(win: &tauri::WebviewWindow) -> Result<(), String> {
-    let hwnd = win
-        .hwnd()
-        .map_err(|e| format!("获取歌词窗口句柄失败: {e}"))?;
-    unsafe {
-        SetWindowPos(
-            hwnd,
-            Some(HWND_TOPMOST),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        )
-        .map_err(|e| format!("设置歌词窗口系统级置顶失败: {e}"))?;
-    }
+/// 歌词保持独立顶层窗口；置顶维护不建立与 Explorer 任务栏的 owner 关系。
+fn apply_topmost(win: &tauri::WebviewWindow, enabled: bool) -> Result<(), String> {
+    win.set_always_on_top(enabled).map_err(|e| format!("{e}"))?;
+    #[cfg(target_os = "windows")]
+    topmost::request_restore(win.app_handle());
     Ok(())
 }
-
-#[cfg(target_os = "windows")]
-fn attach_lyric_to_taskbar(win: &tauri::WebviewWindow) -> Result<(), String> {
-    let hwnd = win
-        .hwnd()
-        .map_err(|e| format!("获取歌词窗口句柄失败: {e}"))?;
-    let taskbar = unsafe { FindWindowW(windows::core::w!("Shell_TrayWnd"), None) }
-        .map_err(|e| format!("查找 Windows 任务栏窗口失败: {e}"))?;
-    if taskbar.0.is_null() {
-        return Err("未找到 Windows 任务栏窗口".to_string());
-    }
-    unsafe {
-        // windows 0.62 在 32 位下把 SetWindowLongPtrW re-export 成 SetWindowLongW，
-        // 参数是 i32 而非 isize；用 `as _` 让编译器按目标指针宽度推断（x64/arm64 推成
-        // isize，i686 推成 i32），否则 i686 交叉编译报 E0308。
-        SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, taskbar.0 as _);
-    }
-    force_windows_topmost(win)
-}
-
-#[cfg(not(target_os = "windows"))]
-fn force_windows_topmost(_win: &tauri::WebviewWindow) -> Result<(), String> {
-    Ok(())
-}
-
-#[cfg(not(target_os = "windows"))]
-fn attach_lyric_to_taskbar(win: &tauri::WebviewWindow) -> Result<(), String> {
-    // 仍然走 force_windows_topmost，而不是直接 Ok(())：非 Windows 的替身得被
-    // 调用，否则它自己变成 dead code，撞 `-D dead_code`（非 Windows 平台 CI 红过）
-    force_windows_topmost(win)
-}
-
-/// 将歌词窗口重新放到 TOPMOST 组最前端，不激活窗口、不改变位置和大小。
-#[cfg(target_os = "windows")]
-fn restore_lyric_topmost(raw_hwnd: usize) {
-    let hwnd = windows::Win32::Foundation::HWND(raw_hwnd as *mut core::ffi::c_void);
-    if unsafe { IsWindowVisible(hwnd) }.as_bool() {
-        let _ = unsafe {
-            SetWindowPos(
-                hwnd,
-                Some(HWND_TOPMOST),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-            )
-        };
-    }
-}
-
-/// Windows 会在 EVENT_SYSTEM_FOREGROUND 发出后继续调整 Shell_TrayWnd 的 Z-order。
-/// 因此先立即恢复一次，再做几次短延迟重试，覆盖 Explorer 的异步重排窗口。
-/// 代次计数用于让连续切换应用时的旧重试任务尽快退出，避免相互竞争。
-#[cfg(target_os = "windows")]
-unsafe extern "system" fn foreground_changed(
-    _hook: HWINEVENTHOOK,
-    event: u32,
-    _foreground: windows::Win32::Foundation::HWND,
-    _object_id: i32,
-    _child_id: i32,
-    _event_thread: u32,
-    _event_time: u32,
-) {
-    if event != EVENT_SYSTEM_FOREGROUND {
-        return;
-    }
-    let Some(raw_hwnd) = LYRIC_HWND.get().copied() else {
-        return;
-    };
-
-    restore_lyric_topmost(raw_hwnd);
-    let generation = TOPMOST_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-    let _ = std::thread::Builder::new()
-        .name("lyric-topmost-retry".to_string())
-        .spawn(move || {
-            for delay_ms in [16_u64, 40, 90, 180] {
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-                if TOPMOST_GENERATION.load(std::sync::atomic::Ordering::SeqCst) != generation {
-                    return;
-                }
-                restore_lyric_topmost(raw_hwnd);
-            }
-        });
-}
-
-#[cfg(target_os = "windows")]
-static LYRIC_HWND: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-#[cfg(target_os = "windows")]
-static TOPMOST_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(target_os = "windows")]
-fn start_topmost_guard(app: AppHandle) {
-    if let Some(win) = app.get_webview_window(LYRIC_WINDOW_LABEL) {
-        if let Ok(hwnd) = win.hwnd() {
-            let _ = LYRIC_HWND.set(hwnd.0 as usize);
-        }
-    }
-
-    let _ = std::thread::Builder::new()
-        .name("lyric-topmost-guard".to_string())
-        .spawn(move || unsafe {
-            let hook = SetWinEventHook(
-                EVENT_SYSTEM_FOREGROUND,
-                EVENT_SYSTEM_FOREGROUND,
-                None,
-                Some(foreground_changed),
-                0,
-                0,
-                WINEVENT_OUTOFCONTEXT,
-            );
-            if hook.0.is_null() {
-                log::error!("[lyric-window] 注册前台窗口变化监听失败");
-                return;
-            }
-
-            let mut message = MSG::default();
-            while GetMessageW(&mut message, None, 0, 0).as_bool() {
-                let _ = TranslateMessage(&message);
-                DispatchMessageW(&message);
-            }
-            let _ = UnhookWinEvent(hook);
-        });
-}
-
-#[cfg(not(target_os = "windows"))]
-fn start_topmost_guard(_app: AppHandle) {}
 
 pub const LYRIC_WINDOW_LABEL: &str = "lyrics";
 
@@ -315,7 +167,7 @@ fn build_window(app: &AppHandle, state: &LyricWindowState) -> tauri::Result<taur
     .inner_size(state.width as f64, state.height as f64)
     .decorations(false)
     .transparent(true)
-    .always_on_top(true)
+    .always_on_top(state.always_on_top)
     .skip_taskbar(true)
     .shadow(false)
     .resizable(true)
@@ -328,10 +180,6 @@ fn build_window(app: &AppHandle, state: &LyricWindowState) -> tauri::Result<taur
 
 /// 显示歌词窗口（首次创建），返回应用后的状态
 pub fn show(app: &AppHandle) -> Result<LyricWindowState, String> {
-    // 每个进程只启动一个置顶维护线程，避免反复隐藏/显示歌词时创建多个守护线程。
-    static TOPMOST_GUARD_STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    TOPMOST_GUARD_STARTED.get_or_init(|| start_topmost_guard(app.clone()));
-
     let state = app.try_state::<AppState>();
     let db = state.as_ref().and_then(|s| s.db.clone());
     let mut state = load_state(db.as_deref());
@@ -346,16 +194,15 @@ pub fn show(app: &AppHandle) -> Result<LyricWindowState, String> {
     }
 
     let win = build_window(app, &state).map_err(|e| format!("歌词窗口创建失败: {e}"))?;
+    #[cfg(target_os = "windows")]
+    topmost::start(app);
     let _ = win.set_position(PhysicalPosition::new(state.x, state.y));
     let _ = win.set_size(PhysicalSize::new(state.width, state.height));
     // 先显示，再重新应用置顶状态。Windows 在隐藏窗口 show 后可能重新计算 Z-order，
     // 若只在 show 前设置 TOPMOST，切换到其他应用时歌词窗口可能被普通窗口盖住。
     let _ = win.show();
-    let _ = win.set_always_on_top(state.always_on_top);
-    if state.always_on_top {
-        if let Err(e) = attach_lyric_to_taskbar(&win) {
-            log::warn!("[lyric-window] {e}");
-        }
+    if let Err(e) = apply_topmost(&win, state.always_on_top) {
+        log::warn!("[lyric-window] {e}");
     }
     // 锁定即穿透：窗口恢复显示时按锁定态应用鼠标穿透
     let _ = win.set_ignore_cursor_events(state.locked);
@@ -365,8 +212,10 @@ pub fn show(app: &AppHandle) -> Result<LyricWindowState, String> {
     Ok(state)
 }
 
-/// 隐藏歌词窗口（保留进程与状态）
+/// 关闭歌词 WebView 以释放资源；保留位置与样式，下次显示时重新创建。
 pub fn hide(app: &AppHandle) -> Result<LyricWindowState, String> {
+    #[cfg(target_os = "windows")]
+    topmost::suspend();
     let state_guard = app.try_state::<AppState>();
     let db = state_guard.as_ref().and_then(|s| s.db.clone());
     let mut state = load_state(db.as_deref());
@@ -505,11 +354,8 @@ pub fn set_style(app: &AppHandle, patch: Value) -> Result<LyricWindowState, Stri
     }
     if let Some(win) = app.get_webview_window(LYRIC_WINDOW_LABEL) {
         if let Some(v) = apply_always_on_top {
-            let _ = win.set_always_on_top(v);
-            if v {
-                if let Err(e) = attach_lyric_to_taskbar(&win) {
-                    log::warn!("[lyric-window] {e}");
-                }
+            if let Err(e) = apply_topmost(&win, v) {
+                log::warn!("[lyric-window] {e}");
             }
         }
     }

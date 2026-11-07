@@ -961,7 +961,7 @@ AstralClient
 | 任务栏 | 不显示 |
 | 可拖拽 | 是 |
 | 鼠标穿透 | 支持锁定 |
-| 尺寸 | 默认 900×140 |
+| 尺寸 | 默认 520×180，随内容调整高度 |
 | 位置 | 用户可调整并记忆 |
 
 ### 桌面歌词窗口配置
@@ -972,8 +972,8 @@ AstralClient
   "locked": true,
   "x": 120,
   "y": 940,
-  "width": 900,
-  "height": 140,
+  "width": 520,
+  "height": 180,
   "fontSize": 24,
   "fontWeight": 700,
   "opacity": 0.9,
@@ -991,12 +991,12 @@ AstralClient
 桌面歌词窗口不写进 `tauri.conf.json` 的 `windows` 数组，而是在用户首次开启时由 Rust 动态创建，避免冷启动即创建透明置顶窗口拖慢启动。
 
 ```rust
-WebviewWindowBuilder::new(app, "lyrics", WebviewUrl::App("index.html#/lyrics".into()))
+WebviewWindowBuilder::new(app, "lyrics", WebviewUrl::App("lyric.html".into()))
     .title("轻听桌面歌词")
-    .inner_size(900.0, 140.0)
+    .inner_size(state.width as f64, state.height as f64)
     .decorations(false)
     .transparent(true)       // 必须与 decorations(false) 同时使用
-    .always_on_top(true)
+    .always_on_top(state.always_on_top)
     .skip_taskbar(true)
     .shadow(false)           // 透明窗口保留阴影会出现灰色矩形
     .resizable(true)
@@ -1012,7 +1012,11 @@ Windows 平台注意事项（原文未覆盖，均为实测坑点）：
 3. `always_on_top` 会被其他应用的全屏独占（游戏、视频全屏）覆盖，这是系统行为，不视为缺陷；可选提供「检测到前台全屏时自动隐藏」开关（P3）。
 4. 多显示器下 `x/y` 是虚拟桌面坐标，可能为负值；恢复位置前必须校验落点仍在某个显示器可见区域内。
 5. DPI 变化（跨屏拖动）时窗口尺寸按逻辑像素保持，字体不需要额外缩放。
-6. 歌词窗口的 capability 单独授权，只允许订阅歌词与播放位置事件（§17.4）。
+6. 歌词保持独立顶层窗口，**不把 owner 设置为 `Shell_TrayWnd`**。截图或通知栏触发 Shell 层级重排后，由 `lyric_window/topmost.rs` 监听前台切换及主/副任务栏的 reorder 事件，在主线程恢复 TOPMOST，保留位置、尺寸和焦点。恢复前重读当前窗口的可见性与置顶开关，不使用 `SWP_SHOWWINDOW`，避免迟到事件重新显示已隐藏的歌词。
+7. 隐藏歌词会关闭 WebView 以释放内存，下次打开重新创建；置顶维护必须在窗口创建后启动，并按 `lyrics` label 查找当前窗口，不能用 `OnceLock<HWND>` 保存首次句柄。每个进程仅一个事件线程，相关事件后最多约一秒的短时重试，事件合并后再交给主线程；空闲时没有轮询计时器，也不逐事件创建线程。
+8. 歌词窗口的 capability 单独授权，只允许桌面歌词显示和控制所需的 IPC（§17.4）。
+
+Windows 回归：`node scripts/check-native.mjs test --lib lyric_window::` 使用完全透明、不可激活的测试窗口检查被另一置顶窗口遮挡后恢复、位置/焦点不变、隐藏/关闭置顶后不再抬升，以及关闭重建。真实截图工具需另行复测：将歌词拖到任务栏区域，截图并结束/取消、切换应用，再关闭重开歌词；开启置顶时应恢复原位置的显示，关闭置顶时不应被自动抬升。
 
 ## 4.3 迷你播放器窗口
 
