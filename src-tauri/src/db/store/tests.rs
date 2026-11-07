@@ -162,7 +162,7 @@ fn like_clear_local_vs_reset_sync() {
     let t = track("1001", "晴天");
     let pid = create_playlist(&conn, "换号测试").expect("create");
     add_liked_song(&conn, &t, &pid).expect("add");
-    add_liked_playlist(&conn, "wyy", "pl1", "云卡", "", "").expect("pl");
+    add_liked_playlist(&conn, "wyy", "pl1", "云卡", None, "").expect("pl");
     enqueue_pending_like_op(&conn, "song", "add", "song:wyy:1001", "{}").expect("enqueue");
     set_setting(&conn, "like.sync.seq", "42").expect("set seq");
     set_setting(&conn, "like.imported", "1").expect("set imported");
@@ -227,7 +227,7 @@ fn delete_playlist_removes_ghost_cloud_card() {
     let conn = test_conn();
     let pid = create_playlist(&conn, "被删的歌单").expect("create");
     // 模拟服务器回声：同步回来一张同 pid 的 local 卡片
-    add_liked_playlist(&conn, "local", &pid, "被删的歌单", "", "").expect("echo card");
+    add_liked_playlist(&conn, "local", &pid, "被删的歌单", None, "").expect("echo card");
 
     delete_playlist(&conn, &pid).expect("delete");
 
@@ -289,7 +289,7 @@ fn follow_cloud_delete_cleans_everything() {
     let t = track("3201", "随歌单走的歌");
     let pid = create_playlist(&conn, "他端删的").expect("create");
     add_liked_song(&conn, &t, &pid).expect("add");
-    add_liked_playlist(&conn, "local", &pid, "他端删的", "", "").expect("echo card");
+    add_liked_playlist(&conn, "local", &pid, "他端删的", None, "").expect("echo card");
 
     delete_playlist_follow_cloud(&conn, &pid).expect("follow delete");
 
@@ -354,8 +354,8 @@ fn playlist_list_merges_local_and_cloud_cards() {
     // 本地自建一张
     let pid = create_playlist(&conn, "测试歌单").expect("create");
     // 云端同步回两张卡片（含一张 local「我喜欢的歌曲」）
-    add_liked_playlist(&conn, "local", "local", "我喜欢的歌曲", "", "").expect("cloud card 1");
-    add_liked_playlist(&conn, "qq", "5033052", "拯救歌荒", "", "").expect("cloud card 2");
+    add_liked_playlist(&conn, "local", "local", "我喜欢的歌曲", None, "").expect("cloud card 1");
+    add_liked_playlist(&conn, "qq", "5033052", "拯救歌荒", None, "").expect("cloud card 2");
 
     let all = list_my_playlists(&conn).expect("list");
     // 本地 1 张 + 云端 2 张，pid 各不相同
@@ -482,7 +482,7 @@ fn adopt_card_playlist_creates_local_row_from_synced_card() {
     let conn = test_conn();
 
     // 他端建的歌单：本机只有云端卡片（liked_playlists），没有本地行
-    add_liked_playlist(&conn, "local", "pid-remote-1", "手机上的歌单", "https://cdn/x.png", "")
+    add_liked_playlist(&conn, "local", "pid-remote-1", "手机上的歌单", Some("https://cdn/x.png"), "")
         .expect("add card");
     assert_eq!(adopt_card_playlist(&conn, "pid-remote-1").expect("adopt"), 1);
 
@@ -520,7 +520,7 @@ fn adopt_card_playlist_creates_local_row_from_synced_card() {
     assert_eq!(renamed, "PC 改的名");
 
     // 在线音源卡片 / 完全不存在的 pid：不认领（返回 0）
-    add_liked_playlist(&conn, "wyy", "pid-online-1", "在线歌单", "", "").expect("add card");
+    add_liked_playlist(&conn, "wyy", "pid-online-1", "在线歌单", None, "").expect("add card");
     assert_eq!(adopt_card_playlist(&conn, "pid-online-1").expect("adopt"), 0);
     assert_eq!(adopt_card_playlist(&conn, "pid-none").expect("adopt"), 0);
     let n: i64 = conn
@@ -535,7 +535,7 @@ fn adopt_card_playlist_creates_local_row_from_synced_card() {
 fn list_my_playlists_cover_falls_back_to_card_pic() {
     let conn = test_conn();
 
-    add_liked_playlist(&conn, "local", "pid-card-cov", "云名", "https://cdn/card.png", "")
+    add_liked_playlist(&conn, "local", "pid-card-cov", "云名", Some("https://cdn/card.png"), "")
         .expect("add card");
     adopt_card_playlist(&conn, "pid-card-cov").expect("adopt");
 
@@ -592,7 +592,7 @@ fn clear_playlist_cover_path_only_touches_covered_rows() {
 #[test]
 fn rename_playlist_is_noop_without_local_row() {
     let conn = test_conn();
-    add_liked_playlist(&conn, "local", "pid-only-card", "纯卡片", "", "").expect("add card");
+    add_liked_playlist(&conn, "local", "pid-only-card", "纯卡片", None, "").expect("add card");
     assert_eq!(
         rename_playlist(&conn, "pid-only-card", "新名").expect("rename"),
         0

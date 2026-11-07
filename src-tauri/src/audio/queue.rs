@@ -29,12 +29,17 @@ pub struct Queue {
     /// 之后（`pin == index + 1`）才算数 —— 播放推进到它身上后 `index` 变成该
     /// 下标，条件自然失效，不需要额外的"消费"钩子，也就不会把后面几次 next 钉死。
     pinned_next: Option<usize>,
+    /// 正在播的行被删后留下的逻辑空隙（0..=len，不落库）。
+    /// `index` 展示其后继，下一跳从空隙开始，而不是把后继再跳过一次。
+    /// 保留 len 这个尾部空隙，之后 append 的第一首也能自然接上。
+    removed_current_gap: Option<usize>,
 }
 
 impl Queue {
     pub fn set(&mut self, tracks: Vec<Track>, index: usize) {
         // 换整条队列（播放新列表 / 恢复会话）：上一轮插进来的「下一首」不再有效
         self.pinned_next = None;
+        self.removed_current_gap = None;
         self.tracks = tracks;
         self.index = if self.tracks.is_empty() {
             None
@@ -45,6 +50,10 @@ impl Queue {
 
     pub fn current(&self) -> Option<&Track> {
         self.tracks.get(self.index?)
+    }
+
+    pub(super) fn selection_cursor(&self) -> (Option<usize>, Option<usize>, Option<usize>) {
+        (self.index, self.pinned_next, self.removed_current_gap)
     }
 
     pub fn len(&self) -> usize {
@@ -71,6 +80,14 @@ impl Queue {
         // 放在模式分支之前，next_index_skipping 的屏蔽判断才仍有机会否掉它
         if let Some(pin) = self.pinned_next_index() {
             return Some(pin);
+        }
+        if let Some(gap) = self.removed_current_gap {
+            return Some(if matches!(mode, PlayMode::Random) {
+                // 被删的曲目已不在候选集，不能再把展示中的后继排除。
+                fastrand::usize(..len)
+            } else {
+                gap % len
+            });
         }
         match mode {
             PlayMode::OneLoop if auto => Some(cur),
@@ -113,17 +130,22 @@ impl Queue {
         let len = self.tracks.len();
         let cur = self.index?;
         let base = self.next_index(mode, auto)?;
-        if len <= 1 || !skip(&self.tracks[base]) {
+        if !skip(&self.tracks[base]) {
             return Some(base);
         }
-        if matches!(mode, PlayMode::OneLoop) && auto {
+        if self.removed_current_gap.is_none()
+            && (len <= 1 || (matches!(mode, PlayMode::OneLoop) && auto))
+        {
             return Some(base);
         }
         match mode {
             PlayMode::Random => {
                 // 在「非当前 + 未屏蔽」的集合里重掷一次；全是屏蔽项就放弃（None）
                 let candidates: Vec<usize> = (0..len)
-                    .filter(|&i| i != cur && !skip(&self.tracks[i]))
+                    .filter(|&i| {
+                        (self.removed_current_gap.is_some() || i != cur)
+                            && !skip(&self.tracks[i])
+                    })
                     .collect();
                 if candidates.is_empty() {
                     None
@@ -141,7 +163,7 @@ impl Queue {
                     if i >= len {
                         i = 0;
                     }
-                    if i == cur {
+                    if i == cur && self.removed_current_gap.is_none() {
                         return Some(i);
                     }
                     if !skip(&self.tracks[i]) {
@@ -163,6 +185,13 @@ impl Queue {
         if len == 1 {
             return Some(0);
         }
+        if let Some(gap) = self.removed_current_gap {
+            return Some(if matches!(mode, PlayMode::Random) {
+                fastrand::usize(..len)
+            } else {
+                (gap + len - 1) % len
+            });
+        }
         match mode {
             PlayMode::Random => {
                 let mut pick = cur;
@@ -180,6 +209,12 @@ impl Queue {
     /// 在当前曲目之后插入一首（「下一首播放」）。
     /// 队列为空或尚未定位时退化为追加到队尾（此时没有「下一跳」可指定，不写 pin）。
     pub fn insert_next(&mut self, track: Track) {
+        if let Some(gap) = self.removed_current_gap {
+            self.tracks.insert(gap, track);
+            self.pinned_next = Some(gap);
+            self.clamp_index();
+            return;
+        }
         match self.index {
             Some(i) if i < self.tracks.len() => {
                 self.tracks.insert(i + 1, track);
@@ -198,6 +233,7 @@ impl Queue {
     pub fn commit_index(&mut self, i: usize) {
         self.index = Some(i);
         self.pinned_next = None;
+        self.removed_current_gap = None;
     }
 
     /// 「下一首播放」待消费的下标。仍紧跟当前曲目之后才算数：
@@ -205,12 +241,14 @@ impl Queue {
     /// 条件都不再成立，自动失效。
     pub fn pinned_next_index(&self) -> Option<usize> {
         let (pin, cur) = (self.pinned_next?, self.index?);
-        (pin == cur + 1 && pin < self.tracks.len()).then_some(pin)
+        let next = self.removed_current_gap.unwrap_or(cur + 1);
+        (pin == next && pin < self.tracks.len()).then_some(pin)
     }
 
     /// 追加到队尾（「加入播放队列」）。不改变当前播放位置。
     pub fn append(&mut self, tracks: Vec<Track>) {
         self.tracks.extend(tracks);
+        self.clamp_index();
     }
 
     /// 单曲播放用（DESIGN §11.2 `play_track`）：**不替换队列** —— 队列里已有同一首
@@ -228,6 +266,7 @@ impl Queue {
             return i;
         }
         self.tracks.push(track);
+        self.clamp_index();
         self.tracks.len() - 1
     }
 
@@ -239,11 +278,18 @@ impl Queue {
             return None;
         }
         let removed = self.tracks.remove(i);
-        self.index = match self.index {
-            Some(cur) if cur > i => Some(cur - 1),
-            Some(cur) if cur == i => Some(cur),
-            other => other,
-        };
+        if let Some(gap) = self.removed_current_gap {
+            self.removed_current_gap = Some(if i < gap { gap - 1 } else { gap });
+        } else {
+            self.index = match self.index {
+                Some(cur) if cur > i => Some(cur - 1),
+                Some(cur) if cur == i => {
+                    self.removed_current_gap = Some(cur);
+                    Some(cur)
+                }
+                other => other,
+            };
+        }
         // pin 跟着同一条平移规则走；被移除的正好是 pin 时直接作废
         self.pinned_next = match self.pinned_next {
             Some(pin) if pin == i => None,
@@ -282,12 +328,18 @@ impl Queue {
         }
         let item = self.tracks.remove(from);
         self.tracks.insert(to, item);
-        self.index = match self.index {
-            Some(cur) if cur == from => Some(to),
-            Some(cur) if from < cur && to >= cur => Some(cur - 1),
-            Some(cur) if from > cur && to <= cur => Some(cur + 1),
-            other => other,
-        };
+        if let Some(gap) = self.removed_current_gap {
+            // 空隙跟着前面的行移动，不冒充某一条仍在队列中的曲目。
+            let gap = if from < gap { gap - 1 } else { gap };
+            self.removed_current_gap = Some(if to < gap { gap + 1 } else { gap });
+        } else {
+            self.index = match self.index {
+                Some(cur) if cur == from => Some(to),
+                Some(cur) if from < cur && to >= cur => Some(cur - 1),
+                Some(cur) if from > cur && to <= cur => Some(cur + 1),
+                other => other,
+            };
+        }
         // 「下一首播放」必须跟着这首歌本身走，不能留在原位置指向别人
         self.pinned_next = match self.pinned_next {
             Some(pin) if pin == from => Some(to),
@@ -304,12 +356,13 @@ impl Queue {
         let Some(cur) = self.index else {
             return 0;
         };
-        let keep = cur + 1;
+        let keep = self.removed_current_gap.unwrap_or(cur + 1);
         let removed = self.tracks.len().saturating_sub(keep);
         self.tracks.truncate(keep);
         if self.pinned_next.is_some_and(|pin| pin >= keep) {
             self.pinned_next = None;
         }
+        self.clamp_index();
         removed
     }
 
@@ -317,6 +370,14 @@ impl Queue {
     fn clamp_index(&mut self) {
         if self.tracks.is_empty() {
             self.index = None;
+            self.removed_current_gap = None;
+            self.pinned_next = None;
+            return;
+        }
+        if let Some(gap) = self.removed_current_gap {
+            let gap = gap.min(self.tracks.len());
+            self.removed_current_gap = Some(gap);
+            self.index = Some(gap % self.tracks.len());
             return;
         }
         if let Some(cur) = self.index {
@@ -559,12 +620,79 @@ mod tests {
     }
 
     #[test]
-    fn remove_current_keeps_slot_then_clamps() {
+    fn removing_playing_first_advances_to_its_original_successor_once() {
         let mut q = queue_of(3);
-        q.index = Some(2); // 最后一首
+        q.remove_at(0);
+        let next = q.next_index(PlayMode::ListLoop, true).expect("还有下一首");
+        assert_eq!(q.tracks[next].id, "1", "删除正在播的 0 后不能跳过 1");
+        q.commit_index(next);
+        let following = q.next_index(PlayMode::ListLoop, true).expect("继续推进");
+        assert_eq!(q.tracks[following].id, "2", "后继只消费一次");
+    }
+
+    #[test]
+    fn removing_playing_tail_wraps_to_the_first_successor() {
+        let mut q = queue_of(3);
+        q.index = Some(2);
         q.remove_at(2);
         assert_eq!(ids(&q), vec!["0", "1"]);
-        assert_eq!(q.index, Some(1), "越界收敛到末尾");
+        assert_eq!(q.index, Some(0), "已删末尾的后继是列表开头，不是上一首");
+        assert_eq!(q.next_index(PlayMode::ListLoop, true), Some(0));
+        assert_eq!(q.previous_index(PlayMode::ListLoop), Some(1));
+    }
+
+    #[test]
+    fn appending_after_removing_playing_tail_fills_the_pending_gap() {
+        let mut q = queue_of(3);
+        q.commit_index(2);
+        q.remove_at(2);
+        q.append(vec![queue_of(4).tracks[3].clone()]);
+        let next = q.next_index(PlayMode::ListLoop, true).unwrap();
+        assert_eq!(q.tracks[next].id, "3");
+        q.commit_index(next);
+        assert_eq!(q.next_index(PlayMode::ListLoop, true), Some(0));
+    }
+
+    #[test]
+    fn play_next_pin_survives_removal_and_can_be_replaced_at_the_gap() {
+        let mut q = queue_of(3);
+        q.insert_next(queue_of(5).tracks[3].clone());
+        q.remove_at(0);
+        let next = q.next_index(PlayMode::Random, true).unwrap();
+        assert_eq!(q.tracks[next].id, "3");
+        q.insert_next(queue_of(5).tracks[4].clone());
+        let next = q.next_index(PlayMode::OneLoop, true).unwrap();
+        assert_eq!(q.tracks[next].id, "4");
+        q.commit_index(next);
+        assert_eq!(q.pinned_next_index(), None);
+    }
+
+    #[test]
+    fn a_removed_current_does_not_exempt_its_successor_from_dislikes() {
+        let mut q = queue_of(3);
+        q.remove_at(0);
+        let next = q
+            .next_index_skipping(PlayMode::OneLoop, true, |track| track.id == "1")
+            .unwrap();
+        assert_eq!(q.tracks[next].id, "2");
+        assert_eq!(q.next_index_skipping(PlayMode::ListLoop, true, |_| true), None);
+        assert_eq!(q.next_index_skipping(PlayMode::Random, true, |_| true), None);
+        q.remove_at(1);
+        assert_eq!(q.next_index_skipping(PlayMode::OneLoop, true, |_| true), None);
+    }
+
+    #[test]
+    fn editing_after_removal_keeps_the_gap_not_a_fake_playing_track() {
+        let mut q = queue_of(4);
+        q.commit_index(1);
+        q.remove_at(1);
+        q.move_item(2, 1);
+        let next = q.next_index(PlayMode::ListLoop, true).unwrap();
+        assert_eq!(q.tracks[next].id, "3");
+        assert_eq!(q.clear_after_current(), 2);
+        assert_eq!(ids(&q), vec!["0"]);
+        q.set(queue_of(3).tracks, 0);
+        assert_eq!(q.next_index(PlayMode::ListLoop, true), Some(1));
     }
 
     #[test]

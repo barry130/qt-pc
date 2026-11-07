@@ -119,7 +119,7 @@ beforeEach(() => {
   ipcMocks.setPlayMode.mockResolvedValue(undefined);
   ipcMocks.seek.mockResolvedValue(undefined);
   ipcMocks.pause.mockResolvedValue(undefined);
-  usePlayerStore.setState({ queue: [], queueIndex: null, state: null, playQueue: vi.fn(async () => {}) });
+  usePlayerStore.setState({ queue: [], queueIndex: null, state: null, playQueue: vi.fn(async () => ({ applied: true, ticket: 0, target: null })) });
   useRadioStore.setState({
     active: false,
     queueClaimed: false,
@@ -143,7 +143,7 @@ beforeEach(() => {
 describe("私人 FM 队列归属（queueClaimed）", () => {
   it("start：playQueue 整队替换落地后才认领队列", async () => {
     mockPref();
-    const playQueue = vi.fn(async (_tracks: Track[], _startIndex: number) => {});
+    const playQueue = vi.fn(async (_tracks: Track[], _startIndex: number) => ({ applied: true, ticket: 0, target: null }));
     usePlayerStore.setState({ playQueue });
     await useRadioStore.getState().start(null);
     expect(playQueue).toHaveBeenCalledTimes(1);
@@ -311,7 +311,7 @@ describe("私人 FM 会话轮换（每次打开都该换一批）", () => {
 
   /** 跑一轮 start，返回这一次真正排进播放器队列的曲目 */
   async function runStart(): Promise<Track[]> {
-    const playQueue = vi.fn(async (_tracks: Track[], _startIndex: number) => {});
+    const playQueue = vi.fn(async (_tracks: Track[], _startIndex: number) => ({ applied: true, ticket: 0, target: null }));
     usePlayerStore.setState({ queue: [], queueIndex: null, playQueue });
     await useRadioStore.getState().start(null);
     return playQueue.mock.calls[0]![0] as Track[];
@@ -351,7 +351,8 @@ describe("私人 FM 退出时归还原播放列表", () => {
 
   it("停止 FM：把原列表、当时那一首与播放位置放回去", async () => {
     mockPref();
-    const playQueue = vi.fn(async (_tracks: Track[], _startIndex: number) => {});
+    const target = { generation: 1, platform: "local" as const, id: playlist[1]!.id };
+    const playQueue = vi.fn(async (_tracks: Track[], _startIndex: number) => ({ applied: true, ticket: 0, target }));
     usePlayerStore.setState({ playQueue });
     setPlayerSession(playlist, 1, 61_000);
     await useRadioStore.getState().start(null);
@@ -362,14 +363,15 @@ describe("私人 FM 退出时归还原播放列表", () => {
     expect(playQueue).toHaveBeenCalledTimes(1);
     expect(playQueue.mock.calls[0]![1]).toBe(1);
     expect((playQueue.mock.calls[0]![0] as Track[]).map(trackKey)).toEqual(playlist.map(trackKey));
-    expect(ipcMocks.seek).toHaveBeenCalledWith(61_000);
+    expect(ipcMocks.seek).toHaveBeenCalledWith(61_000, target);
     expect(ipcMocks.pause).not.toHaveBeenCalled();
     expect(useRadioStore.getState().stash).toBeNull();
   });
 
   it("进入时是暂停：放回原处后保持暂停", async () => {
     mockPref();
-    const playQueue = vi.fn(async (_tracks: Track[], _startIndex: number) => {});
+    const target = { generation: 2, platform: "local" as const, id: playlist[0]!.id };
+    const playQueue = vi.fn(async (_tracks: Track[], _startIndex: number) => ({ applied: true, ticket: 0, target }));
     usePlayerStore.setState({ playQueue });
     setPlayerSession(playlist, 0, 0, false);
     await useRadioStore.getState().start(null);
@@ -383,7 +385,7 @@ describe("私人 FM 退出时归还原播放列表", () => {
 
   it("让位退出（用户自己换了队列）不抢回原列表", async () => {
     mockPref();
-    const playQueue = vi.fn(async (_tracks: Track[], _startIndex: number) => {});
+    const playQueue = vi.fn(async (_tracks: Track[], _startIndex: number) => ({ applied: true, ticket: 0, target: null }));
     usePlayerStore.setState({ playQueue });
     setPlayerSession(playlist, 1, 61_000);
     await useRadioStore.getState().start(null);
@@ -399,7 +401,7 @@ describe("私人 FM 退出时归还原播放列表", () => {
 
   it("进入 FM 前本来就没在放东西：停止时不还原", async () => {
     mockPref();
-    const playQueue = vi.fn(async (_tracks: Track[], _startIndex: number) => {});
+    const playQueue = vi.fn(async (_tracks: Track[], _startIndex: number) => ({ applied: true, ticket: 0, target: null }));
     usePlayerStore.setState({ playQueue, queue: [], queueIndex: null });
     await useRadioStore.getState().start(null);
     expect(useRadioStore.getState().stash).toBeNull();

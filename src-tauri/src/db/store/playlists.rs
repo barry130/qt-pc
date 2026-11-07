@@ -370,10 +370,18 @@ pub(crate) fn delete_playlist(conn: &Connection, pid: &str) -> Result<(), rusqli
 
 /// 对账用的自建歌单行：pid + 云端确认点。
 /// `cloud_seq IS NULL` 表示从未被云端确认过。
+///
+/// 智能歌单是纯本地数据（DESIGN.md:108 R66）：它们没有云端歌单卡片，
+/// 推送/对账若把它们算进来会拿本地 pid 去建云端歌单（C12），所以查询侧
+/// 直接排除；`is_smart` 为 NULL 的老库行按普通歌单处理。
 pub(crate) fn list_playlist_sync_rows(
     conn: &Connection,
 ) -> Result<Vec<(String, Option<i64>)>, rusqlite::Error> {
-    let mut stmt = conn.prepare("SELECT pid, cloud_seq FROM playlists ORDER BY created_at ASC")?;
+    let mut stmt = conn.prepare(
+        "SELECT pid, cloud_seq FROM playlists
+          WHERE COALESCE(is_smart, 0) = 0
+          ORDER BY created_at ASC",
+    )?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();
     while let Some(row) = rows.next()? {
@@ -576,4 +584,34 @@ pub(crate) fn remove_track_from_playlist(
         params![pid, db_track_id(track)],
     )?;
     remove_liked_song(conn, track, Some(pid))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::store::tests::new_conn;
+
+    /// 智能歌单只存在于本机：对账/推送不能把它们当成云端歌单（C12）。
+    #[test]
+    fn sync_rows_only_contain_normal_playlists() {
+        let conn = new_conn();
+        let normal = create_playlist(&conn, "普通歌单").unwrap();
+        let smart = crate::smart_playlist::create_smart_playlist(
+            &conn,
+            "智能歌单",
+            &crate::smart_playlist::SmartRules::default(),
+            None,
+            "title",
+        )
+        .unwrap();
+
+        let rows = list_playlist_sync_rows(&conn).unwrap();
+        let pids: Vec<&str> = rows.iter().map(|(pid, _)| pid.as_str()).collect();
+        assert!(pids.contains(&normal.as_str()), "普通歌单必须参与云端对账");
+        assert!(
+            !pids.contains(&smart.as_str()),
+            "智能歌单是纯本地数据，不该被推送到云端"
+        );
+        assert_eq!(rows.len(), 1);
+    }
 }

@@ -20,6 +20,27 @@ pub struct HistoryItem {
     pub played_at: i64,
 }
 
+/// Read-only progress observation; the existing serialized HistoryItem is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryProgress {
+    pub played_at: i64,
+    pub played_duration_ms: i64,
+    pub completed: bool,
+}
+
+pub(crate) fn history_progress(
+    conn: &Connection, track: &Track,
+) -> Result<Option<HistoryProgress>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT played_at, played_duration_ms, completed FROM play_history WHERE track_id = ?1",
+        params![db_track_id(track)],
+        |row| Ok(HistoryProgress {
+            played_at: row.get(0)?, played_duration_ms: row.get(1)?,
+            completed: row.get::<_, i64>(2)? != 0,
+        }),
+    ).optional()
+}
+
 /// 记录一次播放（同一首歌只保留最近一条：先删旧记录再插入）。
 /// 本地曲目若尚未被扫描入库，tracks 里没有对应行（外键），此时静默跳过。
 pub(crate) fn record_play_history(conn: &Connection, track: &Track) -> Result<(), rusqlite::Error> {

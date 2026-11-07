@@ -158,7 +158,8 @@ fn order_by(sort: &str) -> &'static str {
         "added_asc" => "t.created_at ASC, t.title COLLATE NOCASE ASC",
         "title" => "t.title COLLATE NOCASE ASC",
         "singer" => "t.singer COLLATE NOCASE ASC, t.title COLLATE NOCASE ASC",
-        "album" => "t.album COLLATE NOCASE ASC, t.disc_no_is_null, t.title COLLATE NOCASE ASC",
+        // 专辑排序：库里没有碟号/音轨号列（C11），同专辑内只能按歌名兜底
+        "album" => "t.album COLLATE NOCASE ASC, t.title COLLATE NOCASE ASC",
         "play_count" => "COALESCE(ps.play_count, 0) DESC, t.title COLLATE NOCASE ASC",
         "last_played" => "ps.last_played_at DESC, t.title COLLATE NOCASE ASC",
         "rating" => "COALESCE(r.rating, 0) DESC, t.title COLLATE NOCASE ASC",
@@ -241,10 +242,13 @@ fn compile_rule(rule: &SmartRule, now: i64) -> Option<(String, Vec<SqlValue>)> {
             "false" | "0" | "no" => false,
             _ => return None,
         };
+        // 关键点（C10）：`liked_songs.sid` 存的是音源原始 id，而 `tracks.id` 是
+        // `platform:原始id`（tracks::db_track_id 的口径）。直接 `ls.sid = t.id`
+        // 永远匹配不到；按同一个口径拆出原始 id 再比。
         let expr = "EXISTS (SELECT 1 FROM liked_songs ls
                       WHERE ls.deleted_at IS NULL
                         AND ls.platform = t.platform
-                        AND ls.sid = t.id)";
+                        AND ls.sid = substr(t.id, instr(t.id, ':') + 1))";
         return Some((
             if want { expr.to_string() } else { format!("NOT {expr}") },
             Vec::new(),
@@ -471,12 +475,21 @@ mod tests {
             .unwrap();
         }
         if liked {
-            conn.execute(
-                "INSERT INTO liked_songs (id, uid, sid, platform, name, singer, album, created_at)
-                 VALUES (?1, 1, ?2, 'local', ?3, ?4, '专辑', 1)",
-                rusqlite::params![id, id, title, singer],
-            )
-            .unwrap();
+            // 走真实收藏写入路径：`liked_songs.sid` 存音源原始 id，`id` 才是
+            // `platform:sid`。手填前缀 id 会掩盖「规则永远匹配不到」的 bug（C10）。
+            let track = Track {
+                id: path,
+                platform: crate::provider::types::SourceId::local(),
+                title: title.to_string(),
+                singer: singer.to_string(),
+                album: "专辑".to_string(),
+                pic_url: String::new(),
+                duration: 200.0,
+                music_id: None,
+                start_ms: None,
+                end_ms: None,
+            };
+            crate::db::store::add_liked_song(conn, &track, "inbox").expect("写收藏");
         }
     }
 
@@ -570,6 +583,40 @@ mod tests {
         assert_eq!(top.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(), vec!["三", "二"]);
         let by_title = resolve(&conn, &SmartRules::default(), None, "title").unwrap();
         assert_eq!(by_title.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(), vec!["一", "三", "二"]);
+    }
+
+    /// UI 里能选的每种排序都必须能在真实库上执行（C11：`album` 曾引用不存在的列）。
+    #[test]
+    fn every_ui_sort_option_is_executable() {
+        let conn = new_conn();
+        seed(&conn, "丙", "甲", None, None, 0, None, false);
+        seed(&conn, "乙", "甲", None, None, 0, None, false);
+        conn.execute("UPDATE tracks SET album = 'B 专辑' WHERE title = '丙'", [])
+            .unwrap();
+        conn.execute("UPDATE tracks SET album = 'A 专辑' WHERE title = '乙'", [])
+            .unwrap();
+
+        for sort in [
+            "added_desc",
+            "added_asc",
+            "title",
+            "singer",
+            "album",
+            "play_count",
+            "last_played",
+            "rating",
+            "random",
+        ] {
+            resolve(&conn, &SmartRules::default(), None, sort)
+                .unwrap_or_else(|e| panic!("排序 {sort} 不能在真实库上执行：{e}"));
+        }
+
+        // 专辑排序：不同专辑按专辑名，同专辑内按歌名
+        let by_album = resolve(&conn, &SmartRules::default(), None, "album").unwrap();
+        assert_eq!(
+            by_album.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(),
+            vec!["乙", "丙"]
+        );
     }
 
     #[test]

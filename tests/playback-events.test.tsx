@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock("@/services/ipc", () => mocks);
 vi.mock("@/stores/player", () => ({
   usePlayerStore: (select: (state: typeof mocks) => unknown) => select(mocks),
+  currentLiveRevision: () => 0,
 }));
 vi.mock("@/lib/logger", () => ({ log: { warn: vi.fn(), error: vi.fn() } }));
 import { usePlaybackEvents } from "@/hooks/usePlaybackEvents";

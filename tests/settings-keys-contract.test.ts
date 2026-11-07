@@ -10,13 +10,20 @@
  * 注意：auth.ts 里 like.* 三个键**刻意**用字面量（启动早期同步引用未初始化
  * 完的模块常量会掩盖真正的错误，见该文件注释），不强改成常量 —— 这里只对值。
  */
-import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { CACHE_AUDIO_LIMIT_MB_KEY, GAPLESS_KEY, QUALITY_KEY } from "@/lib/storageKeys";
 
-const read = (rel: string): string =>
-  readFileSync(join(process.cwd(), rel), "utf8");
+type PublicSourceScanner = {
+  files(dir: string, extensions: readonly string[]): string[];
+  read(file: string): string;
+};
+const scannerModule = new URL("../scripts/check-motion.mjs", import.meta.url).href;
+const { createPublicSourceScanner } = await import(scannerModule) as {
+  createPublicSourceScanner(root: string): PublicSourceScanner;
+};
+const sources = createPublicSourceScanner(process.cwd());
+const read = (rel: string): string => sources.read(join(process.cwd(), rel));
 
 /** 解析 Rust 源码里的键常量表：`pub const SETTING_X: &str = "value";` */
 function rustConsts(rel: string): Record<string, string> {
@@ -25,20 +32,6 @@ function rustConsts(rel: string): Record<string, string> {
     /pub(?:\(crate\))? const ([A-Z0-9_]+): &str = "([^"]*)";/g,
   )) {
     out[m[1]] = m[2];
-  }
-  return out;
-}
-
-/** 递归收集 src/ 下全部 .ts/.tsx 文件（散写字面量回归检查用） */
-function collectSources(dir: string): string[] {
-  const out: string[] = [];
-  for (const entry of readdirSync(dir)) {
-    const full = join(dir, entry);
-    if (statSync(full).isDirectory()) {
-      out.push(...collectSources(full));
-    } else if (/\.tsx?$/.test(entry)) {
-      out.push(full);
-    }
   }
   return out;
 }
@@ -100,8 +93,8 @@ describe("settings 键名跨端契约", () => {
       /getSetting\(\s*"app\.lastError"\s*\)/,
       /setSetting\(\s*"app\.lastError"\s*,/,
     ];
-    for (const file of collectSources(join(process.cwd(), "src"))) {
-      const code = readFileSync(file, "utf8")
+    for (const file of sources.files(join(process.cwd(), "src"), [".ts", ".tsx"])) {
+      const code = sources.read(file)
         .replace(/\/\*[\s\S]*?\*\//g, "")
         .replace(/^\s*\/\/.*$/gm, "");
       for (const pattern of banned) {

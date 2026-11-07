@@ -6,7 +6,7 @@ import type { Track } from "@/types";
 
 const mocks = vi.hoisted(() => ({
   play: vi.fn(async () => undefined),
-  playQueue: vi.fn(async () => undefined),
+  playQueue: vi.fn(async () => ({ applied: true, ticket: 0, target: null })),
   navigate: vi.fn(),
   startDownload: vi.fn(async (_track: Track, _quality: string) => undefined),
   getDownloadQuality: vi.fn(async () => "320k"),

@@ -80,6 +80,7 @@ pub struct ParsedEpisode {
     pub audio_url: String,
     pub duration_ms: i64,
     pub published_at: i64,
+    pub transcripts: Vec<crate::podcast_subtitles::TranscriptLink>,
 }
 
 // ---------- 文本小工具 ----------
@@ -382,6 +383,7 @@ pub fn parse_feed(xml: &str) -> Result<ParsedFeed, String> {
             audio_url,
             duration_ms,
             published_at,
+            transcripts: crate::podcast_subtitles::transcript_links(block),
         });
     }
     if episodes.is_empty() {
@@ -480,13 +482,14 @@ fn store_show(conn: &Connection, url: &str, feed: &ParsedFeed) -> Result<String,
         // 与更新的元信息，绝不能把「听了一半」的进度冲掉。
         tx.execute(
             "INSERT INTO podcast_episodes
-               (id, show_id, title, description, audio_url, duration_ms, published_at, played, position_ms, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8)
+               (id, show_id, title, description, audio_url, duration_ms, published_at, played, position_ms, created_at, transcripts_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0, ?8, ?9)
              ON CONFLICT(id) DO UPDATE SET
                title        = excluded.title,
                description  = excluded.description,
                duration_ms  = excluded.duration_ms,
-               published_at = excluded.published_at",
+               published_at = excluded.published_at,
+               transcripts_json = excluded.transcripts_json",
             params![
                 ep_id,
                 id,
@@ -495,7 +498,8 @@ fn store_show(conn: &Connection, url: &str, feed: &ParsedFeed) -> Result<String,
                 ep.audio_url,
                 ep.duration_ms,
                 ep.published_at,
-                now
+                now,
+                serde_json::to_string(&ep.transcripts).unwrap_or_else(|_| "[]".into())
             ],
         )?;
     }
@@ -701,6 +705,7 @@ mod tests {
       <title>第 2 期：慢下来</title>
       <description><![CDATA[<p>这一期聊慢生活</p>]]></description>
       <enclosure url="https://cdn.test/ep2.mp3" type="audio/mpeg" length="12345"/>
+      <podcast:transcript url="/ep2.vtt" type="text/vtt" language="en"/>
       <itunes:duration>1:02:03</itunes:duration>
       <pubDate>Wed, 01 Nov 2025 12:00:00 +0800</pubDate>
     </item>
@@ -730,6 +735,9 @@ mod tests {
         assert_eq!(feed.episodes[0].title, "第 2 期：慢下来");
         assert_eq!(feed.episodes[0].duration_ms, 3_723_000);
         assert_eq!(feed.episodes[0].description, "这一期聊慢生活");
+        assert_eq!(feed.episodes[0].transcripts[0].url, "/ep2.vtt");
+        assert_eq!(feed.episodes[0].transcripts[0].language, "en");
+        assert!(feed.episodes[1].transcripts.is_empty());
         assert_eq!(feed.episodes[1].duration_ms, 3_723_000);
         assert!(feed.episodes[0].published_at > feed.episodes[1].published_at);
     }
@@ -779,6 +787,8 @@ mod tests {
 
         let episodes = list_episodes(&conn, &id).unwrap();
         assert_eq!(episodes.len(), 2);
+        let saved_links: String = conn.query_row("SELECT transcripts_json FROM podcast_episodes WHERE id=?1", [&episodes[0].id], |row| row.get(0)).unwrap();
+        assert!(saved_links.contains("/ep2.vtt"));
         assert!(!episodes[0].played);
         assert_eq!(episodes[0].position_ms, 0);
 

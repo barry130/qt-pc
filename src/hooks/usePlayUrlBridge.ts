@@ -65,7 +65,7 @@ async function answer(req: PlayUrlRequest): Promise<void> {
     size = res.size;
     actualQuality = res.actualQuality;
     if (res.quality.length > 0) hitQuality = res.quality;
-    if (url.length > 0 && res.quality !== wanted && known === null) {
+    if (url.length > 0 && res.quality !== (res.requestedQuality ?? wanted) && known === null) {
       // 不静默降档：让用户知道听到的是 128K 而不是请求的档位
       toast(`当前音源只能提供 ${qualityShortLabel(res.quality)}：${req.track.title}`);
     }

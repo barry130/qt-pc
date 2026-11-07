@@ -157,6 +157,19 @@ pub struct Track {
     pub end_ms: Option<u64>,
 }
 
+impl Track {
+    /// 两条曲目是否指向**同一次收听身份**。
+    ///
+    /// 引擎用它判断「切歌要不要结算旧会话」「挂载成功要不要重开收听会话」
+    /// （`audio/engine.rs` 的 `load_queue_track` / `begin_listen`）。
+    /// 身份口径必须与落库主键一致：裸 id 在不同音源之间会撞车
+    /// （`wyy:42` 与 `qq:42` 是两首歌），而元数据（歌名/专辑/时长/封面）
+    /// 变化不影响身份——弱网重载、恢复现场、换音质都是同一次收听。
+    pub fn same_identity(&self, other: &Self) -> bool {
+        self.platform == other.platform && self.id == other.id
+    }
+}
+
 /// Provider 错误分类（DESIGN §6.4 / §6.10）：serde tag=kind 供前端区分展示。
 #[derive(Debug, thiserror::Error, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -294,5 +307,47 @@ mod tests {
             serde_json::from_value::<Quality>(json).expect("反序列化"),
             Quality::new("hifi")
         );
+    }
+
+    /// 回归（C17）：跨音源的相同裸 id 不是同一首。
+    ///
+    /// 历史缺陷：引擎 `switched` 与 `begin_listen` 只比 `Track.id`，
+    /// 从 `wyy:same-id` 切到 `qq:same-id` 时沿用上一条会话——
+    /// counted / scrobbled / started_at 都不重来，新歌白听、旧歌多记一次。
+    #[test]
+    fn track_identity_requires_platform_and_id() {
+        let base = Track {
+            id: "same-id".into(),
+            platform: SourceId::new("wyy"),
+            title: "歌名".into(),
+            singer: "歌手".into(),
+            album: "专辑".into(),
+            pic_url: String::new(),
+            duration: 200.0,
+            music_id: None,
+            start_ms: None,
+            end_ms: None,
+        };
+
+        // 元数据变了、platform + id 不变：仍同一次收听（重载 / 换封面不重开）
+        let mut metadata_changed = base.clone();
+        metadata_changed.title = "改过的歌名".into();
+        metadata_changed.album = "改过的专辑".into();
+        metadata_changed.duration = 999.0;
+        metadata_changed.pic_url = "https://cdn/new.png".into();
+        assert!(base.same_identity(&metadata_changed));
+
+        // 同 platform 不同 id：不是同一首
+        let mut other_id = base.clone();
+        other_id.id = "other-id".into();
+        assert!(!base.same_identity(&other_id));
+
+        // 同裸 id、不同 platform：不是同一首（C17 本体）
+        let mut other_platform = base.clone();
+        other_platform.platform = SourceId::new("qq");
+        assert!(!base.same_identity(&other_platform));
+
+        // 自身当然同身份
+        assert!(base.same_identity(&base.clone()));
     }
 }

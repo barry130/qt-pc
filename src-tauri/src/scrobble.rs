@@ -613,8 +613,25 @@ pub(crate) async fn flush_with(
     now: i64,
 ) -> Result<FlushOutcome, String> {
     let creds = db.with(|conn| Ok(credentials(conn)))?;
-    let rows: Vec<ScrobbleRow> = db.with(|conn| store::scrobble_due(conn, now, BATCH))?;
     let mut out = FlushOutcome::default();
+    // 没开任何目标时不该把行一直留在 pending 里发霉：清掉，等用户开开关后重新听。
+    if creds.lastfm.is_none() && creds.listenbrainz.is_none() {
+        db.with(|conn| store::scrobble_clear(conn, None).map(|_| ()))?;
+        db.with(|conn| store::scrobble_prune_sent(conn).map(|_| ()))?;
+        return Ok(out);
+    }
+
+    // 只取「已开启目标」的行，且每个目标各取一批（C15）：先全局 LIMIT 再按
+    // 开关过滤时，关闭目标的 50 条旧行就能让另一个目标永远排不上。
+    let mut targets: Vec<&str> = Vec::with_capacity(2);
+    if creds.lastfm.is_some() {
+        targets.push(TARGET_LASTFM);
+    }
+    if creds.listenbrainz.is_some() {
+        targets.push(TARGET_LISTENBRAINZ);
+    }
+    let rows: Vec<ScrobbleRow> =
+        db.with(|conn| store::scrobble_due_for_targets(conn, now, BATCH, &targets))?;
     if rows.is_empty() {
         return Ok(out);
     }
@@ -651,10 +668,6 @@ pub(crate) async fn flush_with(
         }
     }
 
-    // 没开任何目标时不该把行一直留在 pending 里发霉：清掉，等用户开开关后重新听。
-    if creds.lastfm.is_none() && creds.listenbrainz.is_none() {
-        db.with(|conn| store::scrobble_clear(conn, None).map(|_| ()))?;
-    }
     db.with(|conn| store::scrobble_prune_sent(conn).map(|_| ()))?;
     Ok(out)
 }
@@ -1334,6 +1347,43 @@ mod tests {
 
         let pending = db.with(store::scrobble_pending_count).unwrap();
         assert_eq!(pending, 0);
+    }
+
+    /// 关闭目标的积压不能饿死开启的目标（C15）。
+    #[tokio::test]
+    async fn disabled_target_backlog_does_not_starve_enabled_one() {
+        let db = test_db();
+        db.with(|conn| {
+            // Last.fm 没开（但队列里有 50 条更老的待发行），ListenBrainz 开着
+            write_setting(conn, KEY_LISTENBRAINZ_TOKEN, "tok")?;
+            write_setting(conn, KEY_LISTENBRAINZ_ENABLED, "1")?;
+            for i in 0..50 {
+                store::scrobble_enqueue(conn, TARGET_LASTFM, &track(), 1_700_000_000 + i, 269_000)?;
+            }
+            store::scrobble_enqueue(conn, TARGET_LISTENBRAINZ, &track(), 1_700_001_000, 269_000)?;
+            Ok(())
+        })
+        .unwrap();
+
+        let transport = FakeTransport::ok_json("{}");
+        let out = flush_with(&transport, &db, 1_700_000_100).await.unwrap();
+        assert_eq!(out.sent, 1, "开启的 ListenBrainz 必须发得出去");
+        assert!(out.error.is_none());
+        assert!(
+            transport.forms.lock().unwrap().is_empty(),
+            "Last.fm 关着，不该发它的积压"
+        );
+        assert_eq!(transport.json_body.lock().unwrap().len(), 1);
+
+        db.with(|conn| {
+            assert_eq!(
+                store::scrobble_pending_count(conn)?,
+                50,
+                "关闭目标的待发行保持原状，等用户重新打开"
+            );
+            Ok(())
+        })
+        .unwrap();
     }
 
     #[tokio::test]

@@ -450,7 +450,11 @@ function expected(target, actual) {
 
 /** 核心：返回每个目标的状态（不落盘） */
 export function plan(config = loadConfig()) {
-  return buildTargets(config).map((t) => {
+  return planTargets(buildTargets(config));
+}
+
+function planTargets(targets) {
+  return targets.map((t) => {
     const abs = path.join(ROOT, t.file);
     const actual = fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : "";
     const want = expected(t, actual);
@@ -477,7 +481,8 @@ export function sync(config = loadConfig()) {
 
 /** 校验模式：返回不一致列表（空数组 = 全部一致；跳过 skipCheck 的私有产物） */
 export function check(config = loadConfig()) {
-  return plan(config).filter((i) => i.changed && !i.skipCheck);
+  // Exclude private targets before inspecting files or evaluating generators.
+  return planTargets(buildTargets(config).filter((t) => !t.skipCheck)).filter((i) => i.changed);
 }
 
 /** `--check` 输出用的解释文案：私有配置缺值时把后果说清楚，而不是只报一个 exit 1 */
@@ -501,9 +506,8 @@ function main() {
   }
 
   if (isCheck) {
-    // 私有配置缺失**不算不一致**：公开仓库 / CI 裸构建本来就该是空的。
-    // 只提示后果；真正的强制在发版流程（release.yml 缺 Secret 直接 fail）。
-    printPrivateHints(config);
+    // 公开一致性校验不探测或读取私有配置及其生成物。
+    // 私有值的提示保留在写入模式，强制校验仍由发版流程负责。
     const bad = check(config);
     if (bad.length === 0) {
       console.log(`[config] 全部一致（版本 ${config.version.name} / ${config.version.code}）`);

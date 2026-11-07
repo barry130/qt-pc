@@ -7,7 +7,6 @@
  * 常量（src/lib/window-labels.ts）与 Rust 常量、tauri.conf.json 钉在
  * 一起 —— 任何一侧漂移直接测试失败。
  */
-import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
@@ -17,22 +16,16 @@ import {
   SOURCE_ENGINE_WINDOW_LABEL,
 } from "@/lib/window-labels";
 
-const read = (rel: string): string =>
-  readFileSync(join(process.cwd(), rel), "utf8");
-
-/** 递归收集 src/ 下全部 .ts/.tsx 文件（回归检查用） */
-function collectSources(dir: string): string[] {
-  const out: string[] = [];
-  for (const entry of readdirSync(dir)) {
-    const full = join(dir, entry);
-    if (statSync(full).isDirectory()) {
-      out.push(...collectSources(full));
-    } else if (/\.tsx?$/.test(entry)) {
-      out.push(full);
-    }
-  }
-  return out;
-}
+type PublicSourceScanner = {
+  files(dir: string, extensions: readonly string[]): string[];
+  read(file: string): string;
+};
+const scannerModule = new URL("../scripts/check-motion.mjs", import.meta.url).href;
+const { createPublicSourceScanner } = await import(scannerModule) as {
+  createPublicSourceScanner(root: string): PublicSourceScanner;
+};
+const sources = createPublicSourceScanner(process.cwd());
+const read = (rel: string): string => sources.read(join(process.cwd(), rel));
 
 describe("窗口 label 跨端契约", () => {
   it("TS 常量与 Rust 侧常量逐字一致", () => {
@@ -68,8 +61,8 @@ describe("窗口 label 跨端契约", () => {
       /\.label\s*!==\s*"mini"/,
       /emitTo\(\s*"source-engine"/,
     ];
-    for (const file of collectSources(join(process.cwd(), "src"))) {
-      const text = readFileSync(file, "utf8");
+    for (const file of sources.files(join(process.cwd(), "src"), [".ts", ".tsx"])) {
+      const text = sources.read(file);
       // 剥掉块注释与行注释，只查代码
       const code = text
         .replace(/\/\*[\s\S]*?\*\//g, "")

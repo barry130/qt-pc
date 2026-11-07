@@ -346,42 +346,51 @@ fn scan_filter(db: &crate::db::Database) -> ScanFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lyric_access::native_fixture::NativeFixture;
 
     #[test]
     fn audio_and_cue_paths_are_interesting() {
-        assert!(is_interesting_path(Path::new("D:/music/a.flac")));
-        assert!(is_interesting_path(Path::new("D:/music/a.mp3")));
-        assert!(is_interesting_path(Path::new("D:/music/album.cue")));
+        let fixture = NativeFixture::new("watch-audio");
+        assert!(is_interesting_path(&fixture.file("a.flac", b"audio")));
+        assert!(is_interesting_path(&fixture.file("a.mp3", b"audio")));
+        assert!(is_interesting_path(&fixture.file("album.cue", b"cue")));
+        assert!(is_interesting_path(&fixture.dir("album")));
     }
 
     #[test]
     fn sidecar_and_temp_paths_are_ignored() {
+        let fixture = NativeFixture::new("watch-sidecars");
         // 封面 / 歌词 / 半成品下载文件变了都不该触发入库
-        assert!(!is_interesting_path(Path::new("D:/music/cover.jpg")));
-        assert!(!is_interesting_path(Path::new("D:/music/a.lrc")));
-        assert!(!is_interesting_path(Path::new("D:/music/a.flac.part")));
+        assert!(!is_interesting_path(&fixture.file("cover.jpg", b"cover")));
+        assert!(!is_interesting_path(&fixture.file("a.lrc", b"lyric")));
+        assert!(!is_interesting_path(&fixture.file("a.flac.part", b"partial")));
     }
 
     #[test]
     fn vanished_paths_are_judged_by_extension() {
+        let fixture = NativeFixture::new("watch-vanished");
+        let missing = fixture.path().join("not-present");
+        assert!(!missing.exists(), "消失路径必须属于未分配的 fixture 子树");
         // 删除事件到达时文件已不存在，扩展名还在：音频文件放行交给上层按前缀清
-        assert!(is_interesting_path(Path::new("D:/music/不存在的专辑/a.flac")));
+        assert!(is_interesting_path(&missing.join("不存在的专辑/a.flac")));
         // 整个目录被移走时路径通常没有扩展名，必须放行才能清掉它下面的曲目
-        assert!(is_interesting_path(Path::new("D:/music/旧专辑")));
+        assert!(is_interesting_path(&missing.join("旧专辑")));
         // 但消失的封面/歌词/半成品文件不该触发入库
-        assert!(!is_interesting_path(Path::new("D:/music/vanished.jpg")));
-        assert!(!is_interesting_path(Path::new("D:/music/vanished.lrc")));
-        assert!(!is_interesting_path(Path::new("D:/music/vanished.flac.part")));
+        assert!(!is_interesting_path(&missing.join("vanished.jpg")));
+        assert!(!is_interesting_path(&missing.join("vanished.lrc")));
+        assert!(!is_interesting_path(&missing.join("vanished.flac.part")));
     }
 
     #[test]
     fn access_events_are_dropped() {
+        let fixture = NativeFixture::new("watch-access");
+        let audio = fixture.file("a.flac", b"audio");
         let mut batch = BTreeSet::new();
         collect_paths(
             Ok(notify::Event::new(EventKind::Access(
                 notify::event::AccessKind::Read,
             ))
-            .add_path(PathBuf::from("D:/music/a.flac"))),
+            .add_path(audio.clone())),
             &mut batch,
         );
         assert!(batch.is_empty(), "读取文件不该被当成曲库变化");
@@ -390,7 +399,7 @@ mod tests {
             Ok(notify::Event::new(EventKind::Create(
                 notify::event::CreateKind::File,
             ))
-            .add_path(PathBuf::from("D:/music/a.flac"))),
+            .add_path(audio)),
             &mut batch,
         );
         assert_eq!(batch.len(), 1);

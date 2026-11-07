@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { ArrowLeft, Info } from "lucide-react";
 import { avatarUrl, displayName, useAuthStore } from "@/stores/auth";
@@ -43,24 +43,33 @@ export function ProfileEditPage(): React.JSX.Element {
   const [busy, setBusy] = useState(false);
   const [done, setDone] = useState(false);
   const [avatarBusy, setAvatarBusy] = useState(false);
+  const avatarPending = useRef(false);
 
   const avatar = avatarUrl(profile);
   const avatarSrc = avatar ? qtresCoverUrl(avatar) : null;
 
   /** 换头像：选图 → 直传一条龙 → 只改本地展示态（URL 即版本，天然破缓存） */
   const changeAvatar = async (): Promise<void> => {
-    setTip(null);
-    const path = await ipc.pickImage("选择头像图片");
-    if (!path) return;
+    if (avatarPending.current || !session) return;
+    avatarPending.current = true;
     setAvatarBusy(true);
+    setTip(null);
+    const currentSession = session;
+    const isCurrent = (): boolean => useAuthStore.getState().session === currentSession;
     try {
-      const { url } = await ipc.astralUploadAvatar(path);
+      const epoch = await ipc.likeSessionEpoch();
+      if (!isCurrent()) return;
+      const path = await ipc.pickImage("选择头像图片");
+      if (!path || !isCurrent()) return;
+      const { url } = await ipc.astralUploadAvatar(path, epoch);
+      if (!isCurrent()) return;
       setLocalAvatar(url);
       // 头像区旁边没有常驻的文字位，回执走右上角 Toast（tip 那行留给保存表单）
       toastSuccess("头像已更新");
     } catch (err) {
-      toastError(authTip(err));
+      if (isCurrent()) toastError(authTip(err));
     } finally {
+      avatarPending.current = false;
       setAvatarBusy(false);
     }
   };

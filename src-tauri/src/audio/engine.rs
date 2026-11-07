@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -29,10 +30,18 @@ use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
 use super::fx::{AudioFx, DspSource, EqParams, FadeParams, FxState};
+use super::device_source::DeviceSource;
+use super::play_intent::{PlayTarget, QueueCommitReply};
+use super::playback_commit::{PlaybackCommitPlan, PlaybackCommitter};
+use super::speed_setting::SourceSpeedAuthority;
+pub use super::speed_setting::{NativeSpeedSetting, SourceSpeedSetting, SpeedSettingPending};
 use super::queue::Queue;
-use super::source::{IntervalSource, SourceProgress, TrackedSource};
+pub use super::source::SourceProgress;
+use super::source::{IntervalSource, TrackedSource};
 use super::range_reader::{self, RangeShared};
 use super::state::{PlayMode, PlaybackStateSnapshot, PlaybackStatus, Quality};
+#[path = "dlna_adapter.rs"]
+mod dlna_adapter;
 
 /// 播放来源：在线 URL（走 HttpRangeReader）或本地文件。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,9 +64,38 @@ pub enum PlaySource {
 
 /// 音频命令（DESIGN §7.4 AudioCmd 的 M2 子集）。
 pub enum AudioCmd {
+    DlnaConnect {
+        device_id: String,
+        reply: tokio::sync::oneshot::Sender<Result<crate::dlna::CastState, String>>,
+    },
+    DlnaDisconnect {
+        return_to_local: bool,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
+    DlnaDisconnected(Box<dlna_adapter::DisconnectResult>),
+    DlnaLoaded(Box<dlna_adapter::LoadResult>),
+    DlnaPoll(Box<dlna_adapter::PollResult>),
+    DlnaAction(Box<dlna_adapter::ActionResult>),
+    DlnaBoundPause {
+        target: PlayTarget,
+        original: Arc<super::render_control::SourceSeekPort>,
+        session_id: u64,
+        generation: u64,
+        paused: bool,
+    },
+    DlnaBoundSeek {
+        request: super::render_control::BoundSeekRequest,
+        session_id: u64,
+        generation: u64,
+    },
+    /// Produced only after the actual mounted source and Player naturally drain.
+    SourceFinished(Arc<super::render_control::SourceSeekPort>),
     /// 解码器已构建完成，可以挂载播放。构建（HTTP open + 首包探测）在
     /// blocking 线程池完成 —— 引擎线程全程不做网络 IO。
     LoadReady {
+        /// The logical owner captured before resolving or constructing this source.
+        target: Option<PlayTarget>,
+        port: Option<Arc<super::render_control::SourceSeekPort>>,
         track: Box<Track>,
         decoder: Box<dyn Source + Send>,
         shared: Option<Arc<RangeShared>>,
@@ -89,6 +127,36 @@ pub enum AudioCmd {
     SetQueue {
         tracks: Vec<Track>,
         index: usize,
+    },
+    /// Sender captures the original intent before this message enters the channel.
+    QueuedSetQueue {
+        tracks: Vec<Track>,
+        index: usize,
+        play_intent: u64,
+        reply: tokio::sync::oneshot::Sender<QueueCommitReply>,
+    },
+    QueuedPlayAt {
+        index: usize,
+        play_intent: u64,
+        reply: tokio::sync::oneshot::Sender<QueueCommitReply>,
+    },
+    QueuedNext {
+        play_intent: u64,
+        reply: tokio::sync::oneshot::Sender<QueueCommitReply>,
+    },
+    QueuedPrevious {
+        play_intent: u64,
+        reply: tokio::sync::oneshot::Sender<QueueCommitReply>,
+    },
+    QueuedPlayTrack {
+        track: Box<Track>,
+        play_intent: u64,
+        reply: tokio::sync::oneshot::Sender<QueueCommitReply>,
+    },
+    StampedRestore {
+        stamp: super::playback_commit::RestoreStamp,
+        session: super::playback_commit::RestoredPlayback,
+        reply: tokio::sync::oneshot::Sender<Option<(PlayTarget, PlaybackStateSnapshot)>>,
     },
     /// 单曲播放：**不替换队列** —— 队里已有这首（同 id + 同 platform）就播它原来那条，
     /// 否则追加到队尾再播。用户点某一首不该冲掉正在排队的整张列表。
@@ -148,6 +216,10 @@ pub enum AudioCmd {
     /// 改播放倍速（0.5 ~ 2.0）。rodio Player 的速度控制链全权处理，
     /// 进度 / seek 的内容时间域由引擎在读写两侧换算（见 content_pos_ms / sink_seek_content）。
     SetSpeed(f32),
+    /// Persistence only: retains the original source and control revision, never Player.
+    SourceSpeedSetting(Box<SourceSpeedSetting>),
+    /// Explicit Native control retains its sender value and shared speed revision.
+    NativeSpeedSetting(Box<NativeSpeedSetting>),
     /// 睡眠定时：`Some(ms)` = 定时武装（到点暂停并清空）；None = 取消。
     /// `after_track` = 播完当前曲目后停止（无倒计时）。
     SetSleepTimer {
@@ -174,6 +246,8 @@ pub enum AudioCmd {
     SetCacheDir(PathBuf),
     /// 取址 / 打开流失败的回执：统一置错误态，并决定是否自动跳过（§7.3 恢复策略）。
     LoadFailed {
+        original: Option<Arc<super::render_control::SourceSeekPort>>,
+        kind: &'static str,
         track_id: String,
         message: String,
         /// 触发时是否处于「应当继续播放」的语义（自动切歌 / 在播时换曲）
@@ -215,10 +289,367 @@ pub enum AudioCmd {
     Shutdown,
 }
 
+/// Immutable source-loader inputs, prepared by the same factory used by the actor.
+/// Preparation only reserves the original target; it opens no device, file or URL.
+pub struct SourceLoadRequest {
+    pub target: Option<PlayTarget>,
+    pub port: Option<Arc<super::render_control::SourceSeekPort>>,
+    pub track: Track,
+    pub autoplay: bool,
+    pub start_ms: u64,
+    pub gen: u64,
+}
+
+impl SourceLoadRequest {
+    fn ready_command(
+        &self, preload: bool, built: BuiltDecoder, is_local: bool,
+        fetched_at: Option<u64>, play_url: Option<String>, size_bytes: Option<u64>,
+    ) -> AudioCmd {
+        let BuiltDecoder { source: decoder, shared, duration_ms, physical_duration_ms } = built;
+        // A CUE track covers part of the physical file. Scale its byte count as
+        // well, so dividing by the interval duration preserves the file bitrate.
+        let size_bytes = size_bytes.or_else(|| shared.as_ref().and_then(|shared| shared.total_len()));
+        let size_bytes = if self.track.start_ms.is_some() || self.track.end_ms.is_some() {
+            size_bytes.and_then(|size| (physical_duration_ms > 0).then(|| {
+                (u128::from(size) * u128::from(duration_ms) / u128::from(physical_duration_ms)) as u64
+            }))
+        } else {
+            size_bytes
+        };
+        let start_at = if duration_ms > 0 { self.start_ms.min(duration_ms) } else { self.start_ms };
+        AudioCmd::LoadReady {
+            target: self.target.clone(),
+            port: self.port.clone(),
+            track: Box::new(self.track.clone()),
+            decoder,
+            shared,
+            duration_ms,
+            start_at: (start_at > 0).then_some(start_at),
+            autoplay: self.autoplay,
+            is_local,
+            url_fetched_at: fetched_at,
+            play_url,
+            size_bytes,
+            gen: self.gen,
+            preload,
+        }
+    }
+
+    fn failure_command(&self, kind: &'static str, message: String, stalled: bool) -> AudioCmd {
+        AudioCmd::LoadFailed {
+            original: self.port.clone(), kind, track_id: self.track.id.clone(),
+            message, autoplay: self.autoplay, stalled, gen: self.gen,
+        }
+    }
+
+    /// Drive the same local decoder and failure packet without constructing a provider or device.
+    pub fn decode_local_or_report(
+        &self, owner: &AudioEngine, path: &Path,
+    ) -> Result<Decoder<BufReader<std::fs::File>>, String> {
+        decode_local_file(path).inspect_err(|detail| {
+            let _ = owner.tx.send(self.failure_command(
+                "load", load_failure_message(detail, false), false,
+            ));
+        })
+    }
+}
+
+fn load_failure_message(detail: &str, stalled: bool) -> String {
+    if stalled { format!("网络较慢，正在重试（{detail}）") }
+    else { format!("该歌曲暂时无法播放（{detail}）") }
+}
+
+/// Actual failed-loader inputs; the original reservation is not a current-source lookup.
+pub struct SourceFailureInput {
+    pub original: Arc<super::render_control::SourceSeekPort>,
+    pub kind: &'static str,
+    pub track_id: String,
+    pub message: String,
+    pub autoplay: bool,
+    pub stalled: bool,
+    pub gen: u64,
+}
+
+/// Raw actor recovery policy, not an authored failure result or replacement state machine.
+pub struct SourceRecoveryContext {
+    pub auto_next: bool,
+    pub fail_streak: u32,
+    pub failed_tracks: std::collections::HashSet<String>,
+}
+
+pub enum SourceFailureEffect {
+    Error,
+    Retry,
+    Circuit { notice: String },
+    Advance { track: Box<Track>, target: PlayTarget, request: Option<Box<SourceLoadRequest>> },
+}
+
+pub struct SourceFailureApplied {
+    pub input: SourceFailureInput,
+    pub updates: Vec<PlaybackStateSnapshot>,
+    pub effect: SourceFailureEffect,
+}
+
+/// The production channel's accepted semantic work, separated from device/IO effects.
+pub enum AudioDelivery {
+    Command(AudioCmd),
+    SourceSpeedSetting(Box<SourceSpeedSetting>),
+    /// Explicit Native control retains its sender value and shared speed revision.
+    NativeSpeedSetting(Box<NativeSpeedSetting>),
+    Playback(Box<PlaybackCommitPlan>),
+    /// Index/track navigation retains per-track quality and the existing failed-track set.
+    ManualPlayback(Box<PlaybackCommitPlan>),
+    /// Next preserves navigation's existing listening and failure context.
+    NavigationPlayback(Box<PlaybackCommitPlan>),
+    /// Previous does not force Next's listening settlement or skip dislikes.
+    PreviousPlayback(Box<PlaybackCommitPlan>),
+    AutomaticPlayback {
+        advance: Box<super::playback_commit::AutomaticAdvance>,
+        request: Option<Box<SourceLoadRequest>>,
+    },
+    /// Raw original-loader receipt; the shared failure body decides its effects.
+    SourceFailure(Box<SourceFailureInput>),
+    Rejected,
+}
+
+impl AudioDelivery {
+    /// The real actor and headless settings boundary execute this same persistence step.
+    /// Bound requests authorize their captured source after the DB wait and never Player.
+    pub fn persist_speed(self, db: Option<&Database>) -> Result<bool, String> {
+        match self {
+            Self::SourceSpeedSetting(setting) => setting.persist(db),
+            Self::NativeSpeedSetting(setting) => setting.persist(db),
+            Self::Command(AudioCmd::SetSpeed(_)) =>
+                Err(String::from("unstamped Native speed persistence rejected")),
+            _ => Ok(false),
+        }
+    }
+}
+
+/// The same receiver used by `spawn`; constructing a channel never opens a device.
+pub struct AudioCommandInbox {
+    rx: mpsc::Receiver<AudioCmd>,
+    core: PlaybackCommitter,
+    owner: AudioEngine,
+}
+
+impl AudioCommandInbox {
+    fn reserve_plan(&self, plan: Option<PlaybackCommitPlan>) -> Option<PlaybackCommitPlan> {
+        let mut plan = plan?;
+        if let Some(target) = &plan.target {
+            plan.port = Some(self.owner.reserve_source_mount(target.clone())?);
+        }
+        Some(plan)
+    }
+
+    pub fn recv_timeout(
+        &self,
+        timeout: Duration,
+        load_gen: &mut u64,
+    ) -> Result<AudioDelivery, mpsc::RecvTimeoutError> {
+        self.recv_timeout_skipping(timeout, load_gen, |_| false)
+    }
+
+    /// The production actor supplies its existing in-memory dislike matcher, never DB IO.
+    pub fn recv_timeout_skipping(
+        &self,
+        timeout: Duration,
+        load_gen: &mut u64,
+        skip: impl Fn(&Track) -> bool,
+    ) -> Result<AudioDelivery, mpsc::RecvTimeoutError> {
+        let cmd = self.rx.recv_timeout(timeout)?;
+        if let AudioCmd::LoadReady { target: Some(target), gen, preload, .. } = &cmd {
+            let eligible = (*preload || *gen == *load_gen)
+                && self.core.with_target(target, |_| ()).is_some();
+            if !eligible {
+                // Decoder/resource destruction occurs only after the short Gate read ends.
+                return Ok(AudioDelivery::Rejected);
+            }
+        }
+        match cmd {
+            AudioCmd::LoadFailed {
+                original: Some(original), kind, track_id, message, autoplay, stalled, gen,
+            } => Ok(AudioDelivery::SourceFailure(Box::new(SourceFailureInput {
+                original, kind, track_id, message, autoplay, stalled, gen,
+            }))),
+            AudioCmd::SourceFinished(original) => {
+                let Some((advance, port)) = self.owner.advance_finished_source(&original, load_gen, skip)
+                    else { return Ok(AudioDelivery::Rejected); };
+                let request = advance.track.clone().and_then(|track| self.owner.prepare_source_load(
+                    track, Some(advance.target.clone()), port, advance.load_gen, true, 0,
+                )).map(Box::new);
+                Ok(AudioDelivery::AutomaticPlayback { advance: Box::new(advance), request })
+            }
+            AudioCmd::QueuedSetQueue { tracks, index, play_intent, reply } => {
+                // The receiver commits only the ticket captured by the sender.
+                let plan = self.core.commit_queue(play_intent, tracks, index, load_gen);
+                let plan = self.reserve_plan(plan);
+                let receipt = plan.as_ref().map(|plan| plan.reply.clone())
+                    .unwrap_or_else(QueueCommitReply::rejected);
+                let _ = reply.send(receipt);
+                Ok(plan.map(|plan| AudioDelivery::Playback(Box::new(plan)))
+                    .unwrap_or(AudioDelivery::Rejected))
+            }
+            AudioCmd::QueuedPlayAt { index, play_intent, reply } => {
+                let generation = play_intent;
+                let mut queue = self.core.queue_snapshot();
+                let plan = if index >= queue.len() {
+                    None
+                } else {
+                    queue.commit_index(index);
+                    let prepared = self.core.prepare(generation, queue, true, 0, None);
+                    self.core.commit_prepared(generation, prepared, load_gen)
+                };
+                let plan = self.reserve_plan(plan);
+                let receipt = plan.as_ref().map(|plan| plan.reply.clone())
+                    .unwrap_or_else(QueueCommitReply::rejected);
+                let _ = reply.send(receipt);
+                Ok(plan.map(|plan| AudioDelivery::ManualPlayback(Box::new(plan)))
+                    .unwrap_or(AudioDelivery::Rejected))
+            }
+            AudioCmd::QueuedNext { play_intent, reply } => {
+                let generation = play_intent;
+                let mut queue = self.core.queue_snapshot();
+                let mode = self.core.snapshot().play_mode;
+                let plan = queue.next_index_skipping(mode, false, skip).and_then(|index| {
+                    queue.commit_index(index);
+                    let prepared = self.core.prepare(generation, queue, true, 0, None);
+                    self.core.commit_prepared(generation, prepared, load_gen)
+                });
+                let plan = self.reserve_plan(plan);
+                let receipt = plan.as_ref().map(|plan| plan.reply.clone())
+                    .unwrap_or_else(QueueCommitReply::rejected);
+                let _ = reply.send(receipt);
+                Ok(plan.map(|plan| AudioDelivery::NavigationPlayback(Box::new(plan)))
+                    .unwrap_or(AudioDelivery::Rejected))
+            }
+            AudioCmd::QueuedPrevious { play_intent, reply } => {
+                let generation = play_intent;
+                let mut queue = self.core.queue_snapshot();
+                let mode = self.core.snapshot().play_mode;
+                let plan = queue.previous_index(mode).and_then(|index| {
+                    queue.commit_index(index);
+                    let prepared = self.core.prepare(generation, queue, true, 0, None);
+                    self.core.commit_prepared(generation, prepared, load_gen)
+                });
+                let plan = self.reserve_plan(plan);
+                let receipt = plan.as_ref().map(|plan| plan.reply.clone())
+                    .unwrap_or_else(QueueCommitReply::rejected);
+                let _ = reply.send(receipt);
+                Ok(plan.map(|plan| AudioDelivery::PreviousPlayback(Box::new(plan)))
+                    .unwrap_or(AudioDelivery::Rejected))
+            }
+            AudioCmd::QueuedPlayTrack { track, play_intent, reply } => {
+                let mut candidate = self.core.queue_snapshot();
+                let index = candidate.append_or_find(*track);
+                candidate.commit_index(index);
+                let prepared = self.core.prepare(play_intent, candidate, true, 0, None);
+                let plan = self.core.commit_prepared(play_intent, prepared, load_gen);
+                let plan = self.reserve_plan(plan);
+                let receipt = plan.as_ref().map(|plan| plan.reply.clone())
+                    .unwrap_or_else(QueueCommitReply::rejected);
+                let _ = reply.send(receipt);
+                Ok(plan.map(|plan| AudioDelivery::ManualPlayback(Box::new(plan)))
+                    .unwrap_or(AudioDelivery::Rejected))
+            }
+            AudioCmd::StampedRestore { stamp, session, reply } => {
+                let plan = self.core.commit_restore(stamp, session, load_gen);
+                let plan = self.reserve_plan(plan);
+                let receipt = plan.as_ref().and_then(|plan| plan.target.clone()
+                    .map(|target| (target, plan.snapshot.clone())));
+                let _ = reply.send(receipt);
+                Ok(plan.map(|plan| AudioDelivery::Playback(Box::new(plan)))
+                    .unwrap_or(AudioDelivery::Rejected))
+            }
+            AudioCmd::SourceSpeedSetting(setting) => Ok(AudioDelivery::SourceSpeedSetting(setting)),
+            AudioCmd::NativeSpeedSetting(setting) => Ok(AudioDelivery::NativeSpeedSetting(setting)),
+            cmd => Ok(AudioDelivery::Command(cmd)),
+        }
+    }
+}
+
+/// A queue caller releases only its original, still-uncommitted ticket on every exit.
+struct PendingQueueIntent {
+    gate: super::play_intent::PlayIntentGate,
+    generation: u64,
+}
+
+impl Drop for PendingQueueIntent {
+    fn drop(&mut self) {
+        self.gate.abandon(self.generation);
+    }
+}
+
+#[derive(Default)]
+struct SourceMounts {
+    reserved: Option<Arc<super::render_control::SourceSeekPort>>,
+    current: Option<Arc<super::render_control::SourceSeekPort>>,
+}
+
+/// Source callbacks retain original authority without keeping the mount registry alive.
+#[derive(Clone)]
+pub(super) struct SourceControlOwner {
+    core: PlaybackCommitter,
+    mounts: std::sync::Weak<Mutex<SourceMounts>>,
+}
+impl SourceControlOwner {
+    fn with_original<T>(&self, original: &super::render_control::SourceSeekPort,
+        current_only: bool, apply: impl FnOnce(&mut PlaybackStateSnapshot) -> T) -> Option<T>
+    {
+        let mounts = self.mounts.upgrade()?;
+        self.core.with_target(&original.stamp().target, |state| {
+            let mounts = mounts.lock().unwrap_or_else(|e| e.into_inner());
+            let current = mounts.current.as_ref()
+                .is_some_and(|port| std::ptr::eq(port.as_ref(), original));
+            let reserved = !current_only && mounts.reserved.as_ref()
+                .is_some_and(|port| std::ptr::eq(port.as_ref(), original));
+            if original.is_live() && (current || reserved) { Some(apply(state)) } else { None }
+        }).flatten()
+    }
+    pub(super) fn qualifies(&self, original: &super::render_control::SourceSeekPort) -> bool {
+        self.with_original(original, false, |_| ()).is_some()
+    }
+    pub(super) fn commit_seek(&self, original: &super::render_control::SourceSeekPort, position_ms: u64) -> bool {
+        self.with_original(original, true, |state| state.position_ms = position_ms).is_some()
+    }
+    pub(super) fn qualifies_speed(&self, original: &super::render_control::SourceSeekPort,
+        clock: &AtomicU64, revision: u64) -> bool
+    {
+        self.with_original(original, false, |_| clock.load(Ordering::Acquire) == revision)
+            .unwrap_or(false)
+    }
+    fn commit_speed(&self, original: &super::render_control::SourceSeekPort, speed: f32,
+        clock: &AtomicU64) -> Option<u64>
+    {
+        self.with_original(original, false, |state| {
+            // All clock mutations own State; exhaustion rejects without changing speed.
+            let revision = clock.load(Ordering::Acquire).checked_add(1)?;
+            original.set_speed(speed);
+            state.speed = speed;
+            clock.store(revision, Ordering::Release);
+            Some(revision)
+        }).flatten()
+    }
+    fn commit_pause(&self, original: &super::render_control::SourceSeekPort, paused: bool) -> bool {
+        self.with_original(original, false, |state| {
+            original.set_paused(paused);
+            if original.is_ready() { state.position_ms = original.position_ms(); }
+            state.status = if paused { PlaybackStatus::Paused }
+                else if original.is_ready() { PlaybackStatus::Playing } else { PlaybackStatus::Loading };
+        }).is_some()
+    }
+}
+
 /// 引擎句柄：clone 后供多个 Tauri 命令使用。
 #[derive(Clone)]
 pub struct AudioEngine {
     tx: Sender<AudioCmd>,
+    dlna: crate::dlna::DlnaManager,
+    core: PlaybackCommitter,
+    source_mounts: Arc<Mutex<SourceMounts>>,
+    mount_nonce: Arc<AtomicU64>,
+    speed_revision: Arc<AtomicU64>,
+    render_seek: Arc<Mutex<Option<super::render_control::BoundSeekSender>>>,
     state: Arc<RwLock<PlaybackStateSnapshot>>,
     queue: Arc<Mutex<Queue>>,
     /// 音效设置（EQ / 响度归一化 / 淡入淡出）：命令线程写、渲染线程读
@@ -254,6 +685,663 @@ pub fn notify_audio_thread_panic(msg: &str) {
 }
 
 impl AudioEngine {
+    /// Allocate the production message/state boundary without any device, DB or network.
+    pub fn command_channel() -> (Self, AudioCommandInbox) {
+        let (tx, rx) = mpsc::channel();
+        let state = Arc::new(RwLock::new(PlaybackStateSnapshot::default()));
+        let queue = Arc::new(Mutex::new(Queue::default()));
+        let core = PlaybackCommitter::new(
+            super::play_intent::PlayIntentGate::new(), Arc::clone(&queue), Arc::clone(&state),
+        );
+        let engine = Self {
+            tx, core: core.clone(), state, queue, fx: Arc::new(AudioFx::new()),
+            dlna: crate::dlna::DlnaManager::default(),
+            source_mounts: Arc::new(Mutex::new(SourceMounts::default())),
+            mount_nonce: Arc::new(AtomicU64::new(0)),
+            speed_revision: Arc::new(AtomicU64::new(0)),
+            render_seek: Arc::new(Mutex::new(None)),
+            cache_file: Arc::new(Mutex::new(None)),
+        };
+        let inbox = AudioCommandInbox { rx, core, owner: engine.clone() };
+        (engine, inbox)
+    }
+
+    /// Queue the original mounted source; no new ticket or latest-source lookup here.
+    pub fn source_finished(&self, original: Arc<super::render_control::SourceSeekPort>) {
+        let _ = self.tx.send(AudioCmd::SourceFinished(original));
+    }
+
+    /// The production deletion command and software driver share the original Queue gap policy.
+    /// Removing an entry updates only queue metadata, not the physical/logical playing track.
+    pub fn remove_queue_indices(&self, indices: &[usize]) -> usize {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let removed = queue.remove_indices(indices);
+        if removed > 0 {
+            let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+            state.queue_index = queue.index;
+            state.queue_len = queue.len();
+        }
+        removed
+    }
+
+    /// Prepare the existing failure policy outside Gate, then admit its original reservation once.
+    /// A failed loader may own reserved A while the physical current source is still Z.
+    pub fn apply_source_failure(
+        &self, input: SourceFailureInput, context: &mut SourceRecoveryContext,
+        load_gen: &mut u64,
+    ) -> Option<SourceFailureApplied> {
+        if input.gen != *load_gen { return None; }
+        let original = input.original.stamp().target.clone();
+        if input.track_id != original.id { return None; }
+        let mut state = self.snapshot();
+        let mut queue = self.queue_snapshot();
+        let mut policy = SourceRecoveryContext {
+            auto_next: context.auto_next, fail_streak: context.fail_streak,
+            failed_tracks: context.failed_tracks.clone(),
+        };
+        state.status = PlaybackStatus::Error;
+        state.error = Some(input.message.clone());
+        let mut updates = vec![state.clone()];
+        let mut effect = SourceFailureEffect::Error;
+        let mut port = None;
+        if input.autoplay && policy.auto_next {
+            if input.stalled {
+                effect = SourceFailureEffect::Retry;
+            } else {
+                policy.fail_streak += 1;
+                if policy.fail_streak >= FAIL_STREAK_LIMIT {
+                    policy.auto_next = false;
+                    policy.fail_streak = 0;
+                    let notice = format!("连续{FAIL_STREAK_LIMIT}首播放失败，已停止自动切歌");
+                    state.error = Some(notice.clone());
+                    updates.push(state.clone());
+                    effect = SourceFailureEffect::Circuit { notice };
+                } else {
+                    policy.failed_tracks.insert(input.track_id.clone());
+                    let len = queue.len();
+                    if len > 1 {
+                        if let Some(current) = queue.index {
+                            let selected = (1..=len).map(|offset| (current + offset) % len)
+                                .find(|index| queue.tracks.get(*index)
+                                    .is_some_and(|track| !policy.failed_tracks.contains(&track.id)));
+                            if let Some(index) = selected {
+                                queue.commit_index(index);
+                                if let Some(track) = queue.current().cloned() {
+                                    let target = PlayTarget::new(original.generation.checked_add(1)?, &track);
+                                    state.queue_index = queue.index;
+                                    state.queue_len = queue.len();
+                                    super::playback_commit::set_loading_snapshot(&mut state, &track, 0);
+                                    updates.push(state.clone());
+                                    let stamp = super::render_control::MountStamp {
+                                        target: target.clone(),
+                                        mount_nonce: self.mount_nonce.fetch_add(1, Ordering::Relaxed).wrapping_add(1),
+                                    };
+                                    let owner = SourceControlOwner {
+                                        core: self.core.clone(), mounts: Arc::downgrade(&self.source_mounts),
+                                    };
+                                    let candidate = super::render_control::SourceSeekPort::reserved(
+                                        stamp, self.core.gate().clone(), owner,
+                                    );
+                                    // The same factory receives the exact candidate registered by the commit.
+                                    let request = self.prepare_source_load(track.clone(), Some(target.clone()),
+                                        Some(candidate.clone()), input.gen.wrapping_add(1), true, 0).map(Box::new);
+                                    port = Some(candidate);
+                                    effect = SourceFailureEffect::Advance { track: Box::new(track), target, request };
+                                }
+                            } else {
+                                state.error = Some(format!(
+                                    "队列内 {len} 首均无法播放，请检查音源或稍后重试",
+                                ));
+                                updates.push(state.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let has_next = port.is_some();
+        let target_generation = port.as_ref().map_or(original.generation, |port| port.stamp().target.generation);
+        let mut registration = port.clone();
+        let mut retired = None;
+        self.core.gate().with_automatic(original.generation, has_next, |generation| {
+            if generation != target_generation || *load_gen != input.gen { return None; }
+            // Lock order is Gate → Queue → State → Mounts. No IO or resource drops here.
+            let mut current_queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            let mut current_state = self.state.write().unwrap_or_else(|e| e.into_inner());
+            if !current_state.track.as_ref().is_some_and(|track| original.matches_track(track)) {
+                return None;
+            }
+            let mut mounts = self.source_mounts.lock().unwrap_or_else(|e| e.into_inner());
+            let same = |port: &Arc<super::render_control::SourceSeekPort>| {
+                Arc::ptr_eq(port, &input.original) && port.stamp() == input.original.stamp()
+            };
+            let owns_reservation = mounts.reserved.as_ref().is_some_and(same);
+            let owns_current = mounts.reserved.is_none() && mounts.current.as_ref().is_some_and(same);
+            if !owns_reservation && !owns_current { return None; }
+            for next in std::iter::once(&mut state).chain(updates.iter_mut()) {
+                next.volume = current_state.volume;
+                next.muted = current_state.muted;
+                next.speed = current_state.speed;
+                next.play_mode = current_state.play_mode;
+                next.sleep_timer_ms = current_state.sleep_timer_ms;
+                next.sleep_after_track = current_state.sleep_after_track;
+            }
+            if let Some(port) = &port {
+                port.set_speed(current_state.speed);
+                retired = std::mem::replace(&mut mounts.reserved, registration.take());
+                std::mem::swap(&mut *current_queue, &mut queue);
+                std::mem::swap(&mut *current_state, &mut state);
+                *load_gen = input.gen.wrapping_add(1);
+            } else {
+                // An error-only/retry/circuit receipt does not replace unrelated transport metadata.
+                current_state.status = PlaybackStatus::Error;
+                std::mem::swap(&mut current_state.error, &mut state.error);
+            }
+            std::mem::swap(context, &mut policy);
+            Some(())
+        })?;
+        if let Some(retired) = retired { retired.retire(); }
+        Some(SourceFailureApplied { input, updates, effect })
+    }
+
+    pub fn begin_play_intent(&self) -> u64 {
+        self.core.gate().begin()
+    }
+
+    pub fn dlna_manager(&self) -> crate::dlna::DlnaManager { self.dlna.clone() }
+
+    pub async fn connect_dlna(&self, device_id: String) -> Result<crate::dlna::CastState, String> {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.tx.send(AudioCmd::DlnaConnect { device_id, reply }).map_err(|_| "播放引擎已退出")?;
+        result.await.map_err(|_| "播放引擎已退出".to_string())?
+    }
+
+    pub async fn disconnect_dlna(&self, return_to_local: bool) -> Result<(), String> {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        self.tx.send(AudioCmd::DlnaDisconnect { return_to_local, reply }).map_err(|_| "播放引擎已退出")?;
+        result.await.map_err(|_| "播放引擎已退出".to_string())?
+    }
+
+    pub fn abandon_play_intent(&self, play_intent: u64) -> bool {
+        self.core.gate().abandon(play_intent)
+    }
+
+    /// A source adapter retains the same engine authority as its original target.
+    pub fn source_seek_port(&self, stamp: super::render_control::MountStamp)
+        -> Arc<super::render_control::SourceSeekPort>
+    {
+        super::render_control::SourceSeekPort::with_gate(stamp, self.core.gate().clone())
+    }
+
+    /// Reserve one physical source incarnation, without running a decoder or Player.
+    pub fn reserve_source_mount(&self, target: PlayTarget)
+        -> Option<Arc<super::render_control::SourceSeekPort>>
+    {
+        let stamp = super::render_control::MountStamp {
+            target,
+            mount_nonce: self.mount_nonce.fetch_add(1, Ordering::Relaxed).wrapping_add(1),
+        };
+        let owner = SourceControlOwner { core: self.core.clone(), mounts: Arc::downgrade(&self.source_mounts) };
+        let port = super::render_control::SourceSeekPort::reserved(stamp, self.core.gate().clone(), owner);
+        let retired = self.core.with_target(&port.stamp().target, |state| {
+            let mut mounts = self.source_mounts.lock().unwrap_or_else(|e| e.into_inner());
+            port.set_speed(state.speed);
+            mounts.reserved.replace(port.clone())
+        })?;
+        if let Some(retired) = retired { retired.retire(); }
+        Some(port)
+    }
+
+    /// Qualify the original EOF and register C in the same automatic Core commit.
+    fn advance_finished_source(
+        &self, original: &Arc<super::render_control::SourceSeekPort>, load_gen: &mut u64,
+        skip: impl Fn(&Track) -> bool,
+    ) -> Option<(super::playback_commit::AutomaticAdvance,
+        Option<Arc<super::render_control::SourceSeekPort>>)> {
+        let prepared = self.core.prepare_automatic(original.stamp().target.clone(), *load_gen, skip)?;
+        let port = prepared.track.as_ref().map(|_| {
+            let stamp = super::render_control::MountStamp { target: prepared.target.clone(),
+                mount_nonce: self.mount_nonce.fetch_add(1, Ordering::Relaxed).wrapping_add(1) };
+            let owner = SourceControlOwner { core: self.core.clone(), mounts: Arc::downgrade(&self.source_mounts) };
+            super::render_control::SourceSeekPort::reserved(stamp, self.core.gate().clone(), owner)
+        });
+        let mut registration = port.clone();
+        let mut retired = None;
+        let advance = self.core.commit_automatic(&original.stamp().target, prepared, load_gen, |state| {
+            let mut mounts = self.source_mounts.lock().unwrap_or_else(|e| e.into_inner());
+            // EOF may already have retired the source; is_live is deliberately not used.
+            if !original.has_drained_eof() || !mounts.current.as_ref().is_some_and(|current|
+                Arc::ptr_eq(current, original) && current.stamp() == original.stamp())
+                || mounts.reserved.as_ref().is_some_and(|reserved| !Arc::ptr_eq(reserved, original))
+            { return false; }
+            if let Some(port) = &port { port.set_speed(state.speed); }
+            retired = std::mem::replace(&mut mounts.reserved, registration.take());
+            true
+        });
+        if let Some(retired) = retired { retired.retire(); }
+        advance.map(|advance| (advance, port))
+    }
+
+    /// The actor and public software boundary retain the same original loader inputs.
+    /// This is the existing loader preparation, including its fail-closed reservation.
+    pub fn prepare_source_load(
+        &self, track: Track, target: Option<PlayTarget>,
+        original_port: Option<Arc<super::render_control::SourceSeekPort>>,
+        gen: u64, autoplay: bool, start_ms: u64,
+    ) -> Option<SourceLoadRequest> {
+        let port = original_port.or_else(|| target.as_ref()
+            .and_then(|target| self.reserve_source_mount(target.clone())));
+        if target.is_some() && port.is_none() { return None; }
+        Some(SourceLoadRequest { target, port, track, autoplay, start_ms, gen })
+    }
+
+    /// Prepare the actor's existing speculative selection; no source reservation or IO.
+    pub fn prepare_preload(
+        &self, p: &mut PreloadState, input: PreloadPrepare<'_>,
+        skip: impl Fn(&Track) -> bool,
+    ) -> Option<PreloadRequest> {
+        let (playing, mode, original_track) = {
+            let state = self.state.read().unwrap_or_else(|e| e.into_inner());
+            (state.status == PlaybackStatus::Playing, state.play_mode, state.track.clone())
+        };
+        let facts = PreloadFacts {
+            gapless: input.flags.gapless,
+            sleep_after_track: input.flags.sleep_after_track,
+            auto_next: input.flags.auto_next,
+            has_slot: p.slot.is_some(),
+            pausing: input.pausing,
+            playing,
+            has_progress: input.current_progress.is_some(),
+            retries_left: p.retries < PRELOAD_RETRY_LIMIT,
+        };
+        if let Some(reason) = preload_block(facts) {
+            log::trace!("[gapless] 跳过预热：{reason}");
+            return None;
+        }
+        let original_track = original_track?;
+        let original_progress = Arc::clone(input.current_progress?);
+        match (input.target, input.current_mount) {
+            (Some(target), Some(port))
+                if target.matches_track(&original_track) && &port.stamp().target == target
+                    && Arc::ptr_eq(&original_progress, &port.progress()) => {}
+            (None, None) => {}
+            _ => return None,
+        }
+        let candidate = {
+            let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            queue.next_index_skipping(mode, true, skip).and_then(|index| {
+                Some((index, queue.tracks.get(index)?.clone(),
+                    queue.current().cloned(), queue.selection_cursor()))
+            })
+        };
+        let (index, track, original_queue_track, original_queue_cursor) = candidate?;
+        p.gen = p.gen.wrapping_add(1);
+        let gen = p.gen;
+        // Choose Random exactly once; the retained index is committed on activation.
+        p.slot = Some(PreloadSlot {
+            gen, index, track: track.clone(), ready: None,
+            original_track, original_progress, original_target: input.target.cloned(),
+            original_queue_track, original_queue_cursor,
+            original_mount: input.current_mount.cloned(),
+            original_stamp: input.current_mount.map(|mount| mount.stamp().clone()),
+            original_load_gen: input.load_gen,
+        });
+        log::debug!("[gapless] 开始预热下一首 {}（mode={mode:?}, index={index}）", track.id);
+        let quality = input.quality.effective_for(&track);
+        Some(PreloadRequest {
+            request: SourceLoadRequest {
+                target: input.target.cloned(), port: None,
+                track, autoplay: true, start_ms: 0, gen,
+            },
+            quality,
+        })
+    }
+
+    /// Complete only the original reservation after append, never a reconstructed target.
+    pub fn complete_source_mount(&self, original: &Arc<super::render_control::SourceSeekPort>) -> bool {
+        let completed = self.core.with_target(&original.stamp().target, |_| {
+            let mut mounts = self.source_mounts.lock().unwrap_or_else(|e| e.into_inner());
+            if !original.is_live() || !mounts.reserved.as_ref()
+                .is_some_and(|port| Arc::ptr_eq(port, original))
+            {
+                return None;
+            }
+            let reservation = mounts.reserved.take().expect("the original reservation exists");
+            original.arm();
+            Some(mounts.current.replace(reservation))
+        }).flatten();
+        if let Some(retired) = completed {
+            if let Some(retired) = retired { retired.retire(); }
+            return true;
+        }
+        let (retire, discarded) = {
+            let mut mounts = self.source_mounts.lock().unwrap_or_else(|e| e.into_inner());
+            let retire = !mounts.current.as_ref().is_some_and(|port| Arc::ptr_eq(port, original));
+            let discarded = if mounts.reserved.as_ref().is_some_and(|port| Arc::ptr_eq(port, original)) {
+                mounts.reserved.take()
+            } else { None };
+            (retire, discarded)
+        };
+        if retire { original.retire(); }
+        drop(discarded);
+        false
+    }
+
+    pub fn current_source_mount(&self) -> Option<Arc<super::render_control::SourceSeekPort>> {
+        self.source_mounts.lock().unwrap_or_else(|e| e.into_inner()).current.clone()
+    }
+
+    /// The software Player and render inbox used by normal construction and rebuild.
+    pub fn player_channel(&self) -> (Player, super::render_control::RenderSeekOutput) {
+        let (player, output) = Player::new();
+        let (output, sender) = super::render_control::RenderSeekOutput::new(output);
+        let retired = self.render_seek.lock().unwrap_or_else(|e| e.into_inner()).replace(sender);
+        drop(retired);
+        (player, output)
+    }
+
+    /// Capture the original source incarnation, never a later current target.
+    pub fn source_mount(&self, target: &PlayTarget) -> Option<Arc<super::render_control::SourceSeekPort>> {
+        self.core.with_target(target, |_| {
+            let mounts = self.source_mounts.lock().unwrap_or_else(|e| e.into_inner());
+            mounts.current.as_ref().filter(|port| port.stamp().target == *target && port.is_live())
+                .or_else(|| mounts.reserved.as_ref().filter(|port| port.stamp().target == *target && port.is_live())).cloned()
+        }).flatten()
+    }
+
+    /// Source-local control entry; no Player or decoder operations run under the gate.
+    pub fn set_source_paused(&self, target: &PlayTarget, paused: bool)
+        -> Result<super::render_control::MountStamp, super::render_control::BoundSeekFailure>
+    {
+        use super::render_control::BoundSeekFailure;
+        let original = self.source_mount(target).ok_or(BoundSeekFailure {
+            message: "original source not mounted", source_intact: true,
+        })?;
+        let owner = SourceControlOwner { core: self.core.clone(), mounts: Arc::downgrade(&self.source_mounts) };
+        if let Some(connection) = self.dlna.selected() {
+            if !owner.qualifies(&original) {
+                return Err(BoundSeekFailure { message: "original source superseded", source_intact: true });
+            }
+            let stamp = original.stamp().clone();
+            self.tx.send(AudioCmd::DlnaBoundPause {
+                target: target.clone(), original, session_id: connection.id,
+                generation: connection.generation.load(Ordering::Acquire), paused,
+            })
+                .map_err(|_| BoundSeekFailure { message: "audio actor exited", source_intact: true })?;
+            return Ok(stamp);
+        }
+        if !owner.commit_pause(&original, paused) {
+            return Err(BoundSeekFailure { message: "original source superseded", source_intact: true });
+        }
+        Ok(original.stamp().clone())
+    }
+
+    fn commit_source_speed(&self, target: &PlayTarget, speed: f32)
+        -> Result<SourceSpeedAuthority, super::render_control::BoundSeekFailure>
+    {
+        use super::render_control::BoundSeekFailure;
+        if self.dlna.selected().is_some() {
+            return Err(BoundSeekFailure { message: "DLNA does not support playback speed", source_intact: true });
+        }
+        if !speed.is_finite() || !(SPEED_MIN..=SPEED_MAX).contains(&speed) {
+            return Err(BoundSeekFailure { message: "invalid source speed", source_intact: true });
+        }
+        let original = self.source_mount(target).ok_or(BoundSeekFailure {
+            message: "original source not mounted", source_intact: true,
+        })?;
+        let owner = SourceControlOwner { core: self.core.clone(), mounts: Arc::downgrade(&self.source_mounts) };
+        let revision = owner.commit_speed(&original, speed, &self.speed_revision)
+            .ok_or(BoundSeekFailure { message: "original source superseded or speed revision exhausted", source_intact: true })?;
+        Ok(SourceSpeedAuthority::new(owner, original, self.speed_revision.clone(), revision, speed))
+    }
+
+    /// Runtime primitive: no shared Player or persistence work for a bound target.
+    pub fn set_source_speed(&self, target: &PlayTarget, speed: f32)
+        -> Result<super::render_control::MountStamp, super::render_control::BoundSeekFailure>
+    {
+        self.commit_source_speed(target, speed).map(|authority| authority.stamp().clone())
+    }
+
+    /// Commit once, then queue the exact captured authority outside Gate/State/Mounts.
+    pub fn begin_source_speed_setting(&self, target: &PlayTarget, speed: f32)
+        -> Result<SpeedSettingPending, String>
+    {
+        let authority = self.commit_source_speed(target, speed).map_err(|error| error.to_string())?;
+        let (setting, pending) = SourceSpeedSetting::new(authority);
+        self.tx.send(AudioCmd::SourceSpeedSetting(Box::new(setting)))
+            .map_err(|_| String::from("audio actor exited before source speed persistence"))?;
+        Ok(pending)
+    }
+
+    pub fn begin_source_seek(&self, target: &PlayTarget, position_ms: u64)
+        -> Result<super::render_control::BoundSeekPending, super::render_control::BoundSeekFailure>
+    {
+        use super::render_control::{BoundSeekFailure, BoundSeekRequest};
+        let binding = self.core.with_target(target, |_| {
+            let mounts = self.source_mounts.lock().unwrap_or_else(|e| e.into_inner());
+            mounts.current.as_ref().filter(|port| port.stamp().target == *target && port.is_live())
+                .or_else(|| mounts.reserved.as_ref().filter(|port| port.stamp().target == *target && port.is_live()))
+                .map(|port| (port.clone(), port.speed()))
+        }).flatten().ok_or(BoundSeekFailure { message: "original source not mounted", source_intact: true })?;
+        let (port, speed) = binding;
+        let (request, pending) = BoundSeekRequest::new(port.stamp().clone(), port, position_ms, speed)?;
+        if let Some(connection) = self.dlna.selected() {
+            self.tx.send(AudioCmd::DlnaBoundSeek {
+                request, session_id: connection.id, generation: connection.generation.load(Ordering::Acquire),
+            })
+                .map_err(|_| BoundSeekFailure { message: "audio actor exited", source_intact: true })?;
+            return Ok(pending);
+        }
+        let sender = self.render_seek.lock().unwrap_or_else(|e| e.into_inner()).clone()
+            .ok_or(BoundSeekFailure { message: "render output unavailable", source_intact: true })?;
+        if let Err(error) = sender.try_submit(request) { error.reply_outside_gate(); }
+        Ok(pending)
+    }
+
+    /// Construct the production track-local DSP and outer ownership guard.
+    pub fn bind_source(&self, port: Arc<super::render_control::SourceSeekPort>,
+        decoder: Box<dyn Source + Send>, start_ms: u64, fx: Arc<AudioFx>,
+        epoch: Instant, spectrum: Option<crate::audio::SpectrumTap>) -> Box<dyn Source + Send>
+    {
+        let source = DspSource::new(port.tracked_source(decoder, start_ms), fx, epoch, spectrum);
+        let source = port.rate_source(Box::new(source));
+        Box::new(super::render_control::SeekTargetGuard::new(source, port))
+    }
+
+    /// Metadata publish rechecks the original completed physical incarnation.
+    pub fn publish_source_state(&self, original: &Arc<super::render_control::SourceSeekPort>,
+        prepared: PlaybackStateSnapshot) -> bool
+    {
+        let mut prepared = Some(prepared);
+        let retired = self.core.with_target(&original.stamp().target, |state| {
+            let mounts = self.source_mounts.lock().unwrap_or_else(|e| e.into_inner());
+            if !original.is_live() || !mounts.current.as_ref()
+                .is_some_and(|port| Arc::ptr_eq(port, original))
+            { return None; }
+            let mut prepared = prepared.take().expect("one original metadata commit");
+            prepared.position_ms = original.position_ms();
+            if let Some(paused) = original.pause_override() {
+                prepared.status = if paused { PlaybackStatus::Paused } else { PlaybackStatus::Playing };
+            }
+            prepared.volume = state.volume;
+            prepared.muted = state.muted;
+            prepared.speed = state.speed;
+            prepared.play_mode = state.play_mode;
+            std::mem::swap(&mut prepared.quality, &mut state.quality);
+            prepared.queue_index = state.queue_index;
+            prepared.queue_len = state.queue_len;
+            prepared.sleep_timer_ms = state.sleep_timer_ms;
+            prepared.sleep_after_track = state.sleep_after_track;
+            std::mem::swap(&mut prepared.output_device, &mut state.output_device);
+            std::mem::swap(&mut prepared.track, &mut state.track);
+            std::mem::swap(&mut prepared.track_id, &mut state.track_id);
+            std::mem::swap(&mut prepared.source_id, &mut state.source_id);
+            Some(std::mem::replace(state, prepared))
+        }).flatten();
+        let published = retired.is_some();
+        drop(retired);
+        published
+    }
+
+    /// `Some` is an immutable caller-owned ticket; only a native `None` begins work.
+    pub fn send_queue(
+        &self,
+        tracks: Vec<Track>,
+        index: usize,
+        play_intent: Option<u64>,
+    ) -> tokio::sync::oneshot::Receiver<QueueCommitReply> {
+        let play_intent = play_intent.unwrap_or_else(|| self.begin_play_intent());
+        let (reply, receipt) = tokio::sync::oneshot::channel();
+        let _ = self.tx.send(AudioCmd::QueuedSetQueue { tracks, index, play_intent, reply });
+        receipt
+    }
+
+    pub fn send_play_at(
+        &self,
+        index: usize,
+        play_intent: Option<u64>,
+    ) -> tokio::sync::oneshot::Receiver<QueueCommitReply> {
+        let play_intent = play_intent.unwrap_or_else(|| self.begin_play_intent());
+        let (reply, receipt) = tokio::sync::oneshot::channel();
+        let _ = self.tx.send(AudioCmd::QueuedPlayAt { index, play_intent, reply });
+        receipt
+    }
+
+    /// The production index-play IPC boundary shares original-ticket cleanup and ACK rules.
+    pub async fn play_at_with_receipt(
+        &self,
+        index: usize,
+        play_intent: Option<u64>,
+    ) -> Result<QueueCommitReply, String> {
+        let play_intent = play_intent.unwrap_or_else(|| self.begin_play_intent());
+        let _pending = PendingQueueIntent { gate: self.core.gate().clone(), generation: play_intent };
+        let receipt = self.send_play_at(index, Some(play_intent)).await
+            .map_err(|_| "播放引擎未返回索引提交回执".to_string())?;
+        Ok(self.core.gate().with_accepted(play_intent, || receipt)
+            .unwrap_or_else(QueueCommitReply::rejected))
+    }
+
+    pub fn send_next(
+        &self,
+        play_intent: Option<u64>,
+    ) -> tokio::sync::oneshot::Receiver<QueueCommitReply> {
+        let play_intent = play_intent.unwrap_or_else(|| self.begin_play_intent());
+        let (reply, receipt) = tokio::sync::oneshot::channel();
+        let _ = self.tx.send(AudioCmd::QueuedNext { play_intent, reply });
+        receipt
+    }
+
+    /// Native `None`, including the lyrics window, declares ownership before queue preparation.
+    pub async fn next_with_receipt(
+        &self,
+        play_intent: Option<u64>,
+    ) -> Result<QueueCommitReply, String> {
+        let play_intent = play_intent.unwrap_or_else(|| self.begin_play_intent());
+        let _pending = PendingQueueIntent { gate: self.core.gate().clone(), generation: play_intent };
+        let receipt = self.send_next(Some(play_intent)).await
+            .map_err(|_| String::from("播放引擎未返回下一首提交回执"))?;
+        Ok(self.core.gate().with_accepted(play_intent, || receipt)
+            .unwrap_or_else(QueueCommitReply::rejected))
+    }
+
+    /// The production queue IPC boundary; the adapter only supplies DB filtering.
+    pub async fn queue_after_filter<F, Fut>(
+        &self,
+        tracks: Vec<Track>,
+        index: usize,
+        play_intent: Option<u64>,
+        filter: F,
+    ) -> Result<QueueCommitReply, String>
+    where
+        F: FnOnce(Vec<Track>, usize) -> Fut,
+        Fut: std::future::Future<Output = Result<(Vec<Track>, usize), String>>,
+    {
+        if tracks.is_empty() {
+            return Err("队列为空".into());
+        }
+        let play_intent = play_intent.unwrap_or_else(|| self.begin_play_intent());
+        let _pending = PendingQueueIntent { gate: self.core.gate().clone(), generation: play_intent };
+        let (tracks, index) = filter(tracks, index).await?;
+        if tracks.is_empty() {
+            return Err("队列为空".into());
+        }
+        let receipt = self.send_queue(tracks, index, Some(play_intent)).await
+            .map_err(|_| "播放引擎未返回队列提交回执".to_string())?;
+        Ok(self.core.gate().with_accepted(play_intent, || receipt)
+            .unwrap_or_else(QueueCommitReply::rejected))
+    }
+
+    pub fn send_previous(
+        &self, play_intent: Option<u64>,
+    ) -> tokio::sync::oneshot::Receiver<QueueCommitReply> {
+        let play_intent = play_intent.unwrap_or_else(|| self.begin_play_intent());
+        let (reply, receipt) = tokio::sync::oneshot::channel();
+        let _ = self.tx.send(AudioCmd::QueuedPrevious { play_intent, reply });
+        receipt
+    }
+
+    pub async fn previous_with_receipt(
+        &self, play_intent: Option<u64>,
+    ) -> Result<QueueCommitReply, String> {
+        let play_intent = play_intent.unwrap_or_else(|| self.begin_play_intent());
+        let _pending = PendingQueueIntent {
+            gate: self.core.gate().clone(), generation: play_intent,
+        };
+        let receipt = self.send_previous(Some(play_intent)).await
+            .map_err(|_| "播放引擎未返回上一首提交回执".to_string())?;
+        Ok(self.core.gate().with_accepted(play_intent, || receipt)
+            .unwrap_or_else(QueueCommitReply::rejected))
+    }
+
+    pub fn send_play_track(
+        &self, track: Track, play_intent: Option<u64>,
+    ) -> tokio::sync::oneshot::Receiver<QueueCommitReply> {
+        let play_intent = play_intent.unwrap_or_else(|| self.begin_play_intent());
+        let (reply, receipt) = tokio::sync::oneshot::channel();
+        let _ = self.tx.send(AudioCmd::QueuedPlayTrack {
+            track: Box::new(track), play_intent, reply,
+        });
+        receipt
+    }
+
+    /// Captures startup eligibility before calling any storage/async loader.
+    pub async fn restore_after_load<F, Fut>(
+        &self, loader: F,
+    ) -> Result<Option<PlaybackStateSnapshot>, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Option<super::playback_commit::RestoredPlayback>, String>>,
+    {
+        let current = self.snapshot();
+        if current.track_id.is_some() {
+            return Ok(Some(current));
+        }
+        let Some(stamp) = self.core.capture_restore() else { return Ok(None); };
+        let Some(session) = loader().await? else { return Ok(None); };
+        if session.tracks.is_empty() { return Ok(None); }
+        let (reply, received) = tokio::sync::oneshot::channel();
+        self.tx.send(AudioCmd::StampedRestore { stamp, session, reply })
+            .map_err(|_| "audio engine 已退出，恢复请求未送达".to_string())?;
+        let receipt = tokio::time::timeout(Duration::from_secs(5), received).await
+            .map_err(|_| "等待原恢复回执超时".to_string())?
+            .map_err(|_| "audio engine 未返回原恢复回执".to_string())?;
+        Ok(receipt.and_then(|(target, snapshot)|
+            self.core.gate().with_accepted(target.generation, || snapshot)))
+    }
+
+    pub async fn play_track_with_receipt(
+        &self, track: Track, play_intent: Option<u64>,
+    ) -> Result<QueueCommitReply, String> {
+        let play_intent = play_intent.unwrap_or_else(|| self.begin_play_intent());
+        let _pending = PendingQueueIntent {
+            gate: self.core.gate().clone(), generation: play_intent,
+        };
+        let receipt = self.send_play_track(track, Some(play_intent)).await
+            .map_err(|_| String::from("播放引擎未返回单曲提交回执"))?;
+        Ok(self.core.gate().with_accepted(play_intent, || receipt)
+            .unwrap_or_else(QueueCommitReply::rejected))
+    }
+
     /// 启动专属音频线程。url_cache 供自动切歌时异步取址；
     /// db 供队列/播放状态持久化（None = 数据库不可用，播放不受影响）。
     pub fn spawn(
@@ -262,12 +1350,12 @@ impl AudioEngine {
         url_cache: Arc<PlayUrlCache>,
         db: Option<Arc<Database>>,
     ) -> Self {
-        let (tx, rx) = mpsc::channel::<AudioCmd>();
-        let state = Arc::new(RwLock::new(PlaybackStateSnapshot::default()));
-        let state_clone = Arc::clone(&state);
-        let queue = Arc::new(Mutex::new(Queue::default()));
-        let fx = Arc::new(AudioFx::new());
-        let cache_file = Arc::new(Mutex::new(None));
+        let (engine, rx) = Self::command_channel();
+        let tx = engine.tx.clone();
+        let state_clone = Arc::clone(&engine.state);
+        let queue = Arc::clone(&engine.queue);
+        let fx = Arc::clone(&engine.fx);
+        let cache_file = Arc::clone(&engine.cache_file);
         // 注册音频线程 panic 上报通道（先于线程启动；重复启动时以第一次为准）
         let _ = AUDIO_THREAD_PANIC_TX.set(tx.clone());
 
@@ -275,6 +1363,7 @@ impl AudioEngine {
         let queue_thread = Arc::clone(&queue);
         let fx_thread = Arc::clone(&fx);
         let cache_file_thread = Arc::clone(&cache_file);
+        let owner_thread = engine.clone();
         let _ = std::thread::Builder::new()
             .name("audio-engine".into())
             .spawn(move || {
@@ -284,6 +1373,7 @@ impl AudioEngine {
                 // 还活着，send() 侧能感知并报错，前端不至于无提示闪退。
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
                     run_engine(EngineDeps {
+                        owner: owner_thread,
                         app,
                         rx,
                         state: state_clone,
@@ -306,19 +1396,72 @@ impl AudioEngine {
                 }
             });
 
-        Self {
-            tx,
-            state,
-            queue,
-            fx,
-            cache_file,
+        engine
+    }
+
+    /// Explicit unbound transport resume updates source controls at the sender.
+    /// State -> Mounts is a suffix of the qualification lock order; no gate is acquired here.
+    fn resume_source_transport(&self) {
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+        let mounts = self.source_mounts.lock().unwrap_or_else(|e| e.into_inner());
+        for original in mounts.current.iter().chain(mounts.reserved.iter()) {
+            if !original.is_live() { continue; }
+            original.set_paused(false);
+            if state.status == PlaybackStatus::Paused
+                && state.track_id.as_deref() == Some(original.stamp().target.id.as_str())
+                && state.source_id.as_ref().map(|source| source.as_str()) == Some(original.stamp().target.platform.as_str())
+            {
+                if original.is_ready() { state.position_ms = original.position_ms(); }
+                state.status = if original.is_ready() { PlaybackStatus::Playing } else { PlaybackStatus::Loading };
+            }
         }
     }
 
+    /// Explicit Native transport speed is unbound and may control both live sources.
+    /// It takes only State -> Mounts, never source authority from a later snapshot.
+    fn set_source_transport_speed(&self, speed: f32) -> Option<u64> {
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+        let mounts = self.source_mounts.lock().unwrap_or_else(|e| e.into_inner());
+        let revision = self.speed_revision.load(Ordering::Acquire).checked_add(1)?;
+        state.speed = speed;
+        for original in mounts.current.iter().chain(mounts.reserved.iter()) {
+            if original.is_live() { original.set_speed(speed); }
+        }
+        self.speed_revision.store(revision, Ordering::Release);
+        Some(revision)
+    }
+
     pub fn send(&self, cmd: AudioCmd) {
-        // 引擎线程死亡时发送失败仅记录，不打断前端
-        if self.tx.send(cmd).is_err() {
-            log::error!("audio engine 已退出，命令丢弃");
+        if self.dlna.selected().is_some() && matches!(&cmd, AudioCmd::SetSpeed(_)) {
+            let _ = self.tx.send(cmd);
+            return;
+        }
+        let cmd = match cmd {
+            AudioCmd::SetSpeed(speed) => {
+                if !speed.is_finite() { return; }
+                let speed = speed.clamp(SPEED_MIN, SPEED_MAX);
+                let Some(revision) = self.set_source_transport_speed(speed) else { return; };
+                // Value and revision come from this commit, never a later State read.
+                AudioCmd::NativeSpeedSetting(Box::new(NativeSpeedSetting::new(
+                    self.state.clone(), self.speed_revision.clone(), revision, speed)))
+            }
+            cmd => cmd,
+        };
+        match cmd {
+            AudioCmd::SetQueue { tracks, index } => {
+                // Legacy native entries still begin a ticket at the sender, never at receive.
+                let _receipt = self.send_queue(tracks, index, None);
+            }
+            AudioCmd::PlayAt(index) => { let _receipt = self.send_play_at(index, None); }
+            AudioCmd::Next => { let _receipt = self.send_next(None); }
+            AudioCmd::Previous => { let _receipt = self.send_previous(None); }
+            AudioCmd::PlayTrack(track) => { let _receipt = self.send_play_track(*track, None); }
+            cmd => {
+                if matches!(&cmd, AudioCmd::Play) && self.dlna.selected().is_none() { self.resume_source_transport(); }
+                if self.tx.send(cmd).is_err() {
+                    log::error!("audio engine 已退出，命令丢弃");
+                }
+            }
         }
     }
 
@@ -356,10 +1499,118 @@ struct PreloadSlot {
     index: usize,
     track: Track,
     ready: Option<PreparedTrack>,
+    original_track: Track,
+    original_progress: Arc<SourceProgress>,
+    original_target: Option<PlayTarget>,
+    original_queue_track: Option<Track>,
+    original_queue_cursor: (Option<usize>, Option<usize>, Option<usize>),
+    original_mount: Option<Arc<super::render_control::SourceSeekPort>>,
+    original_stamp: Option<super::render_control::MountStamp>,
+    original_load_gen: u64,
+}
+
+/// The actor's single speculative-load state; its actual slot remains opaque.
+#[derive(Default)]
+pub struct PreloadState {
+    gen: u64,
+    /// 本曲内已用掉的预载失败重试次数（换曲/切歌边界归零，见 PRELOAD_RETRY_LIMIT）
+    retries: u32,
+    slot: Option<PreloadSlot>,
+}
+
+impl PreloadState {
+    pub fn prepared_progress(&self) -> Option<&Arc<SourceProgress>> {
+        self.slot.as_ref().and_then(|slot| slot.ready.as_ref()).map(|ready| &ready.progress)
+    }
+    pub fn original_mount(&self) -> Option<&Arc<super::render_control::SourceSeekPort>> {
+        self.slot.as_ref().and_then(|slot| slot.original_mount.as_ref())
+    }
+    pub fn original_stamp(&self) -> Option<&super::render_control::MountStamp> {
+        self.slot.as_ref().and_then(|slot| slot.original_stamp.as_ref())
+    }
+    pub fn original_load_gen(&self) -> Option<u64> {
+        self.slot.as_ref().map(|slot| slot.original_load_gen)
+    }
+
+    /// Take only the actual slot whose original render receipt has started.
+    pub fn take_started(&mut self) -> Option<StartedPreload> {
+        let started = self.slot.as_ref().and_then(|slot| slot.ready.as_ref())
+            .is_some_and(|ready| ready.progress.first_some());
+        if !started { return None; }
+        Some(StartedPreload {
+            slot: self.slot.take().unwrap(),
+        })
+    }
+}
+
+/// Raw actor policy flags; mounted/playing/slot/retry facts stay derived.
+#[derive(Debug, Clone, Copy)]
+pub struct PreloadFlags {
+    pub gapless: bool,
+    pub sleep_after_track: bool,
+    pub auto_next: bool,
+}
+
+/// Borrow the existing quality policy; selected Quality is cloned, not Copy.
+pub struct PreloadQuality<'a> {
+    pub default_quality: &'a Quality,
+    pub track_quality: &'a Option<(String, Quality)>,
+    pub source_qualities: &'a HashMap<String, Quality>,
+}
+
+impl PreloadQuality<'_> {
+    fn effective_for(&self, track: &Track) -> Quality {
+        if let Some((id, q)) = self.track_quality {
+            if *id == track.id {
+                return q.clone();
+            }
+        }
+        if let Some(q) = self.source_qualities.get(track.platform.as_str()) {
+            return q.clone();
+        }
+        self.default_quality.clone()
+    }
+}
+
+/// Original actor inputs, not a lookup of a later physical source.
+pub struct PreloadPrepare<'a> {
+    pub flags: PreloadFlags,
+    pub pausing: bool,
+    pub current_progress: Option<&'a Arc<SourceProgress>>,
+    pub current_mount: Option<&'a Arc<super::render_control::SourceSeekPort>>,
+    pub target: Option<&'a PlayTarget>,
+    pub load_gen: u64,
+    pub quality: PreloadQuality<'a>,
+}
+
+pub struct PreloadRequest {
+    pub request: SourceLoadRequest,
+    pub quality: Quality,
+}
+
+impl PreloadRequest {
+    /// Run the actual local preload decoder/receipt using an owned path.
+    /// Call on the loader worker, never under Gate or on the audio actor.
+    pub fn dispatch_local(self, owner: &AudioEngine, path: PathBuf) -> Result<(), String> {
+        let size_bytes = std::fs::metadata(&path).ok().map(|m| m.len());
+        match build_local_decoder(&path, &self.request.track) {
+            Ok(built) => {
+                let _ = owner.tx.send(self.request.ready_command(true, built, true, None, None, size_bytes));
+                Ok(())
+            }
+            Err(detail) => {
+                let message = load_failure_message(&detail, false);
+                log::debug!("[gapless] speculative load failed for {}: {message}", self.request.track.id);
+                let _ = owner.tx.send(AudioCmd::PreloadFailed { gen: self.request.gen });
+                Err(detail)
+            }
+        }
+    }
 }
 
 struct PreparedTrack {
     progress: Arc<SourceProgress>,
+    binding: Arc<super::render_control::PreloadBinding>,
     shared: Option<Arc<RangeShared>>,
     duration_ms: u64,
     is_local: bool,
@@ -368,19 +1619,114 @@ struct PreparedTrack {
     bitrate_kbps: Option<u32>,
 }
 
+/// Actual started slot, obtainable only through the original progress receipt.
+pub struct StartedPreload {
+    slot: PreloadSlot,
+}
+
+impl StartedPreload {
+    fn ready(&self) -> &PreparedTrack {
+        self.slot.ready.as_ref().expect("a started preload has its prepared receipt")
+    }
+
+    pub fn track(&self) -> &Track { &self.slot.track }
+    pub fn progress(&self) -> &Arc<SourceProgress> { &self.ready().progress }
+    pub fn duration_ms(&self) -> u64 { self.ready().duration_ms }
+    pub fn shared(&self) -> Option<&Arc<RangeShared>> {
+        self.ready().shared.as_ref()
+    }
+    pub fn is_local(&self) -> bool { self.ready().is_local }
+    pub fn url_fetched_at(&self) -> Option<u64> { self.ready().url_fetched_at }
+    pub fn play_url(&self) -> Option<&str> { self.ready().play_url.as_deref() }
+    pub fn bitrate_kbps(&self) -> Option<u32> { self.ready().bitrate_kbps }
+    pub fn original_mount(&self) -> Option<&Arc<super::render_control::SourceSeekPort>> {
+        self.slot.original_mount.as_ref()
+    }
+    pub fn original_stamp(&self) -> Option<&super::render_control::MountStamp> {
+        self.slot.original_stamp.as_ref()
+    }
+    pub fn original_load_gen(&self) -> u64 { self.slot.original_load_gen }
+}
+
+struct PreloadMount {
+    port: Arc<super::render_control::SourceSeekPort>,
+    stamp: super::render_control::MountStamp,
+}
+
+/// Consuming physical admission; never rebuilt from a later snapshot.
+pub struct AdmittedPreload {
+    started: StartedPreload,
+    mount: Option<PreloadMount>,
+    accepted_generation: u64,
+    accepted_load_gen: u64,
+}
+
+impl AdmittedPreload {
+    pub fn started(&self) -> &StartedPreload { &self.started }
+    pub fn track(&self) -> &Track { self.started.track() }
+    pub fn mount(&self) -> Option<&Arc<super::render_control::SourceSeekPort>> {
+        self.mount.as_ref().map(|mount| &mount.port)
+    }
+    pub fn stamp(&self) -> Option<&super::render_control::MountStamp> {
+        self.mount.as_ref().map(|mount| &mount.stamp)
+    }
+}
+
+/// Current/Queue synchronization consumes the physical admission once.
+pub struct PreloadMetadata {
+    admitted: AdmittedPreload,
+}
+
+impl PreloadMetadata {
+    pub fn started(&self) -> &StartedPreload { self.admitted.started() }
+    pub fn track(&self) -> &Track { self.admitted.track() }
+    pub fn duration_ms(&self) -> u64 { self.started().duration_ms() }
+}
+
+/// The same consuming C receipt after its metadata has committed.
+pub struct PublishedPreload {
+    metadata: PreloadMetadata,
+}
+
+impl PublishedPreload {
+    pub fn track(&self) -> &Track { self.metadata.track() }
+    pub fn duration_ms(&self) -> u64 { self.metadata.duration_ms() }
+}
+
+/// Borrow the actual Player and shared DSP parameters; no replacement Player.
+pub struct PreloadRender<'a> {
+    pub player: &'a Player,
+    pub fx: &'a Arc<AudioFx>,
+    pub epoch: Instant,
+}
+
+/// Borrow disjoint fields of the real actor's current-source/recovery state.
+/// No physical mount, target, load clock or authored candidate is supplied here.
+pub struct PreloadCurrent<'a> {
+    pub current_progress: &'a mut Option<Arc<SourceProgress>>,
+    pub current_shared: &'a mut Option<Arc<RangeShared>>,
+    pub failed_tracks: &'a mut HashSet<String>,
+    pub fail_streak: &'a mut u32,
+    pub stall_retry: &'a mut u32,
+    pub watch: &'a mut StallWatch,
+}
+
 struct EngineInner {
+    owner: AudioEngine,
     app: tauri::AppHandle,
     tx: Sender<AudioCmd>,
     state: Arc<RwLock<PlaybackStateSnapshot>>,
     queue: Arc<Mutex<Queue>>,
     cache_dir: PathBuf,
     url_cache: Arc<PlayUrlCache>,
+    remote: Option<dlna_adapter::RemotePlayback>,
+    route_resume: Option<(u64, u64, bool)>,
     gapless: bool,
-    preload_gen: u64,
-    preload: Option<PreloadSlot>,
-    /// 本曲内已用掉的预载失败重试次数（换曲/切歌边界归零，见 PRELOAD_RETRY_LIMIT）
-    preload_retries: u32,
+    preload: PreloadState,
     current_progress: Option<Arc<SourceProgress>>,
+    /// Original physical source installed by mount_decoder, never reconstructed at EOF.
+    current_mount: Option<Arc<super::render_control::SourceSeekPort>>,
+    eof_queued: bool,
     sink: Player,
     /// 持有输出流（丢掉它会立即关闭音频端点）
     _stream: rodio::MixerDeviceSink,
@@ -418,6 +1764,9 @@ struct EngineInner {
     /// LoadFailed 回执带的代次与当前不一致 → 等待期间用户又切了歌，丢弃。
     /// 没有它，连点切歌后旧歌的加载结果会把新歌顶掉。
     load_gen: u64,
+    /// Original accepted owner; never reconstructed from the latest Gate at load completion.
+    play_target: Option<PlayTarget>,
+    play_mount: Option<Arc<super::render_control::SourceSeekPort>>,
     /// 上次把 position 持久化到 settings 的时刻（5s 节流）
     last_persist: Option<std::time::Instant>,
     /// 引擎启动时刻，monotonicMs 以此为原点（DESIGN §7.11）
@@ -450,15 +1799,19 @@ struct EngineInner {
     dislikes: crate::db::store::DislikeMatcher,
     /// 当前这次收听的会话（挂载成功时开始，切歌 / 停止 / 播完时结算落库）。
     /// 听歌统计的「次数 / 时长 / 完播」全部由它记账，见 [`ListenSession`]。
-    listen: Option<ListenSession>,
+    listen: super::listening::ListenLifecycle,
 }
 
 impl EngineInner {
     fn publish(&self) {
         let snap = self.state.read().unwrap_or_else(|e| e.into_inner()).clone();
-        let _ = self.app.emit("playback-state-changed", &snap);
+        self.publish_snapshot(&snap);
+    }
+
+    fn publish_snapshot(&self, snap: &PlaybackStateSnapshot) {
+        let _ = self.app.emit("playback-state-changed", snap);
         // 顺带把当前曲目 / 播放状态投到系统媒体面板（Windows SMTC）
-        crate::smtc::sync(&self.smtc, &snap);
+        crate::smtc::sync(&self.smtc, snap);
         // 任务栏缩略图工具栏的播放/暂停按钮图标跟着翻转
         crate::taskbar::sync(snap.status == PlaybackStatus::Playing);
     }
@@ -550,7 +1903,9 @@ impl EngineInner {
             }
             None => open_default_stream(self.tx.clone())?,
         };
-        let new_sink = rodio::Player::connect_new(new_stream.mixer());
+        let (new_sink, output) = self.owner.player_channel();
+        new_stream.mixer().add(DeviceSource::new(output,
+            new_stream.config().channel_count(), new_stream.config().sample_rate()));
 
         // 迁移前记录当前曲目 / 进度 / 播放态
         let (track, pos_ms, was_playing) = {
@@ -580,8 +1935,9 @@ impl EngineInner {
             .unwrap_or_default();
         self.sink = new_sink;
         self.sink.set_volume(self.effective_volume());
-        // 新 Player 的速度控制是全新的（controls 随实例创建），倍速必须重挂
-        self.sink.set_speed(self.speed);
+        // Source-bound playback owns its rate; legacy playback restores Player's rate.
+        let bound = self.owner.current_source_mount().is_some_and(|port| port.is_live());
+        self.sink.set_speed(if bound { 1.0 } else { self.speed });
         self.current_shared = None;
         self.current_progress = None;
         self.tick_anchor = None;
@@ -654,15 +2010,11 @@ fn parse_quality(s: &str) -> Option<Quality> {
 /// 音质（音源账号页，前端启动/变更时经 SetSourceQualities 推送）；都没配再
 /// 落到全局默认（settings["quality"] 旧键，兼容升级前的存量设置）。
 fn effective_quality_for(inner: &EngineInner, track: &Track) -> Quality {
-    if let Some((id, q)) = &inner.track_quality {
-        if *id == track.id {
-            return q.clone();
-        }
-    }
-    if let Some(q) = inner.source_qualities.get(track.platform.as_str()) {
-        return q.clone();
-    }
-    inner.default_quality.clone()
+    PreloadQuality {
+        default_quality: &inner.default_quality,
+        track_quality: &inner.track_quality,
+        source_qualities: &inner.source_qualities,
+    }.effective_for(track)
 }
 
 /// settings 中的 play_mode 键值：listLoop / oneLoop / random
@@ -700,16 +2052,20 @@ fn content_pos_ms(inner: &EngineInner) -> u64 {
     )
 }
 
-/// 按内容时间域 seek：rodio 的 try_seek 会被外层 Speed 再乘一次倍速，
-/// 这里先除回去，保证「seek 到歌曲第 N 秒」的语义与倍速无关。
+/// Source-bound decoders seek in original content time. Only legacy Player
+/// speed still multiplies seek offsets and requires division here.
 fn sink_seek_content(inner: &EngineInner, pos_ms: u64) -> Result<(), rodio::source::SeekError> {
-    inner
-        .sink
-        .try_seek(Duration::from_millis(pos_ms).div_f32(inner.speed))
+    let bound = inner.owner.current_source_mount().is_some_and(|port| port.is_live());
+    let factor = if bound { 1.0 } else { inner.speed };
+    inner.sink.try_seek(Duration::from_millis(pos_ms).div_f32(factor))
 }
 
 /// 真正执行暂停（淡出到期 / 无淡出的 Pause 共用）。
 fn finish_pause(inner: &mut EngineInner) {
+    if inner.remote.is_some() {
+        let _ = dlna_adapter::route(inner, AudioCmd::Pause);
+        return;
+    }
     invalidate_preload(inner);
     // 暂停是天然的落库时机：先把这段收听结算掉（会话不结束，继续播还能接着记）
     inner.settle_listen(false, false);
@@ -739,8 +2095,9 @@ fn fire_sleep_timer(inner: &mut EngineInner) {
 
 /// 音频线程初始化依赖（OutputStream 仍在线程内创建）
 struct EngineDeps {
+    owner: AudioEngine,
     app: tauri::AppHandle,
-    rx: mpsc::Receiver<AudioCmd>,
+    rx: AudioCommandInbox,
     state: Arc<RwLock<PlaybackStateSnapshot>>,
     cache_dir: PathBuf,
     url_cache: Arc<PlayUrlCache>,
@@ -785,6 +2142,7 @@ fn open_default_stream(tx: Sender<AudioCmd>) -> Result<rodio::MixerDeviceSink, S
 
 fn run_engine(deps: EngineDeps) {
     let EngineDeps {
+        owner,
         app,
         rx,
         state,
@@ -810,21 +2168,27 @@ fn run_engine(deps: EngineDeps) {
             return;
         }
     };
-    let sink = rodio::Player::connect_new(_stream.mixer());
+    let (sink, output) = owner.player_channel();
+    _stream.mixer().add(DeviceSource::new(output,
+        _stream.config().channel_count(), _stream.config().sample_rate()));
     sink.pause();
 
+    let listen = super::listening::ListenLifecycle::production(app.clone(), db.clone());
     let inner = EngineInner {
+        owner,
         app,
         tx,
         state,
         queue,
         cache_dir,
         url_cache,
+        remote: None,
+        route_resume: None,
         gapless: false,
-        preload_gen: 0,
-        preload: None,
-        preload_retries: 0,
+        preload: PreloadState::default(),
         current_progress: None,
+        current_mount: None,
+        eof_queued: false,
         sink,
         _stream,
         // None = 跟随系统默认；启动时从 settings 恢复用户上次的选择
@@ -843,6 +2207,8 @@ fn run_engine(deps: EngineDeps) {
         stall_retry: 0,
         smtc: None,
         load_gen: 0,
+        play_target: None,
+        play_mount: None,
         last_persist: None,
         epoch: std::time::Instant::now(),
         db,
@@ -857,7 +2223,7 @@ fn run_engine(deps: EngineDeps) {
         cache_limit_mb: crate::cache::DEFAULT_AUDIO_CACHE_LIMIT_MB,
         watch: StallWatch::default(),
         dislikes: crate::db::store::DislikeMatcher::empty(),
-        listen: None,
+        listen,
     };
 
     let mut inner = inner;
@@ -967,22 +2333,47 @@ fn run_engine(deps: EngineDeps) {
             Duration::from_secs(1)
         };
 
-        match rx.recv_timeout(timeout) {
-            Ok(cmd) => {
+        let dislikes = &inner.dislikes;
+        match rx.recv_timeout_skipping(timeout, &mut inner.load_gen, |track| dislikes.matches(track)) {
+            Ok(AudioDelivery::Command(cmd)) => {
                 if handle_cmd(&mut inner, cmd) {
                     return;
                 }
             }
+            Ok(AudioDelivery::NativeSpeedSetting(setting)) => {
+                if handle_cmd(&mut inner, AudioCmd::NativeSpeedSetting(setting)) { return; }
+            }
+            Ok(delivery @ AudioDelivery::SourceSpeedSetting(_)) => {
+                // Persistence only. Never reapply Player speed, seek or a later snapshot.
+                if let Err(error) = delivery.persist_speed(inner.db.as_deref()) {
+                    log::warn!("[db] source speed persistence failed: {error}");
+                }
+            }
+            Ok(AudioDelivery::Playback(plan)) => handle_committed_queue(&mut inner, *plan),
+            Ok(AudioDelivery::ManualPlayback(plan)) => handle_committed_playback(&mut inner, *plan, false),
+            Ok(AudioDelivery::NavigationPlayback(plan)) => {
+                inner.settle_listen(false, true);
+                handle_committed_playback_kind(&mut inner, *plan, false, false);
+            }
+            Ok(AudioDelivery::PreviousPlayback(plan)) => {
+                handle_committed_playback_kind(&mut inner, *plan, false, false);
+            }
+            Ok(AudioDelivery::AutomaticPlayback { advance, request }) => {
+                handle_automatic_playback(&mut inner, *advance, request.map(|request| *request));
+            }
+            Ok(AudioDelivery::SourceFailure(input)) => handle_source_failure(&mut inner, *input),
+            Ok(AudioDelivery::Rejected) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
 
         // 到期检查（淡出暂停 / 睡眠定时）与设备热插拔检测，详见各函数注释
         apply_expired_deadlines(&mut inner);
-        check_output_device(&mut inner, &mut last_device_check);
-
-        if playing {
-            playing_cycle(&mut inner, &mut last_publish);
+        if inner.remote.is_some() {
+            dlna_adapter::tick(&mut inner);
+        } else {
+            check_output_device(&mut inner, &mut last_device_check);
+            if playing { playing_cycle(&mut inner, &mut last_publish); }
         }
 
         // 只有「此刻确实在播」才该看到位置推进。其余状态（暂停 / 缓冲 / 加载中 /
@@ -1287,7 +2678,63 @@ fn playing_cycle(inner: &mut EngineInner, last_publish: &mut std::time::Instant)
     }
 }
 
+fn handle_committed_queue(inner: &mut EngineInner, plan: PlaybackCommitPlan) {
+    let selected = plan.autoplay;
+    if !selected {
+        inner.default_quality = plan.snapshot.quality.clone();
+    }
+    handle_committed_playback_kind(inner, plan, true, selected);
+}
+
+fn handle_committed_playback(inner: &mut EngineInner, plan: PlaybackCommitPlan, reset_queue: bool) {
+    handle_committed_playback_kind(inner, plan, reset_queue, true);
+}
+
+fn handle_committed_playback_kind(
+    inner: &mut EngineInner, plan: PlaybackCommitPlan, reset_queue: bool, selected: bool,
+) {
+    invalidate_preload(inner);
+    if reset_queue {
+        inner.track_quality = None;
+        inner.failed_tracks.clear();
+    }
+    if selected {
+        inner.auto_next = true;
+        inner.fail_streak = 0;
+        inner.stall_retry = 0;
+        inner.watch.clear();
+    }
+    // Gate has already moved the real queue/snapshot. All effects and retired drops are outside it.
+    inner.play_target = plan.target.clone();
+    inner.play_mount = plan.port;
+    let _ = inner.app.emit("queue-changed", serde_json::json!({
+        "tracks": plan.queue.tracks,
+        "index": plan.queue.index.map(|index| index as u32),
+    }));
+    inner.publish();
+    if let Some(track) = plan.track {
+        if selected {
+            inner.failed_tracks.remove(&track.id);
+        }
+        let resume = inner.route_resume.take().filter(|(generation, _, _)| plan.target.as_ref()
+            .is_some_and(|target| target.generation == *generation));
+        let (start_ms, autoplay) = resume.map_or((plan.start_ms, plan.autoplay), |(_, position, autoplay)| (position, autoplay));
+        load_queue_track_for_generation(inner, track, autoplay, start_ms, plan.load_gen);
+    } else {
+        inner.settle_listen(false, true);
+        inner.sink.clear();
+        inner.current_shared = None;
+        inner.current_progress = None;
+        inner.pause_deadline = None;
+        inner.fx.clear_fade();
+        inner.fx.set_static_gain(1.0);
+        *inner.cache_file.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+    inner.persist_queue();
+}
+
 fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
+    let Some(cmd) = dlna_adapter::route(inner, cmd) else { return false; };
     sync_gapless_transition(inner);
     // 作废预载：凡可能改变「下一首是谁」或「它的音质」的命令都要重选目标。
     // 刻意不在名单里的两条：
@@ -1313,7 +2760,38 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
         inner.load_gen = inner.load_gen.wrapping_add(1);
     }
     match cmd {
+        AudioCmd::DlnaConnect { .. } | AudioCmd::DlnaDisconnect { .. } | AudioCmd::DlnaDisconnected(_)
+        | AudioCmd::DlnaLoaded(_) | AudioCmd::DlnaPoll(_) | AudioCmd::DlnaAction(_)
+        | AudioCmd::DlnaBoundPause { .. } | AudioCmd::DlnaBoundSeek { .. } => unreachable!("DLNA adapter handles its commands"),
+        // Source lifecycle semantics are consumed by the same production inbox.
+        AudioCmd::SourceFinished(_) => {}
+        AudioCmd::StampedRestore { reply, .. } => {
+            let _ = reply.send(None);
+        }
+        AudioCmd::QueuedSetQueue { reply, .. } | AudioCmd::QueuedPlayAt { reply, .. }
+            | AudioCmd::QueuedNext { reply, .. } | AudioCmd::QueuedPrevious { reply, .. }
+            | AudioCmd::QueuedPlayTrack { reply, .. } => {
+            // Ticketed commands are consumed by the production inbox, never reinterpreted here.
+            let _ = reply.send(QueueCommitReply::rejected());
+        }
+        cmd @ AudioCmd::LoadReady { preload: true, .. } => {
+            let app = &inner.app;
+            let _ = inner.owner.append_preloaded(
+                cmd, &mut inner.preload,
+                PreloadFlags {
+                    gapless: inner.gapless, sleep_after_track: inner.sleep_after_track,
+                    auto_next: inner.auto_next,
+                },
+                PreloadRender {
+                    player: &inner.sink, fx: &inner.fx, epoch: inner.epoch,
+                },
+                || Some(crate::audio::SpectrumTap::new(Some(app.clone()))),
+            );
+            return false;
+        }
         AudioCmd::LoadReady {
+            target,
+            port,
             track,
             decoder,
             shared,
@@ -1325,13 +2803,8 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             play_url,
             size_bytes,
             gen,
-            preload,
+            preload: _,
         } => {
-            if preload {
-                append_preloaded(inner, *track, decoder, shared, duration_ms, is_local,
-                    url_fetched_at, play_url, size_bytes, gen);
-                return false;
-            }
             // 过期结果丢弃：等待取址/构建期间用户又切了歌，这条是旧歌的
             if gen != inner.load_gen {
                 log::debug!(
@@ -1342,6 +2815,8 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             } else {
                 mount_decoder(
                     inner,
+                    target,
+                    port,
                     &track,
                     decoder,
                     shared,
@@ -1382,8 +2857,14 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                     inner.fx.clear_fade();
                 }
                 inner.sink.play();
+                let source_mounts = inner.owner.source_mounts.clone();
                 inner.mutate(|st| {
-                    if st.status == PlaybackStatus::Paused {
+                    let mounts = source_mounts.lock().unwrap_or_else(|e| e.into_inner());
+                    let source_paused = mounts.current.iter().chain(mounts.reserved.iter()).any(|port|
+                        port.is_live() && port.is_paused()
+                            && st.track_id.as_deref() == Some(port.stamp().target.id.as_str())
+                            && st.source_id.as_ref().map(|source| source.as_str()) == Some(port.stamp().target.platform.as_str()));
+                    if st.status == PlaybackStatus::Paused && !source_paused {
                         st.status = PlaybackStatus::Playing;
                     }
                     // 恢复播放 = 用户已经看到并接受了那条说明（掉设备暂停等）。
@@ -1561,8 +3042,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             *inner.cache_file.lock().unwrap_or_else(|e| e.into_inner()) = None;
             {
                 let mut q = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
-                q.tracks.clear();
-                q.index = None;
+                q.set(Vec::new(), 0);
             }
             inner.sync_queue_to_snapshot();
             inner.queue_emit();
@@ -1589,17 +3069,13 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             }
         }
         AudioCmd::RemoveAt(index) => {
-            let removed = inner.queue.lock().unwrap_or_else(|e| e.into_inner()).remove_at(index).is_some();
-            if removed {
-                inner.sync_queue_to_snapshot();
+            if inner.owner.remove_queue_indices(&[index]) > 0 {
                 inner.queue_emit();
                 inner.persist_queue();
             }
         }
         AudioCmd::RemoveIndices(indices) => {
-            let removed = inner.queue.lock().unwrap_or_else(|e| e.into_inner()).remove_indices(&indices);
-            if removed > 0 {
-                inner.sync_queue_to_snapshot();
+            if inner.owner.remove_queue_indices(&indices) > 0 {
                 inner.queue_emit();
                 inner.persist_queue();
             }
@@ -1712,31 +3188,35 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             // 变更后前端对当前曲目按需走 setTrackQuality 立即生效。
             inner.source_qualities = qualities;
         }
-        AudioCmd::SetSpeed(v) => {
-            let v = v.clamp(SPEED_MIN, SPEED_MAX);
-            // 变速重锚：get_pos() 是真实时间口径（rodio 的 TrackPosition 包在 Speed
-            // 外层，只数输出采样），content = get_pos × f 只在「本曲全程同速」时成立。
-            // 中途变速若只换系数，get_pos 连续计时而 f 已变，内容位置瞬间跳变并从此
-            // 偏离真实音频进度（歌词对不上，还原倍速也回不来）。所以先按旧系数取当前
-            // 内容位置，换速后 seek 回同一内容位置——f2 下 get_pos 复位为 pos/f2，
-            // content = (pos/f2) × f2 = pos，真实时间基准重新对齐。与挂载恢复进度
-            // （load_track 里 sink_seek_content）同一套换算路径。
+        AudioCmd::SourceSpeedSetting(setting) => {
+            // Defensive direct dispatch shares the same bound-only executor.
+            if let Err(error) = AudioDelivery::SourceSpeedSetting(setting).persist_speed(inner.db.as_deref()) {
+                log::warn!("[db] source speed persistence failed: {error}");
+            }
+        }
+        AudioCmd::NativeSpeedSetting(setting) => {
+            // Admission only: State is released before Player/decoder or SQLite IO.
+            // A superseded packet never borrows a newer snapshot's value or receipt.
+            if !setting.qualifies() { return false; }
+            let v = setting.speed();
+            let bound = inner.owner.current_source_mount().is_some_and(|port| port.is_live());
             let pos = content_pos_ms(inner);
             inner.speed = v;
-            // rodio 速度控制常驻 Player（controls.speed），5ms 内同步到当前源；
-            // seek 消息排在速度控制之后处理，换算系数一致
-            inner.sink.set_speed(v);
-            if pos > 0 {
+            inner.sink.set_speed(if bound { 1.0 } else { v });
+            // Only legacy unbound decoders still need Player-domain reanchoring.
+            if !bound && pos > 0 {
                 if let Err(e) = sink_seek_content(inner, pos) {
-                    log::warn!("[audio] 变速重锚 seek 失败（继续播放，进度显示可能短暂偏移）: {e}");
+                    log::warn!("[audio] legacy speed seek failed: {e}");
                 }
             }
-            if let Some(db) = &inner.db {
-                if let Err(e) = db.with(|c| store::set_setting(c, SETTING_SPEED, &v.to_string())) {
-                    log::warn!("[db] 倍速入库失败: {e}");
-                }
+            // Requalify after any decoder work and after the DB mutex wait.
+            if let Err(e) = AudioDelivery::NativeSpeedSetting(setting).persist_speed(inner.db.as_deref()) {
+                log::warn!("[db] 倍速入库失败: {e}");
             }
-            inner.mutate(|st| st.speed = v);
+        }
+        AudioCmd::SetSpeed(_) => {
+            // Only send() may convert raw Native input into captured semantic work.
+            log::warn!("[audio] unstamped Native speed command rejected");
         }
         AudioCmd::SetSleepTimer {
             remaining_ms,
@@ -1808,13 +3288,13 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             // 预载失败立刻作废槽位并记一次重试：下一圈预热会重新选目标
             // （随机模式重新掷骰），不必再死等到曲末才由 advance() 现场取链。
             // 次数上限见 PRELOAD_RETRY_LIMIT —— 连续失败时不再反复拉流。
-            if inner.preload.as_ref().is_some_and(|slot| slot.gen == gen) {
-                inner.preload = None;
-                inner.preload_gen = inner.preload_gen.wrapping_add(1);
-                inner.preload_retries = inner.preload_retries.saturating_add(1);
+            if inner.preload.slot.as_ref().is_some_and(|slot| slot.gen == gen) {
+                inner.preload.slot = None;
+                inner.preload.gen = inner.preload.gen.wrapping_add(1);
+                inner.preload.retries = inner.preload.retries.saturating_add(1);
                 log::debug!(
                     "[gapless] 预热失败，换目标重试（{}/{}）",
-                    inner.preload_retries,
+                    inner.preload.retries,
                     PRELOAD_RETRY_LIMIT
                 );
             }
@@ -1863,6 +3343,8 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             inner.cache_dir = dir;
         }
         AudioCmd::LoadFailed {
+            original: _,
+            kind: _,
             track_id,
             message,
             autoplay,
@@ -1992,6 +3474,50 @@ fn playback_resume_point(inner: &EngineInner) -> (bool, u64) {
     (autoplay, st.position_ms)
 }
 
+fn handle_source_failure(inner: &mut EngineInner, input: SourceFailureInput) {
+    let mut context = SourceRecoveryContext {
+        auto_next: inner.auto_next, fail_streak: inner.fail_streak,
+        failed_tracks: std::mem::take(&mut inner.failed_tracks),
+    };
+    let applied = inner.owner.apply_source_failure(input, &mut context, &mut inner.load_gen);
+    inner.auto_next = context.auto_next;
+    inner.fail_streak = context.fail_streak;
+    inner.failed_tracks = context.failed_tracks;
+    let Some(mut applied) = applied else { return; };
+    let _ = inner.app.emit("audio-error", serde_json::json!({
+        "trackId": applied.input.track_id,
+        "kind": applied.input.kind,
+        "message": applied.input.message,
+        "stalled": applied.input.stalled,
+    }));
+    log::error!("[queue] 曲目 {} 播放失败: {}", applied.input.track_id, applied.input.message);
+    // Loading is published with the real effective quality below, just as in the actor loader.
+    if matches!(&applied.effect, SourceFailureEffect::Advance { .. }) {
+        applied.updates.pop();
+    }
+    for snapshot in &applied.updates { inner.publish_snapshot(snapshot); }
+    match applied.effect {
+        SourceFailureEffect::Error => {}
+        SourceFailureEffect::Retry => schedule_stalled_retry(inner, &applied.input.track_id),
+        SourceFailureEffect::Circuit { notice } => {
+            log::warn!("[queue] {notice}");
+            notify_failure(&inner.app, &notice);
+            schedule_recovery_probe(inner);
+        }
+        SourceFailureEffect::Advance { track, target, request } => {
+            inner.queue_emit();
+            invalidate_preload(inner);
+            let _ = inner.listen.before_load(&track);
+            let quality = effective_quality_for(inner, &track);
+            inner.play_target = Some(target);
+            inner.play_mount = None;
+            inner.mutate(|state| state.quality = quality);
+            if let Some(request) = request { spawn_prepared_source_load(inner, *request); }
+            inner.persist_queue();
+        }
+    }
+}
+
 /// 播放队列中的指定曲目：置 Loading 后异步取址+构建，成功回发 LoadReady。
 fn play_queue_track(inner: &mut EngineInner, track: Track) {
     load_queue_track(inner, track, true, 0);
@@ -1999,43 +3525,78 @@ fn play_queue_track(inner: &mut EngineInner, track: Track) {
 
 /// 暂停态变体：恢复现场用（autoplay=false，start_ms>0 时加载后定位）。
 fn load_queue_track(inner: &mut EngineInner, track: Track, autoplay: bool, start_ms: u64) {
+    inner.load_gen = inner.load_gen.wrapping_add(1);
+    let generation = inner.load_gen;
+    load_queue_track_for_generation(inner, track, autoplay, start_ms, generation);
+}
+
+fn load_queue_track_for_generation(
+    inner: &mut EngineInner,
+    track: Track,
+    autoplay: bool,
+    start_ms: u64,
+    gen: u64,
+) {
     invalidate_preload(inner);
     // 切换到别的曲目 = 这次收听结束，先结算（同曲**重载**不结算：弱网原地重试 /
-    // 恢复现场 / 换音质续播都还是同一次收听，见 begin_listen）
-    let switched = inner
-        .listen
-        .as_ref()
-        .is_some_and(|s| s.track.id != track.id);
-    if switched {
-        inner.settle_listen(false, true);
-    }
+    // 恢复现场 / 换音质续播都还是同一次收听，见 begin_listen）。
+    // 身份按 platform + 裸 id 判定：不同音源的相同裸 id 是两首歌（C17）。
+    let _ = inner.listen.before_load(&track);
     // 有效音质：本曲临时指定 → 平台独立音质 → 全局默认（见 effective_quality_for）
     let quality = effective_quality_for(inner, &track);
-    // 每次新加载推进代次：在途的旧加载结果回来时据此丢弃
-    inner.load_gen = inner.load_gen.wrapping_add(1);
-    let gen = inner.load_gen;
+    // The receiver has already committed the accepted generation; do not increment twice.
     inner.mutate(|st| {
         st.quality = quality;
-        st.status = PlaybackStatus::Loading;
-        st.error = None;
-        st.track_id = Some(track.id.clone());
-        st.track = Some(track.clone());
-        st.position_ms = start_ms;
-        st.duration_ms = 0;
-        st.buffered_ms = 0;
-        st.is_local = false;
-        // 上一首的实测码率不能挂在新歌头上：Loading 期显示旧值等于撒谎。
-        // 新值要等流真正挂上（mount_decoder）才算得出来。
-        st.bitrate_kbps = None;
+        super::playback_commit::set_loading_snapshot(st, &track, start_ms);
     });
     spawn_resolve_and_load(inner, track, autoplay, start_ms, gen);
 }
 
 /// 按播放模式切到下一首。`auto` = 自然播完触发。
+/// Device/IO effects for the same automatic mutation delivered by the real inbox.
+fn handle_automatic_playback(
+    inner: &mut EngineInner, advance: super::playback_commit::AutomaticAdvance,
+    request: Option<SourceLoadRequest>,
+) {
+    if let Some(track) = advance.track {
+        inner.queue_emit();
+        invalidate_preload(inner);
+        let _ = inner.listen.before_load(&track);
+        inner.play_target = Some(advance.target);
+        inner.play_mount = None;
+        let quality = effective_quality_for(inner, &track);
+        inner.mutate(|state| state.quality = quality);
+        if let Some(request) = request { spawn_prepared_source_load(inner, request); }
+        inner.persist_queue();
+    } else {
+        inner.sink.clear();
+        inner.current_shared = None;
+        inner.current_progress = None;
+        *inner.cache_file.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        inner.publish();
+        if advance.sleep_fired {
+            inner.sleep_after_track = false;
+            inner.sleep_deadline = None;
+            let _ = inner.app.emit("sleep-timer-fired", ());
+            inner.persist_state();
+        }
+    }
+}
+
 fn advance(inner: &mut EngineInner, auto: bool) {
     // 切歌即这次收听的结束：先按真实收听结算（auto = 自然播完，算一次完播）。
     // 放在最前面，睡眠定时「播完停止」那条提前 return 的路径才不会被漏掉。
     inner.settle_listen(auto, true);
+    if auto {
+        if let Some(original) = &inner.current_mount {
+            if !inner.eof_queued {
+                inner.eof_queued = true;
+                inner.owner.source_finished(original.clone());
+            }
+            // Retain the original even on rejection: never fall back on a later tick.
+            return;
+        }
+    }
     // 睡眠定时「播完当前曲目后停止」：只在自然播完时消费，手动切歌不受影响
     if auto && inner.sleep_after_track {
         inner.sleep_after_track = false;
@@ -2132,7 +3693,7 @@ const STALL_RECOVER_LIMIT: u32 = 3;
 /// 「解码器卡住」在引擎侧是**同一个症状**：墙上时钟在走、`get_pos()` 不动、
 /// `sink.empty()` 永远 false。唯一可靠的判据只有「位置多久没变了」。
 #[derive(Default)]
-struct StallWatch {
+pub struct StallWatch {
     /// 上次观测到的位置与观测时刻；None = 还没有基准（离开 Playing 后重建）
     probe: Option<(u64, Instant)>,
     /// 连续冻结命中次数：位置一推进就清零（恢复阶梯要跨重载延续，见 reset）
@@ -2424,178 +3985,22 @@ fn go_previous(inner: &mut EngineInner) {
     inner.persist_queue();
 }
 
-/// 播放开始即计入播放历史（DESIGN §5.3）。
-/// 写库失败只记 warn 日志 —— 历史与统计都是旁路数据，绝不能影响播放。
-///
-/// 只写历史、不写统计：统计（次数 / 时长）要等这次收听结束时按真实收听结算，
-/// 见 [`ListenSession`] —— 起播即记满整曲时长会让「点开就跳」和「完整听完」
-/// 在报告里长得一模一样。
-fn record_play_start(db: Option<Arc<Database>>, track: Track) {
-    let Some(db) = db else {
-        return;
-    };
-    tauri::async_runtime::spawn(async move {
-        let result = tauri::async_runtime::spawn_blocking(move || {
-            db.with(|conn| crate::db::store::record_play_history(conn, &track))
-        })
-        .await;
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => log::warn!("[history] 写入失败: {e}"),
-            Err(e) => log::warn!("[history] 任务异常: {e}"),
-        }
-    });
-}
-
-// ---------- 听歌统计：按真实收听结算（DESIGN §5.3） ----------
-
-/// 单次 tick 最多计入的墙钟毫秒。位置 tick 是 250ms 节流，正常每次约 250ms；
-/// 超过这个数说明引擎被挂起过（系统休眠 / 调度饿死），那段时间没人在听。
-const LISTEN_TICK_MAX_MS: i64 = 1_000;
-/// 位置单步推进超过它就视为 seek：用户拖过去的那一段并没有听，不计入时长。
-const LISTEN_JUMP_MAX_MS: u64 = 3_000;
-/// 累计这么多收听毫秒就先落一次库：应用被强杀时最多丢这么多。
-const LISTEN_FLUSH_MS: i64 = 30_000;
-
-/// 一次收听会话：从曲目挂载成功开始，到切歌 / 停止 / 播完结算。
-///
-/// 为什么要有它：老口径在**起播那一刻**就把整曲时长记进 `total_played_ms`、
-/// 次数 +1，中途跳过从不回写，于是「点开听 10 秒切掉」在听歌报告里与完整听完
-/// 完全一样，累计时长与平均每次都跟着虚高（用户 m05920 的反馈）。
-/// 现在引擎只按「位置真的在推进」的墙钟时间记账，结算时才落库。
-struct ListenSession {
-    track: Track,
-    /// 上次观察到的内容位置（seek 跳变的判据）
-    last_pos_ms: u64,
-    /// 上次累计的时刻（墙钟）：暂停时位置不推进，自然不计入
-    last_seen: std::time::Instant,
-    /// 已累计但还没落库的毫秒
-    pending_ms: i64,
-    /// 本次会话累计的收听毫秒（判定有效播放用）
-    listened_ms: i64,
-    /// 曲目时长（毫秒，0 = 未知）
-    duration_ms: i64,
-    /// 是否自然播完
-    finished: bool,
-    /// 有效播放次数是否已落库（一次会话最多 +1）
-    counted: bool,
-    /// 完播次数是否已落库
-    finished_written: bool,
-    /// 会话开始时刻（unix 秒）：外部上报（A8）的 scrobble 时间戳用起播时间，
-    /// 不是「跨过阈值那一刻」——Last.fm 的语义是「什么时候听的这首」。
-    started_at: i64,
-    /// 是否已经交给外部上报。一次会话最多报一次：settle_listen 会被反复调用
-    /// （每 30 秒 / 暂停 / 结束），没有这个旗标同一首会报好几遍。
-    scrobbled: bool,
-}
-
-/// 一次结算要写进库的量（借用结束后才异步落库）。
-struct ListenSettle {
-    track: Track,
-    /// 本次要累加的收听毫秒（增量）
-    listened_ms: i64,
-    /// 本次要 +1 的有效播放次数（0/1）
-    plays: i64,
-    /// 本次要 +1 的完播次数（0/1）
-    finished_plays: i64,
-    /// 本次会话累计的收听毫秒（回填 play_history，绝对值）
-    session_ms: i64,
-    /// 会话是否播完（回填 play_history）
-    finished: bool,
-}
-
-/// 落库（后台线程）。失败只记 warn —— 统计是旁路数据，绝不能影响播放。
-fn write_listen(db: Option<Arc<Database>>, s: ListenSettle) {
-    let Some(db) = db else {
-        return;
-    };
-    tauri::async_runtime::spawn(async move {
-        let result = tauri::async_runtime::spawn_blocking(move || {
-            db.with(|conn| {
-                crate::db::store::record_listen(
-                    conn,
-                    &s.track,
-                    s.listened_ms,
-                    s.plays,
-                    s.finished_plays,
-                )?;
-                // play_history 一首只留最近一条：回填真实收听时长与完播标记，
-                // 让「最近播放」里那一行的 played_duration_ms / completed 不再是死值 0
-                crate::db::store::update_play_history_progress(
-                    conn,
-                    &s.track,
-                    s.session_ms,
-                    s.finished,
-                )
-            })
-        })
-        .await;
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => log::warn!("[stats] 写入失败: {e}"),
-            Err(e) => log::warn!("[stats] 任务异常: {e}"),
-        }
-    });
-}
+// ---------- 听歌统计：共享实例生命周期（DESIGN §5.3） ----------
 
 impl EngineInner {
     /// 曲目挂载成功 = 收听会话开始。
     ///
     /// 同一首的**重载**（弱网原地重试 / 启动恢复现场 / 输出流重建续播）不重开会话：
     /// 那还是同一次收听，重开会让「听了一半」永远攒不够有效播放的门槛。
-    fn begin_listen(&mut self, track: &Track, duration_ms: u64) {
+    fn begin_listen(&mut self, track: &Track, duration_ms: u64) -> super::listening::ListenMount {
         let pos = self.state.read().unwrap_or_else(|e| e.into_inner()).position_ms;
-        if let Some(s) = self.listen.as_mut() {
-            if s.track.id == track.id {
-                s.last_pos_ms = pos;
-                s.last_seen = std::time::Instant::now();
-                if duration_ms > 0 {
-                    s.duration_ms = duration_ms as i64;
-                }
-                return;
-            }
-        }
-        self.listen = Some(ListenSession {
-            track: track.clone(),
-            last_pos_ms: pos,
-            last_seen: std::time::Instant::now(),
-            pending_ms: 0,
-            listened_ms: 0,
-            duration_ms: duration_ms as i64,
-            finished: false,
-            counted: false,
-            finished_written: false,
-            started_at: crate::db::store::now_unix(),
-            scrobbled: false,
-        });
-        // 外部上报（A8）：起播就推一次 Now Playing，好友那边能立刻看到。
-        // 只对「新会话」做，上面的同曲重载分支不重复推。
-        crate::scrobble::now_playing(self.db.clone(), track.clone());
+        self.listen.begin_mount(track, duration_ms, pos)
     }
 
     /// 位置 tick 里累计收听：只有位置**在推进**时才按墙钟时间记账。
     /// 暂停（位置冻结）不计；seek 跳变（一步推进过大）不计；倍速无关（按墙钟算）。
     fn accrue_listen(&mut self, pos_ms: u64) {
-        let due = {
-            let Some(s) = self.listen.as_mut() else {
-                return;
-            };
-            let now = std::time::Instant::now();
-            let dt = now.saturating_duration_since(s.last_seen).as_millis() as i64;
-            let advanced =
-                pos_ms > s.last_pos_ms && pos_ms - s.last_pos_ms <= LISTEN_JUMP_MAX_MS;
-            s.last_pos_ms = pos_ms;
-            s.last_seen = now;
-            if advanced {
-                let dt = dt.clamp(0, LISTEN_TICK_MAX_MS);
-                s.pending_ms += dt;
-                s.listened_ms += dt;
-            }
-            s.pending_ms >= LISTEN_FLUSH_MS
-        };
-        if due {
-            self.settle_listen(false, false);
-        }
+        let _ = self.listen.accrue(pos_ms);
     }
 
     /// 结算收听。`finished` = 自然播完；`end` = 会话就此结束（切歌 / 停止）。
@@ -2603,65 +4008,7 @@ impl EngineInner {
     /// 可反复调用：只有没落过库的增量会被写（pending 清零、两个旗标各管一次 +1），
     /// 所以「每 30 秒落一次 + 暂停时落一次 + 结束时落最后一次」不会重复计数。
     fn settle_listen(&mut self, finished: bool, end: bool) {
-        let (payload, scrobble) = {
-            let Some(s) = self.listen.as_mut() else {
-                return;
-            };
-            if finished {
-                s.finished = true;
-            }
-            let plays = if !s.counted
-                && crate::db::store::counts_as_play(s.finished, s.listened_ms, s.duration_ms)
-            {
-                s.counted = true;
-                1
-            } else {
-                0
-            };
-            let finished_plays = if s.finished && !s.finished_written {
-                s.finished_written = true;
-                1
-            } else {
-                0
-            };
-            // 外部上报（A8）：与「算一次有效播放」同门槛（听满一半或 4 分钟
-            // 且至少 15 秒），跨过就交给 scrobble 队列，网络失败由它自己退避
-            // 重试，绝不阻塞引擎线程。
-            let scrobble = if !s.scrobbled
-                && crate::scrobble::should_scrobble(s.listened_ms, s.duration_ms)
-            {
-                s.scrobbled = true;
-                Some((s.track.clone(), s.started_at, s.duration_ms))
-            } else {
-                None
-            };
-            (
-                ListenSettle {
-                    track: s.track.clone(),
-                    listened_ms: std::mem::take(&mut s.pending_ms),
-                    plays,
-                    finished_plays,
-                    session_ms: s.listened_ms,
-                    finished: s.finished,
-                },
-                scrobble,
-            )
-        };
-        if end {
-            self.listen = None;
-        }
-        if payload.listened_ms > 0 || payload.plays > 0 || payload.finished_plays > 0 {
-            write_listen(self.db.clone(), payload);
-        }
-        if let Some((track, started_at, duration_ms)) = scrobble {
-            crate::scrobble::record_listen(
-                self.app.clone(),
-                self.db.clone(),
-                track,
-                started_at,
-                duration_ms,
-            );
-        }
+        let _ = self.listen.settle(finished, end);
     }
 
     /// 结算后仍在播同一首（手动 next 却没有下一首）：重开一段会话，
@@ -2695,12 +4042,26 @@ impl EngineInner {
 /// 失败：取址失败作废缓存重取一次（§7.3）；打开流失败同样作废缓存重开一次
 /// （休眠唤醒后缓存的签名 URL 过期 / 半死连接是常态）；仍失败回发 LoadFailed。
 fn spawn_resolve_and_load(
-    inner: &EngineInner,
+    inner: &mut EngineInner,
     track: Track,
     autoplay: bool,
     start_ms: u64,
     gen: u64,
 ) {
+    let Some(request) = inner.owner.prepare_source_load(
+        track, inner.play_target.clone(), inner.play_mount.take(), gen, autoplay, start_ms,
+    ) else { return; };
+    spawn_prepared_source_load(inner, request);
+}
+
+fn spawn_prepared_source_load(inner: &mut EngineInner, request: SourceLoadRequest) {
+    if let Some(remote) = &mut inner.remote {
+        remote.connection.begin_load(request.gen, request.autoplay);
+        remote.loaded = false;
+        if let Some(request) = remote.pending_seek.take() { request.external_complete(false); }
+    }
+    let cast = inner.remote.as_ref().map(|remote| remote.connection.state());
+    if cast.is_some() { inner.mutate(|state| state.cast = cast); }
     let job = LoadJob {
         app: inner.app.clone(),
         tx: inner.tx.clone(),
@@ -2708,11 +4069,14 @@ fn spawn_resolve_and_load(
         cache_dir: inner.cache_dir.clone(),
         history_db: inner.db.clone(),
         quality: inner.state.read().unwrap_or_else(|e| e.into_inner()).quality.clone(),
-        track,
-        autoplay,
-        start_ms,
-        gen,
+        target: request.target,
+        port: request.port,
+        track: request.track,
+        autoplay: request.autoplay,
+        start_ms: request.start_ms,
+        gen: request.gen,
         preload: false,
+        remote: inner.remote.as_ref().map(|remote| remote.connection.clone()),
     };
     tauri::async_runtime::spawn(job.run());
 }
@@ -2725,11 +4089,14 @@ struct LoadJob {
     cache_dir: PathBuf,
     history_db: Option<Arc<Database>>,
     quality: types::Quality,
+    target: Option<PlayTarget>,
+    port: Option<Arc<super::render_control::SourceSeekPort>>,
     track: Track,
     autoplay: bool,
     start_ms: u64,
     gen: u64,
     preload: bool,
+    remote: Option<crate::dlna::Connection>,
 }
 
 /// 异步自递归的断环点：`LoadJob::run` 内部会为在线替身再起一个
@@ -2742,6 +4109,38 @@ fn spawn_load_job(job: LoadJob) {
 }
 
 impl LoadJob {
+    async fn dispatch_remote(self, source: PlaySource) {
+        let Some(connection) = self.remote.clone() else { return; };
+        let session_id = connection.id;
+        let track = self.track.clone();
+        let gen = self.gen;
+        let start_ms = self.start_ms;
+        let retryable = matches!(&source, PlaySource::Online { .. }) && !self.track.platform.is_podcast();
+        let first_connection = connection.clone();
+        let mut result = tauri::async_runtime::spawn_blocking(move ||
+            first_connection.load(gen, source, &track, start_ms)).await
+            .map_err(|error| error.to_string()).and_then(|result| result);
+        if retryable && connection.matches(session_id, gen)
+            && result.as_ref().is_err_and(|error| error.starts_with("媒体地址不可读取"))
+        {
+            self.cache.invalidate(&PlayUrlCache::cache_key(self.track.platform.as_str(), &self.track.id, crate::quality_str(&self.quality)));
+            match crate::resolve_play_url_script(&self.app, &self.cache, &self.track, self.quality.clone()).await {
+                Ok(hit) => {
+                    let source = PlaySource::Online { url: hit.url, fetchedAt: hit.fetched_at, referer: hit.referer };
+                    let track = self.track.clone();
+                    result = tauri::async_runtime::spawn_blocking(move ||
+                        connection.load(gen, source, &track, start_ms)).await
+                        .map_err(|error| error.to_string()).and_then(|result| result);
+                }
+                Err(error) => result = Err(format!("重新获取投屏地址失败：{error}")),
+            }
+        }
+        let request = SourceLoadRequest {
+            target: self.target, port: self.port, track: self.track,
+            autoplay: self.autoplay, start_ms: self.start_ms, gen: self.gen,
+        };
+        let _ = self.tx.send(AudioCmd::DlnaLoaded(Box::new(dlna_adapter::LoadResult { session_id, request, result })));
+    }
     async fn run(self) {
         // 本地曲目：Track.id 即文件绝对路径，无需 Provider 取址（DESIGN §13）。
         // 文件不在了（被移动/改名/删除——收藏死条目的主要来源）时走替身链
@@ -2819,11 +4218,14 @@ impl LoadJob {
                                 cache_dir: self.cache_dir.clone(),
                                 history_db: self.history_db.clone(),
                                 quality: self.quality.clone(),
+                                target: self.target.clone(),
+                                port: self.port.clone(),
                                 track,
                                 autoplay: self.autoplay,
                                 start_ms: 0,
                                 gen: self.gen,
                                 preload: self.preload,
+                                remote: self.remote.clone(),
                             };
                             spawn_load_job(job);
                             return;
@@ -2894,6 +4296,10 @@ impl LoadJob {
                     fetchedAt: fetched_at,
                     referer,
                 };
+                if self.remote.is_some() {
+                    self.dispatch_remote(source).await;
+                    return;
+                }
                 match self.try_build(&source).await {
                     Ok(built) => self.dispatch_ready(
                         built,
@@ -3009,6 +4415,10 @@ impl LoadJob {
 
     /// 构建并回发（本地/离线文件路径，不重试）。
     async fn build_and_dispatch(self, source: PlaySource, is_local: bool, fetched_at: Option<u64>) {
+        if self.remote.is_some() {
+            self.dispatch_remote(source).await;
+            return;
+        }
         // 本地文件 / 已下载文件的体积直接取文件长度（在线流由取链侧的探测结果带回来），
         // 播放条据此算实际码率 —— 本地无损和在线 128k 的差别是靠这个数看出来的。
         let size_bytes = match &source {
@@ -3031,32 +4441,13 @@ impl LoadJob {
         play_url: Option<String>,
         size_bytes: Option<u64>,
     ) {
-        let BuiltDecoder { source: decoder, shared, duration_ms, physical_duration_ms } = built;
-        // A CUE track covers part of the physical file. Scale its byte count as
-        // well, so dividing by the interval duration preserves the file bitrate.
-        let size_bytes = size_bytes.or_else(|| shared.as_ref().and_then(|shared| shared.total_len()));
-        let size_bytes = if self.track.start_ms.is_some() || self.track.end_ms.is_some() {
-            size_bytes.and_then(|size| (physical_duration_ms > 0).then(|| {
-                (u128::from(size) * u128::from(duration_ms) / u128::from(physical_duration_ms)) as u64
-            }))
-        } else {
-            size_bytes
+        let request = SourceLoadRequest {
+            target: self.target, port: self.port, track: self.track,
+            autoplay: self.autoplay, start_ms: self.start_ms, gen: self.gen,
         };
-        let start_at = if duration_ms > 0 { self.start_ms.min(duration_ms) } else { self.start_ms };
-        let _ = self.tx.send(AudioCmd::LoadReady {
-            track: Box::new(self.track.clone()),
-            decoder,
-            shared,
-            duration_ms,
-            start_at: (start_at > 0).then_some(start_at),
-            autoplay: self.autoplay,
-            is_local,
-            url_fetched_at: fetched_at,
-            play_url,
-            size_bytes,
-            gen: self.gen,
-            preload: self.preload,
-        });
+        let _ = self.tx.send(request.ready_command(
+            self.preload, built, is_local, fetched_at, play_url, size_bytes,
+        ));
     }
 
     /// 回发失败：广播 audio-error + LoadFailed，由引擎统一置错误态并决定跳过。
@@ -3064,11 +4455,7 @@ impl LoadJob {
     /// `stalled` = 本次失败只是环境问题（弱网/引擎卡），不是「这首歌坏了」。
     /// 引擎侧据此不把这首拉进 `failed_tracks`、不计入连续失败熔断。
     fn dispatch_load_failed(self, kind: &'static str, detail: &str, stalled: bool) {
-        let message = if stalled {
-            format!("网络较慢，正在重试（{detail}）")
-        } else {
-            format!("该歌曲暂时无法播放（{detail}）")
-        };
+        let message = load_failure_message(detail, stalled);
         self.dispatch_failed_message(kind, message, stalled);
     }
 
@@ -3080,27 +4467,39 @@ impl LoadJob {
     /// 文件长度，套那个壳只会让用户反复重试。`stalled` 仍然照传，引擎侧
     /// 据此决定是否拉黑、是否计入连续失败熔断。
     fn dispatch_failed_message(self, kind: &'static str, message: String, stalled: bool) {
+        if let Some(connection) = self.remote {
+            let request = SourceLoadRequest {
+                target: self.target, port: self.port, track: self.track,
+                autoplay: self.autoplay, start_ms: self.start_ms, gen: self.gen,
+            };
+            let _ = self.tx.send(AudioCmd::DlnaLoaded(Box::new(dlna_adapter::LoadResult {
+                session_id: connection.id, request, result: Err(message),
+            })));
+            return;
+        }
         if self.preload {
             log::debug!("[gapless] speculative load failed for {}: {message}", self.track.id);
             let _ = self.tx.send(AudioCmd::PreloadFailed { gen: self.gen });
             return;
         }
-        let _ = self.app.emit(
-            "audio-error",
-            serde_json::json!({
-                "trackId": self.track.id,
-                "kind": kind,
-                "message": message,
-                "stalled": stalled,
-            }),
-        );
-        let _ = self.tx.send(AudioCmd::LoadFailed {
-            track_id: self.track.id.clone(),
-            message,
-            autoplay: self.autoplay,
-            stalled,
-            gen: self.gen,
-        });
+        // Original source receipts publish only after the actor's shared admission.
+        // Keep the existing targetless/legacy notification path unchanged.
+        if self.port.is_none() {
+            let _ = self.app.emit(
+                "audio-error",
+                serde_json::json!({
+                    "trackId": self.track.id,
+                    "kind": kind,
+                    "message": message,
+                    "stalled": stalled,
+                }),
+            );
+        }
+        let request = SourceLoadRequest {
+            target: self.target.clone(), port: self.port.clone(), track: self.track.clone(),
+            autoplay: self.autoplay, start_ms: self.start_ms, gen: self.gen,
+        };
+        let _ = self.tx.send(request.failure_command(kind, message, stalled));
     }
 }
 
@@ -3148,15 +4547,19 @@ fn spawn_cache_prune(inner: &EngineInner) {
 /// Cancel only the pending source; current audio remains on the same Player.
 /// The activation CAS closes the race between a manual command and render pull.
 fn invalidate_preload(inner: &mut EngineInner) {
-    let progress = inner.preload.as_ref()
+    let progress = inner.preload.slot.as_ref()
         .and_then(|slot| slot.ready.as_ref()).map(|ready| Arc::clone(&ready.progress));
     if let Some(progress) = progress {
         if !progress.cancel_pending() {
             sync_gapless_transition(inner);
         }
     }
-    inner.preload = None;
-    inner.preload_gen = inner.preload_gen.wrapping_add(1);
+    let retired = inner.preload.slot.take();
+    if let Some(ready) = retired.as_ref().and_then(|slot| slot.ready.as_ref()) {
+        ready.binding.cancel();
+    }
+    drop(retired);
+    inner.preload.gen = inner.preload.gen.wrapping_add(1);
 }
 
 /// 同一首曲目内预载失败的容忍次数：失败即作废槽位换目标重试（见
@@ -3212,130 +4615,416 @@ fn preload_block(facts: PreloadFacts) -> Option<&'static str> {
 /// （`mount_decoder` 末尾，不必等 25ms 的播放圈）、每条命令处理完之后
 /// （`handle_cmd` 末尾，恢复播放 / 开关无缝也走这里），以及播放圈的常规巡检。
 fn maybe_preload(inner: &mut EngineInner) {
-    let (playing, mode) = {
-        let state = inner.state.read().unwrap_or_else(|e| e.into_inner());
-        (state.status == PlaybackStatus::Playing, state.play_mode)
-    };
-    let facts = PreloadFacts {
-        gapless: inner.gapless,
-        sleep_after_track: inner.sleep_after_track,
-        auto_next: inner.auto_next,
-        has_slot: inner.preload.is_some(),
-        pausing: inner.pause_deadline.is_some(),
-        playing,
-        has_progress: inner.current_progress.is_some(),
-        retries_left: inner.preload_retries < PRELOAD_RETRY_LIMIT,
-    };
-    if let Some(reason) = preload_block(facts) {
-        log::trace!("[gapless] 跳过预热：{reason}");
-        return;
-    }
-    let candidate = {
-        let queue = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
-        queue.next_index_skipping(mode, true, |track| inner.dislikes.matches(track))
-            .and_then(|index| queue.tracks.get(index).cloned().map(|track| (index, track)))
-    };
-    let Some((index, track)) = candidate else { return; };
-    inner.preload_gen = inner.preload_gen.wrapping_add(1);
-    let gen = inner.preload_gen;
-    // Choose Random exactly once; the retained index is committed on activation.
-    inner.preload = Some(PreloadSlot { gen, index, track: track.clone(), ready: None });
-    log::debug!("[gapless] 开始预热下一首 {}（mode={mode:?}, index={index}）", track.id);
-    let quality = effective_quality_for(inner, &track);
+    if inner.remote.is_some() { return; }
+    let dislikes = &inner.dislikes;
+    let Some(preload) = inner.owner.prepare_preload(
+        &mut inner.preload,
+        PreloadPrepare {
+            flags: PreloadFlags {
+                gapless: inner.gapless, sleep_after_track: inner.sleep_after_track,
+                auto_next: inner.auto_next,
+            },
+            pausing: inner.pause_deadline.is_some(),
+            current_progress: inner.current_progress.as_ref(),
+            current_mount: inner.current_mount.as_ref(),
+            target: inner.play_target.as_ref(),
+            load_gen: inner.load_gen,
+            quality: PreloadQuality {
+                default_quality: &inner.default_quality,
+                track_quality: &inner.track_quality,
+                source_qualities: &inner.source_qualities,
+            },
+        },
+        |track| dislikes.matches(track),
+    ) else { return; };
+    let PreloadRequest { request, quality } = preload;
     let job = LoadJob {
         app: inner.app.clone(), tx: inner.tx.clone(), cache: Arc::clone(&inner.url_cache),
         cache_dir: inner.cache_dir.clone(), history_db: inner.db.clone(), quality,
-        track, autoplay: true, start_ms: 0, gen, preload: true,
+        target: request.target,
+        port: request.port,
+        track: request.track, autoplay: request.autoplay, start_ms: request.start_ms,
+        gen: request.gen, preload: true,
+        remote: None,
     };
     tauri::async_runtime::spawn(job.run());
 }
 
-#[allow(clippy::too_many_arguments)]
-fn append_preloaded(
-    inner: &mut EngineInner,
-    track: Track,
-    decoder: Box<dyn Source + Send>,
-    shared: Option<Arc<RangeShared>>,
-    duration_ms: u64,
-    is_local: bool,
-    url_fetched_at: Option<u64>,
-    play_url: Option<String>,
-    size_bytes: Option<u64>,
-    gen: u64,
-) {
-    if !inner.gapless || inner.sleep_after_track || !inner.auto_next {
-        return;
+impl AudioEngine {
+    pub fn admit_started_preload(
+        &self,
+        started: StartedPreload,
+        preload: &PreloadState,
+        current_mount: Option<&Arc<super::render_control::SourceSeekPort>>,
+        current_progress: Option<&Arc<SourceProgress>>,
+        load_gen: &mut u64,
+    ) -> Option<AdmittedPreload> {
+        let binding = Arc::clone(&started.ready().binding);
+        let result = (|| {
+            let original_track = started.slot.original_track.clone();
+            let original_progress = Arc::clone(&started.slot.original_progress);
+            let original_mount = started.original_mount().cloned();
+            let original_stamp = started.original_stamp().cloned();
+            let original_target = started.slot.original_target.clone();
+            let original_load_gen = started.original_load_gen();
+            let (original_generation, native, next_load_gen) =
+                match (&original_mount, &original_stamp, &original_target) {
+                    (Some(port), Some(stamp), Some(target))
+                        if stamp == port.stamp() && &stamp.target == target
+                            && target.generation != 0
+                            && target.matches_track(&original_track)
+                            && Arc::ptr_eq(&original_progress, &port.progress()) =>
+                    {
+                        (target.generation, true, load_gen.wrapping_add(1))
+                    }
+                    (None, None, None) => (0, false, *load_gen),
+                    _ => return None,
+                };
+            let mut next_target = if native {
+                Some(PlayTarget::new(original_generation.checked_add(1)?, started.track()))
+            } else { None };
+            let owner = SourceControlOwner {
+                core: self.core.clone(), mounts: Arc::downgrade(&self.source_mounts),
+            };
+            let mut pending = Some(started);
+            self.core.gate().with_automatic(original_generation, native, |generation| {
+                let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+                let state = self.state.write().unwrap_or_else(|e| e.into_inner());
+                let mut mounts = self.source_mounts.lock().unwrap_or_else(|e| e.into_inner());
+                let candidate = pending.as_ref().expect("one original started preload");
+                if preload.gen != candidate.slot.gen || preload.slot.is_some()
+                    || *load_gen != original_load_gen
+                    || !current_progress.is_some_and(|progress|
+                        Arc::ptr_eq(progress, &original_progress))
+                    || !Self::preload_queue_matches(&candidate.slot, &queue)
+                    || !state.track.as_ref().is_some_and(|track| track.same_identity(&original_track))
+                    || state.track_id.as_deref() != Some(original_track.id.as_str())
+                    || !queue.tracks.get(candidate.slot.index)
+                        .is_some_and(|track| track.same_identity(candidate.track()))
+                { return None; }
+                if native {
+                    let original = original_mount.as_ref().expect("qualified native A");
+                    let stamp = original_stamp.as_ref().expect("qualified original stamp");
+                    if !current_mount.is_some_and(|port|
+                        Arc::ptr_eq(port, original) && port.stamp() == stamp)
+                        || !mounts.current.as_ref().is_some_and(|port|
+                            Arc::ptr_eq(port, original) && port.stamp() == stamp)
+                        || mounts.reserved.as_ref().is_some_and(|port|
+                            !Arc::ptr_eq(port, original) || port.stamp() != stamp)
+                        || next_target.as_ref().map(|target| target.generation) != Some(generation)
+                    { return None; }
+                    // Naturally finished A may already be retired; retain its original identity.
+                    binding.try_bind_with(|progress| {
+                        let stamp = super::render_control::MountStamp {
+                            target: next_target.take().expect("the fixed prepared C target"),
+                            mount_nonce: self.mount_nonce.fetch_add(1, Ordering::Relaxed).wrapping_add(1),
+                        };
+                        let port = super::render_control::SourceSeekPort::reserved_with_progress(
+                            stamp, self.core.gate().clone(), owner, Arc::clone(progress),
+                        );
+                        port.set_speed(state.speed);
+                        port.set_paused(state.status == PlaybackStatus::Paused);
+                        port.arm();
+                        let retired_current = mounts.current.replace(port.clone());
+                        let retired_reserved = mounts.reserved.take();
+                        *load_gen = next_load_gen;
+                        let admitted = AdmittedPreload {
+                            started: pending.take().expect("consume the actual qualified slot once"),
+                            mount: Some(PreloadMount { stamp: port.stamp().clone(), port: port.clone() }),
+                            accepted_generation: generation, accepted_load_gen: *load_gen,
+                        };
+                        (port, (admitted, retired_current, retired_reserved))
+                    }).map(|(_same_published_port, result)| result)
+                } else {
+                    if generation != 0 || current_mount.is_some()
+                        || mounts.current.is_some() || mounts.reserved.is_some()
+                    { return None; }
+                    binding.try_admit_unbound(|_| {
+                        (AdmittedPreload {
+                            started: pending.take().expect("consume the actual unbound slot once"),
+                            mount: None, accepted_generation: 0, accepted_load_gen: *load_gen,
+                        }, None, None)
+                    })
+                }
+            })
+        })();
+        let Some((admitted, retired_current, retired_reserved)) = result else {
+            binding.cancel();
+            return None;
+        };
+        for retired in [retired_current, retired_reserved].into_iter().flatten() {
+            retired.retire();
+        }
+        Some(admitted)
     }
-    let Some(slot) = inner.preload.as_ref() else { return; };
-    if slot.gen != gen || slot.track.id != track.id || slot.track.platform != track.platform
-        || slot.ready.is_some()
-    {
-        return;
+
+    /// Consume the actual preload receipt; return all other commands untouched.
+    /// Ok(true) means appended, Ok(false) means rejected by the original guards.
+    /// Defer the concrete optional tap until acceptance, as in the original actor.
+    pub fn append_preloaded(
+        &self, cmd: AudioCmd, preload: &mut PreloadState, flags: PreloadFlags,
+        render: PreloadRender<'_>,
+        spectrum: impl FnOnce() -> Option<crate::audio::SpectrumTap>,
+    ) -> Result<bool, Box<AudioCmd>> {
+        let (track, decoder, shared, duration_ms, is_local, url_fetched_at,
+            play_url, size_bytes, gen) = match cmd {
+            AudioCmd::LoadReady {
+                track, decoder, shared, duration_ms, is_local, url_fetched_at,
+                play_url, size_bytes, gen, preload: true, ..
+            } => (track, decoder, shared, duration_ms, is_local, url_fetched_at,
+                play_url, size_bytes, gen),
+            cmd => return Err(Box::new(cmd)),
+        };
+        if !flags.gapless || flags.sleep_after_track || !flags.auto_next {
+            return Ok(false);
+        }
+        let Some(slot) = preload.slot.as_ref() else { return Ok(false); };
+        if slot.gen != gen || slot.track.id != track.id || slot.track.platform != track.platform
+            || slot.ready.is_some()
+        {
+            return Ok(false);
+        }
+        let valid = self.queue.lock().unwrap_or_else(|e| e.into_inner()).tracks.get(slot.index)
+            .is_some_and(|item| item.id == track.id && item.platform == track.platform);
+        if !valid { return Ok(false); }
+        let bitrate_kbps = measured_bitrate_kbps(
+            size_bytes.or_else(|| shared.as_ref().and_then(|shared| shared.total_len())), duration_ms,
+        );
+        let progress = Arc::new(SourceProgress::default());
+        let source: Box<dyn Source + Send> = Box::new(DspSource::new(
+            Box::new(TrackedSource::new(decoder, Arc::clone(&progress))),
+            Arc::clone(render.fx), render.epoch, spectrum(),
+        ));
+        let (source, binding) = super::render_control::PreloadBinding::wrap(
+            source, Arc::clone(&progress),
+        );
+        preload.slot.as_mut().unwrap().ready = Some(PreparedTrack {
+            progress, binding, shared, duration_ms, is_local,
+            url_fetched_at, play_url, bitrate_kbps,
+        });
+        // No clear(), new Player, fade or second output stream at this boundary.
+        render.player.append(source);
+        Ok(true)
     }
-    let valid = inner.queue.lock().unwrap_or_else(|e| e.into_inner()).tracks.get(slot.index)
-        .is_some_and(|item| item.id == track.id && item.platform == track.platform);
-    if !valid { return; }
-    let bitrate_kbps = measured_bitrate_kbps(
-        size_bytes.or_else(|| shared.as_ref().and_then(|shared| shared.total_len())), duration_ms,
-    );
-    let progress = Arc::new(SourceProgress::default());
-    inner.preload.as_mut().unwrap().ready = Some(PreparedTrack {
-        progress: Arc::clone(&progress), shared, duration_ms, is_local,
-        url_fetched_at, play_url, bitrate_kbps,
+
+    fn preload_mount_matches(admitted: &AdmittedPreload, mounts: &SourceMounts) -> bool {
+        match &admitted.mount {
+            Some(mount) => {
+                mount.stamp == *mount.port.stamp()
+                    && mount.stamp.target.generation == admitted.accepted_generation
+                    && mount.stamp.target.matches_track(admitted.track())
+                    && mounts.current.as_ref().is_some_and(|current|
+                        Arc::ptr_eq(current, &mount.port) && current.stamp() == &mount.stamp)
+                    && !mounts.reserved.as_ref().is_some_and(|reserved|
+                        !Arc::ptr_eq(reserved, &mount.port) || reserved.stamp() != &mount.stamp)
+            }
+            None => admitted.accepted_generation == 0
+                && mounts.current.is_none() && mounts.reserved.is_none(),
+        }
+    }
+
+    fn preload_queue_matches(slot: &PreloadSlot, queue: &Queue) -> bool {
+        queue.selection_cursor() == slot.original_queue_cursor
+            && match (queue.current(), slot.original_queue_track.as_ref()) {
+                (Some(current), Some(original)) => current.same_identity(original),
+                (None, None) => true,
+                _ => false,
+            }
+    }
+
+    /// C is physically current, while semantic current is still A.
+    fn with_admitted_preload<T>(
+        &self, admitted: &AdmittedPreload, load_gen: &u64,
+        commit: impl FnOnce(&mut Queue, &mut PlaybackStateSnapshot) -> T,
+    ) -> Option<T> {
+        self.core.gate().with_accepted(admitted.accepted_generation, || {
+            let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+            let mounts = self.source_mounts.lock().unwrap_or_else(|e| e.into_inner());
+            let original = &admitted.started.slot.original_track;
+            if *load_gen != admitted.accepted_load_gen
+                || !Self::preload_mount_matches(admitted, &mounts)
+                || !Self::preload_queue_matches(&admitted.started.slot, &queue)
+                || !state.track.as_ref().is_some_and(|track| track.same_identity(original))
+                || state.track_id.as_deref() != Some(original.id.as_str())
+                || !queue.tracks.get(admitted.started.slot.index)
+                    .is_some_and(|track| track.same_identity(admitted.track()))
+            { return None; }
+            Some(commit(&mut queue, &mut state))
+        }).flatten()
+    }
+
+    fn admitted_preload_is_current(&self, admitted: &AdmittedPreload, load_gen: &u64) -> bool {
+        self.with_admitted_preload(admitted, load_gen, |_, _| ()).is_some()
+    }
+
+    /// Re-fence the same C after semantic identity becomes C, even at its actual EOF.
+    fn with_preload_metadata<T>(
+        &self, metadata: &PreloadMetadata, load_gen: &u64,
+        commit: impl FnOnce(&mut PlaybackStateSnapshot) -> T,
+    ) -> Option<T> {
+        let admitted = &metadata.admitted;
+        let apply = |state: &mut PlaybackStateSnapshot| {
+            let mounts = self.source_mounts.lock().unwrap_or_else(|e| e.into_inner());
+            if *load_gen != admitted.accepted_load_gen
+                || !Self::preload_mount_matches(admitted, &mounts)
+                || !state.track.as_ref().is_some_and(|track| track.same_identity(metadata.track()))
+                || state.track_id.as_deref() != Some(metadata.track().id.as_str())
+            { return None; }
+            Some(commit(state))
+        };
+        match &admitted.mount {
+            Some(mount) => self.core.with_target(&mount.stamp.target, apply).flatten(),
+            None => self.core.gate().with_accepted(admitted.accepted_generation, || {
+                let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+                apply(&mut state)
+            }).flatten(),
+        }
+    }
+
+    fn preload_metadata_is_current(&self, metadata: &PreloadMetadata, load_gen: &u64) -> bool {
+        self.with_preload_metadata(metadata, load_gen, |_| ()).is_some()
+    }
+
+    /// Consume physical C at the original post-old-listen Queue/current phase.
+    pub fn sync_preload_current(
+        &self, admitted: AdmittedPreload, load_gen: &u64, current: PreloadCurrent<'_>,
+    ) -> Option<PreloadMetadata> {
+        let mut next_progress = Some(Arc::clone(admitted.started().progress()));
+        let mut next_shared = admitted.started().shared().cloned();
+        let mut next_cache = next_shared.as_ref().map(|shared| shared.path().to_path_buf());
+        let mut next_track = Some(admitted.track().clone());
+        let mut next_id = Some(admitted.track().id.clone());
+        let retired_failed = self.with_admitted_preload(&admitted, load_gen, |queue, state| {
+            queue.commit_index(admitted.started.slot.index);
+            std::mem::swap(current.current_progress, &mut next_progress);
+            std::mem::swap(current.current_shared, &mut next_shared);
+            {
+                let mut cache = self.cache_file.lock().unwrap_or_else(|e| e.into_inner());
+                std::mem::swap(&mut *cache, &mut next_cache);
+            }
+            let retired_failed = current.failed_tracks.take(&admitted.track().id);
+            *current.fail_streak = 0;
+            *current.stall_retry = 0;
+            current.watch.clear();
+            state.queue_index = queue.index;
+            state.queue_len = queue.len();
+            std::mem::swap(&mut state.track, &mut next_track);
+            std::mem::swap(&mut state.track_id, &mut next_id);
+            retired_failed
+        });
+        let committed = retired_failed.is_some();
+        drop((retired_failed, next_progress, next_shared, next_cache, next_track, next_id));
+        committed.then_some(PreloadMetadata { admitted })
+    }
+
+    /// Consume the same C metadata under its new target/full stamp/actual actor clock.
+    /// Emit/device/listen/persist remain outside this short memory-only fence.
+    pub fn sync_preload_metadata(
+        &self, metadata: PreloadMetadata, load_gen: &u64,
+        position_ms: u64, quality: Quality,
+    ) -> Option<PublishedPreload> {
+        let ready = metadata.started().ready();
+        let mut next_quality = quality;
+        let mut next_url = ready.play_url.clone();
+        let mut next_source = Some(metadata.track().platform.clone());
+        let mut next_error: Option<String> = None;
+        let written = self.with_preload_metadata(&metadata, load_gen, |state| {
+            std::mem::swap(&mut state.quality, &mut next_quality);
+            std::mem::swap(&mut state.play_url, &mut next_url);
+            std::mem::swap(&mut state.source_id, &mut next_source);
+            std::mem::swap(&mut state.error, &mut next_error);
+            state.duration_ms = ready.duration_ms;
+            state.position_ms = metadata.admitted.mount.as_ref()
+                .map_or(position_ms, |mount| mount.port.position_ms());
+            state.buffered_ms = 0;
+            state.is_local = ready.is_local;
+            state.url_fetched_at = ready.url_fetched_at;
+            state.bitrate_kbps = ready.bitrate_kbps;
+        }).is_some();
+        drop((next_quality, next_url, next_source, next_error));
+        written.then_some(PublishedPreload { metadata })
+    }
+}
+
+fn sync_gapless_actor_identity(inner: &mut EngineInner, metadata: &PreloadMetadata) -> bool {
+    let owner = inner.owner.clone();
+    let next_current = metadata.admitted.mount().cloned();
+    let next_play = next_current.clone();
+    let next_target = metadata.admitted.stamp().map(|stamp| stamp.target.clone());
+    let EngineInner {
+        current_mount, play_mount, play_target, eof_queued, load_gen, ..
+    } = inner;
+    let retired = owner.with_preload_metadata(metadata, load_gen, |_| {
+        *eof_queued = false;
+        (
+            std::mem::replace(current_mount, next_current),
+            std::mem::replace(play_mount, next_play),
+            std::mem::replace(play_target, next_target),
+        )
     });
-    // No clear(), new Player, fade or second output stream at this boundary.
-    inner.sink.append(DspSource::new(
-        Box::new(TrackedSource::new(decoder, progress)), Arc::clone(&inner.fx), inner.epoch,
-        Some(crate::audio::SpectrumTap::new(Some(inner.app.clone()))),
-    ));
+    let committed = retired.is_some();
+    drop(retired);
+    committed
 }
 
 fn sync_gapless_transition(inner: &mut EngineInner) {
-    let started = inner.preload.as_ref().and_then(|slot| slot.ready.as_ref())
-        .is_some_and(|ready| ready.progress.started());
-    if !started { return; }
-    let slot = inner.preload.take().unwrap();
-    let ready = slot.ready.unwrap();
+    let Some(started) = inner.preload.take_started() else { return; };
+    let owner = inner.owner.clone();
+    let Some(admitted) = owner.admit_started_preload(
+        started, &inner.preload, inner.current_mount.as_ref(),
+        inner.current_progress.as_ref(), &mut inner.load_gen,
+    ) else { return; };
+    if !owner.admitted_preload_is_current(&admitted, &inner.load_gen) { return; }
     // gapless 接力同样是换曲：把预载那首的 ReplayGain 换上（否则会沿用上一首的）
-    apply_replay_gain(inner, &slot.track);
+    apply_replay_gain(inner, admitted.track());
     // The old progress handle still points at the old source's final position.
     inner.accrue_listen(content_pos_ms(inner));
     inner.settle_listen(true, true);
-    {
-        let mut queue = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
-        queue.commit_index(slot.index);
-    }
-    inner.current_progress = Some(ready.progress);
-    inner.current_shared = ready.shared;
-    *inner.cache_file.lock().unwrap_or_else(|e| e.into_inner()) =
-        inner.current_shared.as_ref().map(|shared| shared.path().to_path_buf());
-    inner.failed_tracks.remove(&slot.track.id);
-    inner.fail_streak = 0;
-    inner.stall_retry = 0;
-    inner.watch.clear();
-    inner.sync_queue_to_snapshot();
+    let Some(metadata) = owner.sync_preload_current(
+        admitted, &inner.load_gen,
+        PreloadCurrent {
+            current_progress: &mut inner.current_progress,
+            current_shared: &mut inner.current_shared,
+            failed_tracks: &mut inner.failed_tracks,
+            fail_streak: &mut inner.fail_streak,
+            stall_retry: &mut inner.stall_retry,
+            watch: &mut inner.watch,
+        },
+    ) else { return; };
+    if !sync_gapless_actor_identity(inner, &metadata)
+        || !owner.preload_metadata_is_current(&metadata, &inner.load_gen)
+    { return; }
     inner.queue_emit();
     let position_ms = content_pos_ms(inner);
-    let quality = effective_quality_for(inner, &slot.track);
-    inner.mutate(|state| {
-        state.track_id = Some(slot.track.id.clone());
-        state.track = Some(slot.track.clone());
-        state.quality = quality;
-        state.duration_ms = ready.duration_ms;
-        state.position_ms = position_ms;
-        state.buffered_ms = 0;
-        state.is_local = ready.is_local;
-        state.url_fetched_at = ready.url_fetched_at;
-        state.play_url = ready.play_url;
-        state.bitrate_kbps = ready.bitrate_kbps;
-        state.error = None;
-    });
-    inner.begin_listen(&slot.track, ready.duration_ms);
-    record_play_start(inner.db.clone(), slot.track);
-    inner.tick_anchor = None;
+    let quality = effective_quality_for(inner, metadata.track());
+    let track = metadata.track().clone();
+    let duration_ms = metadata.duration_ms();
+    let Some(published) = owner.sync_preload_metadata(
+        metadata, &inner.load_gen, position_ms, quality,
+    ) else { return; };
+    if !owner.preload_metadata_is_current(&published.metadata, &inner.load_gen) { return; }
+    inner.publish();
+    if !owner.preload_metadata_is_current(&published.metadata, &inner.load_gen) { return; }
+    let listen_mount = inner.begin_listen(&track, duration_ms);
+    if !owner.preload_metadata_is_current(&published.metadata, &inner.load_gen) { return; }
+    let _ = listen_mount.record_play_start();
+    {
+        let EngineInner { load_gen, tick_anchor, .. } = inner;
+        if owner.with_preload_metadata(&published.metadata, load_gen, |_| *tick_anchor = None)
+            .is_none()
+        { return; }
+    }
+    if !owner.preload_metadata_is_current(&published.metadata, &inner.load_gen) { return; }
     inner.persist_state();
     // 换曲边界：这是新一首，预载重试额度归零
-    inner.preload_retries = 0;
+    {
+        let EngineInner { load_gen, preload, .. } = inner;
+        if owner.with_preload_metadata(&published.metadata, load_gen, |_| preload.retries = 0)
+            .is_none()
+        { return; }
+    }
+    if !owner.preload_metadata_is_current(&published.metadata, &inner.load_gen) { return; }
     spawn_cache_prune(inner);
 }
 
@@ -3356,6 +5045,8 @@ fn apply_replay_gain(inner: &mut EngineInner, track: &Track) {
 #[allow(clippy::too_many_arguments)]
 fn mount_decoder(
     inner: &mut EngineInner,
+    target: Option<PlayTarget>,
+    port: Option<Arc<super::render_control::SourceSeekPort>>,
     track: &Track,
     decoder: Box<dyn Source + Send>,
     shared: Option<Arc<RangeShared>>,
@@ -3367,6 +5058,12 @@ fn mount_decoder(
     play_url: Option<String>,
     probed_size: Option<u64>,
 ) {
+    let port = match (target, port) {
+        (Some(target), Some(port)) if port.stamp().target == target && port.is_live() => Some(port),
+        (None, None) => None,
+        _ => return,
+    };
+    let autoplay = port.as_ref().and_then(|port| port.pause_override()).map_or(autoplay, |paused| !paused);
     inner.failed_tracks.remove(&track.id);
     // 成功挂载 = 这首能播：重开自动切歌熔断（连续失败计数一并清零）
     inner.auto_next = true;
@@ -3376,20 +5073,29 @@ fn mount_decoder(
     // 清掉 hits 就变成「每 12s 软重载一次」的无限循环，永远升不到重建输出流那一步。
     // 看门狗判定只由「位置真的推进」或「用户手动发起播放」清零。
     inner.sink.clear();
-    // 倍速挂在 rodio Player 的控制链上（对 append 进来的源全局生效）；
-    // DspSource 包在解码器外提供 EQ / 响度归一化 / 淡入淡出
-    inner.sink.set_speed(inner.speed);
+    // Bound sources carry their original rate. Never multiply it again in Player.
+    // Legacy unbound sources still use Player's transport rate.
+    if let Some(port) = &port { inner.speed = port.speed(); }
+    inner.sink.set_speed(if port.is_some() { 1.0 } else { inner.speed });
     // ReplayGain：挂载前把这支曲子该乘的静态增益放进共享效果参数，
     // DspSource 在下一个块边界快照到它（换曲不漏、不早）
     apply_replay_gain(inner, track);
-    let progress = Arc::new(SourceProgress::default());
-    inner.sink.append(DspSource::new(
-        Box::new(TrackedSource::new(decoder, Arc::clone(&progress))
-            .with_position(start_at.unwrap_or(0))),
-        Arc::clone(&inner.fx),
-        inner.epoch,
-        Some(crate::audio::SpectrumTap::new(Some(inner.app.clone()))),
-    ));
+    let progress = port.as_ref().map_or_else(
+        || Arc::new(SourceProgress::default()), |port| port.progress(),
+    );
+    if let Some(port) = &port {
+        let source = inner.owner.bind_source(port.clone(), decoder, start_at.unwrap_or(0),
+            Arc::clone(&inner.fx), inner.epoch,
+            Some(crate::audio::SpectrumTap::new(Some(inner.app.clone()))));
+        inner.sink.append(source);
+        if !inner.owner.complete_source_mount(port) { return; }
+    } else {
+        inner.sink.append(DspSource::new(
+            Box::new(TrackedSource::new(decoder, Arc::clone(&progress))
+                .with_position(start_at.unwrap_or(0))),
+            Arc::clone(&inner.fx), inner.epoch,
+            Some(crate::audio::SpectrumTap::new(Some(inner.app.clone())))));
+    }
     inner.sink.set_volume(inner.effective_volume());
     // 新曲自动播放且开了淡入淡出 → 淡入；否则清掉可能残留的淡出指令。
     // 换曲同时作废在途的「淡出暂停」deadline（新曲已经开始播了）
@@ -3405,6 +5111,8 @@ fn mount_decoder(
     spawn_cache_prune(inner);
     // Initial CUE/restore seeks were performed on the blocking loader worker.
     inner.current_progress = Some(progress);
+    inner.current_mount = port.clone();
+    inner.eof_queued = false;
     if autoplay {
         inner.sink.play();
     } else {
@@ -3418,32 +5126,33 @@ fn mount_decoder(
     let bitrate_kbps = measured_bitrate_kbps(size_bytes, duration_ms);
     inner.current_shared = shared;
 
-    inner.mutate(|st| {
-        st.status = if autoplay {
-            PlaybackStatus::Playing
-        } else {
-            PlaybackStatus::Paused
-        };
-        st.track_id = Some(track.id.clone());
-        st.track = Some(track.clone());
-        st.duration_ms = duration_ms;
-        st.position_ms = start_at.unwrap_or(0);
-        st.error = None;
-        st.is_local = is_local;
-        st.url_fetched_at = url_fetched_at;
-        st.play_url = play_url;
-        st.bitrate_kbps = bitrate_kbps;
-    });
+    let mut prepared = inner.owner.snapshot();
+    prepared.status = if autoplay { PlaybackStatus::Playing } else { PlaybackStatus::Paused };
+    prepared.track_id = Some(track.id.clone());
+    prepared.track = Some(track.clone());
+    prepared.duration_ms = duration_ms;
+    prepared.position_ms = start_at.unwrap_or(0);
+    prepared.error = None;
+    prepared.is_local = is_local;
+    prepared.url_fetched_at = url_fetched_at;
+    prepared.play_url = play_url;
+    prepared.bitrate_kbps = bitrate_kbps;
+    if let Some(port) = &port {
+        if !inner.owner.publish_source_state(port, prepared) { return; }
+        inner.publish();
+    } else {
+        inner.mutate(|st| *st = prepared);
+    }
     // 收听会话从挂载成功这一刻开始（同曲重载不重开：那还是同一次收听）。
     // duration_ms 用解码器报的时长，有效播放的「听满一半」按它算。
-    inner.begin_listen(track, duration_ms);
-    record_play_start(inner.db.clone(), track.clone());
+    let listen_mount = inner.begin_listen(track, duration_ms);
+    let _ = listen_mount.record_play_start();
     inner.tick_anchor = None;
     emit_position_tick(inner);
     inner.persist_state();
     // 「当前这首加载完成」= 预热的最佳时机：地址/缓存/解码器都已经就位，
     // 下一首的取链现在开始，离真正换曲还有整首歌的时间可以失败重试。
-    inner.preload_retries = 0;
+    inner.preload.retries = 0;
     maybe_preload(inner);
 }
 
@@ -3524,6 +5233,19 @@ fn measured_bitrate_kbps(size_bytes: Option<u64>, duration_ms: u64) -> Option<u3
     }
 }
 
+/// The production local decoder branch, without constructing HTTP or device state.
+pub fn decode_local_file(path: &Path) -> Result<Decoder<BufReader<std::fs::File>>, String> {
+    let file = std::fs::File::open(path).map_err(|e| format!("打开本地文件失败: {e}"))?;
+    // File length remains available to the actual decoder and FLAC seeking.
+    Decoder::try_from(file).map_err(|e| format!("解码失败: {e}"))
+}
+
+fn build_local_decoder(path: &Path, track: &Track) -> Result<BuiltDecoder, String> {
+    let decoder = decode_local_file(path)?;
+    let duration = resolve_duration_ms(&decoder, track);
+    track_interval(maybe_downmix(Box::new(decoder)), None, duration, track)
+}
+
 /// 本地直接 File::open。返回 (boxed source, range_shared, duration_ms)。
 /// 只允许在 blocking 线程池里调用 —— HTTP open 最多阻塞一个请求超时，
 /// Decoder::build 探针首包最多再阻塞 FIRST_PACKET_TIMEOUT(8s)。
@@ -3534,13 +5256,7 @@ fn build_decoder(
     track: &Track,
 ) -> Result<BuiltDecoder, String> {
     match source {
-        PlaySource::Local { path } => {
-            let file = std::fs::File::open(path).map_err(|e| format!("打开本地文件失败: {e}"))?;
-            // TryFrom<File> 会用文件长度自动填 byte_len，FLAC 的二分定位才可用
-            let decoder = Decoder::try_from(file).map_err(|e| format!("解码失败: {e}"))?;
-            let duration = resolve_duration_ms(&decoder, track);
-            track_interval(maybe_downmix(Box::new(decoder)), None, duration, track)
-        }
+        PlaySource::Local { path } => build_local_decoder(Path::new(path), track),
         PlaySource::Online { url, referer, .. } => {
             let (reader, shared) =
                 range_reader::open(url, referer, http, cache_dir).map_err(|e| e.to_string())?;
@@ -3947,6 +5663,3036 @@ mod device_action_tests {
         assert!(active.contains("耳机") && active.contains("播放已暂停"));
         let idle = device_gone_reason("耳机", "不可用", false);
         assert!(idle.contains("耳机") && !idle.contains("播放已暂停"));
+    }
+}
+
+#[cfg(test)]
+mod command_channel_tests {
+    use super::{AudioDelivery, AudioEngine};
+    use crate::provider::types::{SourceId, Track};
+    use std::time::Duration;
+
+    fn track(platform: &str, id: &str) -> Track {
+        Track {
+            id: id.into(), platform: SourceId::new(platform), title: id.into(),
+            singer: String::new(), album: String::new(), pic_url: String::new(),
+            duration: 0.0, music_id: None, start_ms: None, end_ms: None,
+        }
+    }
+
+    #[test]
+    fn gapless_output_promotes_the_preloaded_track_to_the_current_source_mount() {
+        exercise_gapless_current_source(true);
+    }
+
+    #[test]
+    fn gapless_output_promotes_the_preloaded_track_to_the_current_source_mount_then_loads_its_successor() {
+        exercise_gapless_current_source(false);
+    }
+
+    fn exercise_gapless_current_source(no_next: bool) {
+        use super::{
+            AudioCmd, PreloadCurrent, PreloadFlags, PreloadPrepare, PreloadQuality,
+            PreloadRender, PreloadState, SourceRecoveryContext, StallWatch,
+        };
+        use crate::audio::{AudioFx, PlaybackStatus, Quality};
+        use rodio::{ChannelCount, SampleRate, Source};
+        use std::collections::{HashMap, HashSet};
+        use std::io::Write;
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let wav = include_bytes!("../../tests/fixtures/self-authored-silence.wav");
+        let root = crate::public_test_fixture::root();
+        let path_a = root.join(format!("gapless-current-mount-original-a-{no_next}.wav"));
+        let path_c = root.join(format!("gapless-current-mount-preloaded-c-{no_next}.wav"));
+        for path in [&path_a, &path_c] {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true).create_new(true).open(path).expect("create an owned WAV fixture");
+            file.write_all(wav).expect("write the existing self-authored WAV bytes");
+            file.flush().expect("flush the owned WAV fixture");
+        }
+
+        let (engine, inbox) = AudioEngine::command_channel();
+        let (player, output) = engine.player_channel();
+        let mut output = rodio::source::UniformSourceIterator::new(output,
+            ChannelCount::new(1).unwrap(), SampleRate::new(1_000).unwrap());
+        let fx = Arc::new(AudioFx::new());
+        let epoch = Instant::now();
+        let mut load_gen = 0;
+        let original_a = engine.begin_play_intent();
+        let mut reply = engine.send_queue(
+            vec![track("source-a", "A"), track("source-c", "C")], 0, Some(original_a),
+        );
+        let AudioDelivery::Playback(plan) = inbox
+            .recv_timeout(Duration::from_secs(5), &mut load_gen).expect("receive the original A queue")
+            else { panic!("the real original A queue must commit"); };
+        let receipt = reply.try_recv().expect("the original A queue receipt");
+        assert!(receipt.applied);
+        let a = receipt.target.expect("the actual accepted A target");
+        assert_eq!(a.generation, original_a);
+        assert_eq!(plan.target.as_ref(), Some(&a));
+        let port_a = plan.port.clone().expect("A's actual original reserved mount");
+        assert_eq!(port_a.stamp().target, a);
+        let request_a = engine.prepare_source_load(
+            plan.track.clone().expect("actual A loader track"), Some(a.clone()), Some(port_a.clone()),
+            load_gen, true, 0,
+        ).expect("prepare A with its actual original source reservation");
+        assert!(Arc::ptr_eq(request_a.port.as_ref().unwrap(), &port_a));
+        let decoder_a = request_a.decode_local_or_report(&engine, &path_a)
+            .expect("the actual local A decoder must open the owned WAV");
+        assert_eq!(decoder_a.channels().get(), 1);
+        assert_eq!(decoder_a.sample_rate().get(), 8_000);
+        assert_eq!(decoder_a.total_duration(), Some(Duration::from_millis(384)));
+        player.append(engine.bind_source(port_a.clone(), Box::new(decoder_a), 0,
+            fx.clone(), epoch, None));
+        assert!(engine.complete_source_mount(&port_a));
+        let mut playing = engine.snapshot();
+        playing.status = PlaybackStatus::Playing;
+        playing.duration_ms = 384;
+        playing.is_local = true;
+        assert!(engine.publish_source_state(&port_a, playing));
+        for _ in 0..128 { assert!(output.next().is_some()); }
+        assert!(port_a.is_live() && port_a.position_ms() > 0 && !player.empty());
+        let current_mount = engine.current_source_mount().expect("real physical current A");
+        assert!(Arc::ptr_eq(&current_mount, &port_a));
+        assert!(Arc::ptr_eq(&engine.source_mount(&a).unwrap(), &port_a));
+        assert_eq!(engine.snapshot().track_id.as_deref(), Some("A"));
+        assert_eq!(engine.queue_snapshot().index, Some(0));
+        let original_stamp = port_a.stamp().clone();
+        let original_load_gen = load_gen;
+        assert_eq!(original_load_gen, 1);
+        let mut current_progress = Some(current_mount.progress());
+        assert!(Arc::ptr_eq(current_progress.as_ref().unwrap(), &port_a.progress()));
+        // A was decoded by the real Local branch, which has no RangeShared.
+        let mut current_shared = None;
+        let mut recovery = SourceRecoveryContext {
+            auto_next: true, fail_streak: 0, failed_tracks: HashSet::new(),
+        };
+        let mut stall_retry = 0;
+        let mut watch = StallWatch::default();
+        let flags = PreloadFlags {
+            gapless: true, sleep_after_track: engine.snapshot().sleep_after_track,
+            auto_next: recovery.auto_next,
+        };
+        let default_quality = engine.snapshot().quality;
+        let track_quality = Some((a.id.clone(), Quality::new("a-only")));
+        let source_qualities = HashMap::from([("source-c".to_owned(), Quality::new("flac"))]);
+        let mut preload = PreloadState::default();
+        let request_c = engine.prepare_preload(
+            &mut preload, PreloadPrepare {
+                flags, pausing: current_mount.is_paused(),
+                current_progress: current_progress.as_ref(), current_mount: Some(&current_mount),
+                target: Some(&a), load_gen,
+                quality: PreloadQuality {
+                    default_quality: &default_quality, track_quality: &track_quality,
+                    source_qualities: &source_qualities,
+                },
+            }, |_| false,
+        ).expect("the real playing A must prepare its existing queue successor C");
+        assert_eq!(request_c.request.track.id, "C");
+        assert_eq!(request_c.request.track.platform.as_str(), "source-c");
+        assert_eq!(request_c.request.target.as_ref(), Some(&a));
+        assert!(request_c.request.port.is_none(), "speculation must not reserve a normal C mount");
+        assert!(request_c.request.autoplay && request_c.request.start_ms == 0);
+        assert_eq!(request_c.quality, Quality::new("flac"));
+        let selected_quality = request_c.quality.clone();
+        let preload_gen = request_c.request.gen;
+        assert!(Arc::ptr_eq(preload.original_mount().unwrap(), &port_a));
+        assert_eq!(preload.original_stamp(), Some(&original_stamp));
+        assert_eq!(preload.original_load_gen(), Some(original_load_gen));
+        assert!(Arc::ptr_eq(&engine.current_source_mount().unwrap(), &port_a));
+        assert_eq!(load_gen, original_load_gen);
+        request_c.dispatch_local(&engine, path_c).expect("dispatch the real owned C local preload");
+        let AudioDelivery::Command(cmd) = inbox
+            .recv_timeout(Duration::from_secs(5), &mut load_gen).expect("receive the real C preload packet")
+            else { panic!("the actual preload must reach the ordinary command delivery"); };
+        match &cmd {
+            AudioCmd::LoadReady { target, port, track, shared, duration_ms, start_at, autoplay,
+                is_local, url_fetched_at, play_url, size_bytes, gen, preload: true, .. } => {
+                assert_eq!(target.as_ref(), Some(&a));
+                assert!(port.is_none() && shared.is_none());
+                assert_eq!((track.platform.as_str(), track.id.as_str()), ("source-c", "C"));
+                assert_eq!(*duration_ms, 384);
+                assert!(start_at.is_none() && *autoplay && *is_local);
+                assert!(url_fetched_at.is_none() && play_url.is_none());
+                assert_eq!(*size_bytes, Some(wav.len() as u64));
+                assert_eq!(*gen, preload_gen);
+            }
+            _ => panic!("dispatch_local must produce the actual preload:true LoadReady receipt"),
+        }
+        assert!(matches!(engine.append_preloaded(
+            cmd, &mut preload, flags, PreloadRender { player: &player, fx: &fx, epoch }, || None,
+        ), Ok(true)), "the actual accepted preload receipt must append to the same real Player");
+        let c_progress = Arc::clone(preload.prepared_progress().expect("the actual prepared C slot"));
+        assert_eq!(c_progress.position_ms(), 0);
+        assert!(preload.take_started().is_none(), "no transition before normal C output");
+        // started() alone can precede decoder.next(); it is not first-Some proof.
+        // Positive content position requires actual decoder Some through ordinary output.
+        for _ in 0..2_048 {
+            assert!(output.next().is_some(), "pull the ordinary software output");
+            if c_progress.position_ms() > 0 { break; }
+        }
+        assert!(c_progress.position_ms() > 0, "owned C decoder never reached ordinary output");
+        assert!(port_a.position_ms() >= 384, "the original owned A really reached EOF");
+        assert!(!player.empty(), "C is still physically playing");
+        let started = preload.take_started().expect("take the actual C slot after real C content");
+        assert_eq!((started.track().platform.as_str(), started.track().id.as_str()), ("source-c", "C"));
+        assert!(Arc::ptr_eq(started.progress(), &c_progress));
+        assert!(Arc::ptr_eq(started.original_mount().unwrap(), &port_a));
+        assert_eq!(started.original_stamp(), Some(&original_stamp));
+        assert_eq!(started.original_load_gen(), original_load_gen);
+        let admitted = engine.admit_started_preload(
+            started, &preload, Some(&current_mount), current_progress.as_ref(), &mut load_gen,
+        ).expect("admit the actual C slot against A and the real inbox actor clock");
+        let metadata = engine.sync_preload_current(admitted, &load_gen, PreloadCurrent {
+            current_progress: &mut current_progress, current_shared: &mut current_shared,
+            failed_tracks: &mut recovery.failed_tracks, fail_streak: &mut recovery.fail_streak,
+            stall_retry: &mut stall_retry, watch: &mut watch,
+        }).expect("consume the original physical C admission at current/Queue sync");
+        assert!(Arc::ptr_eq(current_progress.as_ref().unwrap(), &c_progress));
+        let content_position_ms = current_progress.as_ref().unwrap().position_ms();
+        let _published = engine.sync_preload_metadata(
+            metadata, &load_gen, content_position_ms, selected_quality,
+        ).expect("publish the original C metadata under its actual advanced actor clock");
+        let snapshot = engine.snapshot();
+        let queue = engine.queue_snapshot();
+        assert_eq!(snapshot.track_id.as_deref(), Some("C"));
+        assert_eq!(snapshot.track.as_ref().unwrap().id, "C");
+        assert_eq!(snapshot.status, PlaybackStatus::Playing);
+        assert_eq!(snapshot.position_ms, content_position_ms);
+        assert!(snapshot.position_ms > 0 && snapshot.is_local);
+        assert_eq!((snapshot.queue_index, queue.index), (Some(1), Some(1)));
+        assert_eq!(queue.current().unwrap().id, "C");
+        let physical = engine.current_source_mount().expect("current physical source after C output");
+
+        // First regression assertion: logical C must own the physical current-source boundary.
+        assert_eq!(
+            physical.stamp().target.id.as_str(), snapshot.track_id.as_deref().unwrap(),
+            "gapless C produced samples but current mount is still A: original={original_stamp:?}, original_load_gen={original_load_gen}, load_gen={load_gen}",
+        );
+        assert!(Arc::ptr_eq(&physical.progress(), &c_progress));
+        assert_eq!(load_gen, original_load_gen.wrapping_add(1));
+        let c = physical.stamp().target.clone();
+        assert!(Arc::ptr_eq(&engine.source_mount(&c).unwrap(), &physical));
+        assert!(engine.begin_source_seek(&a, 120).is_err(), "old A cannot seek the actual C remainder");
+        let a_position = port_a.position_ms();
+        let mut pending_seek = engine.begin_source_seek(&c, 120)
+            .expect("actual gapless C must retain its original source-bound seek entry");
+        let mut seek_receipt = None;
+        for _ in 0..64 {
+            assert!(output.next().is_some());
+            if let Ok(result) = pending_seek.try_recv() {
+                seek_receipt = Some(result.expect("the real C remainder must accept its original seek"));
+                break;
+            }
+        }
+        let seek_receipt = seek_receipt.expect("ordinary output must finish the actual C bound seek");
+        assert_eq!(&seek_receipt.stamp, physical.stamp());
+        assert_eq!(seek_receipt.content_position_ms, 120);
+        assert_eq!(engine.snapshot().position_ms, 120);
+        assert!(c_progress.position_ms() >= 120);
+        assert_eq!(port_a.position_ms(), a_position, "C seek cannot reset A's exhausted decoder");
+        assert!(Arc::ptr_eq(&engine.current_source_mount().unwrap(), &physical));
+        assert!(Arc::ptr_eq(&physical.progress(), &c_progress));
+
+        let paused_c_position = c_progress.position_ms();
+        assert_eq!(engine.set_source_paused(&c, true).expect("pause the original gapless C"), *physical.stamp());
+        assert_eq!(engine.snapshot().status, PlaybackStatus::Paused);
+        for _ in 0..16 { assert!(output.next().is_some()); }
+        assert_eq!(c_progress.position_ms(), paused_c_position, "paused C must not pull its original decoder");
+        assert!(engine.set_source_paused(&a, false).is_err(), "exhausted A cannot resume C");
+        assert_eq!(engine.snapshot().status, PlaybackStatus::Paused);
+        assert_eq!(engine.set_source_paused(&c, false).expect("resume the original gapless C"), *physical.stamp());
+        assert_eq!(engine.snapshot().status, PlaybackStatus::Playing);
+        assert!(Arc::ptr_eq(&engine.current_source_mount().unwrap(), &physical));
+        assert_eq!(port_a.position_ms(), a_position);
+
+        let speed_c_position = c_progress.position_ms();
+        assert_eq!(engine.set_source_speed(&c, 2.0).expect("speed the original gapless C"), *physical.stamp());
+        assert!(engine.set_source_speed(&a, 0.5).is_err(), "exhausted A cannot change C's rate");
+        assert_eq!(engine.snapshot().speed, 2.0);
+        for _ in 0..16 { assert!(output.next().is_some()); }
+        let content_advance = c_progress.position_ms() - speed_c_position;
+        assert!((24..=48).contains(&content_advance),
+            "2x C must consume about 32 content ms through sixteen real 1000Hz mono output pulls, got {content_advance}");
+        assert!(Arc::ptr_eq(&engine.current_source_mount().unwrap(), &physical));
+        assert!(Arc::ptr_eq(&physical.progress(), &c_progress));
+        assert_eq!(port_a.position_ms(), a_position);
+
+        let mut sleep_after_c = engine.snapshot();
+        sleep_after_c.sleep_after_track = true;
+        assert!(engine.publish_source_state(&physical, sleep_after_c));
+        assert!(!engine.snapshot().sleep_after_track, "source metadata must preserve the actual user sleep scalar");
+        if no_next { assert_eq!(engine.remove_queue_indices(&[0, 1]), 2); }
+        assert_eq!(engine.snapshot().track_id.as_deref(), Some("C"));
+        assert_eq!(engine.snapshot().status, PlaybackStatus::Playing);
+        for _ in 0..2_048 {
+            if player.empty() { break; }
+            assert!(output.next().is_some());
+        }
+        assert!(player.empty(), "the same Player must naturally drain C's actual remainder");
+        assert!(physical.has_drained_eof(), "only the actual outer None can qualify C EOF");
+        assert!(c_progress.position_ms() >= 384);
+        let c_eof_load_gen = load_gen;
+        engine.source_finished(physical.clone());
+        let AudioDelivery::AutomaticPlayback { advance, request } =
+            inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap()
+            else { panic!("the same original C must commit its actual drained EOF"); };
+        if no_next {
+            assert!(!advance.sleep_fired && advance.track.is_none() && request.is_none(),
+                "the actual empty queue stops at C EOF; metadata cannot arm sleep-after-track");
+            assert_eq!(advance.target, c);
+            assert_eq!(load_gen, c_eof_load_gen, "stopping at C EOF must not invent a successor load");
+            let stopped = serde_json::to_value(&advance.snapshot).unwrap();
+            assert_eq!(stopped["trackId"], "C");
+            assert_eq!(stopped["status"], "stopped");
+            assert_eq!(stopped["positionMs"], 384);
+            assert_eq!(stopped["durationMs"], 384);
+            assert_eq!(stopped["sleepAfterTrack"], false);
+            assert_eq!(engine.snapshot().status, PlaybackStatus::Stopped);
+            assert!(engine.queue_snapshot().is_empty());
+        } else {
+            assert!(!advance.sleep_fired);
+            assert_eq!(advance.track.as_ref().unwrap().id, "A");
+            assert_eq!(load_gen, c_eof_load_gen.wrapping_add(1));
+            assert_eq!(advance.target.generation, c.generation + 1);
+            assert_eq!((advance.target.platform.as_str(), advance.target.id.as_str()), ("source-a", "A"));
+            assert_eq!(engine.queue_snapshot().current().unwrap().id, "A");
+            let request = request.expect("C's actual successor must retain its original loader");
+            assert_eq!(request.target.as_ref(), Some(&advance.target));
+            let fresh_a = request.port.clone().expect("the actual successor reservation");
+            assert_eq!(fresh_a.stamp().target, advance.target);
+            assert_ne!(fresh_a.stamp().mount_nonce, port_a.stamp().mount_nonce);
+            assert!(!Arc::ptr_eq(&fresh_a, &port_a));
+            let decoder = request.decode_local_or_report(&engine, &path_a)
+                .expect("decode the actual successor from the same owned A file");
+            player.append(engine.bind_source(fresh_a.clone(), Box::new(decoder), 0,
+                fx.clone(), epoch, None));
+            assert!(engine.complete_source_mount(&fresh_a));
+            let mut playing = engine.snapshot();
+            playing.status = PlaybackStatus::Playing;
+            playing.duration_ms = 384;
+            playing.is_local = true;
+            assert!(engine.publish_source_state(&fresh_a, playing));
+            for _ in 0..2_048 {
+                assert!(output.next().is_some());
+                if fresh_a.position_ms() > 0 { break; }
+            }
+            assert!(fresh_a.position_ms() > 0);
+            assert!(Arc::ptr_eq(&engine.current_source_mount().unwrap(), &fresh_a));
+            assert!(engine.set_source_paused(&a, true).is_err(), "earlier same-identity A cannot pause the fresh A mount");
+            assert!(engine.set_source_speed(&c, 0.5).is_err(), "finished C cannot change its actual successor");
+            assert_eq!(fresh_a.stamp().target, advance.target);
+        }
+        assert_eq!(port_a.position_ms(), a_position);
+    }
+
+    #[test]
+    fn failed_original_reserved_loader_advances_while_the_predecessor_is_still_current() {
+        use super::{SourceFailureEffect, SourceRecoveryContext};
+        use crate::audio::{AudioFx, PlaybackStatus};
+        use std::io::{Cursor, Write};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let (engine, inbox) = AudioEngine::command_channel();
+        let (player, mut output) = engine.player_channel();
+        let mut load_gen = 0;
+        let z_ticket = engine.begin_play_intent();
+        let mut z_reply = engine.send_queue(vec![track("source-z", "Z")], 0, Some(z_ticket));
+        let AudioDelivery::Playback(z_plan) = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen)
+            .unwrap() else { panic!("the real predecessor queue must commit"); };
+        let z = z_reply.try_recv().unwrap().target.unwrap();
+        let port_z = z_plan.port.clone().unwrap();
+        let wav = include_bytes!("../../tests/fixtures/self-authored-silence.wav");
+        let decoder = rodio::Decoder::new(Cursor::new(wav.to_vec())).unwrap();
+        player.append(engine.bind_source(port_z.clone(), Box::new(decoder), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&port_z));
+        let mut metadata = engine.snapshot();
+        metadata.status = PlaybackStatus::Playing;
+        metadata.duration_ms = 384;
+        assert!(engine.publish_source_state(&port_z, metadata));
+        for _ in 0..128 { assert!(output.next().is_some()); }
+        assert!(port_z.position_ms() > 0, "Z really plays before A starts loading");
+        assert!(!player.empty(), "the predecessor has not naturally drained");
+
+        let a_ticket = engine.begin_play_intent();
+        let mut a_reply = engine.send_queue(vec![track("source-a", "A"), track("source-c", "C")],
+            0, Some(a_ticket));
+        let AudioDelivery::Playback(a_plan) = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen)
+            .unwrap() else { panic!("A must commit its original loading request"); };
+        let a = a_reply.try_recv().unwrap().target.unwrap();
+        let port_a = a_plan.port.clone().unwrap();
+        assert_eq!(load_gen, 2);
+        assert!(Arc::ptr_eq(&engine.current_source_mount().unwrap(), &port_z));
+        assert!(!Arc::ptr_eq(&port_a, &port_z));
+        let request_a = engine.prepare_source_load(a_plan.track.clone().unwrap(), Some(a.clone()),
+            Some(port_a.clone()), load_gen, true, 0).expect("the original reserved A loader");
+        let bad_path = crate::public_test_fixture::root().join("failed-original-reserved-loader-invalid-audio.bin");
+        let mut bad = std::fs::OpenOptions::new().write(true).create_new(true).open(&bad_path).unwrap();
+        bad.write_all(b"owned fixture: this is deliberately not an audio container").unwrap();
+        bad.flush().unwrap();
+        drop(bad);
+        let detail = request_a.decode_local_or_report(&engine, &bad_path).err()
+            .expect("the actual local decoder must reject the owned invalid bytes");
+        assert!(detail.contains("解码失败"), "File::open succeeded; the decoder really failed: {detail}");
+        let AudioDelivery::SourceFailure(input) = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen)
+            .unwrap() else { panic!("the real failure packet must reach the production inbox"); };
+        assert!(Arc::ptr_eq(&input.original, &port_a));
+        assert_eq!(input.original.stamp().target, a);
+        assert_eq!((input.kind, input.track_id.as_str(), input.gen, input.autoplay, input.stalled),
+            ("load", "A", 2, true, false));
+        assert!(input.message.contains(&detail));
+        assert!(Arc::ptr_eq(&engine.current_source_mount().unwrap(), &port_z));
+        let mut recovery = SourceRecoveryContext {
+            auto_next: true, fail_streak: 0, failed_tracks: std::collections::HashSet::new(),
+        };
+        let applied = engine.apply_source_failure(*input, &mut recovery, &mut load_gen)
+            .expect("the original reserved A failure is valid even when physical current is Z");
+        assert_eq!(engine.queue_snapshot().current().unwrap().id, "C");
+        assert_eq!(engine.snapshot().track_id.as_deref(), Some("C"));
+        assert_eq!(engine.snapshot().status, PlaybackStatus::Loading);
+        assert_eq!(load_gen, 3, "only one real loading generation is added for C");
+        assert_eq!(recovery.fail_streak, 1);
+        assert!(recovery.failed_tracks.contains("A"));
+        assert!(recovery.auto_next);
+        let SourceFailureEffect::Advance { track: selected, target, request } = applied.effect
+            else { panic!("ordinary original failure must recover to the real next candidate"); };
+        assert_eq!(selected.id, "C");
+        let request = request.expect("actual failure-selected C has no valid original C loader/port");
+        let c = request.target.clone().unwrap();
+        let port_c = request.port.clone().unwrap();
+        assert_eq!((c.platform.as_str(), c.id.as_str()), ("source-c", "C"));
+        assert_eq!(target, c);
+        assert!(c.generation > a.generation && a.generation > z.generation);
+        assert_eq!(port_c.stamp().target, c);
+        assert_ne!(port_c.stamp().mount_nonce, port_a.stamp().mount_nonce);
+        assert_ne!(port_c.stamp().mount_nonce, port_z.stamp().mount_nonce);
+        assert!(!Arc::ptr_eq(&port_c, &port_a) && !Arc::ptr_eq(&port_c, &port_z));
+        assert!(Arc::ptr_eq(&engine.current_source_mount().unwrap(), &port_z));
+        let decoder = rodio::Decoder::new(Cursor::new(wav.to_vec())).unwrap();
+        player.append(engine.bind_source(port_c.clone(), Box::new(decoder), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&port_c), "complete the same actual C reservation");
+        assert!(Arc::ptr_eq(&engine.current_source_mount().unwrap(), &port_c));
+        assert!(engine.set_source_speed(&c, 2.0).is_ok());
+        assert_eq!(port_c.speed(), 2.0);
+        for _ in 0..8_192 {
+            assert!(output.next().is_some());
+            if port_c.position_ms() > 0 { break; }
+        }
+        assert!(port_c.position_ms() > 0, "the actual failure-selected C reaches software output");
+    }
+
+    #[test]
+    fn original_reserved_loader_failure_cannot_mutate_or_consume_a_preceding_pending_b() {
+        use super::SourceRecoveryContext;
+        use std::io::Write;
+        use std::sync::Arc;
+
+        let (engine, inbox) = AudioEngine::command_channel();
+        let mut load_gen = 0;
+        let a_ticket = engine.begin_play_intent();
+        let mut a_reply = engine.send_queue(vec![track("source-a", "A"), track("source-c", "C")],
+            0, Some(a_ticket));
+        let AudioDelivery::Playback(a_plan) = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen)
+            .unwrap() else { panic!("the original A loading request must commit"); };
+        let a = a_reply.try_recv().unwrap().target.unwrap();
+        let port_a = a_plan.port.clone().unwrap();
+        let request_a = engine.prepare_source_load(a_plan.track.clone().unwrap(), Some(a.clone()),
+            Some(port_a.clone()), load_gen, true, 0).unwrap();
+        let b = engine.begin_play_intent();
+        let before = serde_json::to_value(engine.snapshot()).unwrap();
+        let before_queue = engine.queue_snapshot();
+        let before_tracks = serde_json::to_value(&before_queue.tracks).unwrap();
+        let before_gen = load_gen;
+        let mut recovery = SourceRecoveryContext {
+            auto_next: true, fail_streak: 0, failed_tracks: std::collections::HashSet::new(),
+        };
+        let bad_path = crate::public_test_fixture::root().join("pending-b-before-original-loader-failure.bin");
+        let mut bad = std::fs::OpenOptions::new().write(true).create_new(true).open(&bad_path).unwrap();
+        bad.write_all(b"owned invalid audio bytes for the original pending loader").unwrap();
+        bad.flush().unwrap();
+        drop(bad);
+        let detail = request_a.decode_local_or_report(&engine, &bad_path).err().unwrap();
+        assert!(detail.contains("解码失败"));
+        let AudioDelivery::SourceFailure(input) = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen)
+            .unwrap() else { panic!("consume the actual original failure packet while B is still pending"); };
+        assert!(Arc::ptr_eq(&input.original, &port_a));
+        assert_eq!(input.gen, before_gen);
+        assert!(engine.apply_source_failure(*input, &mut recovery, &mut load_gen).is_none());
+        // Assert before B is submitted, so its later commit cannot hide an A mutation.
+        assert_eq!(serde_json::to_value(engine.snapshot()).unwrap(), before);
+        let after_queue = engine.queue_snapshot();
+        assert_eq!(after_queue.index, before_queue.index);
+        assert_eq!(serde_json::to_value(&after_queue.tracks).unwrap(), before_tracks);
+        assert_eq!(load_gen, before_gen);
+        assert!(recovery.auto_next);
+        assert_eq!(recovery.fail_streak, 0);
+        assert!(recovery.failed_tracks.is_empty());
+        assert!(engine.current_source_mount().is_none());
+        let mut b_reply = engine.send_queue(vec![track("source-b", "B")], 0, Some(b));
+        let AudioDelivery::Playback(b_plan) = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen)
+            .unwrap() else { panic!("the same original pending B ticket must remain usable"); };
+        let ack = b_reply.try_recv().unwrap();
+        assert!(ack.applied);
+        let target_b = ack.target.unwrap();
+        assert_eq!(target_b.generation, b);
+        assert_eq!((target_b.platform.as_str(), target_b.id.as_str()), ("source-b", "B"));
+        assert_eq!(b_plan.target.as_ref(), Some(&target_b));
+        assert_eq!(b_plan.port.as_ref().unwrap().stamp().target, target_b);
+        assert_eq!(engine.snapshot().track_id.as_deref(), Some("B"));
+        assert_eq!(load_gen, before_gen + 1, "only original B adds one loading generation");
+    }
+
+    #[test]
+    fn queued_original_loader_failure_cannot_mutate_or_consume_a_later_pending_b() {
+        use super::SourceRecoveryContext;
+        use std::io::Write;
+        use std::sync::Arc;
+
+        let (engine, inbox) = AudioEngine::command_channel();
+        let mut load_gen = 0;
+        let a_ticket = engine.begin_play_intent();
+        let mut a_reply = engine.send_queue(vec![track("source-a", "A"), track("source-c", "C")],
+            0, Some(a_ticket));
+        let AudioDelivery::Playback(a_plan) = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen)
+            .unwrap() else { panic!("the original A loader must be prepared first"); };
+        let a = a_reply.try_recv().unwrap().target.unwrap();
+        let port_a = a_plan.port.clone().unwrap();
+        let request_a = engine.prepare_source_load(a_plan.track.clone().unwrap(), Some(a),
+            Some(port_a.clone()), load_gen, true, 0).unwrap();
+        let bad_path = crate::public_test_fixture::root().join("original-loader-failure-queued-before-pending-b.bin");
+        let mut bad = std::fs::OpenOptions::new().write(true).create_new(true).open(&bad_path).unwrap();
+        bad.write_all(b"owned invalid audio: A fails before the original B ticket begins").unwrap();
+        bad.flush().unwrap();
+        drop(bad);
+        let detail = request_a.decode_local_or_report(&engine, &bad_path).err().unwrap();
+        assert!(detail.contains("解码失败"));
+        // A's real failure is already queued. B then begins, but is not submitted yet.
+        let b = engine.begin_play_intent();
+        let before = serde_json::to_value(engine.snapshot()).unwrap();
+        let before_queue = engine.queue_snapshot();
+        let before_tracks = serde_json::to_value(&before_queue.tracks).unwrap();
+        let before_gen = load_gen;
+        let mut recovery = SourceRecoveryContext {
+            auto_next: true, fail_streak: 0, failed_tracks: std::collections::HashSet::new(),
+        };
+        let AudioDelivery::SourceFailure(input) = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen)
+            .unwrap() else { panic!("receive the same A failure after original B begins"); };
+        assert!(Arc::ptr_eq(&input.original, &port_a));
+        assert_eq!(input.gen, before_gen);
+        assert!(engine.apply_source_failure(*input, &mut recovery, &mut load_gen).is_none());
+        assert_eq!(serde_json::to_value(engine.snapshot()).unwrap(), before);
+        let after_queue = engine.queue_snapshot();
+        assert_eq!(after_queue.index, before_queue.index);
+        assert_eq!(serde_json::to_value(&after_queue.tracks).unwrap(), before_tracks);
+        assert_eq!(load_gen, before_gen);
+        assert!(recovery.auto_next && recovery.failed_tracks.is_empty());
+        assert_eq!(recovery.fail_streak, 0);
+        let mut b_reply = engine.send_queue(vec![track("source-b", "B")], 0, Some(b));
+        let AudioDelivery::Playback(b_plan) = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen)
+            .unwrap() else { panic!("A's queued failure must not consume the original pending B ticket"); };
+        let ack = b_reply.try_recv().unwrap();
+        assert!(ack.applied);
+        let target_b = ack.target.unwrap();
+        assert_eq!(target_b.generation, b);
+        assert_eq!((target_b.platform.as_str(), target_b.id.as_str()), ("source-b", "B"));
+        assert_eq!(b_plan.target.as_ref(), Some(&target_b));
+        assert_eq!(b_plan.port.as_ref().unwrap().stamp().target, target_b);
+        assert_eq!(engine.snapshot().track_id.as_deref(), Some("B"));
+        assert_eq!(load_gen, before_gen + 1, "only B starts a new loading generation");
+    }
+
+    #[test]
+    fn late_original_loader_failure_cannot_replace_a_same_target_remount() {
+        use super::SourceRecoveryContext;
+        use crate::audio::{AudioFx, PlaybackStatus};
+        use std::io::{Cursor, Write};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let (engine, inbox) = AudioEngine::command_channel();
+        let (player, mut output) = engine.player_channel();
+        let mut load_gen = 0;
+        let ticket = engine.begin_play_intent();
+        let mut reply = engine.send_queue(vec![track("source-a", "A"), track("source-c", "C")],
+            0, Some(ticket));
+        let AudioDelivery::Playback(plan) = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen)
+            .unwrap() else { panic!("prepare original A through the real channel"); };
+        let a = reply.try_recv().unwrap().target.unwrap();
+        let old_port = plan.port.clone().unwrap();
+        let request = engine.prepare_source_load(plan.track.clone().unwrap(), Some(a.clone()),
+            Some(old_port.clone()), load_gen, true, 0).unwrap();
+        let path = crate::public_test_fixture::root().join("old-loader-failure-before-same-target-remount.bin");
+        let mut bad = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).unwrap();
+        bad.write_all(b"owned invalid audio for the old physical incarnation of A").unwrap();
+        bad.flush().unwrap();
+        drop(bad);
+        assert!(request.decode_local_or_report(&engine, &path).err().unwrap().contains("解码失败"));
+        let replacement = engine.reserve_source_mount(a.clone()).unwrap();
+        assert_eq!(replacement.stamp().target, old_port.stamp().target);
+        assert_ne!(replacement.stamp().mount_nonce, old_port.stamp().mount_nonce);
+        assert!(!Arc::ptr_eq(&replacement, &old_port));
+        let wav = include_bytes!("../../tests/fixtures/self-authored-silence.wav");
+        let decoder = rodio::Decoder::new(Cursor::new(wav.to_vec())).unwrap();
+        player.append(engine.bind_source(replacement.clone(), Box::new(decoder), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&replacement));
+        let mut playing = engine.snapshot();
+        playing.status = PlaybackStatus::Playing;
+        playing.duration_ms = 384;
+        assert!(engine.publish_source_state(&replacement, playing));
+        for _ in 0..128 { assert!(output.next().is_some()); }
+        assert!(replacement.position_ms() > 0 && !player.empty());
+        engine.set_source_speed(&a, 0.5).unwrap();
+        assert_eq!(engine.set_source_paused(&a, true).unwrap(), *replacement.stamp());
+        let before = serde_json::to_value(engine.snapshot()).unwrap();
+        let queue_before = engine.queue_snapshot();
+        let tracks_before = serde_json::to_value(&queue_before.tracks).unwrap();
+        let before_gen = load_gen;
+        let position_before = replacement.position_ms();
+        let mut recovery = SourceRecoveryContext {
+            auto_next: true, fail_streak: 0, failed_tracks: std::collections::HashSet::new(),
+        };
+        let AudioDelivery::SourceFailure(input) = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen)
+            .unwrap() else { panic!("receive the old A failure, not a replacement packet"); };
+        assert!(Arc::ptr_eq(&input.original, &old_port));
+        assert_eq!(input.gen, before_gen, "a loading-generation mismatch must not conceal physical ABA");
+        assert!(engine.apply_source_failure(*input, &mut recovery, &mut load_gen).is_none());
+        assert_eq!(serde_json::to_value(engine.snapshot()).unwrap(), before);
+        let after = engine.queue_snapshot();
+        assert_eq!(after.index, queue_before.index);
+        assert_eq!(serde_json::to_value(&after.tracks).unwrap(), tracks_before);
+        assert_eq!(load_gen, before_gen);
+        assert!(recovery.auto_next && recovery.failed_tracks.is_empty());
+        assert_eq!(recovery.fail_streak, 0);
+        assert!(Arc::ptr_eq(&engine.current_source_mount().unwrap(), &replacement));
+        for _ in 0..128 { assert!(output.next().is_some()); }
+        assert_eq!(replacement.position_ms(), position_before, "the replacement remains paused");
+        assert_eq!(engine.set_source_paused(&a, false).unwrap(), *replacement.stamp());
+        for _ in 0..512 { assert!(output.next().is_some()); }
+        assert!(replacement.position_ms() > position_before, "the same replacement resumes real output");
+        assert!(!player.empty());
+    }
+
+    #[test]
+    fn deleting_playing_a_advances_to_its_existing_queue_successor_after_real_eof() {
+        use super::AudioCmd;
+        use crate::audio::{AudioFx, PlaybackStatus};
+        use std::io::Cursor;
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let (engine, inbox) = AudioEngine::command_channel();
+        let (player, mut output) = engine.player_channel();
+        let mut load_gen = 0;
+        let ticket = engine.begin_play_intent();
+        let mut reply = engine.send_queue(vec![track("source-a", "A"), track("source-b", "B"),
+            track("source-c", "C")], 0, Some(ticket));
+        let AudioDelivery::Playback(plan) = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen)
+            .unwrap() else { panic!("the original A queue must commit"); };
+        let a = reply.try_recv().unwrap().target.unwrap();
+        let port_a = plan.port.clone().unwrap();
+        let wav = include_bytes!("../../tests/fixtures/self-authored-silence.wav");
+        let decoder = rodio::Decoder::new(Cursor::new(wav.to_vec())).unwrap();
+        player.append(engine.bind_source(port_a.clone(), Box::new(decoder), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&port_a));
+        let mut playing = engine.snapshot();
+        playing.status = PlaybackStatus::Playing;
+        playing.duration_ms = 384;
+        assert!(engine.publish_source_state(&port_a, playing));
+        for _ in 0..128 { assert!(output.next().is_some()); }
+        assert!(port_a.position_ms() > 0 && !player.empty());
+        engine.send(AudioCmd::RemoveAt(0));
+        let AudioDelivery::Command(AudioCmd::RemoveAt(index)) =
+            inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap()
+            else { panic!("receive the actual deletion command"); };
+        assert_eq!(engine.remove_queue_indices(&[index]), 1);
+        assert_eq!(engine.queue_snapshot().current().unwrap().id, "B");
+        assert_eq!(engine.queue_snapshot().len(), 2);
+        assert_eq!(engine.snapshot().track_id.as_deref(), Some("A"));
+        assert_eq!(engine.snapshot().status, PlaybackStatus::Playing);
+        assert_eq!(engine.snapshot().queue_len, 2);
+        assert_eq!(load_gen, 1, "deleting the queue entry does not select or reload B");
+        assert!(Arc::ptr_eq(&engine.current_source_mount().unwrap(), &port_a));
+        for _ in 0..8_192 {
+            if player.empty() { break; }
+            assert!(output.next().is_some());
+        }
+        assert!(player.empty());
+        assert!(port_a.position_ms() >= 384, "the deleted physical A really reaches EOF");
+        engine.source_finished(port_a.clone());
+        let AudioDelivery::AutomaticPlayback { advance, request } =
+            inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap()
+            else { panic!("advance the original deleted A through the shared EOF commit"); };
+        assert_eq!(advance.track.as_ref().unwrap().id, "B", "do not skip the existing successor to C");
+        assert_eq!(advance.target.generation, a.generation + 1);
+        assert_eq!((advance.target.platform.as_str(), advance.target.id.as_str()), ("source-b", "B"));
+        assert_eq!(load_gen, 2);
+        assert_eq!(engine.snapshot().track_id.as_deref(), Some("B"));
+        assert_eq!(engine.snapshot().status, PlaybackStatus::Loading);
+        assert_eq!(engine.queue_snapshot().current().unwrap().id, "B");
+        let request = request.expect("the existing successor B needs its actual original loader");
+        assert_eq!(request.target.as_ref(), Some(&advance.target));
+        let port_b = request.port.clone().unwrap();
+        assert_ne!(port_b.stamp().mount_nonce, port_a.stamp().mount_nonce);
+        assert_eq!(port_b.stamp().target, advance.target);
+        let decoder = rodio::Decoder::new(Cursor::new(wav.to_vec())).unwrap();
+        player.append(engine.bind_source(port_b.clone(), Box::new(decoder), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&port_b));
+        engine.set_source_speed(&advance.target, 2.0).unwrap();
+        // Player/render buffering is not an immediate 128-pull activation contract.
+        // Use the same bounded normal-output budget as the existing genuine EOF loader test.
+        for _ in 0..2_048 {
+            assert!(output.next().is_some());
+            if port_b.position_ms() > 0 { break; }
+        }
+        assert!(port_b.position_ms() > 0, "the same selected successor B reaches actual output");
+    }
+
+    #[test]
+    fn batch_deleting_a_middle_playing_track_retains_its_original_successor_after_real_eof() {
+        use super::AudioCmd;
+        use crate::audio::{AudioFx, PlaybackStatus};
+        use std::io::Cursor;
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let (engine, inbox) = AudioEngine::command_channel();
+        let (player, mut output) = engine.player_channel();
+        let mut load_gen = 0;
+        let ticket = engine.begin_play_intent();
+        let mut reply = engine.send_queue(vec![track("source-x", "X"), track("source-y", "Y"),
+            track("source-a", "A"), track("source-b", "B"), track("source-c", "C")],
+            2, Some(ticket));
+        let AudioDelivery::Playback(plan) = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen)
+            .unwrap() else { panic!("the original middle A queue must commit"); };
+        let a = reply.try_recv().unwrap().target.unwrap();
+        let port_a = plan.port.clone().unwrap();
+        let wav = include_bytes!("../../tests/fixtures/self-authored-silence.wav");
+        let decoder = rodio::Decoder::new(Cursor::new(wav.to_vec())).unwrap();
+        player.append(engine.bind_source(port_a.clone(), Box::new(decoder), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&port_a));
+        let mut playing = engine.snapshot();
+        playing.status = PlaybackStatus::Playing;
+        playing.duration_ms = 384;
+        assert!(engine.publish_source_state(&port_a, playing));
+        for _ in 0..128 { assert!(output.next().is_some()); }
+        assert!(port_a.position_ms() > 0 && !player.empty());
+        // Delete the tail, the physical-current middle A, and a predecessor;
+        // duplicates and an out-of-range index must retain the original B choice.
+        engine.send(AudioCmd::RemoveIndices(vec![4, 0, 2, 2, 99]));
+        let AudioDelivery::Command(AudioCmd::RemoveIndices(indices)) =
+            inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap()
+            else { panic!("receive the actual batch deletion command"); };
+        assert_eq!(engine.remove_queue_indices(&indices), 3);
+        let remaining = engine.queue_snapshot();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining.current().unwrap().id, "B");
+        assert_eq!(engine.snapshot().track_id.as_deref(), Some("A"));
+        assert_eq!(engine.snapshot().status, PlaybackStatus::Playing);
+        assert_eq!(engine.snapshot().queue_len, 2);
+        assert_eq!(load_gen, 1, "batch deletion does not select or reload B");
+        assert!(Arc::ptr_eq(&engine.current_source_mount().unwrap(), &port_a));
+        for _ in 0..8_192 {
+            if player.empty() { break; }
+            assert!(output.next().is_some());
+        }
+        assert!(player.empty());
+        assert!(port_a.position_ms() >= 384, "the deleted middle A actually finishes");
+        engine.source_finished(port_a.clone());
+        let AudioDelivery::AutomaticPlayback { advance, request } =
+            inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap()
+            else { panic!("advance the original batch-deleted A through the shared EOF commit"); };
+        assert_eq!(advance.track.as_ref().unwrap().id, "B", "retain B, not the preceding Y");
+        assert_eq!(advance.target.generation, a.generation + 1);
+        assert_eq!((advance.target.platform.as_str(), advance.target.id.as_str()), ("source-b", "B"));
+        assert_eq!(load_gen, 2);
+        assert_eq!(engine.snapshot().track_id.as_deref(), Some("B"));
+        assert_eq!(engine.snapshot().status, PlaybackStatus::Loading);
+        let request = request.expect("the original batch successor B needs its actual loader");
+        assert_eq!(request.target.as_ref(), Some(&advance.target));
+        let port_b = request.port.clone().unwrap();
+        assert_ne!(port_b.stamp().mount_nonce, port_a.stamp().mount_nonce);
+        assert_eq!(port_b.stamp().target, advance.target);
+        let decoder = rodio::Decoder::new(Cursor::new(wav.to_vec())).unwrap();
+        player.append(engine.bind_source(port_b.clone(), Box::new(decoder), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&port_b));
+        engine.set_source_speed(&advance.target, 2.0).unwrap();
+        for _ in 0..2_048 {
+            assert!(output.next().is_some());
+            if port_b.position_ms() > 0 { break; }
+        }
+        assert!(port_b.position_ms() > 0, "the original batch successor B reaches actual output");
+    }
+
+    #[test]
+    fn naturally_drained_original_source_advances_to_a_new_owned_loader_and_controls() {
+        use crate::audio::{AudioFx, PlaybackStatus};
+        use std::io::Cursor;
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let (engine, inbox) = AudioEngine::command_channel();
+        let (player, mut output) = engine.player_channel();
+        let original_a = engine.begin_play_intent();
+        let mut reply = engine.send_queue(vec![track("source-a", "A"), track("source-c", "C")],
+            0, Some(original_a));
+        let mut load_gen = 0;
+        let AudioDelivery::Playback(plan) = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen)
+            .unwrap() else { panic!("the real A queue must commit"); };
+        let a = reply.try_recv().unwrap().target.unwrap();
+        let port_a = plan.port.clone().expect("A's actual reserved physical incarnation");
+        let wav = include_bytes!("../../tests/fixtures/self-authored-silence.wav");
+        let decoder = rodio::Decoder::new(Cursor::new(wav.to_vec())).unwrap();
+        player.append(engine.bind_source(port_a.clone(), Box::new(decoder), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&port_a));
+        let mut metadata = engine.snapshot();
+        metadata.status = PlaybackStatus::Playing;
+        metadata.duration_ms = 384; // 3072 owned mono samples / 8000 Hz.
+        assert!(engine.publish_source_state(&port_a, metadata));
+        for _ in 0..8_192 {
+            if player.empty() { break; }
+            assert!(output.next().is_some(), "software output must be consumed normally");
+        }
+        assert!(player.empty(), "finite owned WAV must naturally drain, without clear or retire");
+        assert!(port_a.position_ms() >= 384, "the original decoder's samples really played");
+        assert_eq!(load_gen, 1);
+
+        engine.source_finished(port_a.clone());
+        let AudioDelivery::AutomaticPlayback { advance, request } = inbox
+            .recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap()
+            else { panic!("natural EOF must select C through the production inbox"); };
+        assert_eq!(engine.queue_snapshot().current().unwrap().id, "C");
+        assert_eq!(engine.snapshot().track_id.as_deref(), Some("C"));
+        assert_eq!(load_gen, 2, "one real loading generation for C");
+        let request = request.expect("actual auto-selected C has no valid original C loader/port");
+        let c = request.target.clone().expect("C loader owns its logical target");
+        let port_c = request.port.clone().expect("C loader owns its physical reservation");
+        assert_eq!((c.platform.as_str(), c.id.as_str()), ("source-c", "C"));
+        assert!(c.generation > a.generation);
+        assert_eq!(advance.target, c);
+        assert_eq!(port_c.stamp().target, c);
+        assert_ne!(port_c.stamp().mount_nonce, port_a.stamp().mount_nonce);
+        assert!(!Arc::ptr_eq(&port_a, &port_c));
+        let decoder = rodio::Decoder::new(Cursor::new(wav.to_vec())).unwrap();
+        player.append(engine.bind_source(port_c.clone(), Box::new(decoder), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&port_c), "complete the same actual C request");
+        assert!(Arc::ptr_eq(&engine.current_source_mount().unwrap(), &port_c));
+        assert!(engine.set_source_speed(&c, 2.0).is_ok(), "Some(C) controls its own new port");
+        assert_eq!(port_c.speed(), 2.0);
+        for _ in 0..2_048 {
+            output.next();
+            if port_c.position_ms() > 0 { break; }
+        }
+        assert!(port_c.position_ms() > 0, "the same C port reaches the real software output");
+    }
+
+    fn assert_drained_a_does_not_consume_pending_b(event_before_b: bool) {
+        use crate::audio::{AudioFx, PlaybackStatus};
+        use std::io::Cursor;
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let (engine, inbox) = AudioEngine::command_channel();
+        let (player, mut output) = engine.player_channel();
+        let a = engine.begin_play_intent();
+        let mut a_reply = engine.send_queue(vec![track("source-a", "A"), track("source-c", "C")], 0, Some(a));
+        let mut load_gen = 0;
+        let AudioDelivery::Playback(a_plan) = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen)
+            .unwrap() else { panic!("actual original A queue"); };
+        assert_eq!(a_reply.try_recv().unwrap().target.unwrap().generation, a);
+        let port = a_plan.port.clone().unwrap();
+        let decoder = rodio::Decoder::new(Cursor::new(
+            include_bytes!("../../tests/fixtures/self-authored-silence.wav").to_vec())).unwrap();
+        player.append(engine.bind_source(port.clone(), Box::new(decoder), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&port));
+        let mut metadata = engine.snapshot();
+        metadata.status = PlaybackStatus::Playing;
+        metadata.duration_ms = 384;
+        assert!(engine.publish_source_state(&port, metadata));
+        for _ in 0..8_192 {
+            if player.empty() { break; }
+            assert!(output.next().is_some());
+        }
+        assert!(player.empty());
+        assert!(port.position_ms() >= 384, "A genuinely drained before either pending ordering");
+
+        if event_before_b { engine.source_finished(port.clone()); }
+        let b = engine.begin_play_intent();
+        if !event_before_b { engine.source_finished(port.clone()); }
+        let before = serde_json::to_value(engine.snapshot()).unwrap();
+        let before_queue = engine.queue_snapshot();
+        let before_tracks = serde_json::to_value(&before_queue.tracks).unwrap();
+        let before_gen = load_gen;
+        assert!(matches!(inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap(),
+            AudioDelivery::Rejected));
+        // Observe before submitting B: a later B commit cannot conceal an A mutation.
+        assert_eq!(serde_json::to_value(engine.snapshot()).unwrap(), before);
+        let after_queue = engine.queue_snapshot();
+        assert_eq!(after_queue.index, before_queue.index);
+        assert_eq!(serde_json::to_value(&after_queue.tracks).unwrap(), before_tracks);
+        assert_eq!(load_gen, before_gen);
+        assert!(Arc::ptr_eq(&engine.current_source_mount().unwrap(), &port));
+
+        let mut b_reply = engine.send_queue(vec![track("source-b", "B")], 0, Some(b));
+        let AudioDelivery::Playback(b_plan) = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen)
+            .unwrap() else { panic!("the same original pending B ticket must still commit"); };
+        let b_ack = b_reply.try_recv().unwrap();
+        assert!(b_ack.applied);
+        let b_target = b_ack.target.unwrap();
+        assert_eq!(b_target.generation, b, "A EOF must not consume or replace original B");
+        assert_eq!((b_target.platform.as_str(), b_target.id.as_str()), ("source-b", "B"));
+        assert_eq!(b_plan.target.as_ref(), Some(&b_target));
+        assert_eq!(b_plan.port.as_ref().unwrap().stamp().target, b_target);
+        assert_eq!(engine.snapshot().track_id.as_deref(), Some("B"));
+        assert_eq!(load_gen, before_gen + 1, "only B commits a new loading generation");
+    }
+
+    #[test]
+    fn naturally_drained_a_cannot_advance_if_original_b_begins_before_its_event() {
+        assert_drained_a_does_not_consume_pending_b(false);
+    }
+
+    #[test]
+    fn naturally_drained_a_cannot_advance_if_original_b_begins_after_its_event_is_queued() {
+        assert_drained_a_does_not_consume_pending_b(true);
+    }
+
+    #[tokio::test]
+    async fn native_queue_filter_wait_cannot_register_a_late_intent_over_b() {
+        let (engine, inbox) = AudioEngine::command_channel();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (filtered_tx, filtered_rx) = tokio::sync::oneshot::channel();
+        let engine_a = engine.clone();
+        let a_work = tokio::spawn(async move {
+            engine_a.queue_after_filter(
+                vec![track("source-a", "7")], 0, None,
+                move |tracks, index| async move {
+                    entered_tx.send(()).expect("A entered the fake DB adapter");
+                    release_rx.await.expect("the DB hold was released");
+                    filtered_tx.send(()).expect("A's filtered result was observed");
+                    Ok((tracks, index))
+                },
+            ).await
+        });
+        entered_rx.await.expect("A is waiting in the production filtering boundary");
+
+        let original_b = engine.begin_play_intent();
+        let mut b_reply = engine.send_queue(vec![track("source-b", "7")], 0, Some(original_b));
+        let mut load_gen = 0;
+        let b_delivery = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let b_receipt = b_reply.try_recv().expect("B got its own production receipt");
+        assert!(b_receipt.applied && matches!(b_delivery, AudioDelivery::Playback(_)));
+        let b_target = b_receipt.target.expect("B's accepted logical target");
+        assert_eq!((b_target.generation, b_target.platform.as_str(), b_target.id.as_str()),
+            (original_b, "source-b", "7"));
+        let before = serde_json::to_value(engine.snapshot()).unwrap();
+        assert_eq!(load_gen, 1);
+
+        release_tx.send(()).expect("release A's fake DB filter");
+        filtered_rx.await.expect("A's public queue operation reached the real sender");
+        let a_delivery = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let a_receipt = a_work.await.expect("A's native queue task completed")
+            .expect("a stale queue is a rejected receipt, not a DB error");
+        let queue = engine.queue_snapshot();
+        let current = queue.current().expect("the accepted B queue is retained");
+        assert!(
+            !a_receipt.applied && matches!(a_delivery, AudioDelivery::Rejected)
+                && (current.platform.as_str(), current.id.as_str()) == ("source-b", "7")
+                && serde_json::to_value(engine.snapshot()).unwrap() == before
+                && load_gen == 1,
+            "filtered native A registered too late and replaced accepted B: receipt={a_receipt:?}, track={:?}, load_gen={load_gen}",
+            engine.snapshot().track_id,
+        );
+        assert!(!engine.abandon_play_intent(original_b), "A must not revoke committed B");
+    }
+
+    #[tokio::test]
+    async fn failed_queue_filter_releases_only_its_original_pending_intent() {
+        let (engine, inbox) = AudioEngine::command_channel();
+        let before = serde_json::to_value(engine.snapshot()).unwrap();
+        let original_a = engine.begin_play_intent();
+        let error = engine.queue_after_filter(
+            vec![track("source-a", "7")], 0, Some(original_a),
+            |_, _| async { Err("synthetic-db-filter-failure".to_string()) },
+        ).await;
+        assert_eq!(error.unwrap_err(), "synthetic-db-filter-failure");
+
+        // A failed action is finished: resending its original ticket cannot revive it.
+        let mut late_a_reply = engine.send_queue(vec![track("source-a", "7")], 0, Some(original_a));
+        let mut load_gen = 0;
+        let late_a_delivery = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let late_a_receipt = late_a_reply.try_recv().expect("the old A message was answered");
+        assert!(
+            !late_a_receipt.applied && matches!(late_a_delivery, AudioDelivery::Rejected)
+                && engine.queue_snapshot().is_empty()
+                && serde_json::to_value(engine.snapshot()).unwrap() == before
+                && load_gen == 0,
+            "failed native DB filtering left A pending and revivable: receipt={late_a_receipt:?}, load_gen={load_gen}",
+        );
+        assert!(!engine.abandon_play_intent(original_a), "A's finally already released its ticket");
+
+        // A's late failure must not release a newer B that has not committed yet.
+        let original_a2 = engine.begin_play_intent();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let engine_a2 = engine.clone();
+        let a2_work = tokio::spawn(async move {
+            engine_a2.queue_after_filter(
+                vec![track("source-a2", "7")], 0, Some(original_a2),
+                move |_, _| async move {
+                    entered_tx.send(()).expect("A2 entered its DB hold");
+                    release_rx.await.expect("A2's hold was released");
+                    Err("synthetic-late-db-failure".to_string())
+                },
+            ).await
+        });
+        entered_rx.await.expect("A2 is waiting");
+        let original_b = engine.begin_play_intent();
+        release_tx.send(()).expect("release A2 after B declares ownership");
+        assert_eq!(a2_work.await.unwrap().unwrap_err(), "synthetic-late-db-failure");
+        let mut b_reply = engine.send_queue(vec![track("source-b", "7")], 0, Some(original_b));
+        let b_delivery = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let b_receipt = b_reply.try_recv().expect("B still owns its pending ticket");
+        assert!(b_receipt.applied && matches!(b_delivery, AudioDelivery::Playback(_)));
+        let b_target = b_receipt.target.expect("B's real accepted target");
+        assert_eq!((b_target.generation, b_target.platform.as_str(), b_target.id.as_str()),
+            (original_b, "source-b", "7"));
+        assert_eq!(load_gen, 1);
+        assert!(!engine.abandon_play_intent(original_b), "finally does not revoke committed B");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_index_play_cannot_commit_under_a_newer_pending_intent() {
+        use std::future::Future;
+        let (engine, inbox) = AudioEngine::command_channel();
+        let seed_receipt = engine.send_queue(
+            vec![track("source-seed", "0"), track("source-a", "7")], 0, None,
+        );
+        let mut load_gen = 0;
+        let seed = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        assert!(matches!(seed, AudioDelivery::Playback(_)));
+        assert!(seed_receipt.await.unwrap().applied);
+        assert_eq!(load_gen, 1);
+        let before = serde_json::to_value(engine.snapshot()).unwrap();
+
+        let original_a = engine.begin_play_intent();
+        let a_work = engine.play_at_with_receipt(1, Some(original_a));
+        tokio::pin!(a_work);
+        let a_waiting = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(a_work.as_mut().poll(cx).is_pending())
+        }).await;
+        assert!(a_waiting, "the real A index command is queued before B begins");
+        let original_b = engine.begin_play_intent();
+        let a_delivery = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let a_receipt = a_work.await.unwrap();
+        assert!(
+            !a_receipt.applied && matches!(a_delivery, AudioDelivery::Rejected)
+                && serde_json::to_value(engine.snapshot()).unwrap() == before
+                && engine.queue_snapshot().index == Some(0) && load_gen == 1,
+            "old queued play_at changed the real native session: receipt={a_receipt:?}, index={:?}, load_gen={load_gen}",
+            engine.queue_snapshot().index,
+        );
+
+        let b_work = engine.play_at_with_receipt(1, Some(original_b));
+        tokio::pin!(b_work);
+        assert!(std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(b_work.as_mut().poll(cx).is_pending())
+        }).await);
+        let b_delivery = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let b_receipt = b_work.await.unwrap();
+        assert!(b_receipt.applied && matches!(b_delivery, AudioDelivery::ManualPlayback(_)));
+        let target = b_receipt.target.unwrap();
+        assert_eq!((target.generation, target.platform.as_str(), target.id.as_str()),
+            (original_b, "source-a", "7"));
+        assert_eq!(engine.queue_snapshot().index, Some(1));
+        assert_eq!(load_gen, 2);
+        assert!(!engine.abandon_play_intent(original_b));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_next_cannot_rebind_to_b_or_bypass_the_original_skip_rules() {
+        use std::future::Future;
+        let (engine, inbox) = AudioEngine::command_channel();
+        let seed_receipt = engine.send_queue(vec![
+            track("source-seed", "0"), track("source-a", "7"), track("source-b", "7"),
+        ], 0, None);
+        let mut load_gen = 0;
+        assert!(matches!(inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap(),
+            AudioDelivery::Playback(_)));
+        assert!(seed_receipt.await.unwrap().applied);
+        let before = serde_json::to_value(engine.snapshot()).unwrap();
+
+        let original_a = engine.begin_play_intent();
+        let a_work = engine.next_with_receipt(Some(original_a));
+        tokio::pin!(a_work);
+        assert!(std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(a_work.as_mut().poll(cx).is_pending())
+        }).await, "the actual Next message is queued before B begins");
+        let original_b = engine.begin_play_intent();
+        let a_delivery = inbox.recv_timeout_skipping(Duration::from_secs(5), &mut load_gen,
+            |track| track.platform == SourceId::new("source-a")).unwrap();
+        let a_receipt = a_work.await.unwrap();
+        assert!(
+            !a_receipt.applied && matches!(a_delivery, AudioDelivery::Rejected)
+                && serde_json::to_value(engine.snapshot()).unwrap() == before
+                && engine.queue_snapshot().index == Some(0) && load_gen == 1,
+            "old queued next changed the real native session: receipt={a_receipt:?}, index={:?}, load_gen={load_gen}",
+            engine.queue_snapshot().index,
+        );
+
+        let b_work = engine.next_with_receipt(Some(original_b));
+        tokio::pin!(b_work);
+        assert!(std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(b_work.as_mut().poll(cx).is_pending())
+        }).await);
+        let b_delivery = inbox.recv_timeout_skipping(Duration::from_secs(5), &mut load_gen,
+            |track| track.platform == SourceId::new("source-a")).unwrap();
+        let b_receipt = b_work.await.unwrap();
+        assert!(b_receipt.applied && matches!(b_delivery, AudioDelivery::NavigationPlayback(_)));
+        let b_target = b_receipt.target.unwrap();
+        assert_eq!((b_target.generation, b_target.platform.as_str(), b_target.id.as_str()),
+            (original_b, "source-b", "7"));
+        assert_eq!(engine.queue_snapshot().index, Some(2), "Next skips A, not the other source's id 7");
+        assert_eq!(load_gen, 2);
+        assert!(!engine.abandon_play_intent(original_b));
+
+        let native_work = engine.next_with_receipt(None);
+        tokio::pin!(native_work);
+        assert!(std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(native_work.as_mut().poll(cx).is_pending())
+        }).await);
+        assert!(matches!(inbox.recv_timeout_skipping(Duration::from_secs(5), &mut load_gen,
+            |track| track.platform == SourceId::new("source-a")).unwrap(),
+            AudioDelivery::NavigationPlayback(_)));
+        let native_receipt = native_work.await.unwrap();
+        assert!(native_receipt.applied, "native/lyrics None begins its own legitimate ticket");
+        let native_target = native_receipt.target.unwrap();
+        assert!(native_target.generation > original_b);
+        assert_eq!((native_target.platform.as_str(), native_target.id.as_str()), ("source-seed", "0"));
+        assert_eq!(load_gen, 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn queued_previous_keeps_its_original_ticket_and_does_not_apply_next_skip_rules() {
+        use std::future::Future;
+
+        let (engine, inbox) = AudioEngine::command_channel();
+        let seed = engine.begin_play_intent();
+        let seed_receipt = engine.send_queue(
+            vec![track("source-seed", "0"), track("source-a", "7"), track("source-b", "7")],
+            0, Some(seed),
+        );
+        let mut load_gen = 0;
+        assert!(matches!(inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap(),
+            AudioDelivery::Playback(_)));
+        assert!(seed_receipt.await.unwrap().applied);
+        let before = serde_json::to_value(engine.snapshot()).unwrap();
+        assert_eq!(load_gen, 1);
+
+        let original_a = engine.begin_play_intent();
+        let a_work = engine.previous_with_receipt(Some(original_a));
+        tokio::pin!(a_work);
+        assert!(std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(a_work.as_mut().poll(cx).is_pending())
+        }).await);
+        let original_b = engine.begin_play_intent();
+        let a_delivery = inbox.recv_timeout_skipping(Duration::from_secs(5), &mut load_gen,
+            |_| true).unwrap();
+        let a_receipt = a_work.await.unwrap();
+        assert!(
+            !a_receipt.applied && a_receipt.target.is_none()
+                && matches!(a_delivery, AudioDelivery::Rejected)
+                && engine.queue_snapshot().index == Some(0)
+                && serde_json::to_value(engine.snapshot()).unwrap() == before
+                && load_gen == 1,
+            "old queued previous changed the real native session: receipt={a_receipt:?}, index={:?}, load_gen={load_gen}",
+            engine.queue_snapshot().index,
+        );
+
+        let b_work = engine.previous_with_receipt(Some(original_b));
+        tokio::pin!(b_work);
+        assert!(std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(b_work.as_mut().poll(cx).is_pending())
+        }).await);
+        assert!(matches!(inbox.recv_timeout_skipping(Duration::from_secs(5), &mut load_gen,
+            |_| true).unwrap(), AudioDelivery::PreviousPlayback(_)));
+        let b_receipt = b_work.await.unwrap();
+        assert!(b_receipt.applied, "Previous must retain B and must not skip every disliked track");
+        let b_target = b_receipt.target.unwrap();
+        assert_eq!((b_target.generation, b_target.platform.as_str(), b_target.id.as_str()),
+            (original_b, "source-b", "7"));
+        assert_eq!(engine.queue_snapshot().index, Some(2));
+        assert_eq!(load_gen, 2);
+        assert!(!engine.abandon_play_intent(original_b));
+
+        let native_work = engine.previous_with_receipt(None);
+        tokio::pin!(native_work);
+        assert!(std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(native_work.as_mut().poll(cx).is_pending())
+        }).await);
+        assert!(matches!(inbox.recv_timeout_skipping(Duration::from_secs(5), &mut load_gen,
+            |_| true).unwrap(), AudioDelivery::PreviousPlayback(_)));
+        let native_receipt = native_work.await.unwrap();
+        assert!(native_receipt.applied, "native/lyrics Previous begins its own legitimate ticket");
+        let native_target = native_receipt.target.unwrap();
+        assert!(native_target.generation > original_b);
+        assert_eq!((native_target.platform.as_str(), native_target.id.as_str()), ("source-a", "7"));
+        assert_eq!(engine.queue_snapshot().index, Some(1));
+        assert_eq!(load_gen, 3);
+    }
+
+    #[test]
+    fn queued_single_track_preserves_its_original_ticket_and_source_identity() {
+        let (engine, inbox) = AudioEngine::command_channel();
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(
+            vec![track("seed-source", "seed"), track("source-a", "7")], 0, None,
+        );
+        assert!(matches!(inbox.recv_timeout(Duration::from_secs(5), &mut load_gen)
+            .unwrap(), AudioDelivery::Playback(_)));
+        assert!(seed.try_recv().unwrap().applied);
+        let original_a = engine.begin_play_intent();
+        let mut old = engine.send_play_track(track("source-a", "7"), Some(original_a));
+        let original_b = engine.begin_play_intent();
+        let before = serde_json::to_value(engine.snapshot()).unwrap();
+        assert!(matches!(inbox.recv_timeout(Duration::from_secs(5), &mut load_gen)
+            .unwrap(), AudioDelivery::Rejected));
+        assert!(!old.try_recv().unwrap().applied);
+        assert_eq!(serde_json::to_value(engine.snapshot()).unwrap(), before);
+        assert_eq!(load_gen, 1);
+
+        let mut current = engine.send_play_track(track("source-b", "7"), Some(original_b));
+        let delivery = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let receipt = current.try_recv().unwrap();
+        assert!(receipt.applied && matches!(delivery, AudioDelivery::ManualPlayback(_)),
+            "current original B single-track play was not committed: {receipt:?}");
+        let target = receipt.target.unwrap();
+        assert_eq!((target.generation, target.platform.as_str(), target.id.as_str()),
+            (original_b, "source-b", "7"));
+        let queue = engine.queue_snapshot();
+        assert_eq!(queue.len(), 3, "different sources with the same id must not alias");
+        assert_eq!(queue.index, Some(2));
+        assert_eq!(engine.snapshot().source_id.as_ref().map(|id| id.as_str()), Some("source-b"));
+        assert_eq!(load_gen, 2);
+        assert!(!engine.abandon_play_intent(original_b));
+
+        let mut native = engine.send_play_track(track("source-a", "7"), None);
+        assert!(matches!(inbox.recv_timeout(Duration::from_secs(5), &mut load_gen)
+            .unwrap(), AudioDelivery::ManualPlayback(_)));
+        let native_target = native.try_recv().unwrap().target.unwrap();
+        assert!(native_target.generation > original_b);
+        assert_eq!(native_target.platform, "source-a");
+        assert_eq!(engine.queue_snapshot().index, Some(1));
+        assert_eq!(engine.queue_snapshot().len(), 3, "existing same-identity track is reused");
+        assert_eq!(load_gen, 3);
+    }
+
+    #[test]
+    fn native_resume_releases_source_pause_and_old_metadata_cannot_pause_it_again() {
+        use crate::audio::AudioFx;
+        use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+        use std::time::Instant;
+        use rodio::{ChannelCount, SampleRate, Source};
+        struct Probe(Arc<AtomicU64>);
+        impl Iterator for Probe { type Item = f32;
+            fn next(&mut self) -> Option<f32> { self.0.fetch_add(1, Ordering::SeqCst); Some(0.25) }
+        }
+        impl Source for Probe {
+            fn current_span_len(&self) -> Option<usize> { None }
+            fn channels(&self) -> ChannelCount { ChannelCount::new(1).unwrap() }
+            fn sample_rate(&self) -> SampleRate { SampleRate::new(1_000).unwrap() }
+            fn total_duration(&self) -> Option<Duration> { None }
+        }
+        let (engine, inbox) = AudioEngine::command_channel();
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let a = seed.try_recv().unwrap().target.unwrap();
+        let port = engine.source_mount(&a).unwrap();
+        let reads = Arc::new(AtomicU64::new(0));
+        let (player, mut output) = engine.player_channel();
+        player.append(engine.bind_source(port.clone(), Box::new(Probe(reads.clone())), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&port));
+        for _ in 0..16 { output.next(); }
+        engine.set_source_paused(&a, true).unwrap();
+        let old_metadata = engine.snapshot();
+        let frozen = reads.load(Ordering::SeqCst);
+        for _ in 0..16 { assert_eq!(output.next(), Some(0.0)); }
+        engine.send(crate::audio::AudioCmd::Play);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        for _ in 0..16 { output.next(); }
+        assert!(reads.load(Ordering::SeqCst) > frozen,
+            "ordinary native resume left the original source permanently paused");
+        assert_eq!(engine.snapshot().status, super::PlaybackStatus::Playing);
+        assert!(engine.publish_source_state(&port, old_metadata));
+        assert_eq!(engine.snapshot().status, super::PlaybackStatus::Playing,
+            "old same-source paused metadata overrode the later native resume");
+        let playing_metadata = engine.snapshot();
+        engine.set_source_paused(&a, true).unwrap();
+        assert!(engine.publish_source_state(&port, playing_metadata));
+        assert_eq!(engine.snapshot().status, super::PlaybackStatus::Paused);
+        let frozen_again = reads.load(Ordering::SeqCst);
+        for _ in 0..16 { assert_eq!(output.next(), Some(0.0)); }
+        assert_eq!(reads.load(Ordering::SeqCst), frozen_again);
+    }
+
+    #[test]
+    fn original_pause_cue_and_status_survive_late_original_load_metadata() {
+        use crate::audio::AudioFx;
+        use std::sync::Arc;
+        use std::time::Instant;
+        use rodio::{ChannelCount, SampleRate, Source};
+        struct Probe;
+        impl Iterator for Probe { type Item = f32; fn next(&mut self) -> Option<f32> { Some(0.25) } }
+        impl Source for Probe {
+            fn current_span_len(&self) -> Option<usize> { None }
+            fn channels(&self) -> ChannelCount { ChannelCount::new(1).unwrap() }
+            fn sample_rate(&self) -> SampleRate { SampleRate::new(1_000).unwrap() }
+            fn total_duration(&self) -> Option<Duration> { None }
+        }
+        let (engine, inbox) = AudioEngine::command_channel();
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let a = seed.try_recv().unwrap().target.unwrap();
+        let mut metadata = engine.snapshot();
+        metadata.status = super::PlaybackStatus::Playing;
+        let port = engine.source_mount(&a).unwrap();
+        let (player, mut output) = engine.player_channel();
+        player.append(engine.bind_source(port.clone(), Box::new(Probe), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&port));
+        for _ in 0..64 { output.next(); }
+        engine.set_source_paused(&a, true).unwrap();
+        assert!(engine.snapshot().position_ms >= 64,
+            "original pause exposed the old cue instead of its frozen content position");
+        assert!(engine.publish_source_state(&port, metadata));
+        assert_eq!(engine.snapshot().status, super::PlaybackStatus::Paused,
+            "late original LoadReady replaced the original pause state");
+        for _ in 0..16 { assert_eq!(output.next(), Some(0.0)); }
+        assert!(engine.snapshot().position_ms >= 64);
+    }
+
+    #[test]
+    fn podcast_unity_speed_after_stereo_track_keeps_real_time() {
+        use crate::audio::AudioFx;
+        use rodio::{ChannelCount, SampleRate};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let (engine, inbox) = AudioEngine::command_channel();
+        let (player, output) = engine.player_channel();
+        let mut load_gen = 0;
+        // 和真实设备一样，输出转换器先建立，再异步挂载节目。
+        let mut output = super::DeviceSource::new(output,
+            ChannelCount::new(2).unwrap(), SampleRate::new(48_000).unwrap());
+        for _ in 0..4_800 { output.next(); }
+
+        let mut first = engine.send_queue(vec![track("local", "stereo")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let first = first.try_recv().unwrap().target.unwrap();
+        let first_port = engine.source_mount(&first).unwrap();
+        let stereo = rodio::buffer::SamplesBuffer::new(ChannelCount::new(2).unwrap(),
+            SampleRate::new(44_100).unwrap(), vec![0.2; 44_100 * 2 * 20]);
+        player.append(engine.bind_source(first_port.clone(), Box::new(stereo), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&first_port));
+        for _ in 0..96_000 { output.next(); }
+
+        let mut next = engine.send_queue(vec![track("podcast", "mono-32k")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let next = next.try_recv().unwrap().target.unwrap();
+        let port = engine.source_mount(&next).unwrap();
+        // send_queue retires the previous source; let the render iterator
+        // consume that boundary without blocking on Player::clear().
+        let mono = rodio::buffer::SamplesBuffer::new(ChannelCount::new(1).unwrap(),
+            SampleRate::new(32_000).unwrap(), vec![0.3; 32_000 * 20]);
+        player.append(engine.bind_source(port.clone(), Box::new(mono), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&port));
+        assert_eq!(engine.snapshot().speed, 1.0);
+        assert_eq!(player.speed(), 1.0);
+        assert_eq!(port.speed(), 1.0);
+        // 切换过渡结束后，输出 1 秒立体声，内容时间也必须只前进 1 秒。
+        for _ in 0..9_600 { output.next(); }
+        let before = port.position_ms();
+        for _ in 0..96_000 { assert!(output.next().is_some()); }
+        let advanced = port.position_ms() - before;
+        assert!((980..=1020).contains(&advanced),
+            "1.0x mono podcast advanced {advanced}ms during 1000ms device output");
+    }
+
+    #[test]
+    fn original_fractional_source_speed_preserves_content_across_render_spans() {
+        use crate::audio::AudioFx;
+        use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+        use std::time::Instant;
+        use rodio::{ChannelCount, SampleRate, Source};
+        struct Probe(Arc<AtomicU64>);
+        impl Iterator for Probe {
+            type Item = f32;
+            fn next(&mut self) -> Option<f32> { self.0.fetch_add(1, Ordering::SeqCst); Some(0.25) }
+        }
+        impl Source for Probe {
+            fn current_span_len(&self) -> Option<usize> { None }
+            fn channels(&self) -> ChannelCount { ChannelCount::new(1).unwrap() }
+            fn sample_rate(&self) -> SampleRate { SampleRate::new(1_000).unwrap() }
+            fn total_duration(&self) -> Option<Duration> { None }
+        }
+        let (engine, inbox) = AudioEngine::command_channel();
+        let (player, output) = engine.player_channel();
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let a = seed.try_recv().unwrap().target.unwrap();
+        let port = engine.source_mount(&a).unwrap();
+        let reads = Arc::new(AtomicU64::new(0));
+        engine.set_source_speed(&a, 1.25).unwrap();
+        player.append(engine.bind_source(port.clone(), Box::new(Probe(reads.clone())), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&port));
+        let mut output = rodio::source::UniformSourceIterator::new(output,
+            ChannelCount::new(1).unwrap(), SampleRate::new(1_000).unwrap());
+        for _ in 0..128 { output.next(); }
+        let before = reads.load(Ordering::SeqCst);
+        for _ in 0..4_096 { assert_eq!(output.next(), Some(0.25)); }
+        let rendered = reads.load(Ordering::SeqCst) - before;
+        assert!((5_118..=5_122).contains(&rendered),
+            "fractional source rate lost content at artificial span boundaries: {rendered}");
+    }
+
+    #[test]
+    fn native_speed_control_updates_original_render_rate_without_waiting_for_actor() {
+        use crate::audio::{AudioCmd, AudioFx};
+        use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+        use std::time::Instant;
+        use rodio::{ChannelCount, SampleRate, Source};
+        struct Probe(Arc<AtomicU64>);
+        impl Iterator for Probe {
+            type Item = f32;
+            fn next(&mut self) -> Option<f32> { self.0.fetch_add(1, Ordering::SeqCst); Some(0.25) }
+        }
+        impl Source for Probe {
+            fn current_span_len(&self) -> Option<usize> { None }
+            fn channels(&self) -> ChannelCount { ChannelCount::new(1).unwrap() }
+            fn sample_rate(&self) -> SampleRate { SampleRate::new(1_000).unwrap() }
+            fn total_duration(&self) -> Option<Duration> { None }
+        }
+        let (engine, inbox) = AudioEngine::command_channel();
+        let (player, output) = engine.player_channel();
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let a = seed.try_recv().unwrap().target.unwrap();
+        let port = engine.source_mount(&a).unwrap();
+        let reads = Arc::new(AtomicU64::new(0));
+        player.append(engine.bind_source(port.clone(), Box::new(Probe(reads.clone())), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&port));
+        engine.set_source_speed(&a, 2.0).unwrap();
+        let mut output = rodio::source::UniformSourceIterator::new(output,
+            ChannelCount::new(1).unwrap(), SampleRate::new(1_000).unwrap());
+        for _ in 0..128 { output.next(); }
+        let original_cue = port.position_ms();
+        engine.send(AudioCmd::SetSpeed(0.5));
+        assert_eq!(port.position_ms(), original_cue,
+            "native rate change sought or reset original content before rendering");
+        // Exercise the sender, deliberately before the actor receives the packet.
+        for _ in 0..128 { output.next(); }
+        let before = reads.load(Ordering::SeqCst);
+        for _ in 0..4_096 { assert!(output.next().is_some()); }
+        let rendered = reads.load(Ordering::SeqCst) - before;
+        assert!((1_920..=2_176).contains(&rendered),
+            "ordinary native speed left the original 2x source unchanged: {rendered}");
+        assert_eq!(engine.snapshot().speed, 0.5);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+    }
+
+    #[test]
+    fn targeted_speed_command_persists_captured_original_speed_through_public_settings() {
+        use crate::{db::Database, audio::AudioCmd};
+        let db = Database::open_in_memory().unwrap();
+        let (engine, inbox) = AudioEngine::command_channel();
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let target = seed.try_recv().unwrap().target.unwrap();
+        let original = engine.source_mount(&target).unwrap();
+        assert_eq!(crate::commands::read_public_setting(&db, "playback.speed").unwrap(), None);
+        let mut pending = crate::commands::set_speed_for_target(&engine, 1.25, Some(&target)).unwrap().expect("source persistence receipt");
+        assert_eq!(original.speed(), 1.25);
+        assert_eq!(engine.snapshot().speed, 1.25);
+        let delivery = inbox.recv_timeout(Duration::ZERO, &mut load_gen)
+            .expect("bound speed commit disappeared before its captured persistence delivery");
+        assert!(!matches!(&delivery, AudioDelivery::Command(AudioCmd::SetSpeed(_))),
+            "bound persistence escaped through the unbound transport");
+        assert!(delivery.persist_speed(Some(&db)).unwrap());
+        let receipt = pending.try_recv().unwrap().unwrap();
+        assert_eq!(receipt.stamp, *original.stamp());
+        assert_eq!(receipt.speed, 1.25);
+        assert_eq!(crate::commands::read_public_setting(&db, "playback.speed").unwrap().as_deref(), Some("1.25"));
+        assert_eq!(original.speed(), 1.25);
+        assert_eq!(load_gen, 1);
+    }
+
+    #[test]
+    fn queued_source_speed_persistence_rejects_new_intent_and_same_target_mount_aba() {
+        use crate::db::Database;
+        for physical_aba in [false, true] {
+            let db = Database::open_in_memory().unwrap();
+            let (engine, inbox) = AudioEngine::command_channel();
+            let mut load_gen = 0;
+            let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+            inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+            let target = seed.try_recv().unwrap().target.unwrap();
+            let original = engine.source_mount(&target).unwrap();
+            let mut pending = crate::commands::set_speed_for_target(&engine, 1.25, Some(&target))
+                .unwrap().unwrap();
+            // Retain B's pending receipt until the obsolete A delivery has been checked.
+            let mut newer = None;
+            let replacement = if physical_aba {
+                let replacement = engine.reserve_source_mount(target.clone()).unwrap();
+                assert_ne!(replacement.stamp(), original.stamp());
+                assert!(engine.complete_source_mount(&replacement));
+                engine.set_source_paused(&target, true).unwrap();
+                Some(replacement)
+            } else {
+                newer = Some(engine.send_queue(vec![track("source-b", "7")], 0, None));
+                None
+            };
+            let before = engine.snapshot();
+            let delivery = inbox.recv_timeout(Duration::ZERO, &mut load_gen).unwrap();
+            assert!(!delivery.persist_speed(Some(&db)).unwrap());
+            assert!(pending.try_recv().unwrap().is_err());
+            assert_eq!(crate::commands::read_public_setting(&db, "playback.speed").unwrap(), None);
+            assert_eq!(engine.snapshot().speed, before.speed);
+            assert_eq!(engine.snapshot().position_ms, before.position_ms);
+            assert_eq!(engine.snapshot().status, before.status);
+            assert_eq!(load_gen, 1);
+            if let Some(replacement) = replacement {
+                assert!(replacement.is_live());
+                assert!(replacement.is_paused());
+                assert_eq!(replacement.position_ms(), 0);
+                assert_eq!(replacement.speed(), 1.25);
+            }
+            if let Some(mut newer) = newer {
+                inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+                assert_eq!(newer.try_recv().unwrap().target.unwrap().platform, "source-b");
+                assert_eq!(load_gen, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn source_speed_persistence_rejects_older_controls_including_speed_value_aba() {
+        use crate::db::Database;
+        for speeds in [vec![1.25, 0.5], vec![1.25, 0.5, 1.25]] {
+            let db = Database::open_in_memory().unwrap();
+            let (engine, inbox) = AudioEngine::command_channel();
+            let mut load_gen = 0;
+            let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+            inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+            let target = seed.try_recv().unwrap().target.unwrap();
+            let original = engine.source_mount(&target).unwrap();
+            let pending: Vec<_> = speeds.iter().map(|speed| {
+                crate::commands::set_speed_for_target(&engine, *speed, Some(&target)).unwrap().unwrap()
+            }).collect();
+            let last_index = pending.len() - 1;
+            let last_speed = *speeds.last().unwrap();
+            for (index, mut pending) in pending.into_iter().enumerate() {
+                let delivery = inbox.recv_timeout(Duration::ZERO, &mut load_gen).unwrap();
+                assert_eq!(delivery.persist_speed(Some(&db)).unwrap(), index == last_index);
+                let receipt = pending.try_recv().unwrap();
+                if index == last_index {
+                    let receipt = receipt.unwrap();
+                    assert_eq!(receipt.stamp, *original.stamp());
+                    assert_eq!(receipt.speed, last_speed);
+                    assert_eq!(crate::commands::read_public_setting(&db, "playback.speed").unwrap(),
+                        Some(last_speed.to_string()));
+                } else {
+                    assert!(receipt.is_err());
+                    assert_eq!(crate::commands::read_public_setting(&db, "playback.speed").unwrap(), None);
+                }
+                assert_eq!(original.speed(), last_speed);
+                assert_eq!(engine.snapshot().speed, last_speed);
+                assert_eq!(load_gen, 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn source_speed_persistence_propagates_sql_failure_and_missing_database_to_caller() {
+        use crate::db::Database;
+        for missing_database in [false, true] {
+            let db = Database::open_in_memory().unwrap();
+            if !missing_database {
+                db.with(|conn| conn.execute_batch("CREATE TEMP TRIGGER bound_speed_abort BEFORE INSERT ON settings WHEN NEW.key = 'playback.speed' BEGIN SELECT RAISE(ABORT, 'bound_speed_write_denied'); END;")).unwrap();
+            }
+            let (engine, inbox) = AudioEngine::command_channel();
+            let mut load_gen = 0;
+            let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+            inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+            let target = seed.try_recv().unwrap().target.unwrap();
+            let original = engine.source_mount(&target).unwrap();
+            let pending = crate::commands::set_speed_for_target(&engine, 1.25, Some(&target)).unwrap().unwrap();
+            let delivery = inbox.recv_timeout(Duration::ZERO, &mut load_gen).unwrap();
+            let expected_error = if missing_database { "database unavailable" } else { "bound_speed_write_denied" };
+            assert!(delivery.persist_speed((!missing_database).then_some(&db)).unwrap_err().contains(expected_error));
+            assert!(pending.wait().await.err().expect("failed persistence returned caller success").contains(expected_error));
+            assert_eq!(crate::commands::read_public_setting(&db, "playback.speed").unwrap(), None);
+            assert_eq!(original.speed(), 1.25);
+            assert_eq!(engine.snapshot().speed, 1.25);
+            assert_eq!(load_gen, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn completed_source_speed_receipt_rejects_new_intent_and_physical_aba_at_both_caller_entries() {
+        use crate::db::Database;
+        for physical_aba in [false, true] {
+            for wait_for_receipt in [false, true] {
+                let db = Database::open_in_memory().unwrap();
+                let (engine, inbox) = AudioEngine::command_channel();
+                let mut load_gen = 0;
+                let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+                inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+                let target = seed.try_recv().unwrap().target.unwrap();
+                let original = engine.source_mount(&target).unwrap();
+                let mut pending = crate::commands::set_speed_for_target(&engine, 1.25, Some(&target)).unwrap().unwrap();
+                let delivery = inbox.recv_timeout(Duration::ZERO, &mut load_gen).unwrap();
+                assert!(delivery.persist_speed(Some(&db)).unwrap());
+                // The write and ACK are complete before source authority is superseded.
+                let mut newer = None;
+                let replacement = if physical_aba {
+                    let replacement = engine.reserve_source_mount(target.clone()).unwrap();
+                    assert_ne!(replacement.stamp(), original.stamp());
+                    assert!(engine.complete_source_mount(&replacement));
+                    engine.set_source_paused(&target, true).unwrap();
+                    Some(replacement)
+                } else {
+                    newer = Some(engine.send_queue(vec![track("source-b", "7")], 0, None));
+                    None
+                };
+                let before = engine.snapshot();
+                let result = if wait_for_receipt { pending.wait().await } else { pending.try_recv().unwrap() };
+                assert!(result.is_err(), "completed obsolete persistence was exposed as current success");
+                // Revocation cannot undo a previously committed SQL write.
+                assert_eq!(crate::commands::read_public_setting(&db, "playback.speed").unwrap().as_deref(), Some("1.25"));
+                assert_eq!(engine.snapshot().speed, before.speed);
+                assert_eq!(engine.snapshot().position_ms, before.position_ms);
+                assert_eq!(engine.snapshot().status, before.status);
+                assert_eq!(load_gen, 1);
+                if let Some(replacement) = replacement {
+                    assert!(replacement.is_live());
+                    assert!(replacement.is_paused());
+                    assert_eq!(replacement.position_ms(), 0);
+                    assert_eq!(replacement.speed(), 1.25);
+                }
+                if let Some(mut newer) = newer {
+                    inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+                    assert_eq!(newer.try_recv().unwrap().target.unwrap().platform, "source-b");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn source_speed_pending_drop_and_channel_closure_never_report_persistence_success() {
+        use crate::db::Database;
+        for mode in ["drop_pending", "drop_delivery", "closed_inbox"] {
+            let db = Database::open_in_memory().unwrap();
+            let (engine, inbox) = AudioEngine::command_channel();
+            let mut load_gen = 0;
+            let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+            inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+            let target = seed.try_recv().unwrap().target.unwrap();
+            let original = engine.source_mount(&target).unwrap();
+            if mode == "closed_inbox" {
+                drop(inbox);
+                assert!(crate::commands::set_speed_for_target(&engine, 1.25, Some(&target))
+                    .err().expect("closed actor returned source persistence success").contains("audio actor exited"));
+            } else {
+                let pending = crate::commands::set_speed_for_target(&engine, 1.25, Some(&target)).unwrap().unwrap();
+                let delivery = inbox.recv_timeout(Duration::ZERO, &mut load_gen).unwrap();
+                if mode == "drop_pending" {
+                    drop(pending);
+                    assert!(!delivery.persist_speed(Some(&db)).unwrap());
+                } else {
+                    drop(delivery);
+                    assert!(pending.wait().await.err().expect("dropped writer returned caller success")
+                        .contains("audio actor exited"));
+                }
+            }
+            assert_eq!(crate::commands::read_public_setting(&db, "playback.speed").unwrap(), None);
+            assert!(original.is_live());
+            assert_eq!(original.speed(), 1.25);
+            assert_eq!(engine.snapshot().speed, 1.25);
+            assert_eq!(load_gen, 1);
+        }
+    }
+
+    #[test]
+    fn source_speed_persistence_is_invalidated_by_newer_explicit_native_transport_control() {
+        use crate::db::Database;
+        let db = Database::open_in_memory().unwrap();
+        let (engine, inbox) = AudioEngine::command_channel();
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let target = seed.try_recv().unwrap().target.unwrap();
+        let original = engine.source_mount(&target).unwrap();
+        let mut pending = crate::commands::set_speed_for_target(&engine, 1.25, Some(&target)).unwrap().unwrap();
+        assert!(crate::commands::set_speed_for_target(&engine, 0.5, None).unwrap().is_none());
+        let old_bound_delivery = inbox.recv_timeout(Duration::ZERO, &mut load_gen).unwrap();
+        assert!(!old_bound_delivery.persist_speed(Some(&db)).unwrap());
+        assert!(pending.try_recv().unwrap().is_err());
+        assert_eq!(crate::commands::read_public_setting(&db, "playback.speed").unwrap(), None);
+        assert_eq!(original.speed(), 0.5);
+        assert_eq!(engine.snapshot().speed, 0.5);
+        // Native remains an explicit global packet, never a source-qualified receipt.
+        assert!(matches!(inbox.recv_timeout(Duration::ZERO, &mut load_gen).unwrap(),
+            AudioDelivery::NativeSpeedSetting(setting) if setting.speed() == 0.5));
+        assert_eq!(load_gen, 1);
+    }
+
+    #[test]
+    fn native_speed_persistence_rejects_older_global_message_after_newer_source_control() {
+        use crate::db::Database;
+        let db = Database::open_in_memory().unwrap();
+        let (engine, inbox) = AudioEngine::command_channel();
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let target = seed.try_recv().unwrap().target.unwrap();
+        let original = engine.source_mount(&target).unwrap();
+        assert!(crate::commands::set_speed_for_target(&engine, 0.5, None).unwrap().is_none());
+        let mut latest = crate::commands::set_speed_for_target(&engine, 1.25, Some(&target))
+            .unwrap().unwrap();
+        let obsolete = inbox.recv_timeout(Duration::ZERO, &mut load_gen).unwrap();
+        assert!(!obsolete.persist_speed(Some(&db)).unwrap(),
+            "obsolete Native speed message wrote a setting after a newer source control");
+        assert_eq!(crate::commands::read_public_setting(&db, "playback.speed").unwrap(), None);
+        assert_eq!(original.speed(), 1.25);
+        assert_eq!(engine.snapshot().speed, 1.25);
+        let current = inbox.recv_timeout(Duration::ZERO, &mut load_gen).unwrap();
+        assert!(current.persist_speed(Some(&db)).unwrap());
+        let receipt = latest.try_recv().unwrap().unwrap();
+        assert_eq!(receipt.stamp, *original.stamp());
+        assert_eq!(receipt.speed, 1.25);
+        assert_eq!(crate::commands::read_public_setting(&db, "playback.speed").unwrap().as_deref(), Some("1.25"));
+        assert_eq!(load_gen, 1);
+    }
+
+    #[test]
+    fn native_speed_persistence_keeps_only_latest_control_across_source_and_value_aba() {
+        use crate::db::Database;
+        for source_control in [false, true] {
+            let db = Database::open_in_memory().unwrap();
+            let (engine, inbox) = AudioEngine::command_channel();
+            let mut load_gen = 0;
+            let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+            inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+            let target = seed.try_recv().unwrap().target.unwrap();
+            let original = engine.source_mount(&target).unwrap();
+            assert!(crate::commands::set_speed_for_target(&engine, 1.25, None).unwrap().is_none());
+            let mut middle = crate::commands::set_speed_for_target(&engine, 0.5,
+                source_control.then_some(&target)).unwrap();
+            assert!(crate::commands::set_speed_for_target(&engine, 1.25, None).unwrap().is_none());
+            // Equal values do not restore the first message's authority.
+            for _ in 0..2 {
+                let old = inbox.recv_timeout(Duration::ZERO, &mut load_gen).unwrap();
+                assert!(!old.persist_speed(Some(&db)).unwrap());
+                assert_eq!(crate::commands::read_public_setting(&db, "playback.speed").unwrap(), None);
+            }
+            if let Some(pending) = &mut middle { assert!(pending.try_recv().unwrap().is_err()); }
+            let current = inbox.recv_timeout(Duration::ZERO, &mut load_gen).unwrap();
+            assert!(current.persist_speed(Some(&db)).unwrap());
+            assert_eq!(crate::commands::read_public_setting(&db, "playback.speed").unwrap().as_deref(), Some("1.25"));
+            assert!(original.is_live());
+            assert_eq!(original.speed(), 1.25);
+            assert_eq!(engine.snapshot().speed, 1.25);
+            assert_eq!(load_gen, 1);
+        }
+    }
+
+    #[test]
+    fn native_speed_waiting_for_database_rejects_superseded_controls_without_locking_playback() {
+        use crate::db::Database;
+        use std::sync::{Arc, mpsc};
+        for source_control in [false, true] {
+            let db = Arc::new(Database::open_in_memory().unwrap());
+            let (engine, inbox) = AudioEngine::command_channel();
+            let mut load_gen = 0;
+            let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+            inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+            let target = seed.try_recv().unwrap().target.unwrap();
+            let original = engine.source_mount(&target).unwrap();
+            crate::commands::set_speed_for_target(&engine, 2.0, None).unwrap();
+            assert!(inbox.recv_timeout(Duration::ZERO, &mut load_gen).unwrap()
+                .persist_speed(Some(&db)).unwrap());
+            crate::commands::set_speed_for_target(&engine, 0.5, None).unwrap();
+            let old = inbox.recv_timeout(Duration::ZERO, &mut load_gen).unwrap();
+            let (held_tx, held_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let holder_db = Arc::clone(&db);
+            let holder = std::thread::spawn(move || holder_db.with(|_| {
+                held_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                Ok(())
+            }));
+            held_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let (started_tx, started_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let writer_db = Arc::clone(&db);
+            let writer = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                done_tx.send(old.persist_speed(Some(&writer_db))).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(matches!(done_rx.recv_timeout(Duration::from_millis(50)),
+                Err(mpsc::RecvTimeoutError::Timeout)), "writer escaped held database serialization");
+            // The real DB mutex stays held while a public playback control completes.
+            let control_engine = engine.clone();
+            let control_target = target.clone();
+            let (control_tx, control_rx) = mpsc::channel();
+            let controller = std::thread::spawn(move || {
+                control_tx.send(crate::commands::set_speed_for_target(&control_engine, 1.25,
+                    source_control.then_some(&control_target))).unwrap();
+            });
+            let control = control_rx.recv_timeout(Duration::from_secs(1));
+            // Always release external blocking work before asserting a failed lock order.
+            release_tx.send(()).unwrap();
+            holder.join().unwrap().unwrap();
+            let mut latest = control.expect("database wait held playback State or Gate").unwrap();
+            controller.join().unwrap();
+            assert!(!done_rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(),
+                "obsolete speed passed admission before waiting for database");
+            writer.join().unwrap();
+            assert_eq!(crate::commands::read_public_setting(&db, "playback.speed").unwrap().as_deref(), Some("2"));
+            assert_eq!(original.speed(), 1.25);
+            assert_eq!(engine.snapshot().speed, 1.25);
+            assert!(inbox.recv_timeout(Duration::ZERO, &mut load_gen).unwrap()
+                .persist_speed(Some(&db)).unwrap());
+            if let Some(pending) = &mut latest {
+                assert_eq!(pending.try_recv().unwrap().unwrap().stamp, *original.stamp());
+            }
+            assert_eq!(crate::commands::read_public_setting(&db, "playback.speed").unwrap().as_deref(), Some("1.25"));
+            assert_eq!(load_gen, 1);
+        }
+    }
+
+    #[test]
+    fn targeted_speed_command_does_not_change_the_live_predecessor_or_enqueue_global_effects() {
+        use crate::audio::AudioFx;
+        use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+        use std::time::Instant;
+        use rodio::{ChannelCount, SampleRate, Source};
+        struct Probe(Arc<AtomicU64>);
+        impl Iterator for Probe {
+            type Item = f32;
+            fn next(&mut self) -> Option<f32> { self.0.fetch_add(1, Ordering::SeqCst); Some(0.25) }
+        }
+        impl Source for Probe {
+            fn current_span_len(&self) -> Option<usize> { None }
+            fn channels(&self) -> ChannelCount { ChannelCount::new(1).unwrap() }
+            fn sample_rate(&self) -> SampleRate { SampleRate::new(1_000).unwrap() }
+            fn total_duration(&self) -> Option<Duration> { None }
+        }
+        let (engine, inbox) = AudioEngine::command_channel();
+        let (player, output) = engine.player_channel();
+        let mut output = rodio::source::UniformSourceIterator::new(output,
+            ChannelCount::new(1).unwrap(), SampleRate::new(1_000).unwrap());
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let a = seed.try_recv().unwrap().target.unwrap();
+        let a_port = engine.source_mount(&a).unwrap();
+        let reads = Arc::new(AtomicU64::new(0));
+        player.append(engine.bind_source(a_port.clone(), Box::new(Probe(reads.clone())), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&a_port));
+        crate::commands::set_speed_for_target(&engine, 0.5, None).unwrap();
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        for _ in 0..128 { output.next(); }
+
+        // B is accepted/reserved, while the physical predecessor A is still rendering.
+        let mut next = engine.send_queue(vec![track("source-b", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let b = next.try_recv().unwrap().target.unwrap();
+        let b_port = engine.source_mount(&b).unwrap();
+        let _pending = crate::commands::set_speed_for_target(&engine, 2.0, Some(&b)).unwrap();
+        for _ in 0..128 { output.next(); }
+        let before = reads.load(Ordering::SeqCst);
+        for _ in 0..4_096 { assert!(output.next().is_some()); }
+        let rendered = reads.load(Ordering::SeqCst) - before;
+        assert!((1_920..=2_176).contains(&rendered),
+            "targeted B speed escaped into the live predecessor A: {rendered}");
+        assert_eq!(a_port.speed(), 0.5);
+        assert_eq!(b_port.speed(), 2.0);
+        assert_eq!(engine.snapshot().speed, 2.0);
+        match inbox.recv_timeout(Duration::ZERO, &mut load_gen).unwrap() {
+            AudioDelivery::SourceSpeedSetting(setting) => {
+                assert_eq!(setting.stamp(), b_port.stamp());
+                assert_eq!(setting.speed(), 2.0);
+            }
+            _ => panic!("a bound speed control queued unbound Player/persistence effects"),
+        }
+        assert!(crate::commands::set_speed_for_target(&engine, 1.25, Some(&a)).is_err());
+        assert_eq!(b_port.speed(), 2.0);
+        assert!(matches!(inbox.recv_timeout(Duration::ZERO, &mut load_gen),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+    }
+
+    #[test]
+    fn original_source_speed_changes_rendered_content_and_late_a_cannot_speed_up_b() {
+        use crate::audio::AudioFx;
+        use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+        use std::time::Instant;
+        use rodio::{ChannelCount, SampleRate, Source};
+        struct Probe(Arc<AtomicU64>);
+        impl Iterator for Probe {
+            type Item = f32;
+            fn next(&mut self) -> Option<f32> { self.0.fetch_add(1, Ordering::SeqCst); Some(0.25) }
+        }
+        impl Source for Probe {
+            fn current_span_len(&self) -> Option<usize> { Some(16) }
+            fn channels(&self) -> ChannelCount { ChannelCount::new(1).unwrap() }
+            fn sample_rate(&self) -> SampleRate { SampleRate::new(1_000).unwrap() }
+            fn total_duration(&self) -> Option<Duration> { None }
+        }
+        let (engine, inbox) = AudioEngine::command_channel();
+        let (player, output) = engine.player_channel();
+        // The actual software queue is rendered at a fixed device-format rate.
+        let mut output = rodio::source::UniformSourceIterator::new(output,
+            ChannelCount::new(1).unwrap(), SampleRate::new(1_000).unwrap());
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let a = seed.try_recv().unwrap().target.unwrap();
+        let a_port = engine.source_mount(&a).unwrap();
+        let a_reads = Arc::new(AtomicU64::new(0));
+        engine.set_source_speed(&a, 2.0).expect("qualified original source speed was unavailable");
+        player.append(engine.bind_source(a_port.clone(), Box::new(Probe(a_reads.clone())), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&a_port));
+        for _ in 0..64 { output.next(); }
+        let before = a_reads.load(Ordering::SeqCst);
+        for _ in 0..4_096 { assert!(output.next().is_some()); }
+        let rendered = a_reads.load(Ordering::SeqCst) - before;
+        assert!((8_064..=8_320).contains(&rendered),
+            "2x source speed did not render twice the original content: {rendered}");
+
+        let mut next = engine.send_queue(vec![track("source-b", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let b = next.try_recv().unwrap().target.unwrap();
+        let b_port = engine.source_mount(&b).unwrap();
+        let b_reads = Arc::new(AtomicU64::new(0));
+        engine.set_source_speed(&b, 0.5).unwrap();
+        player.append(engine.bind_source(b_port.clone(), Box::new(Probe(b_reads.clone())), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&b_port));
+        assert!(engine.set_source_speed(&a, 2.0).is_err());
+        for _ in 0..128 { output.next(); }
+        let before = b_reads.load(Ordering::SeqCst);
+        let a_frozen = a_reads.load(Ordering::SeqCst);
+        for _ in 0..4_096 { assert!(output.next().is_some()); }
+        let rendered = b_reads.load(Ordering::SeqCst) - before;
+        assert!((1_920..=2_176).contains(&rendered),
+            "late A speed changed B's independently selected 0.5x content: {rendered}");
+        assert_eq!(a_reads.load(Ordering::SeqCst), a_frozen);
+    }
+
+    #[test]
+    fn source_pause_freezes_original_decoder_and_late_a_cannot_resume_or_pause_b() {
+        use crate::audio::AudioFx;
+        use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
+        use std::time::Instant;
+        use rodio::{ChannelCount, SampleRate, Source};
+        struct Probe(Arc<AtomicU64>);
+        impl Iterator for Probe {
+            type Item = f32;
+            fn next(&mut self) -> Option<f32> { self.0.fetch_add(1, Ordering::SeqCst); Some(0.25) }
+        }
+        impl Source for Probe {
+            fn current_span_len(&self) -> Option<usize> { None }
+            fn channels(&self) -> ChannelCount { ChannelCount::new(1).unwrap() }
+            fn sample_rate(&self) -> SampleRate { SampleRate::new(1_000).unwrap() }
+            fn total_duration(&self) -> Option<Duration> { None }
+        }
+        let (engine, inbox) = AudioEngine::command_channel();
+        let (player, mut output) = engine.player_channel();
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let a = seed.try_recv().unwrap().target.unwrap();
+        let a_port = engine.source_mount(&a).unwrap();
+        let a_reads = Arc::new(AtomicU64::new(0));
+        player.append(engine.bind_source(a_port.clone(), Box::new(Probe(a_reads.clone())), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&a_port));
+        for _ in 0..16 { output.next(); }
+        assert_eq!(engine.set_source_paused(&a, true).unwrap(), *a_port.stamp());
+        let a_before = a_reads.load(Ordering::SeqCst);
+        let a_pos = a_port.position_ms();
+        for _ in 0..16 { assert_eq!(output.next(), Some(0.0)); }
+        assert_eq!(a_reads.load(Ordering::SeqCst), a_before, "paused original A entered DSP/decoder");
+        assert_eq!(a_port.position_ms(), a_pos, "paused original A advanced content");
+        let mut next = engine.send_queue(vec![track("source-b", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let b = next.try_recv().unwrap().target.unwrap();
+        let b_port = engine.source_mount(&b).unwrap();
+        let b_reads = Arc::new(AtomicU64::new(0));
+        player.append(engine.bind_source(b_port.clone(), Box::new(Probe(b_reads.clone())), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&b_port));
+        assert!(engine.set_source_paused(&a, true).is_err());
+        assert!(engine.set_source_paused(&a, false).is_err());
+        assert_eq!(engine.set_source_paused(&b, true).unwrap(), *b_port.stamp());
+        for _ in 0..16 { assert_eq!(output.next(), Some(0.0)); }
+        assert_eq!(b_reads.load(Ordering::SeqCst), 0, "late A control or paused B entered B decoder");
+        assert_eq!(engine.snapshot().status, super::PlaybackStatus::Paused);
+        assert_eq!(engine.set_source_paused(&b, false).unwrap(), *b_port.stamp());
+        for _ in 0..16 { output.next(); }
+        assert!(b_reads.load(Ordering::SeqCst) > 0, "original B did not resume");
+        assert_eq!(a_reads.load(Ordering::SeqCst), a_before);
+    }
+
+    #[test]
+    fn late_original_load_metadata_preserves_successful_source_seek_cue() {
+        use crate::audio::AudioFx;
+        use std::sync::Arc;
+        use std::time::Instant;
+        use rodio::{ChannelCount, SampleRate, Source};
+        use rodio::source::SeekError;
+        struct Probe;
+        impl Iterator for Probe { type Item = f32; fn next(&mut self) -> Option<f32> { Some(0.25) } }
+        impl Source for Probe {
+            fn current_span_len(&self) -> Option<usize> { None }
+            fn channels(&self) -> ChannelCount { ChannelCount::new(1).unwrap() }
+            fn sample_rate(&self) -> SampleRate { SampleRate::new(1_000).unwrap() }
+            fn total_duration(&self) -> Option<Duration> { Some(Duration::from_secs(60)) }
+            fn try_seek(&mut self, _: Duration) -> Result<(), SeekError> { Ok(()) }
+        }
+        let (engine, inbox) = AudioEngine::command_channel();
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let a = seed.try_recv().unwrap().target.unwrap();
+        let prepared_metadata = engine.snapshot();
+        let port = engine.source_mount(&a).unwrap();
+        let (player, mut output) = engine.player_channel();
+        player.append(engine.bind_source(port.clone(), Box::new(Probe), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&port));
+        for _ in 0..16 { output.next(); }
+        let mut pending = engine.begin_source_seek(&a, 790).unwrap();
+        output.next();
+        assert_eq!(pending.try_recv().unwrap().unwrap().content_position_ms, 790);
+        assert!(engine.publish_source_state(&port, prepared_metadata));
+        assert!(engine.snapshot().position_ms >= 790,
+            "late original LoadReady metadata reset the successfully sought original source cue");
+    }
+
+    #[test]
+    fn source_seek_ack_publishes_original_cue_before_post_seek_decoder_pull() {
+        use crate::audio::AudioFx;
+        use std::sync::Arc;
+        use std::time::Instant;
+        use rodio::{ChannelCount, SampleRate, Source};
+        use rodio::source::SeekError;
+        struct Probe { engine: AudioEngine, sought: bool }
+        impl Iterator for Probe {
+            type Item = f32;
+            fn next(&mut self) -> Option<f32> {
+                if self.sought {
+                    assert!(self.engine.snapshot().position_ms >= 790,
+                        "decoder continued before the original successful seek cue became visible");
+                }
+                Some(0.25)
+            }
+        }
+        impl Source for Probe {
+            fn current_span_len(&self) -> Option<usize> { None }
+            fn channels(&self) -> ChannelCount { ChannelCount::new(1).unwrap() }
+            fn sample_rate(&self) -> SampleRate { SampleRate::new(1_000).unwrap() }
+            fn total_duration(&self) -> Option<Duration> { Some(Duration::from_secs(60)) }
+            fn try_seek(&mut self, _: Duration) -> Result<(), SeekError> { self.sought = true; Ok(()) }
+        }
+        let (engine, inbox) = AudioEngine::command_channel();
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let a = seed.try_recv().unwrap().target.unwrap();
+        let port = engine.source_mount(&a).unwrap();
+        let (player, mut output) = engine.player_channel();
+        player.append(engine.bind_source(port.clone(), Box::new(Probe { engine: engine.clone(), sought: false }),
+            0, Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&port));
+        for _ in 0..16 { output.next(); }
+        let mut pending = engine.begin_source_seek(&a, 790).unwrap();
+        output.next();
+        let receipt = pending.try_recv().unwrap().unwrap();
+        assert_eq!(receipt.stamp, *port.stamp());
+        assert_eq!(receipt.content_position_ms, 790);
+        assert!(engine.snapshot().position_ms >= 790);
+    }
+
+    #[test]
+    fn loading_source_seek_survives_preceding_physical_source_until_original_selection() {
+        use crate::audio::AudioFx;
+        use rodio::{ChannelCount, SampleRate, Source};
+        use rodio::source::SeekError;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Instant;
+        struct Probe { seeks: Arc<AtomicU64> }
+        impl Iterator for Probe {
+            type Item = f32;
+            fn next(&mut self) -> Option<f32> { Some(0.25) }
+        }
+        impl Source for Probe {
+            fn current_span_len(&self) -> Option<usize> { None }
+            fn channels(&self) -> ChannelCount { ChannelCount::new(1).unwrap() }
+            fn sample_rate(&self) -> SampleRate { SampleRate::new(1_000).unwrap() }
+            fn total_duration(&self) -> Option<Duration> { Some(Duration::from_secs(60)) }
+            fn try_seek(&mut self, _: Duration) -> Result<(), SeekError> {
+                self.seeks.fetch_add(1, Ordering::Relaxed); Ok(())
+            }
+        }
+        let (engine, inbox) = AudioEngine::command_channel();
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let a = seed.try_recv().unwrap().target.unwrap();
+        let a_port = engine.source_mount(&a).unwrap();
+        let (player, mut output) = engine.player_channel();
+        let a_seeks = Arc::new(AtomicU64::new(0));
+        let b_seeks = Arc::new(AtomicU64::new(0));
+        player.append(engine.bind_source(a_port.clone(), Box::new(Probe { seeks: a_seeks.clone() }),
+            0, Arc::new(AudioFx::new()), Instant::now(), None));
+        assert!(engine.complete_source_mount(&a_port));
+        for _ in 0..16 { output.next(); }
+        let mut seed = engine.send_queue(vec![track("source-b", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let b = seed.try_recv().unwrap().target.unwrap();
+        let b_port = engine.source_mount(&b).unwrap();
+        let mut pending = engine.begin_source_seek(&b, 740).unwrap();
+        player.append(engine.bind_source(b_port.clone(), Box::new(Probe { seeks: b_seeks.clone() }),
+            0, Arc::new(AudioFx::new()), Instant::now(), None));
+        for _ in 0..16 { output.next(); }
+        assert_eq!(a_seeks.load(Ordering::Relaxed), 0);
+        assert_eq!(b_seeks.load(Ordering::Relaxed), 0);
+        assert!(matches!(pending.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        assert!(engine.complete_source_mount(&b_port));
+        for _ in 0..16 { output.next(); }
+        let receipt = pending.try_recv().unwrap()
+            .expect("original loading B seek must survive the preceding A output tail");
+        assert_eq!(receipt.stamp, *b_port.stamp());
+        assert_eq!(receipt.content_position_ms, 740);
+        assert_eq!(a_seeks.load(Ordering::Relaxed), 0);
+        assert_eq!(b_seeks.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn source_seek_before_load_ready_retains_original_port_and_content_until_mount() {
+        use crate::audio::AudioFx;
+        use rodio::{ChannelCount, SampleRate, Source};
+        use rodio::source::SeekError;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::Instant;
+        struct Probe { pulls: Arc<AtomicU64>, seeks: Arc<std::sync::Mutex<Vec<Duration>>> }
+        impl Iterator for Probe {
+            type Item = f32;
+            fn next(&mut self) -> Option<f32> { self.pulls.fetch_add(1, Ordering::Relaxed); Some(0.25) }
+        }
+        impl Source for Probe {
+            fn current_span_len(&self) -> Option<usize> { None }
+            fn channels(&self) -> ChannelCount { ChannelCount::new(1).unwrap() }
+            fn sample_rate(&self) -> SampleRate { SampleRate::new(1_000).unwrap() }
+            fn total_duration(&self) -> Option<Duration> { Some(Duration::from_secs(60)) }
+            fn try_seek(&mut self, position: Duration) -> Result<(), SeekError> {
+                self.seeks.lock().unwrap().push(position); Ok(())
+            }
+        }
+        let (engine, inbox) = AudioEngine::command_channel();
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let original = seed.try_recv().unwrap().target.unwrap();
+        let (player, mut output) = engine.player_channel();
+        let mut pending = engine.begin_source_seek(&original, 790)
+            .expect("accepted A seek must retain its loading source, not fail before LoadReady");
+        let port = engine.source_mount(&original).expect("loading A has an original source lease");
+        let pulls = Arc::new(AtomicU64::new(0));
+        let seeks = Arc::new(std::sync::Mutex::new(Vec::new()));
+        player.append(engine.bind_source(port.clone(),
+            Box::new(Probe { pulls: pulls.clone(), seeks: seeks.clone() }), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        for _ in 0..16 { output.next(); }
+        assert_eq!(pulls.load(Ordering::Relaxed), 0);
+        assert!(seeks.lock().unwrap().is_empty(), "unarmed original seek crossed DSP into decoder");
+        assert!(matches!(pending.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        assert!(engine.complete_source_mount(&port));
+        for _ in 0..16 { output.next(); }
+        let receipt = pending.try_recv().unwrap().unwrap();
+        assert_eq!(receipt.stamp, *port.stamp());
+        assert_eq!(receipt.content_position_ms, 790);
+        assert_eq!(*seeks.lock().unwrap(), vec![Duration::from_millis(790)]);
+        assert!(pulls.load(Ordering::Relaxed) > 0);
+    }
+
+    #[test]
+    fn reserved_source_outputs_silence_until_original_completion_and_then_continues_while_b_loads() {
+        use crate::audio::AudioFx;
+        use rodio::{ChannelCount, SampleRate, Source};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::time::Instant;
+        struct Probe { pulls: Arc<AtomicU64> }
+        impl Iterator for Probe {
+            type Item = f32;
+            fn next(&mut self) -> Option<f32> { self.pulls.fetch_add(1, Ordering::Relaxed); Some(0.25) }
+        }
+        impl Source for Probe {
+            fn current_span_len(&self) -> Option<usize> { None }
+            fn channels(&self) -> ChannelCount { ChannelCount::new(1).unwrap() }
+            fn sample_rate(&self) -> SampleRate { SampleRate::new(1_000).unwrap() }
+            fn total_duration(&self) -> Option<Duration> { Some(Duration::from_secs(60)) }
+        }
+        let (engine, inbox) = AudioEngine::command_channel();
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let port = engine.reserve_source_mount(seed.try_recv().unwrap().target.unwrap()).unwrap();
+        let pulls = Arc::new(AtomicU64::new(0));
+        let (player, mut output) = engine.player_channel();
+        player.append(engine.bind_source(port.clone(), Box::new(Probe { pulls: pulls.clone() }), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        let held: Vec<_> = (0..32).filter_map(|_| output.next()).collect();
+        assert_eq!(pulls.load(Ordering::Relaxed), 0,
+            "uncompleted candidate entered DSP/decoder before its original mount was armed");
+        assert!(held.iter().all(|sample| *sample == 0.0));
+        assert!(engine.complete_source_mount(&port));
+        let original_b = engine.begin_play_intent();
+        let playing: Vec<_> = (0..32).filter_map(|_| output.next()).collect();
+        assert!(pulls.load(Ordering::Relaxed) > 0, "completed A was silenced by B merely becoming pending");
+        assert!(playing.iter().any(|sample| *sample != 0.0));
+        let mut b_reply = engine.send_queue(vec![track("source-b", "7")], 0, Some(original_b));
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        assert_eq!(b_reply.try_recv().unwrap().target.unwrap().generation, original_b);
+        assert_eq!(load_gen, 2);
+    }
+
+    #[test]
+    fn rejected_source_mount_never_enters_dsp_or_decoder_on_normal_output_pull() {
+        use crate::audio::AudioFx;
+        use rodio::{ChannelCount, SampleRate, Source};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::time::Instant;
+        struct Probe { pulls: Arc<AtomicU64> }
+        impl Iterator for Probe {
+            type Item = f32;
+            fn next(&mut self) -> Option<f32> {
+                self.pulls.fetch_add(1, Ordering::Relaxed);
+                Some(0.25)
+            }
+        }
+        impl Source for Probe {
+            fn current_span_len(&self) -> Option<usize> { None }
+            fn channels(&self) -> ChannelCount { ChannelCount::new(1).unwrap() }
+            fn sample_rate(&self) -> SampleRate { SampleRate::new(1_000).unwrap() }
+            fn total_duration(&self) -> Option<Duration> { Some(Duration::from_secs(60)) }
+        }
+        let (engine, inbox) = AudioEngine::command_channel();
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let port = engine.reserve_source_mount(seed.try_recv().unwrap().target.unwrap()).unwrap();
+        let pulls = Arc::new(AtomicU64::new(0));
+        let (player, mut output) = engine.player_channel();
+        player.append(engine.bind_source(port.clone(), Box::new(Probe { pulls: pulls.clone() }), 0,
+            Arc::new(AudioFx::new()), Instant::now(), None));
+        let before = engine.snapshot();
+        let original_b = engine.begin_play_intent();
+        assert!(!engine.complete_source_mount(&port));
+        assert!(!engine.publish_source_state(&port, before.clone()));
+        for _ in 0..64 { output.next(); }
+        assert_eq!(pulls.load(Ordering::Relaxed), 0,
+            "retired original A crossed the physical outer guard and entered DSP/decoder");
+        assert_eq!(serde_json::to_value(engine.snapshot()).unwrap(), serde_json::to_value(before).unwrap());
+        let mut b_reply = engine.send_queue(vec![track("source-b", "7")], 0, Some(original_b));
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        assert_eq!(b_reply.try_recv().unwrap().target.unwrap().generation, original_b);
+        assert_eq!(load_gen, 2);
+    }
+
+    #[test]
+    fn original_source_mount_completion_cannot_replace_b_or_reuse_an_aba_stamp() {
+        use std::sync::Arc;
+        let (engine, inbox) = AudioEngine::command_channel();
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let target_a = seed.try_recv().unwrap().target.unwrap();
+        let first_a = engine.reserve_source_mount(target_a.clone()).unwrap();
+        assert!(engine.complete_source_mount(&first_a));
+        let reloaded_a = engine.reserve_source_mount(target_a).unwrap();
+        assert_ne!(first_a.stamp().mount_nonce, reloaded_a.stamp().mount_nonce);
+        let before = serde_json::to_value(engine.snapshot()).unwrap();
+        let original_b = engine.begin_play_intent();
+        assert!(!engine.complete_source_mount(&reloaded_a),
+            "old A source completed after original B began and replaced the physical mount");
+        assert!(!reloaded_a.is_live(), "a rejected original candidate must be retired");
+        assert!(first_a.is_live(), "rejecting a candidate must not retire another physical source");
+        assert!(Arc::ptr_eq(&engine.current_source_mount().unwrap(), &first_a));
+        assert_eq!(serde_json::to_value(engine.snapshot()).unwrap(), before);
+        assert_eq!(load_gen, 1);
+        let mut b_reply = engine.send_queue(vec![track("source-b", "7")], 0, Some(original_b));
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let b_target = b_reply.try_recv().unwrap().target.unwrap();
+        assert_eq!(b_target.generation, original_b);
+        let original_b_mount = engine.reserve_source_mount(b_target).unwrap();
+        assert!(engine.complete_source_mount(&original_b_mount));
+        assert!(!first_a.is_live());
+        assert!(!engine.complete_source_mount(&reloaded_a));
+        assert!(Arc::ptr_eq(&engine.current_source_mount().unwrap(), &original_b_mount));
+        assert!(original_b_mount.is_live());
+        assert_eq!(load_gen, 2);
+    }
+
+    #[test]
+    fn load_ready_cannot_mount_accepted_a_while_original_b_is_pending() {
+        let (engine, inbox) = AudioEngine::command_channel();
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        assert!(matches!(inbox.recv_timeout(Duration::from_secs(5), &mut load_gen)
+            .unwrap(), AudioDelivery::Playback(_)));
+        let original_a = seed.try_recv().unwrap().target.unwrap();
+        let before = serde_json::to_value(engine.snapshot()).unwrap();
+        let original_b = engine.begin_play_intent();
+        engine.send(super::AudioCmd::LoadReady {
+            target: Some(original_a), port: None, track: Box::new(track("source-a", "7")),
+            decoder: Box::new(rodio::source::Zero::new(
+                rodio::ChannelCount::new(1).unwrap(), rodio::SampleRate::new(1_000).unwrap(),
+            )),
+            shared: None, duration_ms: 60_000, start_at: Some(61_000), autoplay: false,
+            is_local: false, url_fetched_at: None, play_url: None, size_bytes: None,
+            gen: load_gen, preload: false,
+        });
+        let delivery = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        assert!(matches!(delivery, AudioDelivery::Rejected),
+            "the real production inbox delivered an old A decoder for mounting after B began");
+        assert_eq!(serde_json::to_value(engine.snapshot()).unwrap(), before);
+        assert_eq!(load_gen, 1);
+        let mut b_reply = engine.send_queue(vec![track("source-b", "7")], 0, Some(original_b));
+        assert!(matches!(inbox.recv_timeout(Duration::from_secs(5), &mut load_gen)
+            .unwrap(), AudioDelivery::Playback(_)));
+        let b_target = b_reply.try_recv().unwrap().target.unwrap();
+        assert_eq!(b_target.generation, original_b, "rejecting old A must not consume pending B");
+        assert_eq!(b_target.platform, "source-b");
+        assert_eq!(load_gen, 2);
+    }
+
+    #[tokio::test]
+    async fn same_target_aba_rejects_completed_source_receipts_at_both_caller_entries() {
+        use crate::audio::AudioFx;
+        use rodio::source::SeekError;
+        use rodio::{ChannelCount, SampleRate, Source};
+        use std::sync::{Arc, Mutex, atomic::{AtomicU64, Ordering}};
+        struct Decoder { seeks: Arc<Mutex<Vec<Duration>>>, reads: Arc<AtomicU64> }
+        impl Iterator for Decoder {
+            type Item = f32;
+            fn next(&mut self) -> Option<f32> { self.reads.fetch_add(1, Ordering::SeqCst); Some(0.1) }
+        }
+        impl Source for Decoder {
+            fn current_span_len(&self) -> Option<usize> { None }
+            fn channels(&self) -> ChannelCount { ChannelCount::new(1).unwrap() }
+            fn sample_rate(&self) -> SampleRate { SampleRate::new(1_000).unwrap() }
+            fn total_duration(&self) -> Option<Duration> { Some(Duration::from_secs(60)) }
+            fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
+                self.seeks.lock().unwrap().push(pos);
+                Ok(())
+            }
+        }
+        let (engine, inbox) = AudioEngine::command_channel();
+        let (player, mut output) = engine.player_channel();
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let target = seed.try_recv().unwrap().target.unwrap();
+        let old = engine.source_mount(&target).unwrap();
+        let old_seeks = Arc::new(Mutex::new(Vec::new()));
+        let old_reads = Arc::new(AtomicU64::new(0));
+        player.append(engine.bind_source(old.clone(), Box::new(Decoder {
+            seeks: old_seeks.clone(), reads: old_reads.clone(),
+        }), 0, Arc::new(AudioFx::new()), std::time::Instant::now(), None));
+        assert!(engine.complete_source_mount(&old));
+        output.next();
+        let mut first = engine.begin_source_seek(&target, 80).unwrap();
+        output.next();
+        let second = engine.begin_source_seek(&target, 120).unwrap();
+        output.next();
+        // Both decoder ACKs are already queued, but neither caller consumed one yet.
+        assert_eq!(*old_seeks.lock().unwrap(), vec![Duration::from_millis(80), Duration::from_millis(120)]);
+        assert_eq!(engine.snapshot().position_ms, 120);
+
+        let new = engine.reserve_source_mount(target.clone()).unwrap();
+        assert_ne!(new.stamp().mount_nonce, old.stamp().mount_nonce);
+        assert!(!Arc::ptr_eq(&new, &old));
+        let new_seeks = Arc::new(Mutex::new(Vec::new()));
+        let new_reads = Arc::new(AtomicU64::new(0));
+        player.append(engine.bind_source(new.clone(), Box::new(Decoder {
+            seeks: new_seeks.clone(), reads: new_reads.clone(),
+        }), 900, Arc::new(AudioFx::new()), std::time::Instant::now(), None));
+        assert!(engine.complete_source_mount(&new));
+        engine.set_source_speed(&target, 0.5).unwrap();
+        engine.set_source_paused(&target, true).unwrap();
+        let before = serde_json::to_value(engine.snapshot()).unwrap();
+        assert!(first.try_recv().unwrap().expect_err("try_recv accepted an old physical source ACK").source_intact);
+        assert!(second.wait().await.expect_err("wait accepted an old physical source ACK").source_intact);
+        for _ in 0..32 { output.next(); }
+        assert_eq!(new.position_ms(), 900);
+        assert_eq!(new.speed(), 0.5);
+        assert!(new.is_paused());
+        assert!(new_seeks.lock().unwrap().is_empty());
+        assert_eq!(new_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(serde_json::to_value(engine.snapshot()).unwrap(), before);
+        assert_eq!(new.stamp().target, target);
+        assert_eq!(load_gen, 1);
+        assert_eq!(engine.begin_play_intent(), 2, "physical ABA unexpectedly advanced logical authority");
+    }
+
+    #[tokio::test]
+    async fn caller_does_not_expose_completed_a_source_receipt_after_original_b_begins() {
+        use crate::audio::render_control::{BoundSeekRequest, MountStamp, RenderSeekOutput, SeekTargetGuard};
+        use crate::audio::{AudioFx, DspSource};
+        use rodio::source::SeekError;
+        use rodio::{ChannelCount, Player, SampleRate, Source};
+        use std::sync::{Arc, Mutex};
+        struct Decoder { seeks: Arc<Mutex<Vec<Duration>>> }
+        impl Iterator for Decoder {
+            type Item = f32;
+            fn next(&mut self) -> Option<f32> { Some(0.1) }
+        }
+        impl Source for Decoder {
+            fn current_span_len(&self) -> Option<usize> { None }
+            fn channels(&self) -> ChannelCount { ChannelCount::new(1).unwrap() }
+            fn sample_rate(&self) -> SampleRate { SampleRate::new(1_000).unwrap() }
+            fn total_duration(&self) -> Option<Duration> { Some(Duration::from_secs(60)) }
+            fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
+                self.seeks.lock().unwrap().push(pos);
+                Ok(())
+            }
+        }
+        let (engine, inbox) = AudioEngine::command_channel();
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let stamp = MountStamp { target: seed.try_recv().unwrap().target.unwrap(), mount_nonce: 1 };
+        let port = engine.source_seek_port(stamp.clone());
+        let seeks = Arc::new(Mutex::new(Vec::new()));
+        let (player, output) = Player::new();
+        let (mut output, sender) = RenderSeekOutput::new(output);
+        let dsp = DspSource::new(port.tracked_source(Box::new(Decoder { seeks: seeks.clone() }), 0),
+            Arc::new(AudioFx::new()), std::time::Instant::now(), None);
+        player.append(SeekTargetGuard::new(Box::new(dsp), port.clone()));
+        output.next();
+        let (original_a, a_reply) = BoundSeekRequest::new(stamp, port, 80, 1.0).unwrap();
+        let before = serde_json::to_value(engine.snapshot()).unwrap();
+        assert!(sender.try_submit(original_a).is_ok());
+        output.next();
+        assert_eq!(*seeks.lock().unwrap(), vec![Duration::from_millis(80)]);
+        let original_b = engine.begin_play_intent();
+        assert_eq!(original_b, 2);
+        let error = a_reply.wait().await.expect_err("caller exposed an already completed A ACK after B began");
+        assert!(error.source_intact);
+        assert_eq!(serde_json::to_value(engine.snapshot()).unwrap(), before);
+        let mut b_reply = engine.send_queue(vec![track("source-b", "7")], 0, Some(original_b));
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let b_reply = b_reply.try_recv().unwrap();
+        assert!(b_reply.applied);
+        assert_eq!(b_reply.target.unwrap().generation, original_b);
+        assert_eq!(load_gen, 2);
+    }
+
+    #[test]
+    fn same_target_aba_during_decoder_seek_rejects_old_ack_without_holding_authority_gate() {
+        use crate::audio::AudioFx;
+        use rodio::source::SeekError;
+        use rodio::{ChannelCount, SampleRate, Source};
+        use std::sync::{Arc, Condvar, Mutex, atomic::{AtomicU64, Ordering}};
+        struct Decoder {
+            entered: Option<std::sync::mpsc::Sender<()>>,
+            release: Arc<(Mutex<bool>, Condvar)>,
+            seeks: Arc<Mutex<Vec<Duration>>>,
+            reads: Arc<AtomicU64>,
+        }
+        impl Iterator for Decoder {
+            type Item = f32;
+            fn next(&mut self) -> Option<f32> { self.reads.fetch_add(1, Ordering::SeqCst); Some(0.1) }
+        }
+        impl Source for Decoder {
+            fn current_span_len(&self) -> Option<usize> { None }
+            fn channels(&self) -> ChannelCount { ChannelCount::new(1).unwrap() }
+            fn sample_rate(&self) -> SampleRate { SampleRate::new(1_000).unwrap() }
+            fn total_duration(&self) -> Option<Duration> { Some(Duration::from_secs(60)) }
+            fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
+                self.seeks.lock().unwrap().push(pos);
+                if let Some(entered) = &self.entered {
+                    entered.send(()).unwrap();
+                    let (lock, wake) = &*self.release;
+                    let mut released = lock.lock().unwrap();
+                    while !*released { released = wake.wait(released).unwrap(); }
+                }
+                Ok(())
+            }
+        }
+        struct AbaPullWorker {
+            release: Arc<(Mutex<bool>, Condvar)>,
+            thread: Option<std::thread::JoinHandle<crate::audio::render_control::RenderSeekOutput>>,
+        }
+        impl AbaPullWorker {
+            fn finish(&mut self) -> crate::audio::render_control::RenderSeekOutput {
+                let (lock, wake) = &*self.release;
+                *lock.lock().unwrap() = true;
+                wake.notify_all();
+                self.thread.take().unwrap().join().unwrap()
+            }
+        }
+        impl Drop for AbaPullWorker {
+            fn drop(&mut self) {
+                let (lock, wake) = &*self.release;
+                *lock.lock().unwrap() = true;
+                wake.notify_all();
+                if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+            }
+        }
+        let (engine, inbox) = AudioEngine::command_channel();
+        let engine = Arc::new(engine);
+        let (player, mut output) = engine.player_channel();
+        let player = Arc::new(player);
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let target = seed.try_recv().unwrap().target.unwrap();
+        let old = engine.source_mount(&target).unwrap();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let old_seeks = Arc::new(Mutex::new(Vec::new()));
+        player.append(engine.bind_source(old.clone(), Box::new(Decoder {
+            entered: Some(entered_tx), release: release.clone(), seeks: old_seeks.clone(),
+            reads: Arc::new(AtomicU64::new(0)),
+        }), 0, Arc::new(AudioFx::new()), std::time::Instant::now(), None));
+        assert!(engine.complete_source_mount(&old));
+        output.next();
+        let mut pending = engine.begin_source_seek(&target, 80).unwrap();
+        let mut worker = AbaPullWorker { release: release.clone(),
+            thread: Some(std::thread::spawn(move || { output.next(); output })) };
+        assert!(entered_rx.recv_timeout(Duration::from_secs(5)).is_ok(), "old decoder seek was not entered");
+        let new_seeks = Arc::new(Mutex::new(Vec::new()));
+        let new_reads = Arc::new(AtomicU64::new(0));
+        let (swap_tx, swap_rx) = std::sync::mpsc::channel();
+        let swap_engine = engine.clone();
+        let swap_player = player.clone();
+        let swap_target = target.clone();
+        let swap_seeks = new_seeks.clone();
+        let swap_reads = new_reads.clone();
+        let swap_thread = std::thread::spawn(move || {
+            let new = swap_engine.reserve_source_mount(swap_target.clone()).unwrap();
+            swap_player.append(swap_engine.bind_source(new.clone(), Box::new(Decoder {
+                entered: None, release, seeks: swap_seeks, reads: swap_reads,
+            }), 900, Arc::new(AudioFx::new()), std::time::Instant::now(), None));
+            assert!(swap_engine.complete_source_mount(&new));
+            swap_engine.set_source_speed(&swap_target, 0.5).unwrap();
+            swap_engine.set_source_paused(&swap_target, true).unwrap();
+            swap_tx.send(new).unwrap();
+        });
+        let swapped = swap_rx.recv_timeout(Duration::from_secs(5));
+        let before = swapped.as_ref().ok().map(|_| serde_json::to_value(engine.snapshot()).unwrap());
+        // Always release/join the decoder before diagnosing a blocked Gate.
+        // Keep the software output alive so destruction cannot retire the new source.
+        let mut output = worker.finish();
+        swap_thread.join().unwrap();
+        let new = swapped.expect("blocked decoder seek held the shared source authority Gate");
+        let before = before.unwrap();
+        assert_eq!(engine.snapshot().position_ms, 900);
+        assert_ne!(new.stamp().mount_nonce, old.stamp().mount_nonce);
+        assert!(!Arc::ptr_eq(&new, &old));
+        assert_eq!(*old_seeks.lock().unwrap(), vec![Duration::from_millis(80)]);
+        assert!(pending.try_recv().unwrap().expect_err("decoder returned an applied old source ACK after same-target remount").source_intact);
+        for _ in 0..32 { output.next(); }
+        assert!(new.is_live());
+        assert_eq!(new.position_ms(), 900);
+        assert_eq!(new.speed(), 0.5);
+        assert!(new.is_paused());
+        assert!(new_seeks.lock().unwrap().is_empty());
+        assert_eq!(new_reads.load(Ordering::SeqCst), 0);
+        assert_eq!(serde_json::to_value(engine.snapshot()).unwrap(), before);
+        assert_eq!(new.stamp().target, target);
+        assert_eq!(load_gen, 1);
+        assert_eq!(engine.begin_play_intent(), 2, "physical ABA unexpectedly advanced logical authority");
+    }
+
+    #[test]
+    fn slow_source_seek_leaves_gate_open_and_returns_no_stale_a_receipt() {
+        use crate::audio::render_control::{BoundSeekRequest, MountStamp, RenderSeekOutput, SeekTargetGuard};
+        use crate::audio::{AudioFx, DspSource};
+        use rodio::source::SeekError;
+        use rodio::{ChannelCount, Player, SampleRate, Source};
+        use std::sync::{Arc, Condvar, Mutex};
+        struct Decoder {
+            entered: std::sync::mpsc::Sender<()>,
+            release: Arc<(Mutex<bool>, Condvar)>,
+        }
+        impl Iterator for Decoder {
+            type Item = f32;
+            fn next(&mut self) -> Option<f32> { Some(0.1) }
+        }
+        impl Source for Decoder {
+            fn current_span_len(&self) -> Option<usize> { None }
+            fn channels(&self) -> ChannelCount { ChannelCount::new(1).unwrap() }
+            fn sample_rate(&self) -> SampleRate { SampleRate::new(1_000).unwrap() }
+            fn total_duration(&self) -> Option<Duration> { Some(Duration::from_secs(60)) }
+            fn try_seek(&mut self, _: Duration) -> Result<(), SeekError> {
+                self.entered.send(()).unwrap();
+                let (lock, wake) = &*self.release;
+                let mut released = lock.lock().unwrap();
+                while !*released { released = wake.wait(released).unwrap(); }
+                Ok(())
+            }
+        }
+        struct PullWorker {
+            release: Arc<(Mutex<bool>, Condvar)>,
+            thread: Option<std::thread::JoinHandle<()>>,
+        }
+        impl PullWorker {
+            fn finish(&mut self) {
+                let (lock, wake) = &*self.release;
+                *lock.lock().unwrap() = true;
+                wake.notify_all();
+                self.thread.take().unwrap().join().unwrap();
+            }
+        }
+        impl Drop for PullWorker {
+            fn drop(&mut self) {
+                let (lock, wake) = &*self.release;
+                *lock.lock().unwrap() = true;
+                wake.notify_all();
+                if let Some(thread) = self.thread.take() { let _ = thread.join(); }
+            }
+        }
+        let (engine, inbox) = AudioEngine::command_channel();
+        let engine = Arc::new(engine);
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let stamp = MountStamp { target: seed.try_recv().unwrap().target.unwrap(), mount_nonce: 1 };
+        let port = engine.source_seek_port(stamp.clone());
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (player, output) = Player::new();
+        let (mut output, sender) = RenderSeekOutput::new(output);
+        let dsp = DspSource::new(port.tracked_source(Box::new(Decoder {
+            entered: entered_tx, release: release.clone(),
+        }), 0), Arc::new(AudioFx::new()), std::time::Instant::now(), None);
+        player.append(SeekTargetGuard::new(Box::new(dsp), port.clone()));
+        output.next();
+        let (original_a, mut a_reply) = BoundSeekRequest::new(stamp, port, 80, 1.0).unwrap();
+        let before = serde_json::to_value(engine.snapshot()).unwrap();
+        assert!(sender.try_submit(original_a).is_ok());
+        let thread = std::thread::spawn(move || { output.next(); });
+        let mut worker = PullWorker { release, thread: Some(thread) };
+        assert!(entered_rx.recv_timeout(Duration::from_secs(5)).is_ok(), "A did not reach its decoder seek");
+        let (b_tx, b_rx) = std::sync::mpsc::channel();
+        let b_engine = engine.clone();
+        let b_thread = std::thread::spawn(move || { b_tx.send(b_engine.begin_play_intent()).unwrap(); });
+        let b_ticket = b_rx.recv_timeout(Duration::from_secs(5));
+        worker.finish();
+        b_thread.join().unwrap();
+        let original_b = b_ticket.expect("blocking decoder seek held the shared intent Gate");
+        assert_eq!(original_b, 2);
+        assert!(a_reply.try_recv().unwrap().is_err(), "A returned an applied receipt after B began during decoder seek");
+        assert_eq!(serde_json::to_value(engine.snapshot()).unwrap(), before);
+        let mut b_reply = engine.send_queue(vec![track("source-b", "7")], 0, Some(original_b));
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let b_reply = b_reply.try_recv().unwrap();
+        assert!(b_reply.applied);
+        assert_eq!(b_reply.target.unwrap().generation, original_b);
+        assert_eq!(load_gen, 2);
+    }
+
+    #[test]
+    fn source_bound_render_seek_rejects_a_without_consuming_pending_original_b() {
+        use crate::audio::render_control::{BoundSeekRequest, MountStamp, RenderSeekOutput, SeekTargetGuard};
+        use crate::audio::{AudioFx, DspSource};
+        use rodio::source::SeekError;
+        use rodio::{ChannelCount, Player, SampleRate, Source};
+        use std::sync::{Arc, Mutex};
+        struct Decoder { seeks: Arc<Mutex<Vec<Duration>>> }
+        impl Iterator for Decoder {
+            type Item = f32;
+            fn next(&mut self) -> Option<f32> { Some(0.1) }
+        }
+        impl Source for Decoder {
+            fn current_span_len(&self) -> Option<usize> { None }
+            fn channels(&self) -> ChannelCount { ChannelCount::new(1).unwrap() }
+            fn sample_rate(&self) -> SampleRate { SampleRate::new(1_000).unwrap() }
+            fn total_duration(&self) -> Option<Duration> { Some(Duration::from_secs(60)) }
+            fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
+                self.seeks.lock().unwrap().push(pos);
+                Ok(())
+            }
+        }
+        let (engine, inbox) = AudioEngine::command_channel();
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let stamp = MountStamp { target: seed.try_recv().unwrap().target.unwrap(), mount_nonce: 1 };
+        let port = engine.source_seek_port(stamp.clone());
+        let seeks = Arc::new(Mutex::new(Vec::new()));
+        let (player, output) = Player::new();
+        let (mut output, sender) = RenderSeekOutput::new(output);
+        let dsp = DspSource::new(port.tracked_source(Box::new(Decoder { seeks: seeks.clone() }), 0),
+            Arc::new(AudioFx::new()), std::time::Instant::now(), None);
+        player.append(SeekTargetGuard::new(Box::new(dsp), port.clone()));
+        output.next();
+        let (original_a, mut a_reply) = BoundSeekRequest::new(stamp, port.clone(), 80, 1.0).unwrap();
+        let original_b = engine.begin_play_intent();
+        assert_eq!(original_b, 2, "source factory re-registered the already accepted A");
+        let before = serde_json::to_value(engine.snapshot()).unwrap();
+        assert!(sender.try_submit(original_a).is_ok());
+        output.next();
+        assert!(seeks.lock().unwrap().is_empty(), "stale A reached its decoder while original B was pending");
+        assert!(a_reply.try_recv().unwrap().unwrap_err().source_intact);
+        assert_eq!(serde_json::to_value(engine.snapshot()).unwrap(), before);
+        assert_eq!(load_gen, 1);
+        let mut b_reply = engine.send_queue(vec![track("source-b", "7")], 0, Some(original_b));
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let b_reply = b_reply.try_recv().unwrap();
+        assert!(b_reply.applied, "stale A consumed the original pending B");
+        assert_eq!(b_reply.target.unwrap().generation, original_b);
+        assert_eq!(load_gen, 2);
+        assert_eq!(engine.snapshot().source_id.as_ref().map(|id| id.as_str()), Some("source-b"));
+    }
+
+    #[test]
+    fn initial_paused_source_seek_retains_original_request_until_normal_output_pull() {
+        use crate::audio::render_control::{BoundSeekRequest, MountStamp, RenderSeekOutput,
+            SeekTargetGuard, SourceSeekPort};
+        use crate::audio::{AudioFx, DspSource};
+        use rodio::source::SeekError;
+        use rodio::{ChannelCount, Player, SampleRate, Source};
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        struct PausedDecoder { samples: Arc<AtomicU64>, seeks: Arc<Mutex<Vec<Duration>>> }
+        impl Iterator for PausedDecoder {
+            type Item = f32;
+            fn next(&mut self) -> Option<f32> {
+                self.samples.fetch_add(1, Ordering::SeqCst);
+                Some(0.1)
+            }
+        }
+        impl Source for PausedDecoder {
+            fn current_span_len(&self) -> Option<usize> { None }
+            fn channels(&self) -> ChannelCount { ChannelCount::new(1).unwrap() }
+            fn sample_rate(&self) -> SampleRate { SampleRate::new(1_000).unwrap() }
+            fn total_duration(&self) -> Option<Duration> { Some(Duration::from_secs(60)) }
+            fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
+                self.seeks.lock().unwrap().push(pos);
+                Ok(())
+            }
+        }
+        let (engine, inbox) = AudioEngine::command_channel();
+        let mut load_gen = 0;
+        let mut receipt = engine.send_queue(vec![track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let stamp = MountStamp { target: receipt.try_recv().unwrap().target.unwrap(), mount_nonce: 1 };
+        let port = SourceSeekPort::new(stamp.clone());
+        let samples = Arc::new(AtomicU64::new(0));
+        let seeks = Arc::new(Mutex::new(Vec::new()));
+        let (player, output) = Player::new();
+        player.pause();
+        let (mut output, sender) = RenderSeekOutput::new(output);
+        let dsp = DspSource::new(port.tracked_source(Box::new(PausedDecoder {
+            samples: samples.clone(), seeks: seeks.clone(),
+        }), 0), Arc::new(AudioFx::new()), std::time::Instant::now(), None);
+        player.append(SeekTargetGuard::new(Box::new(dsp), port.clone()));
+        let (request, mut received) = BoundSeekRequest::new(stamp.clone(), port.clone(), 80, 1.0).unwrap();
+        assert!(sender.try_submit(request).is_ok());
+        output.next();
+        assert!(matches!(received.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)),
+            "initial paused seek completed before the queue selected its original source");
+        let mut accepted = None;
+        for _ in 0..64 {
+            output.next();
+            match received.try_recv() {
+                Ok(receipt) => { accepted = Some(receipt); break; }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                Err(error) => panic!("original paused-source receipt closed: {error}"),
+            }
+        }
+        let accepted = accepted.expect("normal paused output pulls never serviced the original request")
+            .expect("original paused source was not sought");
+        assert_eq!(accepted.stamp, stamp);
+        assert_eq!(accepted.content_position_ms, 80);
+        assert_eq!(*seeks.lock().unwrap(), vec![Duration::from_millis(80)]);
+        assert_eq!(samples.load(Ordering::SeqCst), 0);
+        assert!(player.is_paused());
+        assert_eq!(port.position_ms(), 80);
+    }
+
+    #[test]
+    fn render_bound_seek_does_not_reset_the_current_foreign_dsp_or_decoder() {
+        use crate::audio::fx::SpectrumTap;
+        use crate::audio::render_control::{BoundSeekRequest, MountStamp, RenderSeekOutput,
+            SeekTargetGuard, SourceSeekPort};
+        use crate::audio::{AudioFx, DspSource};
+        use rodio::source::SeekError;
+        use rodio::{ChannelCount, Player, SampleRate, Source};
+        use std::sync::{Arc, Mutex};
+
+        struct DecoderTracer { seeks: Arc<Mutex<Vec<Duration>>> }
+        impl Iterator for DecoderTracer {
+            type Item = f32;
+            fn next(&mut self) -> Option<f32> { Some(0.1) }
+        }
+        impl Source for DecoderTracer {
+            fn current_span_len(&self) -> Option<usize> { None }
+            fn channels(&self) -> ChannelCount { ChannelCount::new(1).unwrap() }
+            fn sample_rate(&self) -> SampleRate { SampleRate::new(1_000).unwrap() }
+            fn total_duration(&self) -> Option<Duration> { Some(Duration::from_secs(60)) }
+            fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
+                self.seeks.lock().unwrap().push(pos);
+                Ok(())
+            }
+        }
+        let (engine, inbox) = AudioEngine::command_channel();
+        let mut load_gen = 0;
+        let mut seed = engine.send_queue(vec![track("source-b", "7"), track("source-a", "7")], 0, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let b_target = seed.try_recv().unwrap().target.unwrap();
+        let mut selecting_a = engine.send_play_at(1, None);
+        inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let a_target = selecting_a.try_recv().unwrap().target.unwrap();
+        let b_stamp = MountStamp { target: b_target, mount_nonce: 1 };
+        let a_stamp = MountStamp { target: a_target, mount_nonce: 2 };
+        let b_port = SourceSeekPort::new(b_stamp);
+        let a_port = SourceSeekPort::new(a_stamp.clone());
+        let b_seeks = Arc::new(Mutex::new(Vec::new()));
+        let a_seeks = Arc::new(Mutex::new(Vec::new()));
+        let fx = Arc::new(AudioFx::new());
+        let (player, output) = Player::new();
+        let (mut output, sender) = RenderSeekOutput::new(output);
+        let b_dsp = DspSource::new(b_port.tracked_source(Box::new(DecoderTracer {
+            seeks: b_seeks.clone(),
+        }), 0), fx.clone(), std::time::Instant::now(), Some(SpectrumTap::new(None)));
+        player.append(SeekTargetGuard::new(Box::new(b_dsp), b_port.clone()));
+        output.next();
+        assert!(b_port.position_ms() > 0);
+        let a_dsp = DspSource::new(a_port.tracked_source(Box::new(DecoderTracer {
+            seeks: a_seeks.clone(),
+        }), 0), fx, std::time::Instant::now(), Some(SpectrumTap::new(None)));
+        player.append(SeekTargetGuard::new(Box::new(a_dsp), a_port.clone()));
+        let (request, mut received) = BoundSeekRequest::new(a_stamp.clone(), a_port.clone(), 80, 1.0).unwrap();
+        assert!(sender.try_submit(request).is_ok());
+        output.next();
+        assert!(b_seeks.lock().unwrap().is_empty(),
+            "logical Loading A caused a seek/reset of the physically current B DSP/decoder");
+        let rejected = received.try_recv().unwrap().unwrap_err();
+        assert!(rejected.source_intact);
+        assert!(a_seeks.lock().unwrap().is_empty());
+        assert_eq!(a_port.position_ms(), 0);
+
+        player.skip_one();
+        for _ in 0..512 {
+            output.next();
+            if a_port.position_ms() > 0 { break; }
+        }
+        assert!(a_port.position_ms() > 0);
+        let (request, mut received) = BoundSeekRequest::new(a_stamp.clone(), a_port.clone(), 80, 1.0).unwrap();
+        assert!(sender.try_submit(request).is_ok());
+        output.next();
+        let accepted = received.try_recv().unwrap().unwrap();
+        assert_eq!(accepted.stamp, a_stamp);
+        assert_eq!(accepted.content_position_ms, 80);
+        assert_eq!(*a_seeks.lock().unwrap(), vec![Duration::from_millis(80)]);
+        assert!(b_seeks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_restore_uses_its_captured_eligibility_and_real_commit_receipt() {
+        use crate::audio::state::PlayMode;
+        use crate::provider::types::Quality;
+        fn saved() -> super::super::playback_commit::RestoredPlayback {
+            super::super::playback_commit::RestoredPlayback {
+                tracks: vec![track("saved-source", "7")], index: 0, position_ms: 8_123,
+                play_mode: PlayMode::Random, volume: 0.25, muted: true,
+                quality: Quality::default(),
+            }
+        }
+        let (engine, inbox) = AudioEngine::command_channel();
+        let (loaded_tx, loaded_rx) = tokio::sync::oneshot::channel();
+        let restoring_engine = engine.clone();
+        let restoring = tokio::spawn(async move {
+            restoring_engine.restore_after_load(|| async {
+                let _ = loaded_tx.send(());
+                Ok(Some(saved()))
+            }).await
+        });
+        loaded_rx.await.unwrap();
+        let mut load_gen = 0;
+        let delivery = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let restored = restoring.await.unwrap().unwrap();
+        assert!(restored.is_some(), "eligible startup restore returned no accepted snapshot");
+        assert!(matches!(delivery, AudioDelivery::Playback(_)));
+        let restored = restored.unwrap();
+        assert_eq!(restored.source_id.as_ref().map(|id| id.as_str()), Some("saved-source"));
+        assert_eq!(restored.position_ms, 8_123);
+        assert_eq!(restored.play_mode, PlayMode::Random);
+        assert_eq!(restored.volume, 0.25);
+        assert!(restored.muted);
+        assert_eq!(load_gen, 1);
+        let read_only = engine.restore_after_load(|| async {
+            Err("existing track must not invoke the storage loader".to_string())
+        }).await.unwrap();
+        assert_eq!(serde_json::to_value(read_only.unwrap()).unwrap(),
+            serde_json::to_value(restored).unwrap());
+
+        let (held_engine, held_inbox) = AudioEngine::command_channel();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (loaded_tx, loaded_rx) = tokio::sync::oneshot::channel();
+        let delayed_engine = held_engine.clone();
+        let delayed = tokio::spawn(async move {
+            delayed_engine.restore_after_load(|| async {
+                let _ = entered_tx.send(());
+                release_rx.await.unwrap();
+                let _ = loaded_tx.send(());
+                Ok(Some(saved()))
+            }).await
+        });
+        entered_rx.await.unwrap();
+        let original_b = held_engine.begin_play_intent();
+        let before = serde_json::to_value(held_engine.snapshot()).unwrap();
+        release_tx.send(()).unwrap();
+        loaded_rx.await.unwrap();
+        let mut held_gen = 0;
+        assert!(matches!(held_inbox.recv_timeout(Duration::from_secs(5), &mut held_gen)
+            .unwrap(), AudioDelivery::Rejected));
+        assert!(delayed.await.unwrap().unwrap().is_none());
+        assert_eq!(serde_json::to_value(held_engine.snapshot()).unwrap(), before);
+        assert_eq!(held_gen, 0);
+        let mut b = held_engine.send_queue(vec![track("new-source", "7")], 0, Some(original_b));
+        assert!(matches!(held_inbox.recv_timeout(Duration::from_secs(5), &mut held_gen)
+            .unwrap(), AudioDelivery::Playback(_)));
+        assert_eq!(b.try_recv().unwrap().target.unwrap().generation, original_b);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn late_queue_ack_is_rejected_without_consuming_new_pending_b() {
+        let (engine, inbox) = AudioEngine::command_channel();
+        let original_a = engine.begin_play_intent();
+        let (filtered_tx, filtered_rx) = tokio::sync::oneshot::channel();
+        let engine_a = engine.clone();
+        let a_work = tokio::spawn(async move {
+            engine_a.queue_after_filter(
+                vec![track("source-a", "7")], 0, Some(original_a),
+                move |tracks, index| async move {
+                    filtered_tx.send(()).expect("A reached the real sender");
+                    Ok((tracks, index))
+                },
+            ).await
+        });
+        filtered_rx.await.expect("A has sent its real queue command");
+        let mut load_gen = 0;
+        let a_delivery = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        assert!(matches!(a_delivery, AudioDelivery::Playback(_)));
+        assert_eq!(load_gen, 1, "A's semantic commit really happened first");
+        let before = serde_json::to_value(engine.snapshot()).unwrap();
+
+        // No await between sending A's receipt and beginning B on this single-thread runtime.
+        // A has committed, but its IPC future has not yet returned to its caller.
+        let original_b = engine.begin_play_intent();
+        let a_receipt = a_work.await.unwrap().unwrap();
+        assert!(
+            !a_receipt.applied && a_receipt.target.is_none()
+                && serde_json::to_value(engine.snapshot()).unwrap() == before
+                && load_gen == 1,
+            "late A queue ACK remained usable after B began: receipt={a_receipt:?}, load_gen={load_gen}",
+        );
+
+        let (b_filtered_tx, b_filtered_rx) = tokio::sync::oneshot::channel();
+        let engine_b = engine.clone();
+        let b_work = tokio::spawn(async move {
+            engine_b.queue_after_filter(
+                vec![track("source-b", "7")], 0, Some(original_b),
+                move |tracks, index| async move {
+                    b_filtered_tx.send(()).expect("B reached the same real sender");
+                    Ok((tracks, index))
+                },
+            ).await
+        });
+        b_filtered_rx.await.expect("B still has its original pending authority");
+        let b_delivery = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let b_receipt = b_work.await.unwrap().unwrap();
+        assert!(b_receipt.applied && matches!(b_delivery, AudioDelivery::Playback(_)));
+        let b_target = b_receipt.target.expect("accepted B retains its own ACK target");
+        assert_eq!((b_target.generation, b_target.platform.as_str(), b_target.id.as_str()),
+            (original_b, "source-b", "7"));
+        assert_eq!(load_gen, 2, "the ACK check cannot consume B before its semantic commit");
+        assert!(!engine.abandon_play_intent(original_b), "B survives its caller's finally");
+    }
+
+    #[test]
+    fn queued_original_a_cannot_be_rebound_to_pending_b_by_real_receiver() {
+        let (engine, inbox) = AudioEngine::command_channel();
+        let original_a = engine.begin_play_intent();
+        let mut a_reply = engine.send_queue(vec![track("source-a", "7")], 0, Some(original_a));
+        // The actual A message is already queued before B declares a newer action.
+        let original_b = engine.begin_play_intent();
+        let before = serde_json::to_value(engine.snapshot()).unwrap();
+        let mut load_gen = 0;
+        let a_delivery = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let a_receipt = a_reply.try_recv().expect("the production receiver replied to A");
+        assert!(
+            !a_receipt.applied && matches!(a_delivery, AudioDelivery::Rejected)
+                && engine.queue_snapshot().is_empty()
+                && serde_json::to_value(engine.snapshot()).unwrap() == before
+                && load_gen == 0,
+            "real receiver rebound queued A to B: receipt={a_receipt:?}, track={:?}, load_gen={load_gen}",
+            engine.snapshot().track_id,
+        );
+
+        // The rejected old message must not consume B; identical bare ids are different sources.
+        let mut b_reply = engine.send_queue(vec![track("source-b", "7")], 0, Some(original_b));
+        let b_delivery = inbox.recv_timeout(Duration::from_secs(5), &mut load_gen).unwrap();
+        let b_receipt = b_reply.try_recv().expect("B got its own production receipt");
+        assert!(b_receipt.applied && matches!(b_delivery, AudioDelivery::Playback(_)));
+        let target = b_receipt.target.expect("B's logical accepted target");
+        assert_eq!((target.generation, target.platform.as_str(), target.id.as_str()),
+            (original_b, "source-b", "7"));
+        let queue = engine.queue_snapshot();
+        let current = queue.current().expect("B committed the actual shared queue");
+        assert_eq!((current.platform.as_str(), current.id.as_str()), ("source-b", "7"));
+        assert_eq!(load_gen, 1, "only accepted B allocates a real load generation");
+        assert!(!engine.abandon_play_intent(original_b), "finally cannot revoke accepted B");
     }
 }
 

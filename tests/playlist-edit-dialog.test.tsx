@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  cachedPlaylistCover,
+  hasCachedPlaylistCover,
+  invalidatePlaylistCoverCache,
+  setCachedPlaylistCover,
+} from "@/lib/playlist-cover-cache";
 import type { Track } from "@/types";
 
 const mocks = vi.hoisted(() => ({
@@ -88,6 +94,8 @@ async function openEditDialog(): Promise<void> {
   const { PlaylistDetailPage } = await import("@/components/discovery/PlaylistDetailPage");
   render(<PlaylistDetailPage platform="local" id="pl1" />);
   await waitFor(() => expect(screen.getByText("我的老歌单")).toBeTruthy());
+  await waitFor(() => expect(mocks.getPlaylistCover).toHaveBeenCalledWith("pl1"));
+  await act(async () => { await Promise.resolve(); });
   fireEvent.click(screen.getByLabelText(/编辑歌单/));
   await waitFor(() => expect(screen.getByRole("heading", { level: 2, name: "编辑歌单" })).toBeTruthy());
 }
@@ -106,6 +114,7 @@ describe("本地歌单编辑弹窗（改名 + 换封面）", () => {
 
   afterEach(() => {
     cleanup();
+    invalidatePlaylistCoverCache("pl1");
   });
 
   it("改名保存：调 renamePlaylist，标题当场换新，弹窗关掉", async () => {
@@ -177,6 +186,79 @@ describe("本地歌单编辑弹窗（改名 + 换封面）", () => {
     fireEvent.click(screen.getByRole("button", { name: "恢复默认封面" }));
 
     await waitFor(() => expect(mocks.clearPlaylistCover).toHaveBeenCalledWith("pl1"));
+  });
+
+  it("云端清空成功但本地缓存更新失败：显示独立原因，不误报云端清空失败", async () => {
+    const message = "SQLite 歌单卡片缓存更新失败（synthetic）";
+    mocks.clearPlaylistCover.mockResolvedValue({
+      cloud: "synced",
+      message,
+    });
+    await openEditDialog();
+    fireEvent.click(screen.getByRole("button", { name: "恢复默认封面" }));
+
+    await waitFor(() => expect(mocks.clearPlaylistCover).toHaveBeenCalledWith("pl1"));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(message);
+    expect(screen.queryByText(/云端.*失败/)).toBeNull();
+  });
+
+  it.each([
+    "复制封面文件失败: owned-mid-copy-failure",
+    "登记封面失败: owned-registration-failure",
+  ])("换封面被拒后保留实际缓存及旧预览：%s", async (reason) => {
+    const old = "data:image/jpeg;base64,T0xE";
+    setCachedPlaylistCover("pl1", old);
+    mocks.getPlaylistCover.mockResolvedValue(old);
+    mocks.pickImage.mockResolvedValue("D:/pics/c14-replacement.png");
+    let rejectCover: (error: Error) => void = () => {
+      throw new Error("owned replacement request was not entered");
+    };
+    mocks.setPlaylistCover.mockImplementationOnce(() => new Promise<never>((_resolve, reject) => {
+      rejectCover = reject;
+    }));
+    await openEditDialog();
+    const dialog = screen.getByRole("dialog", { name: "编辑歌单" });
+    const preview = within(dialog).getByAltText("");
+    expect(preview.getAttribute("src")).toBe(old);
+    const readsBeforeReplace = mocks.getPlaylistCover.mock.calls.length;
+    fireEvent.click(within(dialog).getByRole("button", { name: "更换封面" }));
+    await waitFor(() => expect(mocks.setPlaylistCover).toHaveBeenCalledWith(
+      "pl1", "D:/pics/c14-replacement.png",
+    ));
+    expect(cachedPlaylistCover("pl1")).toBe(old);
+    expect(preview.getAttribute("src")).toBe(old);
+    await act(async () => { rejectCover(new Error(reason)); });
+    await waitFor(() => expect(within(dialog).getByRole("alert").textContent).toBe(
+      `更换封面失败：${reason}`,
+    ));
+    expect(hasCachedPlaylistCover("pl1")).toBe(true);
+    expect(cachedPlaylistCover("pl1")).toBe(old);
+    expect(preview.getAttribute("src")).toBe(old);
+    expect(mocks.getPlaylistCover.mock.calls.length).toBe(readsBeforeReplace);
+    expect(within(dialog).getByRole("button", { name: "保存" }).hasAttribute("disabled")).toBe(false);
+  });
+
+  it("换封面成功才废掉实际旧缓存并显示新的读回预览", async () => {
+    const old = "data:image/jpeg;base64,T0xE";
+    const replacement = "data:image/png;base64,TkVX";
+    setCachedPlaylistCover("pl1", old);
+    mocks.getPlaylistCover.mockResolvedValue(old);
+    mocks.pickImage.mockResolvedValue("D:/pics/c14-replacement.png");
+    mocks.setPlaylistCover.mockResolvedValue({ path: "data/covers/pl1.png", cloud: "synced" });
+    await openEditDialog();
+    const dialog = screen.getByRole("dialog", { name: "编辑歌单" });
+    const preview = within(dialog).getByAltText("");
+    expect(preview.getAttribute("src")).toBe(old);
+    const readsBeforeReplace = mocks.getPlaylistCover.mock.calls.length;
+    mocks.getPlaylistCover.mockResolvedValue(replacement);
+    fireEvent.click(within(dialog).getByRole("button", { name: "更换封面" }));
+    await waitFor(() => expect(preview.getAttribute("src")).toBe(replacement));
+    expect(mocks.setPlaylistCover).toHaveBeenCalledWith("pl1", "D:/pics/c14-replacement.png");
+    expect(hasCachedPlaylistCover("pl1")).toBe(false);
+    expect(cachedPlaylistCover("pl1")).toBeUndefined();
+    expect(mocks.getPlaylistCover.mock.calls.length).toBe(readsBeforeReplace + 1);
+    expect(within(dialog).queryByRole("alert")).toBeNull();
   });
 
   it("封面 hover 蒙层与「编辑歌单」入口都在（在线歌单/榜单不摆）", async () => {

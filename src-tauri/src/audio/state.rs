@@ -36,6 +36,8 @@ pub use crate::provider::types::Quality;
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaybackStateSnapshot {
+    /// Present only while the user has selected a DLNA renderer.
+    pub cast: Option<crate::dlna::CastState>,
     pub track_id: Option<String>,
     pub source_id: Option<SourceId>,
     pub status: PlaybackStatus,
@@ -74,6 +76,7 @@ pub struct PlaybackStateSnapshot {
 impl Default for PlaybackStateSnapshot {
     fn default() -> Self {
         Self {
+            cast: None,
             track_id: None,
             source_id: None,
             status: PlaybackStatus::Stopped,

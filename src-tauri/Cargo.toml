@@ -36,6 +36,8 @@ tauri = { version = "=2.12.1", features = ["tray-icon", "macos-private-api"] }
 tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+quick-xml = "0.42"
+if-addrs = "0.14"
 thiserror = "2.0.21"
 async-trait = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
@@ -59,6 +61,8 @@ md-5 = "0.11"
 # 更新包 ed25519 签名校验（file_logger/更新链路）：ring 已由 rustls 带入依赖树，
 # 复用同一份源码不引入新副本
 ring = "0.17"
+# 离线语音引擎的官方 ZIP，只启用解压所需的 deflate。
+zip = { version = "=4.6.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 base64 = "0.23"
 # 同名 .lrc 的文本解码（UTF-8 失败按 GB18030 兜底，中文曲库里大量 GBK 歌词）：
 # reqwest 已把同一版本带进依赖树，不引入新副本
@@ -91,6 +95,12 @@ lofty = "0.24"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 souvlaki = { version = "0.8.3", default-features = false, features = ["use_zbus"] }
+# Astral 身份凭据走 Secret Service；复用现有依赖树，不引入明文回落（S03）
+zbus = { version = "=5.19.0", default-features = false, features = ["async-io", "blocking-api"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Astral 身份凭据走 Keychain；钉住支持本项目 MSRV 的现有版本（S03）
+security-framework = { version = "=3.7.0", default-features = false, features = ["OSX_10_14"] }
 
 # Windows 任务栏缩略图工具栏（taskbar.rs）：ITaskbarList3::ThumbBarAddButtons +
 # GDI 现场生成图标 + 窗口过程替换接收按钮点击。
@@ -102,6 +112,8 @@ souvlaki = { version = "0.8.3", default-features = false, features = ["use_zbus"
 webview2-com = "0.39"
 windows = { version = "0.62", features = [
     "Win32_Foundation",
+    # Astral 身份凭据只进 Windows Credential Manager（S03）
+    "Win32_Security_Credentials",
     "Win32_Graphics_Gdi",
     "Win32_System_Com",
     "Win32_System_Registry",

@@ -6,11 +6,20 @@
 
 pub mod engine;
 pub mod fx;
+pub mod listening;
+pub mod play_intent;
+pub mod playback_commit;
 pub mod queue;
+pub mod render_control;
 pub mod range_reader;
 pub mod replay_gain;
 pub mod state;
+mod device_source;
 mod source;
+mod speed_setting;
+
+#[cfg(test)]
+mod playback_speed_tests;
 
 pub use engine::{AudioCmd, AudioEngine, PlaySource};
 pub use fx::{AudioFx, DspSource, EqParams, FadeParams, FxState, SpectrumTap, EQ_BAND_HZ};

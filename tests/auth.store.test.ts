@@ -5,10 +5,13 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/services/ipc", () => ({
   astralSession: vi.fn(),
+  astralLogin: vi.fn(),
   astralMe: vi.fn(),
   astralLogout: vi.fn(async () => {}),
   getSetting: vi.fn(async () => "1"),
   setSetting: vi.fn(async () => {}),
+  likeClearLocal: vi.fn(async () => 0),
+  likeSessionEpoch: vi.fn(async () => 1),
   likePull: vi.fn(async () => ({ changes: [], maxSeq: 0 })),
   likePullAll: vi.fn(async () => ({ songs: [], playlists: [], maxSeq: 0 })),
   likeApply: vi.fn(async () => {}),
@@ -20,17 +23,32 @@ vi.mock("@/services/ipc", () => ({
 }));
 
 import * as ipc from "@/services/ipc";
-import { useAuthStore, isAdmin, pullLikes } from "@/stores/auth";
+import { useAuthStore, isAdmin, pullLikes, LIKE_OWNER_KEY } from "@/stores/auth";
 import { useFavoritesStore } from "@/stores/favorites";
 import type { AuthSession } from "@/types";
 
 const ipcMock = vi.mocked(ipc);
 
+/** 让 auth store 走真实登录链路进入「身份可信」态，再清掉登录触发的后台同步痕迹 */
+async function loginForLikeSync(): Promise<void> {
+  ipcMock.astralLogin.mockResolvedValue(validSession());
+  ipcMock.astralMe.mockResolvedValue({ id: "account-1", nickname: "轻听用户" });
+  ipcMock.getSetting.mockImplementation((key: string) =>
+    Promise.resolve(key === LIKE_OWNER_KEY ? "account-1" : "1"),
+  );
+  ipcMock.setSetting.mockResolvedValue(undefined);
+  await useAuthStore.getState().login("tester", "pw");
+  for (let i = 0; i < 60; i++) await Promise.resolve();
+  ipcMock.likePull.mockClear();
+  ipcMock.likePullAll.mockClear();
+  ipcMock.likeApply.mockClear();
+  ipcMock.setSetting.mockClear();
+}
+
 /** 本地看还在有效期内（留足 60s 余量）的会话 */
 function validSession(): AuthSession {
   return {
-    token: "stale-token",
-    refreshToken: "stale-token",
+    persistence: "secure",
     expiresAt: Date.now() + 3_600_000,
   };
 }
@@ -73,19 +91,21 @@ describe("auth store 启动恢复", () => {
 
     await useAuthStore.getState().init();
 
-    expect(useAuthStore.getState().session?.token).toBe("stale-token");
+    expect(useAuthStore.getState().session?.persistence).toBe("secure");
     expect(useAuthStore.getState().profile).toEqual({ nickname: "轻听用户" });
     expect(ipcMock.astralLogout).not.toHaveBeenCalled();
   });
 });
 
 describe("云端收藏同步使列表状态缓存失效", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
     useFavoritesStore.setState({ version: 0 });
     ipcMock.getSetting.mockResolvedValue("1");
     ipcMock.likeApply.mockResolvedValue(0);
     ipcMock.likePull.mockResolvedValue({ changes: [], maxSeq: 1 });
+    // 独立 pullLikes() 现在也要求身份可信：先真实登录一次
+    await loginForLikeSync();
   });
 
   it("增量落库成功后刷新收藏版本，无变化不刷新", async () => {

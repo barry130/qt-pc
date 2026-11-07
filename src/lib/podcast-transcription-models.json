@@ -1,0 +1,4 @@
+[
+  { "id": "gpt-4o-transcribe-diarize", "label": "gpt-4o-transcribe-diarize · 说话人时间轴", "responseFormat": "diarized_json" },
+  { "id": "whisper-1", "label": "whisper-1 · 分句时间轴", "responseFormat": "verbose_json" }
+]

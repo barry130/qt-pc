@@ -29,8 +29,10 @@ import type {
   SmartPlaylistMeta,
   SmartRules,
   PlaybackState,
+  PlayTarget,
   PositionChanged,
   QueueChanged,
+  QueueCommitReply,
   Quality,
   RuntimeCacheClearResult,
   Track,
@@ -54,6 +56,11 @@ import type {
   AiProviderProtocol,
 } from "@/types";
 import { isQuality } from "@/lib/quality";
+import type { DlnaDevice, DlnaCastState } from "@/types";
+
+export const discoverDlna = (): Promise<DlnaDevice[]> => invoke("dlna_discover", { timeoutMs: 3000 });
+export const connectDlna = (deviceId: string): Promise<DlnaCastState> => invoke("dlna_connect", { deviceId });
+export const disconnectDlna = (returnToLocal = false): Promise<void> => invoke("dlna_disconnect", { returnToLocal });
 
 /**
  * M0-M2 IPC 契约。命令名与 Rust 侧 `#[tauri::command]` 一一对应；
@@ -663,8 +670,9 @@ export async function getPlaylistTracks(id: string): Promise<Track[]> {
 export async function addTracksToPlaylist(
   id: string,
   tracks: Track[],
+  sessionEpoch?: number,
 ): Promise<number> {
-  return invoke("add_tracks_to_playlist", { id, tracks });
+  return invoke("add_tracks_to_playlist", sessionEpoch === undefined ? { id, tracks } : { id, tracks, sessionEpoch });
 }
 
 /**
@@ -685,8 +693,9 @@ export async function removeTrackFromPlaylist(
 export async function removeTracksFromPlaylist(
   id: string,
   tracks: Track[],
+  sessionEpoch?: number,
 ): Promise<number> {
-  return invoke("remove_tracks_from_playlist", { id, tracks });
+  return invoke("remove_tracks_from_playlist", sessionEpoch === undefined ? { id, tracks } : { id, tracks, sessionEpoch });
 }
 
 // ---------- 智能歌单（A5，对照分析文档 §4.5） ----------
@@ -977,9 +986,9 @@ export async function setSourceQualities(qualities: Record<string, string>): Pro
 
 // ---------- 倍速 / 睡眠定时 / 音效 / 缓存 / 自启 ----------
 
-/** 改播放倍速（0.5~2.0，引擎夹紧）。立即生效并持久化，重启保持 */
-export async function setSpeed(speed: number): Promise<void> {
-  return invoke("set_speed", { speed });
+/** 改播放倍速（0.5~2.0，引擎夹紧）。立即生效并持久化，重启保持；带 target 时绑定该原音源资格 */
+export async function setSpeed(speed: number, target?: PlayTarget): Promise<void> {
+  return invoke("set_speed", target ? { speed, target } : { speed });
 }
 
 /** 预载下一首并连续输出音频；开关由引擎持久化。 */
@@ -1315,18 +1324,26 @@ export async function astralRegister(
   });
 }
 
-export async function astralLogout(): Promise<void> {
-  return invoke("astral_logout");
+export async function astralLogout(sessionEpoch?: number): Promise<void> {
+  return sessionEpoch === undefined
+    ? invoke("astral_logout")
+    : invoke("astral_logout", { sessionEpoch });
 }
 
-/** 当前用户信息：后端字段不固定，按原样透传 */
-export async function astralMe(): Promise<Record<string, unknown> | null> {
-  return invoke("astral_me");
+/** 当前用户信息：后端字段不固定，按原样透传；可绑定已捕获的会话代次。 */
+export async function astralMe(
+  sessionEpoch?: number,
+): Promise<Record<string, unknown> | null> {
+  return sessionEpoch === undefined
+    ? invoke("astral_me")
+    : invoke("astral_me", { sessionEpoch });
 }
 
-/** 用旧 token 换新会话，免得重新输密码 */
-export async function astralRefresh(): Promise<AuthSession> {
-  return invoke("astral_refresh");
+/** 刷新原生会话，可绑定已捕获的原票；仅返回安全会话状态。 */
+export async function astralRefresh(sessionEpoch?: number): Promise<AuthSession> {
+  return sessionEpoch === undefined
+    ? invoke("astral_refresh")
+    : invoke("astral_refresh", { sessionEpoch });
 }
 
 /** 本地保存的会话（可能已过期） */
@@ -1441,8 +1458,9 @@ export async function astralChangePassword(
 
 export async function astralUpdateProfile(
   patch: Record<string, unknown>,
+  sessionEpoch?: number,
 ): Promise<unknown> {
-  return invoke("astral_update_profile", { patch });
+  return invoke("astral_update_profile", { patch, ...sessionEpochPayload(sessionEpoch) });
 }
 
 // ---------- 媒体直传（UPDATE_DESIGN.md §5.2/§5.3） ----------
@@ -1492,8 +1510,12 @@ export async function saveBinaryFile(path: string, data: string): Promise<void> 
 /** 头像上传一条龙，返回新头像 URL（URL 即版本，天然破缓存） */
 export async function astralUploadAvatar(
   filePath: string,
+  sessionEpoch?: number,
 ): Promise<{ url: string }> {
-  return invoke("astral_upload_avatar", { filePath });
+  return invoke("astral_upload_avatar", {
+    filePath,
+    ...(sessionEpoch === undefined ? {} : { sessionEpoch }),
+  });
 }
 
 /** 在线歌单封面上传，返回新封面 URL */
@@ -1603,7 +1625,8 @@ export interface LikeChange {
   hash: string;
   /** 歌曲所属歌单（song 变更项可空；playlist 变更项无此字段） */
   pid?: string;
-  picUrl: string;
+  /** Missing/null preserves metadata; an explicit empty playlist cover clears it. */
+  picUrl?: string | null;
   deleted: boolean;
   updatedSeq: number;
 }
@@ -1613,9 +1636,21 @@ export interface LikePullResult {
   maxSeq: number;
 }
 
+/** 同一同步链固定使用这个代次；只返回代次，不把原生凭据带回 WebView。 */
+export async function likeSessionEpoch(): Promise<number> {
+  return invoke("like_session_epoch");
+}
+
+function sessionEpochPayload(sessionEpoch?: number): { sessionEpoch?: number } {
+  return sessionEpoch === undefined ? {} : { sessionEpoch };
+}
+
 /** 增量拉取云端收藏变更（since 为 0 视作从头开始） */
-export async function likePull(since: number): Promise<LikePullResult> {
-  return invoke("like_pull", { since });
+export async function likePull(
+  since: number,
+  sessionEpoch?: number,
+): Promise<LikePullResult> {
+  return invoke("like_pull", { since, ...sessionEpochPayload(sessionEpoch) });
 }
 
 // ---------- 收藏的在线歌单（schema v2） ----------
@@ -1666,33 +1701,45 @@ export async function isPlaylistFavorited(
 export async function likePullAll(
   page: number,
   size = 100,
+  sessionEpoch?: number,
 ): Promise<unknown> {
-  return invoke("like_pull_all", { page, size });
+  return invoke("like_pull_all", { page, size, ...sessionEpochPayload(sessionEpoch) });
 }
 
 /** 把云端变更落到本地收藏表（不回推，避免来回震荡） */
-export async function likeApply(changes: LikeChange[]): Promise<number> {
-  return invoke("like_apply", { changes });
+export async function likeApply(
+  changes: LikeChange[],
+  sessionEpoch?: number,
+): Promise<number> {
+  return invoke("like_apply", { changes, ...sessionEpochPayload(sessionEpoch) });
 }
 
 /** 重放收藏推送离线队列（断网期间失败的操作，启动/登录后补推） */
-export async function likeFlushPending(): Promise<number> {
-  return invoke("like_flush_pending");
+export async function likeFlushPending(sessionEpoch?: number): Promise<number> {
+  return sessionEpoch === undefined
+    ? invoke("like_flush_pending")
+    : invoke("like_flush_pending", { sessionEpoch });
 }
 
 /** 启动对账：本地有而云端没有的收藏补推（存在性 diff，不是版本比较） */
-export async function likeReconcile(): Promise<number> {
-  return invoke("like_reconcile");
+export async function likeReconcile(sessionEpoch?: number): Promise<number> {
+  return sessionEpoch === undefined
+    ? invoke("like_reconcile")
+    : invoke("like_reconcile", { sessionEpoch });
 }
 
 /** 换账号登录：清空本地收藏/队列/游标（归属检测到变化时调用） */
-export async function likeClearLocal(): Promise<number> {
-  return invoke("like_clear_local");
+export async function likeClearLocal(sessionEpoch?: number): Promise<number> {
+  return sessionEpoch === undefined
+    ? invoke("like_clear_local")
+    : invoke("like_clear_local", { sessionEpoch });
 }
 
-/** 退出登录：清离线队列与游标，保留收藏数据和归属标记 */
-export async function likeResetSync(): Promise<void> {
-  return invoke("like_reset_sync");
+/** 退出登录前：清离线队列与游标，保留收藏数据和归属标记。 */
+export async function likeResetSync(sessionEpoch?: number): Promise<void> {
+  return sessionEpoch === undefined
+    ? invoke("like_reset_sync")
+    : invoke("like_reset_sync", { sessionEpoch });
 }
 
 // ---------- 通用设置项（settings 表） ----------
@@ -1701,8 +1748,12 @@ export async function getSetting(key: string): Promise<string | null> {
   return invoke("get_setting", { key });
 }
 
-export async function setSetting(key: string, value: string): Promise<void> {
-  return invoke("set_setting", { key, value });
+export async function setSetting(
+  key: string,
+  value: string,
+  sessionEpoch?: number,
+): Promise<void> {
+  return invoke("set_setting", { key, value, ...sessionEpochPayload(sessionEpoch) });
 }
 
 /**
@@ -1725,31 +1776,61 @@ export async function revealLogs(): Promise<void> {
 
 // ---------- 播放 / 队列 ----------
 
+/**
+ * 播放意图登记：在取链预解析之前拿一个 Native 代次票。
+ *
+ * 预解析最坏 8s，这段时间里 SMTC / 媒体热键可能已经换了歌（那条路径不经过
+ * JS 的 playActionSeq）。票在动作入口登记，Native 用「登记之后是否又发生过
+ * 播放意图」判断旧动作是否已过期；票随实际播放 IPC 原样带回（playIntent）。
+ * 登记失败时 store 整条动作 fail closed；直接调用旧播放 API 的可选参数仍兼容。
+ */
+export async function beginPlayIntent(): Promise<number> {
+  return invoke("begin_play_intent");
+}
+
+/** 仅取消原票的未提交意图；已提交或被另一票取代时 Native 不做任何修改。 */
+export async function abandonPlayIntent(playIntent: number): Promise<void> {
+  return invoke("abandon_play_intent", { playIntent });
+}
+
 export async function playQueue(
   tracks: Track[],
   startIndex: number,
-): Promise<void> {
-  return invoke("play_queue", { tracks, startIndex });
+  playIntent?: number,
+): Promise<QueueCommitReply> {
+  return playIntent === undefined
+    ? invoke("play_queue", { tracks, startIndex })
+    : invoke("play_queue", { tracks, startIndex, playIntent });
 }
 
 /**
  * 单曲播放：不替换播放列表 —— 队里已有这首就播它原来那条，否则追加到队尾再播。
  * 「播放全部」等整列表入队走 `playQueue`。
  */
-export async function playTrack(track: Track, quality: string): Promise<void> {
-  return invoke("play_track", { track, quality });
+export async function playTrack(
+  track: Track,
+  quality: string,
+  playIntent?: number,
+): Promise<void> {
+  return playIntent === undefined
+    ? invoke("play_track", { track, quality })
+    : invoke("play_track", { track, quality, playIntent });
 }
 
-export async function playAt(index: number): Promise<void> {
-  return invoke("play_at", { index });
+export async function playAt(index: number, playIntent?: number): Promise<void> {
+  return playIntent === undefined
+    ? invoke("play_at", { index })
+    : invoke("play_at", { index, playIntent });
 }
 
-export async function next(): Promise<void> {
-  return invoke("next");
+export async function next(playIntent?: number): Promise<void> {
+  return playIntent === undefined ? invoke("next") : invoke("next", { playIntent });
 }
 
-export async function previous(): Promise<void> {
-  return invoke("previous");
+export async function previous(playIntent?: number): Promise<void> {
+  return playIntent === undefined
+    ? invoke("previous")
+    : invoke("previous", { playIntent });
 }
 
 export async function setPlayMode(
@@ -1798,16 +1879,16 @@ export async function queueRemoveIndices(indices: number[]): Promise<void> {
   return invoke("queue_remove_indices", { indices });
 }
 
-export async function pause(): Promise<void> {
-  return invoke("pause");
+export async function pause(target?: PlayTarget): Promise<void> {
+  return target === undefined ? invoke("pause") : invoke("pause", { target });
 }
 
 export async function resume(): Promise<void> {
   return invoke("resume");
 }
 
-export async function seek(positionMs: number): Promise<void> {
-  return invoke("seek", { positionMs });
+export async function seek(positionMs: number, target?: PlayTarget): Promise<void> {
+  return invoke("seek", target === undefined ? { positionMs } : { positionMs, target });
 }
 
 export async function setVolume(volume: number): Promise<void> {

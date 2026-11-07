@@ -7,7 +7,7 @@
   <body>
     <!--
       音源引擎页（v3 统一包模型，与 qt-uniappx services/source-engine.uts 同口径）：
-      - 由 qtres:// 协议内嵌提供（无 CSP 注入 → 可自由动态 import）；
+      - 由 qtres:// 协议内嵌提供（引擎专用 CSP，动态 import 仅放行同源模块）；
       - __TAURI_INTERNALS__ 由 Tauri 注入（withGlobalTauri 仍为 false，不用全局 API）；
       - 数据槽（meta）：不再内置基线——数据包（install/<id>/meta-bundle.js，
         首行 __QT_PACK__ 包头）完全在线安装；activeMetaId 指向它时本页动态
@@ -75,39 +75,101 @@
        * 其余一律拒绝（全局 fetch、XHR、WebSocket、EventSource、Worker、sendBeacon）。
        */
       function lockDownNetwork() {
-        const IPC_PREFIXES = [
-          "http://ipc.localhost",
-          "https://ipc.localhost",
-          "ipc://",
-        ];
+        // Native all-frame DocumentStart reports any capability it could not
+        // freeze. Never load/evaluate an untrusted bundle after such a failure.
+        if (window.__qtRtcLockFailures !== undefined) {
+          throw new Error("音源引擎禁网能力初始化失败");
+        }
+        const NativeURL = window.URL;
+        const apply = Reflect.apply;
+        const urlHref = Object.getOwnPropertyDescriptor(NativeURL.prototype, "href").get;
+        const urlProtocol = Object.getOwnPropertyDescriptor(NativeURL.prototype, "protocol").get;
+        const urlHostname = Object.getOwnPropertyDescriptor(NativeURL.prototype, "hostname").get;
+        const urlPort = Object.getOwnPropertyDescriptor(NativeURL.prototype, "port").get;
+        const urlUsername = Object.getOwnPropertyDescriptor(NativeURL.prototype, "username").get;
+        const urlPassword = Object.getOwnPropertyDescriptor(NativeURL.prototype, "password").get;
+        const readEndpoint = (url) => ({
+          href: apply(urlHref, url, []),
+          protocol: apply(urlProtocol, url, []),
+          hostname: apply(urlHostname, url, []),
+          port: apply(urlPort, url, []),
+          username: apply(urlUsername, url, []),
+          password: apply(urlPassword, url, []),
+        });
+        const requestUrl = window.Request
+          ? Object.getOwnPropertyDescriptor(window.Request.prototype, "url").get
+          : null;
+        // Scripts may modify public prototypes later. Read native URL slots only
+        // through these captured getters, both for validation and dispatch.
+        const base = readEndpoint(new NativeURL(window.location.href));
         const nativeFetch = window.fetch ? window.fetch.bind(window) : null;
-        window.fetch = function (input, init) {
-          let url = "";
+        const guardedFetch = function (input, init) {
+          let endpoint;
+          let requestInput = false;
           try {
-            url = typeof input === "string" ? input : (input && input.url) || String(input);
+            let raw;
+            if (typeof input === "string") {
+              raw = input;
+            } else {
+              // Use branded native getters, not a caller-controlled .url/toString.
+              try {
+                raw = apply(requestUrl, input, []);
+                requestInput = true;
+              } catch {
+                raw = apply(urlHref, input, []);
+              }
+            }
+            endpoint = readEndpoint(new NativeURL(raw, base.href));
           } catch {
-            url = "";
+            return Promise.reject(new Error("音源包环境禁止直接网络请求，请使用 host.request"));
           }
-          const sameOriginPath = url.startsWith("/") && !url.startsWith("//");
-          const isIpc = IPC_PREFIXES.some((p) => url.startsWith(p));
-          if (!sameOriginPath && !isIpc) {
+          const noCredentials = endpoint.username === "" && endpoint.password === "";
+          const isIpc = endpoint.port === "" && (
+            ((endpoint.protocol === "http:" || endpoint.protocol === "https:") &&
+              endpoint.hostname === "ipc.localhost") ||
+            (endpoint.protocol === "ipc:" && endpoint.hostname === "localhost")
+          );
+          // Custom schemes have the opaque origin "null": compare the full endpoint,
+          // rather than treating every opaque origin (or a slash prefix) as same-origin.
+          const sameOrigin = endpoint.protocol === base.protocol &&
+            endpoint.hostname === base.hostname && endpoint.port === base.port;
+          if (!noCredentials || (!sameOrigin && !isIpc)) {
             return Promise.reject(
               new Error("音源包环境禁止直接网络请求，请使用 host.request"),
             );
           }
           if (!nativeFetch) return Promise.reject(new Error("fetch 不可用"));
-          return nativeFetch(input, init);
+          // Canonicalize strings/URLs once; preserve genuine Request bodies. Never
+          // follow an allowed endpoint's redirect to an unchecked external host.
+          return nativeFetch(requestInput ? input : endpoint.href, { ...init, redirect: "error" });
         };
+        Object.defineProperty(window, "fetch", { value: guardedFetch, writable: false, configurable: false });
+        // Some hosts expose methods on interface prototypes as well. Lock those
+        // native slots too; an own-property shadow alone is not an authorization.
+        const windowPrototype = window.Window && window.Window.prototype;
+        if (windowPrototype && Object.getOwnPropertyDescriptor(windowPrototype, "fetch")) {
+          Object.defineProperty(windowPrototype, "fetch", { value: guardedFetch, writable: false, configurable: false });
+        }
+        const navigatorPrototype = window.Navigator && window.Navigator.prototype;
+        if (navigatorPrototype && Object.getOwnPropertyDescriptor(navigatorPrototype, "sendBeacon")) {
+          Object.defineProperty(navigatorPrototype, "sendBeacon", { value: undefined, writable: false, configurable: false });
+        }
         const deny = (name) =>
           function () {
             throw new Error("音源包环境禁止使用 " + name);
           };
-        try { window.XMLHttpRequest = deny("XMLHttpRequest"); } catch {}
-        try { delete window.WebSocket; } catch {}
-        try { delete window.EventSource; } catch {}
-        try { delete window.Worker; } catch {}
-        try { delete window.SharedWorker; } catch {}
-        try { navigator.sendBeacon = undefined; } catch {}
+        Object.defineProperty(window, "XMLHttpRequest", { value: deny("XMLHttpRequest"), writable: false, configurable: false });
+        for (const name of ["WebSocket", "EventSource", "Worker", "SharedWorker"]) {
+          Object.defineProperty(window, name, { value: undefined, writable: false, configurable: false });
+        }
+        Object.defineProperty(navigator, "sendBeacon", { value: undefined, writable: false, configurable: false });
+        // WebRTC ICE is not uniformly governed by connect-src. Keep these entry
+        // points disabled even after assignment/prototype tampering. Defining the
+        // same undefined value is idempotent with native all-frame DocumentStart.
+        for (const name of [
+          "RTCPeerConnection", "webkitRTCPeerConnection", "mozRTCPeerConnection",
+          "RTCDataChannel", "RTCIceGatherer", "RTCIceTransport", "RTCDtlsTransport", "WebTransport",
+        ]) Object.defineProperty(window, name, { value: undefined, writable: false, configurable: false });
       }
       lockDownNetwork();
 

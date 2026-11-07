@@ -14,6 +14,8 @@
     "config:sync": "node scripts/sync-config.mjs",
     "config:check": "node scripts/sync-config.mjs --check",
     "check:ui": "node scripts/check-motion.mjs",
+    "check:native": "node scripts/check-native.mjs",
+    "test:native": "node scripts/check-native.mjs test",
     "i18n:scan": "node scripts/i18n-scan.mjs",
     "i18n:check": "node scripts/i18n-scan.mjs --check",
     "i18n:baseline": "node scripts/i18n-scan.mjs --write",

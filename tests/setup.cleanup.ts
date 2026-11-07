@@ -9,6 +9,12 @@
 // vitest 默认 globals=false，@testing-library/react 的自动 cleanup 依赖全局 afterEach，
 // 因此不会生效；这里显式注册，让每个用例结束时都卸载自己的 React 树并排空队列。
 import { afterEach } from "vitest";
+import { installMemoryStorageBoundary } from "./helpers/memory-storage-boundary";
+
+// Install before Vitest imports test/production modules: Node's host Storage
+// must never be used by top-level legacy migrations or persist hydration.
+// Keep the boundary for the whole file; restoring it would expose the host again.
+installMemoryStorageBoundary();
 
 afterEach(async () => {
   // node 环境的用例没有 document，跳过（也避免在无 DOM 环境下加载 @testing-library/react）

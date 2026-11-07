@@ -75,7 +75,12 @@ static LOCAL: OnceLock<LocalConfig> = OnceLock::new();
 
 /// 本次运行实际使用的私有配置（首次调用时加载并缓存）。
 pub fn local() -> &'static LocalConfig {
-    LOCAL.get_or_init(load)
+    LOCAL.get_or_init(|| {
+        #[cfg(any(test, qt_public_test_build))]
+        { LocalConfig::default() }
+        #[cfg(not(any(test, qt_public_test_build)))]
+        { load() }
+    })
 }
 
 /// 配置文件路径（供启动日志 / 设置页展示；没找到时为 None）。
@@ -142,6 +147,7 @@ pub fn official_site_url() -> &'static str {
 pub fn own_domain_suffixes() -> &'static [String] {
     static RESOLVED: OnceLock<Vec<String>> = OnceLock::new();
     RESOLVED.get_or_init(|| {
+        #[cfg(not(test))]
         if let Ok(raw) = std::env::var(private_config::OWN_DOMAINS_ENV) {
             if !raw.trim().is_empty() {
                 return normalize_all(raw.split(','));
@@ -235,6 +241,7 @@ fn normalize_all<'a, I: Iterator<Item = &'a str>>(raw: I) -> Vec<String> {
 ///
 /// 解析失败（坏 JSON）**不静默忽略**：那是人写错了，静默会让"改了配置没生效"
 /// 变成一个没有线索的怪现象，所以打 ERROR 并退回编译期常量。
+#[cfg(not(any(test, qt_public_test_build)))]
 fn load() -> LocalConfig {
     if !private_config_applies(crate::app_config::ACTIVE_BACKEND) {
         log::debug!(
@@ -283,6 +290,7 @@ fn load() -> LocalConfig {
 }
 
 /// 取字符串字段（缺省 / 类型不对都当空串，绝不 panic）
+#[cfg(not(any(test, qt_public_test_build)))]
 fn str_field(value: &serde_json::Value, key: &str) -> String {
     value
         .get(key)
@@ -293,11 +301,13 @@ fn str_field(value: &serde_json::Value, key: &str) -> String {
 }
 
 /// 按文档顺序找配置文件，返回第一个存在的。
+#[cfg(not(any(test, qt_public_test_build)))]
 fn find_file() -> Option<PathBuf> {
     candidates().into_iter().find(|p| p.is_file())
 }
 
 /// 候选路径（顺序即优先级，见模块文档）
+#[cfg(not(any(test, qt_public_test_build)))]
 fn candidates() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     if let Some(explicit) = std::env::var_os(ENV_CONFIG_FILE) {

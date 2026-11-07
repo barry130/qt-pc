@@ -410,6 +410,8 @@ pub(crate) const MIGRATIONS: &[(i64, &str)] = &[
     (24, V24),
     (25, V25),
     (26, V26),
+    (27, V27),
+    (28, V28),
 ];
 
 const V1: &str = r#"
@@ -856,7 +858,18 @@ ALTER TABLE tracks ADD COLUMN album_gain_db REAL;
 "#;
 
 /// 当前程序支持的最新 schema 版本。
-pub(crate) const CURRENT_VERSION: i64 = 26;
+const V27: &str = r#"
+ALTER TABLE podcast_episodes ADD COLUMN transcripts_json TEXT NOT NULL DEFAULT '[]';
+CREATE TABLE podcast_subtitles (
+  episode_id TEXT PRIMARY KEY REFERENCES podcast_episodes(id) ON DELETE CASCADE,
+  revision INTEGER NOT NULL,
+  document_json TEXT NOT NULL
+);
+"#;
+
+const V28: &str = "ALTER TABLE podcast_episodes ADD COLUMN subtitle_audio_path TEXT NOT NULL DEFAULT '';";
+
+pub(crate) const CURRENT_VERSION: i64 = 28;
 
 /// 建表 schema_migrations 并把所有未应用版本按序执行。
 pub(crate) fn run(conn: &Connection) -> Result<(), rusqlite::Error> {
@@ -1164,6 +1177,45 @@ mod tests {
     }
 
     #[test]
+    fn podcast_v27_preserves_existing_episodes_and_progress() {
+        let conn = Connection::open_in_memory().unwrap();
+        for &(version, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 26) {
+            conn.execute_batch(sql).unwrap_or_else(|e| panic!("v{version}: {e}"));
+        }
+        conn.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+            INSERT INTO schema_migrations VALUES (26, 0);
+            INSERT INTO podcast_shows VALUES ('s','https://fixture.test/rss','S','','','',0,0);
+            INSERT INTO podcast_episodes VALUES ('e','s','E','','https://fixture.test/e.mp3',600000,0,0,123000,0);").unwrap();
+        run(&conn).unwrap();
+        run(&conn).unwrap();
+        let row: (i64, String) = conn.query_row("SELECT position_ms,transcripts_json FROM podcast_episodes WHERE id='e'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!(row, (123000, "[]".into()));
+        conn.execute("INSERT INTO podcast_subtitles VALUES ('e',1,'{}')", []).unwrap();
+    }
+
+    #[test]
+    fn podcast_v28_keeps_saved_subtitles_and_defaults_local_audio_to_empty() {
+        let conn = Connection::open_in_memory().unwrap();
+        for &(version, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 27) {
+            conn.execute_batch(sql).unwrap_or_else(|e| panic!("v{version}: {e}"));
+        }
+        conn.execute_batch("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL);
+            INSERT INTO schema_migrations VALUES (27,0);
+            INSERT INTO podcast_shows VALUES ('s','https://fixture.test/rss','S','','','',0,0);
+            INSERT INTO podcast_episodes VALUES ('e','s','E','','https://fixture.test/e.mp3',600000,0,0,123000,0,'[]');
+            INSERT INTO podcast_subtitles VALUES ('e',2,'{\"revision\":2,\"source\":\"asr\",\"completedChunks\":[0]}');").unwrap();
+        run(&conn).unwrap();
+        run(&conn).unwrap();
+        let row: (i64, String, String) = conn.query_row("SELECT e.position_ms,e.subtitle_audio_path,s.document_json FROM podcast_episodes e JOIN podcast_subtitles s ON s.episode_id=e.id WHERE e.id='e'", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+        assert_eq!(row.0, 123000);
+        assert_eq!(row.1, "");
+        let document: crate::podcast_subtitles::SubtitleDocument = serde_json::from_str(&row.2).unwrap();
+        assert_eq!(document.revision, 2);
+        assert_eq!(document.completed_chunks, vec![0]);
+        assert!(document.recognizer.is_empty());
+    }
+
+    #[test]
     fn cue_v17_upgrades_existing_local_rows_and_allows_shared_audio_paths() {
         let conn = Connection::open_in_memory().unwrap();
         for &(version, sql) in MIGRATIONS.iter().filter(|(v, _)| *v <= 16) {
@@ -1448,8 +1500,8 @@ COMMIT;"
         assert_eq!(idx, 2, "重建后两个索引都应在");
 
         // UNIQUE 冲突目标还在：同一歌单收藏两次 → 走 UPDATE，只留一行
-        crate::db::store::add_liked_playlist(&conn, "wyy", "p1", "第一次", "", "").unwrap();
-        crate::db::store::add_liked_playlist(&conn, "wyy", "p1", "改名了", "http://c", "").unwrap();
+        crate::db::store::add_liked_playlist(&conn, "wyy", "p1", "第一次", None, "").unwrap();
+        crate::db::store::add_liked_playlist(&conn, "wyy", "p1", "改名了", Some("http://c"), "").unwrap();
         let rows: i64 = conn
             .query_row("SELECT COUNT(*) FROM liked_playlists", [], |r| r.get(0))
             .unwrap();

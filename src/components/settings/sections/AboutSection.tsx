@@ -5,12 +5,13 @@ import { useT } from "@/lib/i18n";
 import { OFFICIAL_AGREEMENT_PATH, OFFICIAL_FEEDBACK_PATH, OFFICIAL_PRIVACY_PATH, officialSitePath } from "@/lib/official-site";
 import { stripErrorUrls } from "@/lib/utils";
 import { getAppPaths, getAppVersion, buildDiagnostics, pickSavePath, saveBinaryFile } from "@/services/ipc";
+import { useAuthStore } from "@/stores/auth";
 import { useDisclaimerStore } from "@/stores/disclaimer";
 import { toast, toastError, toastSuccess } from "@/stores/toast";
 import { useUpdateStore } from "@/stores/update";
 import { type AppPaths, type AppVersion } from "@/types";
 import { ExternalLinkButton, SettingRow } from "../controls";
-import { buttonClass } from "@/components/ui";
+import { Badge, buttonClass } from "@/components/ui";
 
 export function AboutSection(): React.JSX.Element {
   const tr = useT();
@@ -25,6 +26,11 @@ export function AboutSection(): React.JSX.Element {
   const siteUrl = useOfficialSiteUrl();
   /** 重新打开首次启动的免责声明（只展示，不改已记录的接受时刻） */
   const reopenDisclaimer = useDisclaimerStore((s) => s.reopen);
+  /**
+   * 登录态（S03）：系统安全仓库不可用时后端只能把会话放在内存里，重启即失效。
+   * 这种情况下在「关于」里明确告诉用户，而不是让他们重启后才发现被登出。
+   */
+  const session = useAuthStore((s) => s.session);
 
   /**
    * 声明正文由后端下发，离线 / 后台还没发布时点「查看」不会有任何反应。
@@ -89,6 +95,17 @@ export function AboutSection(): React.JSX.Element {
 
   return (
     <div className="max-w-4xl divide-y divide-border">
+      {/* 凭据安全状态（S03）：只在本机确实没持久化时出现，不打扰正常用户 */}
+      {session?.persistence === "memory-only" ? (
+        <SettingRow
+          title={tr("settings.about.sessionMemoryOnly")}
+          description={tr("settings.about.sessionMemoryOnlyHint")}
+        >
+          <Badge tone="outline">
+            {tr("settings.about.sessionMemoryOnlyBadge")}
+          </Badge>
+        </SettingRow>
+      ) : null}
       <SettingRow
         title={tr("settings.about.currentVersion")}
         description={tr("settings.about.appEdition")}

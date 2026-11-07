@@ -1,4 +1,13 @@
 fn main() {
+    // Offline regression gates must never discover or overwrite private inputs.
+    // This process-only opt-in also applies to non-test targets checked by Clippy.
+    println!("cargo:rerun-if-env-changed=QT_PUBLIC_TEST_BUILD");
+    println!("cargo:rustc-check-cfg=cfg(qt_public_test_build)");
+    let public_test_build = std::env::var_os("QT_PUBLIC_TEST_BUILD").as_deref()
+        == Some(std::ffi::OsStr::new("1"));
+    if public_test_build {
+        println!("cargo:rustc-cfg=qt_public_test_build");
+    }
     // 私有值（自有域名 / 生产后端地址 / 官网地址）**不在仓库里**：
     // `src/private_config.rs` 由 `scripts/sync-config.mjs` 从 `app.config.local.json`
     // （被 .gitignore 忽略）生成，而 `cargo test` / `cargo check` 不经过前端脚本，
@@ -8,6 +17,7 @@ fn main() {
     // 清掉，打出来的包会静默退化成"连不上后端"。空壳的语义就是"没有私有配置"：
     // 编译期默认为空，运行期 `runtime_config` 仍会去读 app.config.local.json 覆盖，
     // 所以只影响编译期默认值，不影响本地运行。
+    if !public_test_build {
     let private_config = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap())
         .join("src")
         .join("private_config.rs");
@@ -38,6 +48,7 @@ fn main() {
     // 本脚本会**写出** src/private_config.rs，所以必须显式声明重编条件：
     // 否则 cargo 默认的"包内任何文件变化就重跑"会把这次写入当成新变更，白跑一轮。
     println!("cargo:rerun-if-changed=src/private_config.rs");
+    }
 
     // manifest 不走 tauri-build 的资源嵌入（那只对 bin 生效，测试 exe 会因缺
     // comctl32 v6 依赖在加载期 STATUS_ENTRYPOINT_NOT_FOUND —— rfd / muda /

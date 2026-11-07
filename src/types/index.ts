@@ -89,12 +89,12 @@ export interface DownloadTask {
   updatedAt: number;
 }
 
-/** Astral 登录会话，对齐 Rust `AuthSession`（camelCase，DESIGN §2.3.4） */
+/** Astral 会话的只读安全视图，对齐 Rust `SessionStatus`；凭据不进入 WebView。 */
 export interface AuthSession {
-  token: string;
-  refreshToken: string;
   /** 过期时间，Unix 毫秒 */
   expiresAt: number;
+  /** 系统安全仓库可用时持久化，否则仅在本次进程内有效。 */
+  persistence: "secure" | "memory-only";
 }
 
 /** 听歌统计概览，对齐 Rust `PlayOverview`（DESIGN §5.3） */
@@ -391,9 +391,26 @@ export interface AudioProgram {
   chapterCount: number;
 }
 
+/** 原生已提交播放动作的目标；代次与跨源身份共同约束后续 seek/pause。 */
+export interface PlayTarget {
+  generation: number;
+  platform: Track["platform"];
+  id: string;
+}
+
+/** 原生引擎的队列提交回执；接受空目标和拒绝旧动作不是同一件事。 */
+export interface QueueCommitReply {
+  applied: boolean;
+  target: PlayTarget | null;
+}
+
 /** 对齐 Rust `PlaybackState`（DESIGN §7.2 全量快照） */
 export interface PlaybackState {
+  cast?: DlnaCastState | null;
   trackId: string | null;
+  /** 实际已挂载且仍受当前原生代次授权的目标；Loading 不代表已挂载。
+   * 原生新快照始终携带该字段，可选仅兼容旧快照/测试替身。 */
+  playTarget?: PlayTarget | null;
   sourceId: SourceId | null;
   status: PlaybackStatus;
   positionMs: number;
@@ -423,6 +440,26 @@ export interface PlaybackState {
   /** 本次实际播放码率（kbps，按流的真实字节数 ÷ 时长算）；null = 没测出来（流式 /
    *  无 Content-Length / 本地文件取不到），此时不显示码率而不是显示 0 */
   bitrateKbps: number | null;
+}
+
+export interface DlnaCapabilities {
+  seek: boolean;
+  volume: boolean;
+  pause: boolean;
+}
+
+export interface DlnaDevice {
+  id: string;
+  name: string;
+  capabilities: DlnaCapabilities;
+}
+
+export interface DlnaCastState {
+  sessionId: number;
+  generation: number;
+  deviceId: string;
+  deviceName: string;
+  capabilities: DlnaCapabilities;
 }
 
 /** position-changed 事件负载 */

@@ -16,7 +16,17 @@ const { resolvePlayUrlDetailed, setResolvedPlayUrl } = vi.hoisted(() => ({
 vi.mock("@/source-scripts", () => ({ resolvePlayUrlDetailed }));
 // 降档命中时会补写一份「请求档 → 实际地址」的缓存键（否则引擎按请求档查缓存
 // 永远未命中，每集都多跑一轮跨进程取链）。
-vi.mock("@/services/ipc", () => ({ setResolvedPlayUrl }));
+vi.mock("@/services/ipc", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/services/ipc")>()), setResolvedPlayUrl,
+}));
+// Preferences use the real settings API; only its final native transport is owned.
+vi.mock("@tauri-apps/api/core", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@tauri-apps/api/core")>()),
+  invoke: vi.fn(async (command: string) => {
+    if (command === "get_setting") return null;
+    throw new Error(`Unexpected native IPC: ${command}`);
+  }),
+}));
 
 const registryState = {
   sources: [] as { id: string; qualities: string[] }[],

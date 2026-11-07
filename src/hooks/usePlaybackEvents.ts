@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { usePlayerStore } from "@/stores/player";
+import { currentLiveRevision, usePlayerStore } from "@/stores/player";
 import * as ipc from "@/services/ipc";
 import { log } from "@/lib/logger";
 
@@ -49,11 +49,21 @@ export function usePlaybackEvents(
       ]);
       if (disposed || registered.some((ok) => !ok)) return;
       try {
+        // 恢复只是 fallback：请求发出后只要收到过实时事件（快照 / tick / 队列），
+        // 迟到的恢复响应就是旧值。纯原生路径（SMTC / 热键 / 自动切歌）不经过
+        // JS 的播放动作代次，所以这里用实时事件版本号而不是 id 比较（ABA 也安全）。
+        const revisionAtRequest = currentLiveRevision();
         const restored = restoreSession ? await ipc.restoreLastSession() : null;
         if (disposed) return;
         const snap = restored?.track ? restored : await ipc.getPlaybackState();
         // 事件是真值，不能被请求发出后才返回的旧快照覆盖。
-        if (!disposed && !stateEventApplied) applySnapshot(snap);
+        if (
+          !disposed &&
+          !stateEventApplied &&
+          currentLiveRevision() === revisionAtRequest
+        ) {
+          applySnapshot(snap);
+        }
       } catch (err) {
         log.warn(restoreSession ? "restore_last_session failed" : "get_playback_state failed", err);
       }

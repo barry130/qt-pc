@@ -149,7 +149,7 @@ fn db_json(db: &crate::db::Database) -> serde_json::Value {
 }
 
 /// 配置快照（脱敏）。读的是 `settings` 键值表 —— 播放、外观、上报凭据都在这里。
-fn settings_json(db: Option<&crate::db::Database>) -> serde_json::Value {
+pub(crate) fn settings_json(db: Option<&crate::db::Database>) -> serde_json::Value {
     let Some(db) = db else {
         return serde_json::json!({ "values": null, "redacted": [] });
     };
@@ -165,14 +165,79 @@ fn settings_json(db: Option<&crate::db::Database>) -> serde_json::Value {
     let mut values = serde_json::Map::new();
     let mut redacted: Vec<String> = Vec::new();
     for (key, value) in rows {
-        if is_secret_key(&key) {
-            values.insert(key.clone(), serde_json::json!("***"));
-            redacted.push(key);
+        let mut value = serde_json::Value::String(value);
+        let known_container = matches!(key.trim().to_ascii_lowercase().as_str(), "ai.profiles" | "sourceauth.accounts");
+        let damaged_container = known_container
+            && !value.as_str().is_some_and(|text| is_structured_setting(text, 0));
+        let changed = if is_secret_key(&key) || damaged_container {
+            value = serde_json::json!("***");
+            true
         } else {
-            values.insert(key, serde_json::json!(value));
+            redact_setting_value(&mut value, 0)
+        };
+        if changed {
+            redacted.push(key.clone());
         }
+        values.insert(key, value);
     }
     serde_json::json!({ "values": values, "redacted": redacted })
+}
+
+// Credential containers must eventually decode to an object/array. Broken JSON
+// or multiply encoded primitives cannot safely be inspected, so redact wholesale.
+fn is_structured_setting(text: &str, depth: usize) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(serde_json::Value::Object(_) | serde_json::Value::Array(_)) => true,
+        Ok(serde_json::Value::String(inner)) => is_structured_setting(&inner, depth + 1),
+        _ => false,
+    }
+}
+
+/// Settings values are strings, and may themselves contain JSON-encoded strings.
+/// Preserve their original representation unless a credential was actually masked.
+fn redact_setting_value(value: &mut serde_json::Value, depth: usize) -> bool {
+    if depth > 32 {
+        *value = serde_json::json!("***");
+        return true;
+    }
+    match value {
+        serde_json::Value::Object(fields) => {
+            let mut changed = false;
+            for (key, value) in fields {
+                let lower = key.to_ascii_lowercase();
+                // ai.profiles.keys and sourceAuth.accounts.extras are credential
+                // containers, even when their individual entries have arbitrary names.
+                if is_secret_key(key) || matches!(lower.as_str(), "key" | "keys" | "extras") {
+                    *value = serde_json::json!("***");
+                    changed = true;
+                } else {
+                    changed |= redact_setting_value(value, depth + 1);
+                }
+            }
+            changed
+        }
+        serde_json::Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= redact_setting_value(item, depth + 1);
+            }
+            changed
+        }
+        serde_json::Value::String(text) => {
+            let Ok(mut parsed) = serde_json::from_str::<serde_json::Value>(text) else {
+                return false;
+            };
+            if !redact_setting_value(&mut parsed, depth + 1) {
+                return false;
+            }
+            *text = serde_json::to_string(&parsed).unwrap_or_else(|_| "***".into());
+            true
+        }
+        _ => false,
+    }
 }
 
 /// 键名是否算「密钥类」。宁可多脱一点：误脱一个普通键只是少点信息，漏一个就是凭据外泄。
@@ -440,6 +505,86 @@ mod tests {
             bytes[eocd + 19],
         ]) as usize;
         assert_eq!(&bytes[cd_offset..cd_offset + 4], &[0x50, 0x4b, 0x01, 0x02]);
+    }
+
+    #[test]
+    fn exported_settings_redact_nested_credentials_without_losing_diagnostics() {
+        let db = crate::db::Database::open(Path::new(":memory:")).unwrap();
+        let profiles = serde_json::json!([
+            { "id": "primary", "name": "Work", "model": "local-model", "apiKey": "AI_CANARY", "keys": ["KEY_CANARY"] }
+        ]);
+        let accounts = serde_json::json!({
+            "wy": { "cookie": "COOKIE_CANARY", "user": { "nickname": "Listener", "vip": true }, "extras": { "music_u": "EXTRA_CANARY" } }
+        });
+        let appearance = serde_json::json!({
+            "fontSize": 24,
+            "nested": [
+                { "credential": "NESTED_CANARY", "enabled": true },
+                serde_json::json!({ "accessToken": "ENCODED_CANARY", "mode": "dark" }).to_string()
+            ]
+        });
+        db.with(|conn| {
+            for (key, value) in [
+                ("ai.profiles", profiles.to_string()),
+                ("sourceAuth.accounts", accounts.to_string()),
+                ("appearance", appearance.to_string()),
+                ("doubleEncoded", serde_json::to_string(&serde_json::json!({ "password": "DOUBLE_CANARY", "width": 640 }).to_string()).unwrap()),
+                ("lastfm.user", "Listener".to_string()),
+                ("astral.session", "SESSION_CANARY".to_string()),
+            ] {
+                crate::db::store::set_setting(conn, key, &value)?;
+            }
+            Ok(())
+        }).unwrap();
+
+        // This is the exact snapshot serialized into settings.json by build(), not a
+        // private key predicate or a copy of the redaction implementation.
+        let snapshot = settings_json(Some(&db));
+        let exported = serde_json::to_string(&snapshot).unwrap();
+        for canary in ["AI_CANARY", "KEY_CANARY", "COOKIE_CANARY", "EXTRA_CANARY", "NESTED_CANARY", "ENCODED_CANARY", "DOUBLE_CANARY", "SESSION_CANARY"] {
+            assert!(!exported.contains(canary), "diagnostic export leaked {canary}");
+        }
+        let values = &snapshot["values"];
+        let exported_profiles: serde_json::Value = serde_json::from_str(values["ai.profiles"].as_str().unwrap()).unwrap();
+        assert_eq!(exported_profiles[0]["model"], "local-model");
+        assert_eq!(exported_profiles[0]["name"], "Work");
+        let exported_accounts: serde_json::Value = serde_json::from_str(values["sourceAuth.accounts"].as_str().unwrap()).unwrap();
+        assert_eq!(exported_accounts["wy"]["user"]["nickname"], "Listener");
+        let exported_appearance: serde_json::Value = serde_json::from_str(values["appearance"].as_str().unwrap()).unwrap();
+        assert_eq!(exported_appearance["fontSize"], 24);
+        assert_eq!(exported_appearance["nested"][0]["enabled"], true);
+        assert_eq!(values["lastfm.user"], "Listener");
+        assert!(snapshot["redacted"].as_array().unwrap().contains(&serde_json::json!("ai.profiles")));
+        let original = db.with(|conn| crate::db::store::get_setting(conn, "ai.profiles")).unwrap().unwrap();
+        assert_eq!(original, profiles.to_string(), "export must not mutate saved credentials");
+    }
+
+    #[test]
+    fn exported_settings_fail_closed_for_damaged_credential_containers() {
+        for key in ["ai.profiles", "sourceAuth.accounts"] {
+            for saved in [
+                "{\"key\":\"BROKEN_CREDENTIAL_CANARY".to_owned(),
+                "BROKEN_CREDENTIAL_CANARY".to_owned(),
+                serde_json::to_string("BROKEN_CREDENTIAL_CANARY").unwrap(),
+                serde_json::to_string(&serde_json::to_string("BROKEN_CREDENTIAL_CANARY").unwrap()).unwrap(),
+                serde_json::to_string("{\"cookie\":\"BROKEN_CREDENTIAL_CANARY").unwrap(),
+                "123".to_owned(),
+                "null".to_owned(),
+                "true".to_owned(),
+            ] {
+                let db = crate::db::Database::open(Path::new(":memory:")).unwrap();
+                db.with(|conn| {
+                    crate::db::store::set_setting(conn, key, &saved)?;
+                    crate::db::store::set_setting(conn, "notes", "ordinary malformed { text")?;
+                    Ok(())
+                }).unwrap();
+                let snapshot = settings_json(Some(&db));
+                assert_eq!(snapshot["values"][key], "***", "unsafe credential container {key}");
+                assert_eq!(snapshot["values"]["notes"], "ordinary malformed { text");
+                assert!(snapshot["redacted"].as_array().unwrap().contains(&serde_json::json!(key)));
+                assert_eq!(db.with(|conn| crate::db::store::get_setting(conn, key)).unwrap().unwrap(), saved);
+            }
+        }
     }
 
     #[test]

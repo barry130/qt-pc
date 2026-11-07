@@ -4,7 +4,7 @@
 //!
 //! - `cover/`：封面代取 + 内存去重缓存（不落盘缩略图，后续迭代补 @2x 与磁盘缓存）
 //! - `/engine/index.html`：音源引擎页（source_window.rs 的隐藏窗口加载，
-//!   内嵌 HTML，无 CSP 注入 → 可自由动态 import 音源包脚本）
+//!   内嵌 HTML，响应头注入 S04 CSP → 只允许同源动态 import 与必需 eval）
 //! - `/script/<id>/<file>`：只读分发已安装的音源包文件（v3 统一包模型：
 //!   数据包/播放包同构，目录名 = 包 id；file 严格校验防路径穿越，查询串
 //!   仅用于模块缓存破坏 ?v=）
@@ -18,13 +18,13 @@
 //! （QQ 榜单 y.gtimg.cn、QQ 歌单 p.qpic.cn、B 站 hdslb.com、咪咕 d.musicapp.migu.cn
 //! 都踩过）。
 
+use crate::source_bundle;
 use base64::Engine as _;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tauri::http::{header, Request, Response, StatusCode};
-use crate::source_bundle;
 
 /// 内存封面缓存：URL → bytes。
 ///
@@ -74,8 +74,10 @@ fn cover_client() -> Option<reqwest::blocking::Client> {
     type CachedClient = (u64, Option<reqwest::blocking::Client>);
     static CLIENT_CACHE: OnceLock<Mutex<CachedClient>> = OnceLock::new();
     let generation = crate::net_config::generation();
-    let mut cached = CLIENT_CACHE.get_or_init(|| Mutex::new((0, None)))
-        .lock().unwrap_or_else(|p| p.into_inner());
+    let mut cached = CLIENT_CACHE
+        .get_or_init(|| Mutex::new((0, None)))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
     if cached.0 != generation {
         let client = crate::net_config::configure_blocking(
             reqwest::blocking::Client::builder()
@@ -84,7 +86,10 @@ fn cover_client() -> Option<reqwest::blocking::Client> {
                 .connect_timeout(COVER_CONNECT_TIMEOUT)
                 .pool_max_idle_per_host(4)
                 .pool_idle_timeout(Duration::from_secs(90)),
-        ).build().map_err(|_| log::warn!("[qtres] 封面网络客户端构建失败")).ok();
+        )
+        .build()
+        .map_err(|_| log::warn!("[qtres] 封面网络客户端构建失败"))
+        .ok();
         *cached = (generation, client);
     }
     cached.1.clone()
@@ -106,15 +111,9 @@ struct CoverGateGuard;
 
 impl CoverGateGuard {
     fn acquire() -> Self {
-        let mut used = COVER_GATE
-            .used
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut used = COVER_GATE.used.lock().unwrap_or_else(|p| p.into_inner());
         while *used >= COVER_FETCH_CONCURRENCY {
-            used = COVER_GATE
-                .cv
-                .wait(used)
-                .unwrap_or_else(|p| p.into_inner());
+            used = COVER_GATE.cv.wait(used).unwrap_or_else(|p| p.into_inner());
         }
         *used += 1;
         Self
@@ -123,10 +122,7 @@ impl CoverGateGuard {
 
 impl Drop for CoverGateGuard {
     fn drop(&mut self) {
-        let mut used = COVER_GATE
-            .used
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
+        let mut used = COVER_GATE.used.lock().unwrap_or_else(|p| p.into_inner());
         *used = used.saturating_sub(1);
         COVER_GATE.cv.notify_one();
     }
@@ -363,6 +359,12 @@ fn engine_page_response() -> Response<Vec<u8>> {
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/html; charset=utf-8")
+        // 只给引擎页响应注入 CSP（其余 qtres 页面不动）：页面内的音源包代码
+        // 不能把内嵌 webview 当任意网络出口（S04）。策略见 source_engine_policy。
+        .header(
+            header::CONTENT_SECURITY_POLICY,
+            crate::source_engine_policy::engine_page_csp(),
+        )
         // 引擎页必须即时生效（音源包应用 = 重建窗口重新拉取）
         .header(header::CACHE_CONTROL, "no-store")
         .body(ENGINE_INDEX_HTML.as_bytes().to_vec())
@@ -830,7 +832,9 @@ mod tests {
         assert!(!starts_with_canonical(&absent, &root));
         // 但 handle_script_file 的新顺序下，这条请求会静默 404 而非告警：
         // metadata 阶段就返回，不会走到前缀校验。
-        assert!(!std::fs::metadata(&absent).map(|m| m.is_file()).unwrap_or(false));
+        assert!(!std::fs::metadata(&absent)
+            .map(|m| m.is_file())
+            .unwrap_or(false));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -1106,12 +1110,9 @@ mod tests {
     #[test]
     fn cover_flight_recovers_after_panic() {
         let key = "flight-panic-unique-key";
-        let prev = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
         let r = std::panic::catch_unwind(|| {
             cover_bytes_shared(key, || panic!("boom"));
         });
-        std::panic::set_hook(prev);
         assert!(r.is_err(), "panic 应向上传播");
 
         // 卡死的话这里永远不会返回

@@ -302,31 +302,60 @@ fn liked_playlist_id(platform: &str, pid: &str) -> String {
     format!("{platform}:{pid}")
 }
 
-/// 收藏歌单（幂等）。封面为空时不覆盖已有值，避免把攒下的封面抹掉。
+/// 收藏歌单（幂等）。
+///
+/// `pic_url` 是三态（C13）：
+/// · `None` = 调用方没提供封面（拉取/局部更新）→ 保留已有值，别把攒下的封面抹掉；
+/// · `Some("")` = 云端权威地告诉「这个歌单现在没有封面」→ 必须清掉旧缓存；
+/// · `Some(url)` = 正常更新封面。
+///
+/// 以前统一用 `COALESCE(NULLIF(excluded.pic_url, ''), 旧值)`，把「没提供」和
+/// 「权威空」揉成一种，导致云端清掉封面后本地永远回落到旧 URL。
 pub(crate) fn add_liked_playlist(
     conn: &Connection,
     platform: &str,
     pid: &str,
     name: &str,
-    pic_url: &str,
+    pic_url: Option<&str>,
     _play_count: &str,
 ) -> Result<(), rusqlite::Error> {
     // uid 固定 0，与 add_liked_song 同口径（本地收藏不区分账号，uid 是后端的概念）。
     // 表里也没有 play_count 列 —— 歌单的播放数属于音源数据，不落快照。
     let id = liked_playlist_id(platform, pid);
     let now = now_ms();
+    // 1 = 本次显式给了 pic_url（含空串），0 = 没给、保留原值
+    let provided: i64 = if pic_url.is_some() { 1 } else { 0 };
+    let pic = pic_url.unwrap_or("");
     conn.execute(
         "INSERT INTO liked_playlists (id, uid, pid, platform, name, pic_url,
                                       updated_seq, updated_at, created_at)
          VALUES (?1, 0, ?2, ?3, ?4, ?5, 0, ?6, ?6)
          ON CONFLICT(uid, platform, pid) DO UPDATE SET
            name = excluded.name,
-           pic_url = COALESCE(NULLIF(excluded.pic_url, ''), liked_playlists.pic_url),
+           pic_url = CASE WHEN ?7 = 0 THEN liked_playlists.pic_url ELSE excluded.pic_url END,
            deleted_at = NULL,
            updated_at = excluded.updated_at",
-        params![id, pid, platform, name, pic_url, now],
+        params![id, pid, platform, name, pic, now, provided],
     )?;
     Ok(())
+}
+
+/// 权威写某张收藏歌单卡片的封面（空串 = 清空）。
+///
+/// 云端「已清封面」确认成功后，本地 `liked_playlists` 缓存必须同步（C13），
+/// 否则歌单详情页清掉封面仍会回落到旧卡片封面 URL。返回受影响行数：
+/// 云端歌单可能没有本地卡片行，0 行不算失败。
+pub(crate) fn set_liked_playlist_pic(
+    conn: &Connection,
+    platform: &str,
+    pid: &str,
+    pic_url: &str,
+) -> Result<usize, rusqlite::Error> {
+    conn.execute(
+        "UPDATE liked_playlists SET pic_url = ?3, updated_at = ?4
+          WHERE id = ?1 AND platform = ?2",
+        params![liked_playlist_id(platform, pid), platform, pic_url, now_ms()],
+    )
 }
 
 pub(crate) fn remove_liked_playlist(
@@ -545,5 +574,57 @@ fn ensure_pending_like_ops_table(conn: &Connection) -> Result<(), rusqlite::Erro
          );",
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::store::tests::new_conn;
+
+    fn card_pic(conn: &Connection, platform: &str, pid: &str) -> String {
+        list_liked_playlists(conn)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.platform == platform && p.id == pid)
+            .map(|p| p.pic_url)
+            .unwrap_or_default()
+    }
+
+    /// C13：局部更新没给封面时保留旧值；云端权威空串必须清掉。
+    #[test]
+    fn playlist_pic_none_preserves_and_empty_clears() {
+        let conn = new_conn();
+        add_liked_playlist(&conn, "local", "p1", "歌单", Some("https://img/1.jpg"), "").unwrap();
+        assert_eq!(card_pic(&conn, "local", "p1"), "https://img/1.jpg");
+
+        // 没提供封面（例如只有改名）：保留原封面
+        add_liked_playlist(&conn, "local", "p1", "改名", None, "").unwrap();
+        assert_eq!(
+            card_pic(&conn, "local", "p1"),
+            "https://img/1.jpg",
+            "None 是「没提供」，不该抹掉旧封面"
+        );
+
+        // 权威空封面：必须清掉（以前 COALESCE 会兜回旧值）
+        add_liked_playlist(&conn, "local", "p1", "改名", Some(""), "").unwrap();
+        assert_eq!(card_pic(&conn, "local", "p1"), "", "显式空封面必须生效");
+    }
+
+    /// 云端清封面成功后，用 helper 同步本地卡片缓存。
+    #[test]
+    fn set_liked_playlist_pic_overwrites_and_clears() {
+        let conn = new_conn();
+        add_liked_playlist(&conn, "local", "p1", "歌单", Some("https://img/1.jpg"), "").unwrap();
+        assert_eq!(set_liked_playlist_pic(&conn, "local", "p1", "").unwrap(), 1);
+        assert_eq!(card_pic(&conn, "local", "p1"), "");
+        assert_eq!(
+            set_liked_playlist_pic(&conn, "local", "p1", "https://img/2.jpg").unwrap(),
+            1
+        );
+        assert_eq!(card_pic(&conn, "local", "p1"), "https://img/2.jpg");
+
+        // 本地没有这行（纯云端歌单）→ 0 行，不算失败
+        assert_eq!(set_liked_playlist_pic(&conn, "local", "nope", "").unwrap(), 0);
+    }
 }
 

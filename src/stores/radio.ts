@@ -56,7 +56,7 @@ import {
   shouldRefill,
 } from "@/lib/radio-queue";
 import * as ipc from "@/services/ipc";
-import { usePlayerStore } from "@/stores/player";
+import { usePlayerStore, type PlayActionResult } from "@/stores/player";
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -195,9 +195,18 @@ async function restoreStash(
   set: (patch: Partial<RadioStore>) => void,
 ): Promise<void> {
   try {
-    await usePlayerStore.getState().playQueue(stash.queue, stash.index);
-    if (stash.positionMs > 0) await usePlayerStore.getState().seekTo(stash.positionMs);
-    if (!stash.playing) await ipc.pause();
+    const player = usePlayerStore.getState();
+    const result: PlayActionResult | undefined = await player.playQueue(stash.queue, stash.index);
+    // 恢复期间用户点了别的歌：整队替换动作已被取代、IPC 根本没发出。此时
+    // 播放器属于用户新点的歌，旧会话的 seek/pause 一步都不能再落上去。
+    if (!result || !result.applied) return;
+    // 队列虽然接受了，但没有 Native 目标（代次 + 曲目身份）可校验：后面的
+    // seek/pause 无法证明会落到恢复的那首歌上，宁可放弃恢复的进度也不误伤
+    // 用户此刻正在听的新歌（fail closed）。
+    if (!result.target) return;
+    const { ticket, target } = result;
+    if (stash.positionMs > 0) await player.seekTo(stash.positionMs, ticket, target);
+    if (!stash.playing) await player.pauseForAction(ticket, target);
   } catch (err) {
     set({ error: `恢复原播放列表失败：${errMsg(err)}` });
   }
@@ -420,14 +429,16 @@ export const useRadioStore = create<RadioStore>((set, get) => ({
   ensure: async (remaining) => {
     const state = get();
     if (!state.active || !state.queueClaimed) return;
-    if (!shouldRefill(remaining)) return;
-    // 队列被换走（双击别的歌单/插了外曲/清空队列）：FM 让位，不再往新队列补歌
+    // 归属核对必须排在补歌阈值之前：队列被换走时哪怕余量还很多（用户双击了
+    // 自己的长歌单），FM 也要立刻让位。以前先看阈值，长队列一辈子触发不到这里，
+    // queueClaimed 一直挂着，之后退出 FM 会把原列表盖到用户自己的队列上。
     const player = usePlayerStore.getState();
     if (!queueBelongsToRadio(player.queue, state.usedKeys)) {
       // 同上：让位退出不还原原列表
       get().stop(false);
       return;
     }
+    if (!shouldRefill(remaining)) return;
     await get().refill();
   },
 

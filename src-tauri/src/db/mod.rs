@@ -15,12 +15,26 @@ use std::sync::Mutex;
 use rusqlite::Connection;
 
 pub use store::{PlayState, SavedSession};
+pub use store::history::{HistoryItem, HistoryProgress};
+pub use store::stats::{PlayOverview, PlayStatItem};
 
 pub struct Database {
     conn: Mutex<Connection>,
 }
 
 impl Database {
+    /// Create an isolated database with the production schema and foreign-key policy.
+    /// SQLite allocates only process memory; this never resolves a host database path.
+    pub fn open_in_memory() -> Result<Self, String> {
+        let conn = Connection::open_in_memory().map_err(|e| format!("打开内存数据库失败: {e}"))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| format!("设置 busy_timeout 失败: {e}"))?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(|e| format!("开启 foreign_keys 失败: {e}"))?;
+        migrations::run(&conn).map_err(|e| format!("数据库迁移失败: {e}"))?;
+        Ok(Self { conn: Mutex::new(conn) })
+    }
+
     /// 打开（不存在则创建）并执行迁移。
     pub fn open(path: &Path) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
@@ -46,7 +60,8 @@ impl Database {
         })
     }
 
-    /// 带自愈的打开：先体检，坏了就隔离 + 重建空库；健康则做一份滚动备份。
+    /// 带自愈的打开：先体检，坏了就隔离 + 重建空库；不在打开时生成备份。
+    /// 旧会话必须先完成存储清理，调用方才能显式触发启动备份或导出。
     ///
     /// 为什么把体检放在 `open` 之外单开一个入口：`Database::open` 的语义是"打开并迁移"，
     /// 测试与 `shortcuts.rs` 都在用它，不该被自愈逻辑污染；只有**应用启动**这一条路径
@@ -69,11 +84,30 @@ impl Database {
             return Ok((db, Some(notice)));
         }
         let db = Self::open(path)?;
-        if let Some(dir) = path.parent() {
-            // 备份失败不该影响启动（只记日志），所以这里忽略结果
-            let _ = db.with(|conn| Ok(health::rolling_backup(conn, dir)));
-        }
         Ok((db, None))
+    }
+
+    /// Public observation/reset facades use the same store functions as the commands.
+    pub fn play_overview(&self) -> Result<PlayOverview, String> {
+        self.with(store::play_overview)
+    }
+
+    pub fn top_tracks(&self, limit: u32) -> Result<Vec<PlayStatItem>, String> {
+        self.with(|conn| store::list_top_tracks(conn, limit))
+    }
+
+    pub fn play_history(&self, limit: u32) -> Result<Vec<HistoryItem>, String> {
+        self.with(|conn| store::list_play_history(conn, limit))
+    }
+
+    pub fn history_progress(&self, track: &crate::provider::types::Track)
+        -> Result<Option<HistoryProgress>, String>
+    {
+        self.with(|conn| store::history_progress(conn, track))
+    }
+
+    pub fn clear_listen_stats(&self) -> Result<i64, String> {
+        self.with(store::clear_listen_stats)
     }
 
     /// 取连接锁，**容忍互斥锁毒化**。
@@ -101,6 +135,9 @@ impl Database {
         f(&conn).map_err(|e| e.to_string())
     }
 }
+
+#[cfg(test)]
+mod startup_tests;
 
 #[cfg(test)]
 mod tests {

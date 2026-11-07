@@ -1,16 +1,24 @@
-// 用 .js 而非 .ts：vite 加载 TS 配置要靠 esbuild 子进程（沙箱 EPERM），
-// JS 配置可被直接 import，绕开子进程。
+// 隔离 runner 使用 --configLoader native；仅改成 .js 不会禁用 Vite 的默认 bundle。
+// 用原配置文件 URL 求同一根目录，兼容 native import 与 Vite bundle 两种加载方式。
 import { defineConfig } from "vitest/config";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const root = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
+  // 测试不发现真实 .env*；缓存只落到当前仓库的忽略目录。
+  envDir: false,
+  cacheDir: path.resolve(root, "_tmp/vitest-cache"),
+  // 无 API 监听的 Vitest 仍解析 host；数字地址避免 localhost DNS，不开启监听。
+  server: { host: "127.0.0.1" },
   resolve: {
     alias: {
-      "@": path.resolve(__dirname, "./src"),
+      "@": path.resolve(root, "./src"),
     },
   },
   test: {
-    // 沙箱内禁止 spawn 子进程，用 worker threads 池
+    // 保留原 worker threads 池；进程级 NODE_OPTIONS 在 setup 之前禁用宿主 Storage。
     pool: "threads",
     environment: "node",
     include: ["tests/**/*.test.ts", "tests/**/*.test.tsx"],

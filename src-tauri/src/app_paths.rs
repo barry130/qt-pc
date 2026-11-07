@@ -28,7 +28,7 @@
 use std::path::PathBuf;
 // 只被 install_base()（macOS 除外）用到，所以跟着它一起条件编译：
 // macOS 上留着这个 import 会撞 `-D unused-imports`
-#[cfg(not(target_os = "macos"))]
+#[cfg(any(not(target_os = "macos"), test))]
 use std::sync::OnceLock;
 use tauri::Manager;
 
@@ -74,20 +74,38 @@ fn probe_writable(dir: &std::path::Path) -> bool {
     ok
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(test)))]
+fn install_candidate() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(PathBuf::from))
+}
+
+#[cfg(test)]
+fn install_candidate() -> Option<PathBuf> {
+    let dir = crate::public_test_fixture::root().join("qm-native-install");
+    std::fs::create_dir(&dir).expect("exclusive owned install fixture");
+    Some(dir)
+}
+
+#[cfg(any(not(target_os = "macos"), test))]
 fn install_base() -> Option<&'static PathBuf> {
     static PROBED: OnceLock<Option<PathBuf>> = OnceLock::new();
     PROBED
         .get_or_init(|| {
-            let dir = std::env::current_exe()
-                .ok()
-                .and_then(|exe| exe.parent().map(PathBuf::from))?;
-            probe_writable(&dir).then_some(dir)
+            let dir = install_candidate()?;
+            let writable = probe_writable(&dir);
+            #[cfg(test)]
+            assert!(
+                writable,
+                "owned install fixture must never fall back to user paths"
+            );
+            writable.then_some(dir)
         })
         .as_ref()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 fn install_base() -> Option<&'static PathBuf> {
     None
 }
@@ -109,9 +127,29 @@ fn portable_enabled_in(dir: &std::path::Path, env: Option<&str>) -> bool {
 ///
 /// 结果来自 [`install_base`]（已带可写探测与 `OnceLock` 缓存），所以这里不再
 /// 单独探一次：同一次运行里「日志挂在 exe 旁」与「数据挂在 exe 旁」必须同进同退。
+fn portable_override(key: &str) -> Option<String> {
+    #[cfg(test)]
+    {
+        assert_eq!(key, PORTABLE_ENV, "unexpected ambient environment lookup");
+        // Explicit synthetic input keeps all default app paths in the attested root.
+        Some("1".to_owned())
+    }
+    #[cfg(not(test))]
+    {
+        std::env::var(key).ok()
+    }
+}
+
+pub(crate) fn portable_base_from<'a>(
+    probed_dir: Option<&'a PathBuf>,
+    env: Option<&str>,
+) -> Option<&'a PathBuf> {
+    probed_dir.filter(|dir| portable_enabled_in(dir, env))
+}
+
 pub(crate) fn portable_base() -> Option<&'static PathBuf> {
-    let env = std::env::var(PORTABLE_ENV).ok();
-    install_base().filter(|dir| portable_enabled_in(dir, env.as_deref()))
+    let env = portable_override(PORTABLE_ENV);
+    portable_base_from(install_base(), env.as_deref())
 }
 
 /// 当前是否处于便携模式（设置页 / 诊断包展示用）。
@@ -180,12 +218,8 @@ pub(crate) fn logs_root_from_env() -> Option<PathBuf> {
     }
     #[cfg(target_os = "macos")]
     {
-        std::env::var_os("HOME").map(|h| {
-            PathBuf::from(h)
-                .join("Library")
-                .join("Logs")
-                .join(DIR_NAME)
-        })
+        std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join("Library").join("Logs").join(DIR_NAME))
     }
     #[cfg(target_os = "linux")]
     {
@@ -220,9 +254,9 @@ mod tests {
 
     /// 独立临时目录（并行测试不撞名；用完删）
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("qm-app-paths-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("建临时目录");
+        let dir = crate::public_test_fixture::root()
+            .join(format!("qm-app-paths-{}-{tag}", std::process::id()));
+        std::fs::create_dir(&dir).expect("排他创建已认证临时目录");
         dir
     }
 
@@ -256,7 +290,10 @@ mod tests {
         }
         // 认不出来的取值不打断启动，回到标记文件口径
         for junk in ["", "maybe", "2"] {
-            assert!(portable_enabled_in(&dir, Some(junk)), "{junk:?} 应回落标记文件");
+            assert!(
+                portable_enabled_in(&dir, Some(junk)),
+                "{junk:?} 应回落标记文件"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -282,9 +319,25 @@ mod tests {
     /// 未开便携时不认 exe 目录；明确关掉时即便有标记文件也不是便携
     #[test]
     fn portable_base_requires_flag() {
-        // 测试进程的 exe 目录里不会有 portable.txt，也没有环境变量覆盖
-        if std::env::var(PORTABLE_ENV).is_err() {
-            assert!(!is_portable(), "干净环境不该判定为便携");
-        }
+        let default = portable_base().expect("explicit synthetic portable input");
+        assert_eq!(
+            default.parent().unwrap().to_path_buf(),
+            crate::public_test_fixture::root().to_path_buf()
+        );
+        assert!(is_portable());
+        assert!(!default.join(".quietmusic-write-probe").exists());
+        assert_eq!(logs_root_from_env(), Some(default.join("logs")));
+        let dir = temp_dir("base");
+        assert!(probe_writable(&dir));
+        assert!(
+            portable_base_from(Some(&dir), None).is_none(),
+            "干净环境不该判定为便携"
+        );
+        std::fs::write(dir.join(PORTABLE_FLAG_FILE), b"").expect("写标记");
+        assert!(
+            portable_base_from(Some(&dir), Some("off")).is_none(),
+            "明确关闭时标记不得开启便携"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

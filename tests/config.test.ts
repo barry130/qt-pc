@@ -10,8 +10,9 @@
  * `app.config.local.json`（被忽略）→ `src-tauri/src/private_config.rs`（被忽略），
  * **不参与一致性校验** —— 有私有文件时它本来就该与仓库版本不同。
  */
-import { describe, expect, it } from "vitest";
-import { check, loadConfig, loadLocalConfig, versionCodeOf } from "../scripts/sync-config.mjs";
+import fs from "node:fs";
+import { describe, expect, it, vi } from "vitest";
+import { check, loadConfig, versionCodeOf } from "../scripts/sync-config.mjs";
 
 describe("app.config.json 单一配置源", () => {
   const config = loadConfig();
@@ -48,17 +49,35 @@ describe("app.config.json 单一配置源", () => {
     expect(drifted).toEqual([]);
   });
 
-  it("每个派生文件都被纳入校验（防止新增文件漏配）", () => {
-    const files = check(config).map((i) => i.file);
-    // 这些是同步器负责的全部落点；新增配置落点时要同步更新本列表与 docs/CONFIG.md
-    expect(files.length).toBe(0);
+  it("重复公开校验保持一致，合法版本不产生漂移", () => {
+    // check() only returns drift; full target coverage is exercised with mutated
+    // public fixtures in config-check-private-isolation.test.ts.
+    expect(check(config)).toEqual([]);
     expect(config.version.name).toMatch(/^\d+\.\d+\.\d+$/);
   });
 
-  it("私有配置读取器：文件不存在时返回空对象而不是抛错", () => {
-    // 公开仓库 / CI 裸构建就是"没有私有文件"这一形态，必须能正常构建
-    const local = loadLocalConfig();
-    expect(typeof local).toBe("object");
-    expect(Array.isArray(local)).toBe(false);
+  it("公开一致性校验不探测私有文件，也不写盘", () => {
+    const actualExists = fs.existsSync;
+    const privateAccess: string[] = [];
+    const exists = vi.spyOn(fs, "existsSync").mockImplementation((file) => {
+      const key = String(file).replaceAll("\\", "/");
+      if (key.endsWith("/app.config.local.json") || key.endsWith("/src-tauri/src/private_config.rs")) {
+        privateAccess.push(key);
+        throw new Error("Public configuration test attempted private filesystem access");
+      }
+      return actualExists(file);
+    });
+    const write = vi.spyOn(fs, "writeFileSync").mockImplementation(() => {
+      throw new Error("Public configuration check attempted to write a file");
+    });
+
+    try {
+      expect(check(config)).toEqual([]);
+      expect(privateAccess).toEqual([]);
+      expect(write).not.toHaveBeenCalled();
+    } finally {
+      exists.mockRestore();
+      write.mockRestore();
+    }
   });
 });

@@ -73,12 +73,14 @@ export function PodcastPage(): React.JSX.Element {
     () => shows.find((show) => show.id === selectedId) ?? null,
     [shows, selectedId],
   );
-  /** 音频直链 → 单集 id：保存进度时反查用（播放器只知道 `Track.id`） */
-  const episodeByUrl = useMemo(() => {
-    const map = new Map<string, PodcastEpisode>();
-    for (const episode of episodes) map.set(episode.audioUrl, episode);
-    return map;
-  }, [episodes]);
+  /**
+   * 音频直链 → 单集：保存进度时反查用（播放器只知道 `Track.id`）。
+   *
+   * 不能只从「当前选中的订阅」里现算：用户听着 A 的单集切到 B 看节目单时，
+   * persist() 就查不到 A 的单集，播放进度与 ≥95% 的「已听完」标记整段丢失
+   * （C16）。这里按音频直链跨订阅累积，只增不减；`episodes` 只负责当前列表渲染。
+   */
+  const episodeByUrl = useRef(new Map<string, PodcastEpisode>());
   /** 待续播位置：起播到底后 seek 一次就清掉 */
   const pendingSeek = useRef<{ trackId: string; positionMs: number } | null>(null);
 
@@ -95,7 +97,10 @@ export function PodcastPage(): React.JSX.Element {
       setEpisodes([]);
       return;
     }
-    setEpisodes(await ipc.listPodcastEpisodes(showId));
+    const list = await ipc.listPodcastEpisodes(showId);
+    // 跨订阅累积：切到别的订阅后，正在播放那一集的进度仍然要能落库（C16）
+    for (const item of list) episodeByUrl.current.set(item.audioUrl, item);
+    setEpisodes(list);
   }, []);
 
   useEffect(() => {
@@ -132,15 +137,17 @@ export function PodcastPage(): React.JSX.Element {
 
   /** 进度落库：定时一次 + 播放状态变化时一次 */
   const persist = useCallback(() => {
-    const { state } = usePlayerStore.getState();
+    // tick 只更新顶层进度标量；state.positionMs 是最近一次语义快照的位置。
+    const { state, positionMs: currentPositionMs } = usePlayerStore.getState();
     const track = state?.track;
     if (!track || track.platform !== PODCAST_PLATFORM) return;
-    const episode = episodeByUrl.get(track.id);
+    // 从跨订阅累积的索引里取：当前列表切到别的订阅也照样能保存正在播放那一集（C16）
+    const episode = episodeByUrl.current.get(track.id);
     if (!episode) return;
     const total = episode.durationMs || state.durationMs || 0;
-    const played = total > 0 && state.positionMs >= total * FINISH_RATIO;
-    void ipc.savePodcastProgress(episode.id, Math.round(state.positionMs), played).catch(() => {});
-  }, [episodeByUrl]);
+    const played = total > 0 && currentPositionMs >= total * FINISH_RATIO;
+    void ipc.savePodcastProgress(episode.id, Math.round(currentPositionMs), played).catch(() => {});
+  }, []);
 
   useEffect(() => {
     const timer = window.setInterval(persist, SAVE_INTERVAL_MS);
@@ -208,6 +215,8 @@ export function PodcastPage(): React.JSX.Element {
   async function play(episode: PodcastEpisode) {
     if (!selected) return;
     setError("");
+    // 先记进索引：即使马上切走订阅，这一集的进度也能保存（C16）
+    episodeByUrl.current.set(episode.audioUrl, episode);
     try {
       const track = toTrack(episode, selected);
       const resumeAt = episode.played ? 0 : episode.positionMs;
@@ -218,14 +227,14 @@ export function PodcastPage(): React.JSX.Element {
     }
   }
 
-  const playingEpisode = currentTrack ? episodeByUrl.get(currentTrack.id) ?? null : null;
+  const playingEpisode = currentTrack ? episodeByUrl.current.get(currentTrack.id) ?? null : null;
 
   return (
     <div className="flex h-full flex-col gap-4 overflow-y-auto p-6">
       <header className="flex flex-col gap-1">
         <h1 className="text-lg font-semibold">播客</h1>
         <p className="text-xs text-muted-foreground">
-          订阅 RSS 后可直接播放、断点续播；音频边播边缓存，不占曲库。
+          订阅 RSS 后可播放、断点续播。播放后点击底部封面，进入字幕阅读，可获取字幕、生成字幕和翻译中文。
         </p>
       </header>
 

@@ -7,7 +7,7 @@ const mocks = vi.hoisted(() => ({
   route: { platform: "qq", id: "Album" } as { platform: SourceId; id: string },
   searchMusic: vi.fn(),
   getAlbumDetail: vi.fn(),
-  playQueue: vi.fn(async () => undefined),
+  playQueue: vi.fn(async () => ({ applied: true, ticket: 0, target: null })),
   startDownload: vi.fn(async (_track: Track, _quality: string) => undefined),
   addTracksToPlaylist: vi.fn(async (_pid: string, tracks: Track[]) => tracks.length),
 }));

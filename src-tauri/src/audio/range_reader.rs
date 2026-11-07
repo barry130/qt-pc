@@ -188,7 +188,10 @@ impl RangeShared {
 
     /// 已就绪字节总数（供 bufferedMs 估算）
     pub fn ready_bytes(&self) -> u64 {
-        self.ready.lock().unwrap_or_else(|p| p.into_inner()).total_bytes()
+        self.ready
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .total_bytes()
     }
 
     fn set_total(&self, len: u64) {
@@ -199,16 +202,25 @@ impl RangeShared {
     }
 
     fn add_ready(&self, start: u64, end: u64) {
-        self.ready.lock().unwrap_or_else(|p| p.into_inner()).add(start, end);
+        self.ready
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .add(start, end);
         self.ready_cv.notify_all();
     }
 
     fn is_ready_at(&self, pos: u64) -> bool {
-        self.ready.lock().unwrap_or_else(|p| p.into_inner()).is_ready_at(pos)
+        self.ready
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_ready_at(pos)
     }
 
     fn covers(&self, start: u64, end: u64) -> bool {
-        self.ready.lock().unwrap_or_else(|p| p.into_inner()).covers(start, end)
+        self.ready
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .covers(start, end)
     }
 
     fn wake_all(&self) {
@@ -249,17 +261,14 @@ pub fn open(
     if !referer.is_empty() {
         first = first.header("Referer", referer);
     }
-    let resp = first
-        .timeout(HTTP_TOTAL_GUARD)
-        .send()
-        .map_err(|e| {
-            // 完整地址只进日志；抛给上层的错误不带 URL（含后端/存储域名）
-            log::warn!("[audio] 打开音频流失败: {url} ({e})");
-            io::Error::other(format!(
-                "打开音频流失败: {}",
-                crate::astral::sanitize_err(e)
-            ))
-        })?;
+    let resp = first.timeout(HTTP_TOTAL_GUARD).send().map_err(|e| {
+        // 完整地址只进日志；抛给上层的错误不带 URL（含后端/存储域名）
+        log::warn!("[audio] 打开音频流失败: {url} ({e})");
+        io::Error::other(format!(
+            "打开音频流失败: {}",
+            crate::astral::sanitize_err(e)
+        ))
+    })?;
     let status = resp.status();
     if !status.is_success() {
         return Err(io::Error::other(format!("音频流 HTTP {status}")));
@@ -347,7 +356,7 @@ pub fn open(
 /// - 通道断开（后台线程退出）→ `Ok(0)`，等价于原 body 的 EOF
 /// - 后台线程是 detached 的：被放弃后它会继续阻塞到 body 总超时再自然退出，
 ///   不改内存安全性（它只持有 body 和 sender，不碰共享状态）
-struct BodyReader {
+pub struct BodyReader {
     rx: std::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
     pending: Vec<u8>,
     off: usize,
@@ -356,17 +365,27 @@ struct BodyReader {
 }
 
 /// `BodyReader::read` 的结果：区分「真 EOF」与「空闲超时」
-enum BodyRead {
+pub enum BodyRead {
     Data(usize),
     Eof,
     TimedOut,
 }
 
 impl BodyReader {
-    /// 起一个 detach 的读线程把 `body` 的内容推入有界通道
-    fn new(mut body: Box<dyn Read + Send>) -> Self {
+    /// 起一个 detach 的读线程把 `body` 的内容推入有界通道。
+    /// Production keeps the original nonblocking drop and spawn-failure behavior.
+    pub fn new(body: Box<dyn Read + Send>) -> Self {
+        let (reader, _worker) = Self::spawn(body);
+        reader
+    }
+
+    /// The worker loop is shared; owned finite test readers retain this handle
+    /// for shutdown instead of changing production Drop to synchronously join.
+    pub fn spawn(
+        mut body: Box<dyn Read + Send>,
+    ) -> (Self, io::Result<std::thread::JoinHandle<()>>) {
         let (tx, rx) = std::sync::mpsc::sync_channel::<io::Result<Vec<u8>>>(BODY_CHANNEL_CAP);
-        let _ = std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("audio-body-read".into())
             .spawn(move || {
                 let mut buf = vec![0u8; 64 * 1024];
@@ -386,16 +405,19 @@ impl BodyReader {
                     }
                 }
             });
-        Self {
-            rx,
-            pending: Vec::new(),
-            off: 0,
-            done: false,
-        }
+        (
+            Self {
+                rx,
+                pending: Vec::new(),
+                off: 0,
+                done: false,
+            },
+            worker,
+        )
     }
 
     /// 带空闲超时的读：只有真 EOF 才返回 `BodyRead::Eof`
-    fn read_with_timeout(&mut self, out: &mut [u8], idle: Duration) -> BodyRead {
+    pub fn read_with_timeout(&mut self, out: &mut [u8], idle: Duration) -> BodyRead {
         if self.off >= self.pending.len() {
             if self.done {
                 return BodyRead::Eof;
@@ -499,7 +521,9 @@ fn run_downloader(
                 eof = true;
                 let total = shared.total_len().unwrap_or(pos);
                 if shared.total_len().is_none() {
-                    log::warn!("[audio] 无 Content-Length 的流在 {pos} 字节处收尾（close-delimited）");
+                    log::warn!(
+                        "[audio] 无 Content-Length 的流在 {pos} 字节处收尾（close-delimited）"
+                    );
                 }
                 shared.set_total(total);
                 let _ = writer.set_len(total);
@@ -611,7 +635,12 @@ fn content_range_start(resp: &reqwest::blocking::Response) -> Option<u64> {
 /// `content_range_start` 的纯解析部分（单测直接打它）。
 fn parse_content_range_start(raw: &str) -> Option<u64> {
     let rest = raw.trim().strip_prefix("bytes")?;
-    rest.trim_start().split('-').next()?.trim().parse::<u64>().ok()
+    rest.trim_start()
+        .split('-')
+        .next()?
+        .trim()
+        .parse::<u64>()
+        .ok()
 }
 
 /// 供 rodio/symphonia 使用的 Read + Seek 包装。
@@ -645,7 +674,11 @@ impl Read for HttpRangeReader {
         }
 
         // 只读当前 pos 所在就绪区间的末端为止，绝不越过未就绪字节
-        let span_end = shared.ready.lock().unwrap_or_else(|p| p.into_inner()).ready_upto(self.pos);
+        let span_end = shared
+            .ready
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .ready_upto(self.pos);
         let upper = total.unwrap_or(u64::MAX).min(span_end);
         let max = upper.saturating_sub(self.pos) as usize;
         let want = buf.len().min(max);
@@ -772,13 +805,123 @@ fn sha1_hex(s: &str) -> String {
 mod tests {
     use super::*;
 
+    struct OwnedTestDir(crate::lyric_access::native_fixture::NativeFixture);
+
+    impl OwnedTestDir {
+        fn new() -> Self {
+            Self(crate::lyric_access::native_fixture::NativeFixture::new(
+                "audio-range",
+            ))
+        }
+    }
+
+    #[derive(Default)]
+    struct BodyControl {
+        stopped: Mutex<bool>,
+        wake: Condvar,
+    }
+
+    impl BodyControl {
+        fn stop(&self) {
+            *self.stopped.lock().unwrap_or_else(|p| p.into_inner()) = true;
+            self.wake.notify_all();
+        }
+    }
+
+    /// Silent until explicitly stopped, with an independent finite fail-safe.
+    /// No HTTP response, user file, socket, global hook or 30-second sleeper.
+    struct ControlledRead(Arc<BodyControl>);
+
+    impl Read for ControlledRead {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            let stopped = self.0.stopped.lock().unwrap_or_else(|p| p.into_inner());
+            let (stopped, _) = self
+                .0
+                .wake
+                .wait_timeout_while(stopped, Duration::from_secs(5), |stopped| !*stopped)
+                .unwrap_or_else(|p| p.into_inner());
+            if *stopped {
+                Ok(0)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "controlled reader deadline",
+                ))
+            }
+        }
+    }
+
+    /// Test-only owner of the actual BodyReader worker. Drop closes the receiver
+    /// (also unblocks a full sender), stops controlled Read, and joins on every path.
+    struct OwnedBody {
+        body: Option<BodyReader>,
+        worker: Option<std::thread::JoinHandle<()>>,
+        control: Option<Arc<BodyControl>>,
+        joined: Arc<AtomicBool>,
+    }
+
+    impl OwnedBody {
+        fn new(src: Box<dyn Read + Send>, control: Option<Arc<BodyControl>>) -> Self {
+            let _owned_root = crate::public_test_fixture::root();
+            let (body, worker) = BodyReader::spawn(src);
+            Self {
+                body: Some(body),
+                worker: Some(worker.expect("owned body worker must start")),
+                control,
+                joined: Arc::new(AtomicBool::new(false)),
+            }
+        }
+
+        fn silent() -> Self {
+            let control = Arc::new(BodyControl::default());
+            Self::new(
+                Box::new(ControlledRead(Arc::clone(&control))),
+                Some(control),
+            )
+        }
+
+        fn shutdown(&mut self) {
+            drop(self.body.take());
+            if let Some(control) = &self.control {
+                control.stop();
+            }
+            if let Some(worker) = self.worker.take() {
+                let joined = worker.join();
+                self.joined.store(true, Ordering::SeqCst);
+                if !std::thread::panicking() {
+                    joined.expect("owned body worker panicked");
+                }
+            }
+        }
+    }
+
+    impl std::ops::Deref for OwnedBody {
+        type Target = BodyReader;
+        fn deref(&self) -> &Self::Target {
+            self.body.as_ref().expect("owned reader already shut down")
+        }
+    }
+
+    impl std::ops::DerefMut for OwnedBody {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            self.body.as_mut().expect("owned reader already shut down")
+        }
+    }
+
+    impl Drop for OwnedBody {
+        fn drop(&mut self) {
+            self.shutdown();
+        }
+    }
+
     #[test]
     fn repeated_url_buffers_preserve_independent_bytes() {
-        let dir = std::env::temp_dir().join(format!("quietmusic-audio-{:016x}", fastrand::u64(..)));
-        std::fs::create_dir(&dir).unwrap();
-        let (first_path, mut first) = create_buffer_file(&dir, "https://audio.test/same.flac").unwrap();
+        let dir = OwnedTestDir::new();
+        let (first_path, mut first) =
+            create_buffer_file(&dir.0, "https://audio.test/same.flac").unwrap();
         first.write_all(b"current audio bytes").unwrap();
-        let (next_path, mut next) = create_buffer_file(&dir, "https://audio.test/same.flac").unwrap();
+        let (next_path, mut next) =
+            create_buffer_file(&dir.0, "https://audio.test/same.flac").unwrap();
         next.write_all(b"preloaded audio").unwrap();
         assert_ne!(first_path, next_path);
         first.seek(SeekFrom::Start(0)).unwrap();
@@ -798,7 +941,7 @@ mod tests {
         drop(next);
         std::fs::remove_file(first_path).unwrap();
         std::fs::remove_file(next_path).unwrap();
-        std::fs::remove_dir(dir).unwrap();
+        std::fs::remove_dir(dir.0.path()).unwrap();
     }
 
     #[test]
@@ -831,9 +974,15 @@ mod tests {
     #[test]
     fn parse_content_range_start_variants() {
         assert_eq!(parse_content_range_start("bytes 0-1023/4096"), Some(0));
-        assert_eq!(parse_content_range_start("bytes 1024-2047/4096"), Some(1024));
+        assert_eq!(
+            parse_content_range_start("bytes 1024-2047/4096"),
+            Some(1024)
+        );
         assert_eq!(parse_content_range_start("bytes  1024-2047/*"), Some(1024));
-        assert_eq!(parse_content_range_start("  bytes 4096-8191/8192  "), Some(4096));
+        assert_eq!(
+            parse_content_range_start("  bytes 4096-8191/8192  "),
+            Some(4096)
+        );
         // 形态异常一律 None（调用方只在拿到 Some 时做强校验）
         assert_eq!(parse_content_range_start(""), None);
         assert_eq!(parse_content_range_start("bytes */4096"), None);
@@ -845,7 +994,7 @@ mod tests {
     #[test]
     fn body_reader_yields_bytes_then_eof() {
         let src: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(vec![1u8, 2, 3, 4, 5]));
-        let mut body = BodyReader::new(src);
+        let mut body = OwnedBody::new(src, None);
         let mut out = [0u8; 8];
         match body.read_with_timeout(&mut out, Duration::from_secs(5)) {
             BodyRead::Data(n) => assert_eq!(&out[..n], &[1, 2, 3, 4, 5]),
@@ -865,29 +1014,55 @@ mod tests {
     /// 假死连接：服务端不关连接也不发数据 → 必须报 TimedOut 而不是把下载线程冻死。
     #[test]
     fn body_reader_reports_idle_timeout() {
-        /// 永不返回的 Read，模拟「连上了但不发包也不关连接」
-        struct BlackHole;
-        impl Read for BlackHole {
-            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-                std::thread::sleep(Duration::from_secs(30));
-                Ok(0)
-            }
-        }
-        let src: Box<dyn Read + Send> = Box::new(BlackHole);
-        let mut body = BodyReader::new(src);
+        let mut body = OwnedBody::silent();
         let mut out = [0u8; 8];
         let started = Instant::now();
         let got = body.read_with_timeout(&mut out, Duration::from_millis(150));
         assert!(matches!(got, BodyRead::TimedOut));
         // 关键：判死必须发生在空闲阈值上，而不是被后台线程拖到 30s
         assert!(started.elapsed() < Duration::from_secs(5));
+        body.shutdown();
+        assert!(body.joined.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn body_reader_owned_shutdown_joins_without_draining_all_frames() {
+        let src = Box::new(std::io::Cursor::new(vec![
+            9u8;
+            64 * 1024 * (BODY_CHANNEL_CAP + 2)
+        ]));
+        let mut body = OwnedBody::new(src, None);
+        let joined = Arc::clone(&body.joined);
+        let mut out = [0; 1];
+        assert!(matches!(
+            body.read_with_timeout(&mut out, Duration::from_secs(5)),
+            BodyRead::Data(1)
+        ));
+        assert_eq!(out, [9]);
+        // Closing the receiver releases even a worker waiting on a full channel.
+        drop(body);
+        assert!(joined.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn body_reader_owned_shutdown_joins_during_unwind() {
+        let body = OwnedBody::silent();
+        let joined = Arc::clone(&body.joined);
+        let control = Arc::clone(body.control.as_ref().unwrap());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _owned_body = body;
+            panic!("exercise owned reader assertion-unwind cleanup");
+        }));
+        assert!(result.is_err());
+        assert!(joined.load(Ordering::SeqCst));
+        assert!(*control.stopped.lock().unwrap());
     }
 
     /// 读侧缓冲区小于单帧时，帧内剩余字节必须留到下一次读，不能丢。
     #[test]
     fn body_reader_preserves_partial_frame() {
         let src: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(vec![7u8; 100]));
-        let mut body = BodyReader::new(src);
+        let mut body = OwnedBody::new(src, None);
         let mut out = [0u8; 3];
         match body.read_with_timeout(&mut out, Duration::from_secs(5)) {
             BodyRead::Data(n) => assert_eq!(n, 3),

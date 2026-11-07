@@ -180,6 +180,92 @@ fn resolve_dir(raw: &str) -> Option<PathBuf> {
     }
 }
 
+/// Parsed file settings at the final logger-instance boundary. None preserves
+/// the current value; directory resolution and actual file I/O belong to the target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoggerSettingsUpdate {
+    pub directory: Option<String>,
+    pub max_file_bytes: Option<u64>,
+    pub max_backups: Option<u32>,
+}
+
+/// Final level/storage adapter, shared by the global logger and local instances.
+pub trait LoggerSettingsTarget {
+    fn set_level(&mut self, level: log::LevelFilter);
+    fn apply_file_settings(&mut self, update: LoggerSettingsUpdate);
+}
+
+/// Local scalar settings, with no global logger initialization or level mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalLoggerSettings {
+    pub level: log::LevelFilter,
+    pub max_file_bytes: u64,
+    pub max_backups: u32,
+    /// Last requested raw directory, not a resolved path or an opened log file.
+    pub directory: Option<String>,
+}
+
+impl LoggerSettingsTarget for LocalLoggerSettings {
+    fn set_level(&mut self, level: log::LevelFilter) {
+        self.level = level;
+    }
+
+    fn apply_file_settings(&mut self, update: LoggerSettingsUpdate) {
+        if let Some(bytes) = update.max_file_bytes {
+            self.max_file_bytes = bytes;
+        }
+        if let Some(backups) = update.max_backups {
+            self.max_backups = backups;
+        }
+        if let Some(directory) = update.directory {
+            self.directory = Some(directory);
+        }
+    }
+}
+
+/// The actual shared parse/clamp/None policy. A valid level is applied first,
+/// including when the target has no file logger, matching apply_settings.
+pub fn apply_settings_to(
+    target: &mut dyn LoggerSettingsTarget,
+    dir: Option<&str>,
+    level: Option<&str>,
+    file_mb: Option<&str>,
+    backups: Option<&str>,
+) {
+    if let Some(level) = level.and_then(parse_level) {
+        target.set_level(level);
+    }
+    target.apply_file_settings(LoggerSettingsUpdate {
+        directory: dir.map(str::to_owned),
+        max_file_bytes: file_mb
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|mb| clamp_file_mb(mb) * 1024 * 1024),
+        max_backups: backups
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .map(clamp_backups),
+    });
+}
+
+struct GlobalLoggerSettings;
+
+impl LoggerSettingsTarget for GlobalLoggerSettings {
+    fn set_level(&mut self, level: log::LevelFilter) {
+        log::set_max_level(level);
+    }
+
+    fn apply_file_settings(&mut self, update: LoggerSettingsUpdate) {
+        let Some(mutex) = LOGGER.get() else { return };
+        let mut inner = mutex.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(bytes) = update.max_file_bytes {
+            inner.max_file_bytes = bytes;
+        }
+        if let Some(backups) = update.max_backups {
+            inner.max_backups = backups;
+        }
+        apply_directory(&mut inner, update.directory.as_deref());
+    }
+}
+
 /// 数据库打开后调用：把用户配置盖到运行期参数上。
 ///
 /// 四个参数都是「原始字符串」，解析与夹紧都收在本模块里 —— 调用方
@@ -198,19 +284,10 @@ pub fn apply_settings(
     file_mb: Option<&str>,
     backups: Option<&str>,
 ) {
-    if let Some(level) = level.and_then(parse_level) {
-        log::set_max_level(level);
-    }
+    apply_settings_to(&mut GlobalLoggerSettings, dir, level, file_mb, backups);
+}
 
-    let Some(mutex) = LOGGER.get() else { return };
-    let mut inner = mutex.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(mb) = file_mb.and_then(|s| s.trim().parse::<u64>().ok()) {
-        inner.max_file_bytes = clamp_file_mb(mb) * 1024 * 1024;
-    }
-    if let Some(n) = backups.and_then(|s| s.trim().parse::<u32>().ok()) {
-        inner.max_backups = clamp_backups(n);
-    }
-
+fn apply_directory(inner: &mut Inner, dir: Option<&str>) {
     let Some(raw_dir) = dir else { return };
     let Some(new_dir) = resolve_dir(raw_dir) else {
         return;
@@ -511,7 +588,12 @@ fn rotate(dir: &Path, backups: u32) {
 /// 里的目标识别降成 Warn（丢了全局 info），`off` 等无法识别的词回落默认值。
 fn level_from_env() -> log::LevelFilter {
     let raw = std::env::var("RUST_LOG").unwrap_or_default();
-    let first = raw.split(',').next().unwrap_or("").trim().to_ascii_lowercase();
+    let first = raw
+        .split(',')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
     match first.as_str() {
         "trace" => log::LevelFilter::Trace,
         "debug" => log::LevelFilter::Debug,
@@ -729,57 +811,66 @@ mod tests {
             resolve_dir("D:\\logs\\qm"),
             Some(PathBuf::from("D:\\logs\\qm"))
         );
-        assert_eq!(resolve_dir("  D:\\logs\\qm  "), Some(PathBuf::from("D:\\logs\\qm")));
+        assert_eq!(
+            resolve_dir("  D:\\logs\\qm  "),
+            Some(PathBuf::from("D:\\logs\\qm"))
+        );
     }
 
     /// `apply_settings` 的 `None` = 「这一项不动」：设置页只改大小的时候，级别
     /// 与份数都不能被顺手打回默认。
     #[test]
     fn none_arguments_leave_other_items_untouched() {
-        // 级别是进程级全局量，测试之间会互相串；先存后还，别把这个测试的
-        // 副作用留给同进程的其他测试。
-        let level_before = log::max_level();
-        let mutex = LOGGER.get_or_init(|| {
-            Mutex::new(Inner {
-                dir: None,
-                file: None,
-                written: 0,
-                max_file_bytes: DEFAULT_FILE_MB * 1024 * 1024,
-                max_backups: DEFAULT_BACKUPS,
-            })
-        });
-        // 先摆一个非默认状态
-        apply_settings(None, Some("error"), Some("77"), Some("9"));
-        assert_eq!(log::max_level(), log::LevelFilter::Error);
-        {
-            let inner = mutex.lock().unwrap_or_else(|p| p.into_inner());
-            assert_eq!(inner.max_file_bytes, 77 * 1024 * 1024);
-            assert_eq!(inner.max_backups, 9);
-        }
+        let mut settings = LocalLoggerSettings {
+            level: log::LevelFilter::Warn,
+            max_file_bytes: DEFAULT_FILE_MB * 1024 * 1024,
+            max_backups: DEFAULT_BACKUPS,
+            directory: None,
+        };
+        // 先摆一个非默认状态；共享公有策略只更新这个实例。
+        apply_settings_to(&mut settings, None, Some("error"), Some("77"), Some("9"));
+        assert_eq!(settings.level, log::LevelFilter::Error);
+        assert_eq!(settings.max_file_bytes, 77 * 1024 * 1024);
+        assert_eq!(settings.max_backups, 9);
         // 只改份数：级别与大小保持刚才的值
-        apply_settings(None, None, None, Some("3"));
-        assert_eq!(log::max_level(), log::LevelFilter::Error);
-        {
-            let inner = mutex.lock().unwrap_or_else(|p| p.into_inner());
-            assert_eq!(inner.max_file_bytes, 77 * 1024 * 1024);
-            assert_eq!(inner.max_backups, 3);
-        }
+        apply_settings_to(&mut settings, None, None, None, Some("3"));
+        assert_eq!(settings.level, log::LevelFilter::Error);
+        assert_eq!(settings.max_file_bytes, 77 * 1024 * 1024);
+        assert_eq!(settings.max_backups, 3);
         // 认不出的级别词不动任何东西（不 panic、不回落默认）
-        apply_settings(None, Some("nonsense"), None, None);
-        assert_eq!(log::max_level(), log::LevelFilter::Error);
+        apply_settings_to(&mut settings, None, Some("nonsense"), None, None);
+        assert_eq!(settings.level, log::LevelFilter::Error);
         // 脏数据同样只是「不动」
-        apply_settings(None, None, Some("abc"), None);
-        {
-            let inner = mutex.lock().unwrap_or_else(|p| p.into_inner());
-            assert_eq!(inner.max_file_bytes, 77 * 1024 * 1024);
+        apply_settings_to(&mut settings, None, None, Some("abc"), None);
+        assert_eq!(settings.max_file_bytes, 77 * 1024 * 1024);
+        assert_eq!(settings.max_backups, 3);
+        assert_eq!(settings.directory, None);
+    }
+
+    #[test]
+    fn settings_apply_valid_level_before_absent_file_logger() {
+        struct LevelOnly(log::LevelFilter);
+        impl LoggerSettingsTarget for LevelOnly {
+            fn set_level(&mut self, level: log::LevelFilter) {
+                self.0 = level;
+            }
+            fn apply_file_settings(&mut self, _update: LoggerSettingsUpdate) {
+                // Mirrors LOGGER absence without initializing or mutating it.
+                assert_eq!(self.0, log::LevelFilter::Error);
+            }
         }
-        // 还原：份数回默认，级别回测试前的档
-        {
-            let mut inner = mutex.lock().unwrap_or_else(|p| p.into_inner());
-            inner.max_file_bytes = DEFAULT_FILE_MB * 1024 * 1024;
-            inner.max_backups = DEFAULT_BACKUPS;
-        }
-        log::set_max_level(level_before);
+        let mut target = LevelOnly(log::LevelFilter::Warn);
+        apply_settings_to(&mut target, None, Some("error"), Some("77"), Some("9"));
+        assert_eq!(target.0, log::LevelFilter::Error);
+        apply_settings_to(&mut target, None, None, None, None);
+        apply_settings_to(
+            &mut target,
+            None,
+            Some("nonsense"),
+            Some("abc"),
+            Some("abc"),
+        );
+        assert_eq!(target.0, log::LevelFilter::Error);
     }
 
     /// 域名脱敏：只留接口路径，域名一律 `***`；纯数字 IP 与 localhost 不动。
@@ -819,7 +910,10 @@ mod tests {
             "version Some(\"1.2.3\"), file Some(\"C:\\\\x.log\")"
         );
         // 无域名普通文本原样
-        assert_eq!(mask_hosts("缓存清理完成，释放 12 MB"), "缓存清理完成，释放 12 MB");
+        assert_eq!(
+            mask_hosts("缓存清理完成，释放 12 MB"),
+            "缓存清理完成，释放 12 MB"
+        );
     }
 
     /// reqwest::connect 的 DEBUG 只有域名（打码后零信息）：Error 与 trace 放行，
@@ -843,11 +937,7 @@ mod tests {
             log::LevelFilter::Trace
         ));
         // Error 任何档位都放行（连不上该看见了）
-        assert!(!suppressed_at(
-            "reqwest::connect",
-            log::Level::Error,
-            dbg
-        ));
+        assert!(!suppressed_at("reqwest::connect", log::Level::Error, dbg));
         // 别的 reqwest target（带真正故障信息的）不牵连
         assert!(!suppressed_at("reqwest::blocking", log::Level::Warn, dbg));
         assert!(!suppressed_at("reqwest", log::Level::Debug, dbg));

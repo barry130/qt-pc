@@ -16,9 +16,9 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(import.meta.dirname, "..");
-const SRC = path.join(ROOT, "src");
 
 /** 只扫这些扩展名 */
 const EXTENSIONS = new Set([".ts", ".tsx"]);
@@ -41,53 +41,119 @@ const RULES = [
   },
 ];
 
-const violations = [];
-
-/** 递归收集待扫文件 */
-function walk(dir) {
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-    const full = path.join(dir, entry.name);
-    if (entry.isDirectory()) {
-      if (entry.name === "node_modules" || entry.name === "dist") continue;
-      walk(full);
-      continue;
+/** Public scanning seam; a filesystem adapter allows boundary tests without host reads. */
+export function createPublicSourceScanner(root, fileSystem = fs) {
+  const base = path.resolve(root);
+  const privateNames = new Set(["private_config.rs", "app.config.local.json"]);
+  function excluded(name) {
+    return name.startsWith(".") || privateNames.has(name.toLowerCase());
+  }
+  if (base.split(path.sep).some(excluded)) {
+    throw new Error("Public source root is private or hidden");
+  }
+  function permitted(file) {
+    const absolute = path.resolve(base, file);
+    const relative = path.relative(base, absolute);
+    if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new Error("Source path is outside the public source root");
     }
-    if (!EXTENSIONS.has(path.extname(entry.name))) continue;
-    checkFile(full);
+    if (relative.split(path.sep).some(excluded)) {
+      throw new Error("Source path is private or hidden");
+    }
+    return absolute;
   }
+  function inspect(file) {
+    // Check the whole lexical path before the first metadata lookup, then
+    // lstat each ancestor so an otherwise-public literal cannot cross a link.
+    const absolute = permitted(file);
+    const parts = path.relative(base, absolute).split(path.sep).filter(Boolean);
+    let current = base;
+    let metadata = fileSystem.lstatSync(current);
+    if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
+      throw new Error("Public source root must be a directory without links");
+    }
+    for (const part of parts) {
+      if (!metadata.isDirectory()) throw new Error("Public source ancestor is not a directory");
+      current = path.join(current, part);
+      metadata = fileSystem.lstatSync(current);
+      if (metadata.isSymbolicLink()) throw new Error("Public source path contains a link or junction");
+    }
+    return { file: absolute, metadata };
+  }
+  return {
+    files(dir, extensions, ignoredDirectories = []) {
+      const out = [];
+      function visit(directory) {
+        for (const entry of fileSystem.readdirSync(directory, { withFileTypes: true })) {
+          // Exclude by name before inspecting metadata or evaluating a read.
+          if (excluded(entry.name) || entry.isSymbolicLink()) continue;
+          if (entry.isDirectory() && ignoredDirectories.includes(entry.name)) continue;
+          const full = path.join(directory, entry.name);
+          // lstat does not follow a file symlink or Windows junction/reparse.
+          const metadata = fileSystem.lstatSync(full);
+          if (metadata.isSymbolicLink()) continue;
+          if (metadata.isDirectory()) {
+            if (!ignoredDirectories.includes(entry.name)) visit(full);
+          } else if (metadata.isFile() && extensions.includes(path.extname(entry.name))) {
+            out.push(full);
+          }
+        }
+      }
+      const directory = inspect(dir);
+      if (!directory.metadata.isDirectory()) throw new Error("Public source scan target is not a directory");
+      visit(directory.file);
+      return out;
+    },
+    read(file) {
+      const source = inspect(file);
+      if (!source.metadata.isFile()) throw new Error("Public source read target is not a regular file");
+      return fileSystem.readFileSync(source.file, "utf8");
+    },
+  };
 }
 
-function checkFile(file) {
-  const lines = fs.readFileSync(file, "utf8").split(/\r?\n/);
-  for (const rule of RULES) {
-    lines.forEach((line, index) => {
-      // 注释行整行跳过：注释里举反例是正常的表达方式
-      const trimmed = line.trimStart();
-      if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*")) return;
-      // 正则带 g，逐行使用前必须重置 lastIndex，否则第二行起会漏匹配
-      rule.pattern.lastIndex = 0;
-      const match = rule.pattern.exec(line);
-      if (match === null) return;
-      violations.push({
-        file: path.relative(ROOT, file).split(path.sep).join("/"),
-        line: index + 1,
-        snippet: match[0],
-        rule: rule.id,
-        hint: rule.hint,
+/** Return the CLI's complete rule results without exiting or scanning on import. */
+export function checkMotion(root = ROOT, fileSystem = fs) {
+  const violations = [];
+  const scanner = createPublicSourceScanner(root, fileSystem);
+  for (const file of scanner.files(path.join(root, "src"), [...EXTENSIONS], ["node_modules", "dist"])) {
+    const lines = scanner.read(file).split(/\r?\n/);
+    for (const rule of RULES) {
+      lines.forEach((line, index) => {
+        // 注释行整行跳过：注释里举反例是正常的表达方式
+        const trimmed = line.trimStart();
+        if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*")) return;
+        // 正则带 g，逐行使用前必须重置 lastIndex，否则第二行起会漏匹配
+        rule.pattern.lastIndex = 0;
+        const match = rule.pattern.exec(line);
+        if (match === null) return;
+        violations.push({
+          file: path.relative(root, file).split(path.sep).join("/"),
+          line: index + 1,
+          snippet: match[0],
+          rule: rule.id,
+          hint: rule.hint,
+        });
       });
-    });
+    }
   }
+  return violations;
 }
 
-walk(SRC);
+function main() {
+  const violations = checkMotion();
+  if (violations.length === 0) {
+    console.log("[check-motion] 字号/动效令牌检查通过（0 违规）");
+    process.exit(0);
+  }
 
-if (violations.length === 0) {
-  console.log("[check-motion] 字号/动效令牌检查通过（0 违规）");
-  process.exit(0);
+  console.error(`[check-motion] 发现 ${violations.length} 处硬编码样式，请改用设计令牌：`);
+  for (const v of violations) {
+    console.error(`  ${v.file}:${v.line}  ${v.snippet}  →  ${v.hint}`);
+  }
+  process.exit(1);
 }
 
-console.error(`[check-motion] 发现 ${violations.length} 处硬编码样式，请改用设计令牌：`);
-for (const v of violations) {
-  console.error(`  ${v.file}:${v.line}  ${v.snippet}  →  ${v.hint}`);
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main();
 }
-process.exit(1);

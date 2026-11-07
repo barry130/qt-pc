@@ -93,34 +93,50 @@ pub(crate) fn scrobble_enqueue(
     Ok(n > 0)
 }
 
-/// 取到点该发的行（按入队顺序）。`limit` 是单次冲刷的上限（Last.fm 一次最多 50 首）。
-pub(crate) fn scrobble_due(
+/// 取某几个目标各自到点该发的行（按入队顺序）。
+///
+/// `limit` 是**每个目标**单次冲刷的上限（Last.fm 一次最多 50 首）。按目标
+/// 分别取再合并，避免一个目标的积压把另一个目标饿死（C15）：以前先全局
+/// `LIMIT 50` 再按开关过滤，50 条关闭目标的旧行就能让开启的目标永远发不出去。
+pub(crate) fn scrobble_due_for_targets(
     conn: &Connection,
     now: i64,
     limit: usize,
+    targets: &[&str],
 ) -> Result<Vec<ScrobbleRow>, rusqlite::Error> {
+    if targets.is_empty() {
+        return Ok(Vec::new());
+    }
     let limit = limit.clamp(1, 50) as i64;
-    let mut stmt = conn.prepare(
-        "SELECT id, target, track_id, artist, title, album, duration_ms, played_at, attempts
-           FROM scrobbles
-          WHERE status = 'pending' AND next_at <= ?1
-          ORDER BY id ASC
-          LIMIT ?2",
-    )?;
-    let rows = stmt.query_map(params![now, limit], |r| {
-        Ok(ScrobbleRow {
-            id: r.get(0)?,
-            target: r.get(1)?,
-            track_id: r.get(2)?,
-            artist: r.get(3)?,
-            title: r.get(4)?,
-            album: r.get(5)?,
-            duration_ms: r.get(6)?,
-            played_at: r.get(7)?,
-            attempts: r.get(8)?,
-        })
-    })?;
-    rows.collect()
+    let mut out = Vec::new();
+    for target in targets {
+        let mut stmt = conn.prepare(
+            "SELECT id, target, track_id, artist, title, album, duration_ms, played_at, attempts
+               FROM scrobbles
+              WHERE status = 'pending' AND next_at <= ?1 AND target = ?2
+              ORDER BY id ASC
+              LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![now, target, limit], |r| {
+            Ok(ScrobbleRow {
+                id: r.get(0)?,
+                target: r.get(1)?,
+                track_id: r.get(2)?,
+                artist: r.get(3)?,
+                title: r.get(4)?,
+                album: r.get(5)?,
+                duration_ms: r.get(6)?,
+                played_at: r.get(7)?,
+                attempts: r.get(8)?,
+            })
+        })?;
+        for row in rows {
+            out.push(row?);
+        }
+    }
+    // 合并后仍按入队顺序发；各目标已各取满自己的批次，互不阻塞。
+    out.sort_by_key(|r| r.id);
+    Ok(out)
 }
 
 /// 标记发送成功。
@@ -287,14 +303,14 @@ mod tests {
         let t = track();
         scrobble_enqueue(&conn, TARGET_LASTFM, &t, 1_700_000_000, 269_000).unwrap();
         let now = now_ms() / 1000;
-        assert_eq!(scrobble_due(&conn, now, 10).unwrap().len(), 1, "刚入队应该能取");
+        assert_eq!(scrobble_due_for_targets(&conn, now, 10, &[TARGET_LASTFM, TARGET_LISTENBRAINZ]).unwrap().len(), 1, "刚入队应该能取");
 
-        let row = scrobble_due(&conn, now, 10).unwrap().remove(0);
+        let row = scrobble_due_for_targets(&conn, now, 10, &[TARGET_LASTFM, TARGET_LISTENBRAINZ]).unwrap().remove(0);
         let dead = scrobble_mark_failure(&conn, row.id, row.attempts, "网络错误").unwrap();
         assert!(!dead, "第一次失败只是退避");
-        assert_eq!(scrobble_due(&conn, now, 10).unwrap().len(), 0, "退避期内不该被取");
+        assert_eq!(scrobble_due_for_targets(&conn, now, 10, &[TARGET_LASTFM, TARGET_LISTENBRAINZ]).unwrap().len(), 0, "退避期内不该被取");
         assert_eq!(
-            scrobble_due(&conn, now + 24 * 3600, 10).unwrap().len(),
+            scrobble_due_for_targets(&conn, now + 24 * 3600, 10, &[TARGET_LASTFM, TARGET_LISTENBRAINZ]).unwrap().len(),
             1,
             "退避到期后应重新可取"
         );
@@ -306,13 +322,13 @@ mod tests {
     fn mark_failure_gives_up_at_max_attempts() {
         let conn = new_conn();
         scrobble_enqueue(&conn, TARGET_LASTFM, &track(), 1_700_000_000, 269_000).unwrap();
-        let id = scrobble_due(&conn, now_ms() / 1000, 10).unwrap()[0].id;
+        let id = scrobble_due_for_targets(&conn, now_ms() / 1000, 10, &[TARGET_LASTFM, TARGET_LISTENBRAINZ]).unwrap()[0].id;
         let mut dead = false;
         for attempt in 0..MAX_ATTEMPTS {
             dead = scrobble_mark_failure(&conn, id, attempt, "502").unwrap();
         }
         assert!(dead, "到达 MAX_ATTEMPTS 必须放弃");
-        assert_eq!(scrobble_due(&conn, now_ms() / 1000 + 365 * 24 * 3600, 10).unwrap().len(), 0);
+        assert_eq!(scrobble_due_for_targets(&conn, now_ms() / 1000 + 365 * 24 * 3600, 10, &[TARGET_LASTFM, TARGET_LISTENBRAINZ]).unwrap().len(), 0);
         let s = scrobble_stats(&conn).unwrap();
         assert_eq!((s.pending, s.dead), (0, 1));
     }
@@ -324,7 +340,7 @@ mod tests {
         let t = track();
         scrobble_enqueue(&conn, TARGET_LASTFM, &t, 1_700_000_000, 269_000).unwrap();
         scrobble_enqueue(&conn, TARGET_LISTENBRAINZ, &t, 1_700_000_000, 269_000).unwrap();
-        let fm = scrobble_due(&conn, now_ms() / 1000, 10)
+        let fm = scrobble_due_for_targets(&conn, now_ms() / 1000, 10, &[TARGET_LASTFM, TARGET_LISTENBRAINZ])
             .unwrap()
             .into_iter()
             .filter(|r| r.target == TARGET_LASTFM)
@@ -332,7 +348,7 @@ mod tests {
         scrobble_mark_sent(&conn, &[fm[0].id]).unwrap();
         assert_eq!(scrobble_stats(&conn).unwrap().sent, 1);
         assert_eq!(
-            scrobble_due(&conn, now_ms() / 1000, 10).unwrap().len(),
+            scrobble_due_for_targets(&conn, now_ms() / 1000, 10, &[TARGET_LASTFM, TARGET_LISTENBRAINZ]).unwrap().len(),
             1,
             "已发的行不该再被取"
         );
@@ -340,6 +356,40 @@ mod tests {
         assert_eq!(scrobble_clear(&conn, Some(TARGET_LISTENBRAINZ)).unwrap(), 1);
         let s = scrobble_stats(&conn).unwrap();
         assert_eq!((s.pending, s.sent), (0, 1));
+    }
+
+    /// 一个目标的积压不能饿死另一个目标（C15）：50 条关闭目标的旧行
+    /// 不该占满批次，让开启的目标永远取不到。
+    #[test]
+    fn due_is_fair_across_targets() {
+        let conn = new_conn();
+        let t = track();
+        for i in 0..50 {
+            scrobble_enqueue(&conn, TARGET_LASTFM, &t, 1_700_000_000 + i, 269_000).unwrap();
+        }
+        scrobble_enqueue(&conn, TARGET_LISTENBRAINZ, &t, 1_700_001_000, 269_000).unwrap();
+        let now = now_ms() / 1000;
+
+        // 只取开启的目标：关闭目标的 50 条旧行不参与，开启的目标不会饿死
+        let lb = scrobble_due_for_targets(&conn, now, 10, &[TARGET_LISTENBRAINZ]).unwrap();
+        assert_eq!(lb.len(), 1, "关闭目标的积压不该占满批次");
+        assert_eq!(lb[0].target, TARGET_LISTENBRAINZ);
+
+        // 两个目标都开启时各取各的一批（各 50 条上限），合并按入队顺序
+        let both = scrobble_due_for_targets(&conn, now, 10, &[TARGET_LASTFM, TARGET_LISTENBRAINZ])
+            .unwrap();
+        assert_eq!(
+            both.iter().filter(|r| r.target == TARGET_LASTFM).count(),
+            10,
+            "每个目标各取一批，Last.fm 的积压吃不到 ListenBrainz 的配额"
+        );
+        assert_eq!(
+            both.iter().filter(|r| r.target == TARGET_LISTENBRAINZ).count(),
+            1
+        );
+
+        // 空目标列表 = 不取任何行（冲刷器在没有开启目标时直接清队列）
+        assert!(scrobble_due_for_targets(&conn, now, 10, &[]).unwrap().is_empty());
     }
 
     /// `recent` 按开始时间倒序，供设置页展示。

@@ -118,7 +118,7 @@ describe("播客页面", () => {
   });
 
   it("点单集播放：交给播放器的 Track 用音频直链当 id、平台是 podcast", async () => {
-    const playQueue = vi.fn(async () => {});
+    const playQueue = vi.fn(async () => ({ applied: true, ticket: 0, target: null }));
     usePlayerStore.setState({ playQueue });
     render(<PodcastPage />);
     await screen.findByText("第 1 期：开场");
@@ -140,7 +140,7 @@ describe("播客页面", () => {
   });
 
   it("未听完的单集起播后 seek 回上次位置", async () => {
-    const seekTo = vi.fn(async () => {});
+    const seekTo = vi.fn(async () => true);
     const track: Track = {
       id: ep1.audioUrl,
       platform: "podcast",
@@ -153,6 +153,7 @@ describe("播客页面", () => {
     usePlayerStore.setState({
       playQueue: async () => {
         simulatePlaying(track);
+        return { applied: true, ticket: 0, target: null };
       },
       seekTo,
     });
@@ -165,7 +166,7 @@ describe("播客页面", () => {
   });
 
   it("已听完的单集重听从头开始（不 seek）", async () => {
-    const seekTo = vi.fn(async () => {});
+    const seekTo = vi.fn(async () => true);
     const track: Track = {
       id: ep2.audioUrl,
       platform: "podcast",
@@ -178,6 +179,7 @@ describe("播客页面", () => {
     usePlayerStore.setState({
       playQueue: async () => {
         simulatePlaying(track);
+        return { applied: true, ticket: 0, target: null };
       },
       seekTo,
     });

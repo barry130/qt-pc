@@ -8,13 +8,16 @@ pub mod audio;
 pub mod backup;
 pub mod cache;
 pub mod commands;
+pub mod credential_store;
 pub mod cue;
 pub mod db;
 /// 诊断包导出（B8，对照分析文档 §4.13）：日志 + 脱敏配置 + 库版本 + 设备信息 zip
 pub mod diagnostics;
 pub mod download;
+pub mod dlna;
 /// 下载成品内嵌封面 / 歌词（「下载存储方式 = 音乐内嵌」，lofty 读写标签）
 pub mod embed;
+mod mp4_tag_layout;
 /// 「外部打开」的待取队列与命令行解析（拖拽入窗 / 命令行参数 / 第二实例转发）
 pub mod external_open;
 /// 文件关联与「设为默认播放器」（第二波）
@@ -33,6 +36,7 @@ pub mod listen_report;
 /// 本地优先播放（DESIGN §7.13）：解析链 / 替身链 / 启动对账
 pub mod local_first;
 pub mod local;
+pub mod lyric_access;
 pub mod lyric_window;
 pub mod media;
 /// 迷你播放器悬浮窗（第二波）
@@ -42,11 +46,23 @@ pub mod net_config;
 pub mod net_guard;
 pub mod pack_safety;
 pub mod pack_signature;
+pub mod playlist_cloud;
+pub mod playlist_cover;
 pub mod playlist_io;
 pub mod podcast;
+pub mod podcast_subtitles;
 pub mod playurl_bridge;
 /// 私有配置的编译期常量（由 scripts/sync-config.mjs 生成；缺失时 build.rs 补空壳）
+#[cfg(not(any(test, qt_public_test_build)))]
 pub mod private_config;
+/// Fixed public fixture for offline gates; production keeps its generated module.
+#[cfg(any(test, qt_public_test_build))]
+pub mod private_config {
+    pub const BACKEND_BASE_URL: &str = "";
+    pub const OFFICIAL_SITE_URL: &str = "";
+    pub const OWN_DOMAINS: &[&str] = &[];
+    pub const OWN_DOMAINS_ENV: &str = "QT_OWN_DOMAINS";
+}
 pub mod provider;
 pub mod qtres;
 /// 本地化推荐合辑（第二波）
@@ -67,6 +83,7 @@ pub mod scrobble;
 pub mod webview_mem;
 pub mod smtc;
 pub mod source_bundle;
+pub mod source_engine_policy;
 pub mod source_install;
 pub mod source_pack_header;
 pub mod source_window;
@@ -77,6 +94,8 @@ pub mod tray;
 pub mod uri_scheme;
 /// 音源账号网页登录（v17 契约 auth.webLogin：官方登录页 + Cookie 捕获）
 pub mod web_login;
+#[cfg(test)]
+pub(crate) mod public_test_fixture;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -258,8 +277,8 @@ pub fn run() {
             // 数据库：DESIGN §8.1 %APPDATA%/QuietMusic/data/music.db
             // 口径集中在 app_paths::data_root（含 LightListen 旧目录迁移）
             let db_root = crate::app_paths::data_root(&handle);
-            // 走 open_checked 而不是 open：坏库要隔离重建（并给用户回执），
-            // 好库则顺手做一份滚动备份（详见 db::health）
+            // 走 open_checked 而不是 open：坏库要隔离重建（并给用户回执）。
+            // 打开不生成备份；凭据迁移与卫生验证之后才显式触发滚动快照。
             let db = match Database::open_checked(&db_root.join("data").join("music.db")) {
                 Ok((db, _notice)) => Some(Arc::new(db)),
                 Err(e) => {
@@ -268,6 +287,31 @@ pub fn run() {
                 }
             };
 
+            // 打开与迁移不生成快照：必须先擦除旧会话，再允许任何新备份/CLI 导出。
+            let astral = Arc::new(astral::AstralClient::new(runtime_config::base_url()));
+            astral.set_session_store(
+                db.clone(),
+                &db_root,
+                Arc::new(crate::credential_store::PlatformCredentialStore),
+            );
+            match tauri::async_runtime::block_on(astral.restore_session()) {
+                Ok(Some(_)) => log::info!("[astral] 已从原生凭据仓恢复登录状态"),
+                Ok(None) => {}
+                Err(e) => log::warn!("[astral] 原生会话恢复失败: {e}"),
+            }
+            if let Some(db) = db.as_ref() {
+                match crate::credential_store::check_session_storage_hygiene(db) {
+                    Ok(()) => {
+                        let directory = db_root.join("data");
+                        // 普通快照 IO 失败仍不妨碍启动；凭据卫生失败则根本不生成快照。
+                        let _ = db.with(|conn| {
+                            Ok(crate::db::health::rolling_backup(conn, &directory))
+                        });
+                    }
+                    Err(error) => log::warn!("[backup] 启动备份已跳过: {error}"),
+                }
+            }
+
             // 命令行导出（`QuietMusic.exe --export-backup <目录>`）：给自动备份/换机迁移用。
             // 主窗口在配置里是 `visible: false`（由前端就绪后再 show），所以这里导完直接
             // 退出不会闪一个空窗口；失败用非 0 退出码，方便任务计划/脚本判断。
@@ -275,7 +319,9 @@ pub fn run() {
                 crate::backup::export_dir_from_args(&crate::external_open::argv_from_env())
             {
                 let code = match db.as_ref() {
-                    Some(db) => match crate::backup::export(db, &dir) {
+                    Some(db) => match crate::credential_store::check_session_storage_hygiene(db)
+                        .and_then(|()| crate::backup::export(db, &dir))
+                    {
                         Ok(info) => {
                             log::info!("[backup] 命令行导出完成：{}", info.path);
                             0
@@ -397,33 +443,6 @@ pub fn run() {
                 ),
             }
 
-            let astral = Arc::new(astral::AstralClient::new(runtime_config::base_url()));
-            // 401 自动刷新换到的新会话要能落库（否则重启又回到过期会话）
-            astral.set_session_db(db.clone());
-
-            // 回填上次的登录会话（token 存 settings 表），没过期才装进客户端
-            if let Some(db) = &db {
-                match db.with(|conn| {
-                    crate::db::store::get_setting(conn, crate::astral::SETTING_ASTRAL_SESSION)
-                }) {
-                    // 登出写的是空串（astral::clear_persisted_session），空值 = 未登录。
-                    // 空串喂给 serde_json 只会得到 "EOF while parsing a value"，
-                    // 每次启动白打一条像故障的 WARN —— 先判空再解析。
-                    Ok(Some(json)) if !json.trim().is_empty() => {
-                        match serde_json::from_str::<astral::AuthSession>(&json) {
-                            Ok(session) if session.is_valid() => {
-                                astral.set_session(&session);
-                                log::info!("[astral] 已恢复上次登录会话");
-                            }
-                            Ok(_) => log::info!("[astral] 上次会话已过期，需要重新登录"),
-                            Err(e) => log::warn!("[astral] 会话解析失败: {e}"),
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => log::warn!("[astral] 读取会话失败: {e}"),
-                }
-            }
-
             app.manage(AppState {
                 url_cache,
                 engine,
@@ -503,6 +522,9 @@ pub fn run() {
         // 所有应用命令都过一层来源授权：音源引擎窗口（会把第三方脚本 import
         // 进自己 JS 环境）默认只能调用 ipc_guard 白名单里的命令（见 ipc_guard.rs）
         .invoke_handler(ipc_guard::guarded(tauri::generate_handler![
+            dlna::cmd_discover,
+            dlna::cmd_connect,
+            dlna::cmd_disconnect,
             cmd_builtin_request,
             cmd_set_resolved_play_url,
             cmd_script_bridge_ready,
@@ -535,6 +557,8 @@ pub fn run() {
             web_login::source_web_login_capture,
             web_login::source_web_login_close,
             web_login::source_web_login_diagnose_names,
+            cmd_begin_play_intent,
+            cmd_abandon_play_intent,
             cmd_play_track,
             cmd_play_queue,
             cmd_set_default_quality,
@@ -679,6 +703,7 @@ pub fn run() {
             // 收藏同步（DESIGN §5.3；契约同 qt-uniappx services/like.ts）
             cmd_like_push_song,
             cmd_like_push_playlist,
+            cmd_like_session_epoch,
             cmd_like_pull,
             cmd_like_pull_all,
             cmd_like_apply,
@@ -733,6 +758,24 @@ pub fn run() {
             podcast::cmd_list_podcast_episodes,
             podcast::cmd_save_podcast_progress,
             podcast::cmd_podcast_episode_audio,
+            podcast_subtitles::cmd_podcast_subtitles,
+            podcast_subtitles::cmd_podcast_subtitles_fetch,
+            podcast_subtitles::cmd_podcast_subtitles_import,
+            podcast_subtitles::cmd_podcast_subtitles_transcribe,
+            podcast_subtitles::cmd_podcast_transcription_models,
+            podcast_subtitles::cmd_podcast_subtitles_translate,
+            podcast_subtitles::cmd_podcast_translation_status,
+            podcast_subtitles::cmd_podcast_translation_install,
+            podcast_subtitles::cmd_podcast_translation_install_cancel,
+            podcast_subtitles::cmd_podcast_subtitles_cancel,
+            podcast_subtitles::cmd_podcast_whisper_status,
+            podcast_subtitles::cmd_podcast_whisper_catalog,
+            podcast_subtitles::cmd_podcast_whisper_install,
+            podcast_subtitles::cmd_podcast_whisper_install_progress,
+            podcast_subtitles::cmd_podcast_whisper_install_cancel,
+            podcast_subtitles::cmd_podcast_whisper_pick,
+            podcast_subtitles::cmd_podcast_subtitles_cache_audio,
+            podcast_subtitles::cmd_podcast_subtitles_pick_audio,
             cmd_get_local_cover,
             cmd_read_local_lyric,
             cmd_open_local_paths,

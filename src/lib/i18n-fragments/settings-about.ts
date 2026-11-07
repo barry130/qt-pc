@@ -23,6 +23,11 @@ export const messages = defineFragment({
     "settings.about.dataDirHintPortable":
       "便携模式：曲库、音源包、缓存与日志都在程序旁边，整个文件夹拷到新机器即可继续用",
     "settings.about.portable": "便携",
+    // 凭据安全状态（S03：安全仓库不可用时只在内存里）
+    "settings.about.sessionMemoryOnly": "登录状态未持久化",
+    "settings.about.sessionMemoryOnlyBadge": "仅本次运行",
+    "settings.about.sessionMemoryOnlyHint":
+      "系统安全存储不可用，登录只在本次进程内有效，重启应用后需要重新登录。",
     // 诊断包（§18 / B8）
     "settings.about.diagnostics": "诊断包",
     "settings.about.diagnosticsHint":
@@ -63,6 +68,10 @@ export const messages = defineFragment({
     "settings.about.dataDirHintPortable":
       "Portable mode: library, source packs, cache and logs live next to the app — copy the whole folder to another machine and carry on",
     "settings.about.portable": "Portable",
+    "settings.about.sessionMemoryOnly": "Sign-in not saved",
+    "settings.about.sessionMemoryOnlyBadge": "This session only",
+    "settings.about.sessionMemoryOnlyHint":
+      "Secure storage isn't available, so you stay signed in only until the app closes. You'll need to sign in again after restarting.",
     "settings.about.diagnostics": "Diagnostics bundle",
     "settings.about.diagnosticsHint":
       "For troubleshooting: recent logs, redacted settings, database version and device info. Library contents and play history are not included",

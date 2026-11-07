@@ -467,6 +467,19 @@ fn active_profile(state: &State<'_, AppState>) -> Result<AiProfile, String> {
         .unwrap_or_else(default_profile))
 }
 
+/// 播客转写只借用用户明确选中的供应商凭据；密钥不经过前端字幕任务。
+pub(crate) fn podcast_profile(state: &State<'_, AppState>, id: &str) -> Result<AiProfile, String> {
+    let (profiles, _) = load_profiles(state)?;
+    profiles.into_iter().find(|profile| profile.id == id)
+        .ok_or_else(|| "请在字幕设置中选择语音转写供应商".into())
+}
+
+/// 与 AI 设置接受的根地址、/v1 地址和完整聊天端点保持一致。
+pub(crate) fn podcast_transcription_endpoint(base_url: &str) -> Result<tauri::Url, String> {
+    let base = if base_url.trim().is_empty() { "https://api.openai.com/v1" } else { base_url };
+    crate::net_guard::ensure_http_url(&format!("{}/v1/audio/transcriptions", base_root(base)?))
+}
+
 /// 内部结构 → 前端视图（抹掉 Key，只给掩码；空地址/模型回落默认值）。
 fn view_of(profiles: &[AiProfile], active_id: &str) -> AiLocalConfigView {
     AiLocalConfigView {
@@ -1072,6 +1085,27 @@ pub async fn cmd_ai_local_chat(
         prompt_tokens: usage.as_ref().and_then(|u| u.prompt_tokens),
         completion_tokens: usage.as_ref().and_then(|u| u.completion_tokens),
     })
+}
+
+/// 字幕翻译使用单次请求和总截止时间，避免聊天接口重试让用户长时间无进度。
+pub(crate) async fn podcast_translation(
+    state: &State<'_, AppState>,
+    messages: Vec<AiLocalMessage>,
+    profile_id: &str,
+    model: &str,
+) -> Result<String, String> {
+    let profile = active_profile(state)?;
+    let request_model = if profile.model.trim().is_empty() { DEFAULT_MODEL } else { &profile.model };
+    if profile.id != profile_id || request_model != model {
+        return Err("当前 AI 模型已改变，请重新点击翻译中文".into());
+    }
+    let call = build_chat_call(Protocol::parse(&profile.protocol), &profile.base_url,
+        request_model, &profile.api_key, &messages, 0.2)?;
+    let client = build_client(60, profile.skip_cert_verify)?;
+    let reply = tokio::time::timeout(Duration::from_secs(60), post_chat_once(&client, &call, &profile.api_key))
+        .await.map_err(|_| "本批翻译超过 60 秒，已保留完成的译文。可重试，或到「设置 → AI」更换响应更快的模型".to_owned())?
+        .map_err(|failure| format!("翻译失败：{}；已保留完成的译文，可重试或检查「设置 → AI」", failure.message))?;
+    Ok(reply.0)
 }
 
 /// 中继/上游偶发失败时的总尝试次数。

@@ -1,4 +1,4 @@
-import { create } from "zustand";
+import { create, type StateCreator, type StoreApi, type UseBoundStore } from "zustand";
 import { errMsg } from "@/lib/utils";
 import { log } from "@/lib/logger";
 import type { AuthSession } from "@/types";
@@ -172,6 +172,86 @@ export function isAdmin(profile: Record<string, unknown> | null): boolean {
   return hasPermission(profile, "admin:qt:admin", ["qt_admin"]);
 }
 
+/**
+ * 一次收藏同步的上下文（C01 内层长链路）。
+ *
+ * generation 是前端会话代次；epoch 是宿主侧会话 epoch（登录 / 换号时由 Rust
+ * 自增，同步链路开始时取一次并随每个收藏 IPC 传给宿主）。同一条链路
+ * 里每个 await 都可能横跨一次换号，所以分页、apply、游标与归属写入之前都要用它
+ * 核对一遍 —— 只在外层阶段之间核对，旧账号已经排到 JS 队列里的分页/写入仍会落进
+ * 新账号的本地库。
+ */
+interface LikeSyncContext {
+  generation: number;
+  epoch: number;
+}
+
+/**
+ * 链路是否已被打断。
+ */
+function likeSyncAborted(ctx: LikeSyncContext): boolean {
+  return ctx.generation !== authRuntime.sessionGeneration || !authRuntime.likeSyncTrusted;
+}
+
+/**
+ * 宿主 epoch 拿不到时收手（fail-closed）。
+ *
+ * 之前约定「查询失败就退化成不带 epoch 继续同步」，那是 fail-open：native
+ * 已经换号 / 接口升级异常时，宿主侧的保护恰好失效，旧链路会继续推进游标、
+ * 覆盖 owner，A 的数据就这样落到 B 的接口上（C01）。
+ *
+ * 现在的约定：确认不了宿主会话代次，本轮 flush / pull / apply / owner / 游标
+ * 一个都不发，只在当前代次写一条可排查的 lastError；本地已经落库的数据照常可读，
+ * 断网 / 旧宿主也不会影响已有收藏展示。
+ */
+function reportLikeSyncPaused(generation: number, err: unknown): void {
+  if (generation !== authRuntime.sessionGeneration) return;
+  const reason = "无法确认登录会话代次，已暂停收藏同步";
+  log.warn("[like] 读取宿主会话代次失败，暂停收藏同步", err);
+  void ipc.setSetting("like.lastError", reason).catch(() => {});
+}
+
+/** 收藏 IPC 的 epoch 实参：宿主会话代次（取不到时不发请求，所以这里一定有值） */
+function epochOf(ctx: LikeSyncContext): number {
+  return ctx.epoch;
+}
+
+/**
+ * 构造一次可信同步上下文：先确认本地身份可信，再取一次宿主 epoch。
+ *
+ * 取 epoch 也是 await，期间可能登出 / 换号，所以取完必须再核对一次前端代次。
+ * 返回 null 表示不可信、已换号，或 epoch 查询失败（fail-closed）—— 调用方
+ * 一个云端请求都不要发。
+ */
+async function captureLikeSyncContext(): Promise<LikeSyncContext | null> {
+  if (!authRuntime.likeSyncTrusted) return null;
+  const generation = authRuntime.sessionGeneration;
+  let epoch: number;
+  try {
+    epoch = await ipc.likeSessionEpoch();
+  } catch (err) {
+    reportLikeSyncPaused(generation, err);
+    return null;
+  }
+  if (generation !== authRuntime.sessionGeneration || !authRuntime.likeSyncTrusted) return null;
+  return { generation, epoch };
+}
+
+/**
+ * 启动恢复 / 登录 / 注册链路上的宿主 epoch 获取。
+ *
+ * 取不到就是 fail-closed：写一条当前代次的 lastError 并返回 null，调用方保持
+ * 本地登录态但不做任何云端同步（C01）。已换号 / 已登出的旧链路不写错误。
+ */
+async function fetchLikeSessionEpochFor(generation: number): Promise<number | null> {
+  try {
+    return await ipc.likeSessionEpoch();
+  } catch (err) {
+    reportLikeSyncPaused(generation, err);
+    return null;
+  }
+}
+
 const LIKE_PAGE_SIZE = 200;
 
 /**
@@ -182,25 +262,35 @@ const LIKE_PAGE_SIZE = 200;
  * 所以第一次必须走全量 `like/list` 分页导入，之后才用增量追变更 ——
  * 这也是移动端 like.ts 里 fetchAllLikes 兜底的原因。
  */
-export async function pullLikes(): Promise<void> {
+export async function pullLikes(ctx?: LikeSyncContext): Promise<void> {
+  // 独立调用（我的收藏页打开时刷新）也构造可信上下文并过门闩：
+  // 身份未知 / 隔离失败 / 已登出时一个云端请求都不发。
+  const context = ctx ?? (await captureLikeSyncContext());
+  if (context === null || likeSyncAborted(context)) return;
   // 同上，这里一律用字面量，避免模块初始化顺序带来的引用问题
   const imported = await ipc.getSetting("like.imported").catch(() => null);
+  // 等待 setSetting 期间可能已经登出/换号：后面的分页与写入必须停手
+  if (likeSyncAborted(context)) return;
 
   // 全量导入和游标分开记：老用户可能早就有游标（增量同步跑过），
   // 但没做过全量，这时也该先补一次全量。
   if (imported !== "1") {
-    await importAllLikes();
-    await ipc.setSetting("like.imported", "1").catch(() => {});
+    await importAllLikes(context);
+    if (likeSyncAborted(context)) return;
+    await ipc.setSetting("like.imported", "1", epochOf(context)).catch(() => {});
     return;
   }
 
   const raw = await ipc.getSetting("like.sync.seq").catch(() => null);
+  if (likeSyncAborted(context)) return;
   let since = Number(raw ?? 0);
   // 循环拉到没有新变更为止（对齐 uniappx pullChanges）：
   // 后端单页 500 条上限，之前只拉一次就把游标推到 maxSeq，
   // 第 501 条之后的变更（如删大歌单时同 seq 级联软删的全部成员行）永久丢失
   for (let round = 0; round < 50; round++) {
-    const result = await ipc.likePull(Number.isFinite(since) ? since : 0);
+    if (likeSyncAborted(context)) return;
+    const result = await ipc.likePull(Number.isFinite(since) ? since : 0, epochOf(context));
+    if (likeSyncAborted(context)) return;
     // 增量接口的字段可能带 null（album/hash/pid…），直接透传会让 Rust 反序列化整条失败
     // （invalid type: null, expected a string），所以这里和全量一样先归一。
     const changes = Array.isArray(result?.changes)
@@ -213,22 +303,30 @@ export async function pullLikes(): Promise<void> {
     // 不能再把旧游标写回去（否则永远追不上新库）
     const maxSeq = typeof result?.maxSeq === "number" ? result.maxSeq : since;
     if (maxSeq < since) {
-      await ipc.setSetting("like.sync.seq", String(maxSeq)).catch(() => {});
+      if (likeSyncAborted(context)) return;
+      await ipc.setSetting("like.sync.seq", String(maxSeq), epochOf(context)).catch(() => {});
       return;
     }
     if (changes.length > 0) {
-      await ipc.likeApply(changes);
+      if (likeSyncAborted(context)) return;
+      await ipc.likeApply(changes, epochOf(context));
+      // 跨号打断后不再 bump：本次 apply 落在旧上下文里，刷新 UI 只会暴露脏数据
+      if (likeSyncAborted(context)) return;
       useFavoritesStore.getState().bump();
     }
     if (maxSeq <= since) return;
     since = maxSeq;
-    await ipc.setSetting("like.sync.seq", String(maxSeq)).catch(() => {});
+    if (likeSyncAborted(context)) return;
+    await ipc.setSetting("like.sync.seq", String(maxSeq), epochOf(context)).catch(() => {});
     if (changes.length === 0) return;
   }
 }
 
 /** 全量分页导入，导完把游标推到后端的 maxSeq */
-async function importAllLikes(): Promise<void> {
+async function importAllLikes(ctx?: LikeSyncContext): Promise<void> {
+  // 私有调用方都会传入可信 context；保留兜底，单独调用时同样受信任门闩约束
+  const context = ctx ?? (await captureLikeSyncContext());
+  if (context === null || likeSyncAborted(context)) return;
   // 两阶段（对齐 uniappx doFullPull「先收齐再合并」）：歌曲行的 pid
   // 归属依赖歌单先落地，DESC 分页里歌常在歌单前面的页 —— 逐页应用会因
   // 「歌单不存在」跳过歌曲，且 imported=1 后永不再重试
@@ -237,9 +335,11 @@ async function importAllLikes(): Promise<void> {
   let maxSeq = 0;
   let page = 1;
   for (;;) {
+    if (likeSyncAborted(context)) return;
     const { songs, playlists, maxSeq: seq } = normalizeLikeList(
-      await ipc.likePullAll(page, LIKE_PAGE_SIZE),
+      await ipc.likePullAll(page, LIKE_PAGE_SIZE, epochOf(context)),
     );
+    if (likeSyncAborted(context)) return;
     if (songs.length === 0 && playlists.length === 0) break;
     allPlaylists.push(...playlists.map((p) => toChange("playlist", p)));
     allSongs.push(...songs.map((s) => toChange("song", s)));
@@ -248,17 +348,41 @@ async function importAllLikes(): Promise<void> {
   }
   // 先歌单后歌曲：歌单卡片全部就位，歌曲的 pid 准入检查才都能过
   if (allPlaylists.length > 0) {
-    await ipc.likeApply(allPlaylists);
+    if (likeSyncAborted(context)) return;
+    await ipc.likeApply(allPlaylists, epochOf(context));
+    if (likeSyncAborted(context)) return;
     useFavoritesStore.getState().bump();
   }
   if (allSongs.length > 0) {
-    await ipc.likeApply(allSongs);
+    if (likeSyncAborted(context)) return;
+    await ipc.likeApply(allSongs, epochOf(context));
+    if (likeSyncAborted(context)) return;
     useFavoritesStore.getState().bump();
   }
   if (maxSeq > 0) {
-    await ipc.setSetting("like.sync.seq", String(maxSeq)).catch(() => {});
+    if (likeSyncAborted(context)) return;
+    await ipc.setSetting("like.sync.seq", String(maxSeq), epochOf(context)).catch(() => {});
   }
 }
+
+interface AuthRuntime {
+  /** 登录 / 登出等操作自增；长链路每个 await 后核对，防止旧账号结果覆盖新账号。 */
+  sessionGeneration: number;
+  /** 只有身份确认且本地换号隔离成功后才允许同步收藏。 */
+  likeSyncTrusted: boolean;
+  store?: UseBoundStore<StoreApi<AuthStore>>;
+}
+
+// Vite 热更新与后续懒加载可能用不同 ?t= 地址重复执行本模块。
+// hot.data 按模块路径共享；保留 store 及其会话门闩，避免标题栏和编辑页各持一份状态。
+// 仅保存在当前 WebView 的开发期内存中，不把账号资料写进全局或本地存储。
+// Vitest 等执行器可能只提供空的 hot 占位，没有 Vite 的 data 生命周期。
+const hotData = import.meta.hot?.data;
+const authRuntime: AuthRuntime = hotData?.authRuntime ?? {
+  sessionGeneration: 0,
+  likeSyncTrusted: false,
+};
+if (hotData) hotData.authRuntime = authRuntime;
 
 /**
  * 启动 / 登录后的完整同步（LIKE_SYNC_DESIGN.md §3 / §5 的 PC 版）：
@@ -266,11 +390,27 @@ async function importAllLikes(): Promise<void> {
  *    否则队列里的 remove 会被拉下来的旧状态重新加回本地，来回震荡；
  * 2. 增量拉取（游标缺失转全量）——其他端的删除先在本地生效；
  * 3. 启动对账：全量拉云端做存在性 diff，本地有而云端没有的补推。
+ *
+ * 身份未确认或本地隔离失败时整体跳过；跑到一半被换号/登出打断也立即停止。
+ * epoch / generation 由 resumeLikeSync 在确认身份前取好并传入：整条链路共用
+ * 同一个宿主代次，宿主据此丢弃换号前发出的请求。
  */
-export async function syncLikesWithReconcile(): Promise<void> {
-  await ipc.likeFlushPending().catch(() => {});
-  await pullLikes();
-  await ipc.likeReconcile().catch(() => {});
+export async function syncLikesWithReconcile(epoch: number, generation: number): Promise<void> {
+  // 同步上下文：宿主 epoch 已经由调用方取好（取不到时不会走到这里），
+  // 全链路的每个收藏 IPC 都带上它。
+  const ctx: LikeSyncContext = { generation, epoch };
+  if (likeSyncAborted(ctx)) return;
+  try {
+    await ipc.likeFlushPending(epochOf(ctx)).catch(() => {});
+    if (likeSyncAborted(ctx)) return;
+    await pullLikes(ctx);
+    if (likeSyncAborted(ctx)) return;
+    await ipc.likeReconcile(epochOf(ctx)).catch(() => {});
+  } catch (err) {
+    // 换号 / 登出后旧链路抛错（含宿主 epoch 拒绝）属于预期，安静退出不写 lastError
+    if (likeSyncAborted(ctx)) return;
+    throw err;
+  }
 }
 
 /** 从 me 响应里取当前账号 uid（兼容 user 嵌套与平铺两种形状） */
@@ -289,17 +429,90 @@ function profileUid(profile: Record<string, unknown> | null): string {
  * A 的服务器账号里，清完游标自动复位，随后的 pullLikes 全量拉取恢复 B 的数据。
  * 同账号重登（或 token 过期自动恢复，不走登录页）什么都不动，本地秒恢复。
  * 登录响应的 user.id 记入 like.sync.owner，退出登录不清除。
+ *
+ * 返回 false 表示「身份不可信」或「隔离失败」：此时保持原 owner 不变，
+ * 调用方必须暂停收藏同步 —— 新账号的 session 已由后端持久化，继续同步会把
+ * A 未确认的本地歌单当成 B 的推上去（C01）。generation 用来丢弃换号瞬间
+ * 仍在途的旧流程。
  */
 async function handleLikeOwnerSwitch(
   profile: Record<string, unknown> | null,
-): Promise<void> {
+  generation: number,
+  epoch: number,
+): Promise<boolean> {
   const uid = profileUid(profile);
-  if (!uid) return;
-  const prev = await ipc.getSetting(LIKE_OWNER_KEY).catch(() => null);
-  if (prev && prev !== uid) {
-    await ipc.likeClearLocal().then(() => useFavoritesStore.getState().bump()).catch(() => {});
+  // 身份未知（/me 失败等）：分辨不出是不是同一个人，宁可不动也不猜
+  if (!uid) return false;
+  // 归属检查本身也是写操作：带上宿主 epoch，旧会话的迟到写由宿主直接拒绝
+  let prev: string | null;
+  try {
+    prev = await ipc.getSetting(LIKE_OWNER_KEY);
+  } catch {
+    return false;
   }
-  await ipc.setSetting(LIKE_OWNER_KEY, uid).catch(() => {});
+  if (generation !== authRuntime.sessionGeneration) return false;
+  if (prev && prev !== uid) {
+    try {
+      await ipc.likeClearLocal(epoch);
+      useFavoritesStore.getState().bump();
+    } catch (err) {
+      // 清库失败：保留 A 的本地数据与归属标记，暂停同步等下次登录重试
+      log.warn("[like] 换号清理本地收藏失败，保留原归属并暂停同步", err);
+      void ipc.setSetting("like.lastError", errMsg(err)).catch(() => {});
+      return false;
+    }
+    if (generation !== authRuntime.sessionGeneration) return false;
+  }
+  try {
+    await ipc.setSetting(LIKE_OWNER_KEY, uid, epoch);
+  } catch (err) {
+    log.warn("[like] 记录收藏归属失败，暂停同步", err);
+    return false;
+  }
+  return generation === authRuntime.sessionGeneration;
+}
+
+/**
+ * 身份确认 + 本地隔离都通过才放开收藏同步；否则保持暂停并留一条可排查的线索。
+ * phase 只用于日志前缀（启动恢复 / 登录 / 注册）。
+ */
+async function resumeLikeSync(
+  profile: Record<string, unknown> | null,
+  generation: number,
+  phase: string,
+  epochArg?: number,
+): Promise<void> {
+  // fail-closed：先确认宿主会话代次。取不到就不做归属检查（不写 owner、不清本地库），
+  // 更不启动 flush / pull / reconcile —— fail-open 会在 native 已换号 / 接口升级异常时
+  // 让保护直接消失（C01）。本地可信数据照常可读，只是本轮暂停同步。
+  //
+  // 调用方（init / login / register）已经为身份确认取过一次 epoch，直接复用，
+  // 避免同一链路里出现两个不同代次（task-9）。
+  let epoch: number;
+  if (epochArg === undefined) {
+    const fetched = await fetchLikeSessionEpochFor(generation);
+    if (fetched === null) return;
+    epoch = fetched;
+  } else {
+    epoch = epochArg;
+  }
+  if (generation !== authRuntime.sessionGeneration) return;
+  const trusted = await handleLikeOwnerSwitch(profile, generation, epoch);
+  if (generation !== authRuntime.sessionGeneration) return;
+  authRuntime.likeSyncTrusted = trusted;
+  if (!trusted) {
+    const reason = "身份未确认或本地收藏隔离失败，已暂停收藏同步";
+    log.warn(`[like] ${phase}${reason}`);
+    void ipc.setSetting("like.lastError", reason).catch(() => {});
+    return;
+  }
+  void syncLikesWithReconcile(epoch, generation).catch((err) => {
+    // 跑到一半已换号 / 登出：旧链路的失败（含宿主 epoch 拒绝）与当前账号无关，
+    // 安静退出，别把旧会话的错误写进新会话的 lastError。
+    if (generation !== authRuntime.sessionGeneration || !authRuntime.likeSyncTrusted) return;
+    log.warn(`[like] ${phase}收藏同步失败`, err);
+    void ipc.setSetting("like.lastError", errMsg(err)).catch(() => {});
+  });
 }
 
 type RawLike = Record<string, unknown>;
@@ -334,7 +547,12 @@ function toChange(kind: "song" | "playlist", item: RawLike): ipc.LikeChange {
     ...(kind === "song" && item.pid != null && item.pid !== ""
       ? { pid: String(item.pid) }
       : {}),
-    picUrl: String(item.picUrl ?? ""),
+    // 封面「没给 / 为 null」与「明确清空」是两种语义：前者省略字段（宿主保留
+    // 原封面），后者传空串。这里以前一律 `String(picUrl ?? "")`，全量导入时
+    // 会把云端没给封面的歌单统一改写成空串，覆盖掉本地已有封面（C13）。
+    ...(item.picUrl === undefined || item.picUrl === null
+      ? {}
+      : { picUrl: String(item.picUrl) }),
     // 两种接口字段不一样：增量 changes 给 deleted 布尔，全量 list 给 deletedAt（非空即取消）
     deleted: item.deleted === true || item.deletedAt != null,
     updatedSeq: Number(item.updatedSeq ?? 0),
@@ -353,9 +571,10 @@ function toChange(kind: "song" | "playlist", item: RawLike): ipc.LikeChange {
  */
 async function confirmSession(
   session: AuthSession,
+  epoch: number,
 ): Promise<Record<string, unknown> | null> {
   try {
-    return await ipc.astralMe();
+    return await ipc.astralMe(epoch);
   } catch (err) {
     const still = await ipc.astralSession().catch(() => session);
     if (!still) return null;
@@ -363,45 +582,48 @@ async function confirmSession(
   }
 }
 
-export const useAuthStore = create<AuthStore>((set, get) => ({
+const createAuthState: StateCreator<AuthStore> = (set, get) => ({
   session: null,
   profile: null,
   loading: false,
   error: null,
 
   init: async () => {
+    const generation = ++authRuntime.sessionGeneration;
+    authRuntime.likeSyncTrusted = false;
     try {
       const session = await ipc.astralSession().catch(() => null);
+      // 读会话也是 await：期间用户可能已经登录 / 登出，晚到的旧结果整条作废，
+      // 否则会把新账号的会话覆盖回启动时的旧会话（task-9）。
+      if (generation !== authRuntime.sessionGeneration) return;
       if (!session || !isSessionValid(session)) {
         set({ session: null, profile: null });
         return;
       }
       set({ session });
 
+      // 身份确认必须带宿主会话代次；取不到就保持「已恢复会话、资料待下次刷新」，
+      // 不发任何会改变账号归属的请求（fail-closed，C01）。
+      const epoch = await fetchLikeSessionEpochFor(generation);
+      if (generation !== authRuntime.sessionGeneration) return;
+      if (epoch === null) return;
+
       // 再向服务端确认一次：本地没过期不代表服务端还认这个 token
-      const profile = await confirmSession(session);
+      const profile = await confirmSession(session, epoch);
+      if (generation !== authRuntime.sessionGeneration) return;
       if (!profile) {
         // 服务端明确否认 → 回到未登录（Rust 侧 401 时已清过一遍，这里兜底清本地行）
         set({ session: null, profile: null, error: null });
-        await ipc.astralLogout().catch(() => {});
+        await ipc.astralLogout(epoch).catch(() => {});
         return;
       }
       set({ profile });
-      // 登录态就绪后把云端的收藏变更拉回本地，再补两件事（LIKE_SYNC_DESIGN §3/§5）：
-      // 1) 重放离线队列（断网期间失败的收藏推送）；
-      // 2) 启动对账：本地有而云端没有的收藏补推上去。
-      // 顺序保证「增量拉取在前，对账在后」——其他端删除的收藏先在本地移除，
-      // 不会被对账误复活。同步失败不影响使用，只记错误不抛。
-      void syncLikesWithReconcile().catch((err) => {
-        const msg = errMsg(err);
-        log.warn("[like] 收藏同步失败", err);
-        // 同步失败不该打断登录流程，但得留下线索：错误写进 settings 表，
-        // 桌面端没有顺手的 devtools，从库里能直接读到。
-        // 用字面量而不是模块常量：同步是启动早期跑的，万一模块还没初始化完，
-        // 引用常量会抛 ReferenceError 并**掩盖真正的错误**（这次就是这么踩的）。
-        void ipc.setSetting("like.lastError", msg).catch(() => {});
-      });
+      // 同步前先确认身份并完成换号隔离（C01）：失败保持 owner 不变、暂停同步，
+      // 等下次启动/登录再试；通过后才按「重放队列 → 拉取 → 对账」跑。
+      await resumeLikeSync(profile, generation, "启动恢复后", epoch);
     } catch (err) {
+      // 过期链路的失败与当前会话无关，不能清掉新账号的 profile / 写 error（task-9）。
+      if (generation !== authRuntime.sessionGeneration) return;
       // 后端没起 / 网络不可达：保留本地登录态（离线容忍），只是暂时拿不到用户信息。
       // 这是正常离线场景，不该刷成 warn 吓人；但留一条 debug 决策轨迹 ——
       // 排查「为什么没登录上」时，得能看出是走到了这条路，而不是压根没调。
@@ -411,19 +633,31 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
   },
 
   login: async (username, password) => {
+    const generation = ++authRuntime.sessionGeneration;
+    authRuntime.likeSyncTrusted = false;
     set({ loading: true, error: null });
     try {
       const session = await ipc.astralLogin(username, password);
-      const profile = await ipc.astralMe().catch(() => null);
+      // 登录请求也是 await：期间用户可能又发起登录 / 登出，旧链路一律作废，
+      // 不能把旧账号的会话与资料写回当前账号（task-9）。
+      if (generation !== authRuntime.sessionGeneration) return;
+      // 先取宿主 epoch 再确认身份；取不到就只落地会话、暂停同步（fail-closed）。
+      const epoch = await fetchLikeSessionEpochFor(generation);
+      if (generation !== authRuntime.sessionGeneration) return;
+      if (epoch === null) {
+        set({ session, profile: null, loading: false });
+        return;
+      }
+      const profile = await ipc.astralMe(epoch).catch(() => null);
+      if (generation !== authRuntime.sessionGeneration) return;
       set({ session, profile, loading: false });
-      // 收藏归属检查（换号清库）+ 新账号的收藏同步，失败不影响登录
-      await handleLikeOwnerSwitch(profile);
-      // 与 init 路径同口径：失败写 like.lastError 留排查线索（见 init 内注释）
-      void syncLikesWithReconcile().catch((err) => {
-        log.warn("[like] 登录后收藏同步失败", err);
-        void ipc.setSetting("like.lastError", errMsg(err)).catch(() => {});
-      });
+      // 收藏归属检查（换号清库）+ 新账号的收藏同步：身份与隔离都通过才同步，
+      // 失败保持原 owner 并暂停同步（C01）。
+      await resumeLikeSync(profile, generation, "登录后", epoch);
     } catch (err) {
+      // 过期链路的失败（网络错误 / 旧账号密码错）与当前会话无关，
+      // 不能写进新会话的 error / loading（task-9）。
+      if (generation !== authRuntime.sessionGeneration) return;
       set({
         loading: false,
         error: errMsg(err),
@@ -433,6 +667,8 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
   },
 
   register: async (username, password, passwordConfirm, email, nickname) => {
+    const generation = ++authRuntime.sessionGeneration;
+    authRuntime.likeSyncTrusted = false;
     set({ loading: true, error: null });
     try {
       const session = await ipc.astralRegister(
@@ -442,15 +678,20 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
         email,
         nickname,
       );
-      const profile = await ipc.astralMe().catch(() => null);
+      // 注册同样是多段 await，过期链路的结果不能落到新会话上（task-9）。
+      if (generation !== authRuntime.sessionGeneration) return;
+      const epoch = await fetchLikeSessionEpochFor(generation);
+      if (generation !== authRuntime.sessionGeneration) return;
+      if (epoch === null) {
+        set({ session, profile: null, loading: false });
+        return;
+      }
+      const profile = await ipc.astralMe(epoch).catch(() => null);
+      if (generation !== authRuntime.sessionGeneration) return;
       set({ session, profile, loading: false });
-      await handleLikeOwnerSwitch(profile);
-      // 与 init/login 路径同口径：失败写 like.lastError 留排查线索
-      void syncLikesWithReconcile().catch((err) => {
-        log.warn("[like] 注册后收藏同步失败", err);
-        void ipc.setSetting("like.lastError", errMsg(err)).catch(() => {});
-      });
+      await resumeLikeSync(profile, generation, "注册后", epoch);
     } catch (err) {
+      if (generation !== authRuntime.sessionGeneration) return;
       set({
         loading: false,
         error: errMsg(err),
@@ -460,34 +701,80 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
   },
 
   logout: async () => {
+    // 先让在途同步失效：退出后 token 已不属于这个账号，继续 pull/reconcile
+    // 会把 A 的数据写进随后登录的账号（C01）。
+    const generation = ++authRuntime.sessionGeneration;
+    authRuntime.likeSyncTrusted = false;
     set({ loading: true, error: null });
+    // 退出链路上的补推 / 重置都要带同一个宿主 epoch：
+    // logout 会让 native 提升 epoch，后置的 reset 就带不上原代次了，
+    // 所以 reset 必须放在 astralLogout 之前（task-9）。
+    let epoch: number;
+    try {
+      epoch = await ipc.likeSessionEpoch();
+    } catch (err) {
+      if (generation !== authRuntime.sessionGeneration) return;
+      // 未知宿主 epoch 时，「重置收藏同步 / 登出」都是没有绑定代次的宿主副作用：
+      // A 的旧命令可能在桥里排队，B 的 native 登录先落，零参命令会按 B 的当前
+      // 代次执行，于是迟到的 A 链路直接把刚登录的 B 清掉（task-10）。
+      // 这里必须 fail-closed：保留当前会话、一个宿主写都不发，给可重试的错误。
+      log.warn("[auth] 读取宿主会话代次失败，已取消退出", err);
+      set({ loading: false, error: "无法确认登录会话代次，请稍后重试" });
+      return;
+    }
+    if (generation !== authRuntime.sessionGeneration) return;
     // 退出前把断网积压的收藏操作尽力推一把（token 还有效），丢队列前先补推；
     // 收藏数据与归属标记保留 —— 同账号重登无缝恢复，换号由登录侧清库
-    await ipc.likeFlushPending().catch(() => {});
+    await ipc.likeFlushPending(epoch).catch(() => {});
+    if (generation !== authRuntime.sessionGeneration) return;
+    // 先 reset 再 logout：logout 会提升 native epoch，之后 reset 就带不上同一代次。
+    await ipc.likeResetSync(epoch).catch(() => {});
+    if (generation !== authRuntime.sessionGeneration) return;
     try {
-      await ipc.astralLogout();
+      await ipc.astralLogout(epoch);
     } catch {
       // 后端不可达也要清本地，否则用户退不出去
-    } finally {
-      await ipc.likeResetSync().catch(() => {});
-      set({ session: null, profile: null, loading: false });
     }
+    // 等待期间已重新登录：旧 logout 不能再清新会话（task-9）。
+    if (generation !== authRuntime.sessionGeneration) return;
+    set({ session: null, profile: null, loading: false });
   },
 
   updateProfile: async (patch) => {
+    const generation = authRuntime.sessionGeneration;
+    // 改资料链路上有多个 await：先固定 epoch，之后每一步都核对本地代次，
+    // 旧响应（成功或失败）不能作用于期间新登录的账号（task-9）。
+    let epoch: number;
+    try {
+      epoch = await ipc.likeSessionEpoch();
+    } catch {
+      if (generation !== authRuntime.sessionGeneration) return;
+      const message = "无法确认登录会话代次，请重新登录后再试";
+      set({ loading: false, error: message });
+      throw new Error(message);
+    }
+    if (generation !== authRuntime.sessionGeneration) return;
     set({ loading: true, error: null });
     try {
-      await ipc.astralUpdateProfile(patch);
+      await ipc.astralUpdateProfile(patch, epoch);
     } catch (err) {
-      // 失败时后端还没走到 kickout（校验不过就返回了），本地登录态保持不动
+      // 失败时后端还没走到 kickout（校验不过就返回了），本地登录态保持不动；
+      // 过期链路的失败不写进新会话。
+      if (generation !== authRuntime.sessionGeneration) return;
       set({ loading: false, error: errMsg(err) });
       throw err;
     }
+    if (generation !== authRuntime.sessionGeneration) return;
     // 成功：后端 updateUser 结尾会 StpUtil.kickout(userId)，token 当场作废。
     // 本地必须跟着清，否则界面会停在「显示已登录、接口全 401」。
-    // 收藏数据与归属标记按 logout 的口径保留（同账号重登无缝恢复）。
-    await ipc.astralLogout().catch(() => {});
-    await ipc.likeResetSync().catch(() => {});
+    // 收藏数据与归属标记按 logout 的口径保留（同账号重登无缝恢复）；
+    // 在途的收藏同步也要一并失效（C01）。清理链同样先 reset 再 logout。
+    const cleanupGeneration = ++authRuntime.sessionGeneration;
+    authRuntime.likeSyncTrusted = false;
+    await ipc.likeResetSync(epoch).catch(() => {});
+    if (cleanupGeneration !== authRuntime.sessionGeneration) return;
+    await ipc.astralLogout(epoch).catch(() => {});
+    if (cleanupGeneration !== authRuntime.sessionGeneration) return;
     set({ session: null, profile: null, loading: false });
   },
 
@@ -504,4 +791,17 @@ export const useAuthStore = create<AuthStore>((set, get) => ({
   changePassword: async (email, password, code) => {
     await ipc.astralChangePassword(email, password, code);
   },
-}));
+});
+
+export const useAuthStore = authRuntime.store ?? create<AuthStore>(createAuthState);
+
+if (hotData) {
+  if (authRuntime.store) {
+    // 保留现有资料、订阅与在途会话代次，同时让后续调用使用热更新后的 action。
+    const {
+      session: _session, profile: _profile, loading: _loading, error: _error, ...actions
+    } = createAuthState(useAuthStore.setState, useAuthStore.getState, useAuthStore);
+    useAuthStore.setState(actions);
+  }
+  authRuntime.store = useAuthStore;
+}

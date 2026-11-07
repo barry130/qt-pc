@@ -22,9 +22,11 @@
 import * as ipc from "@/services/ipc";
 import { resolvePlayUrlDetailed } from "@/source-scripts";
 import { normalizeQualityForSource, qualityRanksOf, useSourceRegistryStore } from "@/stores/sourceRegistry";
-import { mirrorPlayUrlLine } from "@/source-scripts/playurl-line";
+import { mirrorPlayUrlLine, rememberPlayUrlLine, playUrlHitLine } from "@/source-scripts/playurl-line";
 import { broadcastPlayUrlLine } from "@/lib/play-url-broadcast";
 import type { Quality, Track } from "@/types";
+import { preferredSource } from "@/lib/preferred-source";
+import { sourcePlayQualityOf } from "@/lib/source-quality";
 
 /** 一次回退取链的完整结果（失败时 url 为空串，其余字段为「没测出来」） */
 export interface FallbackResolveResult {
@@ -36,6 +38,8 @@ export interface FallbackResolveResult {
   actualQuality: string;
   /** 真正出链的档位（空串 = 没有出链）；与请求档不同即说明发生了降档 */
   quality: string;
+  /** 手选音源使用其独立音质，供调用方比较真正的请求档与降档结果。 */
+  requestedQuality?: string;
 }
 
 /**
@@ -165,6 +169,30 @@ export async function resolvePlayUrlWithFallback(
   track: Track,
   wanted: string,
 ): Promise<FallbackResolveResult> {
+  // 手选可能发生在旧请求取链期间。按最新偏好重试，避免晚到的旧请求把原歌
+  // 的 Native URL 缓存重新覆盖为旧源；队列/本地查找保留原歌身份。
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const preferred = await preferredSource(track);
+    const target = preferred ?? track;
+    const selectedQuality = preferred ? sourcePlayQualityOf(preferred.platform) : wanted;
+    const result = await resolvePreferred(target, selectedQuality);
+    const latest = (await preferredSource(track)) ?? track;
+    if (latest.platform !== target.platform || latest.id !== target.id) continue;
+    if (!preferred) return result;
+    if (result.url.length > 0) {
+      await ipc.setResolvedPlayUrl(track, wanted, result.url, result.referer, result.size, result.actualQuality);
+      const line = playUrlHitLine(preferred, result.quality);
+      const selectedLine = line?.kind === "cross" ? line : { id: "cross:" + preferred.platform, name: "已保存的手动音源", kind: "cross" as const, targetSong: { id: preferred.id, name: preferred.title, singer: preferred.singer, album: preferred.album, picUrl: preferred.picUrl, interval: preferred.duration, musicId: preferred.musicId } };
+      rememberPlayUrlLine(track, wanted, selectedLine);
+      if (result.quality !== wanted) rememberPlayUrlLine(track, result.quality, selectedLine);
+      broadcastPlayUrlLine(track, wanted);
+    }
+    return { ...result, requestedQuality: selectedQuality };
+  }
+  throw new Error("音源选择已变化，请重新播放");
+}
+
+async function resolvePreferred(track: Track, wanted: string): Promise<FallbackResolveResult> {
   const attempts = qualityFallbackLadder(track.platform, wanted, track.album);
   let stalled = false;
   for (const quality of attempts) {

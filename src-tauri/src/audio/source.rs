@@ -2,7 +2,7 @@
 //!
 //! A queued source claims its activation atomically on its first sample. Cancelling
 //! an unstarted source therefore never clears/stops the Player's current source.
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,18 +15,32 @@ const CANCELLED: u8 = 2;
 const FINISHED: u8 = 3;
 
 #[derive(Default)]
-pub(super) struct SourceProgress {
+pub struct SourceProgress {
     state: AtomicU8,
     position_ns: AtomicU64,
+    first_some: AtomicBool,
 }
 
 impl SourceProgress {
+    /// Actual progress reported by an external renderer; never synthesizes local audio samples.
+    pub(super) fn external_position(&self, position_ms: u64) {
+        self.position_ns.store(position_ms.saturating_mul(1_000_000), Ordering::Release);
+        self.state.store(ACTIVE, Ordering::Release);
+    }
+    pub fn usable(&self) -> bool {
+        !matches!(self.state.load(Ordering::Acquire), CANCELLED | FINISHED)
+    }
+
     pub fn position_ms(&self) -> u64 {
         self.position_ns.load(Ordering::Acquire) / 1_000_000
     }
 
     pub fn started(&self) -> bool {
         matches!(self.state.load(Ordering::Acquire), ACTIVE | FINISHED)
+    }
+
+    pub(super) fn first_some(&self) -> bool {
+        self.first_some.load(Ordering::Acquire)
     }
 
     /// False means the render thread already won activation; the engine must
@@ -93,6 +107,7 @@ impl Iterator for TrackedSource {
         }
         match self.inner.next() {
             Some(sample) => {
+                self.progress.first_some.store(true, Ordering::Release);
                 self.channel += 1;
                 if self.channel == self.channels.get() {
                     self.channel = 0;

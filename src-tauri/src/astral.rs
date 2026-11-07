@@ -7,7 +7,7 @@
 use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 /// 云端 JSON 的标量字段实测会给 `null`（changes 接口回过 album / hash / pid: null）。
@@ -24,6 +24,19 @@ where
         Some(Value::Number(n)) => n.to_string(),
         Some(Value::Bool(b)) => b.to_string(),
         _ => String::new(),
+    })
+}
+
+fn de_optional_pic_url<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(Value::String(value)) => Some(value),
+        Some(Value::Number(value)) => Some(value.to_string()),
+        Some(Value::Bool(value)) => Some(value.to_string()),
+        _ => None,
     })
 }
 
@@ -69,8 +82,8 @@ pub struct LikeChange {
     /// 歌曲所属歌单（song 变更项新增，可空；playlist 变更项无此字段）
     #[serde(default, deserialize_with = "de_string_or_default")]
     pub pid: String,
-    #[serde(default, deserialize_with = "de_string_or_default")]
-    pub pic_url: String,
+    #[serde(default, deserialize_with = "de_optional_pic_url")]
+    pub pic_url: Option<String>,
     #[serde(default, deserialize_with = "de_bool_or_default")]
     pub deleted: bool,
     #[serde(default, deserialize_with = "de_i64_or_default")]
@@ -101,12 +114,23 @@ pub struct LikeSongPayload<'a> {
 /// 注：后端（astral）从不签发 refreshToken（全仓无下发/刷新端点，只有一条
 /// 字典类型定义），续期完全靠 satoken 主动刷新（见 `refresh`）——这里不设
 /// refresh_token 字段，避免误导后来者以为存在可用的刷新令牌。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// Native-only: intentionally no Serialize, so command returns cannot leak tokens.
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthSession {
     pub token: String,
     /// 过期时间（Unix 毫秒）。后端不返回 expiresIn 时按 7 天算，与移动端一致。
     pub expires_at: i64,
+}
+
+impl std::fmt::Debug for AuthSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AuthSession")
+            .field("token", &"***")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 impl AuthSession {
@@ -384,17 +408,314 @@ fn is_definitive_refresh_rejection(err: &str) -> bool {
 static ASTRAL_HTTP: std::sync::OnceLock<RwLock<(u64, reqwest::Client)>> =
     std::sync::OnceLock::new();
 
+/// Owned request at the HTTP adapter boundary. Intentionally not Debug/Serialize:
+/// request bodies and satoken are native-only credentials.
+pub struct AstralHttpRequest {
+    pub method: reqwest::Method,
+    pub url: String,
+    pub query: Vec<(String, String)>,
+    pub json_body: Option<Value>,
+    pub headers: Vec<(String, String)>,
+    pub satoken: Option<String>,
+}
+
+pub struct AstralHttpResponse {
+    pub status: u16,
+    pub body: String,
+}
+
+pub struct AstralUploadRequest {
+    pub ticket: UploadTicket,
+    pub file_name: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
+/// 两段式代传正文（CUSTOM_HTTP 渠道）：正文经 astral 网关转发，由服务端发往上游。
+/// 与直传不同——这是自家后端地址，必须带 satoken 与统一客户端系统头。
+pub struct AstralProxyPutRequest {
+    pub url: String,
+    pub satoken: Option<String>,
+    pub headers: Vec<(String, String)>,
+    pub bytes: Vec<u8>,
+}
+
+pub trait AstralHttpTransport: Send + Sync {
+    fn send(
+        &self,
+        request: AstralHttpRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AstralHttpResponse, String>> + Send + '_>,
+    >;
+    fn upload(
+        &self,
+        _request: AstralUploadRequest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async { Err("直传适配器未配置".to_owned()) })
+    }
+    fn proxy_put(
+        &self,
+        _request: AstralProxyPutRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AstralHttpResponse, String>> + Send + '_>,
+    > {
+        Box::pin(async { Err("代传适配器未配置".to_owned()) })
+    }
+}
+
+/// Instance requester sharing the actual reqwest header/auth/query/body/read path.
+/// A supplied production client keeps its configured policy; owned_loopback is an
+/// explicit finite numeric endpoint adapter, never the production default.
+pub struct AstralRequester {
+    client: reqwest::Client,
+    owned_origin: Option<reqwest::Url>,
+}
+
+impl AstralRequester {
+    pub fn new(client: reqwest::Client) -> Self {
+        Self {
+            client,
+            owned_origin: None,
+        }
+    }
+
+    /// Caller must own this listener for the requester's whole lifetime.
+    pub fn owned_loopback(addr: std::net::SocketAddr) -> Result<Self, String> {
+        if addr.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST) || addr.port() == 0 {
+            return Err(
+                "Astral owned endpoint must be numeric 127.0.0.1 with a bound port".to_owned(),
+            );
+        }
+        let origin = reqwest::Url::parse(&format!("http://{addr}"))
+            .map_err(|_| "Astral owned endpoint invalid".to_owned())?;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(1))
+            .read_timeout(std::time::Duration::from_secs(3))
+            .timeout(std::time::Duration::from_secs(5))
+            .pool_max_idle_per_host(0)
+            .build()
+            .map_err(|_| "Astral owned client initialization failed".to_owned())?;
+        Ok(Self {
+            client,
+            owned_origin: Some(origin),
+        })
+    }
+
+    pub async fn send(&self, request: AstralHttpRequest) -> Result<AstralHttpResponse, String> {
+        if let Some(origin) = &self.owned_origin {
+            let url = reqwest::Url::parse(&request.url)
+                .map_err(|_| "Astral request is not an owned endpoint".to_owned())?;
+            if url.origin() != origin.origin()
+                || !url.username().is_empty()
+                || url.password().is_some()
+            {
+                return Err("Astral request is not an owned endpoint".to_owned());
+            }
+        }
+        let mut req = self
+            .client
+            .request(request.method, &request.url)
+            .query(&request.query);
+        if let Some(token) = request.satoken {
+            req = req.header("satoken", token);
+        }
+        for (name, value) in request.headers {
+            req = req.header(name, value);
+        }
+        if let Some(body) = request.json_body {
+            req = req.json(&body);
+        }
+        let response = req
+            .send()
+            .await
+            .map_err(|_| "Astral 请求失败，请检查网络连接".to_owned())?;
+        let status = response.status().as_u16();
+        let body = response
+            .text()
+            .await
+            .map_err(|_| "Astral 响应读取失败".to_owned())?;
+        Ok(AstralHttpResponse { status, body })
+    }
+}
+
+impl AstralHttpTransport for AstralRequester {
+    fn send(
+        &self,
+        request: AstralHttpRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AstralHttpResponse, String>> + Send + '_>,
+    > {
+        Box::pin(AstralRequester::send(self, request))
+    }
+}
+
+struct ReqwestAstralTransport;
+impl AstralHttpTransport for ReqwestAstralTransport {
+    fn send(
+        &self,
+        request: AstralHttpRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AstralHttpResponse, String>> + Send + '_>,
+    > {
+        Box::pin(async move { AstralRequester::new(shared_http()).send(request).await })
+    }
+
+    fn upload(
+        &self,
+        request: AstralUploadRequest,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + '_>> {
+        Box::pin(async move {
+            let AstralUploadRequest {
+                ticket,
+                file_name,
+                content_type,
+                bytes,
+            } = request;
+            let client = crate::net_config::configure(reqwest::Client::builder())
+                .timeout(std::time::Duration::from_secs(60))
+                .pool_max_idle_per_host(0)
+                .build()
+                .map_err(|_| "上传客户端构建失败".to_owned())?;
+            let response = if ticket.method.eq_ignore_ascii_case("PUT") {
+                client
+                    .put(&ticket.upload_url)
+                    .body(bytes)
+                    .send()
+                    .await
+                    .map_err(|error| format!("直传失败: {}", sanitize_err(error)))?
+            } else {
+                let field = ticket.form_field.unwrap_or_else(|| "file".into());
+                let mut form = reqwest::multipart::Form::new();
+                if let Some(policy) = ticket.form_policy {
+                    form = form.text("policy", policy);
+                }
+                if let Some(authorization) = ticket.form_authorization {
+                    form = form.text("authorization", authorization);
+                }
+                let part = reqwest::multipart::Part::bytes(bytes)
+                    .file_name(file_name)
+                    .mime_str(&content_type)
+                    .map_err(|_| "上传 MIME 非法".to_owned())?;
+                form = form.part(field, part);
+                client
+                    .post(&ticket.upload_url)
+                    .multipart(form)
+                    .send()
+                    .await
+                    .map_err(|error| format!("直传失败: {}", sanitize_err(error)))?
+            };
+            let status = response.status();
+            if !status.is_success() {
+                return Err(format!("直传被存储端拒绝({status})"));
+            }
+            Ok(())
+        })
+    }
+
+    fn proxy_put(
+        &self,
+        request: AstralProxyPutRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<AstralHttpResponse, String>> + Send + '_>,
+    > {
+        Box::pin(async move {
+            send_proxy_upload(request, crate::net_config::configure(reqwest::Client::builder())).await
+        })
+    }
+}
+
+async fn send_proxy_upload(
+    request: AstralProxyPutRequest,
+    builder: reqwest::ClientBuilder,
+) -> Result<AstralHttpResponse, String> {
+    // 正文上传超时对齐移动端/管理端（服务端 90s 发送截止，客户端放宽到 120s）。
+    // 初始地址已经过同源校验；禁止重定向，防止自定义 satoken 头和正文被转发到别处。
+    let client = builder
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(std::time::Duration::from_secs(120))
+        .pool_max_idle_per_host(0)
+        .build()
+        .map_err(|_| "上传客户端构建失败".to_owned())?;
+    // 生产网关/WAF 拦截非 GET/POST 方法（实测 PUT 返回 200+纯文本「非法请求」），统一 POST。
+    let mut req = client.post(&request.url);
+    if let Some(token) = request.satoken {
+        req = req.header("satoken", token);
+    }
+    for (name, value) in request.headers {
+        req = req.header(name, value);
+    }
+    let response = req
+        .body(request.bytes)
+        .send()
+        .await
+        .map_err(|error| format!("代传失败: {}", sanitize_err(error)))?;
+    let status = response.status().as_u16();
+    let body = response
+        .text()
+        .await
+        .map_err(|_| "代传响应读取失败".to_owned())?;
+    Ok(AstralHttpResponse { status, body })
+}
+
+fn shared_http() -> reqwest::Client {
+    crate::net_config::shared_async_client(&ASTRAL_HTTP, || {
+        crate::net_config::configure(reqwest::Client::builder())
+            .timeout(std::time::Duration::from_secs(15))
+            .pool_max_idle_per_host(0)
+            .build()
+            .expect("reqwest client")
+    })
+}
+
+#[cfg(test)]
+#[path = "../../tests/source-engine-network-guard-astral.rs"]
+mod native_session_regressions;
+
+const ERR_SESSION_CHANGED: &str = "登录会话已变化，请重新同步";
+
+#[derive(Default)]
+struct NativeSessionState {
+    token: Option<String>,
+    expires_at: i64,
+    handle: Option<crate::credential_store::SessionHandle>,
+    vault: Option<Arc<crate::credential_store::SessionVault>>,
+    epoch: u64,
+    revision: u64,
+    login_ticket: u64,
+    verified_uid: Option<String>,
+    like_ready: bool,
+}
+
+#[derive(Clone)]
+struct SessionSnapshot {
+    token: Option<String>,
+    expires_at: i64,
+    vault: Option<Arc<crate::credential_store::SessionVault>>,
+    epoch: u64,
+    revision: u64,
+    login_ticket: u64,
+}
+
+#[derive(Clone)]
+struct AstralCall<'a> {
+    method: reqwest::Method,
+    path: &'a str,
+    query: &'a [(&'a str, &'a str)],
+    json_body: Option<Value>,
+    extra_headers: &'a [(&'a str, &'a str)],
+    auth: bool,
+}
+
 pub struct AstralClient {
     base_url: String,
-    /// 登录后装入；请求时出现则附 satoken 头
-    satoken: RwLock<Option<String>>,
-    /// 当前会话过期时间（Unix 毫秒；0 = 未知/未登录）。主动续期判据
-    expires_at: RwLock<i64>,
-    /// 刷新单飞锁：并发 401 只放一个去换新 token，其余等锁后复用成果
+    transport: Arc<dyn AstralHttpTransport>,
+    metadata: Option<ClientMetadata>,
+    session: Arc<RwLock<NativeSessionState>>,
+    mutations: tokio::sync::Mutex<()>,
+    /// Refresh requests are single-flight; OS work never holds an async executor.
     refresh_lock: tokio::sync::Mutex<()>,
-    /// 会话持久化句柄（settings 表 astral.session）。自动刷新换到的新 token
-    /// 要能落库，否则重启又回到过期会话；None（库不可用）= 仅内存
-    session_db: RwLock<Option<Arc<crate::db::Database>>>,
 }
 
 /// 直传凭证（后端 QtUploadTicketVo 的 Rust 镜像）
@@ -406,58 +727,444 @@ pub struct UploadTicket {
     pub upload_id: String,
     pub form_policy: Option<String>,
     pub form_authorization: Option<String>,
+    epoch: u64,
+    requires_like_owner: bool,
+}
+
+/// 上传计划（后端 QtUploadPlanVo 的 Rust 镜像）：mode=DIRECT 复用三段式直传；
+/// mode=PROXY 走两段式代传（CUSTOM_HTTP 渠道，正文经 astral 网关）。
+#[derive(Debug, Clone)]
+pub struct UploadPlan {
+    pub mode: String,
+    pub ticket: Option<UploadTicket>,
+    pub proxy_upload_id: String,
+    pub proxy_content_path: String,
 }
 
 impl AstralClient {
     pub fn new(base_url: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            satoken: RwLock::new(None),
-            expires_at: RwLock::new(0),
+            transport: Arc::new(ReqwestAstralTransport),
+            metadata: None,
+            session: Arc::new(RwLock::new(NativeSessionState::default())),
+            mutations: tokio::sync::Mutex::new(()),
             refresh_lock: tokio::sync::Mutex::new(()),
-            session_db: RwLock::new(None),
         }
     }
 
-    pub fn set_token(&self, token: Option<String>) {
-        if token.is_none() {
-            *self.expires_at.write().expect("expires 锁") = 0;
+    pub fn new_with_transport(base_url: &str, transport: Arc<dyn AstralHttpTransport>) -> Self {
+        let mut client = Self::new(base_url);
+        client.transport = transport;
+        client
+    }
+
+    /// Explicit final-metadata injection; new/new_with_transport keep the actual
+    /// lazy system metadata path. Session authority and transport behavior are shared.
+    pub fn new_with_transport_and_metadata(
+        base_url: &str,
+        transport: Arc<dyn AstralHttpTransport>,
+        metadata: ClientMetadata,
+    ) -> Self {
+        let mut client = Self::new_with_transport(base_url, transport);
+        client.metadata = Some(metadata);
+        client
+    }
+
+    fn basic_headers(&self) -> Vec<(String, String)> {
+        let headers = match &self.metadata {
+            Some(metadata) => client_headers_with_metadata(metadata),
+            None => client_headers().to_vec(),
+        };
+        headers
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect()
+    }
+
+    pub fn set_session_store(
+        &self,
+        db: Option<Arc<crate::db::Database>>,
+        data_root: &std::path::Path,
+        store: Arc<dyn crate::credential_store::CredentialStore>,
+    ) {
+        let vault = Arc::new(crate::credential_store::SessionVault::new(
+            db,
+            data_root,
+            &self.base_url,
+            store,
+        ));
+        let mut state = self.session.write().expect("session lock");
+        state.vault = Some(vault);
+        state.token = None;
+        state.handle = None;
+        state.expires_at = 0;
+        state.epoch += 1;
+        state.login_ticket += 1;
+        state.verified_uid = None;
+        state.like_ready = false;
+    }
+
+    pub fn session_status(&self) -> Option<crate::credential_store::SessionStatus> {
+        let state = self.session.read().expect("session lock");
+        state.token.as_ref().filter(|token| !token.is_empty())?;
+        state.handle.as_ref().map(|handle| handle.status)
+    }
+
+    fn snapshot(&self) -> SessionSnapshot {
+        let state = self.session.read().expect("session lock");
+        SessionSnapshot {
+            token: state.token.clone(),
+            expires_at: state.expires_at,
+            vault: state.vault.clone(),
+            epoch: state.epoch,
+            revision: state.revision,
+            login_ticket: state.login_ticket,
         }
-        *self.satoken.write().expect("satoken 锁") = token;
     }
 
-    /// 装入完整会话（token + 过期时间）。主动续期需要过期时间做判据。
-    pub fn set_session(&self, session: &AuthSession) {
-        *self.expires_at.write().expect("expires 锁") = session.expires_at;
-        self.set_token(Some(session.token.clone()));
+    fn begin_login(&self) -> SessionSnapshot {
+        let mut state = self.session.write().expect("session lock");
+        state.login_ticket += 1;
+        SessionSnapshot {
+            token: state.token.clone(),
+            expires_at: state.expires_at,
+            vault: state.vault.clone(),
+            epoch: state.epoch,
+            revision: state.revision,
+            login_ticket: state.login_ticket,
+        }
     }
 
-    /// 注入会话持久化句柄（lib.rs 启动时；库打开失败传 None）
-    pub fn set_session_db(&self, db: Option<Arc<crate::db::Database>>) {
-        *self.session_db.write().expect("session db 锁") = db;
+    pub fn session_epoch(&self) -> u64 {
+        self.session.read().expect("session lock").epoch
+    }
+    pub fn is_session_epoch_current(&self, epoch: u64) -> bool {
+        self.session_epoch() == epoch
     }
 
-    fn expires_at_ms(&self) -> i64 {
-        *self.expires_at.read().expect("expires 锁")
-    }
-
-    /// 是否已登录（装着 satoken）。收藏同步据此决定要不要推送。
-    pub fn has_token(&self) -> bool {
-        self.satoken
+    /// Lock order is session -> DB. The closure must not await or reacquire this lock.
+    pub fn with_session_epoch<T>(
+        &self,
+        epoch: u64,
+        commit: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let state = self
+            .session
             .read()
-            .map(|g| g.as_ref().is_some_and(|t| !t.is_empty()))
-            .unwrap_or(false)
+            .map_err(|_| ERR_SESSION_CHANGED.to_owned())?;
+        if state.epoch != epoch {
+            return Err(ERR_SESSION_CHANGED.to_owned());
+        }
+        commit()
+    }
+
+    fn require_like_owner(state: &NativeSessionState) -> Result<(), String> {
+        if !state.like_ready || state.token.is_none() {
+            return Err("登录用户尚未核验，收藏同步已暂停".to_owned());
+        }
+        let uid = state
+            .verified_uid
+            .as_deref()
+            .ok_or_else(|| "登录用户尚未核验，收藏同步已暂停".to_owned())?;
+        if !state
+            .vault
+            .as_ref()
+            .map_or(Ok(false), |vault| vault.like_owner_matches(uid))?
+        {
+            return Err("收藏归属与登录用户不匹配".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Keep real owner verification and the local cloud commit under one READ fence.
+    pub fn with_like_session_epoch<T>(
+        &self,
+        epoch: u64,
+        commit: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let state = self
+            .session
+            .read()
+            .map_err(|_| ERR_SESSION_CHANGED.to_owned())?;
+        if state.epoch != epoch {
+            return Err(ERR_SESSION_CHANGED.to_owned());
+        }
+        Self::require_like_owner(&state)?;
+        commit()
+    }
+
+    pub fn with_like_owner_commit<T>(
+        &self,
+        epoch: u64,
+        uid: &str,
+        commit: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut state = self
+            .session
+            .write()
+            .map_err(|_| ERR_SESSION_CHANGED.to_owned())?;
+        if state.epoch != epoch {
+            return Err(ERR_SESSION_CHANGED.to_owned());
+        }
+        state.like_ready = false;
+        if state.token.is_none() || state.verified_uid.as_deref() != Some(uid) {
+            return Err("登录用户尚未核验，收藏同步已暂停".to_owned());
+        }
+        let result = commit()?;
+        let owner_matches = state
+            .vault
+            .as_ref()
+            .map_or(Ok(false), |vault| vault.like_owner_matches(uid))?;
+        if !owner_matches {
+            return Err("收藏归属与登录用户不匹配".to_owned());
+        }
+        state.like_ready = true;
+        Ok(result)
+    }
+
+    pub fn with_like_owner_invalidated<T>(
+        &self,
+        epoch: u64,
+        operation: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut state = self
+            .session
+            .write()
+            .map_err(|_| ERR_SESSION_CHANGED.to_owned())?;
+        if state.epoch != epoch {
+            return Err(ERR_SESSION_CHANGED.to_owned());
+        }
+        state.like_ready = false;
+        operation()
+    }
+
+    pub fn invalidate_like_owner_ready(&self, epoch: u64) -> Result<(), String> {
+        self.with_like_owner_invalidated(epoch, || Ok(()))
+    }
+
+    async fn install_session(
+        &self,
+        auth: &AuthSession,
+        expected: SessionSnapshot,
+        new_login: bool,
+    ) -> Result<crate::credential_store::SessionStatus, String> {
+        let _mutation = self.mutations.lock().await;
+        let session = self.session.clone();
+        let token = auth.token.clone();
+        let expires_at = auth.expires_at;
+        tokio::task::spawn_blocking(move || {
+            let prepared = if let Some(vault) = &expected.vault {
+                vault.prepare(&token, expires_at)?
+            } else {
+                crate::credential_store::SessionHandle {
+                    status: crate::credential_store::SessionStatus {
+                        expires_at,
+                        persistence: crate::credential_store::SessionPersistence::MemoryOnly,
+                    },
+                    target: None,
+                }
+            };
+            let mut state = session
+                .write()
+                .map_err(|_| ERR_SESSION_CHANGED.to_owned())?;
+            let stale = state.epoch != expected.epoch
+                || if new_login {
+                    state.login_ticket != expected.login_ticket
+                } else {
+                    state.revision != expected.revision
+                };
+            if stale {
+                drop(state);
+                if let Some(vault) = &expected.vault {
+                    vault.abort(&prepared);
+                }
+                return Err(ERR_SESSION_CHANGED.to_owned());
+            }
+            // The DB reference and RAM session install share this WRITE guard.
+            // with_session_epoch's READ guard makes a local commit indivisible.
+            let old = if let Some(vault) = &expected.vault {
+                match vault.commit(&prepared) {
+                    Ok(old) => old,
+                    Err(error) => {
+                        drop(state);
+                        vault.abort(&prepared);
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
+            let status = prepared.status;
+            state.token = Some(token);
+            state.expires_at = expires_at;
+            state.handle = Some(prepared);
+            state.revision += 1;
+            if new_login {
+                state.epoch += 1;
+                state.verified_uid = None;
+                state.like_ready = false;
+            }
+            drop(state);
+            if let Some(vault) = &expected.vault {
+                if vault.retire(old.as_deref()).is_err() {
+                    log::warn!("旧会话凭据清理失败；数据库已解除旧引用");
+                }
+            }
+            // Return the view belonging to this successful ticket, even if a
+            // newer login installs another session before the caller resumes.
+            Ok(status)
+        })
+        .await
+        .map_err(|_| "会话存储任务失败".to_owned())?
+    }
+
+    pub async fn restore_session(
+        &self,
+    ) -> Result<Option<crate::credential_store::SessionStatus>, String> {
+        let _mutation = self.mutations.lock().await;
+        let expected = self.snapshot();
+        let Some(vault) = expected.vault else {
+            return Ok(None);
+        };
+        let session = self.session.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut state = session
+                .write()
+                .map_err(|_| ERR_SESSION_CHANGED.to_owned())?;
+            if state.epoch != expected.epoch || state.login_ticket != expected.login_ticket {
+                return Err(ERR_SESSION_CHANGED.to_owned());
+            }
+            let restored = vault.restore(now_ms())?;
+            let status = restored.as_ref().map(|restored| restored.handle.status);
+            state.token = restored.as_ref().map(|restored| restored.token.clone());
+            state.expires_at = status.map_or(0, |status| status.expires_at);
+            state.handle = restored.map(|restored| restored.handle);
+            state.epoch += 1;
+            state.revision += 1;
+            state.verified_uid = None;
+            state.like_ready = false;
+            Ok(status)
+        })
+        .await
+        .map_err(|_| "会话恢复任务失败".to_owned())?
+    }
+
+    pub async fn clear_session(&self) -> Result<(), String> {
+        self.clear_session_for_epoch(self.session_epoch()).await
+    }
+
+    pub async fn clear_session_for_epoch(&self, epoch: u64) -> Result<(), String> {
+        self.clear_session_matching(epoch, None).await
+    }
+
+    async fn clear_session_for_stamp(&self, epoch: u64, revision: u64) -> Result<(), String> {
+        self.clear_session_matching(epoch, Some(revision)).await
+    }
+
+    async fn clear_session_matching(
+        &self,
+        epoch: u64,
+        revision: Option<u64>,
+    ) -> Result<(), String> {
+        let _mutation = self.mutations.lock().await;
+        let session = self.session.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut state = session
+                .write()
+                .map_err(|_| ERR_SESSION_CHANGED.to_owned())?;
+            if state.epoch != epoch || revision.is_some_and(|wanted| state.revision != wanted) {
+                return Err(ERR_SESSION_CHANGED.to_owned());
+            }
+            let vault = state.vault.clone();
+            let target = state
+                .handle
+                .as_ref()
+                .and_then(|handle| handle.target.clone());
+            state.token = None;
+            state.expires_at = 0;
+            state.handle = None;
+            state.epoch += 1;
+            state.revision += 1;
+            state.login_ticket += 1;
+            state.verified_uid = None;
+            state.like_ready = false;
+            let result = vault
+                .as_ref()
+                .map_or(Ok(None), |vault| vault.clear_reference());
+            drop(state);
+            if let Some(vault) = vault {
+                let old = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|old| old.as_deref())
+                    .or(target.as_deref());
+                let cleanup = vault.retire(old);
+                result?;
+                cleanup?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|_| "会话清理任务失败".to_owned())?
+    }
+
+    /// Native-memory compatibility only. Persistent lifecycle must use the vault APIs.
+    pub fn set_token(&self, token: Option<String>) {
+        let mut state = self.session.write().expect("session lock");
+        state.token = token;
+        if state.token.is_none() {
+            state.expires_at = 0;
+        }
+        state.handle = state
+            .token
+            .as_ref()
+            .map(|_| crate::credential_store::SessionHandle {
+                status: crate::credential_store::SessionStatus {
+                    expires_at: state.expires_at,
+                    persistence: crate::credential_store::SessionPersistence::MemoryOnly,
+                },
+                target: None,
+            });
+        state.epoch += 1;
+        state.revision += 1;
+        state.login_ticket += 1;
+        state.verified_uid = None;
+        state.like_ready = false;
+    }
+
+    pub fn set_session(&self, auth: &AuthSession) {
+        let mut state = self.session.write().expect("session lock");
+        state.token = Some(auth.token.clone());
+        state.expires_at = auth.expires_at;
+        state.handle = Some(crate::credential_store::SessionHandle {
+            status: crate::credential_store::SessionStatus {
+                expires_at: auth.expires_at,
+                persistence: crate::credential_store::SessionPersistence::MemoryOnly,
+            },
+            target: None,
+        });
+        state.epoch += 1;
+        state.revision += 1;
+        state.login_ticket += 1;
+        state.verified_uid = None;
+        state.like_ready = false;
+    }
+
+    // Kept while the Lead replaces the startup call; cannot create plaintext DB persistence.
+    pub fn set_session_db(&self, _db: Option<Arc<crate::db::Database>>) {}
+
+    #[cfg(test)]
+    fn expires_at_ms(&self) -> i64 {
+        self.session.read().expect("session lock").expires_at
+    }
+    pub fn has_token(&self) -> bool {
+        self.token().as_ref().is_some_and(|token| !token.is_empty())
     }
 
     /// 共享的 HTTP 客户端（大文件下载等场景复用连接池）
     pub fn http(&self) -> reqwest::Client {
-        crate::net_config::shared_async_client(&ASTRAL_HTTP, || {
-            crate::net_config::configure(reqwest::Client::builder())
-                .timeout(std::time::Duration::from_secs(15))
-                .pool_max_idle_per_host(0)
-                .build()
-                .expect("reqwest client")
-        })
+        shared_http()
     }
 
     /// 当前生效的后端基地址（音源包 manifest 直拼 URL 用）
@@ -468,65 +1175,20 @@ impl AstralClient {
     /// 当前登录态下的 satoken（未登录 / 已登出为 None）。音源包 manifest 等
     /// 走 builtin_client 的自拼请求也需要随登录态附带 satoken。
     pub fn token(&self) -> Option<String> {
-        self.satoken.read().expect("satoken lock").clone()
+        self.session.read().expect("session lock").token.clone()
     }
 
     /// 刷新会话并落库（单飞）。三态语义见 [`RefreshOutcome`]；调用方负责按态
     /// 决定重试 / 放行 / 返回失效。
-    async fn refresh_session(&self) -> RefreshOutcome {
-        // 排队等锁前先记下当前过期时间：等锁期间别的请求刷新成功的话
-        // expires_at 会前进，就不必再打一次刷新接口
-        let observed = self.expires_at_ms();
-        let _guard = self.refresh_lock.lock().await;
-        if self.token().is_none() {
-            // 等锁期间会话被清（并发刷新失败 / 用户登出），不再重试
-            return RefreshOutcome::Invalid;
-        }
-        if observed > 0 && self.expires_at_ms() > observed {
-            return RefreshOutcome::Ok;
-        }
-        match self.refresh().await {
-            Ok(session) => {
-                self.set_session(&session);
-                self.persist_session(&session).await;
-                RefreshOutcome::Ok
-            }
+    async fn refresh_session(&self, captured: SessionSnapshot) -> RefreshOutcome {
+        match self.refresh_captured(captured.clone()).await {
+            Ok(_) => RefreshOutcome::Ok,
             Err(e) if is_definitive_refresh_rejection(&e) => {
-                log::info!("[astral] 刷新被后端拒绝，清除本地登录态: {e}");
-                self.set_token(None);
-                self.clear_persisted_session().await;
+                log::info!("[astral] 刷新被后端拒绝，撤销原本地登录态");
                 RefreshOutcome::Invalid
             }
-            Err(e) => {
-                // 网络失败 / 网关抖动：token 可能仍有效，不清登录态（uniappx 同策略）
-                RefreshOutcome::Network(e)
-            }
+            Err(e) => RefreshOutcome::Network(e),
         }
-    }
-
-    /// 刷新换到的新会话写进 settings 表（重启后能续上；库不可用时静默跳过）
-    async fn persist_session(&self, session: &AuthSession) {
-        let Some(db) = self.session_db.read().expect("session db 锁").clone() else {
-            return;
-        };
-        let Ok(value) = serde_json::to_string(session) else {
-            log::warn!("[astral] 刷新后的会话序列化失败，token 只留在内存");
-            return;
-        };
-        let _ = tauri::async_runtime::spawn_blocking(move || {
-            db.with(|conn| crate::db::store::set_setting(conn, SETTING_ASTRAL_SESSION, &value))
-        })
-        .await;
-    }
-
-    async fn clear_persisted_session(&self) {
-        let Some(db) = self.session_db.read().expect("session db 锁").clone() else {
-            return;
-        };
-        let _ = tauri::async_runtime::spawn_blocking(move || {
-            db.with(|conn| crate::db::store::set_setting(conn, SETTING_ASTRAL_SESSION, ""))
-        })
-        .await;
     }
 
     /// 发请求并解 QtRestResp：code 0/200 → Ok(data)；其余 → Err(msg)。
@@ -541,85 +1203,165 @@ impl AstralClient {
         extra_headers: &[(&str, &str)],
         auth: bool,
     ) -> Result<Value, String> {
-        // 主动续期：省掉一次必然 401 的往返（uniappx apiRequest 同款）。
-        // 失败都不拦请求：Ok 正常用新 token，Network 下旧 token 可能仍有效，
-        // Invalid 已清登录态、随后的请求会拿到 401 走统一失效路径。
-        if auth && !refresh_path(path) && self.token().is_some() {
-            let exp = self.expires_at_ms();
-            if exp > 0 && should_proactive_refresh(exp, now_ms()) {
-                let _ = self.refresh_session().await;
+        self.request_captured(
+            self.snapshot(),
+            AstralCall {
+                method,
+                path,
+                query,
+                json_body,
+                extra_headers,
+                auth,
+            },
+        )
+        .await
+    }
+
+    fn current_snapshot_for_epoch(&self, epoch: u64) -> Result<SessionSnapshot, String> {
+        let captured = self.snapshot();
+        if captured.epoch != epoch {
+            return Err(ERR_SESSION_CHANGED.to_owned());
+        }
+        Ok(captured)
+    }
+
+    async fn request_for_epoch(&self, epoch: u64, call: AstralCall<'_>) -> Result<Value, String> {
+        self.request_captured(self.current_snapshot_for_epoch(epoch)?, call)
+            .await
+    }
+
+    async fn request_captured(
+        &self,
+        mut captured: SessionSnapshot,
+        call: AstralCall<'_>,
+    ) -> Result<Value, String> {
+        self.request_with_snapshot(&mut captured, call).await
+    }
+
+    async fn request_with_snapshot(
+        &self,
+        captured: &mut SessionSnapshot,
+        call: AstralCall<'_>,
+    ) -> Result<Value, String> {
+        let is_like = call
+            .path
+            .trim_start_matches('/')
+            .starts_with("app/user/like/");
+        {
+            let state = self
+                .session
+                .read()
+                .map_err(|_| ERR_SESSION_CHANGED.to_owned())?;
+            if (call.auth || is_like) && state.epoch != captured.epoch {
+                return Err(ERR_SESSION_CHANGED.to_owned());
+            }
+            if is_like {
+                Self::require_like_owner(&state)?;
+            }
+        }
+        if call.auth
+            && !refresh_path(call.path)
+            && captured.token.is_some()
+            && captured.expires_at > 0
+            && should_proactive_refresh(captured.expires_at, now_ms())
+        {
+            match self.refresh_session(captured.clone()).await {
+                RefreshOutcome::Ok => {
+                    *captured = self.current_snapshot_for_epoch(captured.epoch)?
+                }
+                RefreshOutcome::Invalid => return Err(ERR_UNAUTHORIZED.to_owned()),
+                RefreshOutcome::Network(_) => {}
             }
         }
         let out = self
-            .request_once(
-                method.clone(),
-                path,
-                query,
-                json_body.clone(),
-                extra_headers,
-                auth,
-            )
+            .request_once_captured(captured.clone(), call.clone())
             .await;
-        // 401 自动刷新：只对带认证的请求，且不含刷新接口本身（防递归）。
-        // 单飞锁保证并发 401 只有一个去换新 token，其余等锁后拿新 token 重试。
-        if auth && !refresh_path(path) {
-            if let Err(e) = &out {
-                if is_auth_error(e) && self.token().is_some() {
-                    match self.refresh_session().await {
-                        RefreshOutcome::Ok => {
-                            // 重试一次；仍 401 就原样返回（cmd_astral_me /
-                            // 前端 auth store 按失效清理）
-                            return self
-                                .request_once(method, path, query, json_body, extra_headers, auth)
-                                .await;
-                        }
-                        RefreshOutcome::Invalid => return out,
-                        RefreshOutcome::Network(e2) => return Err(e2),
-                    }
+        if call.auth
+            && !refresh_path(call.path)
+            && captured.token.is_some()
+            && out.as_ref().is_err_and(|error| is_auth_error(error))
+        {
+            match self.refresh_session(captured.clone()).await {
+                RefreshOutcome::Ok => {
+                    *captured = self.current_snapshot_for_epoch(captured.epoch)?;
+                    return self.request_once_captured(captured.clone(), call).await;
                 }
+                RefreshOutcome::Invalid => return out,
+                RefreshOutcome::Network(error) => return Err(error),
             }
         }
         out
     }
 
-    /// 单次请求（不含刷新逻辑；[`Self::request`] 负责续期与重试）
-    async fn request_once(
+    async fn request_once_captured(
         &self,
-        method: reqwest::Method,
-        path: &str,
-        query: &[(&str, &str)],
-        json_body: Option<Value>,
-        extra_headers: &[(&str, &str)],
-        auth: bool,
+        captured: SessionSnapshot,
+        call: AstralCall<'_>,
     ) -> Result<Value, String> {
+        let AstralCall {
+            method,
+            path,
+            query,
+            json_body,
+            extra_headers,
+            auth,
+        } = call;
+        let is_like = path.trim_start_matches('/').starts_with("app/user/like/");
         let url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
-        let mut req = self.http().request(method, &url).query(query);
-        if auth {
-            if let Some(token) = self.token() {
-                req = req.header("satoken", token);
+        let mut headers: Vec<(String, String)> = self.basic_headers();
+        headers.extend(
+            extra_headers
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
+        );
+        let response_task = {
+            let state = self
+                .session
+                .read()
+                .map_err(|_| ERR_SESSION_CHANGED.to_owned())?;
+            if (auth || is_like) && state.epoch != captured.epoch {
+                return Err(ERR_SESSION_CHANGED.to_owned());
+            }
+            if is_like {
+                Self::require_like_owner(&state)?;
+            }
+            self.transport.send(AstralHttpRequest {
+                method,
+                url,
+                query: query
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+                json_body,
+                headers,
+                satoken: if auth { captured.token.clone() } else { None },
+            })
+        };
+        let response = response_task.await?;
+        if auth || is_like {
+            let state = self
+                .session
+                .read()
+                .map_err(|_| ERR_SESSION_CHANGED.to_owned())?;
+            if state.epoch != captured.epoch {
+                return Err(ERR_SESSION_CHANGED.to_owned());
+            }
+            if path.trim_start_matches('/') == "app/user/me" && state.revision != captured.revision
+            {
+                return Err(ERR_SESSION_CHANGED.to_owned());
+            }
+            if is_like {
+                Self::require_like_owner(&state)?;
             }
         }
-        // 统一客户端系统头：所有 astral 请求都要带（接口统计拦截器逐请求测量），
-        // 因此放在收口处注入，各处调用点不必关心。放在 extra_headers 之前，
-        // 需要时调用方仍可覆盖同名头。
-        for (name, value) in client_headers() {
-            req = req.header(*name, value.as_str());
-        }
-        for (k, v) in extra_headers {
-            req = req.header(*k, *v);
-        }
-        if let Some(body) = json_body {
-            req = req.json(&body);
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| format!("Astral 请求失败: {}", sanitize_err(e)))?;
-        let status = resp.status();
-        let body: Value = resp
-            .json()
-            .await
-            .map_err(|e| format!("Astral 响应解析失败({status}): {e}"))?;
+        Self::decode_response(response)
+    }
+
+    fn decode_response(response: AstralHttpResponse) -> Result<Value, String> {
+        let status = reqwest::StatusCode::from_u16(response.status)
+            .map_err(|_| "Astral 响应状态无效".to_owned())?;
+        let body: Value = serde_json::from_str(&response.body)
+            .map_err(|_| format!("Astral 响应解析失败({status})"))?;
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(ERR_UNAUTHORIZED.to_string());
         }
@@ -670,7 +1412,12 @@ impl AstralClient {
     // ---------- 账号（接口契约对齐 qt-uniappx services/music-api.ts AccountApi） ----------
 
     /// 登录。成功即把 token 装进客户端（后续请求自动带 satoken）。
-    pub async fn login(&self, username: &str, password: &str) -> Result<AuthSession, String> {
+    pub async fn login(
+        &self,
+        username: &str,
+        password: &str,
+    ) -> Result<crate::credential_store::SessionStatus, String> {
+        let expected = self.begin_login();
         let data = self
             .post_json(
                 "app/user/login",
@@ -680,8 +1427,7 @@ impl AstralClient {
             )
             .await?;
         let session = parse_session(&data)?;
-        self.set_session(&session);
-        Ok(session)
+        self.install_session(&session, expected, true).await
     }
 
     /// 注册并登录（后端注册成功后直接返回 token）。
@@ -694,7 +1440,8 @@ impl AstralClient {
         password_confirm: &str,
         email: Option<&str>,
         nickname: Option<&str>,
-    ) -> Result<AuthSession, String> {
+    ) -> Result<crate::credential_store::SessionStatus, String> {
+        let expected = self.begin_login();
         let mut body = json!({
             "username": username,
             "password": password,
@@ -712,42 +1459,176 @@ impl AstralClient {
             .post_json("app/user/register", body, &[], false)
             .await?;
         let session = parse_session(&data)?;
-        self.set_session(&session);
-        Ok(session)
+        self.install_session(&session, expected, true).await
     }
 
-    /// 当前登录用户信息（app/user/me）
+    /// 当前登录用户信息（app/user/me）；只有 Native 收到的身份可用于归属提交。
     pub async fn me(&self) -> Result<Value, String> {
-        self.get("app/user/me", &[], true).await
+        self.me_for_epoch(self.session_epoch()).await
+    }
+
+    pub async fn me_for_epoch(&self, epoch: u64) -> Result<Value, String> {
+        let mut captured = self.current_snapshot_for_epoch(epoch)?;
+        let result = self
+            .request_with_snapshot(
+                &mut captured,
+                AstralCall {
+                    method: reqwest::Method::GET,
+                    path: "app/user/me",
+                    query: &[],
+                    json_body: None,
+                    extra_headers: &[],
+                    auth: true,
+                },
+            )
+            .await;
+        let result = {
+            let mut state = self
+                .session
+                .write()
+                .map_err(|_| ERR_SESSION_CHANGED.to_owned())?;
+            if state.epoch != captured.epoch || state.revision != captured.revision {
+                return Err(ERR_SESSION_CHANGED.to_owned());
+            }
+            state.like_ready = false;
+            state.verified_uid = None;
+            match result {
+                Ok(data) => {
+                    let uid = [
+                        data.get("id"),
+                        data.get("uid"),
+                        data.pointer("/user/id"),
+                        data.pointer("/user/uid"),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .find_map(|id| match id {
+                        Value::String(value) if !value.trim().is_empty() => {
+                            Some(value.trim().to_owned())
+                        }
+                        Value::Number(value) => {
+                            value.as_u64().filter(|id| *id > 0).map(|id| id.to_string())
+                        }
+                        _ => None,
+                    })
+                    .ok_or_else(|| "登录用户标识无效，收藏同步已暂停".to_owned())?;
+                    state.verified_uid = Some(uid);
+                    Ok(data)
+                }
+                Err(error) => Err(error),
+            }
+        };
+        // The final authenticated attempt can still reject a successfully
+        // renewed token. Native owns revocation; a caller's epoch-only clear
+        // would race with another renewal after this method returns.
+        if result
+            .as_ref()
+            .is_err_and(|error| error == ERR_UNAUTHORIZED)
+        {
+            self.clear_session_for_stamp(captured.epoch, captured.revision)
+                .await?;
+        }
+        result
+    }
+
+    pub async fn logout_for_epoch(&self, epoch: u64) -> Result<(), String> {
+        let captured = self.current_snapshot_for_epoch(epoch)?;
+        let local = self.clear_session_for_epoch(epoch).await;
+        if local
+            .as_ref()
+            .is_err_and(|error| error == ERR_SESSION_CHANGED)
+            || captured.token.is_none()
+        {
+            return local;
+        }
+        // Logout is the sole detached authenticated request: local authority is
+        // already revoked, and this immutable token can only revoke the old actor.
+        let remote = self
+            .transport
+            .send(AstralHttpRequest {
+                method: reqwest::Method::POST,
+                url: format!("{}/app/user/logout", self.base_url),
+                query: Vec::new(),
+                json_body: Some(json!({})),
+                headers: self.basic_headers(),
+                satoken: captured.token,
+            })
+            .await
+            .and_then(Self::decode_response)
+            .map(|_| ());
+        local.and(remote)
     }
 
     /// 退出登录：无论后端是否成功，本地 token 都会清掉
     pub async fn logout(&self) -> Result<(), String> {
-        let result = self
-            .post_json("app/user/logout", json!({}), &[], true)
-            .await
-            .map(|_| ());
-        self.set_token(None);
-        result
+        self.logout_for_epoch(self.session_epoch()).await
     }
 
     /// 用 refresh token 换新会话（需要先装着旧 token，后端按 satoken 识别）。
     /// 直走 request_once 而非 request 收口：刷新接口不允许再套「续期/401 再
     /// 刷新」逻辑（运行时靠 refresh_path 拦住，静态上也要打断 async 递归环）。
-    pub async fn refresh(&self) -> Result<AuthSession, String> {
-        let data = self
-            .request_once(
-                reqwest::Method::POST,
-                "app/user/refresh",
-                &[],
-                Some(json!({})),
-                &[],
-                true,
+    pub async fn refresh(&self) -> Result<crate::credential_store::SessionStatus, String> {
+        self.refresh_for_epoch(self.session_epoch()).await
+    }
+
+    pub async fn refresh_for_epoch(
+        &self,
+        epoch: u64,
+    ) -> Result<crate::credential_store::SessionStatus, String> {
+        let captured = self.snapshot();
+        if captured.epoch != epoch {
+            return Err(ERR_SESSION_CHANGED.to_owned());
+        }
+        self.refresh_captured(captured).await
+    }
+
+    async fn refresh_captured(
+        &self,
+        captured: SessionSnapshot,
+    ) -> Result<crate::credential_store::SessionStatus, String> {
+        let _flight = self.refresh_lock.lock().await;
+        {
+            let state = self
+                .session
+                .read()
+                .map_err(|_| ERR_SESSION_CHANGED.to_owned())?;
+            if state.epoch != captured.epoch {
+                return Err(ERR_SESSION_CHANGED.to_owned());
+            }
+            if state.token.is_none() {
+                return Err(ERR_UNAUTHORIZED.to_owned());
+            }
+            if state.revision != captured.revision {
+                return state
+                    .handle
+                    .as_ref()
+                    .map(|handle| handle.status)
+                    .ok_or_else(|| ERR_SESSION_CHANGED.to_owned());
+            }
+        }
+        let reply = self
+            .request_once_captured(
+                captured.clone(),
+                AstralCall {
+                    method: reqwest::Method::POST,
+                    path: "app/user/refresh",
+                    query: &[],
+                    json_body: Some(json!({})),
+                    extra_headers: &[],
+                    auth: true,
+                },
             )
-            .await?;
-        let session = parse_session(&data)?;
-        self.set_session(&session);
-        Ok(session)
+            .await;
+        let session = match reply.and_then(|data| parse_session(&data)) {
+            Ok(session) => session,
+            Err(error) if is_definitive_refresh_rejection(&error) => {
+                self.clear_session_for_stamp(captured.epoch, captured.revision)
+                    .await?;
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.install_session(&session, captured, false).await
     }
 
     /// 发送邮箱验证码。`scene` 是邮件模板业务标识（见 [`MAIL_SCENE_CHANGE_PW`]），
@@ -832,7 +1713,574 @@ impl AstralClient {
 
     /// 更新个人资料（昵称 / 头像等字段由后端约定，这里原样透传）
     pub async fn update_profile(&self, patch: Value) -> Result<Value, String> {
-        self.post_json("app/user/update", patch, &[], true).await
+        self.update_profile_for_epoch(self.session_epoch(), patch)
+            .await
+    }
+
+    pub async fn update_profile_for_epoch(
+        &self,
+        epoch: u64,
+        patch: Value,
+    ) -> Result<Value, String> {
+        self.request_for_epoch(
+            epoch,
+            AstralCall {
+                method: reqwest::Method::POST,
+                path: "app/user/update",
+                query: &[],
+                json_body: Some(patch),
+                extra_headers: &[],
+                auth: true,
+            },
+        )
+        .await
+    }
+
+    pub async fn update_user_for_epoch(&self, epoch: u64, patch: Value) -> Result<Value, String> {
+        self.update_profile_for_epoch(epoch, patch).await
+    }
+
+    // Explicit epoch methods pass their captured session to the actual HTTP
+    // adapter; they never check a wrapper and then call an unbound delegate.
+    pub async fn like_playlist_for_epoch(
+        &self,
+        epoch: u64,
+        action: &str,
+        pid: &str,
+        platform: &str,
+        name: &str,
+        pic: Option<&str>,
+    ) -> Result<i64, String> {
+        let mut body = json!({ "action": action, "pid": pid, "platform": platform, "name": name });
+        if let Some(pic) = pic.filter(|pic| !pic.is_empty()) {
+            body["picUrl"] = json!(pic);
+        }
+        let data = self
+            .request_for_epoch(
+                epoch,
+                AstralCall {
+                    method: reqwest::Method::POST,
+                    path: "app/user/like/playlist",
+                    query: &[],
+                    json_body: Some(body),
+                    extra_headers: &[],
+                    auth: true,
+                },
+            )
+            .await?;
+        Ok(seq_of(&data))
+    }
+
+    pub async fn like_changes_for_epoch(
+        &self,
+        epoch: u64,
+        since: i64,
+    ) -> Result<(Vec<Value>, i64), String> {
+        let since_text = since.to_string();
+        let query = [("since", since_text.as_str())];
+        let data = self
+            .request_for_epoch(
+                epoch,
+                AstralCall {
+                    method: reqwest::Method::GET,
+                    path: "app/user/like/changes",
+                    query: &query,
+                    json_body: None,
+                    extra_headers: &[],
+                    auth: true,
+                },
+            )
+            .await?;
+        let changes = data
+            .get("changes")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let max_seq = data.get("maxSeq").and_then(Value::as_i64).unwrap_or(since);
+        Ok((changes, max_seq))
+    }
+
+    pub async fn like_list_for_epoch(
+        &self,
+        epoch: u64,
+        page: i64,
+        size: i64,
+    ) -> Result<Value, String> {
+        let page_text = page.to_string();
+        let size_text = size.to_string();
+        let query = [("page", page_text.as_str()), ("size", size_text.as_str())];
+        self.request_for_epoch(
+            epoch,
+            AstralCall {
+                method: reqwest::Method::GET,
+                path: "app/user/like/list",
+                query: &query,
+                json_body: None,
+                extra_headers: &[],
+                auth: true,
+            },
+        )
+        .await
+    }
+
+    pub async fn like_song_for_epoch(
+        &self,
+        epoch: u64,
+        payload: LikeSongPayload<'_>,
+    ) -> Result<i64, String> {
+        let data = self
+            .request_for_epoch(
+                epoch,
+                AstralCall {
+                    method: reqwest::Method::POST,
+                    path: "app/user/like/song",
+                    query: &[],
+                    json_body: Some(like_song_body(&payload)),
+                    extra_headers: &[],
+                    auth: true,
+                },
+            )
+            .await?;
+        Ok(seq_of(&data))
+    }
+
+    pub async fn like_batch_for_epoch(&self, epoch: u64, ops: Vec<Value>) -> Result<i64, String> {
+        let data = self
+            .request_for_epoch(
+                epoch,
+                AstralCall {
+                    method: reqwest::Method::POST,
+                    path: "app/user/like/batch",
+                    query: &[],
+                    json_body: Some(json!({ "ops": ops })),
+                    extra_headers: &[],
+                    auth: true,
+                },
+            )
+            .await?;
+        Ok(seq_of(&data))
+    }
+
+    // Caller identity is carried into the actual transport and every file stage.
+    // File preflight remains native; the central command must not duplicate it.
+    pub async fn avatar_ticket_for_epoch(
+        &self,
+        epoch: u64,
+        file_name: &str,
+        content_type: &str,
+        size_bytes: i64,
+    ) -> Result<UploadTicket, String> {
+        let data = self.request_for_epoch(epoch, AstralCall {
+            method: reqwest::Method::POST, path: "app/user/avatar/ticket", query: &[],
+            json_body: Some(json!({ "fileName": file_name, "contentType": content_type, "sizeBytes": size_bytes })), extra_headers: &[], auth: true,
+        }).await?;
+        Self::parse_upload_ticket(&data, epoch, false)
+    }
+
+    pub async fn avatar_complete_for_epoch(
+        &self,
+        epoch: u64,
+        upload_id: &str,
+    ) -> Result<String, String> {
+        let data = self
+            .request_for_epoch(
+                epoch,
+                AstralCall {
+                    method: reqwest::Method::POST,
+                    path: "app/user/avatar/complete",
+                    query: &[],
+                    json_body: Some(json!({ "uploadId": upload_id })),
+                    extra_headers: &[],
+                    auth: true,
+                },
+            )
+            .await?;
+        Self::url_of(&data)
+    }
+
+    pub async fn cover_ticket_for_epoch(
+        &self,
+        epoch: u64,
+        pid: &str,
+        platform: &str,
+        file_name: &str,
+        content_type: &str,
+        size_bytes: i64,
+    ) -> Result<UploadTicket, String> {
+        let path = format!("app/user/like/playlist/{pid}/cover/ticket");
+        let data = self.request_for_epoch(epoch, AstralCall {
+            method: reqwest::Method::POST, path: &path, query: &[],
+            json_body: Some(json!({ "platform": platform, "fileName": file_name, "contentType": content_type, "sizeBytes": size_bytes })), extra_headers: &[], auth: true,
+        }).await?;
+        Self::parse_upload_ticket(&data, epoch, true)
+    }
+
+    pub async fn cover_complete_for_epoch(
+        &self,
+        epoch: u64,
+        pid: &str,
+        platform: &str,
+        upload_id: &str,
+    ) -> Result<String, String> {
+        let path = format!("app/user/like/playlist/{pid}/cover/complete");
+        let query = [("platform", platform)];
+        let data = self
+            .request_for_epoch(
+                epoch,
+                AstralCall {
+                    method: reqwest::Method::POST,
+                    path: &path,
+                    query: &query,
+                    json_body: Some(json!({ "uploadId": upload_id })),
+                    extra_headers: &[],
+                    auth: true,
+                },
+            )
+            .await?;
+        Self::url_of(&data)
+    }
+
+    pub async fn cover_clear_for_epoch(
+        &self,
+        epoch: u64,
+        pid: &str,
+        platform: &str,
+    ) -> Result<(), String> {
+        let path = format!("app/user/like/playlist/{pid}/cover");
+        let query = [("platform", platform)];
+        self.request_for_epoch(
+            epoch,
+            AstralCall {
+                method: reqwest::Method::DELETE,
+                path: &path,
+                query: &query,
+                json_body: None,
+                extra_headers: &[],
+                auth: true,
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn direct_upload_for_epoch(
+        &self,
+        epoch: u64,
+        ticket: &UploadTicket,
+        file_name: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), String> {
+        let pending = {
+            let state = self.session.read().map_err(|_| "会话锁失败".to_owned())?;
+            if state.epoch != epoch || ticket.epoch != epoch {
+                return Err(ERR_SESSION_CHANGED.to_owned());
+            }
+            if state.token.is_none() {
+                return Err("尚未登录，请先登录后再上传".to_owned());
+            }
+            if ticket.requires_like_owner {
+                Self::require_like_owner(&state)?;
+            }
+            self.transport.upload(AstralUploadRequest {
+                ticket: ticket.clone(),
+                file_name: file_name.to_owned(),
+                content_type: content_type.to_owned(),
+                bytes,
+            })
+        };
+        let result = pending.await;
+        let state = self
+            .session
+            .read()
+            .map_err(|_| ERR_SESSION_CHANGED.to_owned())?;
+        if state.epoch != epoch || state.token.is_none() {
+            return Err(ERR_SESSION_CHANGED.to_owned());
+        }
+        if ticket.requires_like_owner {
+            Self::require_like_owner(&state)?;
+        }
+        result
+    }
+
+    // ---------- 上传计划（2026-11 代传支持） ----------
+    //
+    // 目录首选渠道是 CUSTOM_HTTP（如 ImgBB）时，直传凭证会把上游凭据泄露给
+    // 客户端，后端只发两段式代传计划；DIRECT 分支保持三段式直传不变。
+
+    fn new_upload_idempotency_key() -> String {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("qt-pc-upload-{}-{}", now_ms(), seq)
+    }
+
+    fn parse_upload_plan(
+        data: &Value,
+        epoch: u64,
+        requires_like_owner: bool,
+    ) -> Result<UploadPlan, String> {
+        let get_str = |k: &str| {
+            data.get(k)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let mode = get_str("mode").ok_or("计划缺少 mode")?;
+        if mode == "PROXY" {
+            let upload_id = get_str("uploadId").ok_or("计划缺少 uploadId")?;
+            let content_path = get_str("contentPath").ok_or("计划缺少 contentPath")?;
+            return Ok(UploadPlan {
+                mode,
+                ticket: None,
+                proxy_upload_id: upload_id,
+                proxy_content_path: content_path,
+            });
+        }
+        if mode != "DIRECT" {
+            return Err(format!("不支持的上传模式 {mode}"));
+        }
+        let ticket = data.get("ticket").ok_or("计划缺少直传凭证")?;
+        let ticket = Self::parse_upload_ticket(ticket, epoch, requires_like_owner)?;
+        Ok(UploadPlan {
+            mode,
+            ticket: Some(ticket),
+            proxy_upload_id: String::new(),
+            proxy_content_path: String::new(),
+        })
+    }
+
+    pub async fn avatar_upload_plan_for_epoch(
+        &self,
+        epoch: u64,
+        file_name: &str,
+        content_type: &str,
+        size_bytes: i64,
+        idempotency_key: &str,
+    ) -> Result<UploadPlan, String> {
+        let data = self.request_for_epoch(epoch, AstralCall {
+            method: reqwest::Method::POST, path: "app/user/avatar/upload-plan", query: &[],
+            json_body: Some(json!({ "fileName": file_name, "contentType": content_type, "sizeBytes": size_bytes, "idempotencyKey": idempotency_key })), extra_headers: &[], auth: true,
+        }).await?;
+        Self::parse_upload_plan(&data, epoch, false)
+    }
+
+    // 8 个参数与同区域 cover_ticket_for_epoch 对称（pid/platform 挂路径，其余为计划要素），
+    // 收拢成 struct 会破坏本文件既有调用风格。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn cover_upload_plan_for_epoch(
+        &self,
+        epoch: u64,
+        pid: &str,
+        platform: &str,
+        file_name: &str,
+        content_type: &str,
+        size_bytes: i64,
+        idempotency_key: &str,
+    ) -> Result<UploadPlan, String> {
+        let path = format!("app/user/like/playlist/{pid}/cover/upload-plan");
+        let data = self.request_for_epoch(epoch, AstralCall {
+            method: reqwest::Method::POST, path: &path, query: &[],
+            json_body: Some(json!({ "platform": platform, "fileName": file_name, "contentType": content_type, "sizeBytes": size_bytes, "idempotencyKey": idempotency_key })), extra_headers: &[], auth: true,
+        }).await?;
+        Self::parse_upload_plan(&data, epoch, true)
+    }
+
+    /// contentPath 以 / 开头时相对站点根解析，否则相对 API 目录解析。
+    /// base_url 已含 /api/v1，不能再把 /api/v1/... 直接拼到它后面。
+    /// 代传会携带登录凭据，只允许同源 HTTP(S) 路径。
+    fn proxy_upload_url(&self, content_path: &str) -> Result<String, String> {
+        let invalid = || "上传计划中的正文地址无效".to_owned();
+        let base = reqwest::Url::parse(&format!("{}/", self.base_url.trim_end_matches('/')))
+            .map_err(|_| invalid())?;
+        if content_path.is_empty()
+            || content_path.starts_with("//")
+            || content_path.contains('\\')
+            || content_path.contains("://")
+        {
+            return Err(invalid());
+        }
+        let url = base.join(content_path).map_err(|_| invalid())?;
+        if !matches!(url.scheme(), "http" | "https")
+            || url.origin() != base.origin()
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(invalid());
+        }
+        Ok(url.into())
+    }
+
+    /// 两段式代传正文：原始字节 POST astral 网关，复用插件两段式状态机；
+    /// state=CREATED 表示本次渠道失败已切换备用渠道，重发同一正文（上限 3 次与服务端 MAX_ATTEMPTS 对齐）。
+    pub async fn proxy_upload_content_for_epoch(
+        &self,
+        epoch: u64,
+        content_path: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<(), String> {
+        let url = self.proxy_upload_url(content_path)?;
+        for _ in 0..3 {
+            let satoken = {
+                let state = self
+                    .session
+                    .read()
+                    .map_err(|_| ERR_SESSION_CHANGED.to_owned())?;
+                if state.epoch != epoch {
+                    return Err(ERR_SESSION_CHANGED.to_owned());
+                }
+                state
+                    .token
+                    .clone()
+                    .ok_or("尚未登录，请先登录后再上传".to_owned())?
+            };
+            let mut headers: Vec<(String, String)> = self.basic_headers();
+            headers.push(("Content-Type".to_owned(), content_type.to_owned()));
+            let response = self
+                .transport
+                .proxy_put(AstralProxyPutRequest {
+                    url: url.clone(),
+                    satoken: Some(satoken),
+                    headers,
+                    bytes: bytes.clone(),
+                })
+                .await?;
+            if response.status < 200 || response.status >= 300 {
+                return Err(format!("代传失败（HTTP {}）", response.status));
+            }
+            let value: Value =
+                serde_json::from_str(&response.body).map_err(|_| "代传回执格式异常".to_owned())?;
+            if value.get("code").and_then(Value::as_i64) != Some(200) {
+                let msg = value
+                    .get("msg")
+                    .and_then(Value::as_str)
+                    .unwrap_or("代传失败");
+                return Err(msg.to_owned());
+            }
+            let state = value
+                .get("data")
+                .and_then(|data| data.get("state"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            match state {
+                "COMMITTED" => return Ok(()),
+                "CREATED" => continue,
+                other => {
+                    let label = if other.is_empty() {
+                        "状态未知"
+                    } else {
+                        other
+                    };
+                    return Err(format!("文件发送失败（{label}）"));
+                }
+            }
+        }
+        Err("上传渠道暂不可用，请稍后重试".to_owned())
+    }
+
+    pub async fn avatar_apply_for_epoch(
+        &self,
+        epoch: u64,
+        upload_id: &str,
+    ) -> Result<String, String> {
+        let data = self
+            .request_for_epoch(
+                epoch,
+                AstralCall {
+                    method: reqwest::Method::POST,
+                    path: "app/user/avatar/apply",
+                    query: &[],
+                    json_body: Some(json!({ "uploadId": upload_id })),
+                    extra_headers: &[],
+                    auth: true,
+                },
+            )
+            .await?;
+        Self::url_of(&data)
+    }
+
+    pub async fn cover_apply_for_epoch(
+        &self,
+        epoch: u64,
+        pid: &str,
+        platform: &str,
+        upload_id: &str,
+    ) -> Result<String, String> {
+        let path = format!("app/user/like/playlist/{pid}/cover/apply");
+        let query = [("platform", platform)];
+        let data = self
+            .request_for_epoch(
+                epoch,
+                AstralCall {
+                    method: reqwest::Method::POST,
+                    path: &path,
+                    query: &query,
+                    json_body: Some(json!({ "uploadId": upload_id })),
+                    extra_headers: &[],
+                    auth: true,
+                },
+            )
+            .await?;
+        Self::url_of(&data)
+    }
+
+    pub async fn upload_avatar_file_for_epoch(
+        &self,
+        epoch: u64,
+        path: &str,
+    ) -> Result<String, String> {
+        self.current_snapshot_for_epoch(epoch)?;
+        let (name, mime, _) = Self::image_meta(path, "avatar")?;
+        // 先确认图片可读再创建上传任务，避免本地读盘失败也占用服务端意图名额。
+        let bytes = Self::read_image_bytes(path).await?;
+        let size = bytes.len() as i64;
+        let idempotency_key = Self::new_upload_idempotency_key();
+        let plan = self
+            .avatar_upload_plan_for_epoch(epoch, &name, mime, size, &idempotency_key)
+            .await?;
+        if plan.mode == "PROXY" {
+            let upload_id = plan.proxy_upload_id;
+            self.proxy_upload_content_for_epoch(epoch, &plan.proxy_content_path, mime, bytes)
+                .await?;
+            return self.avatar_apply_for_epoch(epoch, &upload_id).await;
+        }
+        let ticket = plan.ticket.ok_or("计划缺少直传凭证")?;
+        self.direct_upload_for_epoch(epoch, &ticket, &name, mime, bytes)
+            .await?;
+        self.avatar_complete_for_epoch(epoch, &ticket.upload_id)
+            .await
+    }
+
+    pub async fn upload_cover_file_for_epoch(
+        &self,
+        epoch: u64,
+        pid: &str,
+        platform: &str,
+        path: &str,
+    ) -> Result<String, String> {
+        self.with_like_session_epoch(epoch, || Ok(()))?;
+        let (name, mime, _) = Self::image_meta(path, "cover")?;
+        let bytes = Self::read_image_bytes(path).await?;
+        let size = bytes.len() as i64;
+        let idempotency_key = Self::new_upload_idempotency_key();
+        let plan = self
+            .cover_upload_plan_for_epoch(epoch, pid, platform, &name, mime, size, &idempotency_key)
+            .await?;
+        if plan.mode == "PROXY" {
+            let upload_id = plan.proxy_upload_id;
+            self.proxy_upload_content_for_epoch(epoch, &plan.proxy_content_path, mime, bytes)
+                .await?;
+            return self
+                .cover_apply_for_epoch(epoch, pid, platform, &upload_id)
+                .await;
+        }
+        let ticket = plan.ticket.ok_or("计划缺少直传凭证")?;
+        self.direct_upload_for_epoch(epoch, &ticket, &name, mime, bytes)
+            .await?;
+        self.cover_complete_for_epoch(epoch, pid, platform, &ticket.upload_id)
+            .await
     }
 
     // ---------- 媒体直传（UPDATE_DESIGN.md §5.2/§5.3） ----------
@@ -841,7 +2289,11 @@ impl AstralClient {
     // 凭证里带存储端的直传地址与表单字段，传完再拿 uploadId 回执登记。
     // 直传必须走 Rust：CSP 不放开外部域名，WebView 发不了这个请求。
 
-    fn parse_upload_ticket(data: &Value) -> Result<UploadTicket, String> {
+    fn parse_upload_ticket(
+        data: &Value,
+        epoch: u64,
+        requires_like_owner: bool,
+    ) -> Result<UploadTicket, String> {
         let get_str = |k: &str| {
             data.get(k)
                 .and_then(Value::as_str)
@@ -855,6 +2307,8 @@ impl AstralClient {
             upload_id: get_str("uploadId").ok_or("凭证缺少 uploadId")?,
             form_policy: get_str("formPolicy"),
             form_authorization: get_str("formAuthorization"),
+            epoch,
+            requires_like_owner,
         })
     }
 
@@ -874,15 +2328,8 @@ impl AstralClient {
         content_type: &str,
         size_bytes: i64,
     ) -> Result<UploadTicket, String> {
-        let data = self
-            .post_json(
-                "app/user/avatar/ticket",
-                json!({ "fileName": file_name, "contentType": content_type, "sizeBytes": size_bytes }),
-                &[],
-                true,
-            )
-            .await?;
-        Self::parse_upload_ticket(&data)
+        self.avatar_ticket_for_epoch(self.session_epoch(), file_name, content_type, size_bytes)
+            .await
     }
 
     /// 头像回执登记（app/user/avatar/complete），返回头像 URL（即版本）。
@@ -907,20 +2354,15 @@ impl AstralClient {
         content_type: &str,
         size_bytes: i64,
     ) -> Result<UploadTicket, String> {
-        let data = self
-            .post_json(
-                &format!("app/user/like/playlist/{}/cover/ticket", pid),
-                json!({
-                    "platform": platform,
-                    "fileName": file_name,
-                    "contentType": content_type,
-                    "sizeBytes": size_bytes,
-                }),
-                &[],
-                true,
-            )
-            .await?;
-        Self::parse_upload_ticket(&data)
+        self.cover_ticket_for_epoch(
+            self.session_epoch(),
+            pid,
+            platform,
+            file_name,
+            content_type,
+            size_bytes,
+        )
+        .await
     }
 
     /// 歌单封面回执登记，返回封面 URL。
@@ -963,51 +2405,13 @@ impl AstralClient {
     /// 用独立长超时客户端：目标在公网对象存储，和 Astral 接口的 15s 不共用。
     pub async fn direct_upload(
         &self,
-        t: &UploadTicket,
+        ticket: &UploadTicket,
         file_name: &str,
         content_type: &str,
         bytes: Vec<u8>,
     ) -> Result<(), String> {
-        let client = crate::net_config::configure(reqwest::Client::builder())
-            .timeout(std::time::Duration::from_secs(60))
-            .pool_max_idle_per_host(0)
-            .build()
-            .map_err(|e| format!("上传客户端构建失败: {e}"))?;
-        let resp = if t.method.eq_ignore_ascii_case("PUT") {
-            client
-                .put(&t.upload_url)
-                .body(bytes)
-                .send()
-                .await
-                .map_err(|e| format!("直传失败: {}", sanitize_err(e)))?
-        } else {
-            let field = t.form_field.clone().unwrap_or_else(|| "file".into());
-            let mut form = reqwest::multipart::Form::new();
-            if let Some(p) = &t.form_policy {
-                form = form.text("policy", p.clone());
-            }
-            if let Some(a) = &t.form_authorization {
-                form = form.text("authorization", a.clone());
-            }
-            let part = reqwest::multipart::Part::bytes(bytes)
-                .file_name(file_name.to_string())
-                .mime_str(content_type)
-                .map_err(|e| format!("MIME 非法: {e}"))?;
-            form = form.part(field, part);
-            client
-                .post(&t.upload_url)
-                .multipart(form)
-                .send()
-                .await
-                .map_err(|e| format!("直传失败: {}", sanitize_err(e)))?
-        };
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            let brief: String = body.chars().take(200).collect();
-            return Err(format!("直传被存储端拒绝({status}): {brief}"));
-        }
-        Ok(())
+        self.direct_upload_for_epoch(self.session_epoch(), ticket, file_name, content_type, bytes)
+            .await
     }
 
     /// 头像 / 封面上传的图片大小上限（8 MiB）。
@@ -1079,11 +2483,8 @@ impl AstralClient {
 
     /// 头像上传一条龙：预检 → 取凭证 → 直传 → 回执登记，返回头像 URL。
     pub async fn upload_avatar_file(&self, path: &str) -> Result<String, String> {
-        let (name, mime, size) = Self::image_meta(path, "avatar")?;
-        let t = self.avatar_ticket(&name, mime, size).await?;
-        let bytes = Self::read_image_bytes(path).await?;
-        self.direct_upload(&t, &name, mime, bytes).await?;
-        self.avatar_complete(&t.upload_id).await
+        self.upload_avatar_file_for_epoch(self.session_epoch(), path)
+            .await
     }
 
     /// 歌单封面上传一条龙，返回封面 URL。
@@ -1093,11 +2494,8 @@ impl AstralClient {
         platform: &str,
         path: &str,
     ) -> Result<String, String> {
-        let (name, mime, size) = Self::image_meta(path, "cover")?;
-        let t = self.cover_ticket(pid, platform, &name, mime, size).await?;
-        let bytes = Self::read_image_bytes(path).await?;
-        self.direct_upload(&t, &name, mime, bytes).await?;
-        self.cover_complete(pid, platform, &t.upload_id).await
+        self.upload_cover_file_for_epoch(self.session_epoch(), pid, platform, path)
+            .await
     }
 
     // ---------- 收藏同步（接口契约同 qt-uniappx services/like.ts） ----------
@@ -1617,12 +3015,8 @@ impl AstralClient {
     // 是 QT_UNIAPPX，不传就会被当成手机端，智能体按客户端过滤后可能压根不返回。
 
     pub async fn ai_agents(&self) -> Result<Value, String> {
-        self.get(
-            "app/ai/agents",
-            &[("clientType", AI_CLIENT_TYPE)],
-            true,
-        )
-        .await
+        self.get("app/ai/agents", &[("clientType", AI_CLIENT_TYPE)], true)
+            .await
     }
 
     pub async fn ai_capabilities(&self, agent_code: &str) -> Result<Value, String> {
@@ -1972,27 +3366,185 @@ fn os_description_raw() -> String {
     }
 }
 
+/// Final system metadata values. Supplying an instance performs no OS/environment
+/// query; the normal client still acquires its actual metadata lazily once.
+#[derive(Clone)]
+pub struct ClientMetadata {
+    pub device: String,
+    pub os: String,
+}
+
+/// Shared basic-header contract: actual platform/version constants, column-width
+/// clipping and empty-value omission. No HTTP, host query or global override.
+pub fn client_headers_with_metadata(metadata: &ClientMetadata) -> Vec<(&'static str, String)> {
+    let candidates = [
+        (HDR_CLIENT_UT, CLIENT_UT.to_string()),
+        (HDR_CLIENT_VERSION, version_name().to_string()),
+        (HDR_CLIENT_DEVICE, clip(&metadata.device, MAX_DEVICE_LEN)),
+        (HDR_CLIENT_OS, clip(&metadata.os, MAX_OS_LEN)),
+    ];
+    candidates
+        .into_iter()
+        .filter(|(_, value)| !value.is_empty())
+        .collect()
+}
+
 /// 统一客户端系统头，进程内只算一次（设备名与系统版本在运行期不变）。
 /// 空值不入列——「不存在这个头」比「头是空串」更干净，服务端也按同一语义归一。
 fn client_headers() -> &'static [(&'static str, String)] {
     static HEADERS: std::sync::OnceLock<Vec<(&'static str, String)>> = std::sync::OnceLock::new();
     HEADERS.get_or_init(|| {
-        let candidates = [
-            (HDR_CLIENT_UT, CLIENT_UT.to_string()),
-            (HDR_CLIENT_VERSION, version_name().to_string()),
-            (HDR_CLIENT_DEVICE, device_name()),
-            (HDR_CLIENT_OS, os_description()),
-        ];
-        candidates
-            .into_iter()
-            .filter(|(_, value)| !value.is_empty())
-            .collect()
+        client_headers_with_metadata(&ClientMetadata {
+            device: device_name(),
+            os: os_description(),
+        })
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_metadata() -> ClientMetadata {
+        ClientMetadata {
+            device: "synthetic-owned-device".into(),
+            os: "Synthetic Test OS 1.0".into(),
+        }
+    }
+
+    /// One finite owned HTTP reply. Nonblocking accept, bounded socket operations
+    /// and RAII stop/join cover request failures and assertion unwinding too.
+    pub(super) struct OwnedHttp {
+        pub(super) addr: std::net::SocketAddr,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        pub(super) requests: Arc<std::sync::Mutex<Vec<String>>>,
+        worker: Option<std::thread::JoinHandle<()>>,
+        joined: Arc<std::sync::atomic::AtomicBool>,
+        _fixture: crate::lyric_access::native_fixture::NativeFixture,
+    }
+
+    impl OwnedHttp {
+        pub(super) fn new(status: u16, headers: &str, body: &[u8]) -> Self {
+            use std::io::{Read as _, Write as _};
+            use std::sync::atomic::{AtomicBool, Ordering};
+            let fixture = crate::lyric_access::native_fixture::NativeFixture::new("astral-http");
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking owned listener");
+            let addr = listener.local_addr().expect("addr");
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopped = Arc::clone(&stop);
+            let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&requests);
+            let joined = Arc::new(AtomicBool::new(false));
+            let mut reply = format!(
+                "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n{headers}\r\n", body.len()
+            ).into_bytes();
+            reply.extend_from_slice(body);
+            let worker = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut socket = loop {
+                    if stopped.load(Ordering::SeqCst) || std::time::Instant::now() >= deadline {
+                        return;
+                    }
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(2))
+                        }
+                        Err(_) => return,
+                    }
+                };
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                loop {
+                    if stopped.load(Ordering::SeqCst) || std::time::Instant::now() >= deadline {
+                        return;
+                    }
+                    match socket.read(&mut byte) {
+                        Ok(0) => return,
+                        Ok(_) => {
+                            request.push(byte[0]);
+                            if request.ends_with(b"\r\n\r\n") {
+                                break;
+                            }
+                            if request.len() > 16 * 1024 {
+                                return;
+                            }
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) => {}
+                        Err(_) => return,
+                    }
+                }
+                let header = String::from_utf8(request.clone()).unwrap();
+                let body_len = header
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                    .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+                    .unwrap_or(0);
+                if body_len > 16 * 1024 {
+                    return;
+                }
+                let total = request.len() + body_len;
+                while request.len() < total {
+                    if stopped.load(Ordering::SeqCst) || std::time::Instant::now() >= deadline {
+                        return;
+                    }
+                    match socket.read(&mut byte) {
+                        Ok(0) => return,
+                        Ok(_) => request.push(byte[0]),
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                            ) => {}
+                        Err(_) => return,
+                    }
+                }
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8(request).unwrap());
+                if socket.write_all(&reply).is_ok() {
+                    let _ = socket.flush();
+                }
+            });
+            Self {
+                addr,
+                stop,
+                requests,
+                worker: Some(worker),
+                joined,
+                _fixture: fixture,
+            }
+        }
+    }
+
+    impl Drop for OwnedHttp {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering;
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(worker) = self.worker.take() {
+                let joined = worker.join();
+                self.joined.store(true, Ordering::SeqCst);
+                if !std::thread::panicking() {
+                    joined.expect("owned Astral HTTP worker panicked");
+                }
+            }
+        }
+    }
 
     #[test]
     fn version_code_is_sourced_from_app_config() {
@@ -2059,7 +3611,7 @@ mod tests {
         assert_eq!(c.album, "");
         assert_eq!(c.hash, "");
         assert_eq!(c.pid, "");
-        assert_eq!(c.pic_url, "");
+        assert_eq!(c.pic_url, None);
         assert!(!c.deleted);
         assert_eq!(c.updated_seq, 0);
     }
@@ -2086,8 +3638,27 @@ mod tests {
         assert_eq!(c2.name, "晴天");
         assert_eq!(c2.singer, "周杰伦");
         assert_eq!(c2.hash, "abc");
-        assert_eq!(c2.pic_url, "http://x/y.jpg");
+        assert_eq!(c2.pic_url.as_deref(), Some("http://x/y.jpg"));
         assert_eq!(c2.updated_seq, 42);
+    }
+
+    #[test]
+    fn like_change_preserves_absent_null_and_explicit_empty_pic_url() {
+        for raw in [serde_json::json!({}), serde_json::json!({ "picUrl": null })] {
+            let change: LikeChange = serde_json::from_value(raw).unwrap();
+            assert_eq!(change.pic_url, None);
+        }
+        for (raw, expected) in [
+            (serde_json::json!({ "picUrl": "" }), ""),
+            (
+                serde_json::json!({ "picUrl": "https://example.invalid/cover" }),
+                "https://example.invalid/cover",
+            ),
+            (serde_json::json!({ "picUrl": 42 }), "42"),
+        ] {
+            let change: LikeChange = serde_json::from_value(raw).unwrap();
+            assert_eq!(change.pic_url.as_deref(), Some(expected));
+        }
     }
 
     #[test]
@@ -2123,7 +3694,7 @@ mod tests {
     fn client_headers_follow_the_unified_contract() {
         // 头名与取值必须与后端 astral-common 的 ClientHeaders / stat_platform 字典一致，
         // 否则接口统计与反馈两侧会各记一套维度。
-        let headers = client_headers();
+        let headers = client_headers_with_metadata(&synthetic_metadata());
         let get = |name: &str| {
             headers
                 .iter()
@@ -2133,7 +3704,7 @@ mod tests {
         // 常量与编译目标绑定，断言与定义同源（cfg 一致就不会错）
         assert_eq!(get(HDR_CLIENT_UT), Some(CLIENT_UT));
         assert_eq!(get(HDR_CLIENT_VERSION), Some(version_name()));
-        // 主机名按机器而异：只要求在能取到时非空且不超列宽
+        // 合成最终主机名仍遵循原合同：能取到时非空且不超列宽
         if let Some(device) = get(HDR_CLIENT_DEVICE) {
             assert!(!device.is_empty());
             assert!(device.chars().count() <= MAX_DEVICE_LEN);
@@ -2143,6 +3714,132 @@ mod tests {
         let os = get(HDR_CLIENT_OS).expect("X-OS 不应缺失");
         assert!(!os.is_empty());
         assert!(os.chars().count() <= MAX_OS_LEN, "X-OS 超长: {os}");
+    }
+
+    #[test]
+    fn final_metadata_clips_utf8_and_omits_empty_values() {
+        let headers = client_headers_with_metadata(&ClientMetadata {
+            device: "设备".repeat(100),
+            os: "系统".repeat(70),
+        });
+        let get = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.as_str())
+        };
+        // The public wire contract is 128 device characters and 64 OS characters.
+        assert_eq!(get(HDR_CLIENT_DEVICE), Some("设备".repeat(64)).as_deref());
+        assert_eq!(get(HDR_CLIENT_OS), Some("系统".repeat(32)).as_deref());
+        let empty = client_headers_with_metadata(&ClientMetadata {
+            device: String::new(),
+            os: String::new(),
+        });
+        assert_eq!(empty.len(), 2);
+        assert!(!empty
+            .iter()
+            .any(|(name, _)| *name == HDR_CLIENT_DEVICE || *name == HDR_CLIENT_OS));
+    }
+
+    #[test]
+    fn synthetic_metadata_reaches_the_shared_http_requester() {
+        let server = OwnedHttp::new(200, "", br#"{"code":200,"data":{"ok":true}}"#);
+        let requester =
+            Arc::new(AstralRequester::owned_loopback(server.addr).expect("owned client"));
+        let client = AstralClient::new_with_transport_and_metadata(
+            &format!("http://{}/api/v1", server.addr),
+            requester,
+            synthetic_metadata(),
+        );
+        let value = tauri::async_runtime::block_on(client.get(
+            "app/test",
+            &[("key", "fixture value")],
+            false,
+        ))
+        .unwrap();
+        assert_eq!(value, json!({ "ok": true }));
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let wire = requests[0].to_ascii_lowercase();
+        assert!(wire.starts_with("get /api/v1/app/test?key=fixture+value http/1.1\r\n"));
+        assert!(wire.contains("x-device: synthetic-owned-device\r\n"));
+        assert!(wire.contains("x-os: synthetic test os 1.0\r\n"));
+        assert!(wire.contains(&format!("x-app-ut: {CLIENT_UT}\r\n")));
+        assert!(wire.contains(&format!("x-app-version: {}\r\n", version_name())));
+        assert!(!wire.contains("satoken:"));
+    }
+
+    #[test]
+    fn shared_requester_sends_synthetic_auth_query_headers_and_json() {
+        let server = OwnedHttp::new(200, "", b"owned-response");
+        let requester = AstralRequester::owned_loopback(server.addr).expect("owned client");
+        let mut headers: Vec<_> = client_headers_with_metadata(&synthetic_metadata())
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect();
+        headers.push(("X-Final-Adapter".to_owned(), "owned".to_owned()));
+        let response = tauri::async_runtime::block_on(requester.send(AstralHttpRequest {
+            method: reqwest::Method::POST,
+            url: format!("http://{}/submit", server.addr),
+            query: vec![("key".into(), "fixture value".into())],
+            json_body: Some(json!({ "value": "fixture" })),
+            headers,
+            satoken: Some("synthetic-transport-token".into()),
+        }))
+        .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, "owned-response");
+        let requests = server.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let wire = requests[0].to_ascii_lowercase();
+        assert!(wire.starts_with("post /submit?key=fixture+value http/1.1\r\n"));
+        assert!(wire.contains("satoken: synthetic-transport-token\r\n"));
+        assert!(wire.contains("x-final-adapter: owned\r\n"));
+        assert!(wire.contains("content-type: application/json\r\n"));
+        assert!(wire.ends_with(r#"{"value":"fixture"}"#));
+    }
+
+    #[test]
+    fn owned_requester_does_not_follow_redirects_or_send_to_another_origin() {
+        // Even a regression's redirect destination remains another owned listener.
+        let other = OwnedHttp::new(200, "", b"unexpected-redirect");
+        let server = OwnedHttp::new(
+            302,
+            &format!("Location: http://{}/escape\r\n", other.addr),
+            b"",
+        );
+        let requester = AstralRequester::owned_loopback(server.addr).expect("owned client");
+        let request = |url| AstralHttpRequest {
+            method: reqwest::Method::GET,
+            url,
+            query: Vec::new(),
+            json_body: None,
+            headers: Vec::new(),
+            satoken: None,
+        };
+        let response = tauri::async_runtime::block_on(
+            requester.send(request(format!("http://{}/redirect", server.addr))),
+        )
+        .unwrap();
+        assert_eq!(response.status, 302);
+        let rejected = tauri::async_runtime::block_on(
+            requester.send(request(format!("http://{}/escape", other.addr))),
+        );
+        assert!(rejected.is_err());
+        assert!(other.requests.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn owned_http_server_stops_and_joins_on_assertion_unwind() {
+        use std::sync::atomic::Ordering;
+        let server = OwnedHttp::new(200, "", b"unused");
+        let joined = Arc::clone(&server.joined);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _owned = server;
+            panic!("synthetic owned HTTP assertion unwind");
+        }));
+        assert!(result.is_err());
+        assert!(joined.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -2261,17 +3958,15 @@ mod tests {
         let content = base64::engine::general_purpose::STANDARD
             .decode("cXQtcGMgdXBkYXRlIHNpZ25hdHVyZSB0ZXN0IHZlY3Rvcgo=")
             .expect("测试内容");
-        let dir = std::env::temp_dir().join(format!("qt-sig-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("建临时目录");
-        let file = dir.join("payload.bin");
-        std::fs::write(&file, &content).expect("写测试文件");
+        let dir = crate::lyric_access::native_fixture::NativeFixture::new("astral-sig");
+        let file = dir.file("payload.bin", &content);
         // 正确签名通过
         assert!(AstralClient::verify_installer_signature_with(&file, sig, pk).is_ok());
         // 内容被篡改 → 拒绝
-        std::fs::write(&file, b"tampered").expect("改写测试文件");
+        crate::lyric_access::native_fixture::write_owned(&file, b"tampered").expect("改写测试文件");
         assert!(AstralClient::verify_installer_signature_with(&file, sig, pk).is_err());
         // 签名被篡改 → 拒绝
-        std::fs::write(&file, &content).expect("还原测试文件");
+        crate::lyric_access::native_fixture::write_owned(&file, &content).expect("还原测试文件");
         let bad_sig = format!("{}A", &sig[..sig.len() - 1]);
         assert!(AstralClient::verify_installer_signature_with(&file, &bad_sig, pk).is_err());
         // 换成内嵌正式公钥 → 拒绝（测试密钥签的东西不认）
@@ -2279,7 +3974,7 @@ mod tests {
             AstralClient::verify_installer_signature_with(&file, sig, UPDATE_SIGN_PUBKEY_B64)
                 .is_err()
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        dir.remove();
     }
 
     #[test]
@@ -2386,54 +4081,46 @@ mod tests {
     /// - 响应能在被 park 住的线程上被唤醒并读到完整 body（否则这条会挂住/超时）。
     #[test]
     fn blocking_pool_thread_can_drive_async_request() {
-        use std::io::{Read as _, Write as _};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        let server = std::thread::spawn(move || {
-            if let Ok((mut sock, _)) = listener.accept() {
-                let mut buf = [0u8; 1024];
-                let _ = sock.read(&mut buf);
-                let body = b"hello-update";
-                let head = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
-                    body.len()
-                );
-                let _ = sock.write_all(head.as_bytes());
-                let _ = sock.write_all(body);
-                let _ = sock.flush();
-            }
-        });
+        let server = OwnedHttp::new(200, "", b"hello-update");
+        let addr = server.addr;
         let got = tauri::async_runtime::block_on(async move {
             tauri::async_runtime::spawn_blocking(move || {
                 // 与 download_update_file 完全同款：阻塞池线程 + 运行时句柄 block_on
                 let rt = tauri::async_runtime::handle();
                 rt.block_on(async move {
-                    let client = reqwest::Client::builder()
-                        .timeout(std::time::Duration::from_secs(10))
-                        .build()
-                        .expect("client");
-                    let resp = client
-                        .get(format!("http://{addr}/a.bin"))
-                        .send()
+                    let requester = AstralRequester::owned_loopback(addr).expect("client");
+                    let headers = client_headers_with_metadata(&synthetic_metadata())
+                        .into_iter()
+                        .map(|(name, value)| (name.to_owned(), value))
+                        .collect();
+                    let response = requester
+                        .send(AstralHttpRequest {
+                            method: reqwest::Method::GET,
+                            url: format!("http://{addr}/a.bin"),
+                            query: Vec::new(),
+                            json_body: None,
+                            headers,
+                            satoken: None,
+                        })
                         .await
                         .expect("send");
-                    resp.bytes().await.expect("body").to_vec()
+                    assert_eq!(response.status, 200);
+                    response.body.into_bytes()
                 })
             })
             .await
             .expect("join")
         });
         assert_eq!(got, b"hello-update");
-        let _ = server.join();
+        // The listener stays owned until every awaited operation/byte assertion ends.
+        drop(server);
     }
 
     /// P2-4：图片读盘有 8 MiB 上限，且读盘本身在阻塞池线程上完成
     #[test]
     fn image_bytes_are_capped_and_read_off_async_thread() {
-        let dir = std::env::temp_dir().join(format!("ll-astral-img-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("tmp dir");
-        let small = dir.join("small.png");
-        std::fs::write(&small, b"png-bytes").expect("write small");
+        let dir = crate::lyric_access::native_fixture::NativeFixture::new("astral-img");
+        let small = dir.file("small.png", b"png-bytes");
 
         // 预检：扩展名 → MIME、大小如实上报
         let (name, mime, size) =
@@ -2449,9 +4136,11 @@ mod tests {
         assert_eq!(bytes, b"png-bytes");
 
         // 超限文件：稀疏文件（set_len 不真占磁盘）也会在读之前/读之中被挡住
-        let big = dir.join("big.jpg");
-        std::fs::File::create(&big)
-            .expect("create big")
+        let big = dir.file("big.jpg", b"");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&big)
+            .expect("open owned big")
             .set_len(AstralClient::IMAGE_UPLOAD_MAX_BYTES + 1)
             .expect("set_len");
         let err = AstralClient::image_meta(big.to_str().unwrap(), "avatar").unwrap_err();
@@ -2463,11 +4152,10 @@ mod tests {
         assert!(err.contains("8 MiB"), "上限要写清楚: {err}");
 
         // 不在白名单里的扩展名照旧被拒（原有行为不变）
-        let bad = dir.join("x.bmp");
-        std::fs::write(&bad, b"bmp").expect("write bad");
+        let bad = dir.file("x.bmp", b"bmp");
         let err = AstralClient::image_meta(bad.to_str().unwrap(), "avatar").unwrap_err();
         assert!(err.contains("暂不支持的图片格式"), "格式文案: {err}");
 
-        let _ = std::fs::remove_dir_all(&dir);
+        dir.remove();
     }
 }

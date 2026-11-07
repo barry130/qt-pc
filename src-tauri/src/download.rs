@@ -384,7 +384,7 @@ pub fn is_disk_full(err: &std::io::Error) -> bool {
 
 /// 单次尝试的失败分类，决定重试还是直接放弃。
 #[derive(Debug)]
-enum AttemptError {
+pub enum AttemptError {
     Stopped,
     Retryable(String),
     Fatal(String),
@@ -441,12 +441,21 @@ async fn run_attempts(
     job: &DownloadJob,
     cancel: &Arc<AtomicBool>,
 ) -> DownloadOutcome {
+    run_attempts_with_client_factory(db, job, cancel, &LiveDownloadClientFactory).await
+}
+
+pub async fn run_attempts_with_client_factory(
+    db: &Arc<Database>,
+    job: &DownloadJob,
+    cancel: &Arc<AtomicBool>,
+    clients: &dyn DownloadClientFactory,
+) -> DownloadOutcome {
     let mut last_err = String::from("下载失败");
     for attempt in 1..=MAX_ATTEMPTS {
         if cancel.load(Ordering::SeqCst) {
             return DownloadOutcome::Stopped;
         }
-        match attempt_once(db, job, cancel).await {
+        match attempt_once_with_client_factory(db, job, cancel, clients).await {
             Ok(size) => return DownloadOutcome::Done(size),
             Err(AttemptError::Stopped) => return DownloadOutcome::Stopped,
             // 确定性错误必须原样返回，不能被上一轮（或初始）的 last_err 覆盖。
@@ -650,11 +659,52 @@ fn open_output(
     }
 }
 
+/// Instance boundary only for constructing the HTTP client. Resume validation,
+/// cancellation, filesystem writes and the actual DB writer remain shared.
+pub trait DownloadClientFactory: Sync {
+    fn build(&self, url: &str) -> Result<reqwest::Client, AttemptError>;
+}
+
+struct LiveDownloadClientFactory;
+
+fn download_client_builder(connect: Duration, read: Duration) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .user_agent("Mozilla/5.0")
+        // 即使将来其他依赖合并开启解压 feature，也不能让字节范围被透明解码。
+        .no_gzip()
+        .no_brotli()
+        .no_deflate()
+        .no_zstd()
+        .connect_timeout(connect)
+        .read_timeout(read)
+        .pool_max_idle_per_host(0)
+}
+
+fn build_download_client(builder: reqwest::ClientBuilder) -> Result<reqwest::Client, AttemptError> {
+    builder.build().map_err(|e| {
+        AttemptError::Fatal(format!(
+            "初始化下载客户端失败: {}",
+            crate::astral::sanitize_err(e)
+        ))
+    })
+}
+
+impl DownloadClientFactory for LiveDownloadClientFactory {
+    fn build(&self, _url: &str) -> Result<reqwest::Client, AttemptError> {
+        // 每次尝试重新应用实际配置，不能缓存客户端或强制关闭生产代理。
+        build_download_client(crate::net_config::configure(download_client_builder(
+            CONNECT_TIMEOUT,
+            CHUNK_TIMEOUT,
+        )))
+    }
+}
+
 /// 单次下载尝试：最多一次安全重下 → 重叠字节校验 → 流式写入 → 完整校验后重命名。
-async fn attempt_once(
+pub async fn attempt_once_with_client_factory(
     db: &Arc<Database>,
     job: &DownloadJob,
     cancel: &Arc<AtomicBool>,
+    clients: &dyn DownloadClientFactory,
 ) -> Result<i64, AttemptError> {
     use std::io::{Read, Seek, SeekFrom, Write};
 
@@ -685,27 +735,9 @@ async fn attempt_once(
         Err(e) => return Err(AttemptError::Fatal(format!("读取临时文件失败: {e}"))),
     };
 
-    // 第二波（代理）：下载走的也是音源网络，构建时应用全局代理配置。
+    // 生产工厂每次尝试应用全局代理配置；实例化测试工厂只允许自有 HTTP。
     // 请求头等待、连接、每段数据分别限时，避免给整首大文件设置过短的总时限。
-    let client = crate::net_config::configure(
-        reqwest::Client::builder()
-            .user_agent("Mozilla/5.0")
-            // 即使将来其他依赖合并开启解压 feature，也不能让字节范围被透明解码。
-            .no_gzip()
-            .no_brotli()
-            .no_deflate()
-            .no_zstd()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(CHUNK_TIMEOUT)
-            .pool_max_idle_per_host(0),
-    )
-    .build()
-    .map_err(|e| {
-        AttemptError::Fatal(format!(
-            "初始化下载客户端失败: {}",
-            crate::astral::sanitize_err(e)
-        ))
-    })?;
+    let client = clients.build(&job.url)?;
     let mut resume = existing > 0;
     'request: loop {
         let requested_start = resume.then_some(existing - overlap.len() as u64);
@@ -1091,7 +1123,10 @@ pub async fn save_download_extras(
     if embed_cover.is_none() && lyric_parts.is_none() {
         // 没有能内嵌的内容：进不了标签的封面（webp/gif）仍按 sidecar 落盘
         if cover_sidecar_pending {
-            write_cover_sidecar(final_path, cover_bytes.as_deref().expect("pending 必有字节"));
+            write_cover_sidecar(
+                final_path,
+                cover_bytes.as_deref().expect("pending 必有字节"),
+            );
         }
         return;
     }
@@ -1104,20 +1139,22 @@ pub async fn save_download_extras(
         lyric: lyric_parts.as_ref().map(|(text, _)| text.clone()),
     };
     let p = final_path.to_path_buf();
-    let outcome = match tauri::async_runtime::spawn_blocking(move || {
-        crate::embed::embed_tags(&p, &payload)
-    })
-    .await
-    {
-        Ok(o) => o,
-        Err(e) => crate::embed::EmbedOutcome::Failed(format!("内嵌任务异常: {e}")),
-    };
+    let outcome =
+        match tauri::async_runtime::spawn_blocking(move || crate::embed::embed_tags(&p, &payload))
+            .await
+        {
+            Ok(o) => o,
+            Err(e) => crate::embed::EmbedOutcome::Failed(format!("内嵌任务异常: {e}")),
+        };
     match outcome {
         crate::embed::EmbedOutcome::Done => {
             log::info!("[download] 封面/歌词已内嵌: {}", final_path.display());
             // 内嵌成了，但进不了标签的封面（webp/gif）不能丢
             if cover_sidecar_pending {
-                write_cover_sidecar(final_path, cover_bytes.as_deref().expect("pending 必有字节"));
+                write_cover_sidecar(
+                    final_path,
+                    cover_bytes.as_deref().expect("pending 必有字节"),
+                );
             }
         }
         crate::embed::EmbedOutcome::Skipped(why) => {
@@ -1190,7 +1227,44 @@ mod tests {
         }
     }
 
-    /// 真实 TCP / reqwest 链路，不改全局代理配置；停止旗标保证失败断言也能收线程。
+    const FIXTURE_HTTP_LIMIT: Duration = Duration::from_secs(10);
+
+    /// This instance accepts only the exact URL minted by its owned listener.
+    /// No live settings/system proxy, DNS name or redirect can escape the fixture.
+    struct OwnedDownloadClientFactory {
+        url: reqwest::Url,
+        builds: AtomicUsize,
+    }
+
+    impl OwnedDownloadClientFactory {
+        fn new(server: &MockHttp) -> Self {
+            let url = reqwest::Url::parse(&server.url).unwrap();
+            assert_eq!(url.scheme(), "http");
+            assert_eq!(url.host_str(), Some("127.0.0.1"));
+            assert!(url.port().is_some());
+            Self {
+                url,
+                builds: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl DownloadClientFactory for OwnedDownloadClientFactory {
+        fn build(&self, url: &str) -> Result<reqwest::Client, AttemptError> {
+            if reqwest::Url::parse(url).ok().as_ref() != Some(&self.url) {
+                return Err(AttemptError::Fatal("fixture URL is not owned".into()));
+            }
+            self.builds.fetch_add(1, Ordering::SeqCst);
+            build_download_client(
+                download_client_builder(Duration::from_secs(1), Duration::from_secs(3))
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .timeout(Duration::from_secs(5)),
+            )
+        }
+    }
+
+    /// 真实 TCP / reqwest 链路；绝对时限和停止旗标保证失败断言也能收线程。
     struct MockHttp {
         url: String,
         requests: Arc<Mutex<Vec<String>>>,
@@ -1200,6 +1274,7 @@ mod tests {
 
     impl MockHttp {
         fn new(replies: Vec<HttpReply>) -> Self {
+            let _owned_root = crate::public_test_fixture::root();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             listener.set_nonblocking(true).unwrap();
             let url = format!(
@@ -1211,9 +1286,10 @@ mod tests {
             let stop = Arc::new(AtomicBool::new(false));
             let stopped = Arc::clone(&stop);
             let thread = thread::spawn(move || {
+                let deadline = std::time::Instant::now() + FIXTURE_HTTP_LIMIT;
                 for reply in replies {
                     let mut stream = loop {
-                        if stopped.load(Ordering::SeqCst) {
+                        if stopped.load(Ordering::SeqCst) || std::time::Instant::now() >= deadline {
                             return;
                         }
                         match listener.accept() {
@@ -1232,7 +1308,7 @@ mod tests {
                         .unwrap();
                     let mut request = Vec::new();
                     while !request.ends_with(b"\r\n\r\n") {
-                        if stopped.load(Ordering::SeqCst) {
+                        if stopped.load(Ordering::SeqCst) || std::time::Instant::now() >= deadline {
                             return;
                         }
                         let mut buf = [0; 1024];
@@ -1259,7 +1335,9 @@ mod tests {
                         let _ = stream.write_all(&reply.bytes);
                         let _ = stream.flush();
                     }
-                    while (reply.hold_headers || reply.hold_body) && !stopped.load(Ordering::SeqCst)
+                    while (reply.hold_headers || reply.hold_body)
+                        && !stopped.load(Ordering::SeqCst)
+                        && std::time::Instant::now() < deadline
                     {
                         thread::sleep(Duration::from_millis(2));
                     }
@@ -1292,7 +1370,13 @@ mod tests {
     impl Drop for MockHttp {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::SeqCst);
-            self.thread.take().unwrap().join().unwrap();
+            if let Some(worker) = self.thread.take() {
+                let joined = worker.join();
+                // Always join, including assertion unwinding, without double panic.
+                if !thread::panicking() {
+                    joined.expect("owned HTTP worker panicked");
+                }
+            }
         }
     }
 
@@ -1307,17 +1391,16 @@ mod tests {
     struct DownloadFixture {
         db: Arc<Database>,
         job: DownloadJob,
+        clients: OwnedDownloadClientFactory,
         _dir: TestDir,
     }
 
     impl DownloadFixture {
         fn new(server: &MockHttp, existing: &[u8]) -> Self {
-            let dir = TestDir(std::env::temp_dir().join(format!(
-                "quietmusic-download-{}-{}",
-                std::process::id(),
-                fastrand::u64(..)
-            )));
-            std::fs::create_dir_all(&dir.0).unwrap();
+            let path = crate::public_test_fixture::root()
+                .join(format!("quietmusic-download-{:016x}", fastrand::u64(..)));
+            std::fs::create_dir(&path).unwrap();
+            let dir = TestDir(path);
             let db = Arc::new(Database::open(&dir.0.join("test.db")).unwrap());
             let final_path = dir.0.join("track.mp3");
             let part_path = part_path_for(&final_path);
@@ -1330,11 +1413,31 @@ mod tests {
                 final_path,
                 part_path,
             };
-            Self { db, job, _dir: dir }
+            Self {
+                db,
+                job,
+                clients: OwnedDownloadClientFactory::new(server),
+                _dir: dir,
+            }
         }
 
         async fn attempt(&self) -> Result<i64, AttemptError> {
-            attempt_once(&self.db, &self.job, &Arc::new(AtomicBool::new(false))).await
+            self.attempt_with_cancel(&Arc::new(AtomicBool::new(false)))
+                .await
+        }
+
+        async fn attempt_with_cancel(&self, cancel: &Arc<AtomicBool>) -> Result<i64, AttemptError> {
+            attempt_once_with_client_factory(&self.db, &self.job, cancel, &self.clients).await
+        }
+
+        async fn run_attempts(&self) -> DownloadOutcome {
+            run_attempts_with_client_factory(
+                &self.db,
+                &self.job,
+                &Arc::new(AtomicBool::new(false)),
+                &self.clients,
+            )
+            .await
         }
 
         fn assert_done(&self, bytes: &[u8]) {
@@ -1583,7 +1686,7 @@ mod tests {
         let server = MockHttp::new(vec![HttpReply::new(403, "Content-Length: 0\r\n", b"")]);
         let fixture = DownloadFixture::new(&server, b"old-partial");
         assert!(
-            matches!(run_attempts(&fixture.db, &fixture.job, &Arc::new(AtomicBool::new(false))).await, DownloadOutcome::Failed(msg) if msg == "服务器返回 HTTP 403")
+            matches!(fixture.run_attempts().await, DownloadOutcome::Failed(msg) if msg == "服务器返回 HTTP 403")
         );
         fixture.assert_retained(b"old-partial");
         assert_eq!(server.ranges().len(), 1);
@@ -1600,20 +1703,25 @@ mod tests {
             let cancel = Arc::new(AtomicBool::new(false));
             let stopper = Arc::clone(&cancel);
             let requests = Arc::clone(&server.requests);
-            let stop_task = tokio::spawn(async move {
-                while requests.lock().unwrap().is_empty() {
-                    tokio::time::sleep(Duration::from_millis(2)).await;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+            // Structured concurrency: neither future can outlive this test on
+            // success, timeout or assertion unwinding. No abort-only detached task.
+            let stop = async move {
+                let observed = tokio::time::timeout(Duration::from_secs(2), async {
+                    while requests.lock().unwrap().is_empty() {
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                })
+                .await;
                 stopper.store(true, Ordering::SeqCst);
-            });
-            let result = tokio::time::timeout(
-                Duration::from_secs(2),
-                attempt_once(&fixture.db, &fixture.job, &cancel),
-            )
-            .await
-            .expect("暂停必须及时打断静默网络");
-            stop_task.abort();
+                observed
+            };
+            let (result, observed) = tokio::join!(
+                tokio::time::timeout(Duration::from_secs(2), fixture.attempt_with_cancel(&cancel)),
+                stop,
+            );
+            let result = result.expect("暂停必须及时打断静默网络");
+            observed.expect("owned server must observe the request before cancellation");
             assert!(matches!(result, Err(AttemptError::Stopped)));
             fixture.assert_retained(b"old-partial");
         }
@@ -1690,10 +1798,41 @@ mod tests {
         ]);
         let fixture = DownloadFixture::new(&server, b"old-partial");
         assert!(
-            matches!(run_attempts(&fixture.db, &fixture.job, &Arc::new(AtomicBool::new(false))).await, DownloadOutcome::Failed(msg) if msg == "服务器返回 HTTP 403")
+            matches!(fixture.run_attempts().await, DownloadOutcome::Failed(msg) if msg == "服务器返回 HTTP 403")
         );
         fixture.assert_retained(b"old-partial");
         assert_eq!(server.ranges().len(), 2);
+        assert_eq!(
+            fixture.clients.builds.load(Ordering::SeqCst),
+            2,
+            "each retry must construct its own client"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_fixture_rejects_redirect_without_following_it() {
+        let server = MockHttp::new(vec![HttpReply::new(
+            302,
+            "Location: https://unowned.invalid/audio\r\nContent-Length: 0\r\n",
+            b"",
+        )]);
+        let fixture = DownloadFixture::new(&server, b"old-partial");
+        assert!(matches!(fixture.attempt().await,
+            Err(AttemptError::Fatal(msg)) if msg == "服务器返回 HTTP 302"));
+        fixture.assert_retained(b"old-partial");
+        assert_eq!(server.ranges().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn http_fixture_rejects_unowned_url_before_any_request() {
+        let server = MockHttp::new(vec![]);
+        let mut fixture = DownloadFixture::new(&server, b"old-partial");
+        fixture.job.url = "http://unowned.invalid/audio".into();
+        assert!(matches!(fixture.attempt().await,
+            Err(AttemptError::Fatal(msg)) if msg == "fixture URL is not owned"));
+        fixture.assert_retained(b"old-partial");
+        assert!(server.requests.lock().unwrap().is_empty());
+        assert_eq!(fixture.clients.builds.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1730,20 +1869,18 @@ mod tests {
         .await;
         assert!(matches!(result, Err(AttemptError::Retryable(msg)) if msg.contains("超时")));
         let flag = Arc::clone(&cancel);
-        let stopper = tokio::spawn(async move {
+        let stopper = async move {
             tokio::time::sleep(Duration::from_millis(10)).await;
             flag.store(true, Ordering::SeqCst);
-        });
-        assert!(matches!(
+        };
+        let (stopped, ()) = tokio::join!(
             tokio::time::timeout(
                 Duration::from_secs(1),
                 until_stopped(&cancel, tokio::time::sleep(Duration::from_secs(30)))
-            )
-            .await
-            .unwrap(),
-            Err(AttemptError::Stopped)
-        ));
-        stopper.await.unwrap();
+            ),
+            stopper,
+        );
+        assert!(matches!(stopped.unwrap(), Err(AttemptError::Stopped)));
     }
 
     #[test]

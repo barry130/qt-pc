@@ -742,10 +742,10 @@ export function PlayingPage(): React.JSX.Element {
           <div className="rounded-xl border border-border bg-popover/95 backdrop-blur-xl p-3 text-popover-foreground shadow-raised">
             <SourceSwitchPanel
               track={track}
-              onPick={(candidate) => {
+              onPick={(candidate, original, beforeResolve) => {
                 setPanel(null);
                 // 与播放条「换源」同一套：就地替换当前曲目，队列位置不动
-                void replaceCurrentWithCandidate(candidate);
+                return replaceCurrentWithCandidate(candidate, original, beforeResolve);
               }}
             />
           </div>

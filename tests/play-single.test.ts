@@ -3,7 +3,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn(async () => ({})),
+  invoke: vi.fn(async (cmd: string) => (cmd === "begin_play_intent" ? 1 : {})),
 }));
 
 // preResolvePlayUrl 会按降档阶梯走共享脚本包取链，测试里不需要真取（且会拖慢/发网络）。
@@ -56,7 +56,9 @@ beforeEach(() => {
     pendingSeekAt: 0,
   });
   invokeMock.mockReset();
-  invokeMock.mockResolvedValue({});
+  invokeMock.mockImplementation(async (cmd: string) =>
+    cmd === "begin_play_intent" ? 1 : {},
+  );
 });
 
 describe("单曲播放（play）", () => {
@@ -68,16 +70,19 @@ describe("单曲播放（play）", () => {
     // 关键回归点：以前这里是 play_queue([track], 0)，会把整张列表冲掉
     expect(cmds).not.toContain("play_queue");
 
-    const [name, args] = invokeMock.mock.calls[0] as [string, Record<string, unknown>];
-    expect(name).toBe("play_track");
-    expect((args.track as Track).id).toBe("t1");
+    const playCall = invokeMock.mock.calls.find(([cmd]) => cmd === "play_track") as
+      | [string, Record<string, unknown>]
+      | undefined;
+    expect(playCall).toBeDefined();
+    expect((playCall![1].track as Track).id).toBe("t1");
   });
 
   it("quality 取当前快照默认档位，缺快照时回落 320", async () => {
     await usePlayerStore.getState().play(track);
-    expect(
-      (invokeMock.mock.calls[0]?.[1] as Record<string, unknown>).quality,
-    ).toBe("320");
+    const playCall = invokeMock.mock.calls.find(([cmd]) => cmd === "play_track") as
+      | [string, Record<string, unknown>]
+      | undefined;
+    expect(playCall?.[1].quality).toBe("320");
   });
 
   it("不动前端镜像队列：等 queue-changed 事件，避免追加后下标算错", async () => {
@@ -111,13 +116,15 @@ describe("单曲播放（play）", () => {
 
     const slow = usePlayerStore.getState().play(track);
     const fast = usePlayerStore.getState().play({ ...track, id: "t2" });
+    // 先让两个动作都完成「登记 → 进入取链」，再放行挂住的取链
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
     release();
     await Promise.all([slow, fast]);
 
     // 只有后点的 t2 落地
-    const ids = invokeMock.mock.calls.map(
-      (c) => ((c[1] as Record<string, unknown>).track as Track).id,
-    );
+    const ids = invokeMock.mock.calls
+      .filter(([cmd]) => cmd === "play_track")
+      .map(([, args]) => ((args as Record<string, unknown>).track as Track).id);
     expect(ids).toEqual(["t2"]);
   });
 });

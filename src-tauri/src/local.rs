@@ -295,45 +295,87 @@ pub fn scan_dirs_with_progress(
     rows
 }
 
-/// 可扫描的盘符根目录（Windows 枚举 A:–Z: 中真实存在的盘；macOS 枚举
-/// `/Volumes` 下的挂载卷 + 根；Linux 给出根目录 + 用户家目录）。
-/// 用于本地曲库的「扫描整个磁盘」入口。
-#[cfg(target_os = "windows")]
-pub fn list_drives() -> Vec<String> {
-    ('A'..='Z')
-        .map(|c| format!("{c}:\\"))
-        .filter(|root| Path::new(root).exists())
-        .collect()
+/// Directory observations are instance inputs, not a replacement selection policy.
+pub trait LibraryDirectories {
+    fn exists(&self, path: &Path) -> bool;
+    fn is_dir(&self, path: &Path) -> bool;
+    fn visit_volume_names(&self, visit: &mut dyn FnMut(&str));
+    fn home(&self) -> Option<std::ffi::OsString>;
 }
 
-/// macOS：`/` + `/Volumes/*`（外接盘 / U 盘 / DMG 都挂在这里）。
-#[cfg(target_os = "macos")]
-pub fn list_drives() -> Vec<String> {
-    let mut roots = vec!["/".to_string()];
-    if let Ok(entries) = std::fs::read_dir("/Volumes") {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                let vol = format!("/Volumes/{name}");
-                if Path::new(&vol).is_dir() {
-                    roots.push(vol);
+pub struct SystemLibraryDirectories;
+
+impl LibraryDirectories for SystemLibraryDirectories {
+    fn exists(&self, path: &Path) -> bool {
+        path.exists()
+    }
+    fn is_dir(&self, path: &Path) -> bool {
+        path.is_dir()
+    }
+    fn visit_volume_names(&self, visit: &mut dyn FnMut(&str)) {
+        if let Ok(entries) = std::fs::read_dir("/Volumes") {
+            for entry in entries.flatten() {
+                if let Some(name) = entry.file_name().to_str() {
+                    visit(name);
                 }
             }
         }
     }
-    roots
+    fn home(&self) -> Option<std::ffi::OsString> {
+        std::env::var_os("HOME")
+    }
 }
 
-/// Linux：根目录 + `$HOME`（音乐几乎总在家目录；/proc/mounts 解析留待后续按需）。
-#[cfg(target_os = "linux")]
-pub fn list_drives() -> Vec<String> {
-    let mut roots = vec!["/".to_string()];
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = home.to_string_lossy().to_string();
-        if !home.is_empty() && !roots.contains(&home) {
-            roots.push(home);
+#[derive(Clone, Copy)]
+pub enum LibraryOs {
+    Windows,
+    Macos,
+    Linux,
+}
+
+/// The real A–Z / Volumes / HOME selection, reusable with synthetic observations.
+pub fn list_drives_with_directories(
+    os: LibraryOs,
+    directories: &impl LibraryDirectories,
+) -> Vec<String> {
+    match os {
+        LibraryOs::Windows => ('A'..='Z')
+            .map(|c| format!("{c}:\\"))
+            .filter(|root| directories.exists(Path::new(root)))
+            .collect(),
+        LibraryOs::Macos => {
+            let mut roots = vec!["/".to_owned()];
+            directories.visit_volume_names(&mut |name| {
+                let vol = format!("/Volumes/{name}");
+                if directories.is_dir(Path::new(&vol)) {
+                    roots.push(vol);
+                }
+            });
+            roots
+        }
+        LibraryOs::Linux => {
+            let mut roots = vec!["/".to_owned()];
+            if let Some(home) = directories.home() {
+                let home = home.to_string_lossy().into_owned();
+                if !home.is_empty() && !roots.contains(&home) {
+                    roots.push(home);
+                }
+            }
+            roots
         }
     }
-    roots
+}
+
+/// Production defaults continue querying actual platform directories per call.
+#[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
+pub fn list_drives() -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    let os = LibraryOs::Windows;
+    #[cfg(target_os = "macos")]
+    let os = LibraryOs::Macos;
+    #[cfg(target_os = "linux")]
+    let os = LibraryOs::Linux;
+    list_drives_with_directories(os, &SystemLibraryDirectories)
 }
 
 /// 从日期字符串里取四位年份：`"2019"` / `"2019-05-01"` / `"2019/05"` 都取 2019。
@@ -651,10 +693,9 @@ fn decode_lyric_text(bytes: &[u8]) -> String {
     }
 }
 
-/// 读同名 `.lrc` 正文。文件不存在 / 读不出来 / 正文全空白都返回 None。
-fn read_sidecar_lyric(path: &Path) -> Option<LocalLyric> {
-    let lrc = find_lrc_sidecar(path)?;
-    let bytes = std::fs::read(&lrc).ok()?;
+/// 读一个已经定位好的旁挂 `.lrc` 正文。文件不存在 / 读不出来 / 正文全空白都返回 None。
+fn read_sidecar_file(path: &Path) -> Option<LocalLyric> {
+    let bytes = std::fs::read(path).ok()?;
     let text = decode_lyric_text(&bytes);
     if text.trim().is_empty() {
         return None;
@@ -662,8 +703,28 @@ fn read_sidecar_lyric(path: &Path) -> Option<LocalLyric> {
     Some(LocalLyric {
         text,
         source: LYRIC_SOURCE_SIDECAR,
-        path: Some(lrc.to_string_lossy().into_owned()),
+        path: Some(path.to_string_lossy().into_owned()),
     })
+}
+
+/// 读同名 `.lrc` 正文。文件不存在 / 读不出来 / 正文全空白都返回 None。
+fn read_sidecar_lyric(path: &Path) -> Option<LocalLyric> {
+    read_sidecar_file(&find_lrc_sidecar(path)?)
+}
+/// 读取中央已授权（canonical 边界检查通过）的旁挂歌词正文。
+///
+/// `sidecar` 是 `authorized_sidecar` 校验并 canonical 化后的**实际**文件路径：
+/// 这里只读它，不再按 `audio` 二次 `find_lrc_sidecar`，避免「检查的路径」与
+/// 「实际读的路径」指向不同文件。`None` 表示没有可用旁挂，退回内嵌标签。
+pub fn read_authorized_sidecar(audio: &Path, sidecar: Option<&Path>) -> Option<LocalLyric> {
+    match sidecar {
+        Some(path) => read_sidecar_file(path),
+        None => read_embedded_lyric(audio).map(|text| LocalLyric {
+            text,
+            source: LYRIC_SOURCE_EMBEDDED,
+            path: None,
+        }),
+    }
 }
 
 /// 读内嵌歌词。复用 `read_metadata`（它已经把标签读出来了），不重复实现探测。
@@ -1044,21 +1105,42 @@ mod tests {
         assert_eq!(parse_bpm("快"), None);
     }
 
-    /// 建一个进程唯一的临时目录（不联网、不依赖真实音乐目录）
-    fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "quietmusic-local-{tag}-{}-{}",
-            std::process::id(),
-            fastrand::u64(..)
-        ));
-        std::fs::create_dir_all(&dir).expect("创建临时目录");
-        dir
+    use crate::lyric_access::native_fixture::{create_owned_dir, write_owned, NativeFixture};
+
+    /// Exclusive fixture with mandatory gate attestation and checked cleanup.
+    fn temp_dir(tag: &str) -> NativeFixture {
+        NativeFixture::new(tag)
+    }
+
+    #[derive(Default)]
+    struct SyntheticDirectories {
+        available: HashSet<PathBuf>,
+        directories: HashSet<PathBuf>,
+        volumes: Vec<String>,
+        home: Option<std::ffi::OsString>,
+    }
+
+    impl LibraryDirectories for SyntheticDirectories {
+        fn exists(&self, path: &Path) -> bool {
+            self.available.contains(path)
+        }
+        fn is_dir(&self, path: &Path) -> bool {
+            self.directories.contains(path)
+        }
+        fn visit_volume_names(&self, visit: &mut dyn FnMut(&str)) {
+            for name in &self.volumes {
+                visit(name);
+            }
+        }
+        fn home(&self) -> Option<std::ffi::OsString> {
+            self.home.clone()
+        }
     }
 
     fn touch(dir: &Path, name: &str) -> PathBuf {
         let p = dir.join(name);
-        std::fs::create_dir_all(p.parent().unwrap()).expect("创建父目录");
-        std::fs::write(&p, b"not-a-real-audio-file").expect("写入临时文件");
+        create_owned_dir(p.parent().unwrap());
+        write_owned(&p, b"not-a-real-audio-file").expect("写入临时文件");
         p
     }
 
@@ -1079,7 +1161,7 @@ mod tests {
         bytes.extend_from_slice(b"data");
         bytes.extend_from_slice(&size.to_le_bytes());
         bytes.resize(size as usize + 44, 128);
-        std::fs::write(&path, bytes).unwrap();
+        write_owned(&path, bytes).unwrap();
         path
     }
 
@@ -1088,8 +1170,8 @@ mod tests {
         let root = temp_dir("cue-split");
         let audio = wav(&root, "album.wav", 12);
         let cue = root.join("album.cue");
-        std::fs::write(&cue, "PERFORMER \"Artist\"\nTITLE \"Album\"\nFILE \"album.wav\" WAVE\nTRACK 01 AUDIO\nTITLE \"First\"\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nTITLE \"Second\"\nINDEX 01 00:05:00\nTRACK 03 AUDIO\nINDEX 01 00:20:00").unwrap();
-        std::fs::write(root.join("album.lrc"), "[00:08.00]album lyric").unwrap();
+        write_owned(&cue, "PERFORMER \"Artist\"\nTITLE \"Album\"\nFILE \"album.wav\" WAVE\nTRACK 01 AUDIO\nTITLE \"First\"\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nTITLE \"Second\"\nINDEX 01 00:05:00\nTRACK 03 AUDIO\nINDEX 01 00:20:00").unwrap();
+        write_owned(root.join("album.lrc"), "[00:08.00]album lyric").unwrap();
         let dirs = [root.to_string_lossy().into_owned()];
         let rows = scan_dirs(&dirs);
         assert_eq!(rows.len(), 2);
@@ -1130,7 +1212,7 @@ mod tests {
             opened.iter().map(|r| &r.id).collect::<Vec<_>>(),
             rows.iter().map(|r| &r.id).collect::<Vec<_>>()
         );
-        let _ = std::fs::remove_dir_all(root);
+        root.remove();
     }
 
     #[test]
@@ -1140,19 +1222,19 @@ mod tests {
         wav(&root, "two.wav", 6);
         touch(&root, "picture.jpg");
         let cue = root.join("album.CUE");
-        std::fs::write(&cue, "FILE \"one.wav\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:01:00\nFILE \"missing.wav\" WAVE\nTRACK 02 AUDIO\nINDEX 01 00:00:00\nFILE \"picture.jpg\" WAVE\nTRACK 03 AUDIO\nINDEX 01 00:00:00\nFILE \"two.wav\" WAVE\nTRACK 04 AUDIO\nINDEX 01 00:00:00").unwrap();
+        write_owned(&cue, "FILE \"one.wav\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:01:00\nFILE \"missing.wav\" WAVE\nTRACK 02 AUDIO\nINDEX 01 00:00:00\nFILE \"picture.jpg\" WAVE\nTRACK 03 AUDIO\nINDEX 01 00:00:00\nFILE \"two.wav\" WAVE\nTRACK 04 AUDIO\nINDEX 01 00:00:00").unwrap();
         let (rows, skipped) = scan_files(&[cue.to_string_lossy().into_owned()]);
         assert!(skipped.is_empty());
         assert_eq!(rows.len(), 2);
         assert_eq!((rows[0].duration_ms, rows[1].duration_ms), (7_000, 6_000));
         assert!(rows[0].id.ends_with("#cue:1"));
         assert!(rows[1].id.ends_with("#cue:4"));
-        std::fs::remove_file(root.join("one.wav")).unwrap();
-        std::fs::remove_file(root.join("two.wav")).unwrap();
+        root.remove_file(&root.join("one.wav"));
+        root.remove_file(&root.join("two.wav"));
         let (empty, skipped) = scan_files(&[cue.to_string_lossy().into_owned()]);
         assert!(empty.is_empty());
         assert_eq!(skipped, vec![cue.to_string_lossy().into_owned()]);
-        let _ = std::fs::remove_dir_all(root);
+        root.remove();
     }
 
     #[test]
@@ -1165,7 +1247,7 @@ mod tests {
         assert_eq!(query_local_tracks(&conn).unwrap().len(), 1);
         let cue = root.join("album.cue");
         let sheet = "FILE \"album.wav\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nINDEX 01 00:05:00";
-        std::fs::write(&cue, sheet).unwrap();
+        write_owned(&cue, sheet).unwrap();
         for _ in 0..2 {
             let rows = scan_dirs(&dirs);
             let present = rows.iter().map(|r| r.id.clone()).collect();
@@ -1183,7 +1265,7 @@ mod tests {
             total, 3,
             "one retired whole-file row and two stable child IDs"
         );
-        std::fs::write(
+        write_owned(
             &cue,
             "FILE \"album.wav\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00",
         )
@@ -1201,7 +1283,7 @@ mod tests {
             (tracks[0].start_ms, tracks[0].end_ms, tracks[0].duration),
             (Some(0), Some(12_000), 12.0)
         );
-        std::fs::remove_file(&cue).unwrap();
+        root.remove_file(&cue);
         let rows = scan_dirs(&dirs);
         let present = rows.iter().map(|r| r.id.clone()).collect();
         upsert_local_tracks(&conn, &rows).unwrap();
@@ -1210,14 +1292,14 @@ mod tests {
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].id, audio.to_string_lossy());
         assert_eq!((tracks[0].start_ms, tracks[0].end_ms), (None, None));
-        let _ = std::fs::remove_dir_all(root);
+        root.remove();
     }
 
     #[test]
     fn cue_track_deletion_does_not_delete_siblings() {
         let root = temp_dir("cue-delete");
         wav(&root, "album.wav", 12);
-        std::fs::write(root.join("album.cue"), "FILE \"album.wav\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nINDEX 01 00:05:00").unwrap();
+        write_owned(root.join("album.cue"), "FILE \"album.wav\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nINDEX 01 00:05:00").unwrap();
         let rows = scan_dirs(&[root.to_string_lossy().into_owned()]);
         let conn = test_conn();
         upsert_local_tracks(&conn, &rows).unwrap();
@@ -1225,7 +1307,7 @@ mod tests {
         let tracks = query_local_tracks(&conn).unwrap();
         assert_eq!(tracks.len(), 1);
         assert_eq!(tracks[0].id, rows[1].id);
-        let _ = std::fs::remove_dir_all(root);
+        root.remove();
     }
 
     // ---------- 扩展名过滤（§13.1） ----------
@@ -1261,13 +1343,13 @@ mod tests {
         assert_eq!(found, expected);
         assert!(found.contains(&a) && found.contains(&b));
 
-        let _ = std::fs::remove_dir_all(&root);
+        root.remove();
     }
 
     #[test]
     fn unreadable_or_missing_dir_is_skipped() {
         let root = temp_dir("missing-dir");
-        let _ = std::fs::remove_dir_all(&root);
+        root.remove();
         // 目录不存在：返回空而不是 panic
         assert!(collect_audio_files(&root).is_empty());
         // 扫描入口同样静默跳过
@@ -1295,7 +1377,7 @@ mod tests {
         assert!(found.iter().any(|p| p.ends_with("keep.mp3")));
         assert!(found.iter().any(|p| p.ends_with("i.mp3")));
 
-        let _ = std::fs::remove_dir_all(&root);
+        root.remove();
     }
 
     #[test]
@@ -1332,7 +1414,7 @@ mod tests {
         assert_eq!(last.0, 3, "共访问 3 个文件条目");
         assert_eq!(last.1, 2, "命中 2 首音频");
 
-        let _ = std::fs::remove_dir_all(&root);
+        root.remove();
     }
 
     // ---------- ReplayGain 标签解析（A1） ----------
@@ -1355,7 +1437,10 @@ mod tests {
         );
         // MP4 freeform
         assert_eq!(
-            parse_replay_gain_key("----:com.apple.iTunes:REPLAYGAIN_ALBUM_GAIN", &utf8("-5.1 dB")),
+            parse_replay_gain_key(
+                "----:com.apple.iTunes:REPLAYGAIN_ALBUM_GAIN",
+                &utf8("-5.1 dB")
+            ),
             Some(GainTag::AlbumGain(-5.1))
         );
         // 小写 / 连字符 / 空格都归一化
@@ -1452,7 +1537,7 @@ mod tests {
         let root = temp_dir("min-size");
         touch(&root, "small.mp3"); // 21 字节
         let big = root.join("big.mp3");
-        std::fs::write(&big, vec![0u8; 4096]).expect("写入大文件");
+        write_owned(&big, vec![0u8; 4096]).expect("写入大文件");
 
         let dirs = [root.to_string_lossy().to_string()];
         // 不过滤：两条都在
@@ -1472,38 +1557,55 @@ mod tests {
         assert!(kept[0].path.ends_with("big.mp3"));
 
         // 读不到文件大小：保留，避免误伤
-        assert!(!is_too_small(Path::new("does-not-exist.mp3"), 1024));
+        assert!(!is_too_small(&root.join("does-not-exist.mp3"), 1024));
         // 阈值为 0：关闭过滤
-        assert!(!is_too_small(Path::new("does-not-exist.mp3"), 0));
+        assert!(!is_too_small(&root.join("does-not-exist.mp3"), 0));
 
-        let _ = std::fs::remove_dir_all(&root);
+        root.remove();
     }
 
     #[cfg(target_os = "windows")]
     #[test]
     fn list_drives_returns_windows_roots() {
-        let drives = list_drives();
+        let directories = SyntheticDirectories {
+            available: [r"C:\", r"Z:\"].into_iter().map(PathBuf::from).collect(),
+            ..Default::default()
+        };
+        let drives = list_drives_with_directories(LibraryOs::Windows, &directories);
         assert!(!drives.is_empty(), "至少应枚举到一个盘符");
         assert!(drives.iter().all(|d| d.ends_with(":\\")), "{drives:?}");
         assert!(
             drives.iter().any(|d| d.eq_ignore_ascii_case("c:\\")),
             "系统盘 C: 应被枚举到: {drives:?}"
         );
+        assert_eq!(
+            drives,
+            vec![r"C:\", r"Z:\"],
+            "只选择合成可用盘符，按 A–Z 顺序"
+        );
     }
 
-    /// macOS：`/` 必在；`/Volumes/*` 每个都是目录（CI 上通常为空，但若存在必须合法）
+    /// macOS selection uses synthetic directory observations, never host Volumes.
     #[cfg(target_os = "macos")]
     #[test]
     fn list_drives_returns_macos_roots() {
-        let drives = list_drives();
+        let directories = SyntheticDirectories {
+            directories: ["/", "/Volumes/音乐"]
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+            volumes: vec!["音乐".into(), "not-a-directory".into()],
+            ..Default::default()
+        };
+        let drives = list_drives_with_directories(LibraryOs::Macos, &directories);
         assert!(
             drives.iter().any(|d| d == "/"),
             "根目录应被枚举到: {drives:?}"
         );
         for d in &drives {
             assert!(
-                std::path::Path::new(d).is_dir(),
-                "枚举出的挂载点必须真实存在: {d}"
+                directories.is_dir(Path::new(d)),
+                "枚举出的挂载点必须在合成观察中真实存在: {d}"
             );
         }
         assert!(
@@ -1514,26 +1616,74 @@ mod tests {
         );
     }
 
-    /// Linux：`/` 必在；`$HOME` 非空且存在时也在（两者不重复）
+    /// Linux root / synthetic HOME, preserving the production no-duplicates rule.
     #[cfg(target_os = "linux")]
     #[test]
     fn list_drives_returns_linux_roots() {
-        let drives = list_drives();
+        let directories = SyntheticDirectories {
+            directories: ["/", "/synthetic-home"]
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+            home: Some("/synthetic-home".into()),
+            ..Default::default()
+        };
+        let drives = list_drives_with_directories(LibraryOs::Linux, &directories);
         assert!(
             drives.iter().any(|d| d == "/"),
             "根目录应被枚举到: {drives:?}"
         );
-        assert!(std::path::Path::new("/").is_dir());
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = home.to_string_lossy().to_string();
-            if !home.is_empty() && std::path::Path::new(&home).is_dir() {
-                assert!(drives.contains(&home), "家目录应被枚举到: {drives:?}");
-            }
-        }
+        assert!(directories.is_dir(Path::new("/")));
+        let home = directories.home().unwrap().to_string_lossy().into_owned();
+        assert!(directories.is_dir(Path::new(&home)));
+        assert!(drives.contains(&home), "家目录应被枚举到: {drives:?}");
         let mut uniq = drives.clone();
         uniq.sort();
         uniq.dedup();
         assert_eq!(uniq.len(), drives.len(), "不应有重复项: {drives:?}");
+    }
+
+    #[test]
+    fn synthetic_directory_inputs_share_all_platform_selection() {
+        let mut directories = SyntheticDirectories {
+            available: [r"A:\", r"C:\", r"Z:\"]
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+            directories: ["/", "/Volumes/音乐"]
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
+            volumes: vec!["not-a-directory".into(), "音乐".into()],
+            home: Some("/synthetic-unavailable-home".into()),
+        };
+        assert_eq!(
+            list_drives_with_directories(LibraryOs::Windows, &directories),
+            vec![r"A:\", r"C:\", r"Z:\"]
+        );
+        assert_eq!(
+            list_drives_with_directories(LibraryOs::Macos, &directories),
+            vec!["/", "/Volumes/音乐"]
+        );
+        // Production Linux deliberately accepts a nonempty HOME without exists().
+        assert_eq!(
+            list_drives_with_directories(LibraryOs::Linux, &directories),
+            vec!["/", "/synthetic-unavailable-home"]
+        );
+        for home in [None, Some("".into()), Some("/".into())] {
+            directories.home = home;
+            assert_eq!(
+                list_drives_with_directories(LibraryOs::Linux, &directories),
+                vec!["/"]
+            );
+        }
+        directories.available.clear();
+        assert!(list_drives_with_directories(LibraryOs::Windows, &directories).is_empty());
+        directories.volumes.clear();
+        assert_eq!(
+            list_drives_with_directories(LibraryOs::Macos, &directories),
+            vec!["/"]
+        );
     }
 
     /// 三平台共用：新增的 Linux/macOS 跳过项必须生效，且不误伤通用音乐目录名
@@ -1643,7 +1793,7 @@ mod tests {
         ]);
         assert_eq!(dup.len(), 2, "重叠目录应去重");
 
-        let _ = std::fs::remove_dir_all(&root);
+        root.remove();
     }
 
     #[test]
@@ -1654,7 +1804,7 @@ mod tests {
             read_metadata(&p).is_none(),
             "非真实音频应返回 None 以触发降级"
         );
-        let _ = std::fs::remove_dir_all(&root);
+        root.remove();
     }
 
     // ---------- 入库 / 缺失标记（§13.2） ----------
@@ -1699,7 +1849,7 @@ mod tests {
         assert_eq!(total, 2, "重复扫描不应产生重复行");
 
         // 删掉一个文件后重扫 → 该记录标 missing，查询时被过滤
-        std::fs::remove_file(&second).expect("删除临时文件");
+        root.remove_file(&second);
         let rows2 = scan_dirs(&dirs);
         assert_eq!(rows2.len(), 1);
         let present: HashSet<String> = rows2.iter().map(|r| r.path.clone()).collect();
@@ -1710,7 +1860,7 @@ mod tests {
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].id, first.to_string_lossy());
 
-        let _ = std::fs::remove_dir_all(&root);
+        root.remove();
     }
 
     #[test]
@@ -1728,7 +1878,7 @@ mod tests {
         upsert_local_tracks(&conn, &rows).expect("upsert");
 
         // 只扫描 in_scope，且文件已删 → 只标记 in_scope 的记录
-        std::fs::remove_file(&a).expect("删除");
+        in_scope.remove_file(&a);
         let present: HashSet<String> = HashSet::new();
         let marked =
             mark_missing_local_tracks(&conn, &[in_scope.to_string_lossy().to_string()], &present)
@@ -1739,8 +1889,8 @@ mod tests {
         assert_eq!(left.len(), 1, "范围外记录不应被标记");
         assert_eq!(left[0].id, b.to_string_lossy());
 
-        let _ = std::fs::remove_dir_all(&in_scope);
-        let _ = std::fs::remove_dir_all(&out_scope);
+        in_scope.remove();
+        out_scope.remove();
     }
 
     // ---------- 删除单条本地记录（§13 本地曲库管理） ----------
@@ -1789,7 +1939,7 @@ mod tests {
         // 磁盘文件不受影响（只删记录）
         assert!(drop_one.exists(), "只删记录不应动磁盘文件");
 
-        let _ = std::fs::remove_dir_all(&root);
+        root.remove();
     }
 
     #[test]
@@ -1817,7 +1967,7 @@ mod tests {
         assert_eq!(delete_local_tracks(&conn, &paths).expect("again"), 0);
         assert_eq!(delete_local_tracks(&conn, &[]).expect("empty"), 0);
 
-        let _ = std::fs::remove_dir_all(&root);
+        root.remove();
     }
 
     // ---------- 扫描目录清单（scan_dirs 表） ----------
@@ -1840,7 +1990,7 @@ mod tests {
         // 移除不存在的目录不报错
         remove_scan_dir(&conn, &path).expect("remove 幂等");
 
-        let _ = std::fs::remove_dir_all(&root);
+        root.remove();
     }
 
     // ---------- 本地歌词：同名 .lrc / 内嵌标签（2026-10-18） ----------
@@ -1855,7 +2005,7 @@ mod tests {
             .encode("[00:01.00]晴天 - 周杰伦")
             .0
             .into_owned();
-        std::fs::write(root.join("周杰伦 - 晴天.LRC"), &gbk).expect("写 .lrc");
+        write_owned(root.join("周杰伦 - 晴天.LRC"), &gbk).expect("写 .lrc");
 
         let found = read_local_lyric(&audio).expect("应有同名 .lrc");
         assert_eq!(found.source, LYRIC_SOURCE_SIDECAR);
@@ -1887,7 +2037,7 @@ mod tests {
         // 空白内嵌词等同于没有
         assert!(resolve_local_lyric(&other, Some("   ")).is_none());
 
-        let _ = std::fs::remove_dir_all(&root);
+        root.remove();
     }
 
     #[test]
@@ -1895,16 +2045,42 @@ mod tests {
         let root = temp_dir("lyric-stem");
         let audio = touch(&root, "song.mp3");
         // 同目录但不同主名的 .lrc 不该被认成这首歌的词（一张专辑一个目录时很常见）
-        std::fs::write(root.join("other.lrc"), "[00:01.00]别人的词").expect("写 other.lrc");
+        write_owned(root.join("other.lrc"), "[00:01.00]别人的词").expect("写 other.lrc");
         assert!(find_lrc_sidecar(&audio).is_none());
         assert!(read_local_lyric(&audio).is_none());
 
         // 大小写不同的主名 / 扩展名要能配上（Windows、macOS 上本就是同一个文件）
-        std::fs::write(root.join("SONG.Lrc"), "[00:01.00]自己的词").expect("写 SONG.Lrc");
+        write_owned(root.join("SONG.Lrc"), "[00:01.00]自己的词").expect("写 SONG.Lrc");
         let found = read_local_lyric(&audio).expect("应配上同名 .lrc");
         assert_eq!(found.text, "[00:01.00]自己的词");
 
-        let _ = std::fs::remove_dir_all(&root);
+        root.remove();
+    }
+
+    #[test]
+    fn authorized_sidecar_reads_actual_path_without_second_find() {
+        let root = temp_dir("lyric-authorized");
+        let audio = touch(&root, "song.mp3");
+        // 二次 find 会命中的同名文件：内容故意不同，用来证明 reader 没有重新找。
+        write_owned(root.join("song.lrc"), "[00:01.00]二次 find 会读到").expect("写同名 .lrc");
+        // 授权时确认的实际文件：名字不同，只有显式传入的路径才会被读到。
+        let authorized = root.join("authorized.lrc");
+        write_owned(&authorized, "[00:02.00]授权时确认的实际文件").expect("写授权 .lrc");
+
+        let found = read_authorized_sidecar(&audio, Some(&authorized)).expect("应读到授权路径");
+        assert_eq!(found.text, "[00:02.00]授权时确认的实际文件");
+        assert_eq!(found.source, LYRIC_SOURCE_SIDECAR);
+        assert!(
+            found
+                .path
+                .as_deref()
+                .is_some_and(|p| p.ends_with("authorized.lrc")),
+            "应记录实际读取的旁挂路径：{:?}",
+            found.path
+        );
+        // 没有旁挂时退回内嵌标签，而不是偷偷再 find 同名 .lrc（不是有效音频 → None）。
+        assert!(read_authorized_sidecar(&audio, None).is_none());
+        root.remove();
     }
 
     // ---------- 拖拽 / 命令行带入的条目（2026-10-19） ----------
@@ -1913,12 +2089,12 @@ mod tests {
     fn scan_files_keeps_order_and_reports_skipped() {
         let root = temp_dir("scan-files");
         let album = root.join("album");
-        std::fs::create_dir_all(&album).expect("建专辑目录");
+        create_owned_dir(&album);
         let in_album = touch(&album, "c.ogg");
         let song = touch(&root, "a.flac");
         let text = touch(&root, "readme.txt");
         let empty = root.join("empty");
-        std::fs::create_dir_all(&empty).expect("建空目录");
+        create_owned_dir(&empty);
         let missing = root.join("不存在.mp3");
 
         let arg = |p: &Path| p.to_string_lossy().into_owned();
@@ -1948,7 +2124,7 @@ mod tests {
             "跳过项要如实回传，界面才能提示「N 个条目没打开」"
         );
 
-        let _ = std::fs::remove_dir_all(&root);
+        root.remove();
     }
 
     #[test]
@@ -1957,8 +2133,8 @@ mod tests {
         let root = temp_dir("watch-subtree");
         let keep = root.join("keep");
         let drop = root.join("drop");
-        std::fs::create_dir_all(&keep).unwrap();
-        std::fs::create_dir_all(&drop).unwrap();
+        create_owned_dir(&keep);
+        create_owned_dir(&drop);
         touch(&keep, "a.flac");
         touch(&drop, "b.flac");
         touch(&drop, "c.flac");
@@ -1967,11 +2143,8 @@ mod tests {
         assert_eq!(query_local_tracks(&conn).unwrap().len(), 3);
 
         // 整目录被删：它下面的曲目一起清掉，兄弟目录不受牵连
-        let removed = crate::db::store::delete_local_tracks_under(
-            &conn,
-            &drop.to_string_lossy(),
-        )
-        .unwrap();
+        let removed =
+            crate::db::store::delete_local_tracks_under(&conn, &drop.to_string_lossy()).unwrap();
         assert_eq!(removed, 2);
         let left: Vec<String> = query_local_tracks(&conn)
             .unwrap()
@@ -1979,12 +2152,15 @@ mod tests {
             .map(|t| t.id)
             .collect();
         assert_eq!(left.len(), 1);
-        assert!(left[0].contains("keep"), "兄弟目录里的曲目不该被清掉: {left:?}");
+        assert!(
+            left[0].contains("keep"),
+            "兄弟目录里的曲目不该被清掉: {left:?}"
+        );
 
         // 前缀过短（盘符根）拒绝清理，防一次误调用清空整盘记录
         let guard = crate::db::store::delete_local_tracks_under(&conn, "F:").unwrap();
         assert_eq!(guard, 0);
 
-        let _ = std::fs::remove_dir_all(&root);
+        root.remove();
     }
 }

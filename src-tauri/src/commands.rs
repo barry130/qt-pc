@@ -4,10 +4,11 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::astral::AuthSession;
 use crate::audio::engine::AudioCmd;
 use crate::audio::fx::{EqParams, FadeParams, FxState};
+use crate::audio::play_intent::QueueCommitReply;
 use crate::audio::state::PlayMode;
+use crate::credential_store::SessionStatus;
 use crate::download::{self, DownloadJob, DownloadManager};
 use crate::provider::types::{Quality, Track};
 use crate::provider::url_cache::PlayUrlCache;
@@ -64,9 +65,8 @@ const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 /// 第二波（代理）：走 net_config 的代际缓存 —— 用户改代理后 generation 失配，
 /// 下一次请求在锁外重建客户端（对**下一次音源请求**生效，不打断当前播放）。
 /// 返回值改为按值 clone（reqwest::Client 是 Arc 句柄，调用点无感）。
-static SOURCE_BUILTIN_CLIENT_CACHE: std::sync::OnceLock<
-    std::sync::RwLock<(u64, reqwest::Client)>,
-> = std::sync::OnceLock::new();
+static SOURCE_BUILTIN_CLIENT_CACHE: std::sync::OnceLock<std::sync::RwLock<(u64, reqwest::Client)>> =
+    std::sync::OnceLock::new();
 
 fn source_builtin_client() -> reqwest::Client {
     crate::net_config::shared_async_client(&SOURCE_BUILTIN_CLIENT_CACHE, || {
@@ -101,10 +101,46 @@ fn source_builtin_manual_client() -> reqwest::Client {
     })
 }
 
-/// builtin_request 的可直调实现（供命令与测试共用）
+/// The final HTTP builder boundary; URL/method/response policy remains shared below.
+pub trait SourceBuiltinTransport: Sync {
+    fn request(
+        &self,
+        method: reqwest::Method,
+        target: &reqwest::Url,
+        manual_redirect: bool,
+    ) -> Result<reqwest::RequestBuilder, String>;
+}
+
+struct LiveSourceBuiltinTransport;
+
+impl SourceBuiltinTransport for LiveSourceBuiltinTransport {
+    fn request(
+        &self,
+        method: reqwest::Method,
+        target: &reqwest::Url,
+        manual_redirect: bool,
+    ) -> Result<reqwest::RequestBuilder, String> {
+        let client = if manual_redirect {
+            source_builtin_manual_client()
+        } else {
+            source_builtin_client()
+        };
+        Ok(client.request(method, target.as_str()))
+    }
+}
+
+/// builtin_request 的可直调实现（供命令与测试共用）。
 pub(crate) async fn source_builtin_request(
     url: &str,
     options: Option<&SourceRequestOptions>,
+) -> Result<SourceResponse, String> {
+    source_builtin_request_with_transport(url, options, &LiveSourceBuiltinTransport).await
+}
+
+pub async fn source_builtin_request_with_transport(
+    url: &str,
+    options: Option<&SourceRequestOptions>,
+    transport: &impl SourceBuiltinTransport,
 ) -> Result<SourceResponse, String> {
     // 音源脚本可能来自第三方音源包，URL 由脚本自己拼装：先把"本机能被指使去访问什么"
     // 收敛到公网 http(s)。原实现原样发出去，脚本可以让本机去打 127.0.0.1 的端口
@@ -128,16 +164,13 @@ pub(crate) async fn source_builtin_request(
         .and_then(|o| o.redirect.as_deref())
         .map(|v| v.eq_ignore_ascii_case("manual"))
         .unwrap_or(false);
-    let mut req = (if manual_redirect {
-        source_builtin_manual_client()
-    } else {
-        source_builtin_client()
-    })
-    .request(
-        reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?,
-        target.as_str(),
-    )
-    .timeout(timeout);
+    let mut req = transport
+        .request(
+            reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| e.to_string())?,
+            &target,
+            manual_redirect,
+        )?
+        .timeout(timeout);
     if let Some(headers) = options.and_then(|o| o.headers.as_ref()) {
         for (key, value) in headers {
             req = req.header(key, value);
@@ -336,11 +369,14 @@ pub async fn cmd_play_track(
     state: State<'_, AppState>,
     track: Track,
     quality: Quality,
-) -> Result<(), ProviderError> {
-    state.engine.send(AudioCmd::PlayTrack(Box::new(track.clone())));
-    // 取址链路在 PlayTrack 内（play_queue_track）；quality 仅作缓存键一致性
+    play_intent: Option<u64>,
+) -> Result<QueueCommitReply, String> {
+    // Preserve the existing quality contract; resolution uses engine preferences.
     let _ = quality;
-    Ok(())
+    state
+        .engine
+        .play_track_with_receipt(track, play_intent)
+        .await
 }
 
 /// 设置「默认播放音质」（设置页入口，DESIGN §7.3）：写进 settings 重启后保持，
@@ -377,8 +413,22 @@ pub async fn cmd_set_source_qualities(
         let quality = Quality::parse(&q).ok_or_else(|| format!("未知音质: {q}"))?;
         parsed.insert(platform, quality);
     }
-    state.engine.send(AudioCmd::SetSourceQualities { qualities: parsed });
+    state
+        .engine
+        .send(AudioCmd::SetSourceQualities { qualities: parsed });
     Ok(())
+}
+
+/// Register a caller-owned manual play ticket before frontend preparation/awaits.
+#[tauri::command(rename = "begin_play_intent")]
+pub fn cmd_begin_play_intent(state: State<'_, AppState>) -> u64 {
+    state.engine.begin_play_intent()
+}
+
+/// Idempotent finally: only this still-pending ticket may be abandoned.
+#[tauri::command(rename = "abandon_play_intent")]
+pub fn cmd_abandon_play_intent(state: State<'_, AppState>, play_intent: u64) {
+    state.engine.abandon_play_intent(play_intent);
 }
 
 /// 列表入队并播放 startIndex（DESIGN §11.2 play_queue）
@@ -391,47 +441,63 @@ pub async fn cmd_play_queue(
     state: State<'_, AppState>,
     tracks: Vec<Track>,
     start_index: u32,
-) -> Result<(), String> {
-    if tracks.is_empty() {
-        return Err("队列为空".into());
-    }
-    let (tracks, index) = match state.db.clone() {
-        Some(db) => {
-            let start = start_index as usize;
-            tauri::async_runtime::spawn_blocking(move || {
-                db.with(|conn| crate::db::store::filter_disliked_tracks(conn, tracks, start))
-            })
-            .await
-            // 屏蔽判定失败不该让用户播不了歌：退化成原样入队
-            .map_err(|e| format!("过滤屏蔽列表失败: {e}"))
-            .unwrap_or_else(|_| Ok((Vec::new(), 0)))
-            .unwrap_or_else(|_| (Vec::new(), 0))
-        }
-        None => (tracks, start_index as usize),
-    };
-    if tracks.is_empty() {
-        return Err("队列为空".into());
-    }
-    state.engine.send(AudioCmd::SetQueue { tracks, index });
-    Ok(())
+    play_intent: Option<u64>,
+) -> Result<QueueCommitReply, String> {
+    let db = state.db.clone();
+    state
+        .engine
+        .queue_after_filter(
+            tracks,
+            start_index as usize,
+            play_intent,
+            move |tracks, index| async move {
+                let filtered = match db {
+                    Some(db) => {
+                        tauri::async_runtime::spawn_blocking(move || {
+                            db.with(|conn| {
+                                crate::db::store::filter_disliked_tracks(conn, tracks, index)
+                            })
+                        })
+                        .await
+                        // Preserve the existing DB-filter failure behavior in this intent slice.
+                        .map_err(|e| format!("过滤屏蔽列表失败: {e}"))
+                        .unwrap_or_else(|_| Ok((Vec::new(), 0)))
+                        .unwrap_or_else(|_| (Vec::new(), 0))
+                    }
+                    None => (tracks, index),
+                };
+                Ok(filtered)
+            },
+        )
+        .await
 }
 
 #[tauri::command(rename = "play_at")]
-pub async fn cmd_play_at(state: State<'_, AppState>, index: u32) -> Result<(), String> {
-    state.engine.send(AudioCmd::PlayAt(index as usize));
-    Ok(())
+pub async fn cmd_play_at(
+    state: State<'_, AppState>,
+    index: u32,
+    play_intent: Option<u64>,
+) -> Result<QueueCommitReply, String> {
+    state
+        .engine
+        .play_at_with_receipt(index as usize, play_intent)
+        .await
 }
 
 #[tauri::command(rename = "next")]
-pub async fn cmd_next(state: State<'_, AppState>) -> Result<(), String> {
-    state.engine.send(AudioCmd::Next);
-    Ok(())
+pub async fn cmd_next(
+    state: State<'_, AppState>,
+    play_intent: Option<u64>,
+) -> Result<QueueCommitReply, String> {
+    state.engine.next_with_receipt(play_intent).await
 }
 
 #[tauri::command(rename = "previous")]
-pub async fn cmd_previous(state: State<'_, AppState>) -> Result<(), String> {
-    state.engine.send(AudioCmd::Previous);
-    Ok(())
+pub async fn cmd_previous(
+    state: State<'_, AppState>,
+    play_intent: Option<u64>,
+) -> Result<QueueCommitReply, String> {
+    state.engine.previous_with_receipt(play_intent).await
 }
 
 #[tauri::command(rename = "set_play_mode")]
@@ -538,64 +604,55 @@ pub async fn cmd_get_playback_state(
 pub async fn cmd_restore_last_session(
     state: State<'_, AppState>,
 ) -> Result<Option<crate::audio::state::PlaybackStateSnapshot>, String> {
-    // 引擎已有现场（比如正在播放）→ 直接回当前快照，**绝不**再发 RestoreSession
-    // 把它替换成暂停态。WebView 重挂/重载时前端会重调本命令，
-    // 之前版本会因此把播放中的歌打断并回一个"未在播放"的空快照。
-    let current = state.engine.snapshot();
-    if current.track_id.is_some() {
-        return Ok(Some(current));
-    }
-    let Some(db) = &state.db else {
-        return Ok(None);
-    };
-    let Some(session) = db.with(crate::db::store::load_session)? else {
-        return Ok(None);
-    };
-    let s = &session.state;
-    // 历史版本存过 "sequence"（顺序播放，已删除）：读不出来就回落列表循环，
-    // 老库不该因为一个已下线的枚举值启动失败。
-    let play_mode: PlayMode =
-        serde_json::from_value(serde_json::json!(s.play_mode)).unwrap_or(PlayMode::ListLoop);
-    // 音质档位由音源包声明，宿主不再持有白名单：只拒绝读不出来的空值。
-    let quality: Quality = Quality::parse(&s.quality).unwrap_or_default();
-    // 引擎应装上的那一曲（RestoreSession 处理完 track_id 就位）
-    let expected_track = session.tracks.get(s.index).map(|t| t.id.clone());
-    state.engine.send(AudioCmd::RestoreSession {
-        tracks: session.tracks,
-        index: s.index,
-        position_ms: s.position_ms,
-        play_mode,
-        volume: s.volume.clamp(0.0, 1.0),
-        muted: s.muted,
-        quality,
-    });
-    // mpsc 是异步的：这里**立刻** snapshot 会拿到 track=null 的默认快照，
-    // 前端拿它 applySnapshot 会把引擎刚推的带曲目事件盖掉 ——
-    // 播放条从此停在「未在播放」而音频其实在响。等引擎把当前曲装上再回。
-    let engine = state.engine.clone();
-    let snap = tauri::async_runtime::spawn_blocking(move || {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-        loop {
-            let cur = engine.snapshot();
-            let loaded = match &expected_track {
-                Some(id) => cur.track_id.as_deref() == Some(id.as_str()),
-                None => true,
+    let db = state.db.clone();
+    // The public engine seam captures read-only eligibility before this loader runs.
+    state
+        .engine
+        .restore_after_load(move || async move {
+            let Some(db) = db else {
+                return Ok(None);
             };
-            if loaded || std::time::Instant::now() >= deadline {
-                break cur;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    })
-    .await
-    .map_err(|e| format!("等待恢复播放现场失败: {e}"))?;
-    Ok(Some(snap))
+            let session = tauri::async_runtime::spawn_blocking(move || {
+                db.with(crate::db::store::load_session)
+            })
+            .await
+            .map_err(|e| format!("读取恢复播放现场失败: {e}"))??;
+            let Some(session) = session else {
+                return Ok(None);
+            };
+            let s = session.state;
+            // Removed legacy modes still fall back to list-loop, without widening qualities.
+            let play_mode = serde_json::from_value(serde_json::json!(s.play_mode))
+                .unwrap_or(PlayMode::ListLoop);
+            let quality = Quality::parse(&s.quality).unwrap_or_default();
+            Ok(Some(crate::audio::playback_commit::RestoredPlayback {
+                tracks: session.tracks,
+                index: s.index,
+                position_ms: s.position_ms,
+                play_mode,
+                volume: s.volume.clamp(0.0, 1.0),
+                muted: s.muted,
+                quality,
+            }))
+        })
+        .await
 }
 
 #[tauri::command(rename = "pause")]
-pub async fn cmd_pause(state: State<'_, AppState>) -> Result<(), String> {
-    state.engine.send(AudioCmd::Pause);
-    Ok(())
+pub async fn cmd_pause(
+    state: State<'_, AppState>,
+    target: Option<crate::audio::play_intent::PlayTarget>,
+) -> Result<(), String> {
+    if let Some(target) = target {
+        state
+            .engine
+            .set_source_paused(&target, true)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    } else {
+        state.engine.send(AudioCmd::Pause);
+        Ok(())
+    }
 }
 
 #[tauri::command(rename = "resume")]
@@ -611,18 +668,55 @@ pub async fn cmd_stop(state: State<'_, AppState>) -> Result<(), String> {
 }
 
 #[tauri::command(rename = "seek")]
-pub async fn cmd_seek(state: State<'_, AppState>, position_ms: u64) -> Result<(), String> {
-    state.engine.send(AudioCmd::Seek(position_ms));
-    Ok(())
+pub async fn cmd_seek(
+    state: State<'_, AppState>,
+    position_ms: u64,
+    target: Option<crate::audio::play_intent::PlayTarget>,
+) -> Result<(), String> {
+    if let Some(target) = target {
+        let original = state
+            .engine
+            .begin_source_seek(&target, position_ms)
+            .map_err(|e| e.to_string())?;
+        original.wait().await.map(|_| ()).map_err(|e| e.to_string())
+    } else {
+        state.engine.send(AudioCmd::Seek(position_ms));
+        Ok(())
+    }
 }
 
 // ---------- 倍速 / 睡眠定时 / 音效（EQ / 响度归一化 / 淡入淡出） ----------
 
-/// 改播放倍速（0.5 ~ 2.0，引擎侧夹紧）。立即对当前曲目生效并持久化。
+/// 无目标时全局调速并沿既有 actor 路径持久化（0.5 ~ 2.0，引擎侧夹紧）。
+/// 带 target 时只提交原音源速度；失效返回错误，不发送无目标传输／持久化命令。
+/// 原票作用域不能通过成功验证升级成对其他 current/reserved 音源的全局控制。
 #[tauri::command(rename = "set_speed")]
-pub async fn cmd_set_speed(state: State<'_, AppState>, speed: f32) -> Result<(), String> {
-    state.engine.send(AudioCmd::SetSpeed(speed));
+pub async fn cmd_set_speed(
+    state: State<'_, AppState>,
+    speed: f32,
+    target: Option<crate::audio::play_intent::PlayTarget>,
+) -> Result<(), String> {
+    if let Some(pending) = set_speed_for_target(&state.engine, speed, target.as_ref())? {
+        pending.wait().await?;
+    }
     Ok(())
+}
+
+/// Shared production adapter: Some returns its original persistence receipt, None
+/// remains an explicit Native global transport. Awaiting must never recapture a source.
+pub fn set_speed_for_target(
+    engine: &crate::audio::engine::AudioEngine,
+    speed: f32,
+    target: Option<&crate::audio::play_intent::PlayTarget>,
+) -> Result<Option<crate::audio::engine::SpeedSettingPending>, String> {
+    if engine.dlna_manager().selected().is_some() {
+        return Err("DLNA 投屏不支持倍速播放".into());
+    }
+    if let Some(target) = target {
+        return engine.begin_source_speed_setting(target, speed).map(Some);
+    }
+    engine.send(AudioCmd::SetSpeed(speed));
+    Ok(None)
 }
 
 /// 无缝播放开关：引擎立即应用并持久化，下次启动恢复。
@@ -658,7 +752,9 @@ pub async fn cmd_set_local_first(state: State<'_, AppState>, enabled: bool) -> R
     };
     let v = if enabled { "true" } else { "false" };
     tauri::async_runtime::spawn_blocking(move || {
-        db.with(|c| crate::db::store::set_setting(c, crate::settings_keys::SETTING_PLAY_LOCAL_FIRST, v))
+        db.with(|c| {
+            crate::db::store::set_setting(c, crate::settings_keys::SETTING_PLAY_LOCAL_FIRST, v)
+        })
     })
     .await
     .map_err(|e| format!("写入本地优先开关失败: {e}"))??;
@@ -685,32 +781,45 @@ pub struct LocalFileHit {
 /// 「未命中本地」而不是编一个地址出来。
 #[tauri::command(rename = "resolve_local_file")]
 pub async fn cmd_resolve_local_file(
+    window: tauri::WebviewWindow,
     state: State<'_, AppState>,
     track: Track,
 ) -> Result<Option<LocalFileHit>, String> {
-    // 本地曲目本身就是文件：`id` 即绝对路径（CUE 分轨带 `#start-end` 后缀，
-    // 去后缀口径与引擎的 Local 分支一致），不必再走解析链。
-    if track.platform.is_local() {
-        let path = crate::cue::strip_cue_suffix(&track.id).to_string();
-        if std::path::Path::new(&path).exists() {
-            return Ok(Some(LocalFileHit {
-                path,
-                kind: "local".to_string(),
-            }));
-        }
-        return Ok(None);
-    }
-    let Some(db) = state.db.clone() else {
-        return Ok(None);
+    let lyrics = window.label() == crate::lyric_window::LYRIC_WINDOW_LABEL;
+    let track = if lyrics {
+        let current = state.engine.snapshot().track;
+        crate::lyric_access::authorized_track(current.as_ref(), &track)
+            .map_err(|error| error.to_string())?
+    } else {
+        track
     };
-    Ok(
-        crate::local_first::find_online_local_file(&db, &track)
-            .await
-            .map(|hit| LocalFileHit {
-                path: hit.path,
-                kind: hit.kind.to_string(),
-            }),
-    )
+    let hit = resolve_track_local_file(&state, &track).await;
+    if lyrics {
+        // 本地优先查询可能等待数据库：返回前仍须属于同一条正在播放的曲目。
+        crate::lyric_access::authorized_track(state.engine.snapshot().track.as_ref(), &track)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(hit)
+}
+
+/// 两个歌词命令共享可信解析链；歌词窗口传入的 Track 必须先替换成原生快照。
+async fn resolve_track_local_file(state: &AppState, track: &Track) -> Option<LocalFileHit> {
+    if track.platform.is_local() {
+        let path = crate::cue::strip_cue_suffix(&track.id).to_owned();
+        return std::path::Path::new(&path)
+            .exists()
+            .then_some(LocalFileHit {
+                path,
+                kind: String::from("local"),
+            });
+    }
+    let db = state.db.as_ref()?;
+    crate::local_first::find_online_local_file(db, track)
+        .await
+        .map(|hit| LocalFileHit {
+            path: hit.path,
+            kind: hit.kind.to_owned(),
+        })
 }
 
 /// 武装 / 取消睡眠定时。`remainingMs` = 倒计时剩余毫秒（None = 取消）；
@@ -1076,9 +1185,7 @@ pub async fn cmd_set_appearance(
     let Some(db) = &state.db else {
         return Ok(()); // 数据库不可用时只保持本次会话内存值
     };
-    db.with(|c| {
-        crate::db::store::set_setting(c, crate::settings_keys::SETTING_APPEARANCE, &json)
-    })
+    db.with(|c| crate::db::store::set_setting(c, crate::settings_keys::SETTING_APPEARANCE, &json))
 }
 
 fn default_appearance() -> serde_json::Value {
@@ -1270,10 +1377,7 @@ pub async fn cmd_run_update_installer(app: tauri::AppHandle, path: String) -> Re
 /// 浏览器下载（AppImage/deb/dmg 手动覆盖），不走本命令。
 #[cfg(not(target_os = "windows"))]
 #[tauri::command(rename = "run_update_installer")]
-pub async fn cmd_run_update_installer(
-    _app: tauri::AppHandle,
-    _path: String,
-) -> Result<(), String> {
+pub async fn cmd_run_update_installer(_app: tauri::AppHandle, _path: String) -> Result<(), String> {
     Err("当前平台不支持应用内自动安装，请从下载页手动更新".to_string())
 }
 
@@ -1438,9 +1542,7 @@ pub async fn cmd_astral_reply_feedback(
 // 前端不能直连后端（CSP 只允许 self/ipc），每个接口都要一个命令转一手。
 
 #[tauri::command(rename = "astral_ai_agents")]
-pub async fn cmd_astral_ai_agents(
-    state: State<'_, AppState>,
-) -> Result<serde_json::Value, String> {
+pub async fn cmd_astral_ai_agents(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
     state.astral.ai_agents().await
 }
 
@@ -1915,10 +2017,7 @@ pub async fn cmd_list_dislikes(
 ///
 /// 写完后推一条 `ReloadDislikes` 给引擎：它在「下一首」里要绕开这首。
 #[tauri::command(rename = "add_dislike_song")]
-pub async fn cmd_add_dislike_song(
-    state: State<'_, AppState>,
-    track: Track,
-) -> Result<i64, String> {
+pub async fn cmd_add_dislike_song(state: State<'_, AppState>, track: Track) -> Result<i64, String> {
     let Some(db) = state.db.clone() else {
         return Ok(0);
     };
@@ -1975,10 +2074,7 @@ pub async fn cmd_remove_dislike_singer(
 
 /// 取消屏蔽（按规则 id 逐条删除 —— LX 的 dislike_list 做不到这件事）。
 #[tauri::command(rename = "remove_dislike_rule")]
-pub async fn cmd_remove_dislike_rule(
-    state: State<'_, AppState>,
-    id: i64,
-) -> Result<bool, String> {
+pub async fn cmd_remove_dislike_rule(state: State<'_, AppState>, id: i64) -> Result<bool, String> {
     let Some(db) = state.db.clone() else {
         return Ok(false);
     };
@@ -2123,12 +2219,14 @@ pub async fn cmd_purge_missing_local_tracks(state: State<'_, AppState>) -> Resul
 pub async fn cmd_get_local_cover(path: String) -> Result<Option<String>, String> {
     use base64::Engine as _;
     tauri::async_runtime::spawn_blocking(move || {
-        crate::local::read_cover(std::path::Path::new(crate::cue::strip_cue_suffix(&path))).map(|(mime, bytes)| {
-            format!(
-                "data:{mime};base64,{}",
-                base64::engine::general_purpose::STANDARD.encode(bytes)
-            )
-        })
+        crate::local::read_cover(std::path::Path::new(crate::cue::strip_cue_suffix(&path))).map(
+            |(mime, bytes)| {
+                format!(
+                    "data:{mime};base64,{}",
+                    base64::engine::general_purpose::STANDARD.encode(bytes)
+                )
+            },
+        )
     })
     .await
     .map_err(|e| format!("读取封面失败: {e}"))
@@ -2151,20 +2249,60 @@ pub struct LocalLyricDto {
 /// 三种情况：拖进来还没入库的文件、扫描之后才放进来的 `.lrc`、以及用户改了 `.lrc` 内容。
 /// 与 `get_local_cover` 同一套路：纯读盘，不碰数据库。
 #[tauri::command(rename = "read_local_lyric")]
-pub async fn cmd_read_local_lyric(path: String) -> Result<Option<LocalLyricDto>, String> {
+pub async fn cmd_read_local_lyric(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+    path: String,
+) -> Result<Option<LocalLyricDto>, String> {
     // 子轨时间轴从零开始；整轨旁挂/内嵌歌词尚未分割，不能直接复用。
     if crate::cue::strip_cue_suffix(&path) != path {
         return Ok(None);
     }
+    let trusted = if window.label() == crate::lyric_window::LYRIC_WINDOW_LABEL {
+        let track = state
+            .engine
+            .snapshot()
+            .track
+            .ok_or_else(|| crate::lyric_access::LyricAccessError::NoCurrentTrack.to_string())?;
+        if crate::cue::strip_cue_suffix(&track.id) != track.id {
+            return Ok(None);
+        }
+        let hit = resolve_track_local_file(&state, &track)
+            .await
+            .ok_or_else(|| {
+                crate::lyric_access::LyricAccessError::TrustedAudioUnavailable.to_string()
+            })?;
+        crate::lyric_access::authorized_track(state.engine.snapshot().track.as_ref(), &track)
+            .map_err(|error| error.to_string())?;
+        Some(hit.path)
+    } else {
+        None
+    };
     tauri::async_runtime::spawn_blocking(move || {
-        crate::local::read_local_lyric(std::path::Path::new(&path)).map(|found| LocalLyricDto {
+        let found = match trusted {
+            Some(trusted) => {
+                let audio = crate::lyric_access::authorized_audio(
+                    std::path::Path::new(&trusted),
+                    std::path::Path::new(&path),
+                )
+                .map_err(|error| error.to_string())?;
+                let sidecar = crate::local::find_lrc_sidecar(&audio)
+                    .map(|sidecar| crate::lyric_access::authorized_sidecar(&audio, &sidecar))
+                    .transpose()
+                    .map_err(|error| error.to_string())?;
+                // 只读取已检查的实际侧挂路径，不能再次 find 选出另一个文件。
+                crate::local::read_authorized_sidecar(&audio, sidecar.as_deref())
+            }
+            None => crate::local::read_local_lyric(std::path::Path::new(&path)),
+        };
+        Ok::<_, String>(found.map(|found| LocalLyricDto {
             lrc: found.text,
-            source: found.source.to_string(),
+            source: found.source.to_owned(),
             path: found.path,
-        })
+        }))
     })
     .await
-    .map_err(|e| format!("读取本地歌词失败: {e}"))
+    .map_err(|e| format!("读取本地歌词失败: {e}"))?
 }
 
 /// 「外部打开」的结果：可直接入队播放的曲目 + 没能打开的入参。
@@ -2197,9 +2335,10 @@ pub async fn cmd_open_local_paths(
         });
     }
     // 扫描要读标签 / 试解码，放 blocking 线程；与 cmd_scan_library 同一取舍
-    let (rows, skipped) = tauri::async_runtime::spawn_blocking(move || crate::local::scan_files(&paths))
-        .await
-        .map_err(|e| format!("打开本地文件失败: {e}"))?;
+    let (rows, skipped) =
+        tauri::async_runtime::spawn_blocking(move || crate::local::scan_files(&paths))
+            .await
+            .map_err(|e| format!("打开本地文件失败: {e}"))?;
 
     let tracks: Vec<Track> = rows
         .iter()
@@ -2439,18 +2578,26 @@ pub async fn cmd_add_favorite(
     let Some(db) = state.db.clone() else {
         return Ok(());
     };
+    let epoch = state.astral.session_epoch();
     // 闭包要 move 走一份，推送还得用原值
     let for_db = track.clone();
     let target = pid.clone();
+    let guard = state.astral.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| {
-            crate::db::store::add_tracks_to_playlist(conn, &target, std::slice::from_ref(&for_db))
+        guard.with_session_epoch(epoch, || {
+            db.with(|conn| {
+                crate::db::store::add_tracks_to_playlist(
+                    conn,
+                    &target,
+                    std::slice::from_ref(&for_db),
+                )
+            })
         })
     })
     .await
     .map_err(|e| format!("收藏失败: {e}"))?;
     result.map_err(|e| format!("收藏失败: {e}"))?;
-    push_like_song(&state, &track, "add", Some(&pid)).await;
+    push_like_song(&state, epoch, &track, "add", Some(&pid)).await;
     Ok(())
 }
 
@@ -2467,20 +2614,24 @@ pub async fn cmd_remove_favorite(
     let Some(db) = state.db.clone() else {
         return Ok(());
     };
+    let epoch = state.astral.session_epoch();
     let for_db = track.clone();
     let target = pid.clone();
+    let guard = state.astral.clone();
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| crate::db::store::remove_liked_song(conn, &for_db, target.as_deref()))
+        guard.with_session_epoch(epoch, || {
+            db.with(|conn| crate::db::store::remove_liked_song(conn, &for_db, target.as_deref()))
+        })
     })
     .await
     .map_err(|e| format!("取消收藏失败: {e}"))?
     .map_err(|e| format!("取消收藏失败: {e}"))?;
     match outcome {
         crate::db::store::LikeRemoveOutcome::RemovedAll => {
-            push_like_song(&state, &track, "remove", None).await;
+            push_like_song(&state, epoch, &track, "remove", None).await;
         }
         crate::db::store::LikeRemoveOutcome::Rebound(next) => {
-            push_like_song(&state, &track, "add", Some(&next)).await;
+            push_like_song(&state, epoch, &track, "add", Some(&next)).await;
         }
         crate::db::store::LikeRemoveOutcome::DetachedOnly => {}
     }
@@ -2519,6 +2670,7 @@ fn primary_music_id(music_id: Option<&str>) -> Option<&str> {
 /// `pid` = 歌曲在本地归属的歌单 id，add 时上送云端落库（后端 like/song 新增可选字段）。
 async fn push_like_song(
     state: &State<'_, AppState>,
+    epoch: u64,
     track: &Track,
     action: &str,
     pid: Option<&str>,
@@ -2542,11 +2694,17 @@ async fn push_like_song(
     };
     // 请求体先序列化好再上送：失败时离线队列存的就是它（与上送内容一字不差）
     let queued_body = crate::astral::like_song_body_for_queue(&payload);
-    if let Err(e) = state.astral.like_song(payload).await {
+    if let Err(e) = state.astral.like_song_for_epoch(epoch, payload).await {
         // 失败入队：同目标键只留最新操作，断网重放后即最终状态
-        enqueue_like_op_on_error(state, "song", action, &platform, &track.id, move || {
-            queued_body
-        });
+        enqueue_like_op_on_error(
+            state,
+            epoch,
+            "song",
+            action,
+            &platform,
+            &track.id,
+            move || queued_body,
+        );
         log::warn!("[like] 推送收藏({action})失败，已入离线队列: {e}");
     }
 }
@@ -2560,6 +2718,7 @@ const LIKE_BATCH_LIMIT: usize = 200;
 /// 本地仍是权威：同步失败不影响收藏本身。
 async fn push_like_songs_batch(
     state: &State<'_, AppState>,
+    epoch: u64,
     items: Vec<(Track, String, Option<String>)>,
 ) {
     if items.is_empty() || !state.astral.has_token() {
@@ -2590,13 +2749,21 @@ async fn push_like_songs_batch(
                 crate::astral::like_song_body_for_queue(&payload),
             ));
         }
-        if let Err(e) = state.astral.like_batch(ops).await {
+        if let Err(e) = state.astral.like_batch_for_epoch(epoch, ops).await {
             log::warn!(
                 "[like] 批量推送收藏失败 {} 条，整批入离线队列: {e}",
                 queued.len()
             );
             for (action, platform, sid, body) in queued {
-                enqueue_like_op_on_error(state, "song", &action, &platform, &sid, move || body);
+                enqueue_like_op_on_error(
+                    state,
+                    epoch,
+                    "song",
+                    &action,
+                    &platform,
+                    &sid,
+                    move || body,
+                );
             }
         }
     }
@@ -2605,6 +2772,7 @@ async fn push_like_songs_batch(
 /// 推送失败时的统一入队：写库失败本身只打日志（本地收藏不能被同步问题阻塞）。
 fn enqueue_like_op_on_error(
     state: &State<'_, AppState>,
+    epoch: u64,
     kind: &str,
     action: &str,
     platform: &str,
@@ -2617,8 +2785,11 @@ fn enqueue_like_op_on_error(
     let target_key = format!("{kind}:{platform}:{target_id}");
     let payload_json = build_payload();
     let (k, a) = (kind.to_string(), action.to_string());
-    if let Err(e) = db.with(move |conn| {
-        crate::db::store::enqueue_pending_like_op(conn, &k, &a, &target_key, &payload_json)
+    if let Err(e) = state.astral.with_like_session_epoch(epoch, || {
+        db.with(move |conn| {
+            crate::db::store::enqueue_pending_like_op(conn, &k, &a, &target_key, &payload_json)
+        })
+        .map_err(|e| format!("离线队列入队失败: {e}"))
     }) {
         log::warn!("[like] 离线队列入队失败: {e}");
     }
@@ -2637,16 +2808,43 @@ pub async fn cmd_favorite_playlist(
     let Some(db) = state.db.clone() else {
         return Ok(());
     };
-    let pic = pic_url.clone().unwrap_or_default();
+    let epoch = state.astral.session_epoch();
+    let pic = pic_url.clone();
     let count = play_count.unwrap_or_default();
     let (p, pid, title) = (platform.clone(), id.clone(), name.clone());
+    let guard = state.astral.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| crate::db::store::add_liked_playlist(conn, &p, &pid, &title, &pic, &count))
+        guard.with_session_epoch(epoch, || {
+            db.with(|conn| {
+                crate::playlist_cloud::prepare_playlist_metadata(conn, &p, &pid, |conn| {
+                    crate::db::store::add_liked_playlist(
+                        conn,
+                        &p,
+                        &pid,
+                        &title,
+                        pic.as_deref(),
+                        &count,
+                    )
+                })
+            })
+        })
     })
     .await
     .map_err(|e| format!("收藏歌单失败: {e}"))?;
-    result.map_err(|e| format!("收藏歌单失败: {e}"))?;
-    push_like_playlist(&state, &platform, &id, &name, pic_url.as_deref(), "add").await;
+    let (_, permit) = result.map_err(|e| format!("收藏歌单失败: {e}"))?;
+    push_like_playlist(
+        &state,
+        epoch,
+        &platform,
+        &id,
+        PlaylistPushMetadata {
+            name: &name,
+            pic: pic_url.as_deref(),
+        },
+        "add",
+        permit,
+    )
+    .await;
     Ok(())
 }
 
@@ -2662,14 +2860,34 @@ pub async fn cmd_unfavorite_playlist(
     let Some(db) = state.db.clone() else {
         return Ok(());
     };
+    let epoch = state.astral.session_epoch();
     let (p, pid) = (platform.clone(), id.clone());
+    let guard = state.astral.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| crate::db::store::remove_liked_playlist(conn, &p, &pid))
+        guard.with_session_epoch(epoch, || {
+            db.with(|conn| {
+                crate::playlist_cloud::prepare_playlist_metadata(conn, &p, &pid, |conn| {
+                    crate::db::store::remove_liked_playlist(conn, &p, &pid)
+                })
+            })
+        })
     })
     .await
     .map_err(|e| format!("取消收藏歌单失败: {e}"))?;
-    result.map_err(|e| format!("取消收藏歌单失败: {e}"))?;
-    push_like_playlist(&state, &platform, &id, &name, pic_url.as_deref(), "remove").await;
+    let (_, permit) = result.map_err(|e| format!("取消收藏歌单失败: {e}"))?;
+    push_like_playlist(
+        &state,
+        epoch,
+        &platform,
+        &id,
+        PlaylistPushMetadata {
+            name: &name,
+            pic: pic_url.as_deref(),
+        },
+        "remove",
+        permit,
+    )
+    .await;
     Ok(())
 }
 
@@ -2702,31 +2920,60 @@ pub async fn cmd_is_playlist_favorited(
     .map_err(|e| format!("读取收藏状态失败: {e}"))?
 }
 
+struct PlaylistPushMetadata<'a> {
+    name: &'a str,
+    pic: Option<&'a str>,
+}
+
 /// 与 push_like_song 同款：未登录或推送失败都静默，本地收藏不受影响。
 /// 自建歌单（platform=local）add 成功后把服务器 seq 记为云端确认点
 ///（cloud_seq），对账据此识别「他端已删除」（机制 B，v8）。
 async fn push_like_playlist(
     state: &State<'_, AppState>,
+    epoch: u64,
     platform: &str,
     pid: &str,
-    name: &str,
-    pic: Option<&str>,
+    metadata: PlaylistPushMetadata<'_>,
     action: &str,
+    permit: Option<crate::playlist_cloud::PlaylistSyncPermit>,
 ) {
+    let PlaylistPushMetadata { name, pic } = metadata;
     if !state.astral.has_token() {
         return;
     }
-    match state
-        .astral
-        .like_playlist(action, pid, platform, name, pic)
-        .await
-    {
+    let Some(db) = state.db.as_ref() else {
+        return;
+    };
+    let permit = match crate::playlist_cloud::resolve_playlist_permit(permit, || {
+        state.astral.with_session_epoch(epoch, || {
+            db.with(|conn| crate::playlist_cloud::capture_playlist_permit(conn, platform, pid))
+        })
+    }) {
+        Ok(permit) => permit,
+        Err(error) => {
+            log::warn!("[like] 歌单同步资格无法确认，已暂停推送: {error}");
+            return;
+        }
+    };
+    // Construct cloud futures only inside the captured-permission gate.
+    let Some(push) = crate::playlist_cloud::run_if_allowed(permit, || {
+        state
+            .astral
+            .like_playlist_for_epoch(epoch, action, pid, platform, name, pic)
+    }) else {
+        return;
+    };
+    match push.await {
         Ok(seq) => {
             if action == "add" && platform == crate::db::store::LOCAL_PLATFORM {
                 if let Some(db) = state.db.clone() {
                     let p = pid.to_string();
+                    let guard = state.astral.clone();
                     if let Err(e) = tauri::async_runtime::spawn_blocking(move || {
-                        db.with(|conn| crate::db::store::mark_playlist_cloud_seq(conn, &p, seq))
+                        guard.with_like_session_epoch(epoch, || {
+                            db.with(|conn| crate::db::store::mark_playlist_cloud_seq(conn, &p, seq))
+                                .map_err(|e| format!("记录歌单云端确认点失败: {e}"))
+                        })
                     })
                     .await
                     {
@@ -2747,7 +2994,9 @@ async fn push_like_playlist(
                 body["picUrl"] = serde_json::json!(p);
             }
             let body_str = body.to_string();
-            enqueue_like_op_on_error(state, "playlist", action, platform, pid, move || body_str);
+            enqueue_like_op_on_error(state, epoch, "playlist", action, platform, pid, move || {
+                body_str
+            });
             log::warn!("[like] 推送歌单收藏({action})失败，已入离线队列: {e}");
         }
     }
@@ -2810,11 +3059,9 @@ pub async fn cmd_list_history(
     let Some(db) = state.db.clone() else {
         return Ok(Vec::new());
     };
-    tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| crate::db::store::list_play_history(conn, limit))
-    })
-    .await
-    .map_err(|e| format!("读取播放历史失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || db.play_history(limit))
+        .await
+        .map_err(|e| format!("读取播放历史失败: {e}"))?
 }
 
 /// 清空播放历史。
@@ -2920,15 +3167,40 @@ pub async fn cmd_create_playlist(
     let Some(db) = state.db.clone() else {
         return Err("数据库不可用".to_string());
     };
+    let epoch = state.astral.session_epoch();
     let reg_name = name.clone();
-    let pid = tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| crate::db::store::create_playlist(conn, &reg_name))
+    let guard = state.astral.clone();
+    let (pid, permit) = tauri::async_runtime::spawn_blocking(move || {
+        guard.with_session_epoch(epoch, || {
+            db.with(|conn| {
+                let pid = crate::db::store::create_playlist(conn, &reg_name)?;
+                // 新行的 pid 只在 create 后确定；仍在原 State→DB 锁内捕获。
+                let permit = crate::playlist_cloud::capture_playlist_permit(
+                    conn,
+                    crate::db::store::LOCAL_PLATFORM,
+                    &pid,
+                )?;
+                Ok::<_, rusqlite::Error>((pid, permit))
+            })
+        })
     })
     .await
     .map_err(|e| format!("新建歌单失败: {e}"))??;
     // 登记：歌单元数据（名字）只有这里能上送，云端 qt_like_playlist 有
     // (uid, platform, pid) 唯一键，upsert 幂等；失败不阻塞本地建单
-    push_like_playlist(&state, "local", &pid, &name, None, "add").await;
+    push_like_playlist(
+        &state,
+        epoch,
+        "local",
+        &pid,
+        PlaylistPushMetadata {
+            name: &name,
+            pic: None,
+        },
+        "add",
+        Some(permit),
+    )
+    .await;
     Ok(pid)
 }
 
@@ -3029,16 +3301,27 @@ pub async fn cmd_rename_playlist(
     let Some(db) = state.db.clone() else {
         return Ok(());
     };
+    let epoch = state.astral.session_epoch();
     let (for_db, id) = (id.clone(), id);
     let value = name.clone();
-    let touched = tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| {
-            // 远程同步来的本地歌单（云端卡片、无本地行）：先认领成自建行，
-            // 改名才有落处；在线歌单 / 不存在的 pid 认领返回 0，下面统一报错
-            if crate::db::store::adopt_card_playlist(conn, &for_db)? == 0 {
-                return Ok(0usize);
-            }
-            crate::db::store::rename_playlist(conn, &for_db, &value)
+    let guard = state.astral.clone();
+    let (touched, permit) = tauri::async_runtime::spawn_blocking(move || {
+        guard.with_session_epoch(epoch, || {
+            db.with(|conn| {
+                crate::playlist_cloud::prepare_playlist_metadata(
+                    conn,
+                    crate::db::store::LOCAL_PLATFORM,
+                    &for_db,
+                    |conn| {
+                        // 远程同步来的本地歌单（云端卡片、无本地行）：先认领成自建行，
+                        // 改名才有落处；在线歌单 / 不存在的 pid 认领返回 0，下面统一报错
+                        if crate::db::store::adopt_card_playlist(conn, &for_db)? == 0 {
+                            return Ok(0usize);
+                        }
+                        crate::db::store::rename_playlist(conn, &for_db, &value)
+                    },
+                )
+            })
         })
     })
     .await
@@ -3050,7 +3333,19 @@ pub async fn cmd_rename_playlist(
     // 歌单名是云端 qt_like_playlist 的元数据，改名要上送（后端按 pid upsert、
     // 非空覆盖）；不推的话其他端永远显示旧名 —— uniappx 没有改名功能，
     // 这是设计文档 §2 操作表里缺失的一行
-    push_like_playlist(&state, "local", &id, &name, None, "add").await;
+    push_like_playlist(
+        &state,
+        epoch,
+        "local",
+        &id,
+        PlaylistPushMetadata {
+            name: &name,
+            pic: None,
+        },
+        "add",
+        permit,
+    )
+    .await;
     Ok(())
 }
 
@@ -3108,7 +3403,7 @@ pub async fn cmd_set_playlist_cover(
         }
     };
     let covers_dir = crate::app_paths::data_root(&app).join("playlist-covers");
-    let dest = covers_dir.join(format!("{pid}.{mime_ext}"));
+    let epoch = state.astral.session_epoch();
 
     let Some(db) = state.db.clone() else {
         return Err("数据库不可用".to_string());
@@ -3119,8 +3414,11 @@ pub async fn cmd_set_playlist_cover(
     // 拒绝，免得白复制一个文件再删
     let pid_for_adopt = pid.clone();
     let db_for_adopt = db.clone();
+    let guard_adopt = state.astral.clone();
     let adopted = tauri::async_runtime::spawn_blocking(move || {
-        db_for_adopt.with(|conn| crate::db::store::adopt_card_playlist(conn, &pid_for_adopt))
+        guard_adopt.with_session_epoch(epoch, || {
+            db_for_adopt.with(|conn| crate::db::store::adopt_card_playlist(conn, &pid_for_adopt))
+        })
     })
     .await
     .map_err(|e| format!("登记封面失败: {e}"))?
@@ -3129,35 +3427,49 @@ pub async fn cmd_set_playlist_cover(
         return Err("歌单不存在".to_string());
     }
 
-    let (pid_copy, file_path_copy, dest_copy) = (pid.clone(), file_path.clone(), dest.clone());
-    tauri::async_runtime::spawn_blocking(move || {
-        std::fs::create_dir_all(&covers_dir).map_err(|e| format!("创建封面目录失败: {e}"))?;
-        // 新封面扩展名可能与旧的不同：同 pid 其他扩展名的旧文件一并清掉
-        for old_ext in ["png", "jpg", "webp"] {
-            let old = covers_dir.join(format!("{pid_copy}.{old_ext}"));
-            if old != dest_copy {
-                let _ = std::fs::remove_file(&old);
-            }
-        }
-        std::fs::copy(&file_path_copy, &dest_copy).map_err(|e| format!("复制封面文件失败: {e}"))?;
-        Ok::<(), String>(())
+    let db_for_permit = db.clone();
+    // Capture cloud permission before local cover mutation.
+    let pid_for_permit = pid.clone();
+    let guard_permit = state.astral.clone();
+    let permit = tauri::async_runtime::spawn_blocking(move || {
+        guard_permit.with_session_epoch(epoch, || {
+            db_for_permit.with(|conn| {
+                crate::playlist_cloud::capture_playlist_permit(conn, "local", &pid_for_permit)
+            })
+        })
     })
     .await
-    .map_err(|e| format!("复制封面失败: {e}"))??;
+    .map_err(|e| format!("确认歌单同步资格失败: {e}"))?
+    .map_err(|e| format!("确认歌单同步资格失败: {e}"))?;
 
-    let dest_str = dest.to_string_lossy().to_string();
-    let pid_for_register = pid.clone();
-    let updated = tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| crate::db::store::set_playlist_cover_path(conn, &pid_for_register, &dest_str))
+    let (pid_copy, file_path_copy) = (pid.clone(), file_path.clone());
+    let guard_cover = state.astral.clone();
+    let replacement = tauri::async_runtime::spawn_blocking(move || {
+        guard_cover.with_session_epoch(epoch, || {
+            crate::playlist_cover::replace_playlist_cover(
+                &covers_dir,
+                &pid_copy,
+                std::path::Path::new(&file_path_copy),
+                mime_ext,
+                |path| {
+                    let path = path.to_string_lossy().into_owned();
+                    let updated = db.with(|conn| {
+                        crate::db::store::set_playlist_cover_path(conn, &pid_copy, &path)
+                    })?;
+                    if updated == 0 {
+                        return Err(String::from("只有本地自建歌单可以更换封面"));
+                    }
+                    Ok(())
+                },
+            )
+        })
     })
     .await
-    .map_err(|e| format!("登记封面失败: {e}"))?
-    .map_err(|e| format!("登记封面失败: {e}"))?;
-    if updated == 0 {
-        // 不是本地自建歌单：清掉刚复制的文件，别留孤儿
-        let _ = std::fs::remove_file(&dest);
-        return Err("只有本地自建歌单可以更换封面".to_string());
+    .map_err(|e| format!("更换封面失败: {e}"))??;
+    for warning in &replacement.cleanup_warnings {
+        log::warn!("[playlist-cover] {warning}");
     }
+    let dest = replacement.path;
     // 封面上云（UPDATE_DESIGN.md §5.3）：本地登记成功后顺手把封面文件传到
     // 云端并刷新 qt_like_playlist.pic_url，其他端才能跟着换。上传有每日
     // 配额（每用户 2 次，全部歌单合计），失败 / 离线是常态，只记日志不
@@ -3168,11 +3480,21 @@ pub async fn cmd_set_playlist_cover(
     if state.astral.has_token() {
         let pid_for_upload = pid.clone();
         let dest_for_upload = dest.to_string_lossy().to_string();
-        match state
-            .astral
-            .upload_cover_file(&pid_for_upload, "local", &dest_for_upload)
-            .await
-        {
+        let Some(upload) = crate::playlist_cloud::run_if_allowed(permit, || {
+            state.astral.upload_cover_file_for_epoch(
+                epoch,
+                &pid_for_upload,
+                "local",
+                &dest_for_upload,
+            )
+        }) else {
+            return Ok(PlaylistCoverSetResult {
+                path: dest.to_string_lossy().into_owned(),
+                cloud: String::from("offline"),
+                message: None,
+            });
+        };
+        match upload.await {
             Ok(url) => {
                 // 推封面要带着当前名字一起推（like_playlist 元数据 upsert 语义）
                 let pid_for_name = pid.clone();
@@ -3185,7 +3507,19 @@ pub async fn cmd_set_playlist_cover(
                     .unwrap_or_default(),
                     None => String::new(),
                 };
-                push_like_playlist(&state, "local", &pid, &display_name, Some(&url), "add").await;
+                push_like_playlist(
+                    &state,
+                    epoch,
+                    "local",
+                    &pid,
+                    PlaylistPushMetadata {
+                        name: &display_name,
+                        pic: Some(&url),
+                    },
+                    "add",
+                    Some(permit),
+                )
+                .await;
                 cloud = "synced".to_string();
             }
             Err(e) => {
@@ -3212,7 +3546,9 @@ pub async fn cmd_clear_playlist_cover(
     app: tauri::AppHandle,
     state: State<'_, AppState>,
     pid: String,
+    session_epoch: Option<u64>,
 ) -> Result<PlaylistCoverClearResult, String> {
+    let epoch = session_epoch.unwrap_or_else(|| state.astral.session_epoch());
     // pid 校验与 set_playlist_cover 同款（这里不拼文件名，但口径保持一致）
     if pid.is_empty()
         || pid.len() > 128
@@ -3225,14 +3561,32 @@ pub async fn cmd_clear_playlist_cover(
     let Some(db) = state.db.clone() else {
         return Err("数据库不可用".to_string());
     };
+    let db_for_permit = db.clone();
+    // Capture cloud permission before local cover mutation.
+    let pid_for_permit = pid.clone();
+    let guard_permit = state.astral.clone();
+    let permit = tauri::async_runtime::spawn_blocking(move || {
+        guard_permit.with_session_epoch(epoch, || {
+            db_for_permit.with(|conn| {
+                crate::playlist_cloud::capture_playlist_permit(conn, "local", &pid_for_permit)
+            })
+        })
+    })
+    .await
+    .map_err(|e| format!("确认歌单同步资格失败: {e}"))?
+    .map_err(|e| format!("确认歌单同步资格失败: {e}"))?;
+
     let pid_for_db = pid.clone();
+    let guard = state.astral.clone();
     let exists = tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| {
-            let exists = crate::db::store::playlist_pid_exists(conn, &pid_for_db)?;
-            if exists {
-                crate::db::store::clear_playlist_cover_path(conn, &pid_for_db)?;
-            }
-            Ok(exists)
+        guard.with_session_epoch(epoch, || {
+            db.with(|conn| {
+                let exists = crate::db::store::playlist_pid_exists(conn, &pid_for_db)?;
+                if exists {
+                    crate::db::store::clear_playlist_cover_path(conn, &pid_for_db)?;
+                }
+                Ok(exists)
+            })
         })
     })
     .await
@@ -3245,10 +3599,14 @@ pub async fn cmd_clear_playlist_cover(
     // 没登记过也扫一遍，兜「文件在、登记丢」的账。
     let covers_dir = crate::app_paths::data_root(&app).join("playlist-covers");
     let pid_for_rm = pid.clone();
+    let guard_rm = state.astral.clone();
     let _ = tauri::async_runtime::spawn_blocking(move || {
-        for old_ext in ["png", "jpg", "webp"] {
-            let _ = std::fs::remove_file(covers_dir.join(format!("{pid_for_rm}.{old_ext}")));
-        }
+        guard_rm.with_session_epoch(epoch, || {
+            for old_ext in ["png", "jpg", "webp"] {
+                let _ = std::fs::remove_file(covers_dir.join(format!("{pid_for_rm}.{old_ext}")));
+            }
+            Ok(())
+        })
     })
     .await;
     // 云端封面一并清（app/user/like/playlist/{pid}/cover DELETE）；
@@ -3257,11 +3615,40 @@ pub async fn cmd_clear_playlist_cover(
     let mut cloud = "offline".to_string();
     let mut cloud_message: Option<String> = None;
     if state.astral.has_token() {
-        match state.astral.cover_clear(&pid, "local").await {
-            Ok(()) => cloud = "synced".to_string(),
+        let Some(clear) = crate::playlist_cloud::run_if_allowed(permit, || {
+            crate::playlist_cloud::clear_cloud_cover(
+                || state.astral.cover_clear_for_epoch(epoch, &pid, "local"),
+                || {
+                    // 云请求期间可能完成恢复/换号；重取句柄并验证会话后才清卡片缓存。
+                    let db = state
+                        .db
+                        .as_ref()
+                        .ok_or_else(|| String::from("数据库不可用"))?;
+                    state.astral.with_session_epoch(epoch, || {
+                        db.with(|conn| {
+                            crate::db::store::set_liked_playlist_pic(conn, "local", &pid, "")
+                        })
+                        .map(|_| ())
+                    })
+                },
+            )
+        }) else {
+            return Ok(PlaylistCoverClearResult {
+                cloud: String::from("offline"),
+                message: None,
+            });
+        };
+        match clear.await {
+            Ok(result) => {
+                cloud = String::from("synced");
+                if let Some(error) = result.cache_error {
+                    log::warn!("[like] 云封面已清除，但本地卡片缓存更新失败: {error}");
+                    cloud_message = Some(format!("云封面已清除，但本地缓存更新失败: {error}"));
+                }
+            }
             Err(e) => {
                 log::warn!("[like] 清除云端歌单封面失败（不影响本地）: {e}");
-                cloud = "failed".to_string();
+                cloud = String::from("failed");
                 cloud_message = Some(e);
             }
         }
@@ -3331,14 +3718,31 @@ pub async fn cmd_delete_playlist(state: State<'_, AppState>, id: String) -> Resu
     let Some(db) = state.db.clone() else {
         return Ok(());
     };
+    let epoch = state.astral.session_epoch();
     let push_id = id.clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| crate::db::store::delete_playlist(conn, &id))
+    let guard = state.astral.clone();
+    let permit = tauri::async_runtime::spawn_blocking(move || {
+        guard.with_session_epoch(epoch, || {
+            db.with(|conn| crate::playlist_cloud::delete_playlist_and_capture_permit(conn, &id))
+        })
     })
     .await
     .map_err(|e| format!("删除歌单失败: {e}"))?
     .map_err(|e| format!("删除歌单失败: {e}"))?;
-    push_like_playlist(&state, "local", &push_id, "", None, "remove").await;
+    // 删除前捕获的 permit 直接复用；此时本机行已不在，禁止 fresh query 按 missing 放行。
+    push_like_playlist(
+        &state,
+        epoch,
+        "local",
+        &push_id,
+        PlaylistPushMetadata {
+            name: "",
+            pic: None,
+        },
+        "remove",
+        Some(permit),
+    )
+    .await;
     Ok(())
 }
 
@@ -3386,15 +3790,20 @@ pub async fn cmd_add_tracks_to_playlist(
     state: State<'_, AppState>,
     id: String,
     tracks: Vec<Track>,
+    session_epoch: Option<u64>,
 ) -> Result<usize, String> {
     let Some(db) = state.db.clone() else {
         return Ok(0);
     };
     // id 参数 = 歌单 pid（收藏进哪个歌单，云端就记哪个 pid）
+    let epoch = session_epoch.unwrap_or_else(|| state.astral.session_epoch());
     let for_db = tracks.clone();
     let push_id = id.clone();
+    let guard = state.astral.clone();
     let added = tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| crate::playlist_io::add_imported_tracks(conn, &id, &for_db))
+        guard.with_session_epoch(epoch, || {
+            db.with(|conn| crate::playlist_io::add_imported_tracks(conn, &id, &for_db))
+        })
     })
     .await
     .map_err(|e| format!("添加歌曲到歌单失败: {e}"))?
@@ -3403,7 +3812,7 @@ pub async fn cmd_add_tracks_to_playlist(
         .iter()
         .map(|t| (t.clone(), "add".to_string(), Some(push_id.clone())))
         .collect();
-    push_like_songs_batch(&state, items).await;
+    push_like_songs_batch(&state, epoch, items).await;
     Ok(added)
 }
 
@@ -3416,9 +3825,13 @@ pub async fn cmd_remove_track_from_playlist(
     let Some(db) = state.db.clone() else {
         return Ok(());
     };
+    let epoch = state.astral.session_epoch();
     let for_db = track.clone();
+    let guard = state.astral.clone();
     let outcome = tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| crate::db::store::remove_track_from_playlist(conn, &id, &for_db))
+        guard.with_session_epoch(epoch, || {
+            db.with(|conn| crate::db::store::remove_track_from_playlist(conn, &id, &for_db))
+        })
     })
     .await
     .map_err(|e| format!("从歌单移除歌曲失败: {e}"))?
@@ -3426,10 +3839,10 @@ pub async fn cmd_remove_track_from_playlist(
     // 多归属下的云端策略与 remove_favorite 一致
     match outcome {
         crate::db::store::LikeRemoveOutcome::RemovedAll => {
-            push_like_song(&state, &track, "remove", None).await;
+            push_like_song(&state, epoch, &track, "remove", None).await;
         }
         crate::db::store::LikeRemoveOutcome::Rebound(next) => {
-            push_like_song(&state, &track, "add", Some(&next)).await;
+            push_like_song(&state, epoch, &track, "add", Some(&next)).await;
         }
         crate::db::store::LikeRemoveOutcome::DetachedOnly => {}
     }
@@ -3443,6 +3856,7 @@ pub async fn cmd_remove_tracks_from_playlist(
     state: State<'_, AppState>,
     id: String,
     tracks: Vec<Track>,
+    session_epoch: Option<u64>,
 ) -> Result<u32, String> {
     if tracks.is_empty() {
         return Ok(0);
@@ -3450,19 +3864,23 @@ pub async fn cmd_remove_tracks_from_playlist(
     let Some(db) = state.db.clone() else {
         return Ok(0);
     };
+    let epoch = session_epoch.unwrap_or_else(|| state.astral.session_epoch());
     // playlist_tracks 关联行在 remove_track_from_playlist 里无条件删除，
     // outcome 只决定云端怎么推（与单曲版同一条代码路径）
+    let guard = state.astral.clone();
     let outcomes = tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| {
-            let mut out: Vec<(Track, crate::db::store::LikeRemoveOutcome)> =
-                Vec::with_capacity(tracks.len());
-            for t in &tracks {
-                match crate::db::store::remove_track_from_playlist(conn, &id, t) {
-                    Ok(o) => out.push((t.clone(), o)),
-                    Err(e) => log::warn!("[playlist] 批量移除单曲失败 {}: {e}", t.id),
+        guard.with_session_epoch(epoch, || {
+            db.with(|conn| {
+                let mut out: Vec<(Track, crate::db::store::LikeRemoveOutcome)> =
+                    Vec::with_capacity(tracks.len());
+                for t in &tracks {
+                    match crate::db::store::remove_track_from_playlist(conn, &id, t) {
+                        Ok(o) => out.push((t.clone(), o)),
+                        Err(e) => log::warn!("[playlist] 批量移除单曲失败 {}: {e}", t.id),
+                    }
                 }
-            }
-            Ok(out)
+                Ok(out)
+            })
         })
     })
     .await
@@ -3483,7 +3901,7 @@ pub async fn cmd_remove_tracks_from_playlist(
             crate::db::store::LikeRemoveOutcome::DetachedOnly => {}
         }
     }
-    push_like_songs_batch(&state, items).await;
+    push_like_songs_batch(&state, epoch, items).await;
     Ok(removed)
 }
 
@@ -3517,7 +3935,9 @@ fn default_download_dir() -> Result<std::path::PathBuf, String> {
 /// 当前生效的下载目录：用户自选 > 安装目录/Download。
 /// `db` 传 None（无库模式）时按默认目录。pub(crate)：本地优先启动对账
 /// （lib.rs setup）也用它定位扫描的下载目录。
-pub(crate) fn download_dir_for(db: Option<&Arc<crate::db::Database>>) -> Result<std::path::PathBuf, String> {
+pub(crate) fn download_dir_for(
+    db: Option<&Arc<crate::db::Database>>,
+) -> Result<std::path::PathBuf, String> {
     if let Some(db) = db {
         if let Ok(Some(saved)) =
             db.with(|conn| crate::db::store::get_setting(conn, SETTING_DOWNLOAD_DIR))
@@ -4004,9 +4424,7 @@ pub async fn cmd_start_download(
         let db = Arc::clone(&db);
         let t = track.clone();
         let q = q_str.clone();
-        move || {
-            db.with(|conn| crate::db::store::create_download_task(conn, &t, &q, None, None))
-        }
+        move || db.with(|conn| crate::db::store::create_download_task(conn, &t, &q, None, None))
     })
     .await
     .map_err(|e| format!("创建下载任务失败: {e}"))??;
@@ -4596,8 +5014,7 @@ async fn launch_download(
             // 避免请求 flac 实际 mp3 时虚标
             let named_quality =
                 effective_download_quality(quality_str(&quality), &resolved.actual_quality);
-            let final_path =
-                unique_download_path(&dir, &track, &named_quality, &url, &name_fmt);
+            let final_path = unique_download_path(&dir, &track, &named_quality, &url, &name_fmt);
             let part = download::part_path_for(&final_path);
             (final_path, part)
         }
@@ -4656,44 +5073,13 @@ fn parse_provider_quality(s: &str) -> Option<Quality> {
 // 会话存在本地 settings 表（key = astral.session），启动时由 lib.rs 回填 satoken，
 // 免得每次开应用都要重新登录。
 
-const SETTING_ASTRAL_SESSION: &str = crate::astral::SETTING_ASTRAL_SESSION;
-
-async fn persist_session(db: &Option<Arc<crate::db::Database>>, session: &AuthSession) {
-    let Some(db) = db.clone() else {
-        return;
-    };
-    let value = match serde_json::to_string(session) {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("[astral] 会话序列化失败: {e}");
-            return;
-        }
-    };
-    let _ = tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| crate::db::store::set_setting(conn, SETTING_ASTRAL_SESSION, &value))
-    })
-    .await;
-}
-
-async fn clear_session(db: &Option<Arc<crate::db::Database>>) {
-    let Some(db) = db.clone() else {
-        return;
-    };
-    let _ = tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| crate::db::store::set_setting(conn, SETTING_ASTRAL_SESSION, ""))
-    })
-    .await;
-}
-
 #[tauri::command(rename = "astral_login")]
 pub async fn cmd_astral_login(
     state: State<'_, AppState>,
     username: String,
     password: String,
-) -> Result<AuthSession, String> {
-    let session = state.astral.login(&username, &password).await?;
-    persist_session(&state.db, &session).await;
-    Ok(session)
+) -> Result<SessionStatus, String> {
+    state.astral.login(&username, &password).await
 }
 
 #[tauri::command(rename = "astral_register")]
@@ -4704,8 +5090,8 @@ pub async fn cmd_astral_register(
     password_confirm: String,
     email: Option<String>,
     nickname: Option<String>,
-) -> Result<AuthSession, String> {
-    let session = state
+) -> Result<SessionStatus, String> {
+    state
         .astral
         .register(
             &username,
@@ -4714,67 +5100,47 @@ pub async fn cmd_astral_register(
             email.as_deref(),
             nickname.as_deref(),
         )
-        .await?;
-    persist_session(&state.db, &session).await;
-    Ok(session)
+        .await
 }
 
 #[tauri::command(rename = "astral_logout")]
-pub async fn cmd_astral_logout(state: State<'_, AppState>) -> Result<(), String> {
-    // 后端失败也要清本地：否则用户永远退不出去
-    let result = state.astral.logout().await;
-    clear_session(&state.db).await;
-    result
+pub async fn cmd_astral_logout(
+    state: State<'_, AppState>,
+    session_epoch: Option<u64>,
+) -> Result<(), String> {
+    let epoch = session_epoch.unwrap_or_else(|| state.astral.session_epoch());
+    state.astral.logout_for_epoch(epoch).await
 }
 
-/// 当前登录用户信息。同时是启动时"确认会话是否仍被服务端承认"的探针：
-/// 拿回 401（HTTP 或业务码）说明 token 只是本地没过期、服务端早不认了，
-/// 顺手清掉本地会话和 satoken，界面才不会一直显示「已登录」而接口全 401。
-/// 网络不可达属于另一类错误，不清会话——断网不该把人登出。
+/// 确认当前登录身份。原生层按请求的 epoch + revision 精确撤销失效会话。
+/// 网络不可达不清会话；此处不能额外按 epoch 清除同代新刷新的 revision。
 #[tauri::command(rename = "astral_me")]
-pub async fn cmd_astral_me(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    match state.astral.me().await {
-        Ok(v) if !v.is_null() => Ok(v),
-        Ok(v) => {
-            // 服务端收下了请求却没给用户信息（success(null)）：同样按会话无效处理
-            if state.astral.has_token() {
-                clear_session(&state.db).await;
-                state.astral.set_token(None);
-                log::info!("[astral] /me 返回空，判定会话失效并清除本地登录态");
-            }
-            Ok(v)
-        }
-        Err(e) => {
-            if crate::astral::is_auth_error(&e) {
-                clear_session(&state.db).await;
-                state.astral.set_token(None);
-                log::info!("[astral] 服务端否认会话（401），已清除本地登录态");
-            }
-            Err(e)
-        }
-    }
+pub async fn cmd_astral_me(
+    state: State<'_, AppState>,
+    session_epoch: Option<u64>,
+) -> Result<serde_json::Value, String> {
+    let epoch = session_epoch.unwrap_or_else(|| state.astral.session_epoch());
+    let data = state.astral.me_for_epoch(epoch).await?;
+    state.astral.with_session_epoch(epoch, || Ok(()))?;
+    Ok(data)
 }
 
-/// 用旧 token 换新会话（satoken 过期时前端调这个，不用重新输密码）
+/// 刷新命令同样只允许安全状态回到 WebView，原生 token 不得序列化或写入 settings。
 #[tauri::command(rename = "astral_refresh")]
-pub async fn cmd_astral_refresh(state: State<'_, AppState>) -> Result<AuthSession, String> {
-    let session = state.astral.refresh().await?;
-    persist_session(&state.db, &session).await;
-    Ok(session)
+pub async fn cmd_astral_refresh(
+    state: State<'_, AppState>,
+    session_epoch: Option<u64>,
+) -> Result<SessionStatus, String> {
+    let epoch = session_epoch.unwrap_or_else(|| state.astral.session_epoch());
+    state.astral.refresh_for_epoch(epoch).await
 }
 
-/// 本地保存的会话（可能已过期，是否过期看 `is_valid`）
+/// 仅返回当前原生会话的到期时间和持久化模式，不读取或返回旧 SQLite token。
 #[tauri::command(rename = "astral_session")]
-pub async fn cmd_astral_session(state: State<'_, AppState>) -> Result<Option<AuthSession>, String> {
-    let Some(db) = state.db.clone() else {
-        return Ok(None);
-    };
-    tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| crate::db::store::get_setting(conn, SETTING_ASTRAL_SESSION))
-    })
-    .await
-    .map_err(|e| format!("读取本地会话失败: {e}"))?
-    .map(|v| v.and_then(|s| serde_json::from_str::<AuthSession>(&s).ok()))
+pub async fn cmd_astral_session(
+    state: State<'_, AppState>,
+) -> Result<Option<SessionStatus>, String> {
+    Ok(state.astral.session_status())
 }
 
 /// 发邮箱验证码（当前唯一场景：邮箱改密码）。
@@ -4809,8 +5175,10 @@ pub async fn cmd_astral_change_password(
 pub async fn cmd_astral_update_profile(
     state: State<'_, AppState>,
     patch: serde_json::Value,
+    session_epoch: Option<u64>,
 ) -> Result<serde_json::Value, String> {
-    state.astral.update_profile(patch).await
+    let epoch = session_epoch.unwrap_or_else(|| state.astral.session_epoch());
+    state.astral.update_profile_for_epoch(epoch, patch).await
 }
 
 /// 头像上传（UPDATE_DESIGN.md §5.2）：预检→凭证→直传→登记一条龙，返回头像 URL。
@@ -4819,8 +5187,13 @@ pub async fn cmd_astral_update_profile(
 pub async fn cmd_astral_upload_avatar(
     state: State<'_, AppState>,
     file_path: String,
+    session_epoch: Option<u64>,
 ) -> Result<serde_json::Value, String> {
-    let url = state.astral.upload_avatar_file(&file_path).await?;
+    let epoch = session_epoch.unwrap_or_else(|| state.astral.session_epoch());
+    let url = state
+        .astral
+        .upload_avatar_file_for_epoch(epoch, &file_path)
+        .await?;
     Ok(serde_json::json!({ "url": url }))
 }
 
@@ -4831,11 +5204,37 @@ pub async fn cmd_astral_upload_playlist_cover(
     pid: String,
     platform: String,
     file_path: String,
+    session_epoch: Option<u64>,
 ) -> Result<serde_json::Value, String> {
-    let url = state
-        .astral
-        .upload_cover_file(&pid, &platform, &file_path)
-        .await?;
+    let epoch = session_epoch.unwrap_or_else(|| state.astral.session_epoch());
+    let Some(db) = state.db.clone() else {
+        return Err(String::from("数据库不可用"));
+    };
+    let guard_permit = state.astral.clone();
+    let pid_for_permit = pid.clone();
+    let platform_for_permit = platform.clone();
+    let permit = tauri::async_runtime::spawn_blocking(move || {
+        guard_permit.with_session_epoch(epoch, || {
+            db.with(|conn| {
+                crate::playlist_cloud::capture_playlist_permit(
+                    conn,
+                    &platform_for_permit,
+                    &pid_for_permit,
+                )
+            })
+        })
+    })
+    .await
+    .map_err(|e| format!("确认歌单同步资格失败: {e}"))?
+    .map_err(|e| format!("确认歌单同步资格失败: {e}"))?;
+    let Some(upload) = crate::playlist_cloud::run_if_allowed(permit, || {
+        state
+            .astral
+            .upload_cover_file_for_epoch(epoch, &pid, &platform, &file_path)
+    }) else {
+        return Err(String::from("智能歌单只保存在本机，不支持云端封面"));
+    };
+    let url = upload.await?;
     Ok(serde_json::json!({ "url": url }))
 }
 
@@ -4845,8 +5244,63 @@ pub async fn cmd_astral_clear_playlist_cover(
     state: State<'_, AppState>,
     pid: String,
     platform: String,
+    session_epoch: Option<u64>,
 ) -> Result<(), String> {
-    state.astral.cover_clear(&pid, &platform).await
+    let epoch = session_epoch.unwrap_or_else(|| state.astral.session_epoch());
+    let Some(db) = state.db.clone() else {
+        return Err(String::from("数据库不可用"));
+    };
+    let guard_permit = state.astral.clone();
+    let db_for_permit = db.clone();
+    let pid_for_permit = pid.clone();
+    let platform_for_permit = platform.clone();
+    let permit = tauri::async_runtime::spawn_blocking(move || {
+        guard_permit.with_session_epoch(epoch, || {
+            db_for_permit.with(|conn| {
+                crate::playlist_cloud::capture_playlist_permit(
+                    conn,
+                    &platform_for_permit,
+                    &pid_for_permit,
+                )
+            })
+        })
+    })
+    .await
+    .map_err(|e| format!("确认歌单同步资格失败: {e}"))?
+    .map_err(|e| format!("确认歌单同步资格失败: {e}"))?;
+    astral_clear_playlist_cover_captured(state.astral.clone(), db, epoch, pid, platform, permit)
+        .await
+}
+
+/// Shared tail of the registered clear command after its original permission capture.
+pub async fn astral_clear_playlist_cover_captured(
+    astral: std::sync::Arc<crate::astral::AstralClient>,
+    db: std::sync::Arc<crate::db::Database>,
+    epoch: u64,
+    pid: String,
+    platform: String,
+    permit: crate::playlist_cloud::PlaylistSyncPermit,
+) -> Result<(), String> {
+    let Some(clear) = crate::playlist_cloud::run_if_allowed(permit, || {
+        crate::playlist_cloud::clear_cloud_cover(
+            || astral.cover_clear_for_epoch(epoch, &pid, &platform),
+            || {
+                astral.with_session_epoch(epoch, || {
+                    db.with(|conn| {
+                        crate::db::store::set_liked_playlist_pic(conn, &platform, &pid, "")
+                    })
+                    .map(|_| ())
+                })
+            },
+        )
+    }) else {
+        return Err(String::from("智能歌单只保存在本机，不支持云端封面"));
+    };
+    let result = clear.await?;
+    if let Some(error) = result.cache_error {
+        return Err(format!("云封面已清除，但本地缓存更新失败: {error}"));
+    }
+    Ok(())
 }
 
 // ---------- 收藏同步（DESIGN §5.3；契约同 qt-uniappx services/like.ts） ----------
@@ -4861,21 +5315,26 @@ pub async fn cmd_like_push_song(
     track: Track,
     action: String,
     pid: Option<String>,
+    session_epoch: Option<u64>,
 ) -> Result<i64, String> {
+    let epoch = session_epoch.unwrap_or_else(|| state.astral.session_epoch());
     let platform = track.platform.to_string();
     state
         .astral
-        .like_song(crate::astral::LikeSongPayload {
-            action: &action,
-            sid: &track.id,
-            platform: &platform,
-            name: &track.title,
-            singer: &track.singer,
-            album: &track.album,
-            hash: primary_music_id(track.music_id.as_deref()),
-            pid: pid.as_deref(),
-            pic_url: Some(track.pic_url.as_str()),
-        })
+        .like_song_for_epoch(
+            epoch,
+            crate::astral::LikeSongPayload {
+                action: &action,
+                sid: &track.id,
+                platform: &platform,
+                name: &track.title,
+                singer: &track.singer,
+                album: &track.album,
+                hash: primary_music_id(track.music_id.as_deref()),
+                pid: pid.as_deref(),
+                pic_url: Some(track.pic_url.as_str()),
+            },
+        )
         .await
 }
 
@@ -4887,11 +5346,33 @@ pub async fn cmd_like_push_playlist(
     name: String,
     pic_url: Option<String>,
     action: String,
+    session_epoch: Option<u64>,
 ) -> Result<i64, String> {
+    let epoch = session_epoch.unwrap_or_else(|| state.astral.session_epoch());
+    let Some(db) = state.db.clone() else {
+        return state.astral.with_like_session_epoch(epoch, || Ok(0));
+    };
+    let check_id = id.clone();
+    let check_platform = platform.clone();
+    let can_sync = tauri::async_runtime::spawn_blocking(move || {
+        db.with(|conn| crate::playlist_cloud::playlist_can_sync(conn, &check_platform, &check_id))
+    })
+    .await
+    .map_err(|e| format!("确认歌单同步资格失败: {e}"))??;
+    if !can_sync {
+        log::warn!("[like] 歌单同步资格已失效，跳过推送");
+        return state.astral.with_like_session_epoch(epoch, || Ok(0));
+    }
     state
         .astral
-        .like_playlist(&action, &id, &platform, &name, pic_url.as_deref())
+        .like_playlist_for_epoch(epoch, &action, &id, &platform, &name, pic_url.as_deref())
         .await
+}
+
+/// 同步调用绑定原生会话代次；这里只返回代次，不暴露登录凭据。
+#[tauri::command(rename = "like_session_epoch")]
+pub fn cmd_like_session_epoch(state: State<'_, AppState>) -> u64 {
+    state.astral.session_epoch()
 }
 
 /// 增量拉取收藏变更（since 为 0 时视作从头开始）
@@ -4899,9 +5380,13 @@ pub async fn cmd_like_push_playlist(
 pub async fn cmd_like_pull(
     state: State<'_, AppState>,
     since: i64,
+    session_epoch: Option<u64>,
 ) -> Result<serde_json::Value, String> {
-    let (changes, max_seq) = state.astral.like_changes(since).await?;
-    Ok(serde_json::json!({ "changes": changes, "maxSeq": max_seq }))
+    let epoch = session_epoch.unwrap_or_else(|| state.astral.session_epoch());
+    let (changes, max_seq) = state.astral.like_changes_for_epoch(epoch, since).await?;
+    state.astral.with_like_session_epoch(epoch, || {
+        Ok(serde_json::json!({ "changes": changes, "maxSeq": max_seq }))
+    })
 }
 
 /// 全量分页拉取（游标丢失时的兜底）。返回后端原样 { songs, playlists, maxSeq }。
@@ -4910,11 +5395,14 @@ pub async fn cmd_like_pull_all(
     state: State<'_, AppState>,
     page: i64,
     size: i64,
+    session_epoch: Option<u64>,
 ) -> Result<serde_json::Value, String> {
-    state
+    let epoch = session_epoch.unwrap_or_else(|| state.astral.session_epoch());
+    let list = state
         .astral
-        .like_list(page, if size <= 0 { 100 } else { size })
-        .await
+        .like_list_for_epoch(epoch, page, if size <= 0 { 100 } else { size })
+        .await?;
+    state.astral.with_like_session_epoch(epoch, || Ok(list))
 }
 
 /// 把云端变更落到本地收藏表。**不回推**云端，否则推送和拉取会来回震荡。
@@ -4923,130 +5411,145 @@ pub async fn cmd_like_pull_all(
 pub async fn cmd_like_apply(
     state: State<'_, AppState>,
     changes: Vec<crate::astral::LikeChange>,
+    session_epoch: Option<u64>,
 ) -> Result<usize, String> {
+    let epoch = session_epoch.unwrap_or_else(|| state.astral.session_epoch());
     let Some(db) = state.db.clone() else {
-        return Ok(0);
+        return state.astral.with_like_session_epoch(epoch, || Ok(0));
     };
+    let astral = state.astral.clone();
     tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| {
-            let mut applied = 0usize;
-            for c in changes {
-                if c.id.is_empty() {
-                    continue;
-                }
-                // 歌单收藏：云端只给元信息，够用了（曲目点开时再取）
-                if c.kind == "playlist" {
-                    if c.deleted {
-                        // local 平台 = 自建歌单：本地行、归属、云端卡片一起清，
-                        // 否则下次对账会把这个已被他端删除的歌单重新推上去（机制 B）
-                        if c.platform == crate::db::store::LOCAL_PLATFORM {
-                            crate::db::store::delete_playlist_follow_cloud(conn, &c.id)?;
-                        } else {
-                            crate::db::store::remove_liked_playlist(conn, &c.platform, &c.id)?;
-                        }
-                    } else {
-                        let name = if c.name.is_empty() {
-                            c.id.as_str()
-                        } else {
-                            c.name.as_str()
-                        };
-                        crate::db::store::add_liked_playlist(
-                            conn,
-                            &c.platform,
-                            &c.id,
-                            name,
-                            &c.pic_url,
-                            "",
-                        )?;
-                        // 自建歌单的云端回声：记确认点，对账据此识别「他端删除」
-                        if c.platform == crate::db::store::LOCAL_PLATFORM && c.updated_seq > 0 {
-                            crate::db::store::mark_playlist_cloud_seq(conn, &c.id, c.updated_seq)?;
-                        }
-                        // 他端改名跟随（2026-11-02）：认领过 / 本机自建的本地行
-                        // 同步改名 —— 认领后本地行在合并视图里赢卡片，不跟的话
-                        // 他端改名在本机永不生效。0 行 = 纯卡片无行可改，无害。
-                        if c.platform == crate::db::store::LOCAL_PLATFORM && !c.name.is_empty() {
-                            crate::db::store::rename_playlist(conn, &c.id, &c.name)?;
-                        }
+        astral.with_like_session_epoch(epoch, || {
+            db.with(|conn| {
+                let mut applied = 0usize;
+                for c in changes {
+                    if c.id.is_empty() {
+                        continue;
                     }
-                    applied += 1;
-                    continue;
-                }
-                // 本期只同步 song / playlist 两类，其余（未知类型）跳过
-                if c.kind != "song" {
-                    continue;
-                }
-                // local（另一台设备上的本地曲目）同样要收：手机端收藏的本地歌
-                // 会带 platform="local" 推到云端，这里放过才落得进 PC 的收藏表。
-                // 认不出来的平台才是真脏数据，跳过。
-                let Some(platform) = crate::provider::types::SourceId::parse(&c.platform) else {
-                    log::debug!("[like] 云端歌曲 {} 平台 {} 未知，跳过", c.id, c.platform);
-                    continue;
-                };
-                let db_id = format!("{platform}:{}", c.id);
-                let existing: Option<(Option<String>, Option<i64>)> = match conn.query_row(
-                    "SELECT pic_url, duration_ms FROM tracks WHERE id = ?1",
-                    rusqlite::params![db_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                ) {
-                    Ok(v) => Some(v),
-                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
-                    Err(e) => return Err(e),
-                };
-                let (local_pic, local_duration_ms) = existing.unwrap_or((None, None));
-
-                let track = Track {
-                    id: c.id.clone(),
-                    platform,
-                    title: if c.name.is_empty() {
-                        c.id.clone()
-                    } else {
-                        c.name.clone()
-                    },
-                    singer: c.singer.clone(),
-                    album: c.album.clone(),
-                    pic_url: if c.pic_url.is_empty() {
-                        local_pic.unwrap_or_default()
-                    } else {
-                        c.pic_url.clone()
-                    },
-                    duration: local_duration_ms.unwrap_or(0) as f64 / 1000.0,
-                    music_id: if c.hash.is_empty() {
-                        None
-                    } else {
-                        Some(c.hash.clone())
-                    },
-                    start_ms: None,
-                    end_ms: None,
-                };
-
-                if c.deleted {
-                    // 云端只摘掉变更里指定的那一个 pid（后端删歌单级联软删
-                    // (sid,pid) 行时，每行都带 pid）：歌还有别的归属就留着。
-                    // 没带 pid 的删除（整首取消收藏）才整首下线。
-                    let pid = if c.pid.is_empty() {
-                        None
-                    } else {
-                        Some(c.pid.as_str())
-                    };
-                    crate::db::store::remove_liked_song(conn, &track, pid)?;
-                    applied += 1;
-                } else if c.pid.is_empty() {
-                    // 云端没带 pid（无归属）：不加载（v5 起无默认歌单）
-                    log::debug!("[like] 云端歌曲 {} 未归属歌单，跳过", c.id);
-                } else {
-                    // 必须有对应歌单（云端卡片或本地自建）才加载；
-                    // pid 找不到歌单 → 不加载，等歌单同步过来后的全量重导再进
-                    let known = crate::db::store::playlist_pid_exists(conn, &c.pid)?;
-                    if !known {
-                        log::debug!("[like] 云端歌曲 {} 的歌单 {} 不存在，跳过", c.id, c.pid);
-                    } else {
-                        crate::db::store::add_liked_song(conn, &track, &c.pid)?;
+                    // 歌单收藏：云端只给元信息，够用了（曲目点开时再取）
+                    if c.kind == "playlist" {
+                        if !crate::playlist_cloud::playlist_can_sync(conn, &c.platform, &c.id)? {
+                            continue; // 云端增删、改名均不能覆写本机智能规则。
+                        }
+                        if c.deleted {
+                            // local 平台 = 自建歌单：本地行、归属、云端卡片一起清，
+                            // 否则下次对账会把这个已被他端删除的歌单重新推上去（机制 B）
+                            if c.platform == crate::db::store::LOCAL_PLATFORM {
+                                crate::db::store::delete_playlist_follow_cloud(conn, &c.id)?;
+                            } else {
+                                crate::db::store::remove_liked_playlist(conn, &c.platform, &c.id)?;
+                            }
+                        } else {
+                            let name = if c.name.is_empty() {
+                                c.id.as_str()
+                            } else {
+                                c.name.as_str()
+                            };
+                            crate::db::store::add_liked_playlist(
+                                conn,
+                                &c.platform,
+                                &c.id,
+                                name,
+                                c.pic_url.as_deref(),
+                                "",
+                            )?;
+                            // 自建歌单的云端回声：记确认点，对账据此识别「他端删除」
+                            if c.platform == crate::db::store::LOCAL_PLATFORM && c.updated_seq > 0 {
+                                crate::db::store::mark_playlist_cloud_seq(
+                                    conn,
+                                    &c.id,
+                                    c.updated_seq,
+                                )?;
+                            }
+                            // 他端改名跟随（2026-11-02）：认领过 / 本机自建的本地行
+                            // 同步改名 —— 认领后本地行在合并视图里赢卡片，不跟的话
+                            // 他端改名在本机永不生效。0 行 = 纯卡片无行可改，无害。
+                            if c.platform == crate::db::store::LOCAL_PLATFORM && !c.name.is_empty()
+                            {
+                                crate::db::store::rename_playlist(conn, &c.id, &c.name)?;
+                            }
+                        }
                         applied += 1;
+                        continue;
+                    }
+                    // 本期只同步 song / playlist 两类，其余（未知类型）跳过
+                    if c.kind != "song" {
+                        continue;
+                    }
+                    // local（另一台设备上的本地曲目）同样要收：手机端收藏的本地歌
+                    // 会带 platform="local" 推到云端，这里放过才落得进 PC 的收藏表。
+                    // 认不出来的平台才是真脏数据，跳过。
+                    let Some(platform) = crate::provider::types::SourceId::parse(&c.platform)
+                    else {
+                        log::debug!("[like] 云端歌曲 {} 平台 {} 未知，跳过", c.id, c.platform);
+                        continue;
+                    };
+                    let db_id = format!("{platform}:{}", c.id);
+                    let existing: Option<(Option<String>, Option<i64>)> = match conn.query_row(
+                        "SELECT pic_url, duration_ms FROM tracks WHERE id = ?1",
+                        rusqlite::params![db_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    ) {
+                        Ok(v) => Some(v),
+                        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                        Err(e) => return Err(e),
+                    };
+                    let (local_pic, local_duration_ms) = existing.unwrap_or((None, None));
+
+                    let track = Track {
+                        id: c.id.clone(),
+                        platform,
+                        title: if c.name.is_empty() {
+                            c.id.clone()
+                        } else {
+                            c.name.clone()
+                        },
+                        singer: c.singer.clone(),
+                        album: c.album.clone(),
+                        pic_url: c
+                            .pic_url
+                            .clone()
+                            .filter(|pic| !pic.is_empty())
+                            .unwrap_or_else(|| local_pic.unwrap_or_default()),
+                        duration: local_duration_ms.unwrap_or(0) as f64 / 1000.0,
+                        music_id: if c.hash.is_empty() {
+                            None
+                        } else {
+                            Some(c.hash.clone())
+                        },
+                        start_ms: None,
+                        end_ms: None,
+                    };
+
+                    if c.deleted {
+                        // 云端只摘掉变更里指定的那一个 pid（后端删歌单级联软删
+                        // (sid,pid) 行时，每行都带 pid）：歌还有别的归属就留着。
+                        // 没带 pid 的删除（整首取消收藏）才整首下线。
+                        let pid = if c.pid.is_empty() {
+                            None
+                        } else {
+                            Some(c.pid.as_str())
+                        };
+                        crate::db::store::remove_liked_song(conn, &track, pid)?;
+                        applied += 1;
+                    } else if c.pid.is_empty() {
+                        // 云端没带 pid（无归属）：不加载（v5 起无默认歌单）
+                        log::debug!("[like] 云端歌曲 {} 未归属歌单，跳过", c.id);
+                    } else {
+                        // 必须有对应歌单（云端卡片或本地自建）才加载；
+                        // pid 找不到歌单 → 不加载，等歌单同步过来后的全量重导再进
+                        let known = crate::db::store::playlist_pid_exists(conn, &c.pid)?;
+                        if !known {
+                            log::debug!("[like] 云端歌曲 {} 的歌单 {} 不存在，跳过", c.id, c.pid);
+                        } else {
+                            crate::db::store::add_liked_song(conn, &track, &c.pid)?;
+                            applied += 1;
+                        }
                     }
                 }
-            }
-            Ok(applied)
+                Ok(applied)
+            })
+            .map_err(|e| format!("应用收藏变更失败: {e}"))
         })
     })
     .await
@@ -5058,16 +5561,29 @@ pub async fn cmd_like_apply(
 /// 成功整批移除、失败整批退避保留（批内 op 共享同一次网络结果，同命运）。
 /// 遇到 401（会话失效）或后端不可达立即停：留着等恢复后重放，避免无意义打接口。
 #[tauri::command(rename = "like_flush_pending")]
-pub async fn cmd_like_flush_pending(state: State<'_, AppState>) -> Result<u32, String> {
+pub async fn cmd_like_flush_pending(
+    state: State<'_, AppState>,
+    session_epoch: Option<u64>,
+) -> Result<u32, String> {
+    let epoch = session_epoch.unwrap_or_else(|| state.astral.session_epoch());
     if !state.astral.has_token() {
-        return Ok(0);
+        return state.astral.with_like_session_epoch(epoch, || Ok(0));
     }
     let Some(db) = state.db.clone() else {
-        return Ok(0);
+        return state.astral.with_like_session_epoch(epoch, || Ok(0));
     };
+    let astral = state.astral.clone();
     let db_for_list = db.clone();
+    let guard = astral.clone();
     let ops = tauri::async_runtime::spawn_blocking(move || {
-        db_for_list.with(crate::db::store::list_pending_like_ops)
+        guard.with_like_session_epoch(epoch, || {
+            db_for_list
+                .with(|conn| {
+                    let ops = crate::db::store::list_pending_like_ops(conn)?;
+                    crate::playlist_cloud::filter_pending_cloud_ops(conn, ops)
+                })
+                .map_err(|e| format!("读取离线队列失败: {e}"))
+        })
     })
     .await
     .map_err(|e| format!("读取离线队列失败: {e}"))??;
@@ -5102,14 +5618,19 @@ pub async fn cmd_like_flush_pending(state: State<'_, AppState>) -> Result<u32, S
     }
     if !corrupt.is_empty() {
         let db2 = db.clone();
+        let guard = astral.clone();
         if let Err(e) = tauri::async_runtime::spawn_blocking(move || {
-            db2.with(|conn| {
-                for (id, retries) in &corrupt {
-                    if let Err(e) = crate::db::store::defer_pending_like_op(conn, id, *retries) {
-                        log::warn!("[like] 离线队列退避登记失败: {e}");
+            guard.with_like_session_epoch(epoch, || {
+                db2.with(|conn| {
+                    for (id, retries) in &corrupt {
+                        if let Err(e) = crate::db::store::defer_pending_like_op(conn, id, *retries)
+                        {
+                            log::warn!("[like] 离线队列退避登记失败: {e}");
+                        }
                     }
-                }
-                Ok(())
+                    Ok(())
+                })
+                .map_err(|e| format!("离线队列退避登记失败: {e}"))
             })
         })
         .await
@@ -5121,19 +5642,23 @@ pub async fn cmd_like_flush_pending(state: State<'_, AppState>) -> Result<u32, S
     for chunk in ready.chunks(LIKE_BATCH_LIMIT) {
         let batch_ops: Vec<serde_json::Value> =
             chunk.iter().map(|(.., body)| body.clone()).collect();
-        match state.astral.like_batch(batch_ops).await {
+        match state.astral.like_batch_for_epoch(epoch, batch_ops).await {
             Ok(seq) => {
                 pushed += chunk.len() as u32;
                 let ack_ids: Vec<String> = chunk.iter().map(|(id, ..)| id.clone()).collect();
                 let db2 = db.clone();
+                let guard = astral.clone();
                 if let Err(e) = tauri::async_runtime::spawn_blocking(move || {
-                    db2.with(|conn| {
-                        for id in &ack_ids {
-                            if let Err(e) = crate::db::store::ack_pending_like_op(conn, id) {
-                                log::warn!("[like] 离线队列出队失败: {e}");
+                    guard.with_like_session_epoch(epoch, || {
+                        db2.with(|conn| {
+                            for id in &ack_ids {
+                                if let Err(e) = crate::db::store::ack_pending_like_op(conn, id) {
+                                    log::warn!("[like] 离线队列出队失败: {e}");
+                                }
                             }
-                        }
-                        Ok(())
+                            Ok(())
+                        })
+                        .map_err(|e| format!("离线队列出队失败: {e}"))
                     })
                 })
                 .await
@@ -5164,16 +5689,20 @@ pub async fn cmd_like_flush_pending(state: State<'_, AppState>) -> Result<u32, S
                     .collect();
                 if !marks.is_empty() {
                     let db2 = db.clone();
+                    let guard = astral.clone();
                     if let Err(e) = tauri::async_runtime::spawn_blocking(move || {
-                        db2.with(|conn| {
-                            for (pid, s) in &marks {
-                                if let Err(e) =
-                                    crate::db::store::mark_playlist_cloud_seq(conn, pid, *s)
-                                {
-                                    log::warn!("[like] 记录歌单云端确认点失败: {e}");
+                        guard.with_like_session_epoch(epoch, || {
+                            db2.with(|conn| {
+                                for (pid, s) in &marks {
+                                    if let Err(e) =
+                                        crate::db::store::mark_playlist_cloud_seq(conn, pid, *s)
+                                    {
+                                        log::warn!("[like] 记录歌单云端确认点失败: {e}");
+                                    }
                                 }
-                            }
-                            Ok(())
+                                Ok(())
+                            })
+                            .map_err(|e| format!("记录歌单云端确认点失败: {e}"))
                         })
                     })
                     .await
@@ -5194,16 +5723,20 @@ pub async fn cmd_like_flush_pending(state: State<'_, AppState>) -> Result<u32, S
                     .map(|(id, .., retries, _)| (id.clone(), *retries))
                     .collect();
                 let db2 = db.clone();
+                let guard = astral.clone();
                 if let Err(e2) = tauri::async_runtime::spawn_blocking(move || {
-                    db2.with(|conn| {
-                        for (id, retries) in &deferral {
-                            if let Err(e) =
-                                crate::db::store::defer_pending_like_op(conn, id, *retries)
-                            {
-                                log::warn!("[like] 离线队列退避登记失败: {e}");
+                    guard.with_like_session_epoch(epoch, || {
+                        db2.with(|conn| {
+                            for (id, retries) in &deferral {
+                                if let Err(e) =
+                                    crate::db::store::defer_pending_like_op(conn, id, *retries)
+                                {
+                                    log::warn!("[like] 离线队列退避登记失败: {e}");
+                                }
                             }
-                        }
-                        Ok(())
+                            Ok(())
+                        })
+                        .map_err(|e| format!("离线队列退避登记失败: {e}"))
                     })
                 })
                 .await
@@ -5214,7 +5747,7 @@ pub async fn cmd_like_flush_pending(state: State<'_, AppState>) -> Result<u32, S
             }
         }
     }
-    Ok(pushed)
+    state.astral.with_like_session_epoch(epoch, || Ok(pushed))
 }
 
 /// 启动对账（LIKE_SYNC_DESIGN.md §5）：全量拉取云端收藏做存在性 diff。
@@ -5235,20 +5768,25 @@ pub async fn cmd_like_flush_pending(state: State<'_, AppState>) -> Result<u32, S
 ///
 /// 歌曲补推仍按 (platform, sid) 整档判断、只补主归属 pid，不按 pid 行级 diff。
 #[tauri::command(rename = "like_reconcile")]
-pub async fn cmd_like_reconcile(state: State<'_, AppState>) -> Result<u32, String> {
+pub async fn cmd_like_reconcile(
+    state: State<'_, AppState>,
+    session_epoch: Option<u64>,
+) -> Result<u32, String> {
+    let epoch = session_epoch.unwrap_or_else(|| state.astral.session_epoch());
     if !state.astral.has_token() {
-        return Ok(0);
+        return state.astral.with_like_session_epoch(epoch, || Ok(0));
     }
     let Some(db) = state.db.clone() else {
-        return Ok(0);
+        return state.astral.with_like_session_epoch(epoch, || Ok(0));
     };
+    let astral = state.astral.clone();
 
     // 1) 云端键集合（分页拉全量；后端单页上限 1000）+ 本次快照的 maxSeq
     let mut server_pids: HashSet<String> = HashSet::new();
     let mut server_sids: HashSet<String> = HashSet::new();
     let mut server_max_seq: i64 = 0;
     for page in 1..=200 {
-        let list = state.astral.like_list(page, 1000).await?;
+        let list = astral.like_list_for_epoch(epoch, page, 1000).await?;
         let songs = list
             .get("songs")
             .and_then(serde_json::Value::as_array)
@@ -5292,8 +5830,8 @@ pub async fn cmd_like_reconcile(state: State<'_, AppState>) -> Result<u32, Strin
             let cards = crate::db::store::list_liked_playlists(conn)?;
             let cursor =
                 crate::db::store::get_setting(conn, crate::settings_keys::SETTING_LIKE_SYNC_SEQ)?
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(0);
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(0);
             // (sid, platform, name, singer, album, hash, pic, 主归属 pid)
             let songs = crate::db::store::list_liked_songs_raw(conn)?;
             Ok::<_, rusqlite::Error>((pls, cards, cursor, songs))
@@ -5316,8 +5854,12 @@ pub async fn cmd_like_reconcile(state: State<'_, AppState>) -> Result<u32, Strin
             let p = pid.clone();
             let seq = server_max_seq;
             let db2 = db.clone();
+            let guard = astral.clone();
             if let Err(e) = tauri::async_runtime::spawn_blocking(move || {
-                db2.with(|conn| crate::db::store::mark_playlist_cloud_seq(conn, &p, seq))
+                guard.with_like_session_epoch(epoch, || {
+                    db2.with(|conn| crate::db::store::mark_playlist_cloud_seq(conn, &p, seq))
+                        .map_err(|e| format!("刷新歌单确认点失败: {e}"))
+                })
             })
             .await
             {
@@ -5328,10 +5870,22 @@ pub async fn cmd_like_reconcile(state: State<'_, AppState>) -> Result<u32, Strin
         match cloud_seq {
             None => {
                 // 从未上送：补推歌单元数据
-                let name = tauri::async_runtime::spawn_blocking({
+                let (name, permit) = tauri::async_runtime::spawn_blocking({
                     let db2 = db.clone();
                     let p = pid.clone();
-                    move || db2.with(|conn| playlist_name_by_pid(conn, &p))
+                    let guard = astral.clone();
+                    move || {
+                        guard.with_like_session_epoch(epoch, || {
+                            db2.with(|conn| {
+                                let permit = crate::playlist_cloud::capture_playlist_permit(
+                                    conn,
+                                    crate::db::store::LOCAL_PLATFORM,
+                                    &p,
+                                )?;
+                                playlist_name_by_pid(conn, &p).map(|name| (name, Some(permit)))
+                            })
+                        })
+                    }
                 })
                 .await
                 .unwrap_or_else(|e| {
@@ -5345,27 +5899,33 @@ pub async fn cmd_like_reconcile(state: State<'_, AppState>) -> Result<u32, Strin
                 missing += 1;
                 push_like_playlist(
                     &state,
+                    epoch,
                     crate::db::store::LOCAL_PLATFORM,
                     pid,
-                    &name,
-                    None,
+                    PlaylistPushMetadata {
+                        name: &name,
+                        pic: None,
+                    },
                     "add",
+                    permit,
                 )
                 .await;
             }
             Some(confirmed) if deletions_settled && *confirmed <= server_max_seq => {
                 // 云端确认过、现在没了 → 他端已删，本地跟随删除
-                removed += 1;
-                log::info!("[like] 歌单 {pid} 已被其他端删除，本地跟随移除");
                 let p = pid.clone();
                 let db2 = db.clone();
-                if let Err(e) = tauri::async_runtime::spawn_blocking(move || {
-                    db2.with(|conn| crate::db::store::delete_playlist_follow_cloud(conn, &p))
+                let guard = astral.clone();
+                let deletion = tauri::async_runtime::spawn_blocking(move || {
+                    guard.with_like_session_epoch(epoch, || {
+                        db2.with(|conn| crate::db::store::delete_playlist_follow_cloud(conn, &p))
+                            .map_err(|e| format!("跟随删除歌单失败: {e}"))
+                    })
                 })
                 .await
-                {
-                    log::warn!("[like] 跟随删除歌单失败: {e}");
-                }
+                .map_err(|e| format!("跟随删除歌单任务失败: {e}"));
+                crate::playlist_cloud::finish_confirmed_delete(deletion, &mut removed)?;
+                log::info!("[like] 歌单 {pid} 已被其他端删除，本地跟随移除");
             }
             Some(_) => {
                 // 游标未跟上：增量通道可能还没消费删除事件，本轮不动
@@ -5382,23 +5942,26 @@ pub async fn cmd_like_reconcile(state: State<'_, AppState>) -> Result<u32, Strin
             if server_pids.contains(&card.id) {
                 continue;
             }
-            removed += 1;
-            removed_pids.insert(card.id.clone());
             let (p, pid) = (card.platform.clone(), card.id.clone());
             let db2 = db.clone();
-            let follow = p == crate::db::store::LOCAL_PLATFORM;
-            if let Err(e) = tauri::async_runtime::spawn_blocking(move || {
-                db2.with(|conn| {
-                    if follow {
-                        crate::db::store::delete_playlist_follow_cloud(conn, &pid)
-                    } else {
-                        crate::db::store::remove_liked_playlist(conn, &p, &pid)
-                    }
+            let guard = astral.clone();
+            match tauri::async_runtime::spawn_blocking(move || {
+                guard.with_like_session_epoch(epoch, || {
+                    db2.with(|conn| {
+                        crate::playlist_cloud::remove_card_absent_from_cloud(conn, &p, &pid)
+                    })
+                    .map_err(|e| format!("跟随移除云端卡片失败: {e}"))
                 })
             })
             .await
             {
-                log::warn!("[like] 跟随移除云端卡片失败: {e}");
+                Ok(Ok(true)) => {
+                    removed += 1;
+                    removed_pids.insert(card.id.clone());
+                }
+                Ok(Ok(false)) => {}
+                Ok(Err(e)) => log::warn!("[like] 跟随移除云端卡片失败: {e}"),
+                Err(e) => log::warn!("[like] 跟随移除云端卡片任务失败: {e}"),
             }
         }
     }
@@ -5445,11 +6008,11 @@ pub async fn cmd_like_reconcile(state: State<'_, AppState>) -> Result<u32, Strin
         missing += 1;
         backfill.push((track, "add".to_string(), Some(pid.clone())));
     }
-    push_like_songs_batch(&state, backfill).await;
+    push_like_songs_batch(&state, epoch, backfill).await;
     if missing > 0 || removed > 0 {
         log::info!("[like] 启动对账补推 {missing} 项、跟随云端移除 {removed} 项");
     }
-    Ok(missing)
+    astral.with_like_session_epoch(epoch, || Ok(missing))
 }
 
 /// 按 pid 读自建歌单名（对账补推元数据用）。空串 = 没这行。
@@ -5479,56 +6042,130 @@ fn pls_cloud_alive(
 /// 游标与全量导入标记复位，随后的 pullLikes 自动全量拉取新账号数据。
 /// 播放历史、下载等设备级数据不动。返回清掉的行数。
 #[tauri::command(rename = "like_clear_local")]
-pub async fn cmd_like_clear_local(state: State<'_, AppState>) -> Result<i64, String> {
+pub async fn cmd_like_clear_local(
+    state: State<'_, AppState>,
+    session_epoch: Option<u64>,
+) -> Result<i64, String> {
     let Some(db) = state.db.clone() else {
-        return Ok(0);
+        return Err(String::from("数据库不可用"));
     };
-    tauri::async_runtime::spawn_blocking(move || db.with(crate::db::store::clear_like_local))
-        .await
-        .map_err(|e| format!("清理本地收藏失败: {e}"))?
-        .map_err(|e| format!("清理本地收藏失败: {e}"))
+    let epoch = session_epoch.unwrap_or_else(|| state.astral.session_epoch());
+    let astral = state.astral.clone();
+    let cleared = tauri::async_runtime::spawn_blocking(move || {
+        astral.with_like_owner_invalidated(epoch, || {
+            db.with(crate::db::store::clear_like_local)
+                .map_err(|e| format!("清理本地收藏失败: {e}"))
+        })
+    })
+    .await
+    .map_err(|e| format!("清理本地收藏失败: {e}"))??;
+    Ok(cleared)
 }
 
 /// 退出登录时重置收藏同步状态（LIKE_SYNC_DESIGN.md §6）：
 /// 清离线队列 + 游标 + 全量导入标记；收藏数据与账号归属标记保留，
 /// 同账号重登时无缝恢复（下次同步自动全量拉取合并）。
 #[tauri::command(rename = "like_reset_sync")]
-pub async fn cmd_like_reset_sync(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn cmd_like_reset_sync(
+    state: State<'_, AppState>,
+    session_epoch: Option<u64>,
+) -> Result<(), String> {
     let Some(db) = state.db.clone() else {
-        return Ok(());
+        return Err(String::from("数据库不可用"));
     };
-    tauri::async_runtime::spawn_blocking(move || db.with(crate::db::store::reset_like_sync_state))
-        .await
-        .map_err(|e| format!("重置同步状态失败: {e}"))?
-        .map_err(|e| format!("重置同步状态失败: {e}"))
+    let epoch = session_epoch.unwrap_or_else(|| state.astral.session_epoch());
+    let astral = state.astral.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        astral.with_like_owner_invalidated(epoch, || {
+            db.with(crate::db::store::reset_like_sync_state)
+                .map_err(|e| format!("重置同步状态失败: {e}"))
+        })
+    })
+    .await
+    .map_err(|e| format!("重置同步状态失败: {e}"))??;
+    Ok(())
 }
 
 // ---------- 通用设置项（settings 表，供引导、小开关等零散状态用） ----------
 
+/// 收藏归属标记：登录成功写入 user.id；换号清理与就绪校验据此判断归属。
+const LIKE_OWNER_KEY: &str = "like.sync.owner";
+
 #[tauri::command(rename = "get_setting")]
 pub async fn cmd_get_setting(
+    window: tauri::WebviewWindow,
     state: State<'_, AppState>,
     key: String,
 ) -> Result<Option<String>, String> {
+    let key = if window.label() == crate::lyric_window::LYRIC_WINDOW_LABEL {
+        crate::lyric_access::setting_read_key(&key)
+            .map_err(|error| error.to_string())?
+            .to_owned()
+    } else {
+        key
+    };
+    // 原生凭据命名空间只由专用安全 view 暴露，连无数据库时也不可绕过授权。
+    crate::ipc_guard::authorize_generic_setting(&key)?;
     let Some(db) = state.db.clone() else {
         return Ok(None);
     };
-    tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| crate::db::store::get_setting(conn, &key))
-    })
-    .await
-    .map_err(|e| format!("读取设置失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || read_public_setting(&db, &key))
+        .await
+        .map_err(|e| format!("读取设置失败: {e}"))?
+}
+
+/// The authorized generic setting reader shared by IPC and the headless command boundary.
+/// Window-specific lyric authorization remains at the Webview adapter above.
+pub fn read_public_setting(db: &crate::db::Database, key: &str) -> Result<Option<String>, String> {
+    crate::ipc_guard::authorize_generic_setting(key)?;
+    db.with(|conn| crate::db::store::get_setting(conn, key))
 }
 
 #[tauri::command(rename = "set_setting")]
 pub async fn cmd_set_setting(
+    window: tauri::WebviewWindow,
     state: State<'_, AppState>,
     key: String,
     value: String,
+    session_epoch: Option<u64>,
 ) -> Result<(), String> {
+    let key = if window.label() == crate::lyric_window::LYRIC_WINDOW_LABEL {
+        crate::lyric_access::setting_write_key(&key)
+            .map_err(|error| error.to_string())?
+            .to_owned()
+    } else {
+        key
+    };
+    crate::ipc_guard::authorize_generic_setting(&key)?;
     let Some(db) = state.db.clone() else {
+        if key == LIKE_OWNER_KEY || session_epoch.is_some() {
+            return Err(String::from("数据库不可用"));
+        }
         return Ok(());
     };
+    if key == LIKE_OWNER_KEY {
+        let epoch = session_epoch.unwrap_or_else(|| state.astral.session_epoch());
+        let astral = state.astral.clone();
+        return tauri::async_runtime::spawn_blocking(move || {
+            astral.with_like_owner_commit(epoch, &value, || {
+                db.with(|conn| crate::db::store::set_setting(conn, &key, &value))
+                    .map_err(|e| format!("保存设置失败: {e}"))
+            })
+        })
+        .await
+        .map_err(|e| format!("保存设置失败: {e}"))?;
+    }
+    if let Some(epoch) = session_epoch {
+        let astral = state.astral.clone();
+        return tauri::async_runtime::spawn_blocking(move || {
+            astral.with_session_epoch(epoch, || {
+                db.with(|conn| crate::db::store::set_setting(conn, &key, &value))
+                    .map_err(|e| format!("保存设置失败: {e}"))
+            })
+        })
+        .await
+        .map_err(|e| format!("保存设置失败: {e}"))?;
+    }
     tauri::async_runtime::spawn_blocking(move || {
         db.with(|conn| crate::db::store::set_setting(conn, &key, &value))
     })
@@ -5554,7 +6191,7 @@ pub async fn cmd_get_play_overview(
             active_days: 0,
         });
     };
-    tauri::async_runtime::spawn_blocking(move || db.with(crate::db::store::play_overview))
+    tauri::async_runtime::spawn_blocking(move || db.play_overview())
         .await
         .map_err(|e| format!("读取听歌统计失败: {e}"))?
 }
@@ -5580,7 +6217,7 @@ pub async fn cmd_clear_listen_stats(state: State<'_, AppState>) -> Result<i64, S
     let Some(db) = state.db.clone() else {
         return Ok(0);
     };
-    tauri::async_runtime::spawn_blocking(move || db.with(crate::db::store::clear_listen_stats))
+    tauri::async_runtime::spawn_blocking(move || db.clear_listen_stats())
         .await
         .map_err(|e| format!("清除听歌统计失败: {e}"))?
 }
@@ -5593,11 +6230,9 @@ pub async fn cmd_get_top_tracks(
     let Some(db) = state.db.clone() else {
         return Ok(Vec::new());
     };
-    tauri::async_runtime::spawn_blocking(move || {
-        db.with(|conn| crate::db::store::list_top_tracks(conn, limit))
-    })
-    .await
-    .map_err(|e| format!("读取热门曲目失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || db.top_tracks(limit))
+        .await
+        .map_err(|e| format!("读取热门曲目失败: {e}"))?
 }
 
 #[tauri::command(rename = "get_top_singers")]
@@ -5696,8 +6331,12 @@ pub async fn cmd_set_log_config(
         None => None,
     };
     let level_raw = level.map(crate::file_logger::level_name);
-    let file_mb_raw = file_mb.map(crate::file_logger::clamp_file_mb).map(|v| v.to_string());
-    let backups_raw = backups.map(crate::file_logger::clamp_backups).map(|v| v.to_string());
+    let file_mb_raw = file_mb
+        .map(crate::file_logger::clamp_file_mb)
+        .map(|v| v.to_string());
+    let backups_raw = backups
+        .map(crate::file_logger::clamp_backups)
+        .map(|v| v.to_string());
 
     // 目录传 None：换目录要重开句柄，走 choose_log_dir / reset_log_dir
     crate::file_logger::apply_settings(
@@ -5788,8 +6427,10 @@ pub async fn cmd_choose_log_dir(
 #[tauri::command(rename = "reset_log_dir")]
 pub async fn cmd_reset_log_dir(state: State<'_, AppState>) -> Result<String, String> {
     if let Some(db) = &state.db {
-        db.with(|conn| crate::db::store::set_setting(conn, crate::file_logger::SETTING_LOG_DIR, ""))
-            .map_err(|e| format!("重置日志目录失败: {e}"))?;
+        db.with(|conn| {
+            crate::db::store::set_setting(conn, crate::file_logger::SETTING_LOG_DIR, "")
+        })
+        .map_err(|e| format!("重置日志目录失败: {e}"))?;
     }
     // 空串 = 回到默认目录（见 file_logger::resolve_dir）
     crate::file_logger::apply_settings(Some(""), None, None, None);
@@ -5897,16 +6538,13 @@ fn flac_bits_of(bytes: &[u8]) -> Option<u8> {
     if bytes[4] & 0x7f != 0 {
         return None;
     }
-    let block_len = (u32::from(bytes[5]) << 16)
-        | (u32::from(bytes[6]) << 8)
-        | u32::from(bytes[7]);
+    let block_len = (u32::from(bytes[5]) << 16) | (u32::from(bytes[6]) << 8) | u32::from(bytes[7]);
     if block_len != 34 {
         return None;
     }
     // 顺手验证固定区里的采样率非零，避免把伪造的 fLaC 前缀当成音频元数据。
-    let sample_rate = (u32::from(bytes[18]) << 12)
-        | (u32::from(bytes[19]) << 4)
-        | u32::from(bytes[20] >> 4);
+    let sample_rate =
+        (u32::from(bytes[18]) << 12) | (u32::from(bytes[19]) << 4) | u32::from(bytes[20] >> 4);
     if sample_rate == 0 {
         return None;
     }
@@ -5946,9 +6584,12 @@ pub async fn cmd_export_backup(
     if dir.as_os_str().is_empty() {
         return Err("请先选择备份目录".into());
     }
-    tauri::async_runtime::spawn_blocking(move || crate::backup::export(&db, &dir))
-        .await
-        .map_err(|e| format!("导出备份任务失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::credential_store::check_session_storage_hygiene(&db)?;
+        crate::backup::export(&db, &dir)
+    })
+    .await
+    .map_err(|e| format!("导出备份任务失败: {e}"))?
 }
 
 /// 从备份文件导入（报告 §3.1）：`mode` 取 `replace`（覆盖）/ `merge`（合并）。
@@ -5971,8 +6612,13 @@ pub async fn cmd_import_backup(
         return Err("请先选择备份文件".into());
     }
     let work_dir = crate::app_paths::data_root(&app).join("data");
+    let epoch = state.astral.session_epoch();
+    let astral = state.astral.clone();
     let summary = tauri::async_runtime::spawn_blocking(move || {
-        crate::backup::import(&db, &source, mode, &work_dir)
+        astral.with_like_owner_invalidated(epoch, || {
+            crate::credential_store::check_session_storage_hygiene(&db)?;
+            crate::backup::import(&db, &source, mode, &work_dir)
+        })
     })
     .await
     .map_err(|e| format!("导入备份任务失败: {e}"))??;
@@ -6156,17 +6802,20 @@ pub struct MiniPlayerState {
 }
 
 #[tauri::command(rename = "get_file_association_state")]
-pub async fn cmd_get_file_association_state() -> Result<crate::file_assoc::FileAssociationState, String> {
+pub async fn cmd_get_file_association_state(
+) -> Result<crate::file_assoc::FileAssociationState, String> {
     crate::file_assoc::state()
 }
 
 #[tauri::command(rename = "register_file_associations")]
-pub async fn cmd_register_file_associations() -> Result<crate::file_assoc::FileAssociationState, String> {
+pub async fn cmd_register_file_associations(
+) -> Result<crate::file_assoc::FileAssociationState, String> {
     crate::file_assoc::register()
 }
 
 #[tauri::command(rename = "unregister_file_associations")]
-pub async fn cmd_unregister_file_associations() -> Result<crate::file_assoc::FileAssociationState, String> {
+pub async fn cmd_unregister_file_associations(
+) -> Result<crate::file_assoc::FileAssociationState, String> {
     crate::file_assoc::unregister()
 }
 
@@ -6246,11 +6895,11 @@ pub async fn cmd_write_local_tags(
                     continue;
                 }
             };
-            let before_json = serde_json::to_string(&before)
-                .map_err(|e| format!("原值序列化失败: {e}"))?;
-            if let Err(e) = db.with(|conn| {
-                crate::db::store::record_tag_edit(conn, &batch, &path, &before_json)
-            }) {
+            let before_json =
+                serde_json::to_string(&before).map_err(|e| format!("原值序列化失败: {e}"))?;
+            if let Err(e) =
+                db.with(|conn| crate::db::store::record_tag_edit(conn, &batch, &path, &before_json))
+            {
                 failed.push(TagWriteFailure {
                     path,
                     reason: format!("记录撤销清单失败: {e}"),
@@ -6265,9 +6914,7 @@ pub async fn cmd_write_local_tags(
             // 3) 重扫这一个文件刷库（标题 / 歌手 / 专辑 / 时长都按扫描口径重算）
             let (rows, _skipped) = crate::local::scan_files(std::slice::from_ref(&path));
             if !rows.is_empty() {
-                if let Err(e) = db.with(|conn| {
-                    crate::db::store::upsert_local_tracks(conn, &rows)
-                }) {
+                if let Err(e) = db.with(|conn| crate::db::store::upsert_local_tracks(conn, &rows)) {
                     // 文件已经改好了：算成功，但把「曲库没跟上」如实回报
                     updated += 1;
                     failed.push(TagWriteFailure {
@@ -6293,27 +6940,20 @@ pub async fn cmd_write_local_tags(
 
 /// 最近一批标签修改的凭据：重启应用后「撤销上次修改」还要用它。
 #[tauri::command(rename = "last_tag_edit_batch")]
-pub async fn cmd_last_tag_edit_batch(
-    state: State<'_, AppState>,
-) -> Result<Option<String>, String> {
+pub async fn cmd_last_tag_edit_batch(state: State<'_, AppState>) -> Result<Option<String>, String> {
     let Some(db) = state.db.clone() else {
         return Ok(None);
     };
-    tauri::async_runtime::spawn_blocking(move || {
-        db.with(crate::db::store::latest_tag_edit_batch)
-    })
-    .await
-    .map_err(|e| format!("读取撤销记录失败: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || db.with(crate::db::store::latest_tag_edit_batch))
+        .await
+        .map_err(|e| format!("读取撤销记录失败: {e}"))?
 }
 
 /// 撤销一批标签修改：按撤销清单把原值写回文件并刷库，成功后销毁清单。
 ///
 /// 部分文件恢复失败（被删 / 被占用 / 只读）时保留清单，用户可以修好环境再点一次。
 #[tauri::command(rename = "undo_tag_edit")]
-pub async fn cmd_undo_tag_edit(
-    state: State<'_, AppState>,
-    batch: String,
-) -> Result<usize, String> {
+pub async fn cmd_undo_tag_edit(state: State<'_, AppState>, batch: String) -> Result<usize, String> {
     let Some(db) = state.db.clone() else {
         return Err("数据库未就绪，无法撤销".to_string());
     };
@@ -6325,8 +6965,7 @@ pub async fn cmd_undo_tag_edit(
         let total = rows.len();
         let mut restored = 0usize;
         for row in rows {
-            let Ok(values) =
-                serde_json::from_str::<crate::tags::TagValues>(&row.before_json)
+            let Ok(values) = serde_json::from_str::<crate::tags::TagValues>(&row.before_json)
             else {
                 continue;
             };
@@ -6336,9 +6975,7 @@ pub async fn cmd_undo_tag_edit(
             }
             let (new_rows, _) = crate::local::scan_files(std::slice::from_ref(&row.path));
             if !new_rows.is_empty() {
-                let _ = db.with(|conn| {
-                    crate::db::store::upsert_local_tracks(conn, &new_rows)
-                });
+                let _ = db.with(|conn| crate::db::store::upsert_local_tracks(conn, &new_rows));
             }
             restored += 1;
         }
@@ -6525,10 +7162,22 @@ mod tests {
     fn ext_falls_back_to_flac_for_24bit_quality() {
         // flac24bit / hires 与 flac 一样是 FLAC 容器：裸路径直链（QQ、kw 部分
         // 节点的 URL 不带后缀）必须兜底成 .flac，旧实现在这里落 .mp3
-        assert_eq!(audio_ext_from_url("https://cdn/track/file", "flac24bit"), "flac");
-        assert_eq!(audio_ext_from_url("https://cdn/x.html", "flac24bit"), "flac");
-        assert_eq!(audio_ext_from_url("https://cdn/track/file", "hires"), "flac");
-        assert_eq!(audio_ext_from_url("https://cdn/track/file", "master"), "flac");
+        assert_eq!(
+            audio_ext_from_url("https://cdn/track/file", "flac24bit"),
+            "flac"
+        );
+        assert_eq!(
+            audio_ext_from_url("https://cdn/x.html", "flac24bit"),
+            "flac"
+        );
+        assert_eq!(
+            audio_ext_from_url("https://cdn/track/file", "hires"),
+            "flac"
+        );
+        assert_eq!(
+            audio_ext_from_url("https://cdn/track/file", "master"),
+            "flac"
+        );
         // 空间音频档不是 FLAC 容器，不能跟着一起兜底成 .flac
         assert_eq!(audio_ext_from_url("https://cdn/track/file", "dolby"), "mp3");
         // URL 后缀仍然优先（实测档位比请求档可信，但 URL 比两者都直接）
@@ -6550,7 +7199,9 @@ mod tests {
     #[test]
     fn reveal_rejects_missing_file_without_spawning() {
         // 文件不存在时直接报错（这条路径不会拉起资源管理器，测试无副作用）
-        let missing = std::env::temp_dir().join("ll-no-such-file-99.flac");
+        let fixture = crate::lyric_access::native_fixture::NativeFixture::new("reveal-missing");
+        let missing = fixture.path().join("ll-no-such-file-99.flac");
+        assert!(!missing.exists(), "exclusive fixture path must be absent");
         let err = reveal_in_file_manager_blocking(&missing.to_string_lossy()).unwrap_err();
         assert!(err.contains("不存在"), "错误提示应说明文件不存在: {err}");
     }
@@ -6614,32 +7265,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 音源脚本内置 request 通路验证（真实网络，对齐脚本 wyy 分支的接口）：
-    /// 走 builtin_request 发网易歌单列表请求，断言 200 + JSON body 有 playlists。
-    /// 与音源包 wyy 推荐分支共用同一上游。
-    #[tokio::test]
-    async fn builtin_request_fetches_wyy_playlist_list() {
+    /// The original WYY URL/options and response assertions use the shared relay policy.
+    /// Only final HTTP is pinned to an owned loopback file; this is not upstream availability proof.
+    #[test]
+    fn builtin_request_fetches_wyy_playlist_list() {
+        struct OwnedBuiltinTransport {
+            client: reqwest::Client,
+            source: String,
+            relay: String,
+        }
+        impl super::SourceBuiltinTransport for OwnedBuiltinTransport {
+            fn request(
+                &self,
+                method: reqwest::Method,
+                target: &reqwest::Url,
+                _manual_redirect: bool,
+            ) -> Result<reqwest::RequestBuilder, String> {
+                if target.as_str() != self.source {
+                    return Err("受控内置请求不得访问未拥有的目标".into());
+                }
+                Ok(self.client.request(method, &self.relay))
+            }
+        }
+
         let url = "https://music.163.com/api/playlist/list?cat=%E5%85%A8%E9%83%A8&limit=5&offset=0&total=true";
-        let res = super::source_builtin_request(
-            url,
-            Some(&super::SourceRequestOptions {
-                method: Some("GET".into()),
-                headers: Some(
-                    [
-                        ("Content-Type".to_string(), "application/json".to_string()),
-                        ("Referer".to_string(), "https://music.163.com/".to_string()),
-                    ]
-                    .into_iter()
-                    .collect(),
-                ),
-                body: None,
-                timeout_ms: Some(15_000),
-                redirect: None,
-                response_encoding: None,
-            }),
-        )
-        .await
-        .expect("builtin_request 应成功");
+        let fixture = crate::lyric_access::native_fixture::NativeFixture::new("builtin-wyy");
+        let path = fixture.file(
+            "playlist.json",
+            br#"{"playlists":[{"id":24,"name":"Owned playlist"}]}"#,
+        );
+        let server_http = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(std::time::Duration::from_secs(1))
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (server, run) =
+            crate::dlna::media::MediaServer::start_owned_loopback(listener, server_http).unwrap();
+        let relay = server
+            .register(
+                "127.0.0.1".parse().unwrap(),
+                crate::dlna::media::Resource::File(path),
+                "text/plain",
+            )
+            .unwrap();
+        let transport = OwnedBuiltinTransport {
+            client: reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .connect_timeout(std::time::Duration::from_secs(1))
+                .timeout(std::time::Duration::from_secs(3))
+                .build()
+                .unwrap(),
+            source: url.into(),
+            relay,
+        };
+        // Keep the blocking relay's construction/destruction outside a Tokio context.
+        let res = {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime
+                .block_on(super::source_builtin_request_with_transport(
+                    url,
+                    Some(&super::SourceRequestOptions {
+                        method: Some("GET".into()),
+                        headers: Some(
+                            [
+                                ("Content-Type".to_string(), "application/json".to_string()),
+                                ("Referer".to_string(), "https://music.163.com/".to_string()),
+                            ]
+                            .into_iter()
+                            .collect(),
+                        ),
+                        body: None,
+                        timeout_ms: Some(15_000),
+                        redirect: None,
+                        response_encoding: None,
+                    }),
+                    &transport,
+                ))
+                .expect("builtin_request 应成功")
+        };
         assert_eq!(res.status_code, 200, "上游接口应返回 200");
         assert!(
             res.headers.contains_key("content-type"),
@@ -6653,6 +7363,9 @@ mod tests {
         assert!(!playlists.is_empty(), "歌单列表不应为空");
         let first = &playlists[0];
         assert!(first.get("id").is_some(), "歌单应有 id 字段");
+        server.stop();
+        run.finish()
+            .expect("owned builtin listener and workers join");
     }
 
     fn flac_header(sample_rate: u32, bits: u8) -> Vec<u8> {
@@ -6680,7 +7393,10 @@ mod tests {
     #[test]
     fn flac_bits_of_rejects_incomplete_or_invalid_headers() {
         assert_eq!(flac_bits_of(b"fLaC"), None);
-        assert_eq!(flac_bits_of(b"ID3xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"), None);
+        assert_eq!(
+            flac_bits_of(b"ID3xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
+            None
+        );
 
         let mut wrong_block = flac_header(44_100, 16);
         wrong_block[4] = 1;

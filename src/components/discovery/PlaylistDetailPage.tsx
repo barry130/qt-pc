@@ -775,6 +775,8 @@ function PlaylistEditDialog(props: {
       setPreview(null);
       if (result.cloud === "failed") {
         setError(tr("playlist.edit.coverRestoredCloudFailed", { error: result.message ?? tr("playlist.edit.unknownError") }));
+      } else if (result.message) {
+        setError(result.message);
       }
     } catch (err) {
       setError(tr("playlist.edit.coverRestoreFailed", { error: errMsg(err) }));

@@ -1520,9 +1520,9 @@ function SourceSwitchButton(props: { track: Track }): React.JSX.Element {
         <div className="absolute bottom-full left-1/2 z-30 mb-2 -translate-x-1/2 rounded-xl border border-border bg-popover/95 backdrop-blur-xl p-3 text-popover-foreground shadow-raised">
           <SourceSwitchPanel
             track={props.track}
-            onPick={(candidate) => {
+            onPick={(candidate, original, beforeResolve) => {
               close();
-              void replaceCurrentWithCandidate(candidate);
+              return replaceCurrentWithCandidate(candidate, original, beforeResolve);
             }}
           />
         </div>
