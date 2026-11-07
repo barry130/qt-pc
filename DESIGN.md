@@ -3,11 +3,21 @@
 - 项目名称：轻听 PC 版
 - 目标平台：Windows 10 / Windows 11
 - 技术栈：Tauri 2 + React 19 + TypeScript + Tailwind CSS v4 + shadcn/ui + Rust
-- 文档版本：v1.24
-- 更新日期：2026-10-27
+- 文档版本：v1.25
+- 更新日期：2026-11-07
 - 关联文档：`qt-pc/REQUIREMENTS.md`、`../UPDATE_DESIGN.md`、`docs/CONFIG.md`、`docs/PACKAGING.md`
 
 ---
+
+## 当前实现索引（2026-11-07）
+
+- 播放内核通过 PlayIntent、PlaybackCommit 和 RenderControl 隔离异步取链、加载、定位与输出；DeviceSource 统一输出采样率和声道，防止单声道播客倍速异常。听歌统计独立核算实际播放区间。
+- 播放页布局/背景由 `stores/playingStyle.ts` 独立持久化；逐字渲染与歌词时间计算复用 `KaraokeWord`、`lyric-rhythm`，不创建第二套播放器。
+- 播客字幕的原生处理、版本化保存、转写和翻译在 `src-tauri/src/podcast_subtitles/`；前端通过专用服务、store 与自动识别/桌面广播 hooks 接入。无时间轴文字稿不伪造同步能力。详见 [播客字幕](docs/podcast-subtitles.md)。
+- 收藏版本选择共用 `CollectChoice` 与 `collect-match`，播放源偏好写入原生设置，异步读写以最新选择为准；播放源标识读取同一播放快照。详见 [匹配规则](docs/collection-matching.md)。
+- DLNA 作为原生 AudioEngine 的输出适配器接入，不复制队列或播放状态机。详见 [DLNA 实现](docs/DLNA_IMPLEMENTATION.md)。
+- 账号凭据留在原生系统凭据库，WebView 仅持有安全会话视图；登录代次约束上传、同步与配置回执。开发热更新保持同一个认证 store，已挂载标题栏和资料页不产生独立副本。
+- 原生测试入口 `scripts/check-native.mjs` 显式启用公开配置和独占临时目录；前端测试使用内存存储边界。CI 与本机共用门禁，不借用真实用户数据和凭据。
 
 ## 0. 基线核对与修订记录
 
@@ -832,7 +842,7 @@ AstralClient
 | rustfft | 频谱分析 |
 | ringbuf | 音频线程 → 分析线程的无锁采样传递（原文缺失） |
 | souvlaki | Windows SMTC 系统媒体控制（原文只提需求未定实现，缺失） |
-| keyring | Windows 凭据管理器读写 satoken（§17.1 依赖，原文缺失） |
+| windows / security-framework / zbus | Windows Credential Manager / macOS Keychain / Linux Secret Service；不可用时仅内存，见 §17.1 |
 | image / palette | 封面缩略图与取色 |
 | pinyin | 中文库拼音 / 首字母搜索（§8.6 依赖，原文缺失） |
 | rusqlite | SQLite（`bundled` + `functions`；FTS5 需开启 `bundled-full` 或确认编译带 FTS5） |
@@ -4233,15 +4243,15 @@ logs/
 
 ## 17.1 凭据存储
 
-当前第一版只有 Astral 轻听账号凭据，不保存网易云、QQ、酷我、酷狗的音源平台账号。
+本节约束 Astral 轻听身份凭据。音源账号的 `sourceAuth.accounts` 与凭据副键属于 R38 已明确授权的前端音源包契约，不因本次 Astral 加固迁移到系统凭据库；下述 AI 模型 Key 的明文设置例外也保持不变。
 
-1. Astral `satoken` 优先使用 Windows Credential Manager 存储。
-2. token 不写入 SQLite。
-3. token 不写入日志。
-4. 界面显示时使用掩码。
-5. 退出登录时清理 token。
-6. token 过期时由 Rust 自动刷新。
-7. 后续若增加 WebDAV 或授权音源登录，同样必须使用系统凭据管理器。
+1. Astral `satoken` 只进入 Rust 内存与系统凭据库：Windows Credential Manager、macOS Keychain、Linux Secret Service。系统库锁定、不可用或不允许无提示访问时，使用明确的 `memory-only` 会话，不回退到 SQLite 明文，也不因此阻止本次登录。
+2. SQLite 的 `astral.session` 只允许版本化引用、到期时间与本机命名空间目标；目标由数据根和后端命名空间隔离，不存 token 或 refresh token。持久化成功后才提交引用，提交成功后才安装新的内存会话；失败保留原会话并回收本次新建的凭据目标。
+3. 认证 IPC 不返回 token，界面只接收 `SessionStatus { expiresAt, persistence }`。`memory-only` 在设置页显式提示「仅本次运行」，关闭应用后需要重新登录。
+4. 旧版 SQLite 明文会话必须先安全擦除并完成 WAL 清理，之后才允许新滚动备份或导出。清理失败不得遗留成功标记或生成新快照；已有用户备份不会擅自删除，旧备份可能仍含历史明文，请按敏感文件保管。
+5. Merge 与 Replace 导入均不接受源备份的 `astral.session` 或清理标记，保留目标库对应键的原值（包括原本不存在），不恢复源账号，也不读取或删除其它数据根的系统凭据。
+6. 登出与刷新绑定会话 epoch、刷新 revision 和凭据目标；迟到的旧请求不能清除新登录、覆盖新刷新或删除新目标。网络暂时失败与当前凭据明确失效分开处理；认证凭据不写入日志。
+7. 后续新增的身份授权凭据沿用系统库或明确的仅内存模式；不能引入静默明文持久化回退。
 
 ### 例外：AI 模型 Key（`ai.apiKey`）
 
@@ -4253,10 +4263,10 @@ logs/
 
 ## 17.2 IPC 安全
 
-1. Tauri Capability 按窗口最小授权。
-2. 桌面歌词窗口只订阅歌词事件。
-3. 文件访问范围限制在用户选择的目录。
-4. 高危命令需要显式用户操作触发。
+1. Tauri Capability 与自定义 IPC 同时按真实窗口 label 最小授权，不能只限制插件权限而默认放行所有 command。
+2. 桌面歌词窗口只取得歌词展示、播放控制及必要音源配置能力；其它自定义 command 在入口拒绝。读写音源配置按不同键集合校验，禁止任意 setting/key 访问。
+3. 文件访问范围限制在用户选择的目录；歌词窗口的本地歌词和侧车读取另外绑定 Rust 当前播放快照、平台与曲目 id、可信解析的完整本地元数据及 canonical 路径，不能由前端伪造路径取得授权。
+4. 高危命令需要显式用户操作触发。通用 `get_setting` 不回传 `ai.apiKey` 或 `ai.profiles`，AI 设置例外不意味着 WebView 能直接读取 Key。
 
 ## 17.3 主题安全
 
@@ -4317,11 +4327,13 @@ Tauri 2 的权限是**按窗口授权**的，§17.2 提出了「最小授权」�
 配套约束：
 
 1. 歌词窗口**不授予** `dialog` / `opener` / `fs` / `shell` 任何权限，即使歌词内容被污染也无法触发文件或外链操作。
-2. 自定义 command 也要按窗口区分：歌词窗口只允许调用 `get_playback_state`、`toggle_play`、`next`、`previous`、`set_desktop_lyric_*`；其余 command 在 handler 入口用 `window.label()` 校验并拒绝。
+2. 自定义 command 也按真实 `window.label()` 区分：歌词窗口采用原生明确白名单，仅取得播放控制、歌词展示、必要音源配置和当前曲目受限解析/侧车能力；主窗口和隐藏音源窗口各有独立边界。命令级白名单之外，设置键、当前曲目身份和 canonical 文件路径仍逐参数验证（§17.2）。
 3. CSP（§4.1）不放开任何外部域名；`img-src` / `media-src` 只放开 `asset:` 与 `qtres:`。
 4. `assetProtocol.scope` 限定 `$APPDATA/**` 与 `$APPCACHE/**`；用户添加的音乐目录**不加入 asset scope**（本地音频由 Rust 读取后走播放链路，不需要 WebView 直接访问）。
 5. 本地封面同样经 `qtres://local/<trackId>` 读取，避免为了显示内嵌封面而把整个音乐目录暴露给 WebView。
 6. `dangerousDisableAssetCspModification` 保持默认（不禁用）。
+7. 隐藏音源引擎的 `qtres` 自定义协议页面不能依赖主 WebView 的默认 CSP：引擎 HTML 响应单独带 CSP，普通浏览器网络、frame、worker、表单与远程资源关闭，保留已安装包必需的本地模块、inline/eval 和实际 Tauri IPC 传输 origin。原生导航仅准入精确引擎页及平台本地 shim，新窗口明确拒绝。
+8. CSP 不单独保证 WebRTC 不发起 ICE。引擎在所有 frame 的 document-start 注入同一份幂等冻结资产，锁定 RTC 工厂；主引擎同时锁定普通网络 API 及可恢复它们的原生 prototype 槽。冻结失败留下 sticky 状态，包加载前显式 fail closed，不能删掉或改写全局 guard 后恢复直连。
 
 ---
 

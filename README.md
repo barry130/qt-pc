@@ -13,11 +13,15 @@ Windows / Linux / macOS 桌面端轻量级**本地音乐播放器**。基于 **T
 - **音效 DSP**：十段均衡器（±12dB 防削波，含预设）、响度归一化、淡入淡出，倍速播放（默认倍速全局记忆）
 - **在线播放**：HTTP Range 流式读取 + 边下边播，拖动进度条即时定位
 - **播放体验**：播放队列、三种播放模式（列表循环 / 单曲循环 / 随机）、音量与静音、播放条工具按钮自定义
+- **播放页风格**：经典唱片、歌词律动、专辑画廊、纯净歌词四种布局，背景单独设置，支持自选图片
+- **播客字幕**：节目字幕、SRT / VTT 导入、云端转写与 whisper.cpp 本地识别；支持自动边播边识别、双语阅读、桌面字幕和本地英译中，详见 [播客字幕](docs/podcast-subtitles.md)
+- **DLNA 投屏**：发现局域网电视/音箱，投放在线或本地音频，按设备能力控制播放、进度和音量，详见 [投屏说明](docs/DLNA.md)
 - **桌面歌词**：独立置顶歌词窗口，支持锁定 / 穿透、快捷键呼出（Ctrl+Alt+K）与自定义样式，逐行 / 逐字同步
 - **系统集成**：系统媒体控制（Windows SMTC / Linux MPRIS / macOS 正在播放，媒体键与蓝牙耳机按键可用）、任务栏缩略图播放控制按钮（Windows）、托盘菜单、开机自启
 - **屏蔽规则**：按歌手 / 关键词屏蔽不喜欢的歌曲（歌名 / 歌手拆词匹配，与移动端同口径）
 - **下载管理**：无损 / 高音质下载，进度写库、任务列表、去重命名
-- **收藏与歌单**：与后端账号云同步，本地 / 在线歌单统一组织，收藏「同名不同源」查重提示，歌单分享链接导入
+- **收藏与歌单**：与后端账号云同步，本地 / 在线歌单统一组织，按歌名、歌手和专辑相似度提示跨源重复，由用户选择保留版本；支持歌单分享链接导入
+- **账号状态**：登录凭据由原生系统凭据库保管，不进入 WebView；系统凭据库不可用时提示仅本次会话有效。换号隔离异步请求，头像更新同步到各页面
 - **听歌统计**：播放次数、时长、热门曲目与歌手排行；分享卡片（歌曲 / 歌词卡片导出）
 - **自动更新**：官方版本校验 + 加速节点下载 + MD5 校验；首次启动引导页
 - **外观与快捷键**：浅色 / 深色 / 跟随系统、封面色取色主题、全局快捷键、缓存管理（上限与分项清理）
@@ -129,24 +133,30 @@ pnpm config:check    # 只校验（已挂进 pnpm build / pnpm test：手改派�
 
 ```bash
 pnpm check                                    # 配置一致性 → tsc → 字号/动效令牌 → eslint --max-warnings 0 → vitest
-cd src-tauri && cargo clippy --all-targets -- -D warnings && cargo test --lib
+pnpm check:native                             # 公开配置 + 隔离临时目录 → clippy -D warnings → cargo test
 ```
 
 ```bash
-# 只跑前端测试（Vitest，129 个测试文件 / 1242 条用例）
+# 只跑前端测试（Vitest + Testing Library）
 pnpm test
 pnpm typecheck
 pnpm lint                                     # 只跑 eslint（pnpm check 里带 --max-warnings 0）
 
 # Rust 单元测试
-cd src-tauri && cargo test --lib
+pnpm test:native --lib
 
 # FLAC 定位回归测试（含负例，锁定 rodio 的 Unseekable 行为）
-cd src-tauri && cargo test --test flac_seek
+pnpm test:native --test flac_seek
 
-# 真实链路测试（依赖外网，默认 #[ignore]）
+# 真实链路测试（明确读取私有配置并访问外网，默认忽略，不属于隔离门禁）
 cd src-tauri && cargo test --test live_astral -- --ignored --nocapture
 ```
+
+常规原生测试必须通过 `scripts/check-native.mjs` 运行：脚本为子进程设置公开配置及独占的
+`_tmp/native-tests` 临时目录，结束后清理；不会修改开发用私有配置、用户数据库或系统登录凭据。
+构建缓存默认放在 `src-tauri/target/native-check`，与正在运行的 `tauri dev` 可执行文件隔离；可通过 `CARGO_TARGET_DIR` 指定其他独立缓存目录。
+CI 在 Windows、Linux 和 macOS 上使用同一入口。需对齐 CI 工具链时使用 Rust 1.99.1。
+Node 25 开发环境可设置 `NODE_OPTIONS=--no-experimental-webstorage`，避免 Node 实验性全局存储干扰浏览器测试。
 
 ## 构建与打包
 
@@ -154,10 +164,9 @@ cd src-tauri && cargo test --test live_astral -- --ignored --nocapture
 pnpm build          # 仅前端产物（会先跑 config:sync）
 ```
 
-> **本机不能直接跑 `pnpm tauri build` / `pnpm tauri dev`**：Tauri CLI 会把 `process.argv[0]`
-> 解析成 `DSH Desktop.exe`，报 `unrecognized subcommand`。三平台安装包（Windows NSIS /
-> Linux deb+AppImage / macOS app+dmg）都走 [`docs/PACKAGING.md`](docs/PACKAGING.md)
-> 里的手动分步流程（`pnpm exec tauri build --runner cargo --bundles <目标>`），与 `tauri build` 等价。
+三平台安装包（Windows NSIS / Linux deb+AppImage / macOS app+dmg）使用
+`pnpm tauri build`，具体依赖、打包参数与特殊开发宿主下的 CLI 排障见
+[`docs/PACKAGING.md`](docs/PACKAGING.md)。
 
 版本号等发布前必须同步修改的配置见 [`docs/CONFIG.md`](docs/CONFIG.md)。
 
@@ -213,6 +222,10 @@ qt-pc/
 | [`docs/CONFIG.md`](docs/CONFIG.md) | **唯一配置源 `app.config.json`**：字段表、同步器用法、发布流程、音源包机制、安装包行为与护栏 |
 | [`docs/PACKAGING.md`](docs/PACKAGING.md) | 三平台打包流程（Windows NSIS / Linux deb+AppImage / macOS app+dmg）、自动发版与常见失败 |
 | [`docs/plan-playlist-merge.md`](docs/plan-playlist-merge.md) | 收藏 / 歌单模型重构方案 |
+| [`docs/collection-matching.md`](docs/collection-matching.md) | 跨源同曲匹配阈值、版本选择与播放源偏好 |
+| [`docs/podcast-subtitles.md`](docs/podcast-subtitles.md) | 云端 / 本地识别、引擎模型下载、翻译、自动生成与桌面字幕 |
+| [`docs/DLNA.md`](docs/DLNA.md) | 局域网投屏使用与设备能力限制 |
+| [`docs/DLNA_IMPLEMENTATION.md`](docs/DLNA_IMPLEMENTATION.md) | 投屏模块、控制代次与可复现协议联调 |
 | [`docs/UI-COMPONENTS.md`](docs/UI-COMPONENTS.md) | **共享 UI 组件清单与使用规则**：写界面前先查这里，按钮/输入/弹窗/空态/骨架全部走 `@/components/ui` |
 | [`docs/screenshots/`](docs/screenshots/) | 界面截图（JPEG，1280 宽），与上文「界面预览」对应；在线内容均来自使用者自行安装的音源包 |
 
