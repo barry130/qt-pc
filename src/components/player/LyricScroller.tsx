@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useRef, useState } from "react";
-import { formatTime, type LyricLine, type LyricWord } from "@/lib/lrc";
+import { formatTime, type LyricLine } from "@/lib/lrc";
+import { KaraokeWord } from "@/components/player/KaraokeWord";
 import {
   LYRIC_FONT_SIZE_DEFAULT,
   LYRIC_INACTIVE_RATIO,
@@ -451,22 +452,3 @@ const LyricLineRow = memo(function LyricLineRow(props: {
     </div>
   );
 });
-
-/** 逐字染色保留连续渐变：词唱到一半时只有半边高亮。 */
-function KaraokeWord(props: { word: LyricWord; elapsedMs: number }): React.JSX.Element {
-  const { word, elapsedMs } = props;
-  const passed = elapsedMs - word.startMs;
-  const raw = word.durationMs > 0 ? passed / word.durationMs : passed >= 0 ? 1 : 0;
-  const ratio = raw < 0 ? 0 : raw > 1 ? 1 : raw;
-  const pct = Math.round(ratio * 100);
-  return (
-    <span style={{
-      backgroundImage: `linear-gradient(90deg, var(--lyric-highlight) ${pct}%, var(--lyric-inactive) ${pct}%)`,
-      WebkitBackgroundClip: "text",
-      backgroundClip: "text",
-      color: "transparent",
-    }}>
-      {word.text}
-    </span>
-  );
-}

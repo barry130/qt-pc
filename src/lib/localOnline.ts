@@ -362,6 +362,8 @@ function cacheLyric(track: Track, cross: CrossSourceHit | null, lyric: Lyric): v
 }
 
 export function getPlaybackLyric(track: Track, cross: CrossSourceHit | null = null): Promise<Lyric> {
+  // 播客有独立字幕时间轴；不能把节目标题送到歌曲音源搜索歌词。
+  if (track.platform === "podcast") return Promise.resolve({ lrc: "", translation: "" });
   const key = lyricCacheKey(track, cross);
   const hit = lyricCache.get(key);
   if (hit !== undefined) {

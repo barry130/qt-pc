@@ -54,6 +54,7 @@ import type { Quality, Track } from "@/types";
 import type { LocalFileHit } from "@/services/ipc";
 import { useInterpolatedPosition } from "@/hooks/useInterpolatedPosition";
 import { useNowPlayingCover } from "@/hooks/useNowPlayingLocalMedia";
+import { useNowPlayingCrossSource } from "@/hooks/useNowPlayingCrossSource";
 import { formatTime } from "@/lib/lrc";
 import { playUrlLine, playUrlMiss } from "@/source-scripts/playurl-line";
 import { cn } from "@/lib/utils";
@@ -75,6 +76,7 @@ import {
 } from "@/services/ipc";
 import { setSourcePlayQuality } from "@/lib/source-quality";
 import { toastSuccess } from "@/stores/toast";
+import { DlnaButton } from "@/components/player/DlnaButton";
 
 /**
  * 子组件的 memo 版本。
@@ -132,6 +134,7 @@ export function PlayerBar(): React.JSX.Element {
    */
   const track = usePlayerStore((s) => s.state?.track ?? null);
   const status = usePlayerStore((s) => s.state?.status ?? null);
+  const canPause = usePlayerStore((s) => s.state?.cast?.capabilities.pause ?? true);
   const quality = usePlayerStore((s) => s.state?.quality ?? null);
   const playMode = usePlayerStore((s) => s.state?.playMode ?? "listLoop");
   // 私人 FM 接管队列期间（A7，2026-11-02）：播放模式由 FM 自己管（无限循环），
@@ -145,6 +148,7 @@ export function PlayerBar(): React.JSX.Element {
   // 与 track.platform 是两件事：本地优先命中时 platform 还是原平台（kg/qq…），
   // 但播的是磁盘文件、state.playUrl 为空，见 local_first.rs 的解析链注释。
   const playingLocal = usePlayerStore((s) => s.state?.isLocal ?? false);
+  const cross = useNowPlayingCrossSource();
 
   const isPlayingPage = pathname === "/playing";
   const playing = status === "playing";
@@ -452,7 +456,7 @@ export function PlayerBar(): React.JSX.Element {
               码率测不出来就只留平台：宁可空着，也不写个 0 kbps 冒充"码率极低"。 */}
           {track ? (
             <div className="flex min-w-0 items-center gap-1.5 text-muted-foreground/80">
-              <SourceTag platform={track.platform} size="xs" />
+              <SourceTag platform={cross?.target ?? track.platform} size="xs" />
               {bitrateKbps !== null ? (
                 <span className="truncate text-2xs tabular-nums">
                   {bitrateKbps} kbps
@@ -480,8 +484,9 @@ export function PlayerBar(): React.JSX.Element {
             <button
               type="button"
               aria-label={playing ? t("player.pause") : t("player.play")}
+              title={playing && !canPause ? "此投屏设备不支持暂停，可从投屏菜单断开" : undefined}
               onClick={handleToggle}
-              disabled={!track}
+              disabled={!track || (playing && !canPause)}
               className={cn(
                 // 辉光颜色跟 --primary 走（color-mix 派生），换肤/换主色时不会留旧色残影
                 "flex h-12 w-12 items-center justify-center rounded-full bg-gradient-to-br from-primary to-primary/80 text-primary-foreground shadow-[0_4px_14px_color-mix(in_srgb,var(--primary)_32%,transparent),0_2px_4px_rgba(0,0,0,0.12),inset_0_1px_2px_rgba(255,255,255,0.2)] transition-[transform,box-shadow] duration-base ease-soft hover:shadow-[0_6px_18px_color-mix(in_srgb,var(--primary)_42%,transparent),0_3px_6px_rgba(0,0,0,0.15),inset_0_1px_2px_rgba(255,255,255,0.25)] hover:scale-105 active:shadow-[inset_0_2px_6px_rgba(0,0,0,0.25)] disabled:cursor-not-allowed disabled:opacity-40",
@@ -510,7 +515,8 @@ export function PlayerBar(): React.JSX.Element {
       {/* 音量：固定在播放条最右侧，不参与左右分列（设置 → 播放条 可隐藏）。
           容器定宽 w-56 与左侧封面区等宽：两侧等宽，中间控制区的中点才落在窗口中点，
           否则播放键会被挤偏（音量控件本身只有 w-32，右侧比左侧窄） */}
-      <div className="flex w-56 shrink-0 items-center justify-end">
+      <div className="flex w-56 shrink-0 items-center justify-end gap-3">
+        <DlnaButton />
         {visibleBarIds.includes("volume") && <VolumeControlMemo />}
       </div>
     </div>
@@ -532,6 +538,7 @@ export function PlayerBar(): React.JSX.Element {
 const ProgressSlider = memo(function ProgressSlider(): React.JSX.Element {
   const position = useInterpolatedPosition();
   const duration = usePlayerStore((s) => s.durationMs);
+  const canSeek = usePlayerStore((s) => s.state?.cast?.capabilities.seek ?? true);
   // 松手后到 seek 生效前的乐观目标（store 侧），优先于插值位置展示
   const pendingSeekMs = usePlayerStore((s) => s.pendingSeekMs);
   // 拖动进度条期间拖块常显（hover 才浮现的互补态）
@@ -557,6 +564,7 @@ const ProgressSlider = memo(function ProgressSlider(): React.JSX.Element {
     e: ReactPointerEvent<HTMLDivElement>,
   ): number | null => {
     const durationMs = usePlayerStore.getState().durationMs;
+    if (usePlayerStore.getState().state?.cast?.capabilities.seek === false) return null;
     if (durationMs <= 0) return null;
     const rect = e.currentTarget.getBoundingClientRect();
     const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
@@ -621,7 +629,7 @@ const ProgressSlider = memo(function ProgressSlider(): React.JSX.Element {
   // 键盘可达：滑块是 role="slider"，必须能用 ←/→（±5s）、Home/End 操作，
   // 否则纯键盘用户根本没法 seek（aria-* 只描述状态，不提供操作）。
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>): void => {
-    if (duration <= 0) return;
+    if (duration <= 0 || !canSeek) return;
     const step = e.shiftKey ? 30_000 : 5_000;
     const from = dragPreviewMs ?? pendingSeekMs ?? position;
     let target: number | null = null;
@@ -644,7 +652,9 @@ const ProgressSlider = memo(function ProgressSlider(): React.JSX.Element {
         aria-valuemax={Math.round(duration)}
         aria-valuenow={Math.round(shownPosition)}
         aria-valuetext={`${formatTime(shownPosition)} / ${formatTime(duration)}`}
-        tabIndex={0}
+        aria-disabled={!canSeek}
+        title={canSeek ? undefined : "此投屏设备不支持拖动进度"}
+        tabIndex={canSeek ? 0 : -1}
         onKeyDown={onKeyDown}
         onPointerDown={onBarDown}
         onPointerMove={onBarMove}
@@ -994,16 +1004,18 @@ function QualityMenu(props: { current: Quality; platform: string }): React.JSX.E
  * 与「音质」不同——音质菜单只改当前这首，默认音质在设置页。
  */
 function SpeedMenu(props: { current: number }): React.JSX.Element {
+  const casting = usePlayerStore((state) => state.state?.cast != null);
   return (
     <Popover
       trigger={(t) => (
         <button
           type="button"
           aria-label={`倍速：${speedLabel(props.current)}`}
-          title="倍速"
+          title={casting ? "DLNA 投屏不支持倍速" : "倍速"}
+          disabled={casting}
           aria-haspopup="menu"
           aria-expanded={t.open}
-          onClick={t.toggle}
+          onClick={casting ? undefined : t.toggle}
           className="flex h-9 min-w-12 items-center justify-center rounded-full px-2.5 text-xs font-medium tabular-nums text-foreground/80 transition-colors hover:bg-secondary/50 hover:text-foreground"
         >
           {speedLabel(props.current)}
@@ -1602,6 +1614,7 @@ function VolumeControl(): React.JSX.Element {
   const toggleMute = usePlayerStore((s) => s.toggleMute);
   const volume = state?.volume ?? 0.8;
   const muted = state?.muted ?? false;
+  const adjustable = state?.cast?.capabilities.volume ?? true;
   /** 展示值：静音时轨道归零，但拖动/键盘调整会先解除静音 */
   const effective = muted ? 0 : volume;
   /** 拖动标记：ref 记录，避免 move 事件高频触发重渲染 */
@@ -1613,6 +1626,7 @@ function VolumeControl(): React.JSX.Element {
   };
 
   const onDown = (e: ReactPointerEvent<HTMLDivElement>): void => {
+    if (!adjustable) return;
     e.currentTarget.setPointerCapture(e.pointerId);
     draggingRef.current = true;
     // 静音中开始拖动：先解除静音，否则轨道纹丝不动像「冻结」
@@ -1621,7 +1635,7 @@ function VolumeControl(): React.JSX.Element {
   };
 
   const onMove = (e: ReactPointerEvent<HTMLDivElement>): void => {
-    if (!draggingRef.current) return;
+    if (!adjustable || !draggingRef.current) return;
     void setVolume(ratioFromEvent(e));
   };
 
@@ -1633,6 +1647,7 @@ function VolumeControl(): React.JSX.Element {
 
   // 键盘可达性：←/↓ 减、→/↑ 增（5% 步进），Home/End 跳到最小/最大
   const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>): void => {
+    if (!adjustable) return;
     const step = 0.05;
     let next: number | null = null;
     if (e.key === "ArrowRight" || e.key === "ArrowUp") next = effective + step;
@@ -1651,6 +1666,7 @@ function VolumeControl(): React.JSX.Element {
         type="button"
         aria-label={muted ? t("player.unmute") : t("player.mute")}
         title={muted ? t("player.unmute") : t("player.mute")}
+        disabled={!adjustable}
         onClick={() => void toggleMute()}
         className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-secondary hover:text-foreground"
       >
@@ -1671,7 +1687,9 @@ function VolumeControl(): React.JSX.Element {
         aria-valuemin={0}
         aria-valuemax={100}
         aria-valuenow={Math.round(effective * 100)}
-        tabIndex={0}
+        aria-disabled={!adjustable}
+        title={adjustable ? undefined : "此投屏设备不支持远程音量"}
+        tabIndex={adjustable ? 0 : -1}
         onPointerDown={onDown}
         onPointerMove={onMove}
         onPointerUp={onUp}

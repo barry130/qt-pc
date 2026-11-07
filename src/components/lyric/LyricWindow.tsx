@@ -38,7 +38,6 @@ import {
 } from "@/services/ipc";
 import { listen } from "@tauri-apps/api/event";
 import {
-  findActiveIndex,
   karaokeFillRatio,
   mergeRomanization,
   mergeTranslation,
@@ -48,7 +47,9 @@ import {
 } from "@/lib/lrc";
 import { crossSourceHitFromLine, dropCachedLyric, getPlaybackLyric } from "@/lib/localOnline";
 import { requestPlayUrlLine } from "@/lib/play-url-broadcast";
+import { useSourceRegistryStore } from "@/stores/sourceRegistry";
 import type { PlayUrlLine } from "@/source-engine/client";
+import { desktopActiveIndex, desktopSubtitleLines, PODCAST_SUBTITLE_UPDATE, requestPodcastSubtitles, type DesktopSubtitleLine, type PodcastSubtitleSnapshot } from "@/lib/podcast-subtitle-sync";
 
 /**
  * 桌面歌词窗口视图（DESIGN §10.2 R4）：
@@ -114,13 +115,15 @@ export function LyricWindow(): React.JSX.Element {
   // 当前曲目的 React 状态：只为驱动歌词偏移的重读（useLyricOffset 依赖它）。
   // 其余逻辑仍走 currentTrackRef（回调里读最新值，不受渲染时序影响）。
   const [currentTrack, setCurrentTrack] = useState<Track | null>(null);
+  const [podcastMessage, setPodcastMessage] = useState("正在等待播客字幕…");
+  const podcastRevision = useRef(-1);
   // 工具条：悬停即现；右键可固定（再次右键收起）
   const [hovered, setHovered] = useState(false);
   const [pinned, setPinned] = useState(false);
 
   const baseRef = useRef<InterpBase>({ positionMs: 0, receivedAt: 0 });
   const playingRef = useRef(false);
-  const linesRef = useRef<LyricLine[]>([]);
+  const linesRef = useRef<DesktopSubtitleLine[]>([]);
   const activeIdxRef = useRef(-1);
   // rAF 里比较填充比例用 ref，避免每帧读 state
   const fillRatioRef = useRef(1);
@@ -132,7 +135,7 @@ export function LyricWindow(): React.JSX.Element {
   // 桌面歌词窗口与主窗口是两个独立 WebView（各持一份 store），所以偏移也要自己
   // 去库里读一遍，不能复用主窗口的内存值。
   const lyricOffset = useLyricOffset(currentTrack);
-  offsetRef.current = lyricOffset.offsetMs;
+  offsetRef.current = currentTrack?.platform === "podcast" ? 0 : lyricOffset.offsetMs;
 
   // 工具条：悬停即现；右键可固定（再次右键收起）；锁定时整体隐藏（防误触，
   // 解锁走托盘勾选 / 设置页 / Ctrl+Alt+K）
@@ -173,8 +176,10 @@ export function LyricWindow(): React.JSX.Element {
    * （桌面歌词）」——`app.lastError` 里抓到的是
    * `[桌面歌词] Cannot read properties of undefined (reading 'words')`。
    */
-  const applyLines = useCallback((next: LyricLine[]): void => {
-    const idx = findActiveIndex(next, baseRef.current.positionMs - offsetRef.current);
+  const applyLines = useCallback((next: DesktopSubtitleLine[]): void => {
+    const base = baseRef.current;
+    const position = base.positionMs + (playingRef.current ? performance.now() - base.receivedAt : 0);
+    const idx = desktopActiveIndex(next, position - offsetRef.current);
     linesRef.current = next;
     activeIdxRef.current = idx;
     fillRatioRef.current = 1;
@@ -187,6 +192,7 @@ export function LyricWindow(): React.JSX.Element {
   const loadLyricFor = useCallback(async (track: Track | null): Promise<void> => {
     currentTrackRef.current = track;
     setCurrentTrack(track);
+    const seq = ++lyricSeq.current;
     const key = trackKey(track);
     if (!track || key.length === 0) {
       setHasTrack(false);
@@ -194,7 +200,19 @@ export function LyricWindow(): React.JSX.Element {
       return;
     }
     setHasTrack(true);
-    const seq = ++lyricSeq.current;
+    if (track.platform === "podcast") {
+      podcastRevision.current = -1;
+      setPodcastMessage("正在等待播客字幕…");
+      offsetRef.current = 0;
+      applyLines([]);
+      requestPodcastSubtitles();
+      return;
+    }
+    // 桌面歌词是独立 WebView：注册表可能还没就绪（音源包加载慢，或入口那次
+    // ensure() 失败过）。此时 crossSourceHitFromLine 里的 registryHasSource()
+    // 会把合法的跨源命中当成「目标源已下线」丢掉 → 只能按原平台取词、时间轴
+    // 偏掉（C08）。ensure 幂等，就绪后立即 resolve；失败也只退回原平台取词。
+    await useSourceRegistryStore.getState().ensure().catch(() => {});
     const cross = crossSourceHitFromLine(crossLineByTrack.current.get(key) ?? null, track.platform);
     try {
       const lyric = await getPlaybackLyric(track, cross);
@@ -211,6 +229,27 @@ export function LyricWindow(): React.JSX.Element {
       if (seq !== lyricSeq.current) return;
       applyLines([]);
     }
+  }, [applyLines]);
+
+  // The subtitle task and this window live in separate WebViews. A snapshot is
+  // sent after every saved segment/translation and requested again on opening.
+  useEffect(() => {
+    let disposed = false;
+    let off: (() => void) | undefined;
+    void listen<PodcastSubtitleSnapshot>(PODCAST_SUBTITLE_UPDATE, ({ payload }) => {
+      const track = currentTrackRef.current;
+      if (disposed || track?.platform !== "podcast" || track.id !== payload.episodeId) return;
+      const document = payload.document;
+      if ((document?.revision ?? -1) < podcastRevision.current) return;
+      podcastRevision.current = document?.revision ?? -1;
+      setPodcastMessage(document?.cues.length && !document.timed ? "本集文字稿无时间轴，请在播放页阅读" : "正在等待当前播客字幕…");
+      applyLines(desktopSubtitleLines(document));
+    }).then((unlisten) => {
+      if (disposed) { unlisten(); return; }
+      off = unlisten;
+      requestPodcastSubtitles();
+    }).catch(() => {});
+    return () => { disposed = true; off?.(); };
   }, [applyLines]);
 
   // —— 订阅与初始化（一次） ——
@@ -295,7 +334,7 @@ export function LyricWindow(): React.JSX.Element {
           await listen<{ platform: string; id: string; line: PlayUrlLine | null }>("play-url-line", (e) => {
             const key = `${e.payload.platform}:${e.payload.id}`;
             crossLineByTrack.current.set(key, e.payload.line);
-            if (key === loadedTrackKey.current) {
+            if (key === loadedTrackKey.current && currentTrackRef.current?.platform !== "podcast") {
               void loadLyricFor(currentTrackRef.current);
             }
           }),
@@ -354,7 +393,7 @@ export function LyricWindow(): React.JSX.Element {
         const now =
           positionMs + (playingRef.current ? performance.now() - receivedAt : 0);
         const pos = now - offsetRef.current;
-        const idx = findActiveIndex(ls, pos);
+        const idx = desktopActiveIndex(ls, pos);
         if (idx !== activeIdxRef.current) {
           activeIdxRef.current = idx;
           setActiveIdx(idx);
@@ -508,7 +547,7 @@ export function LyricWindow(): React.JSX.Element {
   const nextLine = safeIdx >= 0 && safeIdx + 1 < lines.length ? lines[safeIdx + 1] : null;
   const showSecond = ui.lineMode === "two-lines";
   const showThird = ui.lineMode === "three-lines";
-  const mainText = hasTrack ? (current?.text || "… 间奏 …") : "轻听 · 桌面歌词";
+  const mainText = hasTrack ? (current?.text || (currentTrack?.platform === "podcast" ? podcastMessage : "… 间奏 …")) : "轻听 · 桌面歌词";
   // 第二行：有罗马音（日文歌假名注音）就显示罗马音，否则仍是译文，都没有才退下一句
   const secondText = hasTrack
     ? current?.romanization ||

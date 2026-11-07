@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import "@/index.css";
 import { ErrorBoundary } from "@/components/common/ErrorBoundary";
 import { LyricWindow } from "@/components/lyric/LyricWindow";
+import { useSourceRegistryStore } from "@/stores/sourceRegistry";
 import { installHiddenPause, installWindowErrorLog } from "./boot";
 
 /**
@@ -19,8 +20,24 @@ import { installHiddenPause, installWindowErrorLog } from "./boot";
 installWindowErrorLog();
 installHiddenPause();
 
-const root = document.getElementById("root");
-if (root) {
+/**
+ * 桌面歌词是独立 WebView：主窗口 AppShell 启动时做的音源注册表 ensure()
+ * 在这个窗口里不生效。而「按命中线路跨源取词」依赖注册表里的源清单
+ * （crossSourceHitFromLine → registryHasSource）：注册表为空时，合法的跨源
+ * 命中会被当成「目标源已下线」丢掉，歌词只能按原平台取，时间轴整体偏掉
+ * （C08）。所以先等注册表落地再挂载视图。
+ *
+ * 拉取失败也必须照常挂载 —— 只退回按原平台取词，不能因为音源包没装/引擎没起来
+ * 就让整个歌词窗空白。
+ */
+void (async () => {
+  try {
+    await useSourceRegistryStore.getState().ensure();
+  } catch {
+    /* 注册表拉取失败不阻断歌词窗：跨源判断退化为按原平台取词 */
+  }
+  const root = document.getElementById("root");
+  if (!root) return;
   ReactDOM.createRoot(root).render(
     <React.StrictMode>
       <ErrorBoundary label="桌面歌词" autoReset>
@@ -28,4 +45,4 @@ if (root) {
       </ErrorBoundary>
     </React.StrictMode>,
   );
-}
+})();

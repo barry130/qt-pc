@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import {
   Ban,
@@ -26,13 +26,11 @@ import {
 } from "lucide-react";
 import type { Lyric, Track } from "@/types";
 import { usePlayerStore } from "@/stores/player";
+import { usePlayingStyleStore, type PlayingStyle } from "@/stores/playingStyle";
 import { isAdmin, useAuthStore } from "@/stores/auth";
 import { useInterpolatedPosition } from "@/hooks/useInterpolatedPosition";
-import {
-  crossSourceForPlayback,
-  getPlaybackLyric,
-  type CrossSourceHit,
-} from "@/lib/localOnline";
+import { getPlaybackLyric, type CrossSourceHit } from "@/lib/localOnline";
+import { useNowPlayingCrossSource } from "@/hooks/useNowPlayingCrossSource";
 import { useLyricOffset } from "@/hooks/useLyricOffset";
 import {
   LYRIC_FONT_SIZE_DEFAULT,
@@ -55,8 +53,13 @@ import {
 } from "@/lib/lrc";
 import { WindowControls } from "@/components/WindowControls";
 import { SourceTag } from "@/components/common/SourceTag";
-import { errMsg } from "@/lib/utils";
+import { cn, errMsg } from "@/lib/utils";
 import { LyricScroller } from "@/components/player/LyricScroller";
+import { RhythmLyrics } from "@/components/player/RhythmLyrics";
+import { FocusLyrics } from "@/components/player/FocusLyrics";
+import { PlayingStyleControl } from "@/components/player/PlayingStyleControl";
+import { PodcastSubtitles } from "@/components/podcast/PodcastSubtitles";
+import "@/components/player/playing-style.css";
 import { ShareCardPanel } from "@/components/player/ShareCardPanel";
 import { ContextMenu, FloatingPanel, type ContextMenuItem } from "@/components/common/ContextMenu";
 import { CollectMenu } from "@/components/mine/CollectMenu";
@@ -67,11 +70,9 @@ import { useDislikesStore } from "@/stores/dislikes";
 import * as ipc from "@/services/ipc";
 
 /**
- * 播放页（全屏歌词 + 旋转封面）：
- * - 左侧：黑胶唱片风格旋转封面（仅播放时旋转，暂停停在当前角度）
- * - 右侧：曲目信息 + 滚动歌词
+ * 播放页：经典唱片 / 歌词律动 / 专辑画廊 / 纯净歌词，背景独立选择。
  * - 左上角：收回按钮（返回上一页）
- * - 右上角：最小化 / 最大化 / 退出（本页隐藏了 TitleBar，必须自带窗口控制）
+ * - 右上角：风格切换 + 最小化 / 最大化 / 退出
  * - 歌词同步误差 ≤ 50ms（rAF 插值 + 高亮平滑）
  */
 export function PlayingPage(): React.JSX.Element {
@@ -79,8 +80,11 @@ export function PlayingPage(): React.JSX.Element {
   const playUrl = usePlayerStore((s) => s.state?.playUrl ?? null);
   const quality = usePlayerStore((s) => s.state?.quality ?? null);
   const playing = usePlayerStore((s) => s.state?.status === "playing");
-  const seekTo = usePlayerStore((s) => s.seekTo);
-  const position = useInterpolatedPosition();
+  const style = usePlayingStyleStore((s) => s.style);
+  const loadStyle = usePlayingStyleStore((s) => s.load);
+  const podcast = track?.platform === "podcast";
+  const compact = podcast || style !== "classic";
+  useEffect(() => { void loadStyle(); }, [loadStyle]);
   const navigate = useNavigate();
   const pathname = useLocation().pathname;
 
@@ -213,7 +217,7 @@ export function PlayingPage(): React.JSX.Element {
         urlFetchedAt: st?.urlFetchedAt ?? null,
         status: st?.status ?? null,
         durationMs: st?.durationMs ?? null,
-        positionMs: Math.round(position),
+        positionMs: Math.round(usePlayerStore.getState().interpolatedPositionMs()),
         speed: st?.speed ?? null,
         bitrateKbps: st?.bitrateKbps ?? null,
         lyric: {
@@ -483,16 +487,8 @@ export function PlayingPage(): React.JSX.Element {
     return items;
   };
 
-  // 换源兜底会把实际播放地址切到别的平台（playUrl 变化时命中线路记忆刚更新）：
-  // 歌词必须跟着换到对应源重取，避免「放的是 kw 的音、显示的是 wyy 的词」
-  const cross = useMemo(
-    () => crossSourceForPlayback(track, quality),
-    // 线路记忆不是响应式数据，靠 playUrl 变化触发重估（跨源兜底必然改地址）。
-    // playUrl 是刻意的缓存失效触发器而非被读取的值，插件会误判为多余依赖，
-    // 必须保留在依赖里。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [track, quality, playUrl],
-  );
+  // 音源徽标和歌词使用与底部播放条相同的实际取链来源。
+  const cross = useNowPlayingCrossSource();
 
   const key = track
     ? `${track.platform}:${track.id}:${cross?.target ?? ""}:${cross?.song?.id ?? ""}`
@@ -509,6 +505,7 @@ export function PlayingPage(): React.JSX.Element {
     setRomanization("");
     setError(null);
     setLoading(true);
+    if (track.platform === "podcast") { setLoading(false); return; }
     getPlaybackLyric(track, cross)
       .then((lyr) => {
         // 已有更新的取词（如随后又换源）：过期结果不应用，最后应用的必须是对应源的
@@ -546,7 +543,6 @@ export function PlayingPage(): React.JSX.Element {
   // 直接写 lyricFontSize.bump 既不稳定也会被 eslint exhaustive-deps 判为缺 lyricFontSize。
   const bumpLyricFontSize = lyricFontSize.bump;
   const resetLyricFontSize = lyricFontSize.reset;
-  const activeIndex = findActiveIndex(lines, position - lyricOffset.offsetMs);
 
   // 快捷键只在本页挂载期间生效：Ctrl/Cmd + = / + 变大，- / _ 变小，0 复位。
   // 不用 window.addEventListener 之外的分发（播放条上的全局快捷键走另一套）。
@@ -612,6 +608,7 @@ export function PlayingPage(): React.JSX.Element {
   return (
     <div
       className="flex h-full w-full"
+      data-playing-style={style}
       onContextMenu={(e) => {
         // 页内没有输入框，右键一律换成自家菜单（浏览器默认菜单里没有一处对播放有用）；
         // 菜单与面板在 portal 里且各自吞掉 contextmenu，不会二次触发这里
@@ -631,26 +628,27 @@ export function PlayingPage(): React.JSX.Element {
       </button>
 
       {/* 窗口控制：AppShell 在播放页整页隐藏 TitleBar，没有这组按钮就没法最小化/关闭窗口 */}
-      <WindowControls
-        variant="floating"
-        closeLabel="退出"
-        className="absolute right-4 top-3 z-10"
-      />
+      <div className="absolute right-4 top-3 z-30 flex items-center gap-2">
+        <PlayingStyleControl />
+        <WindowControls variant="floating" closeLabel="退出" />
+      </div>
 
       <div className="flex min-h-0 w-full flex-1">
-        {/* 左侧：旋转封面 */}
-        <div className="flex w-[38%] shrink-0 items-center justify-center">
-          <VinylCover track={track} playing={playing} />
-        </div>
+        {/* 经典唱片和画廊分别使用旋转唱片、静态方形专辑。 */}
+        {!podcast && style === "classic" ? (
+          <div className="flex w-[38%] shrink-0 items-center justify-center">
+            <VinylCover track={track} playing={playing} />
+          </div>
+        ) : !podcast && style === "gallery" ? <GalleryCover track={track} /> : null}
 
         {/* 右侧：曲目信息 + 歌词 */}
         <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-          {/* pr-32：给右上角的窗口控制按钮让位，长标题不会钻到按钮底下 */}
-          <div className="pl-8 pr-32 pt-10 pb-4">
-            <TrackInfo track={track} cross={cross} />
+          {/* 标题在工具条下方，长标题与窄窗口也不会挤到风格/窗口按钮。 */}
+          <div className={compact ? "qt-rhythm-header" : "pl-8 pr-12 pt-14 pb-4"}>
+            <TrackInfo track={track} cross={cross} compact={compact} />
             {/* 偏移 + 搜索歌词：后者与换源同款（自绘 popover，点外面/Esc 收起），
                 常驻在这里——不只是「暂无歌词」时才能纠错，词挂错版本时也要能换 */}
-            <div className="mt-2 flex justify-end gap-1">
+            {!podcast ? <div className="mt-2 flex justify-end gap-1">
               <LyricSearchButton
                 track={track}
                 cross={cross}
@@ -660,10 +658,14 @@ export function PlayingPage(): React.JSX.Element {
               />
               <LyricFontSizeControl size={lyricFontSize} />
               <LyricOffsetControl offset={lyricOffset} />
-            </div>
+            </div> : <span className="text-xs text-muted-foreground">播客 · 字幕阅读</span>}
           </div>
           <div className="min-h-0 flex-1 overflow-hidden">
-            {error ? (
+            {!track ? (
+              <CenterText text="选择一首歌，开始聆听" />
+            ) : podcast ? (
+              <PodcastSubtitles key={track.id} audioUrl={track.id} />
+            ) : error ? (
               <CenterText text={`歌词加载失败：${error}`} />
             ) : loading ? (
               <CenterText text="歌词加载中…" />
@@ -688,14 +690,12 @@ export function PlayingPage(): React.JSX.Element {
                 )}
               </div>
             ) : (
-              <LyricScroller
+              <PlaybackLyrics
                 key={key}
                 lines={lines}
-                activeIndex={activeIndex}
-                onSeekMs={(ms) => void seekTo(ms + lyricOffset.offsetMs)}
-                positionMs={position - lyricOffset.offsetMs}
-                seekOffsetMs={lyricOffset.offsetMs}
+                offsetMs={lyricOffset.offsetMs}
                 fontSize={lyricFontSize.px}
+                style={style}
               />
             )}
           </div>
@@ -782,6 +782,50 @@ export function PlayingPage(): React.JSX.Element {
       ) : null}
     </div>
   );
+}
+
+/** 只有歌词区订阅高频进度，菜单、封面和整页布局不跟着每秒刷新十次。 */
+const PlaybackLyrics = memo(function PlaybackLyrics(props: {
+  lines: LyricLine[];
+  offsetMs: number;
+  fontSize: number;
+  style: PlayingStyle;
+}): React.JSX.Element {
+  const { lines, offsetMs, fontSize, style } = props;
+  const position = useInterpolatedPosition() - offsetMs;
+  const playing = usePlayerStore((s) => s.state?.status === "playing");
+  const durationMs = usePlayerStore((s) => s.durationMs);
+  const seekTo = usePlayerStore((s) => s.seekTo);
+  const seek = useCallback((ms: number) => { void seekTo(ms + offsetMs); }, [seekTo, offsetMs]);
+  const activeIndex = findActiveIndex(lines, position);
+  return style === "rhythm" ? (
+    <RhythmLyrics lines={lines} activeIndex={activeIndex} positionMs={position} durationMs={durationMs - offsetMs}
+      playing={playing} fontSize={fontSize} onSeekMs={seek} />
+  ) : style === "gallery" || style === "focus" ? (
+    <FocusLyrics lines={lines} activeIndex={activeIndex} positionMs={position} fontSize={fontSize} variant={style} onSeekMs={seek} />
+  ) : (
+    <LyricScroller lines={lines} activeIndex={activeIndex} positionMs={position} seekOffsetMs={offsetMs}
+      fontSize={fontSize} onSeekMs={seek} />
+  );
+});
+
+const GalleryCover = memo(function GalleryCover(props: { track: Track | null }): React.JSX.Element {
+  const coverUrl = useNowPlayingCover(900);
+  return (
+    <div className="qt-gallery-cover">
+      <div className="qt-gallery-art">
+        <GalleryArtwork key={coverUrl} src={coverUrl} title={props.track?.title ?? ""} />
+      </div>
+      <div className="qt-gallery-caption"><span>专辑画廊</span><span>{props.track?.album || "此刻的旋律"}</span></div>
+    </div>
+  );
+});
+
+function GalleryArtwork(props: { src: string | null; title: string }): React.JSX.Element {
+  const [failed, setFailed] = useState(false);
+  return props.src && !failed
+    ? <img src={props.src} alt={`${props.title}专辑封面`} draggable={false} onError={() => setFailed(true)} />
+    : <div className="qt-gallery-placeholder"><Disc3 aria-hidden /><span>静听每一首</span></div>;
 }
 
 /**
@@ -881,7 +925,7 @@ function VinylCover(props: { track: Track | null; playing: boolean }): React.JSX
   );
 }
 
-function TrackInfo(props: { track: Track | null; cross?: CrossSourceHit | null }): React.JSX.Element {
+function TrackInfo(props: { track: Track | null; cross?: CrossSourceHit | null; compact?: boolean }): React.JSX.Element {
   const { track } = props;
   // 本次实际播出来的码率（不是「请求了什么」）。测不出来就是 null，此时不渲染这段，
   // 与播放条保持同一口径：宁可空着，也不写 0 kbps 冒充「码率极低」。
@@ -889,7 +933,7 @@ function TrackInfo(props: { track: Track | null; cross?: CrossSourceHit | null }
   return (
     <div className="min-w-0">
       <div className="flex min-w-0 items-center gap-x-2">
-        <span className="min-w-0 truncate text-2xl font-bold tracking-tight">
+        <span className={cn("min-w-0 truncate tracking-tight", props.compact ? "text-base font-medium" : "text-2xl font-bold")}>
           {track ? track.title : "未在播放"}
         </span>
         {track && <SourceTag platform={props.cross?.target ?? track.platform} />}
@@ -902,7 +946,7 @@ function TrackInfo(props: { track: Track | null; cross?: CrossSourceHit | null }
       {track ? (
         // 歌手在前（音乐 App 惯例），专辑可选展示，用「·」分隔替代全角空格；
         // 两段都可收缩截断，长专辑名不再把歌手名挤出视野
-        <div className="mt-2 flex min-w-0 items-center gap-x-2 text-sm text-muted-foreground">
+        <div className={cn("mt-2 flex min-w-0 items-center gap-x-2 text-muted-foreground", props.compact ? "text-xs" : "text-sm")}>
           <span className="min-w-0 truncate">{track.singer}</span>
           {track.album && (
             <>

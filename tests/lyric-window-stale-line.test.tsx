@@ -40,6 +40,7 @@ const h = vi.hoisted(() => {
   });
   return {
     listeners,
+    events: new Map<string, (event: { payload: unknown }) => void>(),
     track,
     on: (key: string) => (cb: (payload: unknown) => void): (() => void) => {
       listeners.set(key, cb);
@@ -126,6 +127,15 @@ vi.mock("@/hooks/useLyricOffset", () => ({
   }),
 }));
 
+// 本用例不关心源注册表：ensure 直接就绪，取词不再等它（C08 的取词顺序
+// 另见 tests/lyric-window-registry-hydration.test.tsx）
+vi.mock("@/stores/sourceRegistry", () => ({
+  useSourceRegistryStore: {
+    getState: () => ({ ensure: (): Promise<void> => Promise.resolve() }),
+  },
+  registryHasSource: () => true,
+}));
+
 vi.mock("@/lib/localOnline", () => ({
   getPlaybackLyric: h.getPlaybackLyric,
   dropCachedLyric: vi.fn(),
@@ -134,8 +144,12 @@ vi.mock("@/lib/localOnline", () => ({
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => ({})) }));
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(async () => vi.fn()),
+  listen: vi.fn(async (name: string, callback: (event: { payload: unknown }) => void) => {
+    h.events.set(name, callback);
+    return () => h.events.delete(name);
+  }),
   emit: vi.fn(async () => {}),
+  emitTo: vi.fn(async () => {}),
 }));
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
@@ -151,6 +165,7 @@ vi.mock("@tauri-apps/api/window", () => ({
 }));
 
 import { LyricWindow } from "@/components/lyric/LyricWindow";
+import { PODCAST_SUBTITLE_UPDATE } from "@/lib/podcast-subtitle-sync";
 
 const pad = (n: number): string => String(n).padStart(2, "0");
 /** 60 行、秒级一行：位置 50s 时活跃行就是第 50 行 */
@@ -187,6 +202,7 @@ async function playToLine50(): Promise<void> {
 
 beforeEach(() => {
   h.listeners.clear();
+  h.events.clear();
   h.frames.length = 0;
   h.getPlaybackLyric.mockReset();
   h.getPlaybackLyric.mockResolvedValue({
@@ -216,6 +232,33 @@ afterEach(() => {
 });
 
 describe("桌面歌词当前行越界", () => {
+  it("播客字幕更新立即显示当前句和译文，换集或迟到更新不串集，空档不悬挂旧句", async () => {
+    render(<LyricWindow />);
+    await settle();
+    h.getPlaybackLyric.mockClear();
+    const podcast = { ...h.track("podcast-a"), platform: "podcast" };
+    await act(async () => h.emit("playback", { status: "paused", positionMs: 6000, track: podcast }));
+    await settle();
+    expect(mainLine()).toContain("等待播客字幕");
+    expect(h.getPlaybackLyric).not.toHaveBeenCalled();
+    const document = { revision: 2, timed: true, source: "asr", cues: [
+      { startMs: 1000, endMs: 3000, text: "First sentence", translation: "第一句" },
+      { startMs: 5000, endMs: 9000, text: "Current sentence", translation: "当前句" },
+    ] };
+    await act(async () => h.events.get(PODCAST_SUBTITLE_UPDATE)?.({ payload: { episodeId: "podcast-a", document } }));
+    expect(mainLine()).toBe("Current sentence");
+    expect(screen.getByTestId("lyric-second-line").textContent).toBe("当前句");
+    await act(async () => h.events.get(PODCAST_SUBTITLE_UPDATE)?.({ payload: { episodeId: "podcast-a", document: { ...document, revision: 1, cues: [] } } }));
+    expect(mainLine()).toBe("Current sentence");
+    await act(async () => h.emit("playback", { status: "paused", positionMs: 10000, track: podcast }));
+    await frame();
+    expect(mainLine()).toContain("等待当前播客字幕");
+    await act(async () => h.emit("playback", { status: "paused", positionMs: 6000, track: { ...podcast, id: "podcast-b" } }));
+    await act(async () => h.events.get(PODCAST_SUBTITLE_UPDATE)?.({ payload: { episodeId: "podcast-a", document } }));
+    expect(mainLine()).toContain("等待播客字幕");
+    await act(async () => h.events.get(PODCAST_SUBTITLE_UPDATE)?.({ payload: { episodeId: "podcast-b", document: { ...document, timed: false } } }));
+    expect(mainLine()).toContain("无时间轴");
+  });
   it("换到行数更少的歌词：不打崩窗口，主行按新歌词定位", async () => {
     render(<LyricWindow />);
     await settle();

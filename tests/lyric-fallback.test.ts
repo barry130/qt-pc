@@ -67,6 +67,13 @@ beforeEach(() => {
 });
 
 describe("取词失败回读落库歌词", () => {
+  it("播客使用独立字幕，不按节目标题向歌曲音源匹配歌词", async () => {
+    await expect(getPlaybackLyric(track("podcast"))).resolves.toEqual({ lrc: "", translation: "" });
+    expect(getLyricIpc).not.toHaveBeenCalled();
+    expect(getLyricMock).not.toHaveBeenCalled();
+    expect(saveLyricIpc).not.toHaveBeenCalled();
+  });
+
   it("网络失败时用库里的旧词顶上，且键是 platform:id", async () => {
     const t = track();
     getLyricMock.mockRejectedValueOnce(new Error("network"));

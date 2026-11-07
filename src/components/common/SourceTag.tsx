@@ -26,7 +26,8 @@ export function SourceTag(props: {
   size?: "sm" | "xs";
   className?: string;
 }): React.JSX.Element | null {
-  const short = useSourceShort(props.platform);
+  const sourceShort = useSourceShort(props.platform);
+  const short = props.platform === "podcast" ? "播客" : sourceShort;
   const color = useSourceColor(props.platform);
   if (props.platform === LOCAL_PLATFORM) return null;
   return (

@@ -13,6 +13,8 @@ import { CommandPalette } from "@/components/common/CommandPalette";
 import { QueuePanel } from "@/components/player/QueuePanel";
 import { useFramelessWindow } from "@/hooks/useFramelessWindow";
 import { usePlaybackEvents } from "@/hooks/usePlaybackEvents";
+import { usePodcastAutoSubtitles } from "@/hooks/usePodcastAutoSubtitles";
+import { usePodcastSubtitleBroadcast } from "@/hooks/usePodcastSubtitleBroadcast";
 import { usePlayUrlBridge } from "@/hooks/usePlayUrlBridge";
 import { useAppearanceEffect } from "@/hooks/useAppearanceEffect";
 import { useCoverColor } from "@/hooks/useCoverColor";
@@ -29,6 +31,9 @@ import { MetaPackGuide } from "@/components/MetaPackGuide";
 import { useAppearanceStore } from "@/stores/appearance";
 import { toastError } from "@/stores/toast";
 import { usePlayerStore } from "@/stores/player";
+import { usePlayingStyleStore } from "@/stores/playingStyle";
+import { PlayingBackground } from "@/components/player/PlayingBackground";
+import { resolvePlayingBackground } from "@/lib/playing-background";
 import { useSourceRegistryStore } from "@/stores/sourceRegistry";
 import { ensureSourceAuthInjected } from "@/lib/source-auth";
 import { loadSourceQualities } from "@/lib/source-quality";
@@ -56,8 +61,13 @@ import { PageFallback } from "@/lib/lazyPage";
  * 无边框窗口的 8 向 resize 命中区挂在最外层。
  */
 export function AppShell(): React.JSX.Element {
+  const playingStyle = usePlayingStyleStore((s) => s.style);
+  const playingBackground = usePlayingStyleStore((s) => s.background);
+  const playingBackgroundKind = resolvePlayingBackground(playingStyle, playingBackground.kind);
   useFramelessWindow();
   usePlaybackEvents();
+  usePodcastAutoSubtitles();
+  usePodcastSubtitleBroadcast();
   // 引擎→前端取链桥：聚合/脚本方案覆盖引擎主导的换歌（自动切歌/随机/重取）
   usePlayUrlBridge();
   useAppearanceEffect();
@@ -232,15 +242,17 @@ export function AppShell(): React.JSX.Element {
   }, [refreshDislikes]);
 
   return (
-    <div className="relative flex h-screen w-screen flex-col overflow-hidden bg-background text-foreground">
-      {bgImage && (
+    <div className="relative flex h-screen w-screen flex-col overflow-hidden bg-background text-foreground"
+      data-playing-surface={isPlayingPage ? playingStyle : undefined}
+      data-playing-background={isPlayingPage ? playingBackgroundKind : undefined}>
+      {bgImage && (!isPlayingPage || playingBackgroundKind === "theme") && (
         <div
           className="pointer-events-none absolute inset-0 z-0 bg-cover bg-center opacity-40"
           style={{ backgroundImage: `url(${bgImage})` }}
         />
       )}
 
-      {isPlayingPage && playCoverUrl && (
+      {isPlayingPage && playingBackgroundKind === "theme" && playCoverUrl && (
         <div
           aria-hidden
           className="pointer-events-none absolute inset-0 z-0 overflow-hidden"
@@ -289,6 +301,8 @@ export function AppShell(): React.JSX.Element {
           />
         </div>
       )}
+
+      {isPlayingPage ? <PlayingBackground kind={playingBackgroundKind} background={playingBackground} /> : null}
 
       {!isPlayingPage && <TitleBar />}
 
