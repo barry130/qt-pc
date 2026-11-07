@@ -209,6 +209,13 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
   /** 当前会话 id 的镜像：`sendLocal` 的闭包里拿不到最新 state，用它把这一轮写回历史 */
   const activeConversationRef = useRef(0);
 
+  /**
+   * 会话代次：切会话 / 新建对话都 +1。`sendLocal` 发起时记下代次，回复回来
+   * 只有代次没变才接管界面 —— 否则用户已经去了别的会话，答案不能把他拽回来，
+   * 更不能写进别人的历史（C04：本地回合完成时读的是「此刻」的 active 会话）。
+   */
+  const conversationEpoch = useRef(0);
+
   useEffect(() => {
     activeConversationRef.current = activeConversationId;
   }, [activeConversationId]);
@@ -301,8 +308,11 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
     async (id: number): Promise<void> => {
       stopPolling();
       commitSending(false);
+      conversationEpoch.current += 1;
       const seq = loadSeq.current + 1;
       loadSeq.current = seq;
+      // 与代次同步更新，避免同一事件内 send 在 effect 前读取旧会话。
+      activeConversationRef.current = id;
       setActiveConversationId(id);
       if (id <= 0) {
         setMessages([]);
@@ -334,6 +344,8 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
   const newConversation = useCallback((): void => {
     stopPolling();
     commitSending(false);
+    conversationEpoch.current += 1;
+    activeConversationRef.current = 0;
     setActiveConversationId(0);
     setMessages([]);
     setError("");
@@ -426,7 +438,12 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
    * 让「停止 / 重发 / 切会话」之后回来的结果自己作废。
    */
   const sendLocal = useCallback(
-    async (localMode: LocalAssistantMode, text: string): Promise<void> => {
+    async (
+      localMode: LocalAssistantMode,
+      text: string,
+      originConversationId: number,
+      originEpoch: number,
+    ): Promise<void> => {
       commitSending(true);
       setError("");
       const seq = localSeq.current + 1;
@@ -487,12 +504,13 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
           progress: "",
           status: "COMPLETED",
         }));
-        // 规则 / 本地模式没有服务端会话：把这一轮写进本地历史，左侧「历史对话」才有内容
+        // 规则 / 本地模式没有服务端会话：把这一轮写进本地历史，左侧「历史对话」才有内容。
+        // 落库目标固定为发起时的会话；用户中途切走时只落库，不接管界面（代次已变）。
         const conversationId =
-          activeConversationRef.current > 0
-            ? activeConversationRef.current
+          originConversationId > 0
+            ? originConversationId
             : createLocalConversation(text);
-        if (activeConversationRef.current !== conversationId) {
+        if (conversationEpoch.current === originEpoch) {
           activeConversationRef.current = conversationId;
           setActiveConversationId(conversationId);
         }
@@ -512,7 +530,9 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
           content: m.content.length > 0 ? m.content : `出错了：${message}`,
         }));
       } finally {
-        if (alive.current && localSeq.current === seq) commitSending(false);
+        if (alive.current && localSeq.current === seq && conversationEpoch.current === originEpoch) {
+          commitSending(false);
+        }
       }
     },
     [commitSending, patch, prepareCandidates],
@@ -737,24 +757,33 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
       // 立刻落闩：下面 `await readAiMode()` 期间第二次回车会直接返回。
       // 复位由 sendLocal 的 finally / 服务端分支的 catch / stop 统一负责。
       sendingRef.current = true;
+      // 本轮的会话归属在「按下发送」这一刻定死，并连同代次一路传给两个分支：
+      // 读模式 / 建会话 / 等模型期间切了会话，结果也必须回到发起时那条（C04）。
+      const originConversationId = activeConversationRef.current;
+      const originEpoch = conversationEpoch.current;
       // 设置页可能刚改过模式：每次发送都以库里的值为准，用户不用重进页面。
       // 但「服务端 AI」是管理员专属，非管理员一律降级成纯规则（本地回合）。
       let currentMode: AiEngineMode;
       try {
         currentMode = resolveAiMode(await readAiMode(), canUseServer);
       } catch (err) {
-        // 读设置失败不能让门闩一直锁着：否则之后再点发送全都被静默吞掉。
+        // 旧回合的读取失败不能给新会话报错，也不能解开新回合的门闩。
+        if (!alive.current || conversationEpoch.current !== originEpoch) return;
+        // 当前回合读设置失败仍须释放门闩，允许用户重试。
         sendingRef.current = false;
         setError(errMsg(err));
         return;
       }
+      // 模式读取期间切走的回合尚未开始：取消它，不能借用新会话的历史/UI，
+      // 也不能释放新会话可能已经重新取得的发送门闩（C04）。
+      if (conversationEpoch.current !== originEpoch) return;
       if (!alive.current) {
         sendingRef.current = false;
         return;
       }
       setMode(currentMode);
       if (currentMode !== "server") {
-        await sendLocal(currentMode, text);
+        await sendLocal(currentMode, text, originConversationId, originEpoch);
         return;
       }
       commitSending(true);
@@ -775,12 +804,17 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
         // （prepareCandidates 内部自 catch 永不 reject；建会话失败照旧走外层 catch）
         const candidatesPromise = prepareCandidates(text);
         const conversationIdPromise =
-          activeConversationId > 0
-            ? Promise.resolve(activeConversationId)
+          originConversationId > 0
+            ? Promise.resolve(originConversationId)
             : ipc.astralAiCreateConversation(agentCode, titleOf(text)).then((raw) => {
                 const created = normalizeConversation(raw);
                 if (created.id <= 0) throw new Error("会话创建失败，请重试");
-                setActiveConversationId(created.id);
+                // 建会话期间用户可能已经切走：只在还停在发起时那条会话上时接管界面，
+                // 否则把会话 id 交给轮询即可，不能把用户拽回旧会话（C04）
+                if (conversationEpoch.current === originEpoch) {
+                  activeConversationRef.current = created.id;
+                  setActiveConversationId(created.id);
+                }
                 return created.id;
               });
         const [candidates, conversationId] = await Promise.all([
@@ -814,7 +848,6 @@ export function useAiChat(options: UseAiChatOptions): UseAiChatResult {
       }
     },
     [
-      activeConversationId,
       agentCode,
       buildContext,
       canUseServer,

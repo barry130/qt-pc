@@ -125,10 +125,14 @@ export function usePagedList<T>(options: {
     if (isAll && first) {
       // all 模式交给模块级任务（@/lib/paged-all）：卸载只退订，任务继续跑到收尾
       // 并按 cacheKey 缓存到退出 —— 来回切歌手页不再从头重拉几千首。
+      // 捕获「启动这个任务的那一帧」的取数函数，不读 fetchRef/keyRef：
+      // ref 每帧都指向最新页面的函数，旧 key 的后台任务若读 ref，切页后会把
+      // 新页面的数据追加进旧 key 的缓存（C06：A 的缓存里混进 B 的第 2 页，
+      // 切回 A 直接展示污染结果）。任务一旦按 key 建立，取数上下文就该冻结。
       const opts = {
-        fetchPage: (p: number) => fetchRef.current(p),
-        keyOf: (item: T) => keyRef.current(item),
-        pageSize: sizeRef.current,
+        fetchPage: options.fetchPage,
+        keyOf: options.keyOf,
+        pageSize,
         concurrency,
         maxPages,
         emptyStreakLimit,

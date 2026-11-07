@@ -134,8 +134,11 @@ async function doFlushSave(
   if (payload === null) return;
   try {
     await setAppearance(payload);
-    pendingSave = null;
+    // 只清掉「自己这一版」：写库期间用户又改过时 pendingSave 已经换成新对象，
+    // 那是还没落库的最新值 —— 以前无条件置 null，会把它连带清掉，排队的 flush
+    // 看到 null 直接返回，界面新值、库里旧值，saveError 还是 null（C05）。
     retryIndex = 0;
+    if (pendingSave === payload) pendingSave = null;
     set({ saveError: null });
   } catch (e: unknown) {
     const reason = e instanceof Error ? e.message : String(e);
