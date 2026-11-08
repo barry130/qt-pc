@@ -115,7 +115,7 @@ fn extract_archive(archive: &Path, output: &Path, cancel: &Cancellation) -> Resu
     for i in 0..zip.len() {
         cancel.check()?;
         let mut file = zip.by_index(i).map_err(|_| "读取翻译组件失败")?;
-        let name = file.name();
+        let name = file.name().map_err(|_| "读取翻译组件失败")?.into_owned();
         if name.contains(['\\', ':']) || name.split('/').any(|part| part == ".." || part == ".") || file.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
             return Err("翻译压缩包包含不安全路径".into());
         }
@@ -197,6 +197,43 @@ mod tests {
         let stop = Cancellation::default(); stop.cancel();
         assert!(extract_archive(&path, &root.join("cancelled"), &stop).unwrap_err().contains("取消"));
         assert!(!root.join("cancelled").exists());
+    }
+    /// 中央目录（CDFH）与本地头（LFH）声明不同文件名的「双头」归档：解压只认中央目录，
+    /// 本地头里的路径绝不能被写到磁盘，越界路径更不能逃出输出目录。
+    #[test]
+    fn dual_header_names_cannot_redirect_extraction() {
+        let root = crate::public_test_fixture::root()
+            .join(format!("translate-dual-{:016x}", fastrand::u64(..)));
+        fs::create_dir(&root).unwrap();
+        // 等长替换，避免改动归档里其它字段的偏移。
+        let benign = b"payload.txt";
+        let hostile = b"../escape.t";
+        assert_eq!(benign.len(), hostile.len());
+        let path = root.join("dual.zip");
+        let mut writer = zip::ZipWriter::new(fs::File::create(&path).unwrap());
+        writer
+            .start_file("payload.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(b"data").unwrap();
+        writer.finish().unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        let lfh = bytes
+            .windows(4)
+            .position(|window| window == b"PK\x03\x04")
+            .expect("local file header");
+        assert_eq!(&bytes[lfh + 30..lfh + 30 + benign.len()], benign);
+        bytes[lfh + 30..lfh + 30 + hostile.len()].copy_from_slice(hostile);
+        fs::write(&path, &bytes).unwrap();
+        let output = root.join("out");
+        let result = extract_archive(&path, &output, &Cancellation::default());
+        // 允许新版 zip 直接拒绝该归档；无论如何本地头声明的路径都不得落盘。
+        assert!(
+            !root.join("escape.t").exists(),
+            "local header name must never be extracted"
+        );
+        if result.is_ok() {
+            assert_eq!(fs::read(output.join("payload.txt")).unwrap(), b"data");
+        }
     }
     #[test]
     #[ignore = "explicit offline translation download and native inference"]

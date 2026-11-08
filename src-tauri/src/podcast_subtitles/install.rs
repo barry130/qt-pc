@@ -385,7 +385,8 @@ fn engine_entries(
     for i in 0..zip.len() {
         cancel.check()?;
         let mut item = zip.by_index(i).map_err(|_| "无法读取引擎压缩包内容")?;
-        let name = item.name().to_owned();
+        // zip 9.x 起 name() 返回 Result<Cow<str>>：中央目录名读取/解码失败不再被静默忽略。
+        let name = item.name().map_err(|_| "无法读取引擎压缩包内容")?.into_owned();
         if name.contains('\\')
             || name.contains(':')
             || name.split('/').any(|p| p == ".." || p == ".")

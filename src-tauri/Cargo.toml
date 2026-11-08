@@ -62,7 +62,7 @@ md-5 = "0.11"
 # 复用同一份源码不引入新副本
 ring = "0.17"
 # 离线语音引擎的官方 ZIP，只启用解压所需的 deflate。
-zip = { version = "=4.6.1", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "=9.4.2", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 base64 = "0.23"
 # 同名 .lrc 的文本解码（UTF-8 失败按 GB18030 兜底，中文曲库里大量 GBK 歌词）：
 # reqwest 已把同一版本带进依赖树，不引入新副本
