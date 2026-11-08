@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>轻听 QuietMusic 3.0.9 更新说明</title>
+<style>
+  :root{
+    --ink:#1a1d21; --ink-2:#454b54; --ink-3:#6b7280; --line:#e5e7eb;
+    --bg:#f6f7f9; --card:#ffffff; --accent:#2f6df6; --accent-soft:#eaf1fe;
+    --ok:#0f7b53; --warn:#9a5b00;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; padding:40px 20px 72px; background:var(--bg); color:var(--ink);
+    font:16px/1.75 -apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+  }
+  .doc{max-width:820px; margin:0 auto}
+  .card{background:var(--card); border:1px solid var(--line); border-radius:16px; padding:44px 52px 52px;
+        box-shadow:0 1px 2px rgba(16,24,40,.04),0 12px 32px -12px rgba(16,24,40,.10)}
+
+  header.doc-head{border-bottom:1px solid var(--line); padding-bottom:26px; margin-bottom:34px}
+  .eyebrow{font-size:13px; letter-spacing:.14em; text-transform:uppercase; color:var(--accent); font-weight:700; margin:0 0 10px}
+  h1{margin:0 0 8px; font-size:34px; line-height:1.25; letter-spacing:-.01em}
+  h1 .ver{color:var(--accent)}
+  .sub{margin:0; color:var(--ink-3); font-size:14.5px}
+
+  .facts{display:flex; flex-wrap:wrap; gap:10px; margin:22px 0 0}
+  .fact{background:var(--accent-soft); color:#1b3f8f; border-radius:999px; padding:5px 13px; font-size:13px; font-weight:600}
+  .fact.plain{background:#f3f4f6; color:var(--ink-2)}
+
+  .lede{font-size:17px; line-height:1.85; color:var(--ink-2); margin:0 0 8px}
+  .lede strong{color:var(--ink)}
+
+  h2{font-size:22px; margin:44px 0 6px; padding-top:18px; border-top:1px solid var(--line); letter-spacing:-.005em}
+  h2 .n{display:inline-block; min-width:32px; color:var(--accent); font-variant-numeric:tabular-nums}
+  h2 + .hint{margin:0 0 14px; color:var(--ink-3); font-size:14px}
+  h3{font-size:16.5px; margin:24px 0 6px}
+  p{margin:10px 0}
+  ul{margin:10px 0; padding-left:22px}
+  li{margin:7px 0}
+  li::marker{color:#b6bdc7}
+  code{font-family:"Cascadia Mono",Consolas,monospace; font-size:.9em; background:#f2f4f7; border:1px solid #e7e9ee;
+       border-radius:5px; padding:1px 5px; color:#1f2937}
+  .tag{font-size:12px; font-weight:700; padding:2px 8px; border-radius:6px; vertical-align:2px; white-space:nowrap}
+  .tag.new{background:#e7f6ee; color:var(--ok)}
+  .tag.better{background:#eaf1fe; color:#1b3f8f}
+  .tag.fix{background:#fff4e5; color:var(--warn)}
+  .note{border-left:3px solid var(--accent); background:#f8faff; padding:12px 16px; border-radius:0 8px 8px 0; margin:16px 0; color:var(--ink-2)}
+  table{width:100%; border-collapse:collapse; margin:16px 0; font-size:14.5px}
+  th,td{text-align:left; padding:9px 12px; border-bottom:1px solid var(--line)}
+  th{color:var(--ink-3); font-weight:600; font-size:13px; letter-spacing:.02em}
+  td code{background:none; border:none; padding:0}
+  footer.doc-foot{margin-top:44px; padding-top:20px; border-top:1px solid var(--line); color:var(--ink-3); font-size:13px}
+
+  @media (max-width:640px){ body{padding:16px 10px 40px} .card{padding:28px 22px 34px; border-radius:12px} h1{font-size:26px} }
+  @media print{
+    body{background:#fff; padding:0; color:#000; font-size:11pt}
+    .card{border:none; box-shadow:none; padding:0; max-width:none}
+    h2{page-break-after:avoid} li{page-break-inside:avoid}
+    .facts .fact{background:#f2f2f2; color:#000}
+  }
+</style>
+</head>
+<body>
+<main class="doc">
+<article class="card">
+
+<header class="doc-head">
+  <p class="eyebrow">QuietMusic · Release Notes</p>
+  <h1>轻听 <span class="ver">3.0.9</span> 更新说明</h1>
+  <p class="sub">从 1.1.3 到 3.0.9 的全部变化 · 面向使用者的版本说明</p>
+  <div class="facts">
+    <span class="fact">版本 3.0.9</span>
+    <span class="fact">versionCode 309</span>
+    <span class="fact plain">上一版 1.1.3（113）</span>
+    <span class="fact plain">覆盖 2026-10-18 ～ 2026-11-08</span>
+    <span class="fact plain">桌面端 Windows / Linux / macOS</span>
+  </div>
+</header>
+
+<p class="lede">
+  这是一次跨越大版本的整体更新：<strong>音源账号、私人 FM、本地曲库管理、播客与字幕、AI 助手、中英双语界面、DLNA 投送</strong>
+  这批能力都在这一版里补齐；播放器、列表、设置界面做了重构，待机占用明显下降；同时集中修掉了一批长期困扰使用的
+  播放与歌词问题。原有的收藏、歌单、设置和听歌记录都会自动保留。
+</p>
+
+<h2><span class="n">01</span> 音源与账号</h2>
+<p class="hint">这一版把「换源」从一个开关做成了完整的一套账号体系。</p>
+
+<h3>音源账号</h3>
+<ul>
+  <li><span class="tag new">新增</span> <strong>音源账号页</strong>：登录在内嵌网页里完成，不用跳出应用；登录态在后台保活，B 站 Cookie 到期会自动刷新。</li>
+  <li><span class="tag new">新增</span> <strong>账号歌单同步</strong>：登录后自动对比平台歌单与本机收藏，差集可勾选一键收藏；同步结果是全量清单，带「已收藏」标记，也能就地取消收藏。</li>
+  <li><span class="tag new">新增</span> 同步前的登录态前置检查，失败时弹窗里直接给「一键开启并重试」。</li>
+  <li><span class="tag new">新增</span> 换过音源包或音源包已下架后残留的账号卡，会明确标出「音源包已卸载」，不再显示一个看不出是什么的原始 id。</li>
+  <li><span class="tag fix">修复</span> 关掉网页登录窗口后一直卡在「登录中」、要等三分钟超时的情况，现在立即复位。</li>
+  <li><span class="tag better">改进</span> 网页登录失败时，提示会列出抓到的 Cookie 名称（只有名字，没有值），便于判断是「没抓到」还是「被官方拒绝」。</li>
+</ul>
+
+<h3>音源解析</h3>
+<ul>
+  <li><span class="tag fix">修复</span> <strong>酷狗分享短码歌单只显示 10 首</strong>：改为先用短链换取公开歌单 id 再走全量通道，实测 175 / 549 首这类歌单都能完整读取。</li>
+  <li><span class="tag fix">修复</span> 同步来的 B 站收藏歌单点开为空。</li>
+  <li><span class="tag better">改进</span> B 站收藏歌单按分 P 章节展开；多 P 视频按首 P 的真实时长折算码率，挑轨更准。</li>
+  <li><span class="tag better">改进</span> 上游限流不再被当成「这首没有」：自动按建议间隔重试并换线，长歌单的成功率明显上升。</li>
+  <li><span class="tag better">改进</span> 码率不再是硬性否定条件——某个档位取不到时优先保证能播，而不是直接判定这首歌不可用。</li>
+  <li><span class="tag new">新增</span> 聚合搜索：一次查询合并多个音源的结果，每条结果标出来源平台；播放条也显示当前实际音源徽标。</li>
+</ul>
+
+<h2><span class="n">02</span> 播放体验</h2>
+<p class="hint">播放器在这一版被重做过一遍，外观、音质和稳定性都有变化。</p>
+
+<h3>播放界面</h3>
+<ul>
+  <li><span class="tag new">新增</span> <strong>四种播放页样式</strong>，各有独立背景，可按喜好切换；播放中始终标注真正的取流来源。</li>
+  <li><span class="tag new">新增</span> 歌词逐字/逐行同步渲染，桌面歌词窗与主窗口共用同一份时间轴。</li>
+  <li><span class="tag new">新增</span> 歌词字号可调。</li>
+  <li><span class="tag new">新增</span> 播放队列面板高亮当前行（竖条 + 跳动条 + 主色歌名），滚动时也能一眼找到正在放的那首。</li>
+  <li><span class="tag new">新增</span> 播放页右键「分享歌曲」：生成分享图，右下角内嵌下载页二维码。</li>
+</ul>
+
+<h3>音质与播放稳定性</h3>
+<ul>
+  <li><span class="tag fix">修复</span> <strong>5.1 / 7.1 多声道 FLAC 没有声音</strong>：中置与环绕声道被直接丢掉，电平低了 6～10 dB，时长也按错误声道数折算，于是歌词整段错位。现在按 ITU-R BS.775 系数降混到立体声，正常出音、正常对轴。</li>
+  <li><span class="tag new">新增</span> ReplayGain 音量均衡，可按单曲或按专辑两种口径。</li>
+  <li><span class="tag better">改进</span> <strong>无缝播放</strong>的预热提前到「当前曲目加载完成」那一刻，失败会自动换目标重试；拖动进度条、临时调速不再白白作废已经取好的下一首。</li>
+  <li><span class="tag new">新增</span> 本地文件优先播放：同一首歌本机有文件时优先用本地，不占带宽。</li>
+  <li><span class="tag fix">修复</span> 拖动进度条后位置「闪回」到上一处再跳回来。</li>
+</ul>
+
+<h3>私人 FM</h3>
+<ul>
+  <li><span class="tag new">新增</span> 私人 FM 全链路：心动 / 常听 / 探索三档口味，每轮 12 首，自动补歌，关掉页面也会继续补。</li>
+  <li><span class="tag better">改进</span> 进 FM 前会把你正在听的队列整份存下（含进度与暂停状态），退出时原样恢复，播放模式也还回原来的。</li>
+  <li><span class="tag better">改进</span> 队列被手动换走时 FM 会自动让位，不会往别人的队列里继续追加。</li>
+</ul>
+
+<h2><span class="n">03</span> 本地曲库</h2>
+<p class="hint">本机音乐从「能放」变成「能管」。</p>
+<ul>
+  <li><span class="tag new">新增</span> <strong>标签编辑</strong>：改标题、歌手、专辑、年份等标签；写入前自动做快照，可以整单恢复。</li>
+  <li><span class="tag new">新增</span> <strong>5 星评分</strong>，列表页直接显示星级列。</li>
+  <li><span class="tag new">新增</span> <strong>智能歌单</strong>：规则存在库里、曲目实时计算，支持按 BPM 等条件筛选。</li>
+  <li><span class="tag new">新增</span> <strong>本地曲库监听</strong>：文件新增、改名、删除后自动增量入库，不用手动重扫。</li>
+  <li><span class="tag new">新增</span> <strong>音乐整理与库体检</strong>：缺失文件、沉睡 30 天、超长（10 分钟以上）分组列出，可逐条忽略与恢复；移动文件前先落撤销记录，可以整体回退。</li>
+  <li><span class="tag new">新增</span> BPM 识别（读文件标签，20～400 之外视为未知）。</li>
+  <li><span class="tag new">新增</span> <strong>听歌上报</strong>：Last.fm 与 ListenBrainz 二选一，同一时刻只报一家；网络抖动会退避重试。</li>
+  <li><span class="tag new">新增</span> <strong>诊断包导出</strong>：一键打包版本、平台、库体检、表统计、打码后的设置与日志尾部，反馈问题时有据可查。</li>
+  <li><span class="tag new">新增</span> <strong>便携模式</strong>：程序目录放一个 portable.txt（或设置环境变量），数据就跟着程序走，不进系统用户目录。</li>
+  <li><span class="tag new">新增</span> 系统级唤起重播：<code>quietmusic://play</code> 链接可直接播放已在本机的文件。</li>
+  <li><span class="tag new">新增</span> 歌单可改名、可换封面（选图 / 预览 / 清除），封面会复制进数据目录并同步到云端；云端失败不影响本地，界面会说明当前是「已同步 / 离线 / 失败」以及后端给出的原因。</li>
+  <li><span class="tag new">新增</span> 歌单分享卡：前 4 首封面 2×2 拼图，整卡预览不裁切。</li>
+  <li><span class="tag better">改进</span> 收藏时的重复判定放宽，同名不同版本不再被粗暴判成「已存在」；歌单多版本选择会一直保持打开，直到你确认。</li>
+  <li><span class="tag better">改进</span> 听歌报告：30 天改为横向月历（格子大小与一年视图不再打架），切换区间时保留旧数据，不再整块白屏。</li>
+</ul>
+
+<h2><span class="n">04</span> 播客与字幕</h2>
+<ul>
+  <li><span class="tag new">新增</span> 播客订阅：RSS 添加、单集列表、按订阅更新。</li>
+  <li><span class="tag new">新增</span> <strong>字幕识别</strong>：可走云端转写，也可用本机 whisper.cpp 离线跑；短音频自动识别，长音频分段。</li>
+  <li><span class="tag new">新增</span> <strong>离线翻译</strong>（Argos）：无需联网即可把字幕译成中文。</li>
+  <li><span class="tag new">新增</span> 字幕同步到桌面歌词窗，边听边看。</li>
+  <li><span class="tag better">改进</span> 没有时间轴的字幕不再反复刷新播放状态，长播客的界面更省电。</li>
+</ul>
+
+<h2><span class="n">05</span> AI 助手</h2>
+<ul>
+  <li><span class="tag new">新增</span> <strong>两条路线</strong>：本机跑的小模型，或走服务端模型；可在设置里切换。</li>
+  <li><span class="tag new">新增</span> 本地模型可自行添加与编辑供应商（地址、模型、密钥、协议），并按组展示。</li>
+  <li><span class="tag new">新增</span> 「测试连接」：用当前填写的配置真发一句话试一试，只试不存；结果就地显示，改任一字段即清空旧结论。</li>
+  <li><span class="tag new">新增</span> 会话历史，以及「AI 助手」独立入口。</li>
+  <li><span class="tag better">改进</span> 设置页改成两步一页：第 1 步先选引擎，第 2 步才出现模型配置，不再把有依赖关系的两件事并排放。</li>
+  <li><span class="tag fix">修复</span> 旧回复覆盖新提问（串台）、分页缓存串数据、嵌套弹窗丢失键盘焦点。</li>
+</ul>
+
+<h2><span class="n">06</span> 界面与交互</h2>
+<ul>
+  <li><span class="tag new">新增</span> <strong>中英双语界面</strong>：侧边栏、窗口按钮、设置全部分节、播放队列等完成词条化；播放量「万/亿」与「K/M/B」、日期与时长按语言本地化。缺词条时回退中文。</li>
+  <li><span class="tag new">新增</span> <strong>命令面板</strong>：一个入口搜页面、搜设置、直接「喜欢/取消喜欢当前曲目」。</li>
+  <li><span class="tag new">新增</span> <strong>键盘与读屏可达</strong>：空格播放/暂停、方向键前后 10 秒、进度条可键盘操作、切歌有读屏播报、切页后焦点回到内容区。</li>
+  <li><span class="tag new">新增</span> 页面空白处右键不再弹系统原生菜单（划选文字仍然放行）。</li>
+  <li><span class="tag better">改进</span> 标题栏右侧入口重排为 头像 → 通知 → 设置 → 皮肤 → 窗口控制；「外观」提升为一级页面，原设置内地址自动跳转。</li>
+  <li><span class="tag better">改进</span> <strong>列表统一改为一次性加载</strong>，去掉了滑动加载与底部「已经到底了」；同时设了分页护栏，超长歌单也不会把界面拖死。</li>
+  <li><span class="tag better">改进</span> 详情页版式统一（左封面 176px、右侧信息），加载态统一由骨架屏接管；空态、按钮、弹窗、输入框收敛到同一套组件，Esc 关闭与焦点陷阱行为一致。</li>
+  <li><span class="tag better">改进</span> 设置页文案精简 93 处，13 个分节拆开按需加载，音源包教程入口提到页顶。</li>
+  <li><span class="tag new">新增</span> 首页通告栏与消息中心：公告类型、链接打开方式与后台口径统一；「仅首次登录」的公告改为按条记录，关掉一条不会连带错过下一条。</li>
+  <li><span class="tag new">新增</span> <strong>更新说明支持富文本</strong>：后台按 HTML 下发的说明会正常渲染标题、加粗、列表和链接，脚本类标签一律剔除；说明区限高可滚动，不会把「立即更新」顶出屏幕。</li>
+  <li><span class="tag new">新增</span> 首次启动的免责声明改由后台下发：文案、读秒、条款版本都能在后台改，不用发版；改过版本会重新征询，老用户已同意的不会被重复打扰。</li>
+  <li><span class="tag new">新增</span> 每日推荐页；更换头像后，各页面即时同步。</li>
+  <li><span class="tag new">新增</span> DLNA 投送控制：在播放控制里查看并选择局域网内的渲染设备。</li>
+</ul>
+
+<h2><span class="n">07</span> 性能与占用</h2>
+<p class="hint">这一段是「为什么这一版更轻」。</p>
+<ul>
+  <li><span class="tag better">改进</span> 迷你窗、桌面歌词窗改为<strong>独立入口</strong>，不再各自加载一份完整主界面。</li>
+  <li><span class="tag better">改进</span> 迷你窗隐藏即销毁、需要时再建（约 0.3 秒），不再常驻一个渲染进程。</li>
+  <li><span class="tag better">改进</span> 三处 60fps 空转收敛：播放位置按 100ms 步进、桌面歌词 30fps 且暂停即跳过、播放条频谱 30fps 且零信号停机。</li>
+  <li><span class="tag better">改进</span> 窗口隐藏时暂停全部动画与过渡，并把 WebView 内存档位降到低位，恢复可见时回升。</li>
+  <li><span class="tag better">改进</span> 实测待机单核占用由约 7% 降到 1～3%。</li>
+  <li><span class="tag better">改进</span> 批量检查收藏时只准备一次候选并让出主线程；无时间轴字幕不再持续触发播放状态更新。</li>
+</ul>
+
+<h2><span class="n">08</span> 修复清单</h2>
+<p class="hint">按影响面排列，前几条是这一版最值得升级的理由。</p>
+<ul>
+  <li>多声道（5.1 / 7.1）FLAC 无声、音量偏低、歌词整体错位。</li>
+  <li>浅色主题下正在唱的那一行几乎看不见（现在按底色自动校正对比度，最低 5:1）。</li>
+  <li>换源之后桌面歌词窗仍按旧音源取词，歌词与正在播放的版本对不上。</li>
+  <li>拖动进度条后播放位置闪回。</li>
+  <li>同步来的 B 站歌单点开为空；酷狗分享歌单只显示 10 首。</li>
+  <li>托盘菜单「迷你模式」的勾选状态与实际窗口不符。</li>
+  <li>网页登录关闭窗口后一直显示「登录中」，要等三分钟超时。</li>
+  <li>AI 会话里旧回复覆盖新请求；分页缓存串数据；弹窗嵌套后丢失焦点。</li>
+  <li>歌单版本选择被自动关掉、重复匹配过严导致少收藏。</li>
+  <li>反馈信息里的版本识别把 Windows 11 显示成 Windows 10。</li>
+  <li>macOS 构建的两处编译期死代码，CI 镜像同步迁移到 macos-15。</li>
+</ul>
+
+<h2><span class="n">09</span> 升级须知</h2>
+<ul>
+  <li><strong>版本号</strong>：1.1.3 → 3.0.9（versionCode 113 → 309），与移动端 3.x 采用同一套编号口径。</li>
+  <li><strong>数据保留</strong>：收藏、歌单、设置、听歌记录、已登录的账号都会沿用，升级不需要重新配置。</li>
+  <li><strong>音源能力</strong>仍由第三方音源包提供，应用不内置也不分发音源内容；升级后若某个平台用不了，请先在「设置 → 音源包」里安装或更新对应的包。</li>
+  <li><strong>首次启动</strong>会由后台下发免责声明，按提示确认即可；此前已同意过的不会重复弹。</li>
+  <li><strong>Windows</strong>：安装包旁边的 <code>.sig</code> 是应用内自动更新的验签文件，手动安装可以忽略它。</li>
+  <li><strong>macOS</strong>：包未签名也未公证，首次打开会提示「已损坏」。在访达里右键点应用 →「打开」，再点一次「打开」；或在终端执行 <code>xattr -dr com.apple.quarantine /Applications/QuietMusic.app</code>。</li>
+  <li><strong>Linux</strong>：deb 需要 glibc 2.32 及以上（Ubuntu 22.04 / Debian 12 均可），发行版较老请用 AppImage；Linux 不支持应用内自动更新。</li>
+</ul>
+
+<footer class="doc-foot">
+  <p>本说明依据仓库 <code>v1.1.3..HEAD</code> 的提交记录整理，覆盖 2026-10-18 至 2026-11-08。功能以实际运行版本为准；音源相关能力的可用性取决于你所安装的第三方音源包与对应平台的状态。</p>
+</footer>
+
+</article>
+</main>
+</body>
+</html>
