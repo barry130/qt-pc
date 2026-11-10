@@ -88,107 +88,100 @@ export function UpdateDialog(): React.JSX.Element | null {
     await ipc.runUpdateBrowser(browserTarget).catch(() => {});
   };
 
+  // 底部按钮区走 Modal 的 footer（固定底边、不随正文滚动）。下载中 / 出错 / 已启动
+  // 安装器时没有可点的按钮，就不传——否则会留一条空白的按钮栏。
+  const footer =
+    phase === "idle" ? (
+      <>
+        {!isForce(info) && (
+          <button type="button" onClick={close} className={buttonClass({ variant: "outline" })}>
+            暂不更新
+          </button>
+        )}
+        {canBrowserDownload && (
+          <button
+            type="button"
+            onClick={() => void openBrowser()}
+            className={buttonClass({ variant: "outline" })}
+          >
+            浏览器下载
+          </button>
+        )}
+        {supportsInAppUpdate() && (
+          <button
+            type="button"
+            onClick={() => void startDownload()}
+            className={buttonClass({ variant: "primary" })}
+          >
+            立即更新
+          </button>
+        )}
+      </>
+    ) : phase === "done" ? (
+      <button type="button" onClick={close} className={buttonClass({ variant: "primary" })}>
+        完成
+      </button>
+    ) : undefined;
+
   return (
     <Modal
       open
       onClose={close}
-      size="sm"
+      size="wide"
       tone="glass"
       dismissible={false}
       closeOnBackdrop={false}
-      bodyClassName="p-5"
-    >
-        <h2 className="text-base font-medium">
+      title={
+        <>
           发现新版本 {info.versionName}
           {isForce(info) && (
             <span className="ml-2 rounded bg-destructive/10 px-2 py-0.5 text-xs text-destructive">
               强制更新
             </span>
           )}
-        </h2>
-        {/* 更新说明支持富文本：后端 versionInfo 与移动端一致按 HTML 下发（qt-uniappx 的
-            qt-upgrade-popup 就是 :html="info.versionInfo"），PC 之前整段按纯文本渲染，
-            标签会原样露出来。说明可能很长，这里单独限高滚动，免得把按钮顶出可视区。 */}
-        <div className="mt-3 max-h-[40vh] overflow-y-auto pr-1">
-          {info.versionInfo.trim().length > 0 ? (
-            <RichText text={info.versionInfo} />
-          ) : (
-            <p className="text-sm text-muted-foreground">暂无更新说明</p>
-          )}
-        </div>
-        {info.fileSize > 0 && (
-          <p className="mt-2 text-xs text-muted-foreground">
-            安装包大小：{(info.fileSize / 1024 / 1024).toFixed(1)} MB
-          </p>
-        )}
+        </>
+      }
+      footer={footer}
+    >
+      {/* 更新说明：后端按 HTML 下发（qt-uniappx 的 qt-upgrade-popup 也是 :html），但历史上
+          3.0.x 发的是 Markdown（`## 新增` + `- **条目**`），所以两种都要认。
+          长度完全不可控 —— 不设「展开全文」，正文直接铺在 Modal 的滚动区里：
+          面板被夹在视口内，内容超出就自动纵向滚动，按钮区固定在底部不动。 */}
+      {info.versionInfo.trim().length > 0 ? (
+        <RichText text={info.versionInfo} markdown />
+      ) : (
+        <p className="text-sm text-muted-foreground">暂无更新说明</p>
+      )}
+      {info.fileSize > 0 && (
+        <p className="mt-2 text-xs text-muted-foreground">
+          安装包大小：{(info.fileSize / 1024 / 1024).toFixed(1)} MB
+        </p>
+      )}
 
-        {phase === "downloading" && (
-          <div className="mt-4">
-            <div className="h-1.5 w-full overflow-hidden rounded bg-secondary">
-              <div
-                className="h-full bg-primary transition-[width] duration-slow ease-soft"
-                style={{ width: `${percent}%` }}
-              />
-            </div>
-            <p className="mt-1 text-right text-xs tabular-nums text-muted-foreground">
-              {percent}%
-            </p>
+      {phase === "downloading" && (
+        <div className="mt-4">
+          <div className="h-1.5 w-full overflow-hidden rounded bg-secondary">
+            <div
+              className="h-full bg-primary transition-[width] duration-slow ease-soft"
+              style={{ width: `${percent}%` }}
+            />
           </div>
-        )}
-        {phase === "done" && (
-          <p className="mt-4 text-sm text-[var(--primary)]">
-            安装器已启动，应用即将自动退出并就地覆盖安装，无需手动卸载。
+          <p className="mt-1 text-right text-xs tabular-nums text-muted-foreground">
+            {percent}%
           </p>
-        )}
-        {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
-        {phase === "idle" && !canBrowserDownload && !supportsInAppUpdate() && (
-          <p className="mt-3 text-xs text-muted-foreground">
-            后端未提供本平台的下载地址，请到官网下载页手动更新。
-          </p>
-        )}
-
-        <div className="mt-5 flex justify-end gap-2">
-          {phase === "idle" && (
-            <>
-              {!isForce(info) && (
-                <button
-                  type="button"
-                  onClick={close}
-                  className={buttonClass({ variant: "outline" })}
-                >
-                  暂不更新
-                </button>
-              )}
-              {canBrowserDownload && (
-                <button
-                  type="button"
-                  onClick={() => void openBrowser()}
-                  className={buttonClass({ variant: "outline" })}
-                >
-                  浏览器下载
-                </button>
-              )}
-              {supportsInAppUpdate() && (
-                <button
-                  type="button"
-                  onClick={() => void startDownload()}
-                  className={buttonClass({ variant: "primary" })}
-                >
-                  立即更新
-                </button>
-              )}
-            </>
-          )}
-          {phase === "done" && (
-            <button
-              type="button"
-              onClick={close}
-              className={buttonClass({ variant: "primary" })}
-            >
-              完成
-            </button>
-          )}
         </div>
+      )}
+      {phase === "done" && (
+        <p className="mt-4 text-sm text-[var(--primary)]">
+          安装器已启动，应用即将自动退出并就地覆盖安装，无需手动卸载。
+        </p>
+      )}
+      {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+      {phase === "idle" && !canBrowserDownload && !supportsInAppUpdate() && (
+        <p className="mt-3 text-xs text-muted-foreground">
+          后端未提供本平台的下载地址，请到官网下载页手动更新。
+        </p>
+      )}
     </Modal>
   );
 }

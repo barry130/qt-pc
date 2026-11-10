@@ -53,7 +53,9 @@ export function FirstRunDisclaimer(): React.JSX.Element | null {
         className="flex max-h-[85vh] w-[32rem] max-w-[92vw] flex-col rounded-2xl border border-white/20 bg-white/70 p-5 text-card-foreground shadow-overlay backdrop-blur-xl dark:border-white/10 dark:bg-black/40"
       >
         <h2 className="text-base font-medium">{notice.title || "使用前请先阅读"}</h2>
-        <div className="mt-3 flex-1 overflow-y-auto text-muted-foreground">
+        {/* min-h-0 是关键：flex 子项默认 min-height:auto，正文一长它就不肯收缩，
+            整块内容从卡片底部溢出去（看着就是「弹窗比屏幕还大」）。 */}
+        <div className="mt-3 min-h-0 flex-1 overflow-y-auto overscroll-contain text-muted-foreground">
           <RichText text={notice.content} />
           {url.length > 0 && (
             <p className="mt-3 text-sm">

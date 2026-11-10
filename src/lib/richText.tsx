@@ -445,11 +445,148 @@ export function splitLinks(text: string): { type: "text" | "link"; value: string
   return parts;
 }
 
-/** 消息正文：HTML 走富文本渲染，纯文本按段落渲染 */
-export function RichText(props: { text: string }): React.JSX.Element {
+/**
+ * 轻量 Markdown（升级说明用）。
+ *
+ * 后端的 `versionInfo` 一直是 Markdown 风格（`## 新增` + `- **条目**`，见 3.0.9 那条），
+ * 以前走 PlainText，`##` 与 `**` 原样露在界面上，而且每条都渲染成独立段落 —— 同样的
+ * 内容比真实排版高出一大截，正是「一次性全部展开、把容器撑爆」的来源之一。这里只认
+ * 真正的排版标记：标题（#/##/###）、无序列表（- * •）、有序列表（1. `1)`）、加粗、
+ * 行内代码、裸链接；其余一律按段落处理，不引入第三方解析器。
+ */
+function inlineNodes(text: string, keyPrefix: string): ReactNode[] {
+  const out: ReactNode[] = [];
+  const re = /\*\*([^*]+)\*\*|`([^`]+)`/g;
+  let last = 0;
+  let seq = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last) {
+      out.push(...linkNodes(text.slice(last, m.index), `${keyPrefix}-t${seq++}`));
+    }
+    if (m[1] !== undefined) {
+      out.push(<strong key={`${keyPrefix}-b${seq}`}>{m[1]}</strong>);
+    } else {
+      out.push(
+        <code key={`${keyPrefix}-c${seq}`} className="rounded bg-secondary px-1 py-0.5 text-xs">
+          {m[2]}
+        </code>,
+      );
+    }
+    seq += 1;
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) {
+    out.push(...linkNodes(text.slice(last), `${keyPrefix}-t${seq}`));
+  }
+  return out;
+}
+
+/** 纯文本片段里的裸 URL → 可点链接（与 PlainText 同口径） */
+function linkNodes(text: string, keyPrefix: string): ReactNode[] {
+  return splitLinks(text).map((part, index) =>
+    part.type === "link" ? (
+      <ExternalLink key={`${keyPrefix}-l${index}`} href={part.value}>
+        {part.value}
+      </ExternalLink>
+    ) : (
+      <span key={`${keyPrefix}-s${index}`}>{part.value}</span>
+    ),
+  );
+}
+
+function MarkdownText(props: { text: string }): React.JSX.Element {
+  const blocks: ReactNode[] = [];
+  let list: { ordered: boolean; items: string[] } | null = null;
+  let key = 0;
+
+  const flushList = (): void => {
+    if (list === null) return;
+    const items = list.items.map((item, index) => (
+      <li key={`${key}-i${index}`}>{inlineNodes(item, `${key}-i${index}`)}</li>
+    ));
+    const ordered = list.ordered;
+    blocks.push(
+      ordered ? (
+        <ol key={`l${key++}`} className="ml-5 list-decimal space-y-1 text-sm leading-relaxed">
+          {items}
+        </ol>
+      ) : (
+        <ul key={`l${key++}`} className="ml-5 list-disc space-y-1 text-sm leading-relaxed">
+          {items}
+        </ul>
+      ),
+    );
+    list = null;
+  };
+
+  for (const raw of props.text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line.length === 0) {
+      flushList();
+      continue;
+    }
+    const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+    if (heading !== null) {
+      flushList();
+      const level = heading[1].length;
+      const body = inlineNodes(heading[2].trim(), `h${key}`);
+      const cls = level <= 2 ? "text-sm font-semibold" : "text-xs font-semibold text-muted-foreground";
+      blocks.push(
+        level <= 2 ? (
+          <h3 key={`h${key++}`} className={cls}>
+            {body}
+          </h3>
+        ) : (
+          <h4 key={`h${key++}`} className={cls}>
+            {body}
+          </h4>
+        ),
+      );
+      continue;
+    }
+    const bullet = /^[-*•]\s+(.*)$/.exec(line);
+    if (bullet !== null) {
+      if (list === null || list.ordered) {
+        flushList();
+        list = { ordered: false, items: [] };
+      }
+      list.items.push(bullet[1]);
+      continue;
+    }
+    const ordered = /^\d+[.)]\s+(.*)$/.exec(line);
+    if (ordered !== null) {
+      if (list === null || !list.ordered) {
+        flushList();
+        list = { ordered: true, items: [] };
+      }
+      list.items.push(ordered[1]);
+      continue;
+    }
+    flushList();
+    blocks.push(
+      <p key={`p${key++}`} className="whitespace-pre-wrap break-words text-sm leading-relaxed">
+        {inlineNodes(line, `p${key}`)}
+      </p>,
+    );
+  }
+  flushList();
+
+  if (blocks.length === 0) {
+    return <p className="text-sm text-muted-foreground">（这条消息没有正文）</p>;
+  }
+  return <div className="space-y-2">{blocks}</div>;
+}
+
+/**
+ * 消息正文：HTML 走富文本渲染，纯文本按段落渲染。
+ * `markdown` 为真时把纯文本按轻量 Markdown 排版（升级说明用，默认关闭以免改变
+ * 公告/消息既有观感——那边的正文是后端富文本，不是 Markdown）。
+ */
+export function RichText(props: { text: string; markdown?: boolean }): React.JSX.Element {
   const { text } = props;
   if (!looksLikeHtml(text)) {
-    return <PlainText text={text} />;
+    return props.markdown === true ? <MarkdownText text={text} /> : <PlainText text={text} />;
   }
   const nodes = parseHtml(stripDangerous(text));
   if (nodes.length === 0) {

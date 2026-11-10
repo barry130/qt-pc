@@ -107,7 +107,7 @@ function MessagesPanel(props: {
               <X className="h-3.5 w-3.5" />
             </button>
           </div>
-          <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-4 py-3">
             <h2 className="text-sm font-semibold">{current.title}</h2>
             {current.time && (
               <p className="mt-1 text-2xs text-muted-foreground">{current.time}</p>
@@ -180,7 +180,7 @@ function MessagesPanel(props: {
             </div>
           </div>
 
-          <div className="min-h-0 flex-1 overflow-y-auto">
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
             {loading ? (
               <RowsSkeleton rows={5} cover="none" />
             ) : error ? (

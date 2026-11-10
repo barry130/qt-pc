@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { markFirstLoginShown, migrateLegacyFirstLogin, readFirstLoginShown } from "@/lib/noticeFirstLogin";
 import { isNoticeLinkOpenable, useOpenNoticeLink } from "@/lib/notice-open";
 import {
@@ -9,6 +9,7 @@ import {
   type ActiveNotice,
 } from "@/lib/notice-data";
 import { RichText } from "@/lib/richText";
+import { useViewportClamp } from "@/components/ui/modal";
 import { useAuthStore } from "@/stores/auth";
 
 /**
@@ -24,6 +25,7 @@ export function QtNoticeDialog(): React.JSX.Element | null {
   const openLink = useOpenNoticeLink();
   const [index, setIndex] = useState(0);
   const [hideToday, setHideToday] = useState(false);
+  const panelRef = useRef<HTMLDivElement | null>(null);
 
   const loggedIn = session != null;
 
@@ -61,6 +63,10 @@ export function QtNoticeDialog(): React.JSX.Element | null {
     if (notice !== null && hiddenToday) setIndex((value) => value + 1);
   }, [notice, hiddenToday]);
 
+  // 遮罩是 p-6（24px）：视口夹紧时上下各留一份，公告再长也不会高过窗口。
+  // active 跟着「有没有公告」变，面板真正挂上后才会重跑夹紧。
+  useViewportClamp(panelRef, notice !== null && !hiddenToday, 24);
+
   if (notice === null || hiddenToday) return null;
 
   const close = (): void => {
@@ -88,17 +94,19 @@ export function QtNoticeDialog(): React.JSX.Element | null {
       }}
     >
       <div
+        ref={panelRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby="qt-notice-title"
-        className="flex max-h-[min(680px,calc(100vh-48px))] w-[560px] max-w-full flex-col overflow-hidden rounded-2xl border border-border bg-background shadow-overlay"
+        className="flex max-h-[min(680px,calc(100dvh-48px))] w-[560px] max-w-full flex-col overflow-hidden rounded-2xl border border-border bg-background shadow-overlay"
       >
         {notice.title && (
           <div className="shrink-0 px-6 pb-2 pt-6 text-center">
             <h2 id="qt-notice-title" className="text-lg font-semibold">{notice.title}</h2>
           </div>
         )}
-        <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4">
+        {/* 公告正文长度由后台决定：正文区单独滚动，标题与按钮永远留在可视区内 */}
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 py-4">
           <RichText text={notice.content} />
         </div>
         <div className="shrink-0 px-6 pb-5">

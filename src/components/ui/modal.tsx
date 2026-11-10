@@ -1,4 +1,4 @@
-import { useCallback, useId, useRef } from "react";
+import { useCallback, useId, useLayoutEffect, useRef } from "react";
 import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -35,11 +35,47 @@ export type ModalTone = keyof typeof TONE_CLASS;
 const SIZE_CLASS = {
   sm: "max-w-sm",
   md: "max-w-md",
+  /** 与开屏公告（`qt-NoticeDialog` 的 w-[560px]）同宽，长正文弹窗用这个 */
+  wide: "max-w-[560px]",
   lg: "max-w-2xl",
   xl: "max-w-4xl",
 } as const;
 
 export type ModalSize = keyof typeof SIZE_CLASS;
+
+/** 遮罩内边距（与下面 `p-4` 对应）：视口夹紧时两侧各留这么多 */
+const MODAL_VIEWPORT_PADDING = 16;
+
+/**
+ * 把浮层夹进视口高度（`padding` 是上下各留的px）。
+ *
+ * CSS 侧的 `max-h-[calc(100dvh-2rem)]` 只是**声明**：宿主内核不认 `dvh`、或这条 arbitrary
+ * 类被裁剪掉，整条 max-height 就静默失效，浮层跟着内容长到比窗口还高——底部按钮被顶出
+ * 屏幕，`body` 又是 `overflow:hidden`，用户只能看到被裁掉的一截（用户反馈「弹窗比软件
+ * 屏幕还大，也不会滚动」）。所以再用量到的 `innerHeight` 兜一层：面板永远不高过窗口，
+ * 多出来的部分交给内部滚动区。窗口尺寸变化时重算。
+ *
+ * 手工搭壳的开屏公告（`qt-NoticeDialog`）也用它，别各自再抄一遍。
+ */
+export function useViewportClamp(
+  ref: React.RefObject<HTMLElement | null>,
+  active: boolean,
+  padding: number = MODAL_VIEWPORT_PADDING,
+): void {
+  useLayoutEffect(() => {
+    if (!active) return;
+    const panel = ref.current;
+    if (panel === null) return;
+    const clamp = (): void => {
+      // 下限 240px：窗口被压到极矮时也别让面板负高度 / 完全塌掉
+      const limit = Math.max(240, window.innerHeight - padding * 2);
+      panel.style.maxHeight = `${limit}px`;
+    };
+    clamp();
+    window.addEventListener("resize", clamp);
+    return () => window.removeEventListener("resize", clamp);
+  }, [ref, active, padding]);
+}
 
 export function Modal(props: {
   open: boolean;
@@ -89,6 +125,8 @@ export function Modal(props: {
 
   // Esc 与 Tab 循环由陷阱统一处理；不可关闭时传空实现，Esc 就自然失效。
   useFocusTrap(panelRef, props.open, close);
+  // 视口夹紧：CSS 之外再兜一层实测像素（见 useViewportClamp 注释）
+  useViewportClamp(panelRef, props.open, MODAL_VIEWPORT_PADDING);
 
   // 挂到 body 上再画：调用点常在滚动容器 / 带 transform 的祖先里，就地渲染会被裁切
   // （ListenReportDetail、AI 供应商设置原本就各自 createPortal 过一遍）。
@@ -146,7 +184,7 @@ export function Modal(props: {
             )}
           </header>
         )}
-        <div className={cn("min-h-0 flex-1 overflow-y-auto px-5 py-4", props.bodyClassName)}>
+        <div className={cn("min-h-0 flex-1 overflow-y-auto overscroll-contain px-5 py-4", props.bodyClassName)}>
           {props.children}
         </div>
         {props.footer !== undefined && (
