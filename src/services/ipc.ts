@@ -1788,8 +1788,12 @@ export async function revealLogs(): Promise<void> {
  * 播放意图」判断旧动作是否已过期；票随实际播放 IPC 原样带回（playIntent）。
  * 登记失败时 store 整条动作 fail closed；直接调用旧播放 API 的可选参数仍兼容。
  */
-export async function beginPlayIntent(): Promise<number> {
-  return invoke("begin_play_intent");
+export function beginPlayIntent(): Promise<number>;
+export function beginPlayIntent(expectedRevision: number): Promise<number | null>;
+export async function beginPlayIntent(expectedRevision?: number): Promise<number | null> {
+  if (expectedRevision === undefined) return invoke("begin_play_intent");
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) throw new Error("队列归属版本无效");
+  return invoke("begin_play_intent", { expectedRevision });
 }
 
 /** 仅取消原票的未提交意图；已提交或被另一票取代时 Native 不做任何修改。 */
@@ -1801,7 +1805,13 @@ export async function playQueue(
   tracks: Track[],
   startIndex: number,
   playIntent?: number,
+  expectedRevision?: number,
 ): Promise<QueueCommitReply> {
+  if (expectedRevision !== undefined) {
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) throw new Error("队列归属版本无效");
+    if (!Number.isSafeInteger(playIntent) || playIntent === undefined || playIntent < 1) throw new Error("播放意图票无效");
+    return invoke("play_queue", { tracks, startIndex, playIntent, expectedRevision });
+  }
   return playIntent === undefined
     ? invoke("play_queue", { tracks, startIndex })
     : invoke("play_queue", { tracks, startIndex, playIntent });
@@ -1861,6 +1871,35 @@ export async function queueAddNext(track: Track): Promise<void> {
 /** 加入队尾（不打断当前播放） */
 export async function queueAppend(tracks: Track[]): Promise<void> {
   return invoke("queue_append", { tracks });
+}
+
+interface QueueOwnershipReceipt { applied: boolean; queueRevision: number }
+function validateQueueOwnershipReceipt(receipt: QueueOwnershipReceipt): QueueOwnershipReceipt {
+  if (!receipt || typeof receipt.applied !== "boolean" || !Number.isSafeInteger(receipt.queueRevision) || receipt.queueRevision < 0) throw new Error("原生队列回执无效");
+  return receipt;
+}
+/** Release only this owner: no queue, playback, or later user intent is restored or replaced. */
+export async function queueReleaseIfCurrent(expectedRevision: number): Promise<QueueOwnershipReceipt> {
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) throw new Error("队列归属版本无效");
+  return validateQueueOwnershipReceipt(await invoke<QueueOwnershipReceipt>("queue_release_if_current", { expectedRevision }));
+}
+/** Atomically append only to the acknowledged owner; abort can revoke an uncommitted append. */
+export async function queueAppendIfCurrent(tracks: Track[], expectedRevision: number, signal?: AbortSignal): Promise<QueueOwnershipReceipt> {
+  if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) throw new Error("队列归属版本无效");
+  if (signal?.aborted) throw new Error("队列追加已取消");
+  let release: Promise<void> | undefined;
+  let releaseFailed = false;
+  const onAbort = () => {
+    release = queueReleaseIfCurrent(expectedRevision).then(() => undefined, () => { releaseFailed = true; });
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+  const result = await invoke<QueueOwnershipReceipt>("queue_append_if_current", { tracks, expectedRevision })
+    .then(receipt => ({ receipt, failed: false as const }), error => ({ error, failed: true as const }));
+  signal?.removeEventListener("abort", onAbort);
+  await release;
+  if (releaseFailed) throw new Error("原生队列归属释放失败");
+  if (result.failed) throw result.error;
+  return validateQueueOwnershipReceipt(result.receipt);
 }
 
 /** 移除队列中的某一项 */

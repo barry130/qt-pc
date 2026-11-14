@@ -1,8 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "@tanstack/react-router";
+import { listen } from "@tauri-apps/api/event";
+import { SOURCE_META_CHANGED_EVENT, SOURCE_PACK_CHANGED_EVENT } from "@/services/ipc";
+import { onAccountRecommendationContextChange } from "@/lib/account-recommendation";
+import { safeAccountRecommendationError } from "@/lib/account-recommendation-error";
 import { RefreshCw, SlidersHorizontal } from "lucide-react";
 import type { Track } from "@/types";
 import { usePlayerStore } from "@/stores/player";
+import { useRecommendationSourceStore } from "@/stores/recommendation-source";
+import { useSourceRegistryStore } from "@/stores/sourceRegistry";
+import { RecommendationSourceControl } from "@/components/common/RecommendationSourceControl";
 import { useKeepAliveActive } from "@/components/layout/keepAliveActive";
 import { qtresCoverUrl } from "@/lib/lrc";
 import { retainTrackSelection, trackSelectionKey } from "@/lib/track-selection";
@@ -22,7 +29,6 @@ import {
   DAILY_TASTE_HINT,
   DAILY_TASTE_LABEL,
   DAILY_TASTE_ORDER,
-  clearTodayResult,
   generateDailyRecommend,
   loadTodayResult,
   parseDailyRecommendMode,
@@ -65,6 +71,10 @@ export function DailyRecommendPage(): React.JSX.Element {
   const navigate = useNavigate();
   const active = useKeepAliveActive();
   const playQueue = usePlayerStore((s) => s.playQueue);
+  const dailySource = useRecommendationSourceStore((s) => s.daily);
+  const accountMode = dailySource.origin === "account";
+  const selectionRevision = useRecommendationSourceStore((s) => s.dailyRevision);
+  const sourceName = useSourceRegistryStore((s) => s.sources.find((source) => source.id === dailySource.sourceId)?.name ?? dailySource.sourceId);
 
   const [result, setResult] = useState<DailyRecommendResult | null>(null);
   const [mode, setMode] = useState<DailyRecommendMode>("rule");
@@ -75,129 +85,164 @@ export function DailyRecommendPage(): React.JSX.Element {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   /** 冷启动里勾选的风格（点「按这些风格生成」才落库，避免每点一下就搜一轮网络） */
   const [stylePicked, setStylePicked] = useState<string[]>([]);
+  const [sortValue, setSortValue] = useState(DEFAULT_TRACK_SORT);
+  const [providerRefresh, setProviderRefresh] = useState(0);
 
-  /** 同一时刻只允许一次生成；切页/重进不能叠着跑两遍搜索 */
   const runningRef = useRef(false);
-  /** 卸载后不再 setState（搜索要十几秒，用户可能早就切走了） */
   const aliveRef = useRef(true);
+  const activeRef = useRef(active);
+  activeRef.current = active;
+  const providerEpochRef = useRef(0);
+  const requestIdRef = useRef(0);
+  const initialEngineNoticeRef = useRef(false);
+  const playAbortRef = useRef<AbortController | null>(null);
   useEffect(() => {
     aliveRef.current = true;
     return () => {
       aliveRef.current = false;
+      providerEpochRef.current += 1;
+      requestIdRef.current += 1;
+      runningRef.current = false;
+      playAbortRef.current?.abort();
     };
   }, []);
 
-  /**
-   * 生成一版。
-   *
-   * `taste` 显式传进来（而不是让底层去读设置）：刚点完口味按钮时设置可能还没落盘，
-   * 显式传值能保证这次一定按用户刚点的口味算。
-   */
-  const generate = useCallback(
-    async (force: boolean, tasteOverride?: DailyTaste): Promise<void> => {
-      if (runningRef.current) return;
-      runningRef.current = true;
-      setLoading(true);
-      setError(null);
-      setProgress(force ? "重新生成中…" : "准备中…");
-      try {
-        const next = await generateDailyRecommend({
-          force,
-          taste: tasteOverride,
-          onProgress: (text) => {
-            if (aliveRef.current) setProgress(text);
-          },
-        });
-        if (!aliveRef.current) return;
-        setResult(next);
-        setSelected(new Set());
-        // 降级 / 候选不足之类的说明：右上角说一句就走，不占列表区
-        if (next.notice) toast(next.notice);
-      } catch (err) {
-        if (aliveRef.current) setError(errMsg(err));
-      } finally {
-        runningRef.current = false;
-        if (aliveRef.current) {
-          setLoading(false);
-          setProgress("");
-        }
-      }
-    },
-    [],
-  );
-
-  /** 点口味标签：立刻存设置并按新口味重算一批（不满足于只改设置不重算） */
-  const pickTaste = useCallback(
-    async (next: DailyTaste): Promise<void> => {
-      if (next === taste || runningRef.current) return;
-      setTaste(next);
-      try {
-        await saveTaste(next);
-      } catch {
-        // 存不进库不影响本次生成：下面的 generate 会显式带上口味
-      }
-      await generate(true, next);
-    },
-    [taste, generate],
-  );
-
-  /**
-   * 冷启动：用户点完风格 → 存成画像种子 → 清掉当天的冷启动缓存 → 立刻按风格重算。
-   *
-   * 必须清缓存：不清的话 `loadTodayResult` 会把刚才那份冷启动结果原样还回来，
-   * 用户点了风格却发现列表没变，会以为按钮坏了。
-   */
-  const applyStyleSeeds = useCallback(
-    async (names: string[]): Promise<void> => {
-      if (runningRef.current || names.length === 0) return;
-      try {
-        await saveStyleSeeds(names);
-        await clearTodayResult();
-      } catch (err) {
-        toastError(errMsg(err));
-        return;
-      }
-      await generate(true);
-    },
-    [generate],
-  );
-
-  /** 首次挂载 + 每次重新可见时跑一次。
-   *
-   * 先看缓存：命中就直接展示（不闪骨架、不打搜索请求）；没命中才生成。
-   * 跨天时 `loadTodayResult` 返回 null，于是自动重算 —— 这就是"每天第一次进来生成"。
-   * 缓存命中判定交给 `loadTodayResult(mode, taste)`（它内部用 effectiveMode 归一，
-   * 所以设成「服务端 AI」时不会每次都重搜一遍）。
-   */
-  const load = useCallback(async (): Promise<void> => {
-    try {
-      const [currentMode, currentTaste] = await Promise.all([readMode(), readTaste()]);
-      if (!aliveRef.current) return;
-      setMode(currentMode);
-      setTaste(currentTaste);
-      const cached = await loadTodayResult(currentMode, currentTaste);
-      if (!aliveRef.current) return;
-      if (cached) {
-        setResult(cached);
-        return;
-      }
-      await generate(false, currentTaste);
-    } catch (err) {
-      if (aliveRef.current) setError(errMsg(err));
+  const invalidate = useCallback((clearResult = true): void => {
+    providerEpochRef.current += 1;
+    requestIdRef.current += 1;
+    runningRef.current = false;
+    playAbortRef.current?.abort();
+    playAbortRef.current = null;
+    if (!aliveRef.current) return;
+    setLoading(false);
+    setProgress("");
+    setError(null);
+    if (clearResult) {
+      setResult(null);
+      setSelected(new Set());
+      setStylePicked([]);
+      setSortValue(DEFAULT_TRACK_SORT);
     }
+  }, []);
+
+  // Revocation is subscribed while hidden too; initial engine readiness is not a pack replacement.
+  useEffect(() => {
+    const refresh = (): void => {
+      invalidate();
+      if (aliveRef.current) setProviderRefresh((value) => value + 1);
+    };
+    const stopSelection = useRecommendationSourceStore.subscribe((state, previous) => {
+      if (state.dailyRevision !== previous.dailyRevision || state.daily.origin !== previous.daily.origin || state.daily.sourceId !== previous.daily.sourceId) invalidate();
+    });
+    const stopContext = onAccountRecommendationContextChange((feature) => {
+      if (feature === "fm" || useRecommendationSourceStore.getState().daily.origin !== "account") return;
+      if (feature === undefined && !initialEngineNoticeRef.current) { initialEngineNoticeRef.current = true; return; }
+      refresh();
+    });
+    let disposed = false;
+    const unlisteners: Array<() => void> = [];
+    const onPackChanged = (event: { payload: unknown }): void => {
+      const payload = event.payload;
+      if (payload !== null && typeof payload === "object" && "kind" in payload && payload.kind === "play") return;
+      if (useRecommendationSourceStore.getState().daily.origin !== "account") return;
+      initialEngineNoticeRef.current = true;
+      refresh();
+    };
+    for (const event of [SOURCE_META_CHANGED_EVENT, SOURCE_PACK_CHANGED_EVENT]) {
+      void listen(event, onPackChanged).then((unlisten) => {
+        if (disposed) unlisten(); else unlisteners.push(unlisten);
+      }).catch(() => undefined);
+    }
+    return () => { disposed = true; stopSelection(); stopContext(); for (const unlisten of unlisteners) unlisten(); };
+  }, [invalidate]);
+
+  /** Cache, progress, errors and finally all belong to the same request/provider epoch. */
+  const runRequest = useCallback(async (force: boolean, tasteOverride?: DailyTaste, checkCache = false): Promise<void> => {
+    if (!activeRef.current || (runningRef.current && !checkCache)) return;
+    const requestId = ++requestIdRef.current;
+    const epoch = providerEpochRef.current;
+    let provider: { origin: string; sourceId: string; revision: number } | null = null;
+    const isCurrent = (): boolean => {
+      const snapshot = useRecommendationSourceStore.getState();
+      return aliveRef.current && activeRef.current && requestId === requestIdRef.current && epoch === providerEpochRef.current &&
+        (!provider || (snapshot.daily.origin === provider.origin && snapshot.daily.sourceId === provider.sourceId && snapshot.dailyRevision === provider.revision));
+    };
+    runningRef.current = true;
+    setLoading(true); setError(null); setProgress(force ? "重新获取中…" : "准备中…");
+    try {
+      await useRecommendationSourceStore.getState().load();
+      if (!isCurrent()) return;
+      const snapshot = useRecommendationSourceStore.getState();
+      provider = { ...snapshot.daily, revision: snapshot.dailyRevision };
+      let currentMode: DailyRecommendMode | undefined;
+      let currentTaste = tasteOverride;
+      // Account requests never read or alter the application/global AI and local taste settings.
+      if (provider.origin === "app") {
+        const preferences = await Promise.all([readMode(), currentTaste === undefined ? readTaste() : Promise.resolve(currentTaste)]);
+        if (!isCurrent()) return;
+        [currentMode, currentTaste] = preferences;
+        setMode(currentMode); setTaste(currentTaste);
+      }
+      let next = checkCache ? await loadTodayResult(currentMode, currentTaste) : null;
+      if (!isCurrent()) return;
+      initialEngineNoticeRef.current = true;
+      if (!next) {
+        next = await generateDailyRecommend({ force, mode: currentMode, taste: currentTaste, isCurrent,
+          onProgress: (text) => { if (isCurrent()) setProgress(text); } });
+      }
+      if (!isCurrent()) return;
+      setResult(next); setSelected(new Set());
+      if (next.origin === "account") setSortValue(DEFAULT_TRACK_SORT);
+      if (next.notice) toast(next.notice);
+    } catch (err) {
+      if (isCurrent()) setError(provider?.origin === "account" ? safeAccountRecommendationError(err).message : errMsg(err));
+    } finally {
+      if (isCurrent()) { runningRef.current = false; setLoading(false); setProgress(""); }
+    }
+  }, []);
+
+  const generate = useCallback((force: boolean, tasteOverride?: DailyTaste): Promise<void> => runRequest(force, tasteOverride), [runRequest]);
+  const load = useCallback((): Promise<void> => runRequest(false, undefined, true), [runRequest]);
+
+  const pickTaste = useCallback(async (next: DailyTaste): Promise<void> => {
+    if (useRecommendationSourceStore.getState().daily.origin === "account" || next === taste || runningRef.current) return;
+    const epoch = providerEpochRef.current;
+    setTaste(next);
+    try { await saveTaste(next); } catch { /* The explicit taste still applies to this generation. */ }
+    if (aliveRef.current && activeRef.current && epoch === providerEpochRef.current) await generate(true, next);
+  }, [taste, generate]);
+
+  const applyStyleSeeds = useCallback(async (names: string[]): Promise<void> => {
+    if (useRecommendationSourceStore.getState().daily.origin === "account" || runningRef.current || names.length === 0) return;
+    const epoch = providerEpochRef.current;
+    try { await saveStyleSeeds(names); }
+    catch (err) { if (aliveRef.current && activeRef.current && epoch === providerEpochRef.current) toastError(errMsg(err)); return; }
+    // Force already bypasses today's app cache; never clear a newly selected account cache.
+    if (aliveRef.current && activeRef.current && epoch === providerEpochRef.current) await generate(true);
   }, [generate]);
 
   useEffect(() => {
-    if (!active) return;
+    if (!active) { invalidate(false); return; }
     void load();
-  }, [active, load]);
+    return () => { requestIdRef.current += 1; runningRef.current = false; };
+  }, [active, dailySource.origin, dailySource.sourceId, selectionRevision, providerRefresh, load, invalidate]);
 
   const songs = useMemo(() => result?.items.map((item) => item.track) ?? [], [result]);
-  /** 排序（默认顺序）：只改显示顺序，不改数据本身；下拉选项与 uniappx 一致 */
-  const [sortValue, setSortValue] = useState(DEFAULT_TRACK_SORT);
+  /** 应用推荐允许显示排序；账号推荐始终保留平台原始顺序。 */
   /** 排序作用在「可见列表」上，所以播放全部 / 批量管理 / TrackList 拿的都是这个顺序 */
   const { key: sortKey, desc: sortDesc } = parseTrackSort(sortValue);
-  const sortedTracks = useMemo(() => sortTracks(songs, sortKey, sortDesc), [songs, sortKey, sortDesc]);
+  const sortedTracks = useMemo(() => accountMode ? songs : sortTracks(songs, sortKey, sortDesc), [accountMode, songs, sortKey, sortDesc]);
+  const playAll = useCallback((): void => {
+    const epoch = providerEpochRef.current;
+    playAbortRef.current?.abort();
+    const controller = new AbortController();
+    playAbortRef.current = controller;
+    const isCurrent = (): boolean => aliveRef.current && activeRef.current && epoch === providerEpochRef.current && !controller.signal.aborted;
+    void playQueue(sortedTracks, 0, undefined, isCurrent, controller.signal)
+      .catch((err) => { if (isCurrent()) toastError(accountMode ? safeAccountRecommendationError(err).message : errMsg(err)); })
+      .finally(() => { if (playAbortRef.current === controller) playAbortRef.current = null; });
+  }, [playQueue, sortedTracks, accountMode]);
+  useEffect(() => { if (accountMode) setSortValue(DEFAULT_TRACK_SORT); }, [accountMode, dailySource.sourceId]);
   const styleOptions = result?.coldStart ? (result.styleOptions ?? []) : [];
 
   // 新结果到手就清空勾选（此刻的 coldStart 状态已经变了，旧勾选没有意义）
@@ -256,6 +301,9 @@ export function DailyRecommendPage(): React.JSX.Element {
 
   return (
     <div className="flex h-full min-w-0 flex-col">
+      <div className="shrink-0 border-b border-border px-6 py-3">
+        <RecommendationSourceControl feature="daily" />
+      </div>
       {/* hero 与歌单 / 榜单详情页同一套；**不能加 overflow-hidden**（批量条面板是
           absolute 展开的，裁切只加在铺底图那一层） */}
       
@@ -271,17 +319,17 @@ export function DailyRecommendPage(): React.JSX.Element {
             {/* 元信息与「共 N 首」并成一行：hero 高度由封面定死，右侧每多一行就会
                 把页头撑得比封面高（用户 2026-10-24）。模型名长的时候靠 truncate 收住。 */}
             <HeroEyebrow className="truncate text-2xs">{/* 本地模型精选时把模型名也写出来：用户要能看出「这次真的是哪个模型在挑」 */}
-              {result
-                ? `${result.date} · ${modeLabel}${result.model ? ` · ${result.model}` : ""} · ${tasteLabel} · ${
-                    loading ? progress || "生成中…" : `共 ${songs.length} 首`
-                  }`
-                : "全部已装音源"}</HeroEyebrow>
+              {accountMode
+                ? `${result?.date ? `${result.date} · ` : ""}${sourceName || "平台账号"} · 平台账号 · ${loading ? progress || "获取中…" : `共 ${songs.length} 首`}`
+                : result
+                  ? `${result.date} · ${modeLabel}${result.model ? ` · ${result.model}` : ""} · ${tasteLabel} · ${loading ? progress || "生成中…" : `共 ${songs.length} 首`}`
+                  : "全部已装音源"}</HeroEyebrow>
             <h1 className="mt-1 truncate text-2xl font-bold tracking-tight">
               {result?.title || "每日推荐"}
             </h1>
             {/* 摘要只给两行：hero 高度由封面定死，多一行就会把页头撑高 */}
             <p className="mt-2 line-clamp-2 text-xs text-muted-foreground">
-              {result?.summary || "按你的播放记录挑的，每天换一批"}
+              {result?.summary || (accountMode ? "仅使用所选平台账号的每日推荐，保留平台返回顺序。" : "按你的播放记录挑的，每天换一批")}
             </p>
             {/* 口味画像 + 本期风格线并排一行：页头高度由封面定死，右侧内容不能
                 再多占一行（用户 2026-10-24：「高度不要超过图片，内容全部往右边搭」）。
@@ -291,7 +339,7 @@ export function DailyRecommendPage(): React.JSX.Element {
                   候选池搜宽后要把「这期覆盖了哪几条线」摊开；老缓存没有 styleLanes、
                   或这次没有风格线证据（空数组）→ chips 部分整块不渲染。 */}
             <div className="mt-2 flex min-w-0 items-center gap-2">
-              {result?.profileText ? (
+              {!accountMode && result?.profileText ? (
                 <p
                   className="min-w-0 truncate text-xs text-muted-foreground/80"
                   title={`口味画像：${result.profileText}`}
@@ -299,7 +347,7 @@ export function DailyRecommendPage(): React.JSX.Element {
                   口味画像：{result.profileText}
                 </p>
               ) : null}
-              {result?.styleLanes?.length ? (
+              {!accountMode && result?.styleLanes?.length ? (
                 <div className="flex shrink-0 items-center gap-1.5">
                   <span className="text-2xs text-muted-foreground">本期风格</span>
                   <ul role="list" aria-label="本期风格" className="flex items-center gap-1.5">
@@ -320,7 +368,7 @@ export function DailyRecommendPage(): React.JSX.Element {
             {/* 口味（推荐策略）与操作按钮并排一行：hero 高度已经被封面定死，
                 多一行就把页头撑得比封面高，右侧会空出一大块（这页信息本来就多）。 */}
             <div className="mt-3 flex flex-wrap items-center gap-2">
-              <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="推荐口味">
+              {!accountMode ? <div className="flex flex-wrap items-center gap-1.5" role="group" aria-label="推荐口味">
                 {DAILY_TASTE_ORDER.map((item) => {
                   const on = item === taste;
                   return (
@@ -341,13 +389,13 @@ export function DailyRecommendPage(): React.JSX.Element {
                     </button>
                   );
                 })}
-              </div>
+              </div> : null}
 
-              <span className="mx-0.5 h-4 w-px shrink-0 bg-border" aria-hidden />
+              {!accountMode ? <span className="mx-0.5 h-4 w-px shrink-0 bg-border" aria-hidden /> : null}
 
-              <HeroPlayButton disabled={songs.length === 0} onClick={() => void playQueue(sortedTracks, 0)} />
+              <HeroPlayButton disabled={songs.length === 0} onClick={playAll} />
               <IconButton
-                label="换一批"
+                label={accountMode ? "刷新平台推荐" : "换一批"}
                 variant="outline"
                 size="lg"
                 disabled={loading}
@@ -355,20 +403,20 @@ export function DailyRecommendPage(): React.JSX.Element {
               >
                 <RefreshCw className={loading ? "animate-spin" : undefined} />
               </IconButton>
-              <IconButton
+              {!accountMode ? <IconButton
                 label="AI 模式设置"
                 variant="outline"
                 size="lg"
                 onClick={() => void navigate({ to: "/settings/$section", params: { section: "ai" } })}
               >
                 <SlidersHorizontal />
-              </IconButton>
+              </IconButton> : null}
             </div>
           </div>
 
           {!loading && songs.length > 0 ? (
             <div className="relative flex shrink-0 flex-col items-end justify-end gap-2 pb-1">
-              <TrackSortSelect value={sortValue} onChange={setSortValue} />
+              {!accountMode ? <TrackSortSelect value={sortValue} onChange={setSortValue} /> : null}
               <BatchBar
                 embedded
                 tracks={sortedTracks}
@@ -387,7 +435,7 @@ export function DailyRecommendPage(): React.JSX.Element {
 
       {/* 冷启动：没有播放历史/收藏/风格种子时，先让用户点几个风格当画像起点。
           不选也能看下面这批平台新歌 —— 等于自动兜底"先给内容"，不让新用户对着空页面。 */}
-      {result?.coldStart ? (
+      {!accountMode && result?.coldStart ? (
         <section className="shrink-0 border-b border-border bg-secondary/30 px-6 py-4">
           <p className="text-sm font-medium">你爱听什么风格？</p>
           <p className="mt-0.5 text-xs text-muted-foreground">
@@ -443,7 +491,7 @@ export function DailyRecommendPage(): React.JSX.Element {
 
       <div className="min-h-0 flex-1 overflow-y-auto">
         {error ? (
-          <ErrorRetry message={`生成失败：${error}`} onRetry={() => void generate(true)} />
+          <ErrorRetry message={`${accountMode ? "获取失败" : "生成失败"}：${error}`} onRetry={() => void generate(true)} />
         ) : loading && songs.length === 0 ? (
           <TrackRowsSkeleton rows={8} />
         ) : songs.length === 0 ? (
@@ -473,8 +521,10 @@ export function DailyRecommendPage(): React.JSX.Element {
               selection={{ ids: selected, onToggle: toggleSelect, onChange: setSelected }}
             />
             <p className="py-4 text-center text-xs text-muted-foreground">
-              候选来自全部已装音源；心动模式优先收藏（含收藏歌单）；近 {DAILY_HISTORY_DAYS}{" "}
-              天推过的歌会排到后面，同一歌手不会连着排
+              {accountMode ? `按平台原始顺序显示，共 ${songs.length} 首；不使用应用曲库补齐或重排。` : <>
+                候选来自全部已装音源；心动模式优先收藏（含收藏歌单）；近 {DAILY_HISTORY_DAYS}{" "}
+                天推过的歌会排到后面，同一歌手不会连着排
+              </>}
             </p>
           </>
         )}

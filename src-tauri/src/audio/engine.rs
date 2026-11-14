@@ -40,6 +40,7 @@ pub use super::source::SourceProgress;
 use super::source::{IntervalSource, TrackedSource};
 use super::range_reader::{self, RangeShared};
 use super::state::{PlayMode, PlaybackStateSnapshot, PlaybackStatus, Quality};
+use crate::provider::types::QueueAppendReply;
 #[path = "dlna_adapter.rs"]
 mod dlna_adapter;
 
@@ -135,6 +136,7 @@ pub enum AudioCmd {
         tracks: Vec<Track>,
         index: usize,
         play_intent: u64,
+        expected_revision: Option<u64>,
         reply: tokio::sync::oneshot::Sender<QueueCommitReply>,
     },
     QueuedPlayAt {
@@ -167,6 +169,12 @@ pub enum AudioCmd {
     AddNext(Box<Track>),
     /// 加入队尾（不打断当前播放）
     Append(Vec<Track>),
+    /// Actual actor comparison/application, with a oneshot receipt after the queue lock.
+    AppendIfCurrent {
+        tracks: Vec<Track>,
+        expected_revision: u64,
+        reply: tokio::sync::oneshot::Sender<QueueAppendReply>,
+    },
     /// 移除队列中某一项（不打断当前播放）
     RemoveAt(usize),
     /// 批量移除（批量管理）：一次移除多个下标，只发一次队列事件
@@ -411,6 +419,8 @@ pub enum AudioDelivery {
     },
     /// Raw original-loader receipt; the shared failure body decides its effects.
     SourceFailure(Box<SourceFailureInput>),
+    /// Queue/state were already atomically edited; only actual changes need emit/persist.
+    QueueEdit { changed: bool },
     Rejected,
 }
 
@@ -482,9 +492,29 @@ impl AudioCommandInbox {
                 )).map(Box::new);
                 Ok(AudioDelivery::AutomaticPlayback { advance: Box::new(advance), request })
             }
-            AudioCmd::QueuedSetQueue { tracks, index, play_intent, reply } => {
-                // The receiver commits only the ticket captured by the sender.
-                let plan = self.core.commit_queue(play_intent, tracks, index, load_gen);
+            AudioCmd::AppendIfCurrent { tracks, expected_revision, reply } => {
+                let (receipt, changed) = {
+                    let mut queue = self.owner.queue.lock().unwrap_or_else(|e| e.into_inner());
+                    let previous_revision = queue.revision();
+                    let receipt = queue.append_if_current(tracks, expected_revision);
+                    let changed = receipt.applied && queue.revision() != previous_revision;
+                    if changed {
+                        let mut state = self.owner.state.write().unwrap_or_else(|e| e.into_inner());
+                        state.queue_index = queue.index;
+                        state.queue_len = queue.len();
+                    }
+                    (receipt, changed)
+                };
+                // Neither send success nor a stale check outside this actor is acceptance.
+                let _ = reply.send(receipt);
+                Ok(AudioDelivery::QueueEdit { changed })
+            }
+            AudioCmd::QueuedSetQueue { tracks, index, play_intent, expected_revision, reply } => {
+                // Original ticket and optional structural owner meet in the same Native commit.
+                let plan = match expected_revision {
+                    Some(expected) => self.core.commit_queue_if_current(play_intent, tracks, index, expected, load_gen),
+                    None => self.core.commit_queue(play_intent, tracks, index, load_gen),
+                };
                 let plan = self.reserve_plan(plan);
                 let receipt = plan.as_ref().map(|plan| plan.reply.clone())
                     .unwrap_or_else(QueueCommitReply::rejected);
@@ -499,7 +529,8 @@ impl AudioCommandInbox {
                     None
                 } else {
                     queue.commit_index(index);
-                    let prepared = self.core.prepare(generation, queue, true, 0, None);
+                    let expected_revision = queue.revision();
+                    let prepared = self.core.prepare_existing(generation, queue, expected_revision);
                     self.core.commit_prepared(generation, prepared, load_gen)
                 };
                 let plan = self.reserve_plan(plan);
@@ -515,7 +546,8 @@ impl AudioCommandInbox {
                 let mode = self.core.snapshot().play_mode;
                 let plan = queue.next_index_skipping(mode, false, skip).and_then(|index| {
                     queue.commit_index(index);
-                    let prepared = self.core.prepare(generation, queue, true, 0, None);
+                    let expected_revision = queue.revision();
+                    let prepared = self.core.prepare_existing(generation, queue, expected_revision);
                     self.core.commit_prepared(generation, prepared, load_gen)
                 });
                 let plan = self.reserve_plan(plan);
@@ -531,7 +563,8 @@ impl AudioCommandInbox {
                 let mode = self.core.snapshot().play_mode;
                 let plan = queue.previous_index(mode).and_then(|index| {
                     queue.commit_index(index);
-                    let prepared = self.core.prepare(generation, queue, true, 0, None);
+                    let expected_revision = queue.revision();
+                    let prepared = self.core.prepare_existing(generation, queue, expected_revision);
                     self.core.commit_prepared(generation, prepared, load_gen)
                 });
                 let plan = self.reserve_plan(plan);
@@ -543,10 +576,12 @@ impl AudioCommandInbox {
             }
             AudioCmd::QueuedPlayTrack { track, play_intent, reply } => {
                 let mut candidate = self.core.queue_snapshot();
-                let index = candidate.append_or_find(*track);
-                candidate.commit_index(index);
-                let prepared = self.core.prepare(play_intent, candidate, true, 0, None);
-                let plan = self.core.commit_prepared(play_intent, prepared, load_gen);
+                let expected_revision = candidate.revision();
+                let plan = candidate.append_or_find(*track).and_then(|index| {
+                    candidate.commit_index(index);
+                    let prepared = self.core.prepare_existing(play_intent, candidate, expected_revision);
+                    self.core.commit_prepared(play_intent, prepared, load_gen)
+                });
                 let plan = self.reserve_plan(plan);
                 let receipt = plan.as_ref().map(|plan| plan.reply.clone())
                     .unwrap_or_else(QueueCommitReply::rejected);
@@ -848,6 +883,14 @@ impl AudioEngine {
 
     pub fn begin_play_intent(&self) -> u64 {
         self.core.gate().begin()
+    }
+
+    /// Keep Gate and Queue locked through conditional reservation; never replace pending B.
+    pub fn begin_play_intent_if_queue_current(&self, expected_revision: u64) -> Option<u64> {
+        self.core.gate().begin_if_no_pending(|| {
+            let queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            if queue.revision() == expected_revision { Some(queue) } else { None }
+        })
     }
 
     pub fn dlna_manager(&self) -> crate::dlna::DlnaManager { self.dlna.clone() }
@@ -1185,6 +1228,23 @@ impl AudioEngine {
         published
     }
 
+    /// Cancel a pending append owner directly, never behind that append in the actor FIFO.
+    /// This same queue mutex linearizes release against actual append compare/commit; no
+    /// playback state, play intent, loader, source, event or persistence work is performed.
+    pub fn release_queue_if_current(&self, expected_revision: u64) -> QueueAppendReply {
+        self.queue.lock().unwrap_or_else(|e| e.into_inner()).release_if_current(expected_revision)
+    }
+
+    /// No play intent is created: the actor compares against the actual structural owner.
+    pub async fn append_if_current_with_receipt(
+        &self, tracks: Vec<Track>, expected_revision: u64,
+    ) -> Result<QueueAppendReply, String> {
+        let (reply, receipt) = tokio::sync::oneshot::channel();
+        self.tx.send(AudioCmd::AppendIfCurrent { tracks, expected_revision, reply })
+            .map_err(|_| String::from("播放引擎已退出，队列追加请求未送达"))?;
+        receipt.await.map_err(|_| String::from("播放引擎未返回队列追加回执"))
+    }
+
     /// `Some` is an immutable caller-owned ticket; only a native `None` begins work.
     pub fn send_queue(
         &self,
@@ -1194,7 +1254,7 @@ impl AudioEngine {
     ) -> tokio::sync::oneshot::Receiver<QueueCommitReply> {
         let play_intent = play_intent.unwrap_or_else(|| self.begin_play_intent());
         let (reply, receipt) = tokio::sync::oneshot::channel();
-        let _ = self.tx.send(AudioCmd::QueuedSetQueue { tracks, index, play_intent, reply });
+        let _ = self.tx.send(AudioCmd::QueuedSetQueue { tracks, index, play_intent, expected_revision: None, reply });
         receipt
     }
 
@@ -1242,6 +1302,37 @@ impl AudioEngine {
         let _pending = PendingQueueIntent { gate: self.core.gate().clone(), generation: play_intent };
         let receipt = self.send_next(Some(play_intent)).await
             .map_err(|_| String::from("播放引擎未返回下一首提交回执"))?;
+        Ok(self.core.gate().with_accepted(play_intent, || receipt)
+            .unwrap_or_else(QueueCommitReply::rejected))
+    }
+
+    /// Optional FM owner travels with the original intent through filtering and actor delivery.
+    /// Missing conditional tickets fail closed; only the ordinary path may begin a new intent.
+    pub async fn queue_after_filter_with_revision<F, Fut>(
+        &self,
+        tracks: Vec<Track>,
+        index: usize,
+        play_intent: Option<u64>,
+        expected_revision: Option<u64>,
+        filter: F,
+    ) -> Result<QueueCommitReply, String>
+    where
+        F: FnOnce(Vec<Track>, usize) -> Fut,
+        Fut: std::future::Future<Output = Result<(Vec<Track>, usize), String>>,
+    {
+        let Some(expected_revision) = expected_revision else {
+            return self.queue_after_filter(tracks, index, play_intent, filter).await;
+        };
+        let Some(play_intent) = play_intent else { return Ok(QueueCommitReply::rejected()); };
+        if tracks.is_empty() { return Err("队列为空".into()); }
+        let _pending = PendingQueueIntent { gate: self.core.gate().clone(), generation: play_intent };
+        let (tracks, index) = filter(tracks, index).await?;
+        if tracks.is_empty() { return Err("队列为空".into()); }
+        let (reply, receipt) = tokio::sync::oneshot::channel();
+        let _ = self.tx.send(AudioCmd::QueuedSetQueue {
+            tracks, index, play_intent, expected_revision: Some(expected_revision), reply,
+        });
+        let receipt = receipt.await.map_err(|_| "播放引擎未返回队列提交回执".to_string())?;
         Ok(self.core.gate().with_accepted(play_intent, || receipt)
             .unwrap_or_else(QueueCommitReply::rejected))
     }
@@ -2364,6 +2455,13 @@ fn run_engine(deps: EngineDeps) {
                 handle_automatic_playback(&mut inner, *advance, request.map(|request| *request));
             }
             Ok(AudioDelivery::SourceFailure(input)) => handle_source_failure(&mut inner, *input),
+            Ok(AudioDelivery::QueueEdit { changed }) => {
+                if changed {
+                    invalidate_preload(&mut inner);
+                    inner.queue_emit();
+                    inner.persist_queue();
+                }
+            }
             Ok(AudioDelivery::Rejected) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
@@ -2770,6 +2868,11 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
         AudioCmd::StampedRestore { reply, .. } => {
             let _ = reply.send(None);
         }
+        AudioCmd::AppendIfCurrent { reply, .. } => {
+            // The real conditional edit is consumed by the inbox, not replayed as a legacy append.
+            let queue_revision = inner.queue.lock().unwrap_or_else(|e| e.into_inner()).revision();
+            let _ = reply.send(QueueAppendReply { applied: false, queue_revision });
+        }
         AudioCmd::QueuedSetQueue { reply, .. } | AudioCmd::QueuedPlayAt { reply, .. }
             | AudioCmd::QueuedNext { reply, .. } | AudioCmd::QueuedPrevious { reply, .. }
             | AudioCmd::QueuedPlayTrack { reply, .. } => {
@@ -2985,7 +3088,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             // 不碰 track_quality（那是「这首单独指定音质」，与队列无关）。
             let track = {
                 let mut q = inner.queue.lock().unwrap_or_else(|e| e.into_inner());
-                let i = q.append_or_find(*track);
+                let Some(i) = q.append_or_find(*track) else { return false; };
                 q.commit_index(i);
                 q.current().cloned()
             };

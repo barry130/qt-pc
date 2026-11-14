@@ -56,7 +56,13 @@ import {
   shouldRefill,
 } from "@/lib/radio-queue";
 import * as ipc from "@/services/ipc";
-import { usePlayerStore, type PlayActionResult } from "@/stores/player";
+import {
+  abandonPreparedPlayAction, bindPreparedPlayDependency, isPlayActionCurrent, isPreparedPlayActionCurrent,
+  reservePlayAction, usePlayerStore, type PlayActionResult, type PreparedPlayAction,
+} from "@/stores/player";
+import { useRecommendationSourceStore, type RecommendationSelection } from "@/stores/recommendation-source";
+import { accountRecommendationContextIsCurrent, fetchAccountRecommendation, getAccountRecommendationContext, onAccountRecommendationContextChange, type AccountRecommendationContext, type AccountRecommendationPage } from "@/lib/account-recommendation";
+import { safeAccountRecommendationError } from "@/lib/account-recommendation-error";
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -135,6 +141,14 @@ export interface RadioStash {
 }
 
 interface RadioStore {
+  origin: RecommendationSelection["origin"];
+  /** Safe, acknowledged account metadata only; no credential records. */
+  account: AccountRecommendationContext | null;
+  receivedCount: number;
+  accountCursor?: string;
+  queueRevision: number | null;
+  accountFailureCount: number;
+  retryAt: number;
   /** 是否正在 FM 模式（用户停止、或队列被换走让位后变 false） */
   active: boolean;
   /** playQueue 整队替换落地后才 true：FM 持有当前播放器队列的凭证 */
@@ -193,10 +207,14 @@ interface RadioStore {
 async function restoreStash(
   stash: RadioStash,
   set: (patch: Partial<RadioStore>) => void,
+  owner?: { revision: number; isCurrent: () => boolean; signal: AbortSignal },
 ): Promise<void> {
   try {
     const player = usePlayerStore.getState();
-    const result: PlayActionResult | undefined = await player.playQueue(stash.queue, stash.index);
+    const result: PlayActionResult | undefined = owner
+      ? await player.playQueue(stash.queue, stash.index, undefined, owner.isCurrent, owner.signal, owner.revision)
+      : await player.playQueue(stash.queue, stash.index);
+    if (owner?.isCurrent() === false) return;
     // 恢复期间用户点了别的歌：整队替换动作已被取代、IPC 根本没发出。此时
     // 播放器属于用户新点的歌，旧会话的 seek/pause 一步都不能再落上去。
     if (!result || !result.applied) return;
@@ -208,11 +226,43 @@ async function restoreStash(
     if (stash.positionMs > 0) await player.seekTo(stash.positionMs, ticket, target);
     if (!stash.playing) await player.pauseForAction(ticket, target);
   } catch (err) {
-    set({ error: `恢复原播放列表失败：${errMsg(err)}` });
+    if (owner?.isCurrent() !== false) set({ error: `恢复原播放列表失败：${errMsg(err)}` });
   }
 }
 
+// Every explicit start/stop owns a generation; old awaits cannot revive its state.
+async function pullAccountRadioBatch(
+  account: AccountRecommendationContext,
+  usedKeys: ReadonlySet<string>,
+  isCurrent: () => boolean,
+  cursor?: string,
+): Promise<{ page: AccountRecommendationPage; batch: Track[] } | null> {
+  for (let pull = 0; pull < 3; pull += 1) {
+    if (!isCurrent()) return null;
+    const page = await fetchAccountRecommendation(account, cursor);
+    if (!isCurrent()) return null;
+    const batch = dedupe(page.tracks).filter(track => !usedKeys.has(trackKey(track)));
+    if (batch.length > 0 || page.exhausted || pull === 2) return { page, batch };
+    cursor = page.cursor;
+  }
+  return null;
+}
+
+let radioSession = 0;
+let pendingStartAction: PreparedPlayAction | null = null;
+let pendingStartAbort: AbortController | null = null;
+let pendingAppendAbort: AbortController | null = null;
+let pendingRestoreAbort: AbortController | null = null;
+let accountQueueActionTicket: number | null = null;
+
 export const useRadioStore = create<RadioStore>((set, get) => ({
+  origin: "app",
+  account: null,
+  receivedCount: 0,
+  accountCursor: undefined,
+  queueRevision: null,
+  accountFailureCount: 0,
+  retryAt: 0,
   active: false,
   queueClaimed: false,
   restorePlayMode: null,
@@ -232,10 +282,82 @@ export const useRadioStore = create<RadioStore>((set, get) => ({
 
   start: async (seed = null) => {
     if (get().loading) return;
-    set({ loading: true, error: null, exhausted: false, seed });
+    const session = ++radioSession;
+    pendingRestoreAbort?.abort();
+    pendingRestoreAbort = null;
+    accountQueueActionTicket = null;
+    const abortController = new AbortController();
+    pendingStartAbort?.abort();
+    pendingStartAbort = abortController;
+    // reservePlayAction increments the JS generation synchronously at the original click.
+    const actionPromise = reservePlayAction();
+    let action: PreparedPlayAction | null = null;
+    let consumed = false;
+    const current = (): boolean => session === radioSession && !abortController.signal.aborted && (!action || consumed || isPreparedPlayActionCurrent(action));
+    const playBatch = async (tracks: Track[], providerCurrent: () => boolean = () => true): Promise<PlayActionResult | null> => {
+      if (!action || !current() || !providerCurrent()) return null;
+      const dependency = Promise.resolve();
+      if (!bindPreparedPlayDependency(action, dependency)) return null;
+      consumed = true;
+      if (pendingStartAction === action) pendingStartAction = null;
+      return usePlayerStore.getState().playQueue(tracks, 0, dependency, () => current() && providerCurrent(), abortController.signal);
+    };
+    set({ loading: true, error: null, exhausted: false, seed, accountFailureCount: 0, retryAt: 0 });
     try {
+      action = await actionPromise;
+      if (!current()) return;
+      if (!action) {
+        set({ loading: false, active: false, queueClaimed: false, error: "播放意图未取得有效回执，FM 未接管队列。" });
+        return;
+      }
+      pendingStartAction = action;
+      await useRecommendationSourceStore.getState().load();
+      if (!current()) return;
+      const selection = useRecommendationSourceStore.getState().fm;
+      set({ origin: selection.origin });
+      if (selection.origin === "account") {
+        try {
+          const account = await getAccountRecommendationContext("fm");
+          if (!current()) return;
+          set({ account });
+          const pulled = await pullAccountRadioBatch(account, new Set(), current);
+          if (!pulled || !current() || !accountRecommendationContextIsCurrent(account)) return;
+          const { page, batch } = pulled;
+          if (batch.length === 0) {
+            set({ active: false, queueClaimed: false, loading: false, exhausted: page.exhausted,
+              error: "平台本次没有返回 FM 歌曲，未使用应用曲库替补。" });
+            return;
+          }
+          const before = usePlayerStore.getState();
+          const stash = get().queueClaimed ? get().stash : before.queue.length > 0 ? {
+            queue: [...before.queue], index: Math.min(Math.max(0, before.queueIndex ?? 0), before.queue.length - 1),
+            positionMs: Math.max(0, Math.round(before.positionMs)), playing: before.state?.status === "playing",
+          } : null;
+          const receipt = await playBatch(batch, () => accountRecommendationContextIsCurrent(account));
+          if (!current() || !accountRecommendationContextIsCurrent(account)) return;
+          if (!receipt?.applied || typeof receipt.queueRevision !== "number" || !Number.isSafeInteger(receipt.queueRevision) || receipt.queueRevision < 1) {
+            set({ active: false, queueClaimed: false, loading: false, error: "未取得可验证的播放队列回执，FM 未接管队列。" });
+            return;
+          }
+          accountQueueActionTicket = receipt.ticket;
+          const usedKeys = new Set<string>();
+          markUsed(usedKeys, batch);
+          const currentMode = usePlayerStore.getState().state?.playMode ?? "listLoop";
+          const restorePlayMode = currentMode === "listLoop" ? get().restorePlayMode : currentMode;
+          if (currentMode !== "listLoop") void ipc.setPlayMode("listLoop").catch(() => undefined);
+          set({ active: true, queueClaimed: true, loading: false, account, stash, restorePlayMode, usedKeys,
+            receivedCount: batch.length, accountCursor: page.cursor, queueRevision: receipt.queueRevision,
+            exhausted: page.exhausted, pool: [], disliked: [], profile: null, quality: undefined,
+            savedKeys: new Set(), playedKeys: new Set() });
+        } catch (error) {
+          if (current()) set({ active: false, queueClaimed: false, loading: false, error: safeAccountRecommendationError(error).message });
+        }
+        return;
+      }
       const pref = await loadPreference();
+      if (!current()) return;
       const locals = await ipc.getLocalTracks().catch(() => [] as Track[]);
+      if (!current()) return;
       // 池子 = 本地库 + 收藏 + 歌单 + 最近播放；收藏/歌单/最近可能不在本地库里
       // （云端卡片、已删文件），但只要有 playable 的 id 就能进队列，所以一并并进去重。
       const pool = dedupe([
@@ -249,6 +371,7 @@ export const useRadioStore = create<RadioStore>((set, get) => ({
         return;
       }
       const disliked = await ipc.checkDisliked(pool).catch(() => pool.map(() => false));
+      if (!current()) return;
       const savedKeys = new Set(pref.favoriteTracks.map((t) => trackKey(t)));
       // `topTracks` / `style` 在「完全没有收听行为」时可能缺省：
       // 前者只是加权用的历史键（没有就是没听过），后者要一份空画像兜底，
@@ -282,9 +405,6 @@ export const useRadioStore = create<RadioStore>((set, get) => ({
         set({ loading: false, active: false, error: "曲库里的歌都被筛掉了，试试放宽屏蔽列表" });
         return;
       }
-      // 记下这一轮排过的键：下一轮会话据此避让（写在 localStorage，进程重启也还在）
-      writeLastSessionKeys(batch.map((track) => trackKey(track)));
-      markUsed(usedKeys, rest);
       // 进入 FM 前把用户原来的播放列表整份抄下来：FM 只是「接管」播放器队列，
       // 退出（停止 FM）时要原样还回去 —— 对齐网易云，退出 FM 仍能接着放原列表。
       // 已经在 FM 里（queueClaimed）时不再抄一次，否则会把 FM 队列当成「原列表」。
@@ -302,11 +422,20 @@ export const useRadioStore = create<RadioStore>((set, get) => ({
         // 等 playQueue 真正落地（整队替换成功）才认领队列。整批撞上屏蔽列表
         // 被 Rust 滤光时会返回 Err("队列为空")：不接住这个 rejection 的话
         // active 还挂着 true，补歌会一直往旧队列里追加（2026-11-02 修复）。
-        await usePlayerStore.getState().playQueue(batch, 0);
+        const receipt = await playBatch(batch);
+        if (!current()) return;
+        if (!receipt?.applied) {
+          set({ loading: false, active: false, queueClaimed: false, error: "播放队列未接受 FM，本轮未接管队列。" });
+          return;
+        }
       } catch (err) {
+        if (!current()) return;
         set({ loading: false, active: false, queueClaimed: false, error: errMsg(err) });
         return;
       }
+      // 只有已接受的 Native 队列才计入本轮已用键和跨会话避让历史。
+      markUsed(usedKeys, rest);
+      writeLastSessionKeys(batch.map((track) => trackKey(track)));
       // FM 在随机 / 单曲循环模式下「下一首」会跳到队列里任意一首（页面上的
       // 「接下来」当场换成另一批，和刚看到的毫无关系）——用户反馈的就是这个。
       // 所以持有队列期间强制顺序播放，把用户原来的模式记下来，停止/让位时还回去。
@@ -333,12 +462,30 @@ export const useRadioStore = create<RadioStore>((set, get) => ({
         exhausted: false,
       });
     } catch (err) {
-      set({ loading: false, active: false, queueClaimed: false, error: errMsg(err) });
+      if (current()) set({ loading: false, active: false, queueClaimed: false, error: errMsg(err) });
+    } finally {
+      const stillCurrent = current();
+      if (pendingStartAction === action) pendingStartAction = null;
+      if (pendingStartAbort === abortController) pendingStartAbort = null;
+      if (action && !consumed) abandonPreparedPlayAction(action);
+      if (session === radioSession && !stillCurrent) get().stop(false);
+      if (session === radioSession && get().loading) set({ loading: false });
     }
   },
 
   stop: (restoreOriginal = true) => {
-    const { restorePlayMode: restore, stash } = get();
+    radioSession += 1;
+    pendingRestoreAbort?.abort();
+    pendingRestoreAbort = null;
+    pendingStartAbort?.abort();
+    pendingStartAbort = null;
+    pendingAppendAbort?.abort();
+    pendingAppendAbort = null;
+    if (pendingStartAction) abandonPreparedPlayAction(pendingStartAction);
+    pendingStartAction = null;
+    const { origin, restorePlayMode: restore, stash, queueRevision } = get();
+    const acceptedAction = accountQueueActionTicket;
+    accountQueueActionTicket = null;
     set({
       active: false,
       queueClaimed: false,
@@ -348,6 +495,13 @@ export const useRadioStore = create<RadioStore>((set, get) => ({
       error: null,
       exhausted: false,
       seed: null,
+      account: null,
+      accountCursor: undefined,
+      queueRevision: null,
+      receivedCount: 0,
+      accountFailureCount: 0,
+      retryAt: 0,
+      usedKeys: new Set(),
     });
     if (restore !== null) {
       // 把 FM 期间借走的播放模式还给用户：停 FM 只停「继续推歌」，
@@ -357,18 +511,109 @@ export const useRadioStore = create<RadioStore>((set, get) => ({
       });
     }
     // 用户点「停止 FM」= 退出 FM：把进入前那份播放列表原样放回去
-    if (restoreOriginal && stash !== null) void restoreStash(stash, set);
+    if (restoreOriginal && stash !== null) {
+      if (origin === "account") {
+        if (acceptedAction === null || !isPlayActionCurrent(acceptedAction) || queueRevision === null) return;
+        const stoppedSession = radioSession;
+        const abortController = new AbortController();
+        pendingRestoreAbort = abortController;
+        // Native qualifies reservation without replacing pending B, then compares
+        // this original owner again in the actual replacement commit. Never release
+        // and read back a newer owner as permission to resurrect the stash.
+        void restoreStash(stash, set, {
+          revision: queueRevision,
+          isCurrent: () => stoppedSession === radioSession && !abortController.signal.aborted,
+          signal: abortController.signal,
+        }).finally(() => {
+          if (pendingRestoreAbort === abortController) pendingRestoreAbort = null;
+        });
+        return;
+      }
+      void restoreStash(stash, set);
+    }
   },
 
   setTaste: (taste) => {
-    if (get().taste === taste) return;
+    if (useRecommendationSourceStore.getState().fm.origin === "account" || get().taste === taste) return;
     set({ taste });
     // 口味变了下一批就该按新口味排；已经在队列里的歌不动（不打断正在听的东西）
   },
 
   refill: async (count = RADIO_BATCH) => {
     const state = get();
-    if (!state.active || !state.queueClaimed || state.loading || !state.profile || state.exhausted) return;
+    if (!state.active || !state.queueClaimed || state.loading || state.exhausted) return;
+    if (state.origin === "account") {
+      const account = state.account;
+      const expectedRevision = state.queueRevision;
+      if (!account || !accountRecommendationContextIsCurrent(account) || expectedRevision === null || !Number.isSafeInteger(expectedRevision) || expectedRevision < 1) {
+        get().stop(false);
+        return;
+      }
+      if (!queueBelongsToRadio(usePlayerStore.getState().queue, state.usedKeys)) {
+        get().stop(false);
+        return;
+      }
+      if (Date.now() < state.retryAt) return;
+      const session = radioSession;
+      const controller = new AbortController();
+      pendingAppendAbort?.abort();
+      pendingAppendAbort = controller;
+      const current = (): boolean => session === radioSession && !controller.signal.aborted && get().active && get().queueClaimed &&
+        get().account === account && get().queueRevision === expectedRevision && accountRecommendationContextIsCurrent(account);
+      set({ loading: true, error: null });
+      let appendAttempted = false;
+      try {
+        const pulled = await pullAccountRadioBatch(account, state.usedKeys, current, state.accountCursor);
+        if (!pulled || !current()) return;
+        const { page, batch } = pulled;
+        if (batch.length === 0) {
+          // Empty/duplicate pulls cannot commit a cursor without an accepted queue mutation.
+          set({ exhausted: true });
+          return;
+        }
+        // The native compare-and-append is the authority even if the UI mirror is still old.
+        if (!queueBelongsToRadio(usePlayerStore.getState().queue, state.usedKeys)) {
+          get().stop(false);
+          return;
+        }
+        appendAttempted = true;
+        const receipt = await ipc.queueAppendIfCurrent(batch, expectedRevision, controller.signal);
+        if (!current()) return;
+        if (!receipt.applied || !Number.isSafeInteger(receipt.queueRevision) || receipt.queueRevision <= expectedRevision) {
+          get().stop(false);
+          return;
+        }
+        const usedKeys = new Set(state.usedKeys);
+        markUsed(usedKeys, batch);
+        set({ usedKeys, receivedCount: state.receivedCount + batch.length, queueRevision: receipt.queueRevision,
+          accountCursor: page.cursor, exhausted: page.exhausted, accountFailureCount: 0, retryAt: 0 });
+      } catch (error) {
+        if (!current()) return;
+        if (appendAttempted) {
+          get().stop(false);
+          set({ error: "无法验证本次队列追加回执，FM 已停止；请重新开始收听。" });
+          return;
+        }
+        const failure = safeAccountRecommendationError(error);
+        const failures = state.accountFailureCount + 1;
+        const transient = failure.code === "NETWORK" || failure.code === "RATE_LIMIT" || failure.code === "UPSTREAM";
+        if (!transient || failures >= 3) {
+          get().stop(false);
+          set({ error: failure.message });
+        } else {
+          const delay = Math.min(60_000, 5_000 * 2 ** (failures - 1));
+          set({ error: failure.message, accountFailureCount: failures, retryAt: Date.now() + delay });
+        }
+      } finally {
+        if (pendingAppendAbort === controller) pendingAppendAbort = null;
+        if (session === radioSession && (get().account !== account || !accountRecommendationContextIsCurrent(account))) get().stop(false);
+        if (session === radioSession) set({ loading: false });
+      }
+      return;
+    }
+    if (!state.profile) return;
+    const session = radioSession;
+    const current = (): boolean => session === radioSession && get().active && get().queueClaimed && useRecommendationSourceStore.getState().fm.origin === "app";
     // 队列被换走（双击别的歌单/清空队列/插了外曲）：FM 让位，绝不往别人的队列里追加。
     // 传 false：这是用户自己的选择，不要把我们抄下来的旧列表抢回去。
     if (!queueBelongsToRadio(usePlayerStore.getState().queue, state.usedKeys)) {
@@ -394,23 +639,32 @@ export const useRadioStore = create<RadioStore>((set, get) => ({
         set({ loading: false, exhausted: true });
         return;
       }
-      const usedKeys = new Set(state.usedKeys);
-      markUsed(usedKeys, batch);
-      set({ loading: false, usedKeys });
+      if (!current()) return;
       await ipc.queueAppend(batch);
+      if (!current()) return;
+      const usedKeys = new Set(get().usedKeys);
+      markUsed(usedKeys, batch);
+      set({ usedKeys });
     } catch (err) {
-      set({ loading: false, error: errMsg(err) });
+      if (current()) set({ error: errMsg(err) });
+    } finally {
+      if (current()) set({ loading: false });
     }
   },
 
   dislike: async (track) => {
     const state = get();
+    if (useRecommendationSourceStore.getState().fm.origin === "account") return;
+    const session = radioSession;
+    const current = (): boolean => session === radioSession && useRecommendationSourceStore.getState().fm.origin === "app";
     try {
       await ipc.addDislikeSong(track);
     } catch (err) {
       // 屏蔽失败不该挡住切歌：把错误显示出来，但照常往下走
+      if (!current()) return;
       set({ error: errMsg(err) });
     }
+    if (!current()) return;
     // 池子里同键的候选就地标脏，下一批就不会再挑到它（Rust 侧 check_disliked 才是权威，
     // 这里只是让内存里的标记跟上，省掉一次整池重查）。键统一用 trackKey，
     // 与池子判定的口径一致 —— 双口径（歌名键）会让标记和判定对不上。
@@ -432,6 +686,10 @@ export const useRadioStore = create<RadioStore>((set, get) => ({
     // 归属核对必须排在补歌阈值之前：队列被换走时哪怕余量还很多（用户双击了
     // 自己的长歌单），FM 也要立刻让位。以前先看阈值，长队列一辈子触发不到这里，
     // queueClaimed 一直挂着，之后退出 FM 会把原列表盖到用户自己的队列上。
+    // An account append can update the Native mirror before its receipt commits
+    // usedKeys/cursor. Let that receipt settle ownership; Native still compares
+    // the expected revision, and auth/provider revocation cancels immediately.
+    if (state.origin === "account" && state.loading) return;
     const player = usePlayerStore.getState();
     if (!queueBelongsToRadio(player.queue, state.usedKeys)) {
       // 同上：让位退出不还原原列表
@@ -450,3 +708,19 @@ export const useRadioStore = create<RadioStore>((set, get) => ({
     await get().ensure(remaining);
   },
 }));
+
+// Selection changes are explicit relinquishment, not an invitation to restore or auto-start.
+useRecommendationSourceStore.subscribe((state, previous) => {
+  if (state.fmRevision === previous.fmRevision) return;
+  const radio = useRadioStore.getState();
+  if (radio.active || radio.loading || pendingRestoreAbort !== null) radio.stop(false);
+});
+
+onAccountRecommendationContextChange((feature) => {
+  if (feature !== undefined && feature !== "fm") return;
+  const radio = useRadioStore.getState();
+  if (radio.origin !== "account" || (!radio.active && !radio.loading && pendingRestoreAbort === null)) return;
+  // The initial engine-ready notification may precede the first acknowledged context.
+  // Auth/provider revocation cancels preparation and any still-pending owned restore.
+  if (feature === "fm" || radio.account !== null || pendingRestoreAbort !== null) radio.stop(false);
+});

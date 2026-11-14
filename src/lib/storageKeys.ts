@@ -59,6 +59,12 @@ export const AI_API_KEY_KEY = "ai.apiKey";
 /** 每日推荐生成方式：`rule` 纯规则 / `local` 本地模型精选 / `server` 走 astral 音乐助手 */
 export const DAILY_RECOMMEND_MODE_KEY = "dailyRecommend.mode";
 
+/** Daily/FM origin selection; separate from the shared AI mode and from playback source. */
+export const RECOMMENDATION_SOURCE_KEY = "recommendation.sources";
+
+/** Account daily cache. Never merged into local recommendation history; never contains a Cookie. */
+export const ACCOUNT_DAILY_CACHE_KEY = "dailyRecommend.accountCache";
+
 /** 每日推荐当日缓存（JSON：日期 + 曲目 + 规则版本 + 最近若干天已推荐 key） */
 export const DAILY_RECOMMEND_CACHE_KEY = "dailyRecommend.cache";
 

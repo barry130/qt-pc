@@ -52,6 +52,7 @@
 
 import type { MyPlaylistSummary, PlayStatItem, PlaylistCategory, Track } from "@/types";
 import * as ipc from "@/services/ipc";
+import { sourceEnabled, sourcePolicyFingerprint, sourcePolicySnapshot, sourcePolicyRevision, waitSourcePolicy } from "@/lib/source-policy";
 import { LOCAL_PLATFORM } from "@/services/ipc";
 import {
   getAllLatestSongs,
@@ -117,6 +118,10 @@ import {
 } from "@/lib/ai-mode";
 import { askServerForPicks } from "@/lib/ai-server-picks";
 import { isAdmin, useAuthStore } from "@/stores/auth";
+import { useRecommendationSourceStore } from "@/stores/recommendation-source";
+import { AccountRecommendationError } from "@/lib/account-recommendation-error";
+import type { AccountRecommendationContext } from "@/lib/account-recommendation";
+import type { AccountDailyCacheValue } from "@/lib/account-daily-cache";
 
 export type { DailyTaste };
 
@@ -456,8 +461,23 @@ export interface DailyRecommendItem {
   reason: string;
 }
 
+/** Platform/account provenance only; never includes credentials or a local taste score. */
+export interface DailyAccountProvenance {
+  sourceId: string;
+  sourceName: string;
+  accountId: string;
+  nickname: string;
+  packVersion: string;
+  fetchedAt?: number;
+  expiresAt?: number;
+}
+
 /** 一次生成的结果 */
 export interface DailyRecommendResult {
+  sourcePolicy?: string;
+  /** Old application results omit origin. mode/requested/taste only describe app origin. */
+  origin?: "app" | "account";
+  account?: DailyAccountProvenance;
   /** 本地日期 `YYYY-MM-DD` */
   date: string;
   /** 实际生效的模式（`server` 会被降级成 `rule`，看 `notice`） */
@@ -726,9 +746,24 @@ export async function loadTodayResult(
   mode?: DailyRecommendMode,
   taste?: DailyTaste,
 ): Promise<DailyRecommendResult | null> {
+  await waitSourcePolicy();
+  await useRecommendationSourceStore.getState().load();
+  if (useRecommendationSourceStore.getState().daily.origin === "account") {
+    const isCurrent = accountDailySelectionIsCurrent();
+    const { getAccountRecommendationContext, assertAccountRecommendationContextCurrent } = await import("@/lib/account-recommendation");
+    const { readAccountDailyCache } = await import("@/lib/account-daily-cache");
+    assertDailyCallerCurrent({ isCurrent });
+    const context = await getAccountRecommendationContext("daily");
+    assertDailyCallerCurrent({ isCurrent });
+    const cached = await readAccountDailyCache(context, isCurrent);
+    assertDailyCallerCurrent({ isCurrent });
+    assertAccountRecommendationContextCurrent(context);
+    return cached ? accountDailyResult(context, cached) : null;
+  }
   const cache = await readDailyCache();
   const today = cache.today;
   if (!today) return null;
+  if ((today.sourcePolicy !== undefined || sourcePolicySnapshot().enabled !== null) && today.sourcePolicy !== sourcePolicyFingerprint()) return null;
   if (today.date !== todayKey()) return null;
   if (cache.v !== DAILY_RULE_VERSION) return null;
   if (!Array.isArray(today.items) || today.items.length === 0) return null;
@@ -745,6 +780,19 @@ export async function loadTodayResult(
 
 /** 清掉当天缓存（「换一批」用；历史记录保留，仍然参与跨天去重） */
 export async function clearTodayResult(): Promise<void> {
+  await useRecommendationSourceStore.getState().load();
+  if (useRecommendationSourceStore.getState().daily.origin === "account") {
+    accountDailyGeneration += 1;
+    const isCurrent = accountDailySelectionIsCurrent();
+    const { getAccountRecommendationContext } = await import("@/lib/account-recommendation");
+    const { clearAccountDailyCache } = await import("@/lib/account-daily-cache");
+    assertDailyCallerCurrent({ isCurrent });
+    const context = await getAccountRecommendationContext("daily");
+    assertDailyCallerCurrent({ isCurrent });
+    await clearAccountDailyCache(context, isCurrent);
+    assertDailyCallerCurrent({ isCurrent });
+    return;
+  }
   const cache = await readDailyCache();
   await writeDailyCache({ ...cache, today: null });
 }
@@ -772,8 +820,11 @@ function recentRecommendedKeys(cache: DailyCacheStore, includeToday: boolean): S
   return keys;
 }
 
-async function saveResult(result: DailyRecommendResult, replaceToday: boolean): Promise<void> {
+async function saveResult(result: DailyRecommendResult, replaceToday: boolean, options: GenerateOptions = {}): Promise<void> {
+  assertDailyCallerCurrent(options);
+  result.sourcePolicy = sourcePolicyFingerprint();
   const cache = await readDailyCache();
+  assertDailyCallerCurrent(options);
   // 每首同时存 id 键和同名键：跨源换 id 的歌也要能被下一次去重认出来
   const keys = result.items.flatMap((item) => [trackKey(item.track), songNameKey(item.track)]);
   // 同一天点了多次「换一批」时**合并**当天的键，不能覆盖：
@@ -787,7 +838,9 @@ async function saveResult(result: DailyRecommendResult, replaceToday: boolean): 
     .sort((a, b) => (a.date < b.date ? 1 : -1))
     .slice(0, DAILY_HISTORY_DAYS);
   const today = replaceToday ? result : cache.today;
+  assertDailyCallerCurrent(options);
   await writeDailyCache({ v: DAILY_RULE_VERSION, days: trimmed, today });
+  assertDailyCallerCurrent(options);
 }
 
 // ---------- 偏好提取 ----------
@@ -2293,6 +2346,32 @@ async function pickByServer(
   return { parsed: { title: "", summary: "", picks, error: null }, model: reply.model };
 }
 
+function accountDailyResult(context: AccountRecommendationContext, value: AccountDailyCacheValue): DailyRecommendResult {
+  return {
+    origin: "account", date: value.date, mode: "rule", requested: "rule", generatedAt: value.generatedAt,
+    account: { sourceId: context.sourceId, sourceName: context.sourceName, accountId: context.accountId,
+      nickname: context.nickname, packVersion: context.packVersion, fetchedAt: value.fetchedAt,
+      ...(value.expiresAt === undefined ? {} : { expiresAt: value.expiresAt }) },
+    title: `${context.sourceName} · 账号每日推荐`,
+    summary: `平台本次提供 ${value.tracks.length} 首，保留平台原始顺序，未使用应用算法补齐。`,
+    items: value.tracks.map(track => ({ track, reason: `${context.sourceName} · 账号每日推荐` })),
+    notice: value.tracks.length === 0 ? new AccountRecommendationError("EMPTY").message : null,
+  };
+}
+
+let accountDailyGeneration = 0;
+
+/** Freeze selection/day before the first context await, not after it. */
+function accountDailySelectionIsCurrent(generation = accountDailyGeneration): () => boolean {
+  const revision = useRecommendationSourceStore.getState().dailyRevision;
+  const date = todayKey();
+  return () => {
+    const state = useRecommendationSourceStore.getState();
+    return generation === accountDailyGeneration && state.loaded && state.daily.origin === "account" &&
+      revision === state.dailyRevision && date === todayKey();
+  };
+}
+
 export interface GenerateOptions {
   /** 强制重算（「换一批」）；默认命中当天缓存就直接返回 */
   force?: boolean;
@@ -2301,6 +2380,12 @@ export interface GenerateOptions {
   /** 指定口味；不传读设置 */
   taste?: DailyTaste;
   onProgress?: (text: string) => void;
+  /** Caller page epoch; revoked work must not publish progress, cache, or a result. */
+  isCurrent?: () => boolean;
+}
+
+function assertDailyCallerCurrent(options: GenerateOptions): void {
+  if (options.isCurrent?.() === false) throw new AccountRecommendationError("STALE_CONTEXT");
 }
 
 /**
@@ -2329,11 +2414,55 @@ export async function saveMode(mode: DailyRecommendMode): Promise<void> {
 export async function generateDailyRecommend(
   options: GenerateOptions = {},
 ): Promise<DailyRecommendResult> {
+  assertDailyCallerCurrent(options);
+  await waitSourcePolicy();
+  const policyToken = sourcePolicyRevision();
+  const callerCurrent = options.isCurrent;
+  options = { ...options, isCurrent: () => policyToken === sourcePolicyRevision() && callerCurrent?.() !== false };
+  assertDailyCallerCurrent(options);
+  await useRecommendationSourceStore.getState().load();
+  assertDailyCallerCurrent(options);
+  // Account recommendations are an independent provider, not another AI mode.
+  // Branch before app settings/preferences/history/seeds/search/ranking/AI.
+  if (useRecommendationSourceStore.getState().daily.origin === "account") {
+    const generation = ++accountDailyGeneration;
+    const selectionIsCurrent = accountDailySelectionIsCurrent(generation);
+    const isCurrent = (): boolean => selectionIsCurrent() && options.isCurrent?.() !== false;
+    const { getAccountRecommendationContext, fetchAccountRecommendation, assertAccountRecommendationContextCurrent } = await import("@/lib/account-recommendation");
+    assertDailyCallerCurrent({ isCurrent });
+    const { readAccountDailyCache, writeAccountDailyCache } = await import("@/lib/account-daily-cache");
+    assertDailyCallerCurrent({ isCurrent });
+    const assertCurrent = (context?: AccountRecommendationContext): void => {
+      assertDailyCallerCurrent({ isCurrent });
+      if (context) assertAccountRecommendationContextCurrent(context);
+    };
+    const report = (text: string, context?: AccountRecommendationContext): void => {
+      assertCurrent(context); options.onProgress?.(text); assertCurrent(context);
+    };
+    report("正在确认平台账号与音源包…");
+    const context = await getAccountRecommendationContext("daily");
+    assertCurrent(context);
+    if (!options.force) {
+      report("正在读取账号每日推荐缓存…", context);
+      const cached = await readAccountDailyCache(context, isCurrent);
+      assertCurrent(context);
+      if (cached) return accountDailyResult(context, cached);
+    }
+    report("正在获取平台账号每日推荐…", context);
+    const page = await fetchAccountRecommendation(context);
+    assertCurrent(context);
+    const value: AccountDailyCacheValue = { date: todayKey(), generatedAt: Date.now(), ...page };
+    report("正在保存账号每日推荐…", context);
+    await writeAccountDailyCache(context, value, isCurrent);
+    assertCurrent(context);
+    return accountDailyResult(context, value);
+  }
   // 模式与口味互不依赖（各自一次本地设置读），并行取，少一次往返
   const [storedMode, storedTaste] = await Promise.all([
     options.mode ? Promise.resolve(options.mode) : readMode(),
     options.taste ? Promise.resolve(options.taste) : readTaste(),
   ]);
+  assertDailyCallerCurrent(options);
   const stored = storedMode;
   // 「服务端 AI」仅管理员（2026-10-24）：库里存过 server、或调用方显式传 server，
   // 非管理员一律按纯规则跑。`requested` 也记成收敛后的规则 —— 缓存命中判定比的是
@@ -2345,17 +2474,22 @@ export async function generateDailyRecommend(
   const taste = storedTaste;
   if (!options.force) {
     const cached = await loadTodayResult(mode, taste);
+    assertDailyCallerCurrent(options);
     if (cached) return cached;
   }
 
-  const report = options.onProgress ?? (() => {});
+  const report = (text: string): void => {
+    assertDailyCallerCurrent(options); options.onProgress?.(text); assertDailyCallerCurrent(options);
+  };
   const cache = await readDailyCache();
+  assertDailyCallerCurrent(options);
   // 最近推荐过的**只降权不硬排除**：50 首 × 7 天足够把候选池掏空，
   // 硬排除会让页面直接空掉；降权保证没推过的先上，池子耗尽时仍能兜底。
   const historyKeys = recentRecommendedKeys(cache, true);
 
   report("正在读取播放记录…");
   const pref = await loadPreference();
+  assertDailyCallerCurrent(options);
   // 冷启动 = 三条输入全空：没听过、没收藏、也没自己选过风格（新装、换设备、清过统计）。
   // 旧实现这里直接返回空页面 —— 用户 2026-10-23 追问"没有历史怎么办"时暴露的正是这个缺口。
   // 现在不空着：给一批平台侧的最新/热门垫底，同时在页面上摆风格 chip 让用户点。
@@ -2364,6 +2498,7 @@ export async function generateDailyRecommend(
   const coldStart = pref.topSingers.length === 0 && !hasSaved && !hasSeeds;
 
   await useSourceRegistryStore.getState().ensure();
+  assertDailyCallerCurrent(options);
   const source = useMusicSourceStore.getState().activeSourceId;
 
   // 冷启动要先拿平台分类：一给页面摆 chip，二给候选池挑风格歌单（同一批数据，只请求一次）
@@ -2372,6 +2507,7 @@ export async function generateDailyRecommend(
   if (coldStart) {
     report("正在读取平台风格分类…");
     categories = await getPlaylistCategories(source).catch(() => [] as PlaylistCategory[]);
+    assertDailyCallerCurrent(options);
     styleOptions = pickStyleOptions(categories);
   }
   const styleSeeds = pref.styleSeeds ?? [];
@@ -2381,7 +2517,7 @@ export async function generateDailyRecommend(
 
   report("正在搜索候选歌曲（含榜单与风格维度）…");
   const {
-    tracks: pool,
+    tracks: unfilteredPool,
     laneOf,
     affinityLanes,
   } = await buildCandidatePoolWithLanes(pref, source, {
@@ -2391,6 +2527,8 @@ export async function generateDailyRecommend(
     variant,
     onProgress: () => report("正在搜索候选歌曲（含榜单与风格维度）…"),
   });
+  assertDailyCallerCurrent(options);
+  const pool = unfilteredPool.filter(track => sourceEnabled(track.platform));
   if (pool.length === 0) {
     return {
       date: todayKey(),
@@ -2418,6 +2556,7 @@ export async function generateDailyRecommend(
     ipc.checkDisliked(pool).catch(() => pool.map(() => false)),
     ipc.listHistory(500).catch(() => [] as { track: Track }[]),
   ]);
+  assertDailyCallerCurrent(options);
   const playedKeys = new Set(played.map((item) => trackKey(item.track)));
 
   // 两种 AI 模式都要多排一批：`rankCandidates` 只按目标条数返回，
@@ -2484,7 +2623,8 @@ export async function generateDailyRecommend(
       styleLanes: laneStatsOf(ruleItems),
       ...coldFields,
     };
-    await saveResult(result, true);
+    await saveResult(result, true, options);
+    assertDailyCallerCurrent(options);
     return result;
   }
 
@@ -2502,7 +2642,8 @@ export async function generateDailyRecommend(
       notice: "候选池里的歌最近都推荐过（或被屏蔽），已无新歌可推。",
       ...coldFields,
     };
-    await saveResult(result, true);
+    await saveResult(result, true, options);
+    assertDailyCallerCurrent(options);
     return result;
   }
 
@@ -2516,6 +2657,7 @@ export async function generateDailyRecommend(
       mode === "server"
         ? await pickByServer(aiPool, pref, pickCount, taste, laneOf)
         : await askModelForPicks(aiPool, pref, pickCount, taste, laneOf);
+    assertDailyCallerCurrent(options);
     // 实测模型偶尔会多给一两首（要 50 给 51），按目标条数截住，别让页面多出一行
     const targetPicks = parsed.picks.slice(0, DAILY_TARGET);
     // 中段穿插封顶 + 「有没有本地依据」两道闸：没依据的（尤其尾部那些为了凑风格
@@ -2564,9 +2706,12 @@ export async function generateDailyRecommend(
       styleLanes: laneStatsOf(spread),
       ...coldFields,
     };
-    await saveResult(result, true);
+    await saveResult(result, true, options);
+    assertDailyCallerCurrent(options);
     return result;
   } catch (error) {
+    // Cancellation is not an AI failure and must never produce a rule fallback.
+    assertDailyCallerCurrent(options);
     // 模型挂了不能让页面空着：退回规则结果，并把原因如实写出来
     const reason = error instanceof Error ? error.message : String(error);
     const result: DailyRecommendResult = {
@@ -2585,7 +2730,8 @@ export async function generateDailyRecommend(
       profileText,
       ...coldFields,
     };
-    await saveResult(result, true);
+    await saveResult(result, true, options);
+    assertDailyCallerCurrent(options);
     return result;
   }
 }

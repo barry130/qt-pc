@@ -41,19 +41,22 @@ impl PlayTarget {
 pub struct QueueCommitReply {
     pub applied: bool,
     pub target: Option<PlayTarget>,
+    /// Actual structural queue version; only an applied runtime commit may fill it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_revision: Option<u64>,
 }
 
 impl QueueCommitReply {
     pub fn applied(target: PlayTarget) -> Self {
-        Self { applied: true, target: Some(target) }
+        Self { applied: true, target: Some(target), queue_revision: None }
     }
 
     pub fn accepted_empty() -> Self {
-        Self { applied: true, target: None }
+        Self { applied: true, target: None, queue_revision: None }
     }
 
     pub fn rejected() -> Self {
-        Self { applied: false, target: None }
+        Self { applied: false, target: None, queue_revision: None }
     }
 }
 
@@ -97,6 +100,19 @@ impl PlayIntentGate {
     /// IPC 和原生入口共用的新意图声明，不接收已存在的原票。
     pub fn begin(&self) -> u64 {
         self.register()
+    }
+
+    /// Reserve restoration without replacing a pending user. Qualification retains its
+    /// Queue guard until registration completes; lock order remains Gate → Queue.
+    pub fn begin_if_no_pending<G>(&self, qualify: impl FnOnce() -> Option<G>) -> Option<u64> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.pending { return None; }
+        let _qualification = qualify()?;
+        let generation = state.generation.checked_add(1)?;
+        state.generation = generation;
+        state.valid = true;
+        state.pending = true;
+        Some(generation)
     }
 
     /// 只取消自己的未提交原票，不回退代次，也不撤销已经提交的目标。

@@ -56,9 +56,11 @@ async function preResolvePlayUrl(track: Track | undefined): Promise<void> {
  * 没给有效票）不是「旧后端」的兼容场景。拿不到有效票时整条动作 fail closed，
  * 不能退化成无票的旧载荷 —— 那会在 preResolve 窗口重新打开 C03 漏洞。
  */
-async function beginPlayIntent(): Promise<number | null> {
+async function beginPlayIntent(expectedRevision?: number): Promise<number | null> {
   try {
-    const ticket = await ipc.beginPlayIntent();
+    const ticket = expectedRevision === undefined
+      ? await ipc.beginPlayIntent()
+      : await ipc.beginPlayIntent(expectedRevision);
     // 票必须是正的安全整数：undefined/null/NaN/0/负数/非整数/超出安全整数都
     // 不能当作「无票」继续 —— 那会让晚到的无票动作重新变成 Native 眼中的最新意图。
     return typeof ticket === "number" && Number.isSafeInteger(ticket) && ticket > 0
@@ -87,6 +89,11 @@ function abandonPlayIntent(playIntent: number): void {
  * 保证「最后一次点击获胜」。
  */
 let playActionSeq = 0;
+
+/** Whether an accepted playback action is still the latest action. */
+export function isPlayActionCurrent(ticket: number): boolean {
+  return ticket === playActionSeq;
+}
 
 const preparedActionBrand: unique symbol = Symbol("PreparedPlayAction");
 /** An original click's reservation, never a new intent created after persistence. */
@@ -132,10 +139,11 @@ export function abandonPreparedPlayAction(handle: PreparedPlayAction): void {
   if (record) releasePreparedRecord(record);
 }
 
-function startPlayAction(dependency?: Promise<unknown>): { gen: number; intent: Promise<number | null> } {
+function startPlayAction(dependency?: Promise<unknown>, expectedRevision?: number): { gen: number; intent: Promise<number | null> } {
   const record = dependency ? preparedDependencies.get(dependency) : undefined;
-  if (!record) return { gen: ++playActionSeq, intent: beginPlayIntent() };
-  if (record.phase !== "bound" || record.gen !== playActionSeq) {
+  if (!record) return { gen: ++playActionSeq, intent: beginPlayIntent(expectedRevision) };
+  // A pre-existing reservation cannot be retroactively claimed as conditional ownership.
+  if (expectedRevision !== undefined || record.phase !== "bound" || record.gen !== playActionSeq) {
     releasePreparedRecord(record);
     return { gen: record.gen, intent: Promise.resolve(null) };
   }
@@ -185,6 +193,7 @@ export interface PlayActionResult {
   applied: boolean;
   ticket: number;
   target: PlayTarget | null;
+  queueRevision?: number;
 }
 
 interface PlayerStore {
@@ -241,7 +250,7 @@ interface PlayerStore {
    * `playQueue`（DESIGN §11.2 的列表播放语义收敛到那个按钮上）。
    */
   play: (track: Track, beforeResolve?: Promise<unknown>) => Promise<void>;
-  playQueue: (tracks: Track[], startIndex: number, beforeResolve?: Promise<unknown>) => Promise<PlayActionResult>;
+  playQueue: (tracks: Track[], startIndex: number, beforeResolve?: Promise<unknown>, isCurrent?: () => boolean, signal?: AbortSignal, expectedRevision?: number) => Promise<PlayActionResult>;
   playAt: (index: number) => Promise<void>;
   nextTrack: () => Promise<void>;
   prevTrack: () => Promise<void>;
@@ -477,21 +486,36 @@ export const usePlayerStore = create<PlayerStore>((set, get) => ({
     }
   },
 
-  playQueue: async (tracks, startIndex, beforeResolve) => {
-    const { gen, intent } = startPlayAction(beforeResolve);
+  playQueue: async (tracks, startIndex, beforeResolve, isCurrent, signal, expectedRevision) => {
     void beforeResolve?.catch(() => undefined);
+    // A stale internal FM request is not a new user click and must not supersede one.
+    if (signal?.aborted || isCurrent?.() === false) {
+      const prepared = beforeResolve ? preparedDependencies.get(beforeResolve) : undefined;
+      if (prepared) releasePreparedRecord(prepared);
+      return { applied: false, ticket: prepared?.gen ?? playActionSeq, target: null };
+    }
+    const { gen, intent } = startPlayAction(beforeResolve, expectedRevision);
+    const current = (): boolean => gen === playActionSeq && !signal?.aborted && isCurrent?.() !== false;
     const playIntent = await intent;
     if (playIntent === null) return { applied: false, ticket: gen, target: null };
+    // Revoke the original uncommitted ticket during IPC, never undo an applied queue.
+    const abort = (): void => abandonPlayIntent(playIntent);
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
     try {
-      // 登记或预解析被更晚动作超越时，不发旧队列，也不误报应用成功。
-      if (gen !== playActionSeq) return { applied: false, ticket: gen, target: null };
+      // 登记或预解析被更晚动作/账号来源超越时，不发旧队列，也不误报成功。
+      if (!current()) return { applied: false, ticket: gen, target: null };
       if (beforeResolve) await beforeResolve;
-      if (gen !== playActionSeq) return { applied: false, ticket: gen, target: null };
+      if (!current()) return { applied: false, ticket: gen, target: null };
       await preResolvePlayUrl(tracks[startIndex]);
-      if (gen !== playActionSeq) return { applied: false, ticket: gen, target: null };
-      const receipt = await ipc.playQueue(tracks, startIndex, playIntent);
-      return { applied: receipt.applied, ticket: gen, target: receipt.target };
+      if (!current()) return { applied: false, ticket: gen, target: null };
+      const receipt = expectedRevision === undefined
+        ? await ipc.playQueue(tracks, startIndex, playIntent)
+        : await ipc.playQueue(tracks, startIndex, playIntent, expectedRevision);
+      return { applied: receipt.applied, ticket: gen, target: receipt.target,
+        ...(receipt.queueRevision === undefined ? {} : { queueRevision: receipt.queueRevision }) };
     } finally {
+      signal?.removeEventListener("abort", abort);
       abandonPlayIntent(playIntent);
     }
   },

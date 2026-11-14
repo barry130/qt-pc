@@ -10,7 +10,7 @@ use crate::audio::play_intent::QueueCommitReply;
 use crate::audio::state::PlayMode;
 use crate::credential_store::SessionStatus;
 use crate::download::{self, DownloadJob, DownloadManager};
-use crate::provider::types::{Quality, Track};
+use crate::provider::types::{Quality, QueueAppendReply, Track};
 use crate::provider::url_cache::PlayUrlCache;
 use crate::provider::ProviderError;
 use crate::{quality_str, resolve_play_url_script};
@@ -431,8 +431,11 @@ pub async fn cmd_set_source_qualities(
 
 /// Register a caller-owned manual play ticket before frontend preparation/awaits.
 #[tauri::command(rename = "begin_play_intent")]
-pub fn cmd_begin_play_intent(state: State<'_, AppState>) -> u64 {
-    state.engine.begin_play_intent()
+pub fn cmd_begin_play_intent(state: State<'_, AppState>, expected_revision: Option<u64>) -> Option<u64> {
+    match expected_revision {
+        Some(expected) => state.engine.begin_play_intent_if_queue_current(expected),
+        None => Some(state.engine.begin_play_intent()),
+    }
 }
 
 /// Idempotent finally: only this still-pending ticket may be abandoned.
@@ -452,14 +455,16 @@ pub async fn cmd_play_queue(
     tracks: Vec<Track>,
     start_index: u32,
     play_intent: Option<u64>,
+    expected_revision: Option<u64>,
 ) -> Result<QueueCommitReply, String> {
     let db = state.db.clone();
     state
         .engine
-        .queue_after_filter(
+        .queue_after_filter_with_revision(
             tracks,
             start_index as usize,
             play_intent,
+            expected_revision,
             move |tracks, index| async move {
                 let filtered = match db {
                     Some(db) => {
@@ -548,6 +553,25 @@ pub async fn cmd_queue_append(
 ) -> Result<(), String> {
     state.engine.send(AudioCmd::Append(tracks));
     Ok(())
+}
+
+/// FM/refill append only while its actual accepted queue revision still owns the queue.
+#[tauri::command(rename = "queue_append_if_current")]
+pub async fn cmd_queue_append_if_current(
+    state: State<'_, AppState>,
+    tracks: Vec<Track>,
+    expected_revision: u64,
+) -> Result<QueueAppendReply, String> {
+    state.engine.append_if_current_with_receipt(tracks, expected_revision).await
+}
+
+/// Revoke a cancellable append's owner at the shared queue lock, not the actor FIFO.
+#[tauri::command(rename = "queue_release_if_current")]
+pub async fn cmd_queue_release_if_current(
+    state: State<'_, AppState>,
+    expected_revision: u64,
+) -> Result<QueueAppendReply, String> {
+    Ok(state.engine.release_queue_if_current(expected_revision))
 }
 
 /// 移除队列中的某一项。

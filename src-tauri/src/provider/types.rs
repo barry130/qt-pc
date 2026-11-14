@@ -184,6 +184,14 @@ impl Track {
     }
 }
 
+/// Actual actor receipt for a conditional structural append, not channel delivery.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueueAppendReply {
+    pub applied: bool,
+    pub queue_revision: u64,
+}
+
 /// Provider 错误分类（DESIGN §6.4 / §6.10）：serde tag=kind 供前端区分展示。
 #[derive(Debug, thiserror::Error, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]

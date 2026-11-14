@@ -12,12 +12,17 @@
 //! DislikeMatcher 调用），`previous_index` 不带跳过参数 —— 屏蔽语义是「别让它自动出现」，
 //! 不是「禁止聆听」，而上一首只由用户的「上一首」按钮触发，用户主动点的那首不该被拦。
 
-use crate::provider::types::Track;
+use crate::provider::types::{QueueAppendReply, Track};
 
 use super::state::PlayMode;
 
+/// Largest revision that survives a JSON number round trip through JavaScript.
+const MAX_QUEUE_REVISION: u64 = 9_007_199_254_740_991;
+
 #[derive(Debug, Clone, Default)]
 pub struct Queue {
+    /// Runtime-only structural identity. Cursor changes and persistence never reset it.
+    revision: u64,
     pub tracks: Vec<Track>,
     /// 当前曲目下标；None 表示未在播放
     pub index: Option<usize>,
@@ -36,7 +41,28 @@ pub struct Queue {
 }
 
 impl Queue {
-    pub fn set(&mut self, tracks: Vec<Track>, index: usize) {
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn advance_revision(&mut self) -> bool {
+        self.rebase_revision(self.revision, true)
+    }
+
+    /// The live committer rebases prepared replacements onto the runtime queue, never zero.
+    pub(super) fn rebase_revision(&mut self, current: u64, structural_change: bool) -> bool {
+        let next = if structural_change {
+            current.checked_add(1).filter(|&next| next <= MAX_QUEUE_REVISION)
+        } else {
+            Some(current)
+        };
+        let Some(next) = next else { return false; };
+        self.revision = next;
+        true
+    }
+
+    pub fn set(&mut self, tracks: Vec<Track>, index: usize) -> bool {
+        if !self.advance_revision() { return false; }
         // 换整条队列（播放新列表 / 恢复会话）：上一轮插进来的「下一首」不再有效
         self.pinned_next = None;
         self.removed_current_gap = None;
@@ -46,6 +72,7 @@ impl Queue {
         } else {
             Some(index.min(self.tracks.len() - 1))
         };
+        true
     }
 
     pub fn current(&self) -> Option<&Track> {
@@ -208,12 +235,13 @@ impl Queue {
 
     /// 在当前曲目之后插入一首（「下一首播放」）。
     /// 队列为空或尚未定位时退化为追加到队尾（此时没有「下一跳」可指定，不写 pin）。
-    pub fn insert_next(&mut self, track: Track) {
+    pub fn insert_next(&mut self, track: Track) -> bool {
+        if !self.advance_revision() { return false; }
         if let Some(gap) = self.removed_current_gap {
             self.tracks.insert(gap, track);
             self.pinned_next = Some(gap);
             self.clamp_index();
-            return;
+            return true;
         }
         match self.index {
             Some(i) if i < self.tracks.len() => {
@@ -223,6 +251,7 @@ impl Queue {
             }
             _ => self.tracks.push(track),
         }
+        true
     }
 
     /// 播放推进到某一下标（引擎的唯一「现在播这首」入口）。
@@ -246,9 +275,27 @@ impl Queue {
     }
 
     /// 追加到队尾（「加入播放队列」）。不改变当前播放位置。
-    pub fn append(&mut self, tracks: Vec<Track>) {
+    pub fn append(&mut self, tracks: Vec<Track>) -> bool {
+        if tracks.is_empty() || !self.advance_revision() { return false; }
         self.tracks.extend(tracks);
         self.clamp_index();
+        true
+    }
+
+    /// Revoke only this structural owner while the caller holds the authoritative queue lock.
+    /// The checked bump leaves tracks, selection and next-play policy untouched; a committed
+    /// append or replacement already owns another revision and must never be undone.
+    pub fn release_if_current(&mut self, expected_revision: u64) -> QueueAppendReply {
+        let applied = expected_revision == self.revision && self.advance_revision();
+        QueueAppendReply { applied, queue_revision: self.revision }
+    }
+
+    /// Compare and append while the caller holds this same authoritative queue/actor lock.
+    /// A stale owner or exhausted counter leaves every queue field unchanged.
+    pub fn append_if_current(&mut self, tracks: Vec<Track>, expected_revision: u64) -> QueueAppendReply {
+        let applied = expected_revision == self.revision
+            && (tracks.is_empty() || self.append(tracks));
+        QueueAppendReply { applied, queue_revision: self.revision }
     }
 
     /// 单曲播放用（DESIGN §11.2 `play_track`）：**不替换队列** —— 队列里已有同一首
@@ -257,24 +304,26 @@ impl Queue {
     ///
     /// 去重口径与移动端 `qt-uniappx` 的 `playSingle` 一致（按 id + platform 判重）：
     /// 重复点同一首不该在队列里堆出第二条一模一样的记录。
-    pub fn append_or_find(&mut self, track: Track) -> usize {
+    /// Returns None only when a new entry cannot receive another JSON-safe revision.
+    pub fn append_or_find(&mut self, track: Track) -> Option<usize> {
         if let Some(i) = self
             .tracks
             .iter()
             .position(|t| t.id == track.id && t.platform == track.platform)
         {
-            return i;
+            return Some(i);
         }
+        if !self.advance_revision() { return None; }
         self.tracks.push(track);
         self.clamp_index();
-        self.tracks.len() - 1
+        Some(self.tracks.len() - 1)
     }
 
     /// 移除指定下标，并修正当前下标：移除当前曲目之前的项整体前移一位，
     /// 被移除的正好是当前曲目时，下标落到原位置的下一首（播放中的音频不动，
     /// 界面按「接下来播这首」理解）。返回被移除的曲目。
     pub fn remove_at(&mut self, i: usize) -> Option<Track> {
-        if i >= self.tracks.len() {
+        if i >= self.tracks.len() || !self.advance_revision() {
             return None;
         }
         let removed = self.tracks.remove(i);
@@ -310,6 +359,10 @@ impl Queue {
             .collect();
         idxs.sort_unstable();
         idxs.dedup();
+        // Reject the entire batch at exhaustion instead of applying only a prefix.
+        if !self.revision.checked_add(idxs.len() as u64)
+            .is_some_and(|next| next <= MAX_QUEUE_REVISION)
+        { return 0; }
         let mut removed = 0;
         for &i in idxs.iter().rev() {
             if self.remove_at(i).is_some() {
@@ -323,7 +376,7 @@ impl Queue {
     /// 其余受影响的元素整体平移。返回是否真的发生了移动。
     pub fn move_item(&mut self, from: usize, to: usize) -> bool {
         let len = self.tracks.len();
-        if from >= len || to >= len || from == to {
+        if from >= len || to >= len || from == to || !self.advance_revision() {
             return false;
         }
         let item = self.tracks.remove(from);
@@ -358,6 +411,7 @@ impl Queue {
         };
         let keep = self.removed_current_gap.unwrap_or(cur + 1);
         let removed = self.tracks.len().saturating_sub(keep);
+        if removed == 0 || !self.advance_revision() { return 0; }
         self.tracks.truncate(keep);
         if self.pinned_next.is_some_and(|pin| pin >= keep) {
             self.pinned_next = None;
@@ -767,7 +821,7 @@ mod tests {
         let mut q = queue_of(3); // 0 1 2
         let i = q.append_or_find(track_of("9"));
         // 不替换队列：原有的三首还在，新歌追加到队尾
-        assert_eq!(i, 3);
+        assert_eq!(i, Some(3));
         assert_eq!(ids(&q), vec!["0", "1", "2", "9"]);
         // 只找位置，不动当前曲目（置 index 是调用方的事）
         assert_eq!(q.index, Some(0));
@@ -776,7 +830,7 @@ mod tests {
     #[test]
     fn append_or_find_reuses_existing_position() {
         let mut q = queue_of(3);
-        assert_eq!(q.append_or_find(track_of("1")), 1);
+        assert_eq!(q.append_or_find(track_of("1")), Some(1));
         // 已有 → 不重复入队
         assert_eq!(ids(&q), vec!["0", "1", "2"]);
     }
@@ -791,7 +845,7 @@ mod tests {
         };
         let mut other = track_of("7");
         other.platform = crate::provider::types::SourceId::new("kw");
-        assert_eq!(q.append_or_find(other), 1);
+        assert_eq!(q.append_or_find(other), Some(1));
         assert_eq!(ids(&q), vec!["7", "7"]);
         assert_eq!(q.len(), 2);
     }
@@ -915,7 +969,30 @@ mod tests {
             index: None,
             ..Default::default()
         };
-        assert_eq!(q.append_or_find(track_of("a")), 0);
+        assert_eq!(q.append_or_find(track_of("a")), Some(0));
         assert_eq!(ids(&q), vec!["a"]);
+    }
+
+    #[test]
+    fn matching_queue_release_fails_closed_at_js_revision_limit() {
+        let mut q = queue_of(3);
+        q.insert_next(track_of("pinned"));
+        // Boundary fixture only; all operations and observations use the public Queue seam.
+        q.revision = 9_007_199_254_740_990;
+        let tracks = serde_json::to_value(&q.tracks).unwrap();
+        let released = q.release_if_current(9_007_199_254_740_990);
+        assert!(released.applied);
+        assert_eq!(released.queue_revision, 9_007_199_254_740_991);
+        for expected in [9_007_199_254_740_991, 9_007_199_254_740_992, u64::MAX] {
+            let rejected = q.release_if_current(expected);
+            assert!(!rejected.applied);
+            assert_eq!(rejected.queue_revision, 9_007_199_254_740_991);
+        }
+        assert!(!q.append_if_current(vec![track_of("late")], 9_007_199_254_740_990).applied);
+        assert_eq!(q.revision(), 9_007_199_254_740_991);
+        assert_eq!(serde_json::to_value(&q.tracks).unwrap(), tracks);
+        assert_eq!(q.index, Some(0));
+        assert_eq!(q.pinned_next_index(), Some(1));
+        assert_eq!(q.next_index(PlayMode::Random, true), Some(1));
     }
 }

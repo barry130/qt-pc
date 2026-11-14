@@ -49,6 +49,8 @@ pub struct PreparedPlayback {
     target: Option<PlayTarget>,
     autoplay: bool,
     start_ms: u64,
+    expected_revision: Option<u64>,
+    structural_change: bool,
 }
 
 /// 只由真实语义提交返回。资源退休、emit / persist / loader / ACK 均在返回后。
@@ -255,7 +257,19 @@ impl PlaybackCommitter {
         if let Some(quality) = quality {
             snapshot.quality = quality;
         }
-        PreparedPlayback { generation, queue, snapshot, track, target, autoplay, start_ms }
+        PreparedPlayback { generation, queue, snapshot, track, target, autoplay, start_ms,
+            expected_revision: None, structural_change: true }
+    }
+
+    /// Cursor selection or a single-track append prepared from one live queue snapshot.
+    pub(super) fn prepare_existing(
+        &self, generation: u64, queue: Queue, expected_revision: u64,
+    ) -> PreparedPlayback {
+        let structural_change = queue.revision() != expected_revision;
+        let mut prepared = self.prepare(generation, queue, true, 0, None);
+        prepared.expected_revision = Some(expected_revision);
+        prepared.structural_change = structural_change;
+        prepared
     }
 
     pub fn commit_queue(
@@ -268,6 +282,22 @@ impl PlaybackCommitter {
         let mut queue = Queue::default();
         queue.set(tracks, index);
         let prepared = self.prepare(generation, queue, true, 0, None);
+        self.commit_prepared(generation, prepared, load_gen)
+    }
+
+    /// FM restoration compares its acknowledged owner in the same Gate → Queue commit.
+    pub fn commit_queue_if_current(
+        &self,
+        generation: u64,
+        tracks: Vec<Track>,
+        index: usize,
+        expected_revision: u64,
+        load_gen: &mut u64,
+    ) -> Option<PlaybackCommitPlan> {
+        let mut queue = Queue::default();
+        queue.set(tracks, index);
+        let mut prepared = self.prepare(generation, queue, true, 0, None);
+        prepared.expected_revision = Some(expected_revision);
         self.commit_prepared(generation, prepared, load_gen)
     }
 
@@ -290,40 +320,48 @@ impl PlaybackCommitter {
         load_gen: &mut u64,
     ) -> Option<PlaybackCommitPlan> {
         let PreparedPlayback {
-            generation: _, queue, snapshot, track, target, autoplay, start_ms,
+            generation: _, mut queue, mut snapshot, mut track, mut target, autoplay, start_ms,
+            expected_revision, structural_change,
         } = prepared;
-        // 整队列复制在 Gate 外；锁内仅移动旧资源，返回后才能 drop。
-        let queue_event = queue.clone();
-        let snapshot_event = snapshot.clone();
-        let reply = target.clone().map(QueueCommitReply::applied)
-            .unwrap_or_else(QueueCommitReply::accepted_empty);
+        // Copies and rejected candidates remain outside Gate, including revision exhaustion.
+        let mut queue_event = Some(queue.clone());
+        let mut snapshot_event = Some(snapshot.clone());
+        let mut reply = Some(target.clone().map(QueueCommitReply::applied)
+            .unwrap_or_else(QueueCommitReply::accepted_empty));
         let commit = || {
             // 锁顺序固定 Gate → Queue → State；真实三个语义变更在同一提交内。
             let mut current_queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+            if expected_revision.is_some_and(|expected| current_queue.revision() != expected)
+                || !queue.rebase_revision(current_queue.revision(), structural_change)
+            { return None; }
+            queue_event.as_mut().expect("prepared queue event")
+                .rebase_revision(queue.revision(), false);
             let mut current_snapshot = self.state.write().unwrap_or_else(|e| e.into_inner());
-            let retired_queue = std::mem::replace(&mut *current_queue, queue);
-            let retired_snapshot = std::mem::replace(&mut *current_snapshot, snapshot);
+            std::mem::swap(&mut *current_queue, &mut queue);
+            std::mem::swap(&mut *current_snapshot, &mut snapshot);
+            // Capture the applied owner under the same authoritative queue lock.
+            reply.as_mut().expect("prepared queue receipt").queue_revision = Some(current_queue.revision());
             *load_gen = load_gen.wrapping_add(1);
-            PlaybackCommitPlan {
-                reply,
-                target,
+            Some(PlaybackCommitPlan {
+                reply: reply.take().expect("one admitted queue receipt"),
+                target: target.take(),
                 port: None,
-                track,
-                queue: queue_event,
-                snapshot: snapshot_event,
+                track: track.take(),
+                queue: queue_event.take().expect("prepared queue event"),
+                snapshot: snapshot_event.take().expect("prepared snapshot event"),
                 load_gen: *load_gen,
                 autoplay,
                 start_ms,
-                retired_queue,
-                retired_snapshot,
-            }
+                retired_queue: std::mem::take(&mut queue),
+                retired_snapshot: std::mem::take(&mut snapshot),
+            })
         };
         match fence {
             CommitFence::Pending(generation) => self.gate.with_pending(generation, commit),
             CommitFence::Restore { expected_generation, generation } => {
                 self.gate.with_restore(expected_generation, generation, commit)
             }
-        }
+        }.flatten()
     }
 }
 
@@ -417,7 +455,7 @@ mod tests {
         let snapshot = committer.snapshot();
         let receipt = serde_json::to_value(&plan.reply).unwrap();
         assert!(
-            receipt == serde_json::json!({"applied": true, "target": null})
+            receipt == serde_json::json!({"applied": true, "target": null, "queueRevision": 2})
                 && queue.is_empty()
                 && queue.index.is_none()
                 && snapshot.queue_len == 0

@@ -8,7 +8,10 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+const settings = vi.hoisted(() => new Map<string, string>());
 const ipcMocks = vi.hoisted(() => ({
+  getSetting: vi.fn(),
+  setSetting: vi.fn(),
   getLocalTracks: vi.fn(),
   checkDisliked: vi.fn(),
   queueAppend: vi.fn(),
@@ -18,7 +21,11 @@ const ipcMocks = vi.hoisted(() => ({
   pause: vi.fn(),
 }));
 
-vi.mock("@/services/ipc", () => ipcMocks);
+vi.mock("@/services/ipc", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/services/ipc")>();
+  return { ...ipcMocks, SOURCE_META_CHANGED_EVENT: actual.SOURCE_META_CHANGED_EVENT,
+    SOURCE_PACK_CHANGED_EVENT: actual.SOURCE_PACK_CHANGED_EVENT };
+});
 
 const recommendMocks = vi.hoisted(() => ({
   loadPreference: vi.fn(),
@@ -52,6 +59,9 @@ const profile: StyleProfile = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  settings.clear(); // An absent preference preserves the application FM default.
+  ipcMocks.getSetting.mockImplementation(async (key: string) => settings.get(key) ?? null);
+  ipcMocks.setSetting.mockImplementation(async (key: string, value: string) => { settings.set(key, value); });
   ipcMocks.setPlayMode.mockResolvedValue(undefined);
   ipcMocks.seek.mockResolvedValue(undefined);
   ipcMocks.pause.mockResolvedValue(undefined);

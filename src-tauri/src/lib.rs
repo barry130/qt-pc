@@ -97,6 +97,11 @@ pub mod uri_scheme;
 pub mod web_login;
 #[cfg(test)]
 pub(crate) mod public_test_fixture;
+#[cfg(test)]
+mod queue_revision_tests;
+#[cfg(test)]
+#[path = "audio/queue_revision_tests.rs"]
+mod queue_release_tests;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -578,6 +583,8 @@ pub fn run() {
             cmd_clear_queue,
             cmd_queue_add_next,
             cmd_queue_append,
+            cmd_queue_append_if_current,
+            cmd_queue_release_if_current,
             cmd_queue_remove_at,
             cmd_queue_move,
             cmd_queue_clear_after,

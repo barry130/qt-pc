@@ -41,10 +41,13 @@ import type {
   MusicInfo,
   Source,
 } from "@/source-scripts/qt-contract/contract";
-import { engineInvoke, engineResolve, engineSnapshot, INVOKE_TIMEOUT_MS } from "@/source-engine/client";
+import { engineInvoke, engineResolve, engineSnapshot, queryEngineMeta, INVOKE_TIMEOUT_MS } from "@/source-engine/client";
 import { rememberPlayUrlLine, rememberPlayUrlMiss } from "./playurl-line";
 // 包内 parseSheet 入口不可用（老包 / 引擎未就绪）时的本地回退实现
 import { parsePlaylistInput as localParsePlaylistInput } from "@/lib/playlist-link";
+import { AccountRecommendationError, safeAccountRecommendationError } from "@/lib/account-recommendation-error";
+import { emitTo as accountEmitTo, listen as accountListen } from "@tauri-apps/api/event";
+import { SOURCE_ENGINE_WINDOW_LABEL } from "@/lib/window-labels";
 import { assertSourceEnabled, isSourcePolicyError, sourceEnabled, sourcePolicyRevision, waitSourcePolicy } from "@/lib/source-policy";
 
 // ---------- 引擎调用 ----------
@@ -983,6 +986,155 @@ export async function getLatestSongs(
     (p) => p.list as MusicInfo[] | undefined,
   );
   return list.map((m) => toAppTrack(m, source));
+}
+
+// ---------- 账户推荐（不复用公共推荐歌单 / 本地排序） ----------
+
+function assertAccountArgs(source: unknown, accountId: unknown, cursor?: unknown): void {
+  if (typeof source !== "string" || !source.trim() || typeof accountId !== "string" || !accountId.trim() ||
+    (cursor !== undefined && typeof cursor !== "string")) {
+    throw new AccountRecommendationError("INVALID_ARGS");
+  }
+  if (source === "local") throw new AccountRecommendationError("UNSUPPORTED");
+}
+
+// The frozen client owns positive IDs; account-only RPCs use negative IDs on the same protocol.
+let accountRequestId = 0;
+
+/** Keep the raw envelope private so a malformed batch is not confused with transport failure. */
+async function accountInvoke(entry: "accountDailySongs" | "accountFmNext", args: Record<string, unknown>): Promise<Record<string, unknown>> {
+  let unlisten: (() => void) | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let closed = false;
+  try {
+    const unavailable = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => { closed = true; reject(new AccountRecommendationError("ENGINE_UNAVAILABLE")); }, INVOKE_TIMEOUT_MS);
+    });
+    try {
+      if (engineSnapshot().phase !== "ready") await Promise.race([queryEngineMeta(), unavailable]);
+    } catch {
+      throw new AccountRecommendationError("ENGINE_UNAVAILABLE");
+    }
+    if (engineSnapshot().phase !== "ready") throw new AccountRecommendationError("ENGINE_UNAVAILABLE");
+    const requestId = --accountRequestId;
+    let settle!: (answer: Record<string, unknown> | null) => void;
+    const reply = new Promise<Record<string, unknown> | null>(resolve => { settle = resolve; });
+    const binding = accountListen<Record<string, unknown>>("source-engine-response", event => {
+      if (!closed && event.payload?.requestId === requestId) settle(event.payload);
+    }).then(dispose => {
+      if (closed) {
+        try { dispose(); } catch { /* A late native bind ACK still owns only this listener. */ }
+        throw new AccountRecommendationError("ENGINE_UNAVAILABLE");
+      }
+      unlisten = dispose;
+    }).catch(() => { throw new AccountRecommendationError("ENGINE_UNAVAILABLE"); });
+    await Promise.race([binding, unavailable]);
+    void accountEmitTo(SOURCE_ENGINE_WINDOW_LABEL, "source-engine-request", { requestId, kind: "invoke", entry, args })
+      .catch(() => settle(null)); // A missing native ACK must not hold a settled reply/timeout hostage.
+    const answer = await Promise.race([reply, unavailable]);
+    if (answer === null) throw new AccountRecommendationError("ENGINE_UNAVAILABLE");
+    if (answer.error !== undefined && answer.error !== null && typeof answer.error !== "string") {
+      throw new AccountRecommendationError("MALFORMED_RESPONSE");
+    }
+    if (typeof answer.error === "string" && answer.error) {
+      const safe = safeAccountRecommendationError(new Error(answer.error));
+      if (safe.code === "UPSTREAM" && answer.error.startsWith("入口不存在:")) throw new AccountRecommendationError("UNSUPPORTED");
+      if (safe.code === "UPSTREAM" && answer.error.startsWith("未安装数据包，数据接口不可用")) throw new AccountRecommendationError("ENGINE_UNAVAILABLE");
+      throw safe;
+    }
+    if (typeof answer.result !== "string") throw new AccountRecommendationError("MALFORMED_RESPONSE");
+    let payload: unknown;
+    try { payload = JSON.parse(answer.result); } catch { throw new AccountRecommendationError("MALFORMED_RESPONSE"); }
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new AccountRecommendationError("MALFORMED_RESPONSE");
+    return payload as Record<string, unknown>;
+  } catch (error) {
+    throw safeAccountRecommendationError(error);
+  } finally {
+    closed = true;
+    if (timer !== undefined) clearTimeout(timer);
+    try { unlisten?.(); } catch { /* Native listener cleanup must not expose raw errors. */ }
+  }
+}
+
+/** Account songs must satisfy the contract before any Track mapping or caching. */
+function assertAccountSong(raw: unknown): void {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new AccountRecommendationError("MALFORMED_RESPONSE");
+  }
+  const song = raw as Record<string, unknown>;
+  if (["id", "name", "singer", "album", "picUrl"].some(key => typeof song[key] !== "string") ||
+    typeof song.interval !== "number" || !Number.isFinite(song.interval) || song.interval < 0 ||
+    (song.musicId !== undefined && song.musicId !== null && typeof song.musicId !== "string") ||
+    (song.version !== undefined && typeof song.version !== "string") ||
+    (song.isrc !== undefined && typeof song.isrc !== "string") ||
+    (song.durationReliable !== undefined && typeof song.durationReliable !== "boolean")) {
+    throw new AccountRecommendationError("MALFORMED_RESPONSE");
+  }
+}
+
+function copyAccountSong(raw: unknown): MusicInfo {
+  assertAccountSong(raw);
+  const song = raw as MusicInfo;
+  return {
+    id: song.id, name: song.name, singer: song.singer, album: song.album,
+    picUrl: song.picUrl, interval: song.interval,
+    ...(song.musicId === undefined ? {} : { musicId: song.musicId }),
+    ...(song.version === undefined ? {} : { version: song.version }),
+    ...(song.isrc === undefined ? {} : { isrc: song.isrc }),
+    ...(song.durationReliable === undefined ? {} : { durationReliable: song.durationReliable }),
+  };
+}
+
+/** Reconstruct the public contract; account/raw extension fields never leave it. */
+function copyAccountBatch(batch: import("./qt-contract/contract").AccountRecommendationBatch): import("./qt-contract/contract").AccountRecommendationBatch {
+  return {
+    source: batch.source, kind: batch.kind, accountId: batch.accountId,
+    items: batch.items.map(copyAccountSong), fetchedAt: batch.fetchedAt,
+    ...(batch.cursor === undefined ? {} : { cursor: batch.cursor }),
+    ...(batch.expiresAt === undefined ? {} : { expiresAt: batch.expiresAt }),
+    ...(batch.exhausted === undefined ? {} : { exhausted: batch.exhausted }),
+  };
+}
+
+function validAccountTimestamp(value: unknown): boolean {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function assertAccountBatchMetadata(batch: import("./qt-contract/contract").AccountRecommendationBatch): void {
+  if (typeof batch.accountId !== "string" || !validAccountTimestamp(batch.fetchedAt) ||
+    (batch.expiresAt !== undefined && !validAccountTimestamp(batch.expiresAt)) ||
+    (batch.cursor !== undefined && typeof batch.cursor !== "string") ||
+    (batch.exhausted !== undefined && typeof batch.exhausted !== "boolean")) {
+    throw new AccountRecommendationError("MALFORMED_RESPONSE");
+  }
+}
+
+export async function accountDailySongs(source: SourceId, accountId: string): Promise<import("./qt-contract/contract").AccountRecommendationBatch> {
+  assertAccountArgs(source, accountId);
+  return accountInvoke("accountDailySongs", { source, accountId }).then((payload) => {
+    if (!Array.isArray(payload.items) || payload.source !== source || payload.kind !== "daily") {
+      throw new AccountRecommendationError("MALFORMED_RESPONSE");
+    }
+    return payload as unknown as import("./qt-contract/contract").AccountRecommendationBatch;
+  }).then((batch) => {
+        assertAccountBatchMetadata(batch);
+        if (batch.accountId !== accountId) throw new Error("ACCOUNT_CHANGED: 账号推荐结果不属于当前账号");
+        return copyAccountBatch(batch);
+      });
+}
+
+export async function accountFmNext(source: SourceId, accountId: string, cursor?: string): Promise<import("./qt-contract/contract").AccountRecommendationBatch> {
+  assertAccountArgs(source, accountId, cursor);
+  return accountInvoke("accountFmNext", { source, accountId, ...(cursor === undefined ? {} : { cursor }) }).then((payload) => {
+    if (!Array.isArray(payload.items) || payload.source !== source || payload.kind !== "fm") {
+      throw new AccountRecommendationError("MALFORMED_RESPONSE");
+    }
+    return payload as unknown as import("./qt-contract/contract").AccountRecommendationBatch;
+  }).then((batch) => {
+        assertAccountBatchMetadata(batch);
+        if (batch.accountId !== accountId) throw new Error("ACCOUNT_CHANGED: 账号推荐结果不属于当前账号");
+        return copyAccountBatch(batch);
+      });
 }
 
 // ---------- 注册表 ----------

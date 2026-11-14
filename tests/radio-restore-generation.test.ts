@@ -13,7 +13,16 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+const nativeBoundary = vi.hoisted(() => ({
+  settings: new Map<string, string>(),
+  ticket: 0,
+  committed: new Set<number>(),
+  abandoned: new Set<number>(),
+}));
 const ipcMocks = vi.hoisted(() => ({
+  getSetting: vi.fn(),
+  setSetting: vi.fn(),
+  abandonPlayIntent: vi.fn(),
   getLocalTracks: vi.fn(),
   checkDisliked: vi.fn(),
   queueAppend: vi.fn(),
@@ -26,7 +35,11 @@ const ipcMocks = vi.hoisted(() => ({
   beginPlayIntent: vi.fn(),
 }));
 
-vi.mock("@/services/ipc", () => ipcMocks);
+vi.mock("@/services/ipc", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/services/ipc")>();
+  return { ...ipcMocks, SOURCE_META_CHANGED_EVENT: actual.SOURCE_META_CHANGED_EVENT,
+    SOURCE_PACK_CHANGED_EVENT: actual.SOURCE_PACK_CHANGED_EVENT };
+});
 
 const qualityMocks = vi.hoisted(() => ({
   resolvePlayUrlWithFallback: vi.fn(),
@@ -47,7 +60,15 @@ vi.mock("@/lib/source-quality", () => ({
 
 import { usePlayerStore } from "@/stores/player";
 import { useRadioStore } from "@/stores/radio";
-import type { PlaybackState, Track } from "@/types";
+import type { PlaybackState, PlayTarget, Track } from "@/types";
+
+/** Legacy public Native receipt shape; no structural ownership is asserted here. */
+async function nativePlayReceipt(playIntent: number, target: PlayTarget | null = null, accepted = true) {
+  const applied = accepted && Number.isSafeInteger(playIntent) && playIntent > 0 &&
+    playIntent === nativeBoundary.ticket && !nativeBoundary.abandoned.has(playIntent) && !nativeBoundary.committed.has(playIntent);
+  if (applied) nativeBoundary.committed.add(playIntent);
+  return { applied, target: applied ? target : null };
+}
 
 function track(id: string, platform: Track["platform"] = "local"): Track {
   return { id, platform, title: `歌曲 ${id}`, singer: "歌手", album: "专辑", picUrl: "", duration: 240 };
@@ -71,10 +92,19 @@ beforeEach(() => {
   ipcMocks.setPlayMode.mockResolvedValue(undefined);
   ipcMocks.seek.mockResolvedValue(undefined);
   ipcMocks.pause.mockResolvedValue(undefined);
-  ipcMocks.playQueue.mockResolvedValue({ applied: true, target: null });
-  ipcMocks.playTrack.mockResolvedValue(undefined);
-  // 真实 PC 后端一定有 begin_play_intent；测试替身给一张有效正票。
-  ipcMocks.beginPlayIntent.mockResolvedValue(100);
+  nativeBoundary.settings.clear();
+  nativeBoundary.ticket = 0; nativeBoundary.committed.clear(); nativeBoundary.abandoned.clear();
+  ipcMocks.getSetting.mockImplementation(async (key: string) => nativeBoundary.settings.get(key) ?? null);
+  ipcMocks.setSetting.mockImplementation(async (key: string, value: string) => { nativeBoundary.settings.set(key, value); });
+  ipcMocks.playQueue.mockImplementation((_tracks: Track[], _index: number, ticket: number) => nativePlayReceipt(ticket));
+  ipcMocks.playTrack.mockImplementation(async (_track: Track, _quality: string, ticket: number) => {
+    await nativePlayReceipt(ticket);
+  });
+  // 每个公开预约取得新的正票；取消不回退代次，也不撤销已提交的票。
+  ipcMocks.beginPlayIntent.mockImplementation(async () => ++nativeBoundary.ticket);
+  ipcMocks.abandonPlayIntent.mockImplementation(async (ticket: number) => {
+    if (ticket === nativeBoundary.ticket && !nativeBoundary.committed.has(ticket)) nativeBoundary.abandoned.add(ticket);
+  });
   qualityMocks.peekQualityCeiling.mockReturnValue(null);
   qualityMocks.normalizeQualityForSource.mockImplementation((_platform: string, q: string) => q);
   qualityMocks.sourcePlayQualityOf.mockReturnValue("320");
@@ -145,7 +175,7 @@ describe("退出 FM 恢复原会话的代次防护（C03）", () => {
 
   it("没被打断时照常换回原列表、seek 回原位置并保持暂停", async () => {
     const target = { generation: 11, platform: "wyy" as const, id: oldOnline.id };
-    ipcMocks.playQueue.mockResolvedValueOnce({ applied: true, target });
+    ipcMocks.playQueue.mockImplementationOnce((_tracks: Track[], _index: number, ticket: number) => nativePlayReceipt(ticket, target));
     useRadioStore.setState({
       active: true,
       queueClaimed: true,
@@ -174,7 +204,7 @@ describe("退出 FM 恢复原会话的代次防护（C03）", () => {
   });
 
   it("Native 拒绝旧队列提交时不继续 seek/pause，即使 JS 票据尚未变化", async () => {
-    ipcMocks.playQueue.mockResolvedValueOnce({ applied: false, target: null });
+    ipcMocks.playQueue.mockImplementationOnce((_tracks: Track[], _index: number, ticket: number) => nativePlayReceipt(ticket, null, false));
     useRadioStore.setState({
       active: true,
       queueClaimed: true,
@@ -193,7 +223,7 @@ describe("退出 FM 恢复原会话的代次防护（C03）", () => {
 
   it("已接受队列的 Native 目标透传到恢复 seek/pause，而不是只使用 JS 代次", async () => {
     const target = { generation: 73, platform: "wyy", id: "old-online" };
-    ipcMocks.playQueue.mockResolvedValueOnce({ applied: true, target });
+    ipcMocks.playQueue.mockImplementationOnce((_tracks: Track[], _index: number, ticket: number) => nativePlayReceipt(ticket, target));
     useRadioStore.setState({
       active: true,
       queueClaimed: true,
@@ -219,7 +249,7 @@ describe("退出 FM 恢复原会话的代次防护（C03）", () => {
   });
 
   it("队列接受但 Native 目标为空：恢复 fail closed，不再 legacy seek/pause", async () => {
-    ipcMocks.playQueue.mockResolvedValueOnce({ applied: true, target: null });
+    ipcMocks.playQueue.mockImplementationOnce((_tracks: Track[], _index: number, ticket: number) => nativePlayReceipt(ticket));
     useRadioStore.setState({
       active: true,
       queueClaimed: true,
@@ -237,7 +267,7 @@ describe("退出 FM 恢复原会话的代次防护（C03）", () => {
   });
 
   it("带票据但没有 Native 目标的 seek/pause fail closed，不落到当前歌上", async () => {
-    ipcMocks.playQueue.mockResolvedValueOnce({ applied: true, target: null });
+    ipcMocks.playQueue.mockImplementationOnce((_tracks: Track[], _index: number, ticket: number) => nativePlayReceipt(ticket));
     const action = await usePlayerStore.getState().playQueue([newChoice], 0);
     // 当前在播的是用户新点的歌
     usePlayerStore.setState({ positionMs: 2_000 });
