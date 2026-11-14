@@ -14,6 +14,13 @@ import { useContentScroll } from "@/hooks/useContentScroll";
  *
  * 覆盖层自身 `pointer-events-none`，只有按钮那一块 `pointer-events-auto`，
  * 否则这层 `inset-0` 会盖住内容区右上角的行内按钮。
+ *
+ * 按钮在深色壁纸（播放页暗红渐变等）上要立得住（2026-11-14 用户两轮反馈
+ * 「深色背景下向上的图标看不清」）：先试「实底 card + 前景色描边」仍融——播放
+ * 页主题只覆盖 --foreground（米白）不覆盖 --card（#1b1b30 深蓝紫），白图标压
+ * 同明度深底在暗红壁纸上对比不足。终版直接**反转底**：bg-foreground 作底、
+ * text-background 作图标——深色主题=米白圆钮+近黑箭头，浅色主题自动反转为
+ * 深底白箭头，任何壁纸/主题下都是该主题内的最强对比。
  */
 export function ScrollTopLayer(props: {
   /** 换页信号：切 tab 后立刻收起，别拿上一页的滚动位置 */
@@ -40,7 +47,7 @@ export function ScrollTopLayer(props: {
           onClick={() => {
             target?.scrollTo({ top: 0, behavior: "smooth" });
           }}
-          className="pointer-events-auto absolute bottom-4 right-4 flex h-9 w-9 items-center justify-center rounded-full border border-border bg-card/90 text-foreground shadow-raised backdrop-blur-sm transition-colors hover:bg-accent"
+          className="pointer-events-auto absolute bottom-4 right-4 flex h-9 w-9 items-center justify-center rounded-full bg-foreground text-background shadow-[0_4px_14px_rgba(0,0,0,0.45)] transition-opacity hover:opacity-85"
         >
           <ArrowUp className="h-4 w-4" />
         </button>

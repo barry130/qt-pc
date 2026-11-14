@@ -98,14 +98,14 @@ describe("页面渲染冒烟", () => {
     expect(container.textContent).toContain("问题反馈");
   });
 
-  it("反馈列表页：我的/公开 Tab，未登录或空库时显示空态", async () => {
+  it("反馈列表页：显示 CNB 与 GitHub Issue 入口", async () => {
     const { FeedbackListPage } = await import("@/components/mine/FeedbackListPage");
     const container = await renderAfterEffects(<FeedbackListPage />);
     expect(container.textContent).toContain("意见反馈");
-    expect(container.textContent).toContain("我的");
-    expect(container.textContent).toContain("公开");
-    // invoke 对 astral_my_feedback 返回 {} → 规整为空页 → 「我的」Tab 空态
-    expect(container.textContent).toContain("还没有反馈，说说你的想法吧");
+    expect(container.textContent).toContain("在 CNB 提交 Issue");
+    expect(container.textContent).toContain("在 GitHub 提交 Issue");
+    expect(container.textContent).toContain("cnb.cool/canace/qt-pc");
+    expect(container.textContent).toContain("github.com/barry130/qt-pc");
   });
 
   it("反馈详情页：主体与回复区渲染（空数据不抛错）", async () => {
