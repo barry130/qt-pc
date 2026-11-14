@@ -20,6 +20,7 @@
  *   上下文热切换播放包、不重建窗口，主窗口侧只复位生命周期缓存待重新查询。
  */
 import { emitTo, listen } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { stripErrorUrls } from "@/lib/utils";
 import { log } from "@/lib/logger";
 import { SOURCE_ENGINE_WINDOW_LABEL } from "@/lib/window-labels";
@@ -47,6 +48,8 @@ interface EngineReply {
   detail?: string | null;
   /** kind=status 附带：当前生效播放包（null = 未装配播放包） */
   pack?: EnginePackSnapshot | null;
+  /** Actual loaded metadata slot, not the selected installation manifest. */
+  meta?: unknown;
   /** kind=invoke 的返回值（bundle 入口的 JSON 文本） */
   result?: string | null;
   error?: string | null;
@@ -58,6 +61,25 @@ export interface EnginePackSnapshot {
   code: number;
   name: string;
   version: string;
+}
+
+/** Loaded data slot reported by the engine page after import/contract verification. */
+export interface EngineMetaSnapshot { id: string; code: number; revision: string }
+let engineMeta: EngineMetaSnapshot | null = null;
+function normalizeEngineMeta(raw: unknown): EngineMetaSnapshot | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const meta = raw as Record<string, unknown>;
+  if (typeof meta.id !== "string" || !meta.id || typeof meta.code !== "number" ||
+    !Number.isSafeInteger(meta.code) || meta.code <= 0 || typeof meta.revision !== "string" || !meta.revision) return null;
+  return { id: meta.id, code: meta.code, revision: meta.revision };
+}
+
+/** Query the loaded slot; selecting/installing a pack alone is not an applied acknowledgement. */
+export async function queryEngineMeta(): Promise<EngineMetaSnapshot | null> {
+  await ensureBound();
+  const queriedPhase = await queryPhaseOnce();
+  if (queriedPhase) setPhase(queriedPhase);
+  return queriedPhase === "ready" ? engineMeta : null;
 }
 
 /**
@@ -250,7 +272,25 @@ let engineDetail: string | null = null;
 let enginePack: EnginePackSnapshot | null = null;
 
 let seq = 0;
-const pending = new Map<number, (reply: EngineReply) => void>();
+// RPC 应答 2026-11-14 起是全窗口广播（引擎页原 emit_to 只回主窗口，桌面歌词
+// 窗口等取词应答永远超时——恒显「间奏」）。广播后各窗口都按 requestId 对账：
+// 每个窗口各自从 1 计数的纯数字 id 会跨窗口撞号（窗口 A 的 pending.get(5)
+// 可能拿到窗口 B 的应答），所以 id 恒为 `<窗口label>#<序号>` 字符串。
+let originCache: string | null = null;
+function rpcOrigin(): string {
+  if (originCache === null) {
+    try {
+      originCache = getCurrentWebviewWindow().label;
+    } catch {
+      originCache = "web"; // 浏览器预览 / 单测：无 Tauri 窗口
+    }
+  }
+  return originCache;
+}
+function nextRequestId(): string {
+  return `${rpcOrigin()}#${++seq}`;
+}
+const pending = new Map<string, (reply: EngineReply) => void>();
 
 function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -268,9 +308,9 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-function onResponse(payload: EngineReply & { requestId?: number }): void {
+function onResponse(payload: EngineReply & { requestId?: unknown }): void {
   const requestId = payload?.requestId;
-  if (typeof requestId !== "number") return;
+  if (typeof requestId !== "string") return;
   const resolve = pending.get(requestId);
   if (!resolve) return;
   pending.delete(requestId);
@@ -283,7 +323,7 @@ async function emitRequest(payload: Record<string, unknown>): Promise<void> {
 
 /** 查一次引擎生命周期；查不到（引擎窗口不在/超时）返回 null */
 async function queryPhaseOnce(): Promise<EnginePhase | null> {
-  const requestId = ++seq;
+  const requestId = nextRequestId();
   const reply = new Promise<EngineReply>((resolve) => pending.set(requestId, resolve));
   try {
     await emitRequest({ requestId, kind: "status" });
@@ -299,6 +339,7 @@ async function queryPhaseOnce(): Promise<EnginePhase | null> {
     remoteCode = typeof answer.code === "number" ? answer.code : null;
     engineDetail = answer.detail ?? null;
     enginePack = normalizeEnginePack(answer.pack);
+    engineMeta = normalizeEngineMeta(answer.meta);
     return answer.phase;
   }
   return null;
@@ -368,7 +409,7 @@ async function ensureBound(): Promise<void> {
   }
   if (!binding) {
     binding = (async () => {
-      await listen<EngineReply & { requestId?: number }>(
+      await listen<EngineReply & { requestId?: string }>(
         "source-engine-response",
         (e) => onResponse(e.payload),
       );
@@ -445,7 +486,7 @@ export async function engineResolve(
   await ensureBound();
   // 引擎未就绪：环境问题（弱网下引擎页可能被冻住），不是这首歌没地址
   if (phase !== "ready") return failedResolve();
-  const requestId = ++seq;
+  const requestId = nextRequestId();
   const reply = new Promise<EngineReply>((resolve) => pending.set(requestId, resolve));
   try {
     await emitRequest({ requestId, kind: "resolve", source, song, quality });
@@ -513,7 +554,7 @@ export async function engineInvoke(
 ): Promise<Record<string, unknown> | null> {
   await ensureBound();
   if (phase !== "ready") return null;
-  const requestId = ++seq;
+  const requestId = nextRequestId();
   const reply = new Promise<EngineReply>((resolve) => pending.set(requestId, resolve));
   try {
     await emitRequest({ requestId, kind: "invoke", entry, args });

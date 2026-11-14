@@ -30,9 +30,6 @@
       const invoke = internals.invoke.bind(internals);
       const transformCallback = internals.transformCallback.bind(internals);
 
-      /** 主窗口事件目标（emit_to 用 AnyLabel；对齐 @tauri-apps/api emitTo） */
-      const MAIN_TARGET = { kind: "AnyLabel", label: "main" };
-
       /** 包头注释前缀（与 Rust source_pack_header.rs / qt-sources 同步维护） */
       const PACK_HEADER_PREFIX = "/*__QT_PACK__";
       /** 冒烟口径：搜索“晴天”取前 5 首做候选，任一取链 + Range 预检通过即通过 */
@@ -173,15 +170,16 @@
       }
       lockDownNetwork();
 
-      async function emitToMain(event, payload) {
+      // 2026-11-14：RPC 应答从「定向主窗口」改为全窗口广播。原先 emit_to 只回
+      // 主窗口，桌面歌词等副窗口发出的请求（getLyric 等）永远等不到应答 ——
+      // 客户端超时后 getPlaybackLyric 失败，桌面歌词恒显「间奏」。广播后各
+      // 窗口按 requestId 对账（不认识的直接忽略）；跨窗口串号由客户端的
+      // `<窗口label>#<序号>` 字符串 id 防住（账号面沿用负数 id，仍兼容 number）。
+      async function emitToAll(event, payload) {
         try {
-          await invoke("plugin:event|emit_to", {
-            target: MAIN_TARGET,
-            event,
-            payload,
-          });
+          await invoke("plugin:event|emit", { event, payload });
         } catch {
-          // 主窗口不在：无对策，引擎继续自持
+          // 广播失败：无对策，引擎继续自持
         }
       }
 
@@ -224,7 +222,7 @@
       }
 
       function report(phase, extra) {
-        return emitToMain("source-engine-status", {
+        return emitToAll("source-engine-status", {
           phase,
           pack: packSnapshot(),
           meta: metaSnapshot(),
@@ -521,7 +519,9 @@
         await report("ready", { detail: packError || metaError || phaseDetail || null });
       }
 
-      /** 主窗口 RPC：source-engine-request → source-engine-response。
+      /** 宿主窗口 RPC：source-engine-request → source-engine-response（广播应答）。
+       *  任意窗口（主窗口 / 桌面歌词等副窗口）都可能发请求；requestId 由发起端
+       *  生成——音源面为 `<窗口label>#<序号>` 字符串，账号面沿用负数，两者都回。
        *  kind "status" = 查询当前生命周期（client 绑定晚于引擎启动也能对齐状态）；
        *  kind "resolve" = 取链（url "" = 失败/未装播放包；line = 本次命中的线路，
        *                    null = 未知；referer = 宿主取字节要带的头（空串 = 不发）；
@@ -530,9 +530,9 @@
       async function onRequest(event) {
         const payload = (event && event.payload) || {};
         const requestId = payload.requestId;
-        if (typeof requestId !== "number") return;
+        if (typeof requestId !== "number" && typeof requestId !== "string") return;
         if (payload.kind === "status") {
-          await emitToMain("source-engine-response", {
+          await emitToAll("source-engine-response", {
             requestId,
             phase,
             code: activePack ? activePack.code : null,
@@ -559,7 +559,7 @@
           } catch (err) {
             error = String((err && err.message) || err);
           }
-          await emitToMain("source-engine-response", { requestId, result, error });
+          await emitToAll("source-engine-response", { requestId, result, error });
           return;
         }
         // 取链统一走 meta 的 getPlayUrl（未装播放包时它按统一口径抛错）：
@@ -618,7 +618,7 @@
           officialNote = "";
           error = String((err && err.message) || err);
         }
-        await emitToMain("source-engine-response", {
+        await emitToAll("source-engine-response", {
           requestId,
           url,
           line,
