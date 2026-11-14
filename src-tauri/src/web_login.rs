@@ -24,12 +24,28 @@ use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
 pub const WEB_LOGIN_LABEL: &str = "qt-source-web-login";
 
 /// 打开（或重建）音源登录窗口：
-/// 已存在先 destroy 再建，保证每次都从登录页首帧开始（不带上一轮会话残留）。
+/// 已存在先 destroy 再建，并且**每次打开前先清空 WebView 共享 Cookie 库**。
+///
+/// 2026-11-14 修复（对齐 qt-uniappx `openAuthWebView` 的 QtAuthClearCookiesTask）：
+/// 旧注释声称「destroy 再建保证不带上一轮会话残留」——这是错误假设，WebView2
+/// 的 Cookie 存在 profile 用户数据目录，销毁窗口不清、应用重启都在。退出账号
+/// 只清了应用自有凭据（music.db），网页登录窗口再开时站点读到旧 Cookie 直接
+/// 判已登录、自动登录成功。Cookie 库是整个 WebView2 环境共享的（主窗/登录窗
+/// 同 profile），用常驻的 main 窗口操作即可；清空只影响站点登录态，应用
+/// 凭据不受影响。`DeleteCookie` 异步生效，删完用 `cookies()`（阻塞确认读）
+/// 循环确认归零后才建窗加载登录页——保证页面首帧看到的是空 Cookie，不会
+/// 把「待删除的旧登录 Cookie」读回来（uniappx gAuthClearPending 同语义）。
 #[tauri::command]
 pub async fn source_web_login_open(app: AppHandle, url: String) -> Result<(), String> {
     // 旧窗口先销毁（destroy 不触发 CloseRequested，不会被拦截）
     if let Some(win) = app.get_webview_window(WEB_LOGIN_LABEL) {
         let _ = win.destroy();
+    }
+    // 每次打开前清空 WebView Cookie 库：失败不阻断登录（marker+官方校验兜底）
+    match clear_webview_cookies(&app) {
+        Ok(0) => {}
+        Ok(n) => log::info!("[web-login] 已清空 WebView Cookie 库 {n} 条"),
+        Err(e) => log::warn!("[web-login] 清空 Cookie 库失败（不阻断登录）: {e}"),
     }
     let login_url = tauri::Url::parse(&url).map_err(|e| format!("网页登录地址无效 {url}: {e}"))?;
 
@@ -43,6 +59,45 @@ pub async fn source_web_login_open(app: AppHandle, url: String) -> Result<(), St
     .map_err(|e| format!("调度主线程建窗失败: {e}"))?;
     rx.recv()
         .map_err(|_| "主线程建窗结果通道关闭".to_string())?
+}
+
+/// 清空 WebView 共享 Cookie 库并确认归零。
+///
+/// 必须在非 UI 线程调用（async command 天然满足）：`cookies()`/`delete_cookie`
+/// 内部经 WebView2 CookieManager，UI 线程同步等待会死锁（同
+/// `source_web_login_capture` 的死锁注释）。
+fn clear_webview_cookies(app: &AppHandle) -> Result<usize, String> {
+    let Some(win) = app.get_webview_window("main") else {
+        // 主窗不存在（不应发生）：跳过清库，登录流程继续
+        return Ok(0);
+    };
+    let all = win
+        .cookies()
+        .map_err(|e| format!("读取 WebView Cookie 失败: {e}"))?;
+    let total = all.len();
+    if all.is_empty() {
+        return Ok(0);
+    }
+    for cookie in &all {
+        if let Err(e) = win.delete_cookie(cookie.clone()) {
+            log::warn!("[web-login] 删除 Cookie 失败 {}: {e}", cookie.name());
+        }
+    }
+    // DeleteCookie 异步生效：阻塞读确认归零（上限 ~2s），避免建窗后页面首帧
+    // 读到「待删除的旧登录 Cookie」——那会让站点判已登录、秒回 Cookie。
+    for _ in 0..20 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        match win.cookies() {
+            Ok(rest) if rest.is_empty() => return Ok(total),
+            Ok(_) => continue,
+            Err(e) => {
+                log::warn!("[web-login] 清库确认读失败（不阻断）: {e}");
+                return Ok(total);
+            }
+        }
+    }
+    log::warn!("[web-login] 清库确认 ~2s 未归零，继续建窗");
+    Ok(total)
 }
 
 /// [`source_web_login_capture`] 的返回：`closed=true` 表示登录窗口已不存在
