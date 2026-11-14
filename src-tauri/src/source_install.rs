@@ -71,8 +71,14 @@ const MAX_ERROR_CHARS: usize = 300;
 const DOWNLOAD_TIMEOUT_MS: u64 = 60_000;
 /// 包头探测超时（10s，与 uniappx PROBE_TIMEOUT_MS 一致）
 const PROBE_TIMEOUT_MS: u64 = 10_000;
-/// 包头探测的 Range 长度（首 4KiB 足够覆盖包头）
+/// 包头探测的 Range 首档长度（首 4KiB 覆盖绝大多数包）
 const PROBE_RANGE_BYTES: usize = 4096;
+/// 包头探测的 Range 上限：包头首行可能很长——官方包把完整 changelog 写进
+/// 包头 notes，实测 meta-bundle.js 首行 30,755 字节、play 10,526 字节。
+/// 固定 4KiB 窗口会把首行截断 → `parse_pack_header` 拿不到结尾 `*/` 返回 None
+/// → 更新发现静默跳过（2026-11-09「发布了数据包但 PC 一直收不到更新」事故）。
+/// 首档拿不到完整首行时按 ×8 递增窗口重试，上限兜底防「无换行的超大文件」。
+const PROBE_RANGE_MAX_BYTES: usize = 512 * 1024;
 /// 同一包两次 updateUrl 探测的最小间隔（4h，与 uniappx PROBE_INTERVAL_MS 一致）
 const PROBE_INTERVAL_SECS: i64 = 4 * 60 * 60;
 /// 包体防呆下限（正常 bundle ≥ 100KB；挡重定向到 HTML 错误页之类）
@@ -776,6 +782,7 @@ fn rollback_update_at(dir: &Path, pack_id: &str) -> (bool, bool) {
 }
 
 fn broadcast_packs_changed(app: &AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() { state.url_cache.clear(); }
     let _ = app.emit("source-pack-changed", ());
 }
 
@@ -877,6 +884,7 @@ fn stage_pack_text(
 }
 
 fn broadcast_meta_changed(app: &AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() { state.url_cache.clear(); }
     let _ = app.emit("source-meta-changed", ());
 }
 
@@ -1040,11 +1048,30 @@ async fn download_pack_text(url: &str) -> Result<String, String> {
     Ok(text)
 }
 
-/// 探测远端包首行包头（Range GET 首 4KiB；解析失败/无包头 → None）
+/// 探测远端包首行包头（Range GET 首 4KiB，首行被截断时递增窗口重试；
+/// 解析失败/无包头且首行已完整 → None）
 async fn probe_pack_header(url: &str) -> Result<Option<PackHeader>, String> {
-    let (_, text) = trusted_get(url, PROBE_TIMEOUT_MS, Some(PROBE_RANGE_BYTES)).await?;
-    let first_line = text.split('\n').next().unwrap_or("");
-    Ok(parse_pack_header(first_line))
+    let mut window = PROBE_RANGE_BYTES;
+    loop {
+        let (_, text) = trusted_get(url, PROBE_TIMEOUT_MS, Some(window)).await?;
+        if let Some(header) = parse_pack_header(&text) {
+            return Ok(Some(header));
+        }
+        match next_probe_window(window, &text) {
+            Some(next) => window = next,
+            None => return Ok(None),
+        }
+    }
+}
+
+/// 包头探测窗口增长策略：已拿到完整首行（文本含换行）→ 包头确实非法，不再重试；
+/// 无换行 = 首行被 Range 截断 → 返回放大后的窗口；已到上限 → None（放弃）。
+/// 注意：服务端忽略 Range 回 200 全量时文本必含换行，不会误重试。
+fn next_probe_window(current: usize, text: &str) -> Option<usize> {
+    if text.contains('\n') || current >= PROBE_RANGE_MAX_BYTES {
+        return None;
+    }
+    Some((current * 8).min(PROBE_RANGE_MAX_BYTES))
 }
 
 // ---------- 更新发现 ----------
@@ -1236,21 +1263,41 @@ async fn discover_updates(
                                 art.pack_version_name.clone()
                             },
                         )
-                    } else if let Ok(Some(header)) = probe_pack_header(&art.url).await {
-                        if header.kind == PACK_KIND_META && header.id == OFFICIAL_META_ID {
-                            (
-                                header.version_code,
-                                if header.version_name.is_empty() {
-                                    format!("code {}", header.version_code)
-                                } else {
-                                    header.version_name
-                                },
-                            )
-                        } else {
-                            (0, String::new())
-                        }
                     } else {
-                        (0, String::new())
+                        // 回退探测：包头首行可能很长（官方包曾把 changelog 全塞进
+                        // 包头 notes，首行 30KB+），probe_pack_header 会递增窗口重试。
+                        // 探测失败必须留日志——静默跳过正是「发布了数据包但 PC 收不到
+                        // 更新」查不出原因的地方。
+                        match probe_pack_header(&art.url).await {
+                            Ok(Some(header))
+                                if header.kind == PACK_KIND_META && header.id == OFFICIAL_META_ID =>
+                            {
+                                (
+                                    header.version_code,
+                                    if header.version_name.is_empty() {
+                                        format!("code {}", header.version_code)
+                                    } else {
+                                        header.version_name
+                                    },
+                                )
+                            }
+                            Ok(other) => {
+                                log::warn!(
+                                    "[source-bundle] meta 产物包头与官方槽不符（kind={:?} id={:?}），跳过更新: {}",
+                                    other.as_ref().map(|h| h.kind.as_str()),
+                                    other.as_ref().map(|h| h.id.as_str()),
+                                    art.url
+                                );
+                                (0, String::new())
+                            }
+                            Err(e) => {
+                                log::warn!(
+                                    "[source-bundle] meta 产物包头探测失败，跳过数据包更新: {e} ({})",
+                                    art.url
+                                );
+                                (0, String::new())
+                            }
+                        }
                     };
                 // 版本压制例外：同 play 通道（历史未验签官方包不压制）
                 let unverified_official = !installed.sign_verified;
@@ -2962,5 +3009,63 @@ mod tests {
         assert_eq!(with_null.artifacts[0].pack_id, "");
         assert_eq!(with_null.artifacts[0].pack_version_code, 0);
         assert_eq!(with_null.artifacts[0].pack_version_name, "");
+    }
+
+    /// 事故回归（2026-11-09）：官方 meta 包头首行 30,755 字节，固定 4KiB 窗口
+    /// 只能拿到半截 JSON → 解析失败 → 数据包更新被静默跳过。
+    /// 探测窗口必须能按 4K→32K→256K 逐档放大直到拿到完整首行。
+    #[test]
+    fn probe_window_grows_until_long_header_line_complete() {
+        // notes 40KB → 首行约 40KB：4KiB、32KiB 都不完整，256KiB 才完整
+        let notes = "n".repeat(40_000);
+        let full = format!(
+            "/*__QT_PACK__{{\"kind\":\"meta\",\"id\":\"meta-official\",\"name\":\"官方数据包\",\
+             \"versionCode\":2026110901,\"versionName\":\"2026.11.09.1\",\"notes\":\"{notes}\"}}*/\n\
+             (function(){{}})();\n"
+        );
+        let cut = |n: usize| -> String {
+            let end = n.min(full.len());
+            String::from_utf8_lossy(&full.as_bytes()[..end]).into_owned()
+        };
+
+        assert!(
+            parse_pack_header(&cut(PROBE_RANGE_BYTES)).is_none(),
+            "4KiB 只拿到半截包头 → 解析失败（旧实现就是死在这里）"
+        );
+        assert_eq!(
+            next_probe_window(PROBE_RANGE_BYTES, &cut(PROBE_RANGE_BYTES)),
+            Some(32_768),
+            "首行被截断（无换行）→ 放大一档重试"
+        );
+        assert!(parse_pack_header(&cut(32_768)).is_none());
+        assert_eq!(
+            next_probe_window(32_768, &cut(32_768)),
+            Some(262_144)
+        );
+        let parsed = parse_pack_header(&cut(262_144)).expect("256KiB 覆盖 40KB 首行");
+        assert_eq!(parsed.version_code, 2026110901);
+        assert_eq!(parsed.version_name, "2026.11.09.1");
+    }
+
+    /// 完整首行但包头非法（HTML 跳转页/无标记/JSON 损坏）→ 不重试，直接 None；
+    /// 窗口到上限仍被截断 → 放弃，不无限放大。
+    #[test]
+    fn probe_window_stops_on_complete_invalid_line_and_at_cap() {
+        assert_eq!(
+            next_probe_window(PROBE_RANGE_BYTES, "<html><body>302 Found</body></html>\n"),
+            None
+        );
+        assert_eq!(
+            next_probe_window(PROBE_RANGE_BYTES, "/*__QT_PACK__{bad json}*/\nbody"),
+            None
+        );
+        // 到上限仍没有换行（超大且无首行结束符的文件）→ 放弃
+        let at_cap = "x".repeat(PROBE_RANGE_MAX_BYTES);
+        assert_eq!(next_probe_window(PROBE_RANGE_MAX_BYTES, &at_cap), None);
+        // 未到上限且被截断 → 放大，但封顶不超过 PROBE_RANGE_MAX_BYTES
+        assert_eq!(
+            next_probe_window(PROBE_RANGE_MAX_BYTES / 2, "partial"),
+            Some(PROBE_RANGE_MAX_BYTES)
+        );
     }
 }
