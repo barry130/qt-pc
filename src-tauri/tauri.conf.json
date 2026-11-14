@@ -21,7 +21,7 @@
         "minHeight": 640,
         "decorations": false,
         "transparent": false,
-        "dragDropEnabled": true,
+        "dragDropEnabled":  false,
         "additionalBrowserArgs": "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --js-flags=--max-old-space-size=768 --disk-cache-size=52428800",
         "visible": false,
         "center": true
