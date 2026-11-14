@@ -155,6 +155,7 @@ export function SearchPage(): React.JSX.Element {
    */
   const sourcePageMax = useSearchPageMax(activeSourceId);
   const registrySources = useSourceRegistryStore((s) => s.sources);
+  const registryGeneration = useSourceRegistryStore((s) => s.generation);
   const aggPageSize = useMemo(() => {
     const maxes = registrySources
       .map((s) => s.searchPageMax)
@@ -168,7 +169,7 @@ export function SearchPage(): React.JSX.Element {
    * 都回第一页重拉。**activeSourceId 也进键**：聚合模式下它其实不影响取数，但
    * 换源即重搜的语义要和单源一致，不能只在单源路径生效。
    */
-  const resetKey = `${q}|${tab}|${aggregateMode ? "agg" : "one"}|${activeSourceId}|${pageSize}`;
+  const resetKey = `${q}|${tab}|${aggregateMode ? "agg" : "one"}|${activeSourceId}|${pageSize}|${registryGeneration}`;
 
   /**
    * 「上游分页参数不生效」的兜底：部分音源会无视 page 反复返回同一页，而

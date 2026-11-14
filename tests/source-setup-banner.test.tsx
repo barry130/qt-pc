@@ -8,6 +8,9 @@ import { cleanup, render, waitFor } from "@testing-library/react";
 const state = vi.hoisted(() => ({
   settings: new Map<string, string>(),
   registry: {
+    catalog: [],
+    policy: { version: 1, enabled: null, order: [] },
+    generation: 0,
     sources: [] as { id: string; name: string; short: string; color: string }[],
     ensure: () => Promise.resolve(),
   },

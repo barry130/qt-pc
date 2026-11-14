@@ -49,8 +49,10 @@ export function AudioProgramPage(props: { platform: SourceId; id: string }): Rea
   return (
     <div className="flex h-full min-w-0 flex-col">
       <header className="relative shrink-0 border-b border-border">
-        <div className="flex items-center px-6 pt-5"><BackButton /></div>
-        <div className="flex gap-5 px-6 pb-6 pt-4">
+        {/* 返回键与封面头同一行（用户 2026-11-14）。行保持默认 stretch：
+            信息列 self-end 贴底（以下面为基准往上展示），返回键 self-start 贴顶。 */}
+        <div className="flex gap-5 px-6 pb-6 pt-5">
+          <BackButton className="self-start" />
           <div className="h-36 w-36 shrink-0 overflow-hidden rounded-2xl bg-secondary shadow-surface ring-1 ring-border">
             {cover ? <img src={cover} alt="" className="h-full w-full object-cover" /> : <div className="flex h-full items-center justify-center text-muted-foreground/50"><Headphones className="h-10 w-10" /></div>}
           </div>

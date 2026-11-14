@@ -31,6 +31,10 @@ vi.mock("@tauri-apps/api/event", () => ({
     return () => {};
   }),
 }));
+vi.mock("@/services/ipc", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/services/ipc")>(),
+  getSetting: vi.fn(async () => null),
+}));
 
 vi.mock("@/source-scripts", () => ({
   DEFAULT_SEARCH_PAGE_MAX: 20,

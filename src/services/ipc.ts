@@ -76,6 +76,8 @@ export const disconnectDlna = (returnToLocal = false): Promise<void> => invoke("
 /// 「服务端不给 Content-Length」时的分母靠它；actualQuality = 按实测码率
 /// 重标后的档位（**只降不升**，空串 = 未重标），下载命名用它而非请求档，
 /// 否则请求 flac 实际拿到 320k 会被命名成 `.flac` 虚标。
+export async function playUrlCacheEpoch(): Promise<number> { return invoke("play_url_cache_epoch"); }
+
 export async function setResolvedPlayUrl(
   track: Track,
   quality: Quality,
@@ -83,6 +85,7 @@ export async function setResolvedPlayUrl(
   referer = "",
   size: number | null = null,
   actualQuality = "",
+  cacheEpoch?: number,
 ): Promise<void> {
   return invoke("set_resolved_play_url", {
     track,
@@ -91,6 +94,7 @@ export async function setResolvedPlayUrl(
     referer,
     size,
     actualQuality,
+    cacheEpoch,
   });
 }
 
@@ -979,7 +983,7 @@ export async function setTrackQuality(quality: Quality): Promise<void> {
   return invoke("set_track_quality", { quality });
 }
 
-/** 各平台独立音质（音源账号页）：全量推送 {平台: 档位}，只更新引擎运行时副本 */
+/** 各平台独立音质（音源平台管理页）：全量推送 {平台: 档位}，只更新引擎运行时副本 */
 export async function setSourceQualities(qualities: Record<string, string>): Promise<void> {
   return invoke("set_source_qualities", { qualities });
 }

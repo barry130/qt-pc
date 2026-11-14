@@ -27,12 +27,8 @@ export const messages = defineFragment({
     "settings.download.storage.sidecar": "同目录文件",
     "settings.download.concurrency.title": "同时下载数",
     "settings.download.concurrency.description":
-      "并发任务数，超出排队；建议 ≤3，过高易被限流",
-    "settings.download.concurrency.ariaConfirm": "确认将同时下载数改为 {n}",
+      "并发任务数，超出排队",
     "settings.download.concurrency.ariaSet": "同时下载数 {n}",
-    "settings.download.concurrency.pendingLabel": "{n} 个？",
-    "settings.download.concurrency.warning":
-      "同时下载 {n} 个可能被音源判定为异常流量并临时封禁 IP，再点一次「{n} 个？」确认。",
   },
   en: {
     "settings.download.dir.title": "Download folder",
@@ -60,11 +56,7 @@ export const messages = defineFragment({
     "settings.download.storage.sidecar": "Separate files",
     "settings.download.concurrency.title": "Simultaneous downloads",
     "settings.download.concurrency.description":
-      "Parallel downloads; extra tasks queue up. 3 or fewer recommended — higher counts may get rate-limited",
-    "settings.download.concurrency.ariaConfirm": "Confirm raising simultaneous downloads to {n}",
+      "Parallel downloads; extra tasks queue up",
     "settings.download.concurrency.ariaSet": "Simultaneous downloads: {n}",
-    "settings.download.concurrency.pendingLabel": "{n}?",
-    "settings.download.concurrency.warning":
-      "Downloading {n} at once may be flagged as abnormal traffic and get your IP temporarily blocked. Click “{n}?” again to confirm.",
   },
 });

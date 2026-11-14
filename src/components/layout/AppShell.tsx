@@ -112,7 +112,7 @@ export function AppShell(): React.JSX.Element {
     void ensureSourceAuthInjected();
   }, []);
 
-  // 各平台独立音质（音源账号页）：启动读表进缓存并全量推给引擎
+  // 各平台独立音质（音源平台管理页）：启动读表进缓存并全量推给引擎
   //（engine 的队列播放/无缝预加载按这张表取每首歌的请求音质）
   useEffect(() => {
     void loadSourceQualities();

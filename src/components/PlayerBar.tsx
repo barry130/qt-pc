@@ -920,7 +920,7 @@ function MiniModeButton(): React.JSX.Element {
 }
 
 /**
- * 音质入口（播放条）：写入**当前歌曲所在平台**的独立音质（音源账号页按平台
+ * 音质入口（播放条）：写入**当前歌曲所在平台**的独立音质（音源平台管理页按平台
  * 管理），并对当前这首立即生效（setTrackQuality）。
  * 选项按当前歌曲的源收敛（v5 契约 + 登录态切官方清单，见 useSourceQualities）。
  * 菜单向上弹（播放条贴在窗口底部）。
@@ -944,7 +944,7 @@ function QualityMenu(props: { current: Quality; platform: string }): React.JSX.E
         <button
           type="button"
           aria-label={`音质：${shortOf(current)}`}
-          title="音质（各平台独立默认值在音源账号页设置）"
+          title="音质（各平台独立默认值在音源平台管理页设置）"
           aria-haspopup="menu"
           aria-expanded={t.open}
           disabled={busy}

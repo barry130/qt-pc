@@ -42,6 +42,7 @@ struct CacheInner {
     /// 就失去了确定次序（也会被系统时间回拨影响）；插入序号是唯一的，
     /// 同刻按它兜底，淘汰结果稳定可测。
     next_seq: u64,
+    generation: u64,
 }
 
 struct CachedUrl {
@@ -91,6 +92,7 @@ impl PlayUrlCache {
                 map: HashMap::new(),
                 inserts_since_sweep: 0,
                 next_seq: 0,
+                generation: 0,
             }),
             ttl_ms: PLAY_URL_TTL_MS,
             max_entries: PLAY_URL_MAX_ENTRIES,
@@ -137,10 +139,18 @@ impl PlayUrlCache {
     }
 
     /// 写入一条取链结果。`size = None` / `actual_quality` 空串表示这次没测出来。
+    #[cfg(test)]
     pub fn set(&self, key: String, resolved: ResolvedPlayUrl) {
-        let Ok(mut inner) = self.inner.lock() else {
-            return;
-        };
+        self.set_if_current(key, resolved, self.generation());
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).generation
+    }
+
+    pub fn set_if_current(&self, key: String, resolved: ResolvedPlayUrl, generation: u64) -> bool {
+        let Ok(mut inner) = self.inner.lock() else { return false; };
+        if inner.generation != generation { return false; }
         let now = Self::now_ms();
         inner.next_seq = inner.next_seq.wrapping_add(1);
         let seq = inner.next_seq;
@@ -161,6 +171,7 @@ impl PlayUrlCache {
             inner.inserts_since_sweep = 0;
             self.sweep(&mut inner, now);
         }
+        true
     }
 
     /// 全量清扫：先删过期项；仍超容量再按"最旧"（fetched_at，同刻用 seq 兜底）
@@ -193,6 +204,7 @@ impl PlayUrlCache {
         let Ok(mut inner) = self.inner.lock() else {
             return 0;
         };
+        inner.generation = inner.generation.wrapping_add(1);
         let count = inner.map.len();
         inner.map.clear();
         inner.inserts_since_sweep = 0;
@@ -202,6 +214,7 @@ impl PlayUrlCache {
     /// 播放失败时作废缓存
     pub fn invalidate(&self, key: &str) {
         if let Ok(mut inner) = self.inner.lock() {
+            inner.generation = inner.generation.wrapping_add(1);
             inner.map.remove(key);
         }
     }
@@ -216,6 +229,19 @@ impl Default for PlayUrlCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalidation_rejects_late_resolvers() {
+        let cache = PlayUrlCache::new();
+        let old = cache.generation();
+        cache.clear();
+        assert!(!cache.set_if_current("k".into(), hit("https://old/a.mp3", ""), old));
+        let current = cache.generation();
+        assert!(cache.set_if_current("k".into(), hit("https://new/a.mp3", ""), current));
+        cache.invalidate("k");
+        assert!(!cache.set_if_current("k".into(), hit("https://late/a.mp3", ""), current));
+        assert!(cache.get("k").is_none());
+    }
 
     /// 只关心 url/referer 的用例用这个构造，其余字段按"没测出来"填。
     fn hit(url: &str, referer: &str) -> ResolvedPlayUrl {

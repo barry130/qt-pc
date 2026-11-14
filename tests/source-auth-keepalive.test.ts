@@ -22,6 +22,7 @@ const state = vi.hoisted(() => ({
 }));
 
 vi.mock("@/services/ipc", () => ({
+  clearPlayUrlCache: vi.fn(async () => 0),
   getSetting: (key: string) => Promise.resolve(state.store.get(key) ?? null),
   setSetting: (key: string, value: string) => {
     state.store.set(key, value);

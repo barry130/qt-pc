@@ -85,6 +85,7 @@ pub mod smtc;
 pub mod source_bundle;
 pub mod source_engine_policy;
 pub mod source_install;
+pub mod source_policy;
 pub mod source_pack_header;
 pub mod source_window;
 pub mod taskbar;
@@ -165,6 +166,7 @@ pub(crate) async fn resolve_play_url_script(
             referer,
             size,
             actual_quality,
+    let generation = cache.generation();
         } => crate::provider::url_cache::ResolvedPlayUrl {
             url,
             referer,
@@ -175,10 +177,11 @@ pub(crate) async fn resolve_play_url_script(
         crate::playurl_bridge::AskOutcome::NoUrl => return Err(ProviderError::NoPlayableUrl),
         crate::playurl_bridge::AskOutcome::Stalled => return Err(ProviderError::ResolveStalled),
     };
-    cache.set(key.clone(), reply);
+    if !cache.set_if_current(key.clone(), reply, generation) { return Err(ProviderError::ResolveStalled); }
     // fetched_at 由 set 写入当前时间；这里再读一次拿到真实时间戳
     cache.get(&key).ok_or(ProviderError::NoPlayableUrl)
 }
+        crate::playurl_bridge::AskOutcome::PolicyBlocked(message) => return Err(ProviderError::SourcePolicy { message }),
 
 pub(crate) fn quality_str(q: &Quality) -> &str {
     q.as_str()
@@ -533,6 +536,7 @@ pub fn run() {
             cmd_get_local_first,
             cmd_set_local_first,
             cmd_resolve_local_file,
+            cmd_play_url_cache_epoch,
             cmd_invalidate_play_url,
             source_bundle::cmd_source_chain_overlay,
             source_install::cmd_source_state,
@@ -542,6 +546,8 @@ pub fn run() {
             source_install::cmd_source_install_from_text,
             source_install::cmd_source_install_local_file,
             source_install::cmd_source_stage_from_url,
+            source_policy::cmd_source_policy_get,
+            source_policy::cmd_source_policy_set,
             source_install::cmd_source_stage_from_file,
             source_install::cmd_source_install_staged,
             source_install::cmd_source_activate_pack,

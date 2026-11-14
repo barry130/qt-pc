@@ -52,7 +52,7 @@ const ONLINE_ITEMS: Item[] = [
 const MINE_ITEMS: Item[] = [
   // 「我的歌单」与「收藏」已合成一页（/my/playlists），不再分两个入口
   { labelKey: "nav.myPlaylists", to: "/my/playlists", icon: ListMusic },
-  // 音源账号登录与各源「数据/播放是否使用登录态」开关，紧跟我的歌单（用户指定位置）
+  // 音源平台管理（合三为一：账号登录、音乐源启用/优先级、聚合搜索都在该页），紧跟我的歌单（用户指定位置）
   { labelKey: "nav.sourceAccounts", to: "/source-accounts", icon: KeyRound },
   // 私人 FM 依赖的是本地画像（收藏/歌单/历史），本地模式一样能用，所以放「我的」组
   { labelKey: "nav.radio", to: "/radio", icon: RadioTower },

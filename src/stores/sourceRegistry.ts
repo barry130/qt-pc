@@ -24,6 +24,8 @@ import {
   sourceDownloadQualityOf,
   sourcePlayQualityOf,
 } from "@/lib/source-quality";
+import { policyOrder, readSourcePolicy, sourcePolicySnapshot, SOURCE_POLICY_CHANGED_EVENT, type SourcePolicy } from "@/lib/source-policy";
+import { defaultSourcePolicy, policySourceEnabled } from "@/lib/source-policy-model";
 
 /**
  * 音源/音质注册表（数据包声明，宿主不内置清单）——DESIGN §6.2/§6.4。
@@ -45,6 +47,10 @@ import {
  * 仍残留旧包的榜单/歌单/新歌，因为那些 effect 只依赖 activeSourceId）。
  */
 interface SourceRegistryStore {
+  /** Full package catalog, including disabled sources for account management and saved-track labels. */
+  catalog: RegistrySource[];
+  policy: SourcePolicy;
+  policySupported: boolean;
   /** 数据包声明的音源清单（顺序即切换器/引导页的展示顺序） */
   sources: RegistrySource[];
   /** 数据包声明的音质档位（设置页/播放条的选项来源） */
@@ -71,6 +77,24 @@ interface SourceRegistryStore {
 }
 
 let inflight: Promise<void> | null = null;
+let policyListenerBound = false;
+function enabledCatalog(catalog: RegistrySource[], policy: SourcePolicy): RegistrySource[] {
+  return policyOrder(policy, catalog).filter(source => policySourceEnabled(policy, source.id));
+}
+function catalogSources(state: SourceRegistryStore): RegistrySource[] {
+  return state.catalog.length > 0 ? state.catalog : state.sources;
+}
+function bindPolicyListener(): void {
+  if (policyListenerBound) return;
+  policyListenerBound = true;
+  window.addEventListener(SOURCE_POLICY_CHANGED_EVENT, () => {
+    const state = useSourceRegistryStore.getState();
+    const policy = sourcePolicySnapshot();
+    const sources = enabledCatalog(state.catalog, policy);
+    useSourceRegistryStore.setState({ policy, sources, generation: state.generation + 1 });
+    if (state.ready) validateActiveSource(sources);
+  });
+}
 
 /** 播放包安装/切换/卸载会热切换引擎页：若注册表还没取到（首次 ensure 时
  *  引擎未就绪），换页完成后补取。模块内只绑一次。 */
@@ -128,7 +152,9 @@ async function load(set: (partial: Partial<SourceRegistryStore>) => void): Promi
   bindMetaListener();
   bindPhaseHook();
   bindProfileListeners();
+  bindPolicyListener();
   try {
+    await readSourcePolicy();
     const registry = await getSourceRegistry();
     const before = useSourceRegistryStore.getState();
     if (registry === null) {
@@ -138,6 +164,8 @@ async function load(set: (partial: Partial<SourceRegistryStore>) => void): Promi
         before.ready || before.sources.length > 0 || before.qualities.length > 0;
       set({
         sources: [],
+        catalog: [],
+        policySupported: false,
         qualities: [],
         profiles: {},
         ready: false,
@@ -149,15 +177,20 @@ async function load(set: (partial: Partial<SourceRegistryStore>) => void): Promi
     // （800/2500ms）会各跑一次 refresh，包内容没变就不让常驻页白刷一轮。
     const changed =
       !before.ready ||
-      JSON.stringify(before.sources) !== JSON.stringify(registry.sources) ||
+      JSON.stringify(before.catalog) !== JSON.stringify(registry.sources) ||
       JSON.stringify(before.qualities) !== JSON.stringify(registry.qualities);
+    const policy = sourcePolicySnapshot();
+    const sources = enabledCatalog(registry.sources, policy);
     set({
-      sources: registry.sources,
+      catalog: registry.sources,
+      sources,
+      policy,
+      policySupported: registry.sourcePolicyVersion === 1,
       qualities: registry.qualities,
       ready: true,
       ...(changed ? { generation: before.generation + 1 } : {}),
     });
-    validateActiveSource(registry.sources);
+    validateActiveSource(sources);
     // 注册表落地后重查各源生效音质清单（换包可能换官方档位自述）
     void useSourceRegistryStore.getState().refreshQualityProfiles();
   } finally {
@@ -168,15 +201,17 @@ async function load(set: (partial: Partial<SourceRegistryStore>) => void): Promi
 /** 注册表加载后纠正全局音源：换包后原音源可能已下线（存档里也可能存着
  *  脏值），回退到数据包声明的第一个音源，避免页面拿死 id 请求。 */
 function validateActiveSource(sources: RegistrySource[]): void {
-  if (sources.length === 0) return;
   const music = useMusicSourceStore.getState();
   const current = music.activeSourceId;
   if (current === "local") return;
   if (sources.some((s) => s.id === current)) return;
-  music.setActiveSource(sources[0].id);
+  music.setActiveSource(sources[0]?.id ?? "local");
 }
 
 export const useSourceRegistryStore = create<SourceRegistryStore>()((set, get) => ({
+  catalog: [],
+  policy: defaultSourcePolicy(),
+  policySupported: false,
   sources: [],
   qualities: [],
   ready: false,
@@ -279,7 +314,7 @@ export function registryHasSource(id: string): boolean {
 export function useSourceLabel(id: string): string {
   return useSourceRegistryStore((s) => {
     if (id === "local") return "本地";
-    return s.sources.find((item) => item.id === id)?.name ?? "未知";
+    return catalogSources(s).find((item) => item.id === id)?.name ?? "未知";
   });
 }
 
@@ -291,7 +326,7 @@ export function useSourceLabel(id: string): string {
 export function useSourceShort(id: string): string {
   return useSourceRegistryStore((s) => {
     if (id === "local") return "本地";
-    const found = s.sources.find((item) => item.id === id);
+    const found = catalogSources(s).find((item) => item.id === id);
     return found?.short || found?.name || "未知";
   });
 }
@@ -301,7 +336,7 @@ export function useSourceShort(id: string): string {
  * 这个函数再在 map 里用（内部订阅注册表，加载完成后整页自动重渲染）。
  */
 export function useSourceLabelFn(): (id: string) => string {
-  const sources = useSourceRegistryStore((s) => s.sources);
+  const sources = useSourceRegistryStore((s) => catalogSources(s));
   return (id: string): string => {
     if (id === "local") return "本地";
     return sources.find((item) => item.id === id)?.name ?? "未知";
@@ -311,7 +346,7 @@ export function useSourceLabelFn(): (id: string) => string {
 /** 音源徽标底色（#rrggbb；本地与未知源用中性灰） */
 export function useSourceColor(id: string): string {
   return useSourceRegistryStore((s) =>
-    s.sources.find((item) => item.id === id)?.color ?? (id === "local" ? "#8b93a7" : "#8b92a1"),
+    catalogSources(s).find((item) => item.id === id)?.color ?? (id === "local" ? "#8b93a7" : "#8b92a1"),
   );
 }
 
@@ -327,7 +362,7 @@ export function useSourceColor(id: string): string {
 export function useSearchPageMax(id: string): number {
   return useSourceRegistryStore((s) => {
     if (id === "local") return DEFAULT_SEARCH_PAGE_MAX;
-    const declared = s.sources.find((item) => item.id === id)?.searchPageMax;
+    const declared = catalogSources(s).find((item) => item.id === id)?.searchPageMax;
     return typeof declared === "number" && Number.isFinite(declared) && declared > 0
       ? Math.floor(declared)
       : DEFAULT_SEARCH_PAGE_MAX;
@@ -349,7 +384,7 @@ export function useSearchPageMax(id: string): number {
  */
 export function useLatestUsesOffset(id: string): boolean {
   return useSourceRegistryStore(
-    (s) => s.sources.find((item) => item.id === id)?.latestUsesOffset === true,
+    (s) => catalogSources(s).find((item) => item.id === id)?.latestUsesOffset === true,
   );
 }
 
@@ -366,7 +401,8 @@ export type SourceFeature = "charts" | "playlists" | "artist" | "album" | "lates
  */
 export function useSourceSupports(id: string, feature: SourceFeature): boolean {
   return useSourceRegistryStore((s) => {
-    const flag = s.sources.find((item) => item.id === id)?.features?.[feature];
+    if (!policySourceEnabled(s.policy, id)) return false;
+    const flag = catalogSources(s).find((item) => item.id === id)?.features?.[feature];
     return flag !== false;
   });
 }
@@ -378,7 +414,7 @@ export function useSourceSupports(id: string, feature: SourceFeature): boolean {
  */
 export function useAnySourceSupports(feature: SourceFeature): boolean {
   return useSourceRegistryStore((s) => {
-    if (s.sources.length === 0) return true;
+    if (s.sources.length === 0) return !s.ready;
     return s.sources.some((item) => item.features?.[feature] !== false);
   });
 }
@@ -439,7 +475,7 @@ export function qualityRanksOf(qualities: RegistryQuality[]): string[] {
  * 先取稳定的 store 字段，再用 useMemo 派生。
  */
 export function useSourceQualities(id: string | null): RegistryQuality[] {
-  const sources = useSourceRegistryStore((s) => s.sources);
+  const sources = useSourceRegistryStore((s) => catalogSources(s));
   const qualities = useSourceRegistryStore((s) => s.qualities);
   const profiles = useSourceRegistryStore((s) => s.profiles);
   return useMemo(() => {
@@ -459,11 +495,11 @@ const EMPTY_SORTS: { id: string; name: string }[] = [];
 /**
  * 某源当前生效的音质档位清单（**非响应式**函数版，与 useSourceQualities 同
  * 口径）：store.profiles 里包侧判定的官方清单优先，否则包侧 qualities 子集，
- * 再退全局档位。音源账号页每张卡片的音质下拉用它（.map 里不能调 hook）。
+ * 再退全局档位。音源平台管理页每张卡片的音质下拉用它（.map 里不能调 hook）。
  */
 export function sourceQualityOptionsOf(id: string): RegistryQuality[] {
   const state = useSourceRegistryStore.getState();
-  const source = state.sources.find((item) => item.id === id);
+  const source = catalogSources(state).find((item) => item.id === id);
   const official = officialQualitiesFromProfile(state.profiles[id]);
   if (official.length > 0) return official;
   const declared = source?.qualities;
@@ -477,7 +513,7 @@ export function sourceQualityOptionsOf(id: string): RegistryQuality[] {
  * 页面据此不渲染排序选择器；有多个选项时展示（wyy 最热/最新、kg 最热/最新/推荐）。
  */
 export function usePlaylistSorts(id: string | null): { id: string; name: string }[] {
-  const sources = useSourceRegistryStore((s) => s.sources);
+  const sources = useSourceRegistryStore((s) => catalogSources(s));
   return useMemo(() => {
     if (id === null) return EMPTY_SORTS;
     const sorts = sources.find((item) => item.id === id)?.playlistSorts;
@@ -522,7 +558,7 @@ export function clampQualityForPlatform(
   rawWanted: string,
 ): string {
   const state = useSourceRegistryStore.getState();
-  const source = platform == null ? undefined : state.sources.find((item) => item.id === platform);
+  const source = platform == null ? undefined : catalogSources(state).find((item) => item.id === platform);
   const official = officialProfileIds(platform);
   // 存量请求档可能是旧第三方档名（官方清单生效时）：经包侧 aliases 归一到
   // 官方 level，否则旧档名不在官方清单里、被钳到清单最高档（jymaster）

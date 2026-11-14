@@ -11,9 +11,11 @@ const state = vi.hoisted(() => ({
   sets: [] as { scope: "meta" | "play"; source?: string; cookie?: string }[],
   clears: [] as { scope: "meta" | "play"; source?: string }[],
   setThrows: false,
+  setWait: null as Promise<void> | null,
 }));
 
 vi.mock("@/services/ipc", () => ({
+  clearPlayUrlCache: vi.fn(async () => 0),
   getSetting: (key: string) => Promise.resolve(state.store.get(key) ?? null),
   setSetting: (key: string, value: string) => {
     state.store.set(key, value);
@@ -27,7 +29,7 @@ vi.mock("@/source-scripts", () => ({
   authSetCredential: (scope: "meta" | "play", source: string, cookie: string) => {
     if (state.setThrows) return Promise.reject(new Error("engine not ready"));
     state.sets.push({ scope, source, cookie });
-    return Promise.resolve();
+    return state.setWait ?? Promise.resolve();
   },
   authClearCredential: (scope: "meta" | "play", source?: string) => {
     state.clears.push({ scope, source });
@@ -78,7 +80,35 @@ beforeEach(() => {
   state.sets.length = 0;
   state.clears.length = 0;
   state.setThrows = false;
+  state.setWait = null;
   resetSourceAuthCaches();
+});
+
+describe("credential transition serialization", () => {
+  it("logout waits for an older injection and leaves both scopes clear", async () => {
+    let release!: () => void;
+    state.setWait = new Promise<void>(resolve => { release = resolve; });
+    const saving = saveSourceAuthAccount("bili", "test-session", USER);
+    await vi.waitFor(() => expect(state.sets).toHaveLength(1));
+    const removing = removeSourceAuthAccount("bili");
+    release();
+    await Promise.all([saving, removing]);
+    expect(state.clears.slice(-2)).toEqual([{ scope: "meta", source: "bili" }, { scope: "play", source: "bili" }]);
+    expect(JSON.parse(state.store.get(SOURCE_AUTH_ACCOUNTS_KEY)!)).toEqual({});
+    const { clearPlayUrlCache } = await import("@/services/ipc");
+    expect(clearPlayUrlCache).toHaveBeenCalledTimes(4);
+  });
+
+  it("failed injection still fences in-flight results and does not block the next mutation", async () => {
+    const { clearPlayUrlCache } = await import("@/services/ipc");
+    vi.mocked(clearPlayUrlCache).mockClear();
+    state.setThrows = true;
+    await expect(saveSourceAuthAccount("bili", "test-session", USER)).rejects.toThrow("engine not ready");
+    expect(clearPlayUrlCache).toHaveBeenCalledTimes(2);
+    state.setThrows = false;
+    await removeSourceAuthAccount("bili");
+    expect(state.clears.slice(-2)).toEqual([{ scope: "meta", source: "bili" }, { scope: "play", source: "bili" }]);
+  });
 });
 
 describe("parseSourceAuthToggles", () => {
@@ -190,8 +220,8 @@ describe("setSourceAuthToggle（按源独立）", () => {
     state.clears.length = 0;
     await setSourceAuthToggle("bili", "play", false);
     expect(state.clears).toEqual([{ scope: "play", source: "bili" }]);
-    // 只对账被切的源：bili 的 meta 面仍注入；wyy 不在本次动作范围内
-    expect(state.sets.map((c) => `${c.scope}:${c.source}`)).toEqual(["meta:bili"]);
+    // 已成功注入的 meta 会话保持原对象，不因 PLAY-only 变化重设；wyy 也不受影响。
+    expect(state.sets.map((c) => `${c.scope}:${c.source}`)).toEqual([]);
     // 开关表里只有 bili 被物化，wyy 留在解析链下一级（旧全局/缺省）
     const map = JSON.parse(state.store.get(SOURCE_AUTH_TOGGLES_KEY) ?? "{}");
     expect(map).toEqual({ bili: { useMeta: true, usePlay: false } });

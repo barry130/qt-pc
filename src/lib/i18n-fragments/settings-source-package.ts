@@ -7,14 +7,8 @@ import { defineFragment } from "@/lib/i18n-fragment";
  */
 export const messages = defineFragment({
   zh: {
-    "settings.sourcePackage.aggregateTitle": "聚合搜索音源",
-    "settings.sourcePackage.aggregateDescAll": "跨源搜索、AI 找歌、换源与每日推荐共用；单源搜索不受影响",
-    "settings.sourcePackage.aggregateDescSelected":
-      "跨源搜索、AI 找歌、换源与每日推荐只查勾选的源（已选 {enabled}/{total}）；新装源默认不参与",
-    "settings.sourcePackage.aggregateKeepOne": "至少留一个音源，否则聚合搜索不会有结果",
-    "settings.sourcePackage.saveFailed": "保存失败：{message}",
-    "settings.sourcePackage.engineNotReady": "音源引擎未就绪，暂时读不到音源清单",
-    "settings.sourcePackage.loadingSources": "正在读取音源清单…",
+    // 2026-11-14 合三为一：音乐源（policy*）、聚合搜索（aggregate*）、音源账号
+    // 三块的 UI 与文案键已随组件一起移入「音源平台管理」页（该页为硬编码中文）。
     "settings.sourcePackage.kindMeta": "数据包",
     "settings.sourcePackage.kindPlay": "播放包",
     "settings.sourcePackage.dataPackTitle": "数据包",
@@ -85,17 +79,8 @@ export const messages = defineFragment({
     "settings.sourcePackage.installSourceManifest": "官方渠道",
   },
   en: {
-    "settings.sourcePackage.aggregateTitle": "Aggregated search sources",
-    "settings.sourcePackage.aggregateDescAll":
-      "Shared by cross-source search, AI song finding, source switching and daily picks; single-source search is unaffected",
-    "settings.sourcePackage.aggregateDescSelected":
-      "Cross-source search, AI song finding, source switching and daily picks only query checked sources ({enabled}/{total} selected); newly installed sources are off by default",
-    "settings.sourcePackage.aggregateKeepOne":
-      "Keep at least one source, or aggregated search will never return results",
-    "settings.sourcePackage.saveFailed": "Failed to save: {message}",
-    "settings.sourcePackage.engineNotReady":
-      "The source engine isn’t ready, so the source list can’t be read yet",
-    "settings.sourcePackage.loadingSources": "Loading source list…",
+    // 2026-11-14 合三为一：music-source / aggregate / account keys moved to the
+    // merged Source Platforms page (hardcoded zh); only pack management stays here.
     "settings.sourcePackage.kindMeta": "Data pack",
     "settings.sourcePackage.kindPlay": "Playback pack",
     "settings.sourcePackage.dataPackTitle": "Data pack",

@@ -2,6 +2,7 @@ import { searchAllBatches } from "@/source-scripts";
 import { readAggregateSources } from "@/lib/aggregate-sources";
 import { compactText as normalizeMatchText } from "@/lib/text";
 import type { Track } from "@/types";
+import { SOURCE_POLICY_CHANGED_EVENT } from "./source-policy";
 
 /**
  * 手动换源（用户 m07452：「增加一个换源，即当前源不支持该歌曲，支持搜索
@@ -33,6 +34,7 @@ export function scoreCandidate(
   let score = 0;
   if (name === wantName) score += 10;
   else if (name.includes(wantName) || wantName.includes(name)) score += 5;
+  if (score === 0) return 0;
   const singer = normalizeMatchText(candidate.singer ?? "");
   const wantSinger = normalizeMatchText(want.singer ?? "");
   if (singer && wantSinger) {
@@ -62,6 +64,8 @@ const CACHE_TTL_MS = 10 * 60 * 1000;
 
 type Candidate = { track: Track; score: number };
 const cache = new Map<string, { at: number; items: Candidate[] }>();
+let cacheGeneration = 0;
+const requests = new Map<string, number>();
 
 function cacheKey(track: Track, page: number, size: number): string {
   return `${track.platform}:${track.id}:${page}:${size}`;
@@ -92,10 +96,13 @@ function cacheSet(key: string, items: Candidate[]): void {
 
 /** 清空换源缓存（切账号/换包/手动刷新时用；测试里也要用它隔离） */
 export function clearSourceSwitchCache(): number {
+  cacheGeneration += 1;
+  requests.clear();
   const count = cache.size;
   cache.clear();
   return count;
 }
+if (typeof window !== "undefined") window.addEventListener(SOURCE_POLICY_CHANGED_EVENT, clearSourceSwitchCache);
 
 /**
  * 同步窥一眼首页缓存（未命中返回 null）。
@@ -126,6 +133,9 @@ export async function findSourceCandidates(
     if (cached !== null) return cached;
   }
   // 聚合搜索只查用户勾选的音源（设置 → 音源包 → 聚合搜索音源；null = 全部）
+  const generation = cacheGeneration;
+  const request = (requests.get(key) ?? 0) + 1;
+  requests.set(key, request);
   const batches = await searchAllBatches(keyword, page, size, (await readAggregateSources()) ?? undefined);
   const out: { track: Track; score: number }[] = [];
   const seen = new Set<string>();
@@ -142,6 +152,7 @@ export async function findSourceCandidates(
   }
   out.sort((a, b) => b.score - a.score);
   const result = out.slice(0, MAX_CANDIDATES);
-  cacheSet(key, result);
+  if (generation !== cacheGeneration) throw new Error("音乐源设置或换源候选已变化，请重试");
+  if (requests.get(key) === request) cacheSet(key, result);
   return result;
 }

@@ -305,7 +305,7 @@ export function BatchBar(props: {
           const t = list[cursor++]!;
           try {
             // 与 DownloadButton.start() 同款：下载音质按曲目所在平台独立取值
-            //（音源账号页配置），再按源收敛到可用档
+            //（音源平台管理页配置），再按源收敛到可用档
             await ipc.startDownload(
               t,
               clampQualityForPlatform(t.platform, sourceDownloadQualityOf(t.platform)),

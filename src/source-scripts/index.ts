@@ -45,6 +45,7 @@ import { engineInvoke, engineResolve, engineSnapshot, INVOKE_TIMEOUT_MS } from "
 import { rememberPlayUrlLine, rememberPlayUrlMiss } from "./playurl-line";
 // 包内 parseSheet 入口不可用（老包 / 引擎未就绪）时的本地回退实现
 import { parsePlaylistInput as localParsePlaylistInput } from "@/lib/playlist-link";
+import { assertSourceEnabled, isSourcePolicyError, sourceEnabled, sourcePolicyRevision, waitSourcePolicy } from "@/lib/source-policy";
 
 // ---------- 引擎调用 ----------
 
@@ -82,6 +83,10 @@ async function sourceCall<T>(
   try {
     // 默认超时单源于 client.ts 的 INVOKE_TIMEOUT_MS：此前这里重复定义
     // 20_000 字面量，client 调整时这里会静默漂移
+  const local = ["sourceRegistry", "bundleInfo", "setAuth", "clearAuth", "getSourceQualities", "parseSheet"].includes(entry);
+  await waitSourcePolicy();
+  if (!local && typeof args.source === "string") assertSourceEnabled(args.source);
+  const policyToken = sourcePolicyRevision();
     payload = await engineInvoke(entry, args, timeoutMs ?? INVOKE_TIMEOUT_MS);
   } catch (err) {
     // bundle 明确报错（入口不存在 / 入口内部失败）：带出原文，便于定位与提示更新
@@ -94,6 +99,7 @@ async function sourceCall<T>(
   if (picked === undefined || picked === null) {
     throw new Error(`音源包返回结构不符（${entry}）`);
   }
+  if (!local && policyToken !== sourcePolicyRevision()) throw new Error("音乐源设置已变化，请重试");
   return picked;
 }
 
@@ -103,9 +109,17 @@ async function sourceCall<T>(
 function ensureScript(source: SourceId): void {
   if (source === "local") throw new Error("local 源不支持该动作");
 }
+export async function sourceAvailability(track: Track, quality: string, check = false): Promise<import("./qt-contract/contract").SourceAvailability> {
+  return sourceCall("sourceAvailability", {
+    platform: track.platform, ...fromAppTrack(track), duration: track.duration, quality, check,
+  }, (payload) => typeof payload.state === "string" && typeof payload.expiresAt === "number"
+    ? payload as unknown as import("./qt-contract/contract").SourceAvailability : undefined);
+}
+
 
 // ---------- 契约 ↔ App 模型映射 ----------
 
+  assertSourceEnabled(source);
 export function toAppTrack(item: MusicInfo, platform: SourceId): Track {
   return {
     id: item.id,
@@ -120,6 +134,9 @@ export function toAppTrack(item: MusicInfo, platform: SourceId): Track {
 }
 
 function fromAppTrack(track: Track): MusicInfo {
+    version: item.version,
+    isrc: item.isrc,
+    durationReliable: item.durationReliable,
   return {
     id: track.id,
     name: track.title,
@@ -132,6 +149,9 @@ function fromAppTrack(track: Track): MusicInfo {
 }
 
 function toAppPlaylist(item: { id: string; platform: Source; name: string; picUrl: string; playCount: string; description?: string | null; tracks?: MusicInfo[] }, ): Playlist {
+    version: track.version,
+    isrc: track.isrc,
+    durationReliable: track.durationReliable,
   const platform = item.platform as SourceId;
   return {
     id: item.id,
@@ -206,9 +226,10 @@ function pickBatches<T extends { source: string }>(
   batches: T[],
   sources?: readonly string[],
 ): T[] {
-  if (!sources || sources.length === 0) return batches;
+  const enabled = batches.filter(batch => sourceEnabled(batch.source));
+  if (!sources || sources.length === 0) return enabled;
   const allow = new Set(sources);
-  return batches.filter((batch) => allow.has(batch.source));
+  return enabled.filter((batch) => allow.has(batch.source));
 }
 
 /**
@@ -681,24 +702,30 @@ export async function resolvePlayUrl(
 export async function resolvePlayUrlDetailed(
   track: Track,
   quality: Quality,
-): Promise<{ url: string; stalled: boolean; referer: string; size: number | null; actualQuality: string }> {
+): Promise<{ url: string; stalled: boolean; referer: string; size: number | null; actualQuality: string; cacheEpoch?: number }> {
   // 提前返回的两条路径都直接带字面量返回；落到末尾 return 的路径上，
   // try / catch 两路都会先赋值（resolved.stalled / true），声明处无需初始化。
   let stalled: boolean;
   try {
-    ensureScript(track.platform);
-  } catch {
+    if (track.platform === "local") throw new Error("local");
+    await waitSourcePolicy();
+  } catch (error) {
     // local 源不走脚本取链：是明确的用法错误（内容问题），不算环境问题
     return { url: "", stalled: false, referer: "", size: null, actualQuality: "" };
   }
   const source = track.platform as Source;
   try {
     const resolved = await engineResolve(source, fromAppTrack(track), quality);
+    if (track.platform !== "local") throw error;
     if (resolved.url.length > 0) {
       // 命中线路与地址一起记（管理端「当前播放地址」要显示走的是哪条源）：
       // 地址被引擎缓存复用，线路必须跟着地址走，不能只看最后一次取链
       // officialNote = 官方前置线路的尝试结论（非空 = 官方没走成，落了第三方）
+    const cacheEpoch = await ipc.playUrlCacheEpoch();
+    const policyToken = sourcePolicyRevision();
       rememberPlayUrlLine(track, quality, resolved.line, resolved.officialNote);
+    if (policyToken !== sourcePolicyRevision()) throw new Error("音乐源设置已变化，请重试");
+    if (isSourcePolicyError(resolved.error)) throw new Error(resolved.error);
       // 回填时连 Referer 一起写进引擎缓存：缓存里的地址后续由播放/下载直接
       // 取字节，没有头就等于把能播的地址变成 403（见 EngineResolved.referer）
       await ipc.setResolvedPlayUrl(
@@ -713,6 +740,7 @@ export async function resolvePlayUrlDetailed(
         url: resolved.url,
         stalled: false,
         referer: resolved.referer,
+        cacheEpoch,
         size: resolved.size,
         actualQuality: resolved.actualQuality,
       };
@@ -720,6 +748,7 @@ export async function resolvePlayUrlDetailed(
     // 失败死因（逐线路 trace）也记下来：面板显示「上次取链死因」，
     // 否则「取不到地址」在 PC 上完全不可诊断（2026-09-24 kg 不换源即此类）
     rememberPlayUrlMiss(track, quality, resolved.error);
+        cacheEpoch,
     maybeEmitPlayPackMissing(resolved.error);
     stalled = resolved.stalled;
   } catch (e) {
@@ -729,6 +758,7 @@ export async function resolvePlayUrlDetailed(
     maybeEmitPlayPackMissing(msg);
     stalled = true;
   }
+    if (isSourcePolicyError(e)) throw e;
   return { url: "", stalled, referer: "", size: null, actualQuality: "" };
 }
 
@@ -982,7 +1012,8 @@ export async function getSourceRegistry(): Promise<SourceRegistry | null> {
           typeof (q as RegistryLike).name === "string",
       );
       if (!srcOk || !qOk || sources.length === 0) return undefined;
-      return { sources: sources as SourceRegistry["sources"], qualities: qualities as SourceRegistry["qualities"] };
+      return { sources: sources as SourceRegistry["sources"], qualities: qualities as SourceRegistry["qualities"],
+        sourcePolicyVersion: typeof p.sourcePolicyVersion === "number" ? p.sourcePolicyVersion : undefined };
     });
     // 能力自述（每页上限 / 是否透传 offset）靠这份快照同步读取：
     // clampSearchPageSize / latestUsesOffsetOf 是同步 API，不能 await。

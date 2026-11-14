@@ -1,7 +1,6 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useOfficialSiteUrl } from "@/hooks/useOfficialSiteUrl";
 import { useTauriEvent } from "@/hooks/useTauriEvent";
-import { readAggregateSources, saveAggregateSources } from "@/lib/aggregate-sources";
 import { useT } from "@/lib/i18n";
 import { OFFICIAL_SOURCE_SETUP_PATH, officialSitePath } from "@/lib/official-site";
 import { stripErrorUrls } from "@/lib/utils";
@@ -9,12 +8,10 @@ import * as ipc from "@/services/ipc";
 import { SOURCE_META_CHANGED_EVENT, SOURCE_PACK_CHANGED_EVENT } from "@/services/ipc";
 import { activateSourcePack, applySourceUpdate, discoverSourceUpdates, getSourceState, installStagedSource, isPackLinkUrl, lastErrorSummary, packDisplayName, packVersionLabel, shortUpdateDate, stageSourceFromFile, stageSourceFromUrl, uninstallSourcePack, type PackPreviewVo, type PackUpdateOfferVo, type SourcePackVo } from "@/source-scripts/source-update";
 import { useSourceUpdateStore } from "@/stores/source-update";
-import { useSourceRegistryStore } from "@/stores/sourceRegistry";
 import { toast, toastError, toastSuccess } from "@/stores/toast";
 import { ExternalLink } from "lucide-react";
-import { SettingRow, Switch } from "../controls";
+import { SettingRow } from "../controls";
 import { Button, Modal } from "@/components/ui";
-import { SourceAccountSection } from "./SourceAccountSection";
 import { buttonClass } from "@/components/ui";
 
 export function packLabel(p: SourcePackVo): string {
@@ -62,110 +59,9 @@ type ArmedUninstall = { packId: string; timer: number };
 /** 本会话已提示过的剪贴板链接（同一链接只提示一次，忽略/安装都算） */
 const PROMPTED_CLIPBOARD_LINKS = new Set<string>();
 
-/**
- * 聚合搜索音源（设置 → 音源包）：勾哪几个源，聚合类搜索就只查这几个。
- *
- * 「聚合」= 一次搜索同时打多个源：搜索页「全部音源」分组、AI 找歌的候选池、手动换源、
- * 每日推荐的跨源补充。**单源搜索不受影响**（搜索页某个源的页签、榜单、歌单、歌手页
- * 用的都是用户当前选中的那个源，与这里无关）。
- *
- * 关掉的源在数据包侧就**不发请求**（`searchAll`/`searchMany` 的可选 `sources` 入参），
- * 不是搜完再把结果丢掉 —— 少一个源就真的少一份往返、少一条超时线，聚合搜索结果也
- * 不会被用户不想用的源污染。
- *
- * 存的是源 id 数组；「全选」写成空值（= 全部），这样以后数据包新增音源时会自动参与，
- * 而不是被一份旧的白名单永久排除在外。
- *
- * 导出只为单测能直接挂这一个设置行（整页要有音源包/更新/剪贴板一堆依赖）。
- */
-export function AggregateSourcesRow(): React.JSX.Element {
-  const tr = useT();
-  const sources = useSourceRegistryStore((s) => s.sources);
-  const ensure = useSourceRegistryStore((s) => s.ensure);
-  /** null = 全部音源（还没配置过，或用户点回了全选） */
-  const [selected, setSelected] = useState<string[] | null>(null);
-  const [loaded, setLoaded] = useState(false);
-  /** 写入串行队列：连点时按钮立刻响应，但落库顺序不会乱（后写的必须是后点的那次） */
-  const saveQueue = useRef<Promise<void>>(Promise.resolve());
-
-  useEffect(() => {
-    void ensure();
-    void (async () => {
-      setSelected(await readAggregateSources());
-      setLoaded(true);
-    })();
-  }, [ensure]);
-
-  const allIds = sources.map((item) => item.id);
-  // 只有注册表里真实存在的源可勾选；设置里残留的已卸载源 id 原样留在配置里
-  // （重新装包后自动恢复），但不参与这里的开关显示
-  const enabledIds =
-    selected === null ? allIds : allIds.filter((id) => selected.includes(id));
-  const enabledCount = enabledIds.length;
-
-  const toggle = (id: string): void => {
-    if (!loaded) return;
-    const next = enabledIds.includes(id)
-      ? enabledIds.filter((item) => item !== id)
-      : allIds.filter((item) => enabledIds.includes(item) || item === id);
-    if (next.length === 0) {
-      // 一个都不选 = 聚合搜索永远空结果，直接拦在 UI 上（数据侧也把空数组当「全部」）
-      toast(tr("settings.sourcePackage.aggregateKeepOne"));
-      return;
-    }
-    const allSelected = next.length === allIds.length;
-    // 先乐观更新：连点两个开关不该丢第二个点击（落库是串行的，写失败再提示）
-    setSelected(allSelected ? null : next);
-    saveQueue.current = saveQueue.current
-      .then(() => saveAggregateSources(allSelected ? [] : next))
-      .catch((e) => {
-        toastError(
-          tr("settings.sourcePackage.saveFailed", { message: stripErrorUrls(String(e)) }),
-        );
-      });
-  };
-
-  return (
-    <SettingRow
-      title={tr("settings.sourcePackage.aggregateTitle")}
-      description={
-        allIds.length === 0
-          ? tr("settings.sourcePackage.aggregateDescAll")
-          : tr("settings.sourcePackage.aggregateDescSelected", {
-              enabled: enabledCount,
-              total: allIds.length,
-            })
-      }
-    >
-      <div className="flex w-full flex-col gap-1.5">
-        {allIds.length === 0 && (
-          <span className="text-xs text-muted-foreground">
-            {loaded
-              ? tr("settings.sourcePackage.engineNotReady")
-              : tr("settings.sourcePackage.loadingSources")}
-          </span>
-        )}
-        {sources.map((item) => (
-          <div key={item.id} className="flex w-full items-center justify-end gap-2">
-            <span className="flex-1 text-right text-xs text-muted-foreground">
-              {item.name}
-            </span>
-            <Switch
-              checked={enabledIds.includes(item.id)}
-              onToggle={() => toggle(item.id)}
-            />
-          </div>
-        ))}
-      </div>
-    </SettingRow>
-  );
-}
-
-/** 音源账号（v9 数据包）：扫码登录 B 站/网易等音源账号；凭据只存本机，
- *  「数据请求/播放请求是否使用登录态」两面开关**按源独立**。管理界面已
- *  独立成「音源账号」页（侧边栏「我的」组、我的歌单下方，/source-accounts），
- *  设置页只留跳转入口。 */
-
+/** 音源包分区（设置 → 音源包）：只管数据/播放包的安装、更新、卸载与状态展示。
+ *  2026-11-14 合三为一：音乐源启用/优先级、聚合搜索、音源账号三块并入侧边栏
+ *  「音源平台管理」页（/source-accounts，改名后路由不变），本分区不再渲染它们。 */
 export function SourcePackageSection(): React.JSX.Element {
   const tr = useT();
   const local = useSourceUpdateStore((s) => s.local);
@@ -484,7 +380,10 @@ export function SourcePackageSection(): React.JSX.Element {
       >
         <span className="font-mono text-xs text-muted-foreground">{playStatus}</span>
       </SettingRow>
-      <SourceAccountSection />
+      {/* 2026-11-14 合三为一：音乐源启用/优先级（SourcePolicySection）、聚合搜索
+          （AggregateSourcesRow）、音源账号入口（SourceAccountSection）全部并入
+          侧边栏「音源平台管理」页（/source-accounts），设置里只留包的安装/
+          更新/卸载（用户裁定）。 */}
       <SettingRow
         title={tr("settings.sourcePackage.installedTitle")}
         description={tr("settings.sourcePackage.installedDesc", {
@@ -550,7 +449,6 @@ export function SourcePackageSection(): React.JSX.Element {
           ))}
         </div>
       </SettingRow>
-      <AggregateSourcesRow />
       <SettingRow
         title={tr("settings.sourcePackage.updatesTitle")}
         description={tr("settings.sourcePackage.updatesDesc")}

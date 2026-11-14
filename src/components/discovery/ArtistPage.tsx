@@ -171,11 +171,11 @@ function ArtistPageContent({ platform, name, artistId }: {
       
         <DetailHero coverUrl={coverUrl}>
 
-        <div className="relative flex items-center px-6 pt-5">
-          <BackButton />
-        </div>
-
-        <div className="relative flex gap-5 px-6 pb-6 pt-4">
+        {/* 返回键与封面头同一行（用户 2026-11-14）。行保持默认 stretch：
+            信息列/右列靠 justify-end 贴底（以下面为基准往上展示），返回键
+            self-start 贴顶。 */}
+        <div className="relative flex gap-5 px-6 pb-6 pt-5">
+          <BackButton className="self-start" />
           <HeroCover src={coverUrl} fallback={name} size="md" />
           <div className="flex min-w-0 flex-1 flex-col justify-end pb-1">
             <HeroEyebrow>歌手</HeroEyebrow>

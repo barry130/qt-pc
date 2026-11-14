@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { isSourcePolicyError } from "@/lib/source-policy";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -45,6 +46,7 @@ async function answer(req: PlayUrlRequest): Promise<void> {
   // 「实测字节 ÷ 时长」重标后的档位（只降不升）。null / 空串 = 没测出来。
   let size: number | null;
   let actualQuality: string;
+  let policyError: string | undefined;
   // 实际出链档位：降档时线路记忆是按**实际档位**记的（rememberPlayUrlLine 的键
   // 就是真正请求成功的那一档），广播线路给歌词窗口时必须用同一口径，否则读到空串。
   let hitQuality = req.quality;
@@ -69,12 +71,16 @@ async function answer(req: PlayUrlRequest): Promise<void> {
       // 不静默降档：让用户知道听到的是 128K 而不是请求的档位
       toast(`当前音源只能提供 ${qualityShortLabel(res.quality)}：${req.track.title}`);
     }
-  } catch {
+  } catch (error) {
     url = "";
     stalled = true;
     referer = "";
     size = null;
     actualQuality = "";
+    if (isSourcePolicyError(error)) {
+      policyError = error instanceof Error ? error.message : String(error);
+      stalled = false;
+    }
   }
   // 迟到的应答（引擎已超时回落）在 Rust 侧按 requestId 找不到条目，静默忽略
   await invoke("resolve_play_url_reply", {
@@ -84,6 +90,7 @@ async function answer(req: PlayUrlRequest): Promise<void> {
     referer,
     size,
     actualQuality,
+    ...(policyError ? { policyError } : {}),
   }).catch(() => {});
   // 桌面歌词窗口读不到宿主侧的线路记忆（各窗口独立 JS 上下文），广播命中线路供它
   // 判断「当前地址是否跨源兜底」并按目标源重取歌词（取链漏斗里也已广播一次，这里

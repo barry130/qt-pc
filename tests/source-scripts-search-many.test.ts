@@ -9,6 +9,10 @@
  * 老包上时直接抛「数据包版本过旧」，避免两端各写一份聚合规则后漂移。
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
+vi.mock("@/services/ipc", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/services/ipc")>(),
+  getSetting: vi.fn(async () => null),
+}));
 
 import type { EngineMockState } from "./helpers/engine-client";
 import { engineClientModule, resetEngineState } from "./helpers/engine-client";

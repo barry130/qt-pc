@@ -10,6 +10,10 @@
  * 其实现与测试由独立渠道维护。
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
+vi.mock("@/services/ipc", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/services/ipc")>(),
+  getSetting: vi.fn(async () => null),
+}));
 
 /** 音源引擎 mock：index.ts 已不内置音源实现，app 层数据/取链只经引擎窗口 */
 const engineMock = vi.hoisted(() => ({
@@ -131,6 +135,7 @@ describe("source-scripts dispatcher（纯音源包：app 只经引擎调用）",
     engineMock.resolveSize = 8_734_208;
     engineMock.resolveActualQuality = "320";
     const ipc = await import("@/services/ipc");
+    vi.spyOn(ipc, "playUrlCacheEpoch").mockResolvedValue(3);
     const backfillSpy = vi.spyOn(ipc, "setResolvedPlayUrl").mockResolvedValue(undefined);
     const mod = await import("@/source-scripts");
     const track = {
@@ -156,6 +161,7 @@ describe("source-scripts dispatcher（纯音源包：app 只经引擎调用）",
       "https://www.bilibili.com/",
       8_734_208,
       "320",
+      3,
     );
     backfillSpy.mockRestore();
     engineMock.resolveReferer = "";
@@ -164,6 +170,7 @@ describe("source-scripts dispatcher（纯音源包：app 只经引擎调用）",
   it("resolvePlayUrl（预解析）：命中线路随地址一起记，管理端按曲目+音质读回", async () => {
     const { playUrlLine, clearPlayUrlLines } = await import("@/source-scripts/playurl-line");
     const ipc = await import("@/services/ipc");
+    vi.spyOn(ipc, "playUrlCacheEpoch").mockResolvedValue(3);
     const backfillSpy = vi.spyOn(ipc, "setResolvedPlayUrl").mockResolvedValue(undefined);
     const mod = await import("@/source-scripts");
     const track = {
@@ -199,6 +206,7 @@ describe("source-scripts dispatcher（纯音源包：app 只经引擎调用）",
 
   it("resolvePlayUrl（预解析）：引擎为空/抛错返回空串且不回填（无内置兜底）", async () => {
     const ipc = await import("@/services/ipc");
+    vi.spyOn(ipc, "playUrlCacheEpoch").mockResolvedValue(3);
     const backfillSpy = vi.spyOn(ipc, "setResolvedPlayUrl").mockResolvedValue(undefined);
     const mod = await import("@/source-scripts");
     const track = {
@@ -222,6 +230,7 @@ describe("source-scripts dispatcher（纯音源包：app 只经引擎调用）",
   it("resolvePlayUrl（预解析）：失败死因记进面板，之后成功即清除", async () => {
     const { playUrlMiss, clearPlayUrlLines } = await import("@/source-scripts/playurl-line");
     const ipc = await import("@/services/ipc");
+    vi.spyOn(ipc, "playUrlCacheEpoch").mockResolvedValue(3);
     const backfillSpy = vi.spyOn(ipc, "setResolvedPlayUrl").mockResolvedValue(undefined);
     const mod = await import("@/source-scripts");
     const track = {
@@ -257,6 +266,7 @@ describe("source-scripts dispatcher（纯音源包：app 只经引擎调用）",
 
   it("resolvePlayUrl（预解析）：local 源返回空串不预取链（内容问题，stalled=false）", async () => {
     const ipc = await import("@/services/ipc");
+    vi.spyOn(ipc, "playUrlCacheEpoch").mockResolvedValue(3);
     const backfillSpy = vi.spyOn(ipc, "setResolvedPlayUrl").mockResolvedValue(undefined);
     const mod = await import("@/source-scripts");
     const track = {

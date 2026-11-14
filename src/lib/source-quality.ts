@@ -1,6 +1,6 @@
 /**
  * 各平台独立的音质选择（2026-10-25 用户需求：音质从「播放/下载设置」里的全局
- * 单值改为按平台管理，入口在音源账号页每个平台卡片上）：
+ * 单值改为按平台管理，入口在音源平台管理页每个平台卡片上）：
  *  - 播放音质：写 settings 键 `play.sourceQualities`（{平台: 档位} 全量表），
  *    启动/变更时经 `set_source_qualities` 全量推给 Rust 引擎——引擎的队列播放 /
  *    无缝预加载都按 `本曲临时 → 平台独立 → 全局默认` 取值（engine.rs
@@ -12,7 +12,7 @@
  *
  * 读取口径与 lib/source-auth.ts 同款：进程内缓存 + 同步 getter + 变更事件。
  * 兼容迁移：平台没配过时回落旧全局键（`quality` / `downloadQuality`），
- * 存量用户升级后行为不变；用户在音源账号页选定后即落新键。
+ * 存量用户升级后行为不变；用户在音源平台管理页选定后即落新键。
  */
 
 import {
@@ -109,7 +109,7 @@ export function sourceDownloadQualityOf(source: string): string {
   return "320";
 }
 
-/** 平台音质表变化事件（音源账号页写入后派发；播放条/设置相关 UI 订阅刷新） */
+/** 平台音质表变化事件（音源平台管理页写入后派发；播放条/设置相关 UI 订阅刷新） */
 export const SOURCE_QUALITIES_CHANGED_EVENT = "qt:source-qualities-changed";
 
 function emitSourceQualitiesChanged(): void {

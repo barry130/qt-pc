@@ -71,7 +71,7 @@ const PAGES: PageEntry[] = [
   { label: "歌单广场", to: "/playlists", icon: ListMusic, keywords: "playlist" },
   { label: "排行榜", to: "/charts", icon: BarChart3, keywords: "chart rank" },
   { label: "我的歌单", to: "/my/playlists", icon: ListMusic, keywords: "mine 收藏" },
-  { label: "音源账号", to: "/source-accounts", icon: KeyRound, keywords: "account login" },
+  { label: "音源平台管理", to: "/source-accounts", icon: KeyRound, keywords: "account login source policy aggregate" },
   { label: "本地音乐", to: "/library", icon: Music, keywords: "local" },
   { label: "下载管理", to: "/downloads", icon: Download, keywords: "download task" },
   { label: "最近播放", to: "/history", icon: Clock, keywords: "history" },

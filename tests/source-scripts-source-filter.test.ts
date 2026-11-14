@@ -6,6 +6,10 @@
  * 就会从旧包的应答里漏回来。这一层是旧包兼容的唯一保证，用用例锁住。
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
+vi.mock("@/services/ipc", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/services/ipc")>(),
+  getSetting: vi.fn(async () => null),
+}));
 
 import type { EngineMockState } from "./helpers/engine-client";
 import { engineClientModule, resetEngineState } from "./helpers/engine-client";

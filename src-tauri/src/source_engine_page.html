@@ -33,7 +33,6 @@
       /** 包头注释前缀（与 Rust source_pack_header.rs / qt-sources 同步维护） */
       const PACK_HEADER_PREFIX = "/*__QT_PACK__";
       /** 冒烟口径：搜索“晴天”取前 5 首做候选，任一取链 + Range 预检通过即通过 */
-      const SMOKE_SOURCE = "kw";
       const SMOKE_KEYWORD = "晴天";
       const SMOKE_SIZE = 5;
       const SMOKE_ATTEMPTS = 2;
@@ -51,6 +50,67 @@
       /** 页面生命周期：booting → ready | error（仅宿主钩子注入失败才 error） */
       let phase = "booting";
       let phaseDetail = null;
+      let sourcePolicy = { version: 1, enabled: null, order: [] };
+      let policyEpoch = 0;
+      let policyError = null;
+      let policyLoading = null;
+      const LOCAL_ENTRIES = new Set(["sourceRegistry", "bundleInfo", "setAuth", "clearAuth",
+        "getSourceQualities", "parseSheet", "loadChain", "installPlayPack", "uninstallPlayPack"]);
+      const POLICY_UPGRADE = "当前数据包不支持平台总开关，请到音源包管理更新数据包";
+      function policyConfigured() {
+        return sourcePolicy.enabled !== null || sourcePolicy.order.length > 0;
+      }
+      function policyAllows(id) {
+        return sourcePolicy.enabled === null || sourcePolicy.enabled.includes(id);
+      }
+      function orderedPolicySources(catalog) {
+        return [...new Set([...sourcePolicy.order, ...catalog])]
+          .filter(id => catalog.includes(id) && policyAllows(id));
+      }
+      // Only the dedicated native read is exposed to the script window.
+      function refreshSourcePolicy() {
+        policyEpoch++;
+        const previous = policyLoading;
+        const task = (async () => {
+          if (previous) await previous;
+          try {
+            sourcePolicy = await invoke("source_policy_get");
+            if (entries && typeof entries.setSourcePolicy === "function") {
+              await entries.setSourcePolicy(sourcePolicy);
+            }
+            policyError = null;
+          } catch (error) {
+            policyError = "音乐源设置未能应用：" + String(error?.message || error);
+          }
+        })();
+        policyLoading = task;
+        void task.finally(() => { if (policyLoading === task) policyLoading = null; });
+        return task;
+      }
+      async function sourcePolicyStatus() {
+        if (policyLoading) await policyLoading;
+        const metaSupported = !!entries && typeof entries.setSourcePolicy === "function";
+        let playSupported = null;
+        if (activePack) {
+          try { playSupported = JSON.parse(await entries.bundleInfo({})).playPolicyVersion === 1; }
+          catch { playSupported = false; }
+        }
+        const message = policyError || (!entries ? "安装数据包后可管理音乐源" :
+          !metaSupported ? POLICY_UPGRADE :
+          playSupported === false ? "当前播放包不支持平台总开关，请更新播放包；自定义设置期间暂停在线取链" : "");
+        return { metaSupported, playSupported, message, configured: policyConfigured() };
+      }
+      async function guardSourcePolicy(name) {
+        if (policyLoading) await policyLoading;
+        if (LOCAL_ENTRIES.has(name)) return;
+        if (policyError) throw new Error(policyError);
+        if (policyConfigured() && (!entries || typeof entries.setSourcePolicy !== "function")) {
+          throw new Error(POLICY_UPGRADE);
+        }
+      }
+      function assertPolicyEpoch(token) {
+        if (token !== policyEpoch) throw new Error("音乐源设置已变化，请重试");
+      }
 
       async function waitInternals() {
         for (let i = 0; i < 100; i++) {
@@ -310,6 +370,7 @@
           );
         }
         entries = e;
+        await refreshSourcePolicy();
         metaLoaded = {
           id: target.id,
           code: target.code || 0,
@@ -398,6 +459,7 @@
           if (!res.ok) throw new Error("播放包文件读取失败: HTTP " + res.status);
           const code = await res.text();
           const installed = JSON.parse(entries.installPlayPack({ code }));
+          await refreshSourcePolicy();
           const overlay =
             (await packChainOverlay(pack.dir)) || (await rootChainOverlay());
           if (overlay) entries.loadChain(overlay);
@@ -435,11 +497,19 @@
        * 跳过（不下结论）。全部失败抛错 → 上层按更新失败回滚。
        */
       async function networkSmoke() {
+        const status = await sourcePolicyStatus();
+        if (policyError || (policyConfigured() && (!status.metaSupported || status.playSupported === false))) return;
+        const token = policyEpoch;
         let candidates = [];
+        let smokeSource = "";
         try {
+          const registry = JSON.parse(await entries.sourceRegistry({}));
+          const ids = (registry.sources || []).map(item => item.id);
+          smokeSource = orderedPolicySources(ids)[0] || "";
+          if (!smokeSource) return; // 全部关闭：只验装配，不为了冒烟偷偷启用平台。
           const searched = JSON.parse(
             await entries.search({
-              source: SMOKE_SOURCE,
+              source: smokeSource,
               keyword: SMOKE_KEYWORD,
               page: 1,
               size: SMOKE_SIZE,
@@ -454,10 +524,11 @@
         let lastError = "冒烟取链全部失败";
         for (const song of candidates) {
           for (let attempt = 0; attempt < SMOKE_ATTEMPTS; attempt++) {
+            if (token !== policyEpoch) return;
             try {
               const resolved = JSON.parse(
                 await entries.getPlayUrl({
-                  platform: String(song.platform || SMOKE_SOURCE),
+                  platform: String(song.platform || smokeSource),
                   id: song.id,
                   name: song.name,
                   singer: song.singer || "",
@@ -467,6 +538,7 @@
                 }),
               );
               if (!resolved || !resolved.url) throw new Error("取链返回空");
+              if (token !== policyEpoch) return;
               const checked = JSON.parse(await entries.verifyPlayable({ url: resolved.url }));
               if (!checked || checked.ok !== true) {
                 throw new Error("Range 预检失败: HTTP " + (checked && checked.status));
@@ -485,15 +557,23 @@
             }
           }
         }
+        if (token !== policyEpoch) return;
         throw new Error("冒烟失败（“" + SMOKE_KEYWORD + "”前 " + candidates.length + " 首全部取链失败）：" + lastError);
       }
 
       async function boot() {
         await report("booting");
+        await refreshSourcePolicy();
         // 1) 宿主钩子必须先于 meta-bundle 注入（meta 顶层见到 __qtHost 才自注册）
         globalThis.__qtHost = {
-          request: (url, options) =>
-            invoke("builtin_request", { url, options: options || null }),
+          request: (url, options) => {
+            if (policyLoading) return Promise.reject(new Error("音乐源设置正在应用，请重试"));
+            if (policyError) return Promise.reject(new Error(policyError));
+            if (policyConfigured() && (!entries || typeof entries.setSourcePolicy !== "function")) {
+              return Promise.reject(new Error(POLICY_UPGRADE));
+            }
+            return invoke("builtin_request", { url, options: options || null });
+          },
           platform: 1103,
           // 包内诊断日志（如扫码 803 凭据提取失败的定位短语）→ 本地文件日志；
           // 只写短语不落凭据值（包侧 AuthLog 契约），且绝不上报后端
@@ -547,6 +627,14 @@
           let error = null;
           try {
             const name = payload.entry == null ? "" : String(payload.entry);
+            if (name === "sourcePolicyStatus") {
+              if (payload.args && payload.args.refresh === true) await refreshSourcePolicy();
+              result = JSON.stringify(await sourcePolicyStatus());
+              await emitToAll("source-engine-response", { requestId, result, error });
+              return;
+            }
+            await guardSourcePolicy(name);
+            const token = policyEpoch;
             const fn = entries ? entries[name] : null;
             if (typeof fn !== "function") {
               throw new Error(
@@ -556,7 +644,9 @@
               );
             }
             result = await fn(payload.args || {});
+            if (!LOCAL_ENTRIES.has(name)) assertPolicyEpoch(token);
           } catch (err) {
+            result = null;
             error = String((err && err.message) || err);
           }
           await emitToAll("source-engine-response", { requestId, result, error });
@@ -588,6 +678,8 @@
         }
         try {
           if (entries && typeof payload.source === "string") {
+            await guardSourcePolicy("getPlayUrl");
+            const token = policyEpoch;
             const song = payload.song || {};
             const parsed = JSON.parse(
               await entries.getPlayUrl({
@@ -600,8 +692,12 @@
                 duration: song.interval,
                 // kg 各档 hash 载体（v15 官方线路按档取 hash 匹配）
                 musicId: song.musicId,
+                version: song.version,
+                isrc: song.isrc,
+                durationReliable: song.durationReliable,
               }),
             );
+            assertPolicyEpoch(token);
             url = parsed.url || "";
             line = parsed.line || null;
             referer = typeof parsed.referer === "string" ? parsed.referer : "";
@@ -663,6 +759,11 @@
         event: "source-engine-request",
         target: { kind: "Any" },
         handler: transformCallback(onRequest),
+      }).catch(() => {});
+      await invoke("plugin:event|listen", {
+        event: "source-policy-changed",
+        target: { kind: "Any" },
+        handler: transformCallback(() => { void refreshSourcePolicy(); }),
       }).catch(() => {});
       await invoke("plugin:event|listen", {
         event: "source-pack-changed",

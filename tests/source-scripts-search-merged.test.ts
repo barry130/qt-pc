@@ -14,6 +14,10 @@
  *    与包内规则不同的合并结果凑合用。
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+vi.mock("@/services/ipc", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/services/ipc")>(),
+  getSetting: vi.fn(async () => null),
+}));
 
 import type { EngineMockState } from "./helpers/engine-client";
 import { engineClientModule, resetEngineState } from "./helpers/engine-client";

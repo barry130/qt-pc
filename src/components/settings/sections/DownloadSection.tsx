@@ -4,16 +4,10 @@ import { errMsg } from "@/lib/utils";
 import * as ipc from "@/services/ipc";
 import { SettingRow, Switch } from "../controls";
 
-/**
- * 超过这个数就要二次确认。
- *
- * 批量下载不限流会被音源 / CDN 当成爬虫：LX Music 就是因为默认放开并发被临时封过 IP
- * （issue #1992，34 条讨论），它同样把 3 当成「安全线」、>3 才弹确认。这里对齐这个口径。
- */
-const SAFE_DOWNLOAD_CONCURRENCY = 3;
-
-/** 可选的同时下载数，与 Rust `download::MIN/MAX_CONCURRENCY` 一致 */
-const CONCURRENCY_CHOICES = [1, 2, 3, 4, 5, 6];
+/** 可选的同时下载数（用户 2026-11-14：只保留 1、2）。Rust 侧仍接受 1-6
+ * （download::MIN/MAX_CONCURRENCY，后台钳制不受影响）；老配置存了 3-6 的
+ * 会追加为当前值按钮显示，点 1/2 即切换——不悄悄改用户的存量值。 */
+const CONCURRENCY_CHOICES = [1, 2];
 
 /** 下载设置：保存位置（默认安装目录/Download，可选任意位置） */
 
@@ -22,8 +16,6 @@ export function DownloadSection(): React.JSX.Element {
   const [dir, setDir] = useState("");
   const [nameFormat, setNameFormat] = useState<"artist" | "song">("artist");
   const [concurrency, setConcurrency] = useState(ipc.DEFAULT_DOWNLOAD_CONCURRENCY);
-  // 选了 >3 时先挂在这里等用户确认。沿用全项目唯一的二次确认手法：原地换文案再点第二下
-  const [pendingConcurrency, setPendingConcurrency] = useState<number | null>(null);
   // 下载成功的就地附件（封面原图 / 歌词），Rust 侧默认开，这里只做镜像
   const [saveCover, setSaveCover] = useState(true);
   const [saveLyric, setSaveLyric] = useState(true);
@@ -144,7 +136,6 @@ export function DownloadSection(): React.JSX.Element {
     try {
       // Rust 侧会再夹一次到 1–6，并以实际生效值回传（避免前后端口径漂移）
       setConcurrency(await ipc.setDownloadConcurrency(n));
-      setPendingConcurrency(null);
     } catch (err) {
       setError(errMsg(err));
     } finally {
@@ -153,18 +144,8 @@ export function DownloadSection(): React.JSX.Element {
   };
 
   const chooseConcurrency = (n: number): void => {
-    // 3 以内直接生效；>3 先弹确认 —— 批量下载不限流会被音源/CDN 判成爬虫，
-    // LX Music 就因此被封过 IP（issue #1992），它同样把 >3 做成需要确认。
-    //
-    // 「待确认的就是这一项」才算第二下。少了这个判断，第二下只会把同一个值再
-    // set 一遍（React 看到值没变，不重渲染也不提交），按钮永远停在「6 个？」。
-    // 与卸载音源包（armed?.packId !== pack.id）、删歌单（confirmRemoveId !== p.pid）
-    // 同一套写法；点别的数字则改成武装那一项。
-    if (n > SAFE_DOWNLOAD_CONCURRENCY && pendingConcurrency !== n) {
-      setPendingConcurrency(n);
-      return;
-    }
-    setPendingConcurrency(null);
+    // 选项只剩 1/2（用户 2026-11-14），永远在限流红线以内——>3 的二次确认
+    // 手法随 3-6 选项一并移除；Rust clamp_concurrency 仍兜底。
     void applyConcurrency(n);
   };
 
@@ -199,7 +180,7 @@ export function DownloadSection(): React.JSX.Element {
           </button>
         </div>
       </SettingRow>
-      {/* 默认下载音质已改为按平台独立设置（音源账号页），此处不再有全局入口 */}
+      {/* 默认下载音质已改为按平台独立设置（音源平台管理页），此处不再有全局入口 */}
       <SettingRow
         title={tr("settings.download.nameFormat.title")}
         description={tr("settings.download.nameFormat.description")}
@@ -255,43 +236,33 @@ export function DownloadSection(): React.JSX.Element {
         description={tr("settings.download.concurrency.description")}
       >
         <div className="flex items-center gap-2">
-          {CONCURRENCY_CHOICES.map((n) => {
+          {/* 存量值是 3-6 的老配置：追加为当前值按钮（active），显示与实际
+              存储保持一致，不悄悄改用户的值；点 1/2 即切换。 */}
+          {(CONCURRENCY_CHOICES.includes(concurrency)
+            ? CONCURRENCY_CHOICES
+            : [...CONCURRENCY_CHOICES, concurrency]
+          ).map((n) => {
             const active = concurrency === n;
-            // 待确认的那一项原地变文案 + 变红，点第二下才真正提交
-            const confirming = pendingConcurrency === n;
             return (
               <button
                 key={n}
                 type="button"
                 onClick={() => chooseConcurrency(n)}
                 disabled={busy}
-                aria-label={
-                  confirming
-                    ? tr("settings.download.concurrency.ariaConfirm", { n })
-                    : tr("settings.download.concurrency.ariaSet", { n })
-                }
+                aria-label={tr("settings.download.concurrency.ariaSet", { n })}
                 aria-pressed={active}
                 className={
-                  confirming
-                    ? "rounded-md border border-destructive px-3 py-1.5 text-xs text-destructive transition-colors hover:bg-destructive/10 disabled:opacity-50"
-                    : active
-                      ? "rounded-md border border-primary bg-primary/10 px-3 py-1.5 text-xs font-medium text-primary transition-colors disabled:opacity-50"
-                      : "rounded-md border border-border px-3 py-1.5 text-xs transition-colors hover:bg-accent disabled:opacity-50"
+                  active
+                    ? "rounded-md border border-primary bg-primary/10 px-3 py-1.5 text-xs font-medium text-primary transition-colors disabled:opacity-50"
+                    : "rounded-md border border-border px-3 py-1.5 text-xs transition-colors hover:bg-accent disabled:opacity-50"
                 }
               >
-                {confirming
-                  ? tr("settings.download.concurrency.pendingLabel", { n })
-                  : String(n)}
+                {String(n)}
               </button>
             );
           })}
         </div>
       </SettingRow>
-      {pendingConcurrency !== null && (
-        <p className="py-2 text-xs text-destructive">
-          {tr("settings.download.concurrency.warning", { n: pendingConcurrency })}
-        </p>
-      )}
       {error && <p className="py-2 text-xs text-destructive">{error}</p>}
     </div>
   );

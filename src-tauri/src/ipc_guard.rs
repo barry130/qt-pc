@@ -43,6 +43,8 @@ pub(crate) const ENGINE_ALLOWED_COMMANDS: &[&str] = &[
     "builtin_request",
     // 读当前包状态（packs/activeId/activeMetaId；装配哪个包由它决定）
     "source_state",
+    // 平台总开关的专用只读面；不开放任意 get_setting 或策略写入。
+    "source_policy_get",
     // 读本地 chain.json 覆盖层（调链用；无覆盖层时播放包用内置默认链）
     "source_chain_overlay",
     // 装配成功后回填真实包名/版本（设置页展示）

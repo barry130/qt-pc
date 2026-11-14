@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronDown, ChevronsDownUp, ChevronsUpDown } from "lucide-react";
+import { ChevronDown, ChevronsDownUp, ChevronsUpDown, GripVertical } from "lucide-react";
 import { stripErrorUrls } from "@/lib/utils";
 import { qtresImageSrc } from "@/lib/lrc";
 import {
@@ -39,23 +39,48 @@ import {
 } from "@/lib/source-quality";
 import type { Quality } from "@/types";
 import { buttonClass, Modal } from "@/components/ui";
+import {
+  movePolicySource,
+  policyOrder,
+  saveSourcePolicy,
+  sourceEnabled,
+  sourcePolicyError,
+  sourcePolicyRevision,
+  sourcePolicySnapshot,
+  togglePolicySource,
+  waitSourcePolicy,
+} from "@/lib/source-policy";
+import { defaultSourcePolicy, dragPolicySource, policySourceEnabled } from "@/lib/source-policy-model";
+import { readAggregateSources, saveAggregateSources } from "@/lib/aggregate-sources";
+import { engineInvoke } from "@/source-engine/client";
 
 /**
- * 音源账号（路由 /source-accounts，侧边栏「我的」组、我的歌单下方）。
+ * 音源平台管理（路由 /source-accounts，侧边栏「我的」组、我的歌单下方）。
  *
- * 每个音源一张卡片，独立管理四件事：
+ * 2026-11-14 用户需求「合三为一」：原先「设置→音源包」里的音乐源启用/优先级、
+ * 聚合搜索音源两块与独立的音源账号页合并成本页，页面更名音源平台管理，
+ * 版式参照 qt-uniappx pages/source-auth/index.uvue——每个音源一张卡片，
+ * 展开后依次：启用平台 → 参与聚合搜索 → 数据/播放登录态 → 播放/下载音质；
+ * 登录入口在卡片头行。设置页的音源包分区只留安装/更新/卸载（用户裁定）。
+ *
+ * 每个音源一张卡片，独立管理：
  * - 登录本身：扫码 / 导入 Cookie（入口按数据包注册表的 auth.methods 显隐；
  *   旧包不声明 = 不显示登录按钮，只保留已存账号的退出）；
+ * - 启用平台与优先级：本机 source-policy 是唯一真源，保存走 saveSourcePolicy
+ *   （内部读回引擎，sourcePolicyStatus refresh）；关闭平台不影响凭据与收藏；
+ * - 参与聚合搜索：null/空 = 全部音源，显式数组 = 只查这几个；平台关闭时
+ *   开关置灰但原设置保留（与 uniappx 同口径）；
  * - 「数据请求使用登录态」（meta 面）与「播放请求使用登录态」（play 面）
  *   两个开关——**按源独立**，与设置页时期的全局一对开关不同：关掉 B 站的
  *   播放登录态不影响网易的任何一面；
  * - 播放音质 / 下载音质（2026-10-25 需求：各平台独立，设置页不再有全局音质）。
  *
  * 卡片清单 = 注册表全部源（顺序与展示一致；2026-10-25 用户需求「全平台写入
- * 音源账号」）——没有声明 auth 的源（当前包里只有 migu：官方登录态查询端点
- * 已失效）也有音质卡，只是不渲染登录行。注册表里已经没有、但库里还存着凭据
+ * 音源账号」）——没有声明 auth 的源也有音质卡，只是不渲染登录行。
+ * 登录能力完全跟随当前数据包声明；注册表里已经没有、但库里还存着凭据
  * 的源补一张「残留卡」（2026-10-27 用户需求）：标题旁标出「音源包已卸载」，
- * 否则用户只看到一个内部 id（如 netease）不知道这是什么。
+ * 否则用户只看到一个内部 id（如 netease）不知道这是什么。残留卡没有
+ * 启用平台/聚合搜索行（不在注册表里）。
  *
  * 播放面登录态生效时，该源官方前置线路启用，音质选择整体切换到官方档位
  * 清单（注册表 auth.officialQualities，v10/v11）——下拉选项经
@@ -81,13 +106,14 @@ type SourceCard = {
   orphan?: boolean;
 };
 
-function Switch(props: { checked: boolean; onToggle: () => void; disabled?: boolean }): React.JSX.Element {
+function Switch(props: { checked: boolean; onToggle: () => void; disabled?: boolean; label?: string }): React.JSX.Element {
   return (
     <button
       type="button"
       role="switch"
       aria-checked={props.checked}
       aria-disabled={props.disabled}
+      aria-label={props.label}
       disabled={props.disabled}
       onClick={() => {
         if (!props.disabled) props.onToggle();
@@ -106,7 +132,7 @@ function Switch(props: { checked: boolean; onToggle: () => void; disabled?: bool
 }
 
 export function SourceAccountsPage(): React.JSX.Element {
-  const sources = useSourceRegistryStore((s) => s.sources);
+  const sources = useSourceRegistryStore((s) => s.catalog);
   const ensure = useSourceRegistryStore((s) => s.ensure);
   /** 注册表是否真的取到过：区分「包已卸载」与「引擎还没就绪」——残留卡的
    *  标签文案靠它选词，不能把「还没取到」误说成「已卸载」 */
@@ -158,12 +184,32 @@ export function SourceAccountsPage(): React.JSX.Element {
   const [allCollapsed, setAllCollapsed] = useState(true);
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
 
-  /** 卡片清单（2026-10-25 用户需求「全平台写入音源账号」）：注册表全部源按展示
-   *  顺序——登录行仍按 auth.methods 门控（kg/migu 无登录接口不渲染登录区），
+  // ── 音乐源启用/优先级 + 聚合搜索（2026-11-14 用户需求「音源平台管理」）──
+  // 原先这两块在 设置→音源包 里，账号在独立的「音源账号」页；用户要求把
+  // 「音源包的音乐源」与「聚合搜索音源」并进音源账号页，改名音源平台管理，
+  // 且是**合三为一**（一个平台一张卡），不是三份并列。参照 qt-uniappx
+  // pages/source-auth/index.uvue 的单卡内顺序：登录 → 启用平台 → 聚合搜索
+  // → 登录权限 → 音质。设置页那边只保留音源包安装/更新（用户明确要求）。
+  const catalog = useSourceRegistryStore((s) => s.catalog);
+  const registryPolicy = useSourceRegistryStore((s) => s.policy);
+  /** 注册表世代：policy 变化会推进它，用它重拉引擎侧的音乐源设置状态 */
+  const registryGeneration = useSourceRegistryStore((s) => s.generation);
+  const [policySaving, setPolicySaving] = useState(false);
+  const [policyMessage, setPolicyMessage] = useState("");
+  /** 聚合搜索白名单：null = 全部音源（没配置过或点回全选） */
+  const [aggregate, setAggregate] = useState<string[] | null>(null);
+  const [aggregateLoaded, setAggregateLoaded] = useState(false);
+  /** 写入串行队列：连点开关时按钮立刻响应，但落库顺序不会乱 */
+  const aggregateQueue = useRef<Promise<void>>(Promise.resolve());
+
+  /** 卡片清单（2026-10-25 用户需求「全平台写入音源账号」）：注册表全部源按
+   *  **策略顺序**渲染（policyOrder：拖拽/排序保存的就是这份 order，落库后
+   *  accept→store 刷新→这里立即重排；否则拖拽存了也不显示=看起来没生效，
+   *  2026-11-14 实测踩过）——登录行仍按当前数据包的 auth.methods 门控，
    *  播放/下载音质行全源都有；注册表之外残留账号的源排后面（只展示账号与
    *  退出——凭据还在库里，不能让用户找不到退出口）。 */
   const cards: SourceCard[] = [
-    ...sources.map((s) => ({
+    ...policyOrder(registryPolicy ?? defaultSourcePolicy(), sources).map((s) => ({
       id: s.id,
       name: s.name,
       methods: s.auth?.methods ?? [],
@@ -178,6 +224,7 @@ export function SourceAccountsPage(): React.JSX.Element {
   useEffect(() => {
     void ensure();
     void (async () => {
+      await waitSourcePolicy();
       const acc = await readSourceAuthAccounts();
       setAccounts(acc);
       setLoaded(true);
@@ -194,8 +241,11 @@ export function SourceAccountsPage(): React.JSX.Element {
       // musickey 保活），落库更新让官方线路/后续校验拿到新 keyst；轮换应答
       // 随行下发的 refresh_token（bili 等源）并入 extras 一并落库。
       for (const [source, account] of Object.entries(acc)) {
+        if (!sourceEnabled(source)) continue;
+        const policyToken = sourcePolicyRevision();
         authCheckUser(source, account.cookie, account.extras)
           .then((r) => {
+            if (policyToken !== sourcePolicyRevision() || !sourceEnabled(source)) return;
             if (r.credential !== null && r.user !== null) {
               const extras = mergeCredentialExtras(account.extras, r.refreshToken);
               void saveSourceAuthAccount(source, r.credential, r.user, extras).catch(
@@ -260,6 +310,10 @@ export function SourceAccountsPage(): React.JSX.Element {
    *  静默轮询（用户在官方页登录完成后理应自动关窗，若没有会看到原因）。 */
   const startWebLogin = (item: SourceCard): void => {
     if (!item.webLogin || webLoginBusy !== null) return;
+    if (!sourceEnabled(item.id)) {
+      toast("该音乐源已关闭，可在音源包管理中启用后登录");
+      return;
+    }
     setWebLoginBusy(item.id);
     let progressNote: string | null = null;
     runWebLoginFlow(
@@ -509,13 +563,186 @@ export function SourceAccountsPage(): React.JSX.Element {
   /** 只要有卡片处于展开态，右上角按钮就是「全部折叠」，否则是「全部展开」 */
   const anyCardExpanded = cards.some((item) => !(collapsed[item.id] ?? allCollapsed));
 
+  // ── 音乐源启用与优先级：本机 source-policy 是唯一真源，改动后推给引擎 ──
+  // 与设置页原来的 SourcePolicySection 同一套 lib 调用，只是搬进本页卡片里。
+  // store 契约保证 policy 存在；兜底 defaultSourcePolicy 只为测试 mock 缺字段时
+  // 不崩页面（enabled: null = 全部启用，与未配置语义一致）。
+  const effectivePolicy = registryPolicy ?? defaultSourcePolicy();
+  const orderedSources = policyOrder(effectivePolicy, catalog);
+  const enabledSources = orderedSources.filter((s) => policySourceEnabled(effectivePolicy, s.id));
+  /** 该源在启用清单里的名次（1 起）；未启用返回 0 */
+  const sourceRank = (id: string): number => enabledSources.findIndex((s) => s.id === id) + 1;
+
+  useEffect(() => {
+    let live = true;
+    void engineInvoke("sourcePolicyStatus", {})
+      .then((status) => {
+        if (!live) return;
+        setPolicyMessage(
+          sourcePolicyError() ||
+            (typeof status?.message === "string" ? status.message : ""),
+        );
+      })
+      .catch(() => {
+        if (live) setPolicyMessage("音乐源设置正在读取…");
+      });
+    return () => {
+      live = false;
+    };
+  }, [registryPolicy, registryGeneration]);
+
+  /** 切开关（direction 0）或调顺序（±1）；写失败不改 UI，提示原文。
+   *  saveSourcePolicy 内部已把新值读回引擎（sourcePolicyStatus refresh），
+   *  这里不再额外推一次——重复推只会多一次 IPC。 */
+  const changeMusicSource = async (id: string, direction?: -1 | 1): Promise<void> => {
+    if (policySaving) return;
+    setPolicySaving(true);
+    try {
+      const ids = catalog.map((s) => s.id);
+      const current = sourcePolicySnapshot();
+      await saveSourcePolicy(
+        direction === undefined
+          ? togglePolicySource(current, ids, id)
+          : movePolicySource(current, ids, id, direction),
+      );
+    } catch (e) {
+      toastError(`保存失败：${stripErrorUrls(String(e))}`);
+    } finally {
+      setPolicySaving(false);
+    }
+  };
+
+  // ── 拖拽排序（2026-11-14 用户需求：优先级从 ↑/↓ 按钮改为拖拽）──
+  // 落到某张卡上 = 插到它前面；落到尾部放置区 = 移到最后；落在空白处/自己 = 取消。
+  // WebView2 实测（2026-11-14）：dragDropEnabled:false 后 dragstart/dragover 已能触发
+  // （截图可见高亮与尾部放置区），但 drop 事件被 WebView2 吞掉（wry 已知坑）⇒
+  // 整体改用指针事件（pointerdown → window pointermove/pointerup），不依赖 WebView
+  // 的 HTML5 DnD 支持；鼠标/触摸/笔统一走 Pointer Events，键盘 ↑/↓ 保留。
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const [dragOverId, setDragOverId] = useState<string | null>(null);
+  const [dragOverEnd, setDragOverEnd] = useState(false);
+  const draggingRef = useRef<string | null>(null);
+  const dragActiveRef = useRef(false);
+
+  /** 命中测试：坐标 → 目标卡 id / "end"（尾部放置区）/ null（落点无效） */
+  const hitTestDragTarget = (clientX: number, clientY: number): string | null => {
+    const el = document.elementFromPoint(clientX, clientY);
+    if (!el) return null;
+    if (el.closest("[data-drop-end]")) return "end";
+    const card = el.closest("[data-source-card]");
+    return card ? card.getAttribute("data-source-card") : null;
+  };
+
+  const cleanupDrag = (): void => {
+    dragActiveRef.current = false;
+    draggingRef.current = null;
+    setDraggingId(null);
+    setDragOverId(null);
+    setDragOverEnd(false);
+  };
+
+  // 指针拖拽期把 move/up 挂在 window 上（把手只收 pointerdown）：真实环境里指针
+  // 可以拖出把手范围，jsdom 里 fireEvent 派发的事件也会冒泡到 window，同一路径。
+  useEffect(() => {
+    if (draggingId === null) return;
+    const onMove = (e: PointerEvent): void => {
+      if (!dragActiveRef.current) return;
+      const target = hitTestDragTarget(e.clientX, e.clientY);
+      if (target === "end") {
+        setDragOverEnd(true);
+        setDragOverId(null);
+        return;
+      }
+      setDragOverEnd(false);
+      setDragOverId(target && target !== draggingRef.current ? target : null);
+    };
+    const onUp = (e: PointerEvent): void => {
+      if (!dragActiveRef.current) return;
+      const target = hitTestDragTarget(e.clientX, e.clientY);
+      const id = draggingRef.current;
+      cleanupDrag();
+      if (!id || !target) return; // 落在空白处 = 取消
+      if (target === "end") {
+        void dropMusicSource(id, null);
+        return;
+      }
+      if (target === id) return; // 落在自己身上 = 不写库
+      void dropMusicSource(id, target);
+    };
+    const onCancel = (): void => cleanupDrag();
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key === "Escape") cleanupDrag();
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onCancel);
+    window.addEventListener("keydown", onKey);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onCancel);
+      window.removeEventListener("keydown", onKey);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 拖拽辅助闭包每渲染重建，只按 draggingId 开关一次
+  }, [draggingId]);
+
+  /** 落库：与 changeMusicSource 同一条串行保存路径（snapshot + saveSourcePolicy） */
+  const dropMusicSource = async (id: string, anchorId: string | null): Promise<void> => {
+    setDraggingId(null);
+    setDragOverId(null);
+    setDragOverEnd(false);
+    draggingRef.current = null;
+    if (policySaving || id === anchorId) return;
+    setPolicySaving(true);
+    try {
+      const ids = catalog.map((s) => s.id);
+      await saveSourcePolicy(dragPolicySource(sourcePolicySnapshot(), ids, id, anchorId));
+    } catch (e) {
+      toastError(`保存失败：${stripErrorUrls(String(e))}`);
+    } finally {
+      setPolicySaving(false);
+    }
+  };
+
+  // ── 聚合搜索白名单：null/空 = 全部音源；显式数组 = 只查这几个 ──
+  useEffect(() => {
+    void (async () => {
+      setAggregate(await readAggregateSources());
+      setAggregateLoaded(true);
+    })();
+  }, []);
+
+  const aggregateIds = catalog.map((s) => s.id);
+  const aggregateEnabled =
+    aggregate === null ? aggregateIds : aggregateIds.filter((id) => aggregate.includes(id));
+
+  const toggleAggregate = (id: string): void => {
+    if (!aggregateLoaded) return;
+    const next = aggregateEnabled.includes(id)
+      ? aggregateEnabled.filter((item) => item !== id)
+      : aggregateIds.filter((item) => aggregateEnabled.includes(item) || item === id);
+    if (next.length === 0) {
+      // 一个都不选 = 聚合搜索永远空结果，直接拦在 UI 上
+      toast("聚合搜索至少要留一个音源");
+      return;
+    }
+    const allSelected = next.length === aggregateIds.length;
+    // 先乐观更新：连点两个开关不该丢第二个点击（落库串行，写失败再提示）
+    setAggregate(allSelected ? null : next);
+    aggregateQueue.current = aggregateQueue.current
+      .then(() => saveAggregateSources(allSelected ? [] : next))
+      .catch((e) => {
+        toastError(`保存失败：${stripErrorUrls(String(e))}`);
+      });
+  };
+
   return (
     <div className="flex h-full min-w-0 flex-col">
       <div className="flex items-start justify-between gap-3 border-b border-border px-4 py-3">
         <div className="min-w-0">
-          <h1 className="text-xl font-bold tracking-tight">音源账号</h1>
+          <h1 className="text-xl font-bold tracking-tight">音源平台管理</h1>
           <p className="mt-1 text-xs text-muted-foreground">
-            扫码登录音源官方账号，凭据只存本机；每个音源单独决定数据/播放请求是否使用登录态。
+            每个音源一张卡片：登录、启用与优先级、聚合搜索、登录态与音质全部在此按源管理；拖动卡片左侧把手调整优先级；凭据只存本机。
           </p>
         </div>
         {cards.length > 0 ? (
@@ -527,7 +754,7 @@ export function SourceAccountsPage(): React.JSX.Element {
               setAllCollapsed(anyCardExpanded);
               setCollapsed({});
             }}
-            title={anyCardExpanded ? "收起所有音源的登录态设置" : "展开所有音源的登录态设置"}
+            title={anyCardExpanded ? "收起所有音源的平台设置" : "展开所有音源的平台设置"}
             className="flex shrink-0 items-center gap-1 rounded-md px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
           >
             {anyCardExpanded ? (
@@ -540,10 +767,15 @@ export function SourceAccountsPage(): React.JSX.Element {
         ) : null}
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
+        {policyMessage ? (
+          <p role="status" className="mb-2 text-xs text-amber-600 dark:text-amber-400">
+            {policyMessage}
+          </p>
+        ) : null}
         {cards.length === 0 ? (
           <p className="text-xs text-muted-foreground">
             {loaded
-              ? "当前数据包不支持音源账号登录（需 2026.10.24 及以上版本的数据包）"
+              ? "当前数据包不支持音源平台管理（需 2026.10.24 及以上版本的数据包）"
               : "正在读取音源清单…"}
           </p>
         ) : (
@@ -557,9 +789,45 @@ export function SourceAccountsPage(): React.JSX.Element {
               return (
                 <div
                   key={item.id}
-                  className="rounded-xl border border-border bg-card/60 px-4 py-3"
+                  data-source-card={item.id}
+                  className={`rounded-xl border bg-card/60 px-4 py-3 ${
+                    dragOverId === item.id && draggingId !== null && draggingId !== item.id
+                      ? "border-primary shadow-sm"
+                      : "border-border"
+                  } ${draggingId === item.id ? "opacity-70 ring-2 ring-primary/60" : ""}`}
                 >
                   <div className="flex items-center justify-between gap-3">
+                  <div className="flex min-w-0 items-center gap-1">
+                    {!item.orphan ? (
+                      <span
+                        role="button"
+                        tabIndex={0}
+                        aria-label="拖拽调整优先级"
+                        title={`拖拽调整 ${item.name} 的优先级；聚焦后也可用 ↑/↓ 键微调`}
+                        data-drag-handle={item.id}
+                        onPointerDown={(e) => {
+                          // 只接受主键（鼠标左键 / 触摸 / 笔）；右键等不进入拖拽
+                          if (e.pointerType === "mouse" && e.button !== 0) return;
+                          // 阻止隐式焦点/文本选择；键盘 Tab 聚焦不受影响
+                          e.preventDefault();
+                          dragActiveRef.current = true;
+                          draggingRef.current = item.id;
+                          setDraggingId(item.id);
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === "ArrowUp") {
+                            e.preventDefault();
+                            void changeMusicSource(item.id, -1);
+                          } else if (e.key === "ArrowDown") {
+                            e.preventDefault();
+                            void changeMusicSource(item.id, 1);
+                          }
+                        }}
+                        className="shrink-0 cursor-grab touch-none select-none self-center rounded-md p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/60 active:cursor-grabbing"
+                      >
+                        <GripVertical aria-hidden="true" className="h-4 w-4" />
+                      </span>
+                    ) : null}
                     <button
                       type="button"
                       onClick={() =>
@@ -591,6 +859,7 @@ export function SourceAccountsPage(): React.JSX.Element {
                         <span className="shrink-0 text-2xs text-muted-foreground">未登录</span>
                       )}
                     </button>
+                  </div>
                     {account ? (
                       <span className="flex shrink-0 items-center gap-2">
                         <button
@@ -710,6 +979,48 @@ export function SourceAccountsPage(): React.JSX.Element {
 
                   {isCollapsed ? null : (
                     <div className="mt-2 border-t border-border/70 pt-1">
+                      {/* 启用平台 + 聚合搜索（2026-11-14 合三为一）：卡内顺序照
+                          qt-uniappx 音源平台管理页——登录在卡头，展开后依次
+                          启用平台 → 聚合搜索 → 登录权限 → 音质；残留卡
+                          （orphan，包已卸载）不在注册表里，没有这两行。 */}
+                      {!item.orphan ? (
+                        <>
+                          <div className="flex items-center justify-between gap-4 py-2">
+                            <div className="min-w-0">
+                              <p className="text-sm">启用平台</p>
+                              <p className="mt-0.5 text-xs text-muted-foreground">
+                                {sourceEnabled(item.id)
+                                  ? `已启用 · 优先级第 ${sourceRank(item.id)}/${enabledSources.length} 位，拖动卡片左侧把手排序`
+                                  : "关闭后该平台的搜索/歌单/榜单下线；正在播放与已收藏不受影响"}
+                              </p>
+                            </div>
+                            <span className="flex shrink-0 items-center gap-2">
+                              <Switch
+                                checked={sourceEnabled(item.id)}
+                                onToggle={() => void changeMusicSource(item.id)}
+                                disabled={policySaving}
+                                label={`启用平台：${item.name}`}
+                              />
+                            </span>
+                          </div>
+                          <div className="flex items-center justify-between gap-4 py-2">
+                            <div className="min-w-0">
+                              <p className="text-sm">参与聚合搜索</p>
+                              <p className="mt-0.5 text-xs text-muted-foreground">
+                                {sourceEnabled(item.id)
+                                  ? "只影响聚合类搜索（全部音源、AI 找歌、跨源补充），单源搜索不受影响"
+                                  : "启用平台后生效；原参与设置会保留"}
+                              </p>
+                            </div>
+                            <Switch
+                              checked={aggregateEnabled.includes(item.id)}
+                              onToggle={() => toggleAggregate(item.id)}
+                              disabled={!sourceEnabled(item.id) || !aggregateLoaded}
+                              label={`参与聚合搜索：${item.name}`}
+                            />
+                          </div>
+                        </>
+                      ) : null}
                       <div className="flex items-center justify-between gap-4 py-2">
                         <div className="min-w-0">
                           <p className="text-sm">数据请求使用登录态</p>
@@ -721,6 +1032,7 @@ export function SourceAccountsPage(): React.JSX.Element {
                           checked={tg.useMeta}
                           onToggle={() => toggleScope(item.id, "meta", !tg.useMeta)}
                           disabled={!account}
+                          label={`数据请求使用登录态：${item.name}`}
                         />
                       </div>
                       <div className="flex items-center justify-between gap-4 py-2">
@@ -734,6 +1046,7 @@ export function SourceAccountsPage(): React.JSX.Element {
                           checked={tg.usePlay}
                           onToggle={() => toggleScope(item.id, "play", !tg.usePlay)}
                           disabled={!account}
+                          label={`播放请求使用登录态：${item.name}`}
                         />
                       </div>
                       {(
@@ -780,6 +1093,17 @@ export function SourceAccountsPage(): React.JSX.Element {
                 </div>
               );
             })}
+            {/* 拖拽中才出现的尾部放置区：松手 = 把拖着的源放到最后一位 */}
+            {draggingId !== null ? (
+              <div
+                data-drop-end="true"
+                className={`flex h-10 items-center justify-center rounded-xl border border-dashed text-xs transition-colors ${
+                  dragOverEnd ? "border-primary bg-primary/10 text-primary" : "border-border text-muted-foreground"
+                }`}
+              >
+                松手放到最后
+              </div>
+            ) : null}
           </div>
         )}
       </div>

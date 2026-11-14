@@ -264,6 +264,7 @@ pub async fn cmd_builtin_request(
 /// （**只降不升**，空串 = 未重标）。下载命名与进度靠后两者，缺了就把
 /// 320k 的文件命名成 `.flac`（虚标）。
 #[tauri::command(rename = "set_resolved_play_url")]
+#[allow(clippy::too_many_arguments)] // Flat IPC fields preserve the existing host contract.
 pub async fn cmd_set_resolved_play_url(
     state: State<'_, AppState>,
     track: Track,
@@ -272,6 +273,7 @@ pub async fn cmd_set_resolved_play_url(
     referer: String,
     size: Option<u64>,
     actual_quality: Option<String>,
+    cache_epoch: u64,
 ) -> Result<(), ProviderError> {
     if url.is_empty() {
         return Ok(());
@@ -281,7 +283,7 @@ pub async fn cmd_set_resolved_play_url(
         &track.id,
         crate::quality_str(&quality),
     );
-    state.url_cache.set(
+    if !state.url_cache.set_if_current(
         key,
         crate::provider::url_cache::ResolvedPlayUrl {
             url,
@@ -290,8 +292,14 @@ pub async fn cmd_set_resolved_play_url(
             actual_quality: actual_quality.unwrap_or_default(),
             fetched_at: 0,
         },
-    );
+        cache_epoch,
+    ) { return Err(ProviderError::ResolveStalled); }
     Ok(())
+}
+
+#[tauri::command(rename = "play_url_cache_epoch")]
+pub fn cmd_play_url_cache_epoch(state: State<'_, AppState>) -> u64 {
+    state.url_cache.generation()
 }
 
 /// 引擎 → 前端取链桥（playurl_bridge）：主窗口挂载后置就绪标志。
@@ -331,6 +339,7 @@ pub async fn cmd_resolve_play_url_reply(
     stalled: bool,
     size: Option<u64>,
     actual_quality: Option<String>,
+    policy_error: Option<String>,
 ) {
     crate::playurl_bridge::reply(
         request_id,
@@ -340,6 +349,7 @@ pub async fn cmd_resolve_play_url_reply(
             size,
             actual_quality: actual_quality.unwrap_or_default(),
             stalled,
+            policy_error,
         },
     );
 }

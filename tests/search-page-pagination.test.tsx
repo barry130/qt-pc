@@ -60,7 +60,8 @@ vi.mock("@/lib/search-history", () => ({
   clearSearchHistory: vi.fn(async () => {}),
 }));
 
-// 聚合搜索音源设置（设置 → 音源包）：本文件只关心取全量，按默认「全部音源」处理
+// 聚合搜索音源设置（音源平台管理页卡内开关；2026-11-14 合三为一后从设置页迁入）：
+// 本文件只关心取全量，按默认「全部音源」处理
 vi.mock("@/lib/aggregate-sources", () => ({
   readAggregateSources: vi.fn(async () => null),
 }));

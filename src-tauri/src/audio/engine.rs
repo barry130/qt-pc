@@ -124,6 +124,8 @@ pub enum AudioCmd {
     SetVolume(f32),
     SetMuted(bool),
     /// 整表替换队列并从 index 开始播放
+    /// Retire speculative playback after source preferences change, leaving the current stream alone.
+    SourcePolicyChanged,
     SetQueue {
         tracks: Vec<Track>,
         index: usize,
@@ -3363,7 +3365,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                 // 事件已由取址方（含原消息）发出，这里只负责状态与跳过决策
                 // 自动下一首标识关闭（熔断已触发）就不跳，保持错误态等用户处理；
                 // autoplay=false 的加载（启动恢复/暂停态重载）本来就不在自动链上
-                if autoplay && inner.auto_next {
+                if autoplay && inner.auto_next && !policy_blocked {
                     if stalled {
                         // 环境问题：原地重试同一首，绝不换歌、绝不计入熔断。
                         // 这是弱网修复的核心——过去弱网超时被当成「歌坏了」，
@@ -3387,6 +3389,11 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                             skip_if_recoverable(inner, &track_id, autoplay);
                         }
                     }
+        AudioCmd::SourcePolicyChanged => {
+            invalidate_preload(inner);
+            // Resume speculative work on the next real track transition, after policy application.
+            inner.preload.retries = PRELOAD_RETRY_LIMIT;
+        }
                 }
             }
         }
@@ -3459,6 +3466,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
     // 每条命令处理完立刻补一次预热：挂载完成（LoadReady）/ 恢复播放 / 重新开
     // 无缝，都在这一条命令里把状态推到可预热，不必再等播放圈的下一次轮询
     // （非播放态那一圈要等满 1s，等于白等一秒才开始预取）。
+                let policy_blocked = crate::source_policy::is_policy_error(&message);
     maybe_preload(inner);
     false
 }
@@ -4484,6 +4492,10 @@ impl LoadJob {
         }
         // Original source receipts publish only after the actor's shared admission.
         // Keep the existing targetless/legacy notification path unchanged.
+                if let crate::provider::types::ProviderError::SourcePolicy { message } = &e {
+                    self.dispatch_failed_message("source-policy", message.clone(), false);
+                    return;
+                }
         if self.port.is_none() {
             let _ = self.app.emit(
                 "audio-error",

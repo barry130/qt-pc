@@ -112,7 +112,7 @@ export function PlaybackSection(): React.JSX.Element {
           ))}
         </select>
       </SettingRow>
-      {/* 默认播放音质已改为按平台独立设置（音源账号页），此处不再有全局入口 */}
+      {/* 默认播放音质已改为按平台独立设置（音源平台管理页），此处不再有全局入口 */}
       <SettingRow
         title={tr("settings.playback.gapless.title")}
         description={tr("settings.playback.gapless.desc")}

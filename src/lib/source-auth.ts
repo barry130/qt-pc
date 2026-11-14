@@ -32,12 +32,42 @@ import {
 } from "@/source-scripts";
 import { onEnginePhaseChange } from "@/source-engine/client";
 import { SOURCE_META_CHANGED_EVENT, SOURCE_PACK_CHANGED_EVENT } from "@/services/ipc";
+import { sourceEnabled, sourcePolicyRevision, waitSourcePolicy } from "@/lib/source-policy";
+
+let nextMetaRevision = 0;
+let metaResetRevision = 0;
+const metaRevisions = new Map<string, number>();
+const metaAuthListeners = new Set<(sourceId?: string) => void>();
+
+/** Changes only for metadata identity/permission, not a play-only toggle. */
+export function sourceMetaAuthRevision(source: string): number {
+  return Math.max(metaResetRevision, metaRevisions.get(source) ?? 0);
+}
+
+export function onSourceMetaAuthChange(listener: (sourceId?: string) => void): () => void {
+  metaAuthListeners.add(listener);
+  return () => metaAuthListeners.delete(listener);
+}
+
+function invalidateMetaAuth(source?: string): void {
+  const revision = ++nextMetaRevision;
+  if (source === undefined) {
+    metaResetRevision = revision;
+    successfulMetaInjections.clear();
+  } else {
+    metaRevisions.set(source, revision);
+    successfulMetaInjections.delete(source);
+  }
+  for (const listener of metaAuthListeners) {
+    try { listener(source); } catch { /* A subscriber cannot block credential revocation. */ }
+  }
+}
 
 /** 一个已登录账号的持久记录（cookie 是官方下发的凭据本体） */
 export interface SourceAuthAccount {
   cookie: string;
   user: SourceAuthUser;
-  /** ISO 时间：排障用（「我什么时候登的」），不参与任何逻辑判断 */
+  /** ISO 登录/轮换时间：非密钥标记，用于隔离重新登录后的账号推荐缓存。 */
   savedAt: string;
   /** 登录/轮换时随 credential 下发的凭据副键（键名沿用包侧应答字段，
    * 如 bili 的 refresh_token）。校验时原样透传回包入口供 refreshCredential
@@ -95,6 +125,12 @@ export function parseSourceAuthAccounts(raw: string | null | undefined): SourceA
 }
 
 let cachedAccounts: SourceAuthAccounts | undefined;
+let mutationTail: Promise<unknown> = Promise.resolve();
+function mutateAuth<T>(operation: () => Promise<T>): Promise<T> {
+  const task = mutationTail.then(operation, operation);
+  mutationTail = task.catch(() => undefined);
+  return task;
+}
 
 export function readSourceAuthAccountsSync(): SourceAuthAccounts {
   return cachedAccounts ?? {};
@@ -108,12 +144,13 @@ export async function readSourceAuthAccounts(): Promise<SourceAuthAccounts> {
 }
 
 async function writeAccounts(next: SourceAuthAccounts): Promise<void> {
-  cachedAccounts = next;
   await ipc.setSetting(SOURCE_AUTH_ACCOUNTS_KEY, JSON.stringify(next));
+  cachedAccounts = next;
 }
 
 /** 清进程内缓存（账号表/开关表/旧全局解析），下次读取回库重拉。测试用。 */
 export function resetSourceAuthCaches(): void {
+  invalidateMetaAuth();
   cachedAccounts = undefined;
   cachedToggles = undefined;
   cachedLegacy = undefined;
@@ -167,8 +204,8 @@ async function readTogglesMap(): Promise<SourceAuthTogglesMap> {
 }
 
 async function writeTogglesMap(next: SourceAuthTogglesMap): Promise<void> {
-  cachedToggles = next;
   await ipc.setSetting(SOURCE_AUTH_TOGGLES_KEY, JSON.stringify(next));
+  cachedToggles = next;
 }
 
 /** 旧全局键（per-source 表上线前所有源共用一对）。只读不写：作为未物化源的
@@ -221,17 +258,27 @@ export async function readSourceAuthTogglesFor(source: string): Promise<SourceAu
  * 优先继承，避免升级后新登录的源绕过用户已调过的全局关闭）+ 立即注入该源。
  * extras 为登录/轮换时随 credential 下发的凭据副键（如 bili refresh_token）；
  * 缺省/空表不写 extras 键，账号记录形状与旧版本保持一致。 */
-export async function saveSourceAuthAccount(
+export function saveSourceAuthAccount(
   source: string,
   cookie: string,
   user: SourceAuthUser,
   extras?: Record<string, string>,
 ): Promise<void> {
+  invalidateMetaAuth(source);
+  return mutateAuth(() => saveAccount(source, cookie, user, extras));
+}
+
+async function saveAccount(source: string, cookie: string, user: SourceAuthUser, extras?: Record<string, string>): Promise<void> {
   const accounts = { ...(await readSourceAuthAccounts()) };
+  const now = Date.now();
+  const previousSavedAt = Date.parse(accounts[source]?.savedAt ?? "");
+  // savedAt is the non-secret persistent login session: never reuse it on relogin.
+  const loginAt = Number.isFinite(previousSavedAt) && previousSavedAt >= now && previousSavedAt < 8_640_000_000_000_000
+    ? previousSavedAt + 1 : now;
   accounts[source] = {
     cookie,
     user,
-    savedAt: new Date().toISOString(),
+    savedAt: new Date(loginAt).toISOString(),
     ...(extras !== undefined && Object.keys(extras).length > 0 ? { extras } : {}),
   };
   const map = { ...(await readTogglesMap()) };
@@ -239,6 +286,7 @@ export async function saveSourceAuthAccount(
     // 刚登录成功：该源必有账号，走登录态缺省（旧全局继承→数据开/播放关）
     await writeTogglesMap({ ...map, [source]: await effectiveTogglesFor(source, map) });
   }
+  successfulMetaInjections.delete(source);
   await writeAccounts(accounts);
   await applySourceAuthForSource(source);
   emitPlayLoginChanged();
@@ -246,14 +294,20 @@ export async function saveSourceAuthAccount(
 
 /** 退出一个源的登录：清凭据 + 两面都清掉该源的注入。开关选择保留——
  * 重新登录后还原用户之前的开关习惯。 */
-export async function removeSourceAuthAccount(source: string): Promise<void> {
+export function removeSourceAuthAccount(source: string): Promise<void> {
+  // Revoke in-flight readers immediately, before asynchronous persistence/injection.
+  invalidateMetaAuth(source);
+  return mutateAuth(() => removeAccount(source));
+}
+
+async function removeAccount(source: string): Promise<void> {
   const accounts = { ...(await readSourceAuthAccounts()) };
   if (!(source in accounts)) return;
   delete accounts[source];
+  successfulMetaInjections.delete(source);
   await writeAccounts(accounts);
   try {
-    await authClearCredential("meta", source);
-    await authClearCredential("play", source);
+    await applySourceAuthForSource(source);
   } catch {
     // 引擎未就绪/旧包没有入口：内存副本随下次注入自然对齐（库里已删）
   }
@@ -279,7 +333,7 @@ export function mergeCredentialExtras(
   return Object.keys(next).length > 0 ? next : undefined;
 }
 
-/** 进行中的全量保活（模块级锁：后台定时器与音源账号页同时触发只跑一轮，
+/** 进行中的全量保活（模块级锁：后台定时器与音源平台管理页同时触发只跑一轮，
  * 进行中的调用复用同一个 Promise，拿到同一份统计结果） */
 let keepaliveInFlight: Promise<{ checked: number; rotated: number }> | null = null;
 
@@ -299,25 +353,38 @@ export function refreshAllSourceAccounts(
 ): Promise<{ checked: number; rotated: number }> {
   if (keepaliveInFlight !== null) return keepaliveInFlight;
   const round = (async () => {
+    await waitSourcePolicy();
     const accounts = await readSourceAuthAccounts();
     const sources = Object.keys(accounts);
     let rotated = 0;
+    let checked = 0;
     for (const source of sources) {
+      if (!sourceEnabled(source)) continue;
+      const policyToken = sourcePolicyRevision();
       const account = accounts[source];
       try {
+        checked++;
         const r = await authCheckUser(source, account.cookie, account.extras);
         if (!r.ok || r.credential === null) continue; // 失效跳过不删 / 未轮换跳过不写
         const extras = mergeCredentialExtras(account.extras, r.refreshToken);
-        await saveSourceAuthAccount(source, r.credential, r.user ?? account.user, extras);
-        rotated += 1;
+        const credential = r.credential;
+        await mutateAuth(async () => {
+          if (policyToken !== sourcePolicyRevision() || !sourceEnabled(source)) return;
+          // A slow keepalive must not restore a logged-out or newly replaced account.
+          if ((await readSourceAuthAccounts())[source] !== account) return;
+          invalidateMetaAuth(source);
+          await saveAccount(source, credential, r.user ?? account.user, extras);
+          rotated += 1;
+        });
       } catch (err) {
+        if (policyToken !== sourcePolicyRevision() || !sourceEnabled(source)) continue;
         console.warn(
           `[source-auth] 后台保活校验失败${reason ? `（${reason}）` : ""}：${source}`,
           err,
         );
       }
     }
-    return { checked: sources.length, rotated };
+    return { checked, rotated };
   })();
   void round.catch(() => undefined); // 拒绝由调用方消化，锁自身不告警
   keepaliveInFlight = round.finally(() => {
@@ -329,11 +396,16 @@ export function refreshAllSourceAccounts(
 /** 切换一个源的一面开关并立即生效：先把该源在解析链上的生效值物化进表
  * （此后旧全局键不再影响这个源），再按新值对该源逐面 set/clear。
  * 失败抛给调用方决定提示。 */
-export async function setSourceAuthToggle(
+export function setSourceAuthToggle(
   source: string,
   scope: SourceAuthScope,
   on: boolean,
 ): Promise<void> {
+  if (scope === "meta") invalidateMetaAuth(source);
+  return mutateAuth(() => setToggle(source, scope, on));
+}
+
+async function setToggle(source: string, scope: SourceAuthScope, on: boolean): Promise<void> {
   const map = { ...(await readTogglesMap()) };
   const current = await effectiveTogglesFor(source, map);
   const next: SourceAuthToggles =
@@ -393,19 +465,118 @@ export function sourceVipTierOf(source: string): "none" | "vip" | "svip" | null 
 /** 单源应用（按源逐面对账）：有凭据的面按开关 set，开关关的面显式 clear——
  * 清单源单面而不是整面，别的源不受牵连。无凭据时两面清干净（引擎里可能
  * 残留旧副本）。失败抛给调用方决定提示。 */
-async function applySourceAuthForSource(source: string): Promise<void> {
-  const [accounts, map] = await Promise.all([readSourceAuthAccounts(), readTogglesMap()]);
-  const account = accounts[source];
-  if (account === undefined) {
-    await authClearCredential("meta", source);
-    await authClearCredential("play", source);
-    return;
-  }
-  const toggles = await effectiveTogglesFor(source, map);
-  for (const scope of ["meta", "play"] as const) {
-    const on = scope === "meta" ? toggles.useMeta : toggles.usePlay;
-    if (on) await authSetCredential(scope, source, account.cookie);
-    else await authClearCredential(scope, source);
+/** Only an acknowledged metadata session is reusable; no credential is cached here. */
+interface SuccessfulMetaInjection {
+  accountId: string;
+  savedAt: string;
+  authRevision: number;
+  engineEpoch: number;
+}
+let metaInjectionEpoch = 0;
+const successfulMetaInjections = new Map<string, SuccessfulMetaInjection>();
+
+function resetMetaInjectionEpoch(): void {
+  metaInjectionEpoch += 1;
+  successfulMetaInjections.clear();
+}
+
+async function injectMetaAuthOnce(source: string, account: SourceAuthAccount, revision: number): Promise<boolean> {
+  // Saving can inject before any recommendation/ensure consumer has bound hooks.
+  bindInjectionHooks();
+  const epoch = metaInjectionEpoch;
+  const previous = successfulMetaInjections.get(source);
+  if (previous?.accountId === account.user.id && previous.savedAt === account.savedAt &&
+    previous.authRevision === revision && previous.engineEpoch === epoch) return true;
+  successfulMetaInjections.delete(source);
+  await authSetCredential("meta", source, account.cookie);
+  // A late ACK cannot restore readiness after revocation, replacement or engine reset.
+  if (metaInjectionEpoch !== epoch || sourceMetaAuthRevision(source) !== revision ||
+    cachedAccounts?.[source] !== account) return false;
+  successfulMetaInjections.set(source, { accountId: account.user.id, savedAt: account.savedAt,
+    authRevision: revision, engineEpoch: epoch });
+  return true;
+}
+
+let injectionTail: Promise<unknown> = Promise.resolve();
+function serializeAuthInjection<T>(operation: () => Promise<T>): Promise<T> {
+  const task = injectionTail.then(operation);
+  injectionTail = task.catch(() => undefined);
+  return task;
+}
+
+function applySourceAuthForSource(source: string): Promise<void> {
+  return serializeAuthInjection(() => reconcileSourceAuth(source));
+}
+
+/** Non-secret identity barrier for account metadata requests. Play permission is untouched. */
+export interface SourceMetaAuthSnapshot {
+  sourceId: string;
+  accountId: string;
+  nickname: string;
+  /** Non-secret login/rotation timestamp; separates a re-login from stale disk cache. */
+  accountSession: string;
+  authRevision: number;
+}
+
+export function sourceMetaAuthSnapshotIsCurrent(snapshot: SourceMetaAuthSnapshot): boolean {
+  const account = cachedAccounts?.[snapshot.sourceId];
+  return sourceMetaAuthRevision(snapshot.sourceId) === snapshot.authRevision &&
+    account?.user.id === snapshot.accountId && account.savedAt === snapshot.accountSession &&
+    (cachedToggles?.[snapshot.sourceId]?.useMeta ?? cachedLegacy?.useMeta ?? true);
+}
+
+export function prepareSourceMetaAuth(source: string): Promise<SourceMetaAuthSnapshot> {
+  bindInjectionHooks();
+  const revision = sourceMetaAuthRevision(source);
+  const assertCurrent = (): void => {
+    if (sourceMetaAuthRevision(source) !== revision) {
+      throw new Error("ACCOUNT_AUTH_CHANGED: 音源账号或数据授权已改变，请重新获取");
+    }
+  };
+  return mutateAuth(async () => {
+    assertCurrent();
+    const account = (await readSourceAuthAccounts())[source];
+    if (!account?.user.id) throw new Error("ACCOUNT_AUTH_REQUIRED: 请先登录该音源账号");
+    const toggles = await readSourceAuthTogglesFor(source);
+    assertCurrent();
+    if (!toggles.useMeta) throw new Error("ACCOUNT_META_DISABLED: 请在音源平台管理页开启数据面登录授权");
+    // Unlike ensureSourceAuthInjected(), this successful acknowledgement is mandatory.
+    await serializeAuthInjection(async () => {
+      assertCurrent();
+      const ready = await injectMetaAuthOnce(source, account, revision);
+      assertCurrent();
+      if (!ready) throw new Error("ACCOUNT_AUTH_CHANGED: 数据包授权会话已改变，请重新获取");
+    });
+    return { sourceId: source, accountId: account.user.id, nickname: account.user.nickname,
+      accountSession: account.savedAt, authRevision: revision };
+  });
+}
+
+async function reconcileSourceAuth(source: string): Promise<void> {
+  const revision = sourceMetaAuthRevision(source);
+  await ipc.clearPlayUrlCache();
+  try {
+    const [accounts, map] = await Promise.all([readSourceAuthAccounts(), readTogglesMap()]);
+    const account = accounts[source];
+    if (account === undefined) {
+      successfulMetaInjections.delete(source);
+      await authClearCredential("meta", source);
+      await authClearCredential("play", source);
+      return;
+    }
+    const toggles = await effectiveTogglesFor(source, map);
+    if (toggles.useMeta) await injectMetaAuthOnce(source, account, revision);
+    else {
+      successfulMetaInjections.delete(source);
+      await authClearCredential("meta", source);
+    }
+    // Play authorization/cache invalidation remains independent of metadata readiness.
+    if (toggles.usePlay) await authSetCredential("play", source, account.cookie);
+    else await authClearCredential("play", source);
+  } finally {
+    // Queries started between the two credential writes must not survive the transition.
+    await ipc.clearPlayUrlCache();
+    emitPlayLoginChanged();
   }
 }
 
@@ -435,11 +606,16 @@ function bindInjectionHooks(): void {
   if (hooksBound) return;
   hooksBound = true;
   onEnginePhaseChange((phase) => {
-    if (phase !== "ready") return;
+    if (phase !== "ready") {
+      // Drop the old engine's ACK before its replacement can accept requests.
+      resetMetaInjectionEpoch();
+      return;
+    }
     void ensureSourceAuthInjected();
   });
   for (const event of [SOURCE_META_CHANGED_EVENT, SOURCE_PACK_CHANGED_EVENT]) {
     void listen(event, () => {
+      resetMetaInjectionEpoch();
       // 与注册表刷新同款延迟重试：引擎页接到广播后要 fetch+import 新包，
       // 立即注入会打到旧实例（或装载中）上
       window.setTimeout(() => void ensureSourceAuthInjected(), 800);

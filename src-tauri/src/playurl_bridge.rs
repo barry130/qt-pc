@@ -64,6 +64,8 @@ pub struct BridgeReply {
     /// 本次失败是**环境问题**（弱网 / 引擎页未就绪 / 应答超时）而非
     /// 「音源确实没这首」——引擎据此不拉黑曲目、不计入熔断（2026-10-03 弱网修复）
     pub stalled: bool,
+    /// A device policy blocks this resolve; wait for an explicit user action.
+    pub policy_error: Option<String>,
 }
 
 /// 一次在途的前端取链请求（一个 request_id = 一次 `play_url_request` 事件）。
@@ -125,6 +127,7 @@ pub enum AskOutcome {
     },
     /// 前端应答了，但脚本链整体没给出地址（音源确实没有 / 线路全灭）
     NoUrl,
+    PolicyBlocked(String),
     /// 等待超时 / 事件发不出去 / 前端未就绪 —— **环境问题，可能重试就好**
     Stalled,
 }
@@ -306,6 +309,9 @@ pub async fn ask_frontend(app: &AppHandle, track: &Track, quality: Quality) -> A
         }
     }
     match tokio::time::timeout(ASK_TIMEOUT, rx).await {
+        Ok(Ok(r)) if r.policy_error.is_some() => AskOutcome::PolicyBlocked(
+            r.policy_error.unwrap_or_else(|| "音乐源设置已变化，请重新播放".into()),
+        ),
         // 前端带了 stalled 标记上来：它已判定这是环境问题，优先采信
         Ok(Ok(r)) if r.stalled && !r.url.is_empty() => AskOutcome::Url {
             url: r.url,
@@ -359,6 +365,7 @@ mod tests {
             size: None,
             actual_quality: String::new(),
             stalled,
+            policy_error: None,
         }
     }
 
@@ -397,6 +404,7 @@ mod tests {
                 size: Some(9_812_345),
                 actual_quality: "320".into(),
                 stalled: false,
+                policy_error: None,
             },
         );
         let r1 = rx1.try_recv().expect("第一个等待方");

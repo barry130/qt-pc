@@ -8,6 +8,7 @@ import { cn } from "@/lib/utils";
 import type { Track } from "@/types";
 import { savePreferredSource } from "@/lib/preferred-source";
 import { clearPlayUrlCache } from "@/services/ipc";
+import { SourceAvailabilityButton } from "./SourceAvailabilityButton";
 
 /** 每页条数：与 findSourceCandidates 的默认 size 一致，缓存键要对齐才命中 */
 const PAGE_SIZE = 5;
@@ -204,8 +205,8 @@ export function SourceSwitchPanel(props: {
                  一点都缩不动），结果**歌名和平台徽标被挤成 0 宽**，整行只剩一长条
                  灰色歌手名（2026-10-29 用户截图反馈）。grid 的 minmax(0,1fr) 给歌名
                  兜底，歌手列封顶 42% 后自己截断，徽标也就不会被吃掉。 */
+              <div key={`${it.track.platform}:${it.track.id}`}>
               <button
-                key={`${it.track.platform}:${it.track.id}`}
                 type="button"
                 disabled={refreshing || picking}
                 onClick={() => { void pick(it.track); }}
@@ -227,6 +228,8 @@ export function SourceSwitchPanel(props: {
                   {it.track.duration > 0 ? formatTime(it.track.duration * 1000) : ""}
                 </span>
               </button>
+              <SourceAvailabilityButton track={it.track} />
+              </div>
             ))}
           </div>
           {items.length >= 5 && (

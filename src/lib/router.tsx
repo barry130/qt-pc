@@ -69,7 +69,8 @@ const AudioProgramPage = lazyPage<{ platform: string; id: string }>(
   "AudioProgramPage",
 );
 const LocalMixPage = lazyPage<{ mixKey: string }>(() => import("@/components/mine/LocalMixPage"), "LocalMixPage");
-/** 音源账号：每源独立管理登录与「数据/播放是否使用登录态」（二级页，直接渲染） */
+/** 音源平台管理（2026-11-14 合三为一）：每源卡片管理登录、启用与优先级、聚合搜索、
+ *  「数据/播放是否使用登录态」与音质（二级页，直接渲染） */
 const SourceAccountsPage = lazyPage(
   () => import("@/components/mine/SourceAccountsPage"),
   "SourceAccountsPage",
@@ -245,7 +246,8 @@ const localMixRoute = createRoute({
   },
 });
 
-/** 音源账号（侧边栏「我的」组）：每源登录 + 按源独立的 meta/play 开关 */
+/** 音源平台管理（侧边栏「我的」组，路径 /source-accounts 保持兼容）：每源卡片
+ *  登录 + 启用/优先级 + 聚合搜索 + 按源独立的 meta/play 开关与音质 */
 const sourceAccountsRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/source-accounts",

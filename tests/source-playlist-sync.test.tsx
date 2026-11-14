@@ -62,11 +62,12 @@ const registryState = vi.hoisted(() => {
     Record<string, unknown>
   >;
   // 稳定快照：页面 effect 依赖 registryProfiles，引用每次变化会导致无限重渲染
-  const snapshot = { sources, ensure, profiles: {}, ready: true };
+  const snapshot = { sources, get catalog() { return this.sources; }, ensure, profiles: {}, ready: true };
   return { ensure, sources, snapshot };
 });
 
 vi.mock("@/services/ipc", () => ({
+  clearPlayUrlCache: vi.fn(async () => 0),
   getSetting: (key: string) => Promise.resolve(ipcState.store.get(key) ?? null),
   setSetting: (key: string, value: string) => {
     ipcState.store.set(key, value);
@@ -115,6 +116,8 @@ vi.mock("@/source-scripts", () => ({
 
 vi.mock("@/source-engine/client", () => ({
   onEnginePhaseChange: () => () => undefined,
+  // 合三为一后页面挂载时会查询音乐源设置状态（sourcePolicyStatus）
+  engineInvoke: async () => ({ ready: true, message: "" }),
 }));
 
 vi.mock("@tauri-apps/api/event", () => ({
@@ -744,14 +747,15 @@ describe("SourceAccountsPage：卡片折叠与开关行", () => {
     await screen.findByText("B站");
     fireEvent.click(screen.getByRole("button", { name: /全部展开/ }));
 
-    // 开关顺序跟行顺序一致：数据请求在前、播放请求在后
-    const switches = screen.getAllByRole("switch");
-    expect(switches.length).toBeGreaterThanOrEqual(2);
-    expect(switches[0].getAttribute("aria-checked")).toBe("true");
-    expect(switches[1].getAttribute("aria-checked")).toBe("false");
+    // 2026-11-14 合三为一后每卡有 4 个开关（启用平台/聚合搜索/数据/播放），
+    // 按行语义命名查询，不再按索引取
+    const metaSwitch = screen.getByRole("switch", { name: "数据请求使用登录态：B站" });
+    const playSwitch = screen.getByRole("switch", { name: "播放请求使用登录态：B站" });
+    expect(metaSwitch.getAttribute("aria-checked")).toBe("true");
+    expect(playSwitch.getAttribute("aria-checked")).toBe("false");
     // 没账号时开关仍禁用（缺省值只是展示口径，注入要等登录）
-    expect(switches[0].hasAttribute("disabled")).toBe(true);
-    expect(switches[1].hasAttribute("disabled")).toBe(true);
+    expect(metaSwitch.hasAttribute("disabled")).toBe(true);
+    expect(playSwitch.hasAttribute("disabled")).toBe(true);
   });
 
   it("已登录的源按缺省展示：数据请求使用登录态=开、播放请求使用登录态=关", async () => {
@@ -765,9 +769,9 @@ describe("SourceAccountsPage：卡片折叠与开关行", () => {
 
     fireEvent.click(screen.getByRole("button", { name: /全部展开/ }));
     await waitFor(() =>
-      expect(screen.getAllByRole("switch")[0].getAttribute("aria-checked")).toBe("true"),
+      expect(screen.getByRole("switch", { name: "数据请求使用登录态：B站" }).getAttribute("aria-checked")).toBe("true"),
     );
-    expect(screen.getAllByRole("switch")[1].getAttribute("aria-checked")).toBe("false");
+    expect(screen.getByRole("switch", { name: "播放请求使用登录态：B站" }).getAttribute("aria-checked")).toBe("false");
   });
 
   it("不再渲染「登录后同步歌单」开关行（默认开启）", async () => {
@@ -805,7 +809,7 @@ describe("SourceAccountsPage：卡片折叠与开关行", () => {
     fireEvent.click(screen.getByRole("button", { name: "取消" }));
     fireEvent.click(screen.getByRole("button", { name: /全部展开/ }));
     await waitFor(() =>
-      expect(screen.getAllByRole("switch")[0].getAttribute("aria-checked")).toBe("true"),
+      expect(screen.getByRole("switch", { name: "数据请求使用登录态：B站" }).getAttribute("aria-checked")).toBe("true"),
     );
   });
 });
