@@ -103,7 +103,23 @@ pub fn filter_pending_cloud_ops(
 ) -> rusqlite::Result<Vec<crate::db::store::PendingLikeOp>> {
     let mut kept = Vec::with_capacity(ops.len());
     for op in ops {
-        // 只有歌单 metadata 需要按智能标记过滤；歌曲 op 原样保留。
+        // A manual edit after a follow commit supersedes its unsent membership.
+        if op.kind == "song" {
+            if let Ok(body) = serde_json::from_str::<serde_json::Value>(&op.payload_json) {
+                if let (Some(platform), Some(sid), Some(pid)) = (
+                    body.get("platform").and_then(|v| v.as_str()),
+                    body.get("sid").and_then(|v| v.as_str()),
+                    body.get("pid").and_then(|v| v.as_str()).filter(|p| !p.is_empty()),
+                ) {
+                    let member = crate::db::store::get_playlist_tracks(conn, pid)?.iter()
+                        .any(|t| t.platform.as_str() == platform && t.id == sid);
+                    if (op.action == "add" && !member) || (op.action == "remove" && member) {
+                        crate::db::store::ack_pending_like_op(conn, &op.id)?;
+                        continue;
+                    }
+                }
+            }
+        }
         if op.kind != "playlist" {
             kept.push(op);
             continue;

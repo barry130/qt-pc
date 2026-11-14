@@ -2709,6 +2709,7 @@ async fn push_like_song(
     action: &str,
     pid: Option<&str>,
 ) {
+    let _write_guard = state.astral.lock_like_writes().await;
     if !state.astral.has_token() {
         return;
     }
@@ -2755,6 +2756,7 @@ async fn push_like_songs_batch(
     epoch: u64,
     items: Vec<(Track, String, Option<String>)>,
 ) {
+    let _write_guard = state.astral.lock_like_writes().await;
     if items.is_empty() || !state.astral.has_token() {
         return;
     }
@@ -3197,11 +3199,12 @@ pub async fn cmd_purge_missing_history(state: State<'_, AppState>) -> Result<usi
 pub async fn cmd_create_playlist(
     state: State<'_, AppState>,
     name: String,
+    session_epoch: Option<u64>,
 ) -> Result<String, String> {
     let Some(db) = state.db.clone() else {
         return Err("数据库不可用".to_string());
     };
-    let epoch = state.astral.session_epoch();
+    let epoch = session_epoch.unwrap_or_else(|| state.astral.session_epoch());
     let reg_name = name.clone();
     let guard = state.astral.clone();
     let (pid, permit) = tauri::async_runtime::spawn_blocking(move || {
@@ -3239,6 +3242,27 @@ pub async fn cmd_create_playlist(
 }
 
 // ---------- 智能歌单（A5，对照分析文档 §4.5） ----------
+#[tauri::command(rename = "apply_playlist_follow")]
+pub async fn cmd_apply_playlist_follow(
+    state: State<'_, AppState>,
+    input: crate::playlist_follow::FollowCommit,
+    session_epoch: u64,
+) -> Result<(), String> {
+    let db = state.db.clone().ok_or("数据库不可用")?;
+    let guard = state.astral.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        guard.with_session_epoch(session_epoch, || {
+            db.with(|conn| crate::playlist_follow::commit(conn, &input))
+        })
+    }).await.map_err(|e| e.to_string())??;
+    if state.astral.has_token() {
+        if let Err(error) = cmd_like_flush_pending(state, Some(session_epoch)).await {
+            log::warn!("[follow] 已保存，等待同步: {error}");
+        }
+    }
+    Ok(())
+}
+
 // 规则存 smart_playlists，曲目每次按规则现算（get_playlist_tracks 内部自动分流），
 // 所以这里只需要维护「规则 + 限制 + 排序」三样东西。
 // 不上送云端：其他端还不认识智能歌单，推过去只会多出一张没有曲目的空卡片。
@@ -5599,6 +5623,7 @@ pub async fn cmd_like_flush_pending(
     state: State<'_, AppState>,
     session_epoch: Option<u64>,
 ) -> Result<u32, String> {
+    let _write_guard = state.astral.lock_like_writes().await;
     let epoch = session_epoch.unwrap_or_else(|| state.astral.session_epoch());
     if !state.astral.has_token() {
         return state.astral.with_like_session_epoch(epoch, || Ok(0));

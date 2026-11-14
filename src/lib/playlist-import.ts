@@ -7,6 +7,7 @@
 import type { Playlist, SourceId } from "@/types";
 import * as ipc from "@/services/ipc";
 import * as sourceApi from "@/source-scripts";
+import { attachPlaylistFollow } from "./playlist-follow";
 
 export interface PlaylistImportResult {
   /** 远端歌单详情（含名称/封面/播放量） */
@@ -81,26 +82,35 @@ export async function importPlaylistSongs(
   text: string,
   forced: SourceId | undefined,
   target: ImportSongsTarget,
+  follow = false,
 ): Promise<ImportSongsResult> {
+  const epoch = await ipc.likeSessionEpoch();
   const parsed = await sourceApi.parseSheetInput(text, forced);
   if (!parsed) {
     throw new Error("无法识别歌单链接或 ID，请检查输入或手动选择平台");
   }
   const playlist = await sourceApi.getPlaylistDetail(parsed.platform, parsed.id);
-  const tracks = playlist?.tracks ?? [];
+  const tracks = [...new Map((playlist?.tracks ?? []).map(track => [JSON.stringify([track.platform, track.id]), track])).values()];
   if (!playlist?.name || tracks.length === 0) {
     throw new Error("该歌单不存在或没有可导入的歌曲");
   }
+  if (follow && playlist.complete !== true) throw new Error("来源未返回完整歌单，暂不能开启跟随");
   let targetId: string;
   let targetName: string;
   if (target.kind === "new") {
     // 名称留空 = 默认用远程歌单名（与移动端一致）
     targetName = (target.name ?? "").trim() || playlist.name;
-    targetId = await ipc.createPlaylist(targetName);
+    targetId = await ipc.createPlaylist(targetName, epoch);
   } else {
     targetId = target.id;
     targetName = target.name;
   }
-  const added = await ipc.addTracksToPlaylist(targetId, tracks);
+  const existing = await ipc.getPlaylistTracks(targetId);
+  let added: number;
+  if (follow) {
+    await attachPlaylistFollow(targetId, playlist, existing, epoch);
+    const oldKeys = new Set(existing.map(t => JSON.stringify([t.platform, t.id])));
+    added = tracks.filter(t => !oldKeys.has(JSON.stringify([t.platform, t.id]))).length;
+  } else added = await ipc.addTracksToPlaylist(targetId, tracks, epoch);
   return { targetId, targetName, added, total: tracks.length };
 }

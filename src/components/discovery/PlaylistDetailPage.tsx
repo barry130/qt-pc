@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Heart, ImageDown, Pencil, Search, Share2, SlidersHorizontal, X } from "lucide-react";
+import { FileDown, Heart, Pencil, Search, Share2, SlidersHorizontal, X } from "lucide-react";
 import { useNavigate } from "@tanstack/react-router";
 import { errMsg } from "@/lib/utils";
 import { filterTracks, retainTrackSelection, trackSelectionKey } from "@/lib/track-selection";
@@ -22,6 +22,7 @@ import { useT } from "@/lib/i18n";
 import { PlaylistShareCard } from "@/components/player/PlaylistShareCard";
 import { useDismissOnOutside } from "@/hooks/useDismissOnOutside";
 import { toastSuccess } from "@/stores/toast";
+import { PlaylistFollowControls } from "@/components/mine/PlaylistFollowControls";
 
 import {
   DetailHero,
@@ -461,11 +462,12 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
             absolute 展开的，hero 一裁就只剩一条缝，面板会被挡在页头里。 */}
         <DetailHero as="div" coverUrl={cover}>
 
-        <div className="relative flex items-center px-6 pt-5">
-          <BackButton />
-        </div>
-
-        <div className="relative flex gap-5 px-6 pb-6 pt-4">
+        {/* 返回键与封面头同一行（用户 2026-11-14）：hero 整体上移一行。
+            行不设 items-start（默认 stretch）——信息列/右列要拉满行高走
+            justify-end 贴底（用户 2026-11-14：以下面为基准往上展示），
+            返回键单独 self-start 贴顶。 */}
+        <div className="relative flex gap-5 px-6 pb-6 pt-5">
+          <BackButton className="self-start" />
           {/* 封面高度 = 整块 hero 的高度：右侧内容（标题 / 计数 / 简介 / 按钮）全部
               收在这个高度以内，不许把页头撑得比封面高（用户 2026-10-24：「左边图片，
               右边内容，高度不要超过图片，内容全部往右边搭」）。与每日推荐页同尺寸，
@@ -550,7 +552,9 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
                   className="h-9 w-9 rounded-lg"
                   onClick={() => void exportPlaylist()}
                 >
-                  <Share2 className="h-4 w-4" />
+                  {/* 导出与分享卡分家（用户 2026-11-14）：导出是落文件用
+                      FileDown，分享卡才是 Share2，两个按钮不再共用图标。 */}
+                  <FileDown className="h-4 w-4" />
                 </IconButton>
               ) : null}
               {isLocal ? (
@@ -577,7 +581,9 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
                   className="h-9 w-9 rounded-lg"
                   onClick={() => setShareOpen(true)}
                 >
-                  <ImageDown className="h-4 w-4" />
+                  {/* 分享图标用 Share2（用户 2026-11-14：收藏旁边的分享
+                      按钮要长成分享的样子，原图标 ImageDown 像下载）。 */}
+                  <Share2 className="h-4 w-4" />
                 </IconButton>
               ) : null}
             </div>
@@ -631,6 +637,7 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
           ) : null}
         </div>
       </DetailHero>
+      {isLocal && smart === null && <PlaylistFollowControls key={id} pid={id} />}
 
       {/* 智能歌单提示条：曲目是规则现算出来的，不能手动增删，只能改规则 */}
       {smart && (

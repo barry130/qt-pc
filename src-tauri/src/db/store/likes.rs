@@ -472,6 +472,15 @@ pub(crate) fn enqueue_pending_like_op(
     target_key: &str,
     payload_json: &str,
 ) -> Result<(), rusqlite::Error> {
+    // Membership operations in different playlists must not overwrite each other.
+    let body = serde_json::from_str::<serde_json::Value>(payload_json).ok();
+    let membership_key = if kind == "song" {
+        body.as_ref().and_then(|v| Some(serde_json::json!([
+            "song", v.get("platform")?.as_str()?, v.get("sid")?.as_str()?,
+            v.get("pid").and_then(|p| p.as_str()).unwrap_or("")
+        ]).to_string()))
+    } else { None };
+    let target_key = membership_key.as_deref().unwrap_or(target_key);
     // 历史版本建库可能没有这张表（v1 schema 只在全新库完整执行）
     ensure_pending_like_ops_table(conn)?;
     let now = now_ms();
@@ -501,7 +510,7 @@ pub(crate) fn list_pending_like_ops(
     ensure_pending_like_ops_table(conn)?;
     let mut stmt = conn.prepare(
         "SELECT id, type, action, payload_json, retry_count, next_retry_at, created_at
-           FROM pending_like_ops ORDER BY created_at ASC",
+           FROM pending_like_ops ORDER BY created_at ASC, rowid ASC",
     )?;
     let mut rows = stmt.query([])?;
     let mut out = Vec::new();

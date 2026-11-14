@@ -35,6 +35,7 @@ export function ImportPlaylistDialog(props: {
   const [text, setText] = useState("");
   const [platform, setPlatform] = useState<string>("");
   const [busy, setBusy] = useState(false);
+  const [follow, setFollow] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // 导入歌曲模式：解析出的预览（含全量曲目）与目标选择
   const [preview, setPreview] = useState<Playlist | null>(null);
@@ -88,7 +89,7 @@ export function ImportPlaylistDialog(props: {
         const all = await ipc.listMyPlaylists();
         setMyPlaylists(
           all
-            .filter((p) => p.platform === ipc.LOCAL_PLATFORM)
+            .filter((p) => p.platform === ipc.LOCAL_PLATFORM && !p.isSmart)
             .map((p) => ({ id: p.pid, name: p.name })),
         );
         setTargetChoice(0);
@@ -133,7 +134,7 @@ export function ImportPlaylistDialog(props: {
         if (targetChoice === 0) return { kind: "new" as const, name: newName };
         const pl = myPlaylists[targetChoice - 1];
         return { kind: "existing" as const, id: pl.id, name: pl.name };
-      })());
+      })(), follow);
       setResult(`已导入 ${res.added} / ${res.total} 首到「${res.targetName}」`);
       props.onSongsImported?.(res.targetId);
     } catch (err) {
@@ -184,7 +185,7 @@ export function ImportPlaylistDialog(props: {
       const all = await ipc.listMyPlaylists();
       setMyPlaylists(
         all
-          .filter((p) => p.platform === ipc.LOCAL_PLATFORM)
+          .filter((p) => p.platform === ipc.LOCAL_PLATFORM && !p.isSmart)
           .map((p) => ({ id: p.pid, name: p.name })),
       );
       setTargetChoice(0);
@@ -378,6 +379,13 @@ export function ImportPlaylistDialog(props: {
           </div>
         )}
 
+        {mode === "songs" && !fileSource && preview && (
+          <label className="mt-3 flex items-start gap-2 text-xs text-muted-foreground">
+            <input type="checkbox" checked={follow} disabled={busy || preview.complete !== true}
+              onChange={event => setFollow(event.target.checked)} />
+            <span>跟随原歌单更新<br />{preview.complete === true ? "本设备每天检查，保留你手动添加和删除的歌曲。" : "来源未确认列表完整，更新数据包后可开启。"}</span>
+          </label>
+        )}
         {result && <p className="mt-2 text-xs text-primary">{result}</p>}
         {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
 

@@ -12,6 +12,8 @@ import {
 vi.mock("@/services/ipc", () => ({
   createPlaylist: vi.fn(),
   addTracksToPlaylist: vi.fn(),
+  likeSessionEpoch: vi.fn(async () => 7),
+  getPlaylistTracks: vi.fn(async () => []),
 }));
 // 歌单链接解析已下沉到数据包（source-scripts.parseSheetInput），这里给它补桩：
 // 本文件测的是「导入编排」而非解析本身（解析单测在 qt-sources/tests/sheet-
@@ -76,11 +78,11 @@ describe("importPlaylistSongs 导入歌曲编排", () => {
       { kind: "new" },
     );
 
-    expect(ipc.createPlaylist).toHaveBeenCalledWith("夜曲歌单");
+    expect(ipc.createPlaylist).toHaveBeenCalledWith("夜曲歌单", 7);
     expect(ipc.addTracksToPlaylist).toHaveBeenCalledWith("pid-new", [
       expect.objectContaining({ id: "s1" }),
       expect.objectContaining({ id: "s2" }),
-    ]);
+    ], 7);
     expect(res).toEqual({
       targetId: "pid-new",
       targetName: "夜曲歌单",
@@ -99,7 +101,7 @@ describe("importPlaylistSongs 导入歌曲编排", () => {
       name: "  我的开车歌单  ",
     });
 
-    expect(ipc.createPlaylist).toHaveBeenCalledWith("我的开车歌单");
+    expect(ipc.createPlaylist).toHaveBeenCalledWith("我的开车歌单", 7);
   });
 
   it("选现有歌单：不再新建，直接往目标整单拷入", async () => {
@@ -113,7 +115,7 @@ describe("importPlaylistSongs 导入歌曲编排", () => {
     );
 
     expect(ipc.createPlaylist).not.toHaveBeenCalled();
-    expect(ipc.addTracksToPlaylist).toHaveBeenCalledWith("pid-old", expect.anything());
+    expect(ipc.addTracksToPlaylist).toHaveBeenCalledWith("pid-old", expect.anything(), 7);
     expect(res.targetName).toBe("已有的歌单");
     expect(res.added).toBe(1);
   });

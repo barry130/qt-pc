@@ -714,6 +714,7 @@ pub struct AstralClient {
     metadata: Option<ClientMetadata>,
     session: Arc<RwLock<NativeSessionState>>,
     mutations: tokio::sync::Mutex<()>,
+    like_writes: tokio::sync::Mutex<()>,
     /// Refresh requests are single-flight; OS work never holds an async executor.
     refresh_lock: tokio::sync::Mutex<()>,
 }
@@ -749,6 +750,7 @@ impl AstralClient {
             metadata: None,
             session: Arc::new(RwLock::new(NativeSessionState::default())),
             mutations: tokio::sync::Mutex::new(()),
+            like_writes: tokio::sync::Mutex::new(()),
             refresh_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -878,6 +880,11 @@ impl AstralClient {
     }
 
     /// Keep real owner verification and the local cloud commit under one READ fence.
+    /// Serialize replay and immediate membership pushes, preserving local edit order.
+    pub async fn lock_like_writes(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.like_writes.lock().await
+    }
+
     pub fn with_like_session_epoch<T>(
         &self,
         epoch: u64,

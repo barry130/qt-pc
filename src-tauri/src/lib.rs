@@ -49,6 +49,7 @@ pub mod pack_signature;
 pub mod playlist_cloud;
 pub mod playlist_cover;
 pub mod playlist_io;
+mod playlist_follow;
 pub mod podcast;
 pub mod podcast_subtitles;
 pub mod playurl_bridge;
@@ -817,6 +818,7 @@ pub fn run() {
             cmd_purge_missing_history,
             // 我的歌单（DESIGN §5.3）
             cmd_create_playlist,
+            cmd_apply_playlist_follow,
             cmd_rename_playlist,
             cmd_delete_playlist,
             cmd_set_playlist_cover,

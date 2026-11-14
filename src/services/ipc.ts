@@ -651,8 +651,15 @@ export async function saveShortcuts(
 
 // ---------- 我的歌单（DESIGN §5.3，本地自建歌单） ----------
 
-export async function createPlaylist(name: string): Promise<string> {
-  return invoke("create_playlist", { name });
+export async function createPlaylist(name: string, sessionEpoch?: number): Promise<string> {
+  return invoke("create_playlist", { name, ...sessionEpochPayload(sessionEpoch) });
+}
+
+export async function applyPlaylistFollow(input: {
+  pid: string; owner: string; expectedLocalKeys: string[] | null;
+  added: Track[]; removed: Track[]; expectedJson: string | null; nextJson: string;
+}, sessionEpoch: number): Promise<void> {
+  return invoke("apply_playlist_follow", { input, sessionEpoch });
 }
 
 export async function renamePlaylist(id: string, name: string): Promise<void> {

@@ -55,6 +55,7 @@ import { useRadioRefill } from "@/hooks/useRadioRefill";
 import { useContextMenuGuard } from "@/hooks/useContextMenuGuard";
 import { ScreenReaderAnnouncer } from "@/components/layout/ScreenReaderAnnouncer";
 import { PageFallback } from "@/lib/lazyPage";
+import { usePlaylistFollow } from "@/hooks/usePlaylistFollow";
 
 /**
  * 全局布局（DESIGN §5.1）：标题栏 + 侧边栏 + 内容区 + 播放条。
@@ -80,6 +81,7 @@ export function AppShell(): React.JSX.Element {
   useTransportKeys();
   // 私人 FM 补歌心跳（A7）：不依赖 FM 页可见，离页也照常按余量补歌
   useRadioRefill();
+  usePlaylistFollow();
   // 右键守卫：没用处的区域不再弹浏览器原生菜单（输入框与划选文本仍放行）
   useContextMenuGuard();
   // 外部打开（拖拽入窗 / 命令行参数 / 第二实例转发）：只挂一次，返回值只用于拖拽提示浮层

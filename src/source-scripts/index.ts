@@ -154,7 +154,7 @@ function fromAppTrack(track: Track): MusicInfo {
   };
 }
 
-function toAppPlaylist(item: { id: string; platform: Source; name: string; picUrl: string; playCount: string; description?: string | null; tracks?: MusicInfo[] }, ): Playlist {
+function toAppPlaylist(item: { id: string; platform: Source; name: string; picUrl: string; playCount: string; description?: string | null; tracks?: MusicInfo[]; complete?: boolean }, ): Playlist {
   const platform = item.platform as SourceId;
   return {
     id: item.id,
@@ -164,6 +164,7 @@ function toAppPlaylist(item: { id: string; platform: Source; name: string; picUr
     playCount: item.playCount,
     description: item.description ?? null,
     tracks: item.tracks?.map((t) => toAppTrack(t, platform)),
+    complete: item.complete === true,
   };
 }
 
