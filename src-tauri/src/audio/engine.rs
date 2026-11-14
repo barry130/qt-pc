@@ -5377,7 +5377,7 @@ mod duration_tests {
             album: "".into(),
             pic_url: String::new(),
             duration: seconds,
-            music_id: None,
+            recording: Default::default(), music_id: None,
             start_ms: None,
             end_ms: None,
         }
@@ -5676,7 +5676,7 @@ mod command_channel_tests {
         Track {
             id: id.into(), platform: SourceId::new(platform), title: id.into(),
             singer: String::new(), album: String::new(), pic_url: String::new(),
-            duration: 0.0, music_id: None, start_ms: None, end_ms: None,
+            duration: 0.0, recording: Default::default(), music_id: None, start_ms: None, end_ms: None,
         }
     }
 

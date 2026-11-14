@@ -236,7 +236,7 @@ pub fn mark_missing_local_tracks(
 /// 读库内本地曲目（不扫磁盘）；`missing = 1` 的记录不返回。
 pub fn query_local_tracks(conn: &Connection) -> Result<Vec<Track>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, singer, album, duration_ms, music_id, start_ms, end_ms
+        "SELECT id, title, singer, album, duration_ms, music_id, start_ms, end_ms, recording_version, isrc, duration_reliable
          FROM tracks
          WHERE platform = 'local' AND missing = 0
          ORDER BY title COLLATE NOCASE, singer COLLATE NOCASE",
@@ -253,7 +253,7 @@ pub fn query_local_tracks(conn: &Connection) -> Result<Vec<Track>, rusqlite::Err
             album: row.get(3)?,
             pic_url: String::new(),
             duration: row.get::<_, Option<i64>>(4)?.unwrap_or(0) as f64 / 1000.0,
-            music_id: row.get(5)?,
+            recording: recording_from_row(row)?, music_id: row.get(5)?,
             start_ms: row
                 .get::<_, Option<i64>>(6)?
                 .and_then(|v| u64::try_from(v).ok()),
@@ -307,7 +307,7 @@ pub fn query_local_track_files(
 /// `Track.id` 仍是原文件路径，前端可直接展示。
 pub fn query_missing_local_tracks(conn: &Connection) -> Result<Vec<Track>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT id, title, singer, album, duration_ms, music_id, start_ms, end_ms
+        "SELECT id, title, singer, album, duration_ms, music_id, start_ms, end_ms, recording_version, isrc, duration_reliable
          FROM tracks
          WHERE platform = 'local' AND missing = 1
          ORDER BY title COLLATE NOCASE, singer COLLATE NOCASE",
@@ -324,7 +324,7 @@ pub fn query_missing_local_tracks(conn: &Connection) -> Result<Vec<Track>, rusql
             album: row.get(3)?,
             pic_url: String::new(),
             duration: row.get::<_, Option<i64>>(4)?.unwrap_or(0) as f64 / 1000.0,
-            music_id: row.get(5)?,
+            recording: recording_from_row(row)?, music_id: row.get(5)?,
             start_ms: row
                 .get::<_, Option<i64>>(6)?
                 .and_then(|v| u64::try_from(v).ok()),
@@ -533,7 +533,7 @@ pub fn local_candidates_by_meta(
 ) -> Result<Vec<Track>, rusqlite::Error> {
     let (sql, params): (&str, Vec<&dyn rusqlite::ToSql>) = if duration_ms > 0 {
         (
-            "SELECT id, title, singer, album, duration_ms, music_id, start_ms, end_ms
+            "SELECT id, title, singer, album, duration_ms, music_id, start_ms, end_ms, recording_version, isrc, duration_reliable
                FROM tracks
               WHERE platform = 'local' AND missing = 0 AND cue_path IS NULL
                 AND duration_ms BETWEEN ?1 - 4000 AND ?1 + 4000",
@@ -541,7 +541,7 @@ pub fn local_candidates_by_meta(
         )
     } else {
         (
-            "SELECT id, title, singer, album, duration_ms, music_id, start_ms, end_ms
+            "SELECT id, title, singer, album, duration_ms, music_id, start_ms, end_ms, recording_version, isrc, duration_reliable
                FROM tracks
               WHERE platform = 'local' AND missing = 0 AND cue_path IS NULL AND title = ?1",
             vec![&want_title],
@@ -560,7 +560,7 @@ pub fn local_candidates_by_meta(
             album: row.get(3)?,
             pic_url: String::new(),
             duration: row.get::<_, Option<i64>>(4)?.unwrap_or(0) as f64 / 1000.0,
-            music_id: row.get(5)?,
+            recording: recording_from_row(row)?, music_id: row.get(5)?,
             start_ms: row
                 .get::<_, Option<i64>>(6)?
                 .and_then(|v| u64::try_from(v).ok()),

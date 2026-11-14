@@ -412,6 +412,7 @@ pub(crate) const MIGRATIONS: &[(i64, &str)] = &[
     (26, V26),
     (27, V27),
     (28, V28),
+    (29, V29),
 ];
 
 const V1: &str = r#"
@@ -869,7 +870,11 @@ CREATE TABLE podcast_subtitles (
 
 const V28: &str = "ALTER TABLE podcast_episodes ADD COLUMN subtitle_audio_path TEXT NOT NULL DEFAULT '';";
 
-pub(crate) const CURRENT_VERSION: i64 = 28;
+const V29: &str = "ALTER TABLE tracks ADD COLUMN recording_version TEXT;
+ALTER TABLE tracks ADD COLUMN isrc TEXT;
+ALTER TABLE tracks ADD COLUMN duration_reliable INTEGER;";
+
+pub(crate) const CURRENT_VERSION: i64 = 29;
 
 /// 建表 schema_migrations 并把所有未应用版本按序执行。
 pub(crate) fn run(conn: &Connection) -> Result<(), rusqlite::Error> {

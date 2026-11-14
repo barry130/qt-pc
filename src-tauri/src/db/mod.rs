@@ -162,7 +162,7 @@ mod tests {
             album: "专辑".into(),
             pic_url: String::new(),
             duration: 210.0,
-            music_id: None,
+            recording: Default::default(), music_id: None,
             start_ms: None,
             end_ms: None,
         }

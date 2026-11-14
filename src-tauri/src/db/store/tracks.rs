@@ -38,15 +38,18 @@ pub(crate) fn upsert_tracks(conn: &Connection, tracks: &[&Track]) -> Result<(), 
         let duration_ms = (t.duration * 1000.0) as i64;
         conn.execute(
             "INSERT INTO tracks (id, platform, title, singer, album, pic_url, duration_ms,
-                                 music_id, missing, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?9)
+                                 music_id, missing, created_at, updated_at, recording_version, isrc, duration_reliable)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?9, ?10, ?11, ?12)
              ON CONFLICT(id) DO UPDATE SET
                title = excluded.title,
                singer = excluded.singer,
                album = excluded.album,
                pic_url = excluded.pic_url,
                duration_ms = excluded.duration_ms,
-               music_id = excluded.music_id,
+               music_id = COALESCE(excluded.music_id, tracks.music_id),
+               recording_version = COALESCE(excluded.recording_version, tracks.recording_version),
+               isrc = COALESCE(excluded.isrc, tracks.isrc),
+               duration_reliable = COALESCE(excluded.duration_reliable, tracks.duration_reliable),
                missing = 0,
                updated_at = excluded.updated_at",
             params![
@@ -63,6 +66,7 @@ pub(crate) fn upsert_tracks(conn: &Connection, tracks: &[&Track]) -> Result<(), 
                 duration_ms,
                 t.music_id,
                 now,
+                t.recording.version, t.recording.isrc, t.recording.duration_reliable,
             ],
         )?;
     }
@@ -89,8 +93,17 @@ pub(crate) fn track_from_row(row: &rusqlite::Row<'_>) -> Result<Option<Track>, r
         album: row.get(4)?,
         pic_url: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
         duration: row.get::<_, Option<i64>>(6)?.unwrap_or(0) as f64 / 1000.0,
-        music_id: row.get(7)?,
+        recording: recording_from_row(row)?, music_id: row.get(7)?,
         start_ms: row.get::<_, Option<i64>>(8)?.and_then(|v| u64::try_from(v).ok()),
         end_ms: row.get::<_, Option<i64>>(9)?.and_then(|v| u64::try_from(v).ok()),
     }))
+}
+
+/// Named columns avoid disturbing existing positional projections (history/report fields).
+pub(crate) fn recording_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<crate::provider::types::RecordingMetadata> {
+    Ok(crate::provider::types::RecordingMetadata {
+        version: row.get("recording_version")?,
+        isrc: row.get("isrc")?,
+        duration_reliable: row.get("duration_reliable")?,
+    })
 }

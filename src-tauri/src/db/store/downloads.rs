@@ -195,7 +195,7 @@ const DOWNLOAD_SELECT_COLUMNS: &str =
     "d.id, d.quality, d.actual_quality, d.status, d.progress, d.file_path, d.file_size,
             d.error, d.part_path, d.total_bytes, d.created_at, d.updated_at,
             t.id, t.platform, t.title, t.singer, t.album, t.duration_ms, t.music_id,
-            t.start_ms, t.end_ms";
+            t.start_ms, t.end_ms, t.recording_version, t.isrc, t.duration_reliable";
 
 /// 把一行下载任务映射成 `DownloadTask`。轨道主键解析失败返回 None（脏数据跳过）。
 fn map_download_row(row: &rusqlite::Row<'_>) -> Result<Option<DownloadTask>, rusqlite::Error> {
@@ -224,7 +224,7 @@ fn map_download_row(row: &rusqlite::Row<'_>) -> Result<Option<DownloadTask>, rus
             album: row.get(16)?,
             pic_url: String::new(),
             duration: row.get::<_, Option<i64>>(17)?.unwrap_or(0) as f64 / 1000.0,
-            music_id: row.get(18)?,
+            recording: recording_from_row(row)?, music_id: row.get(18)?,
             start_ms: row.get::<_, Option<i64>>(19)?.and_then(|v| u64::try_from(v).ok()),
             end_ms: row.get::<_, Option<i64>>(20)?.and_then(|v| u64::try_from(v).ok()),
         },

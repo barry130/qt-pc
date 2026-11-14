@@ -232,7 +232,7 @@ pub(crate) fn list_top_tracks(
     let mut stmt = conn.prepare(
         "SELECT s.play_count, s.last_played_at, s.total_played_ms,
                 t.id, t.platform, t.title, t.singer, t.album, t.pic_url,
-                t.duration_ms, t.music_id, t.start_ms, t.end_ms
+                t.duration_ms, t.music_id, t.start_ms, t.end_ms, t.recording_version, t.isrc, t.duration_reliable
            FROM play_stats s JOIN tracks t ON t.id = s.track_id
           ORDER BY s.play_count DESC, s.last_played_at DESC
           LIMIT ?1",
@@ -256,7 +256,7 @@ pub(crate) fn list_top_tracks(
                 album: row.get(7)?,
                 pic_url: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
                 duration: row.get::<_, Option<i64>>(9)?.unwrap_or(0) as f64 / 1000.0,
-                music_id: row.get(10)?,
+                recording: recording_from_row(row)?, music_id: row.get(10)?,
                 start_ms: row.get::<_, Option<i64>>(11)?.and_then(|v| u64::try_from(v).ok()),
                 end_ms: row.get::<_, Option<i64>>(12)?.and_then(|v| u64::try_from(v).ok()),
             },
@@ -332,7 +332,7 @@ fn stat_item_from_row(row: &rusqlite::Row<'_>) -> Result<Option<PlayStatItem>, r
             album: row.get(7)?,
             pic_url: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
             duration: row.get::<_, Option<i64>>(9)?.unwrap_or(0) as f64 / 1000.0,
-            music_id: row.get(10)?,
+            recording: recording_from_row(row)?, music_id: row.get(10)?,
             start_ms: row.get::<_, Option<i64>>(11)?.and_then(|v| u64::try_from(v).ok()),
             end_ms: row.get::<_, Option<i64>>(12)?.and_then(|v| u64::try_from(v).ok()),
         },
@@ -352,7 +352,7 @@ pub(crate) fn list_recent_tracks(
 ) -> Result<Vec<Track>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT substr(t.id, instr(t.id, ':') + 1), t.platform, t.title, t.singer,
-                t.album, t.pic_url, t.duration_ms, t.music_id, t.start_ms, t.end_ms
+                t.album, t.pic_url, t.duration_ms, t.music_id, t.start_ms, t.end_ms, t.recording_version, t.isrc, t.duration_reliable
            FROM play_stats s
            JOIN tracks t ON t.id = s.track_id
           WHERE s.last_played_at >= ?1 AND t.missing = 0
@@ -390,7 +390,7 @@ pub(crate) fn list_most_played_tracks(
     let mut stmt = conn.prepare(
         "SELECT s.play_count, s.last_played_at, s.total_played_ms,
                 t.id, t.platform, t.title, t.singer, t.album, t.pic_url,
-                t.duration_ms, t.music_id, t.start_ms, t.end_ms
+                t.duration_ms, t.music_id, t.start_ms, t.end_ms, t.recording_version, t.isrc, t.duration_reliable
            FROM play_stats s JOIN tracks t ON t.id = s.track_id
           WHERE s.play_count >= ?1 AND t.missing = 0
           ORDER BY s.play_count DESC, s.last_played_at DESC
@@ -417,7 +417,7 @@ pub(crate) fn list_unreplayed_tracks(
     let mut stmt = conn.prepare(
         "SELECT s.play_count, s.last_played_at, s.total_played_ms,
                 t.id, t.platform, t.title, t.singer, t.album, t.pic_url,
-                t.duration_ms, t.music_id, t.start_ms, t.end_ms
+                t.duration_ms, t.music_id, t.start_ms, t.end_ms, t.recording_version, t.isrc, t.duration_reliable
            FROM play_stats s JOIN tracks t ON t.id = s.track_id
           WHERE s.play_count >= ?1 AND s.last_played_at < ?2 AND t.missing = 0
           ORDER BY s.last_played_at ASC
@@ -472,7 +472,7 @@ pub(crate) fn list_late_night_tracks(
 ) -> Result<Vec<Track>, rusqlite::Error> {
     let sql = format!(
         "SELECT substr(t.id, instr(t.id, ':') + 1), t.platform, t.title, t.singer,
-                t.album, t.pic_url, t.duration_ms, t.music_id, t.start_ms, t.end_ms
+                t.album, t.pic_url, t.duration_ms, t.music_id, t.start_ms, t.end_ms, t.recording_version, t.isrc, t.duration_reliable
            FROM play_stats s
            JOIN tracks t ON t.id = s.track_id
           WHERE t.missing = 0 AND ({})
@@ -520,7 +520,7 @@ pub(crate) fn list_favorite_tracks_by_plays(
 ) -> Result<Vec<Track>, rusqlite::Error> {
     let mut stmt = conn.prepare(
         "SELECT substr(t.id, instr(t.id, ':') + 1), t.platform, t.title, t.singer,
-                t.album, t.pic_url, t.duration_ms, t.music_id, t.start_ms, t.end_ms
+                t.album, t.pic_url, t.duration_ms, t.music_id, t.start_ms, t.end_ms, t.recording_version, t.isrc, t.duration_reliable
            FROM liked_songs l
            JOIN play_stats s ON s.track_id = l.id
            JOIN tracks t ON t.id = l.id

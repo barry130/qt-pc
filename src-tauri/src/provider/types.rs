@@ -131,6 +131,18 @@ impl std::fmt::Display for Quality {
     }
 }
 
+/// Optional recording evidence survives IPC and persistence without changing track identity.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecordingMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isrc: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_reliable: Option<bool>,
+}
+
 /// 统一 Track 模型。`platform` 字段名与 Astral 收藏接口 / 移动端保持一致。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -146,6 +158,8 @@ pub struct Track {
     pub duration: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub music_id: Option<String>,
+    #[serde(flatten, default)]
+    pub recording: RecordingMetadata,
     /// 本地 CUE 分轨（第二波）：子轨在所属音频文件内的**起始**偏移（毫秒）。
     /// None = 普通曲目（在线 / 本地整轨），序列化省略，老前端与老库无感。
     /// 播放侧语义：引擎从 start_ms 起播、到 end_ms 自然切下一首（区间接入
@@ -285,7 +299,7 @@ mod tests {
             album: "a".into(),
             pic_url: String::new(),
             duration: 1.0,
-            music_id: None,
+            recording: Default::default(), music_id: None,
             start_ms: None,
             end_ms: None,
         };
@@ -324,7 +338,7 @@ mod tests {
             album: "专辑".into(),
             pic_url: String::new(),
             duration: 200.0,
-            music_id: None,
+            recording: Default::default(), music_id: None,
             start_ms: None,
             end_ms: None,
         };

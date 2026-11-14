@@ -2350,7 +2350,7 @@ pub async fn cmd_open_local_paths(
             album: row.album.clone(),
             pic_url: String::new(),
             duration: row.duration_ms as f64 / 1000.0,
-            music_id: None,
+            recording: Default::default(), music_id: None,
             start_ms: row.start_ms,
             end_ms: row.end_ms,
         })
@@ -5512,7 +5512,7 @@ pub async fn cmd_like_apply(
                             .filter(|pic| !pic.is_empty())
                             .unwrap_or_else(|| local_pic.unwrap_or_default()),
                         duration: local_duration_ms.unwrap_or(0) as f64 / 1000.0,
-                        music_id: if c.hash.is_empty() {
+                        recording: Default::default(), music_id: if c.hash.is_empty() {
                             None
                         } else {
                             Some(c.hash.clone())
@@ -5997,7 +5997,7 @@ pub async fn cmd_like_reconcile(
             album: album.clone(),
             pic_url: pic.clone(),
             duration: 0.0,
-            music_id: if hash.is_empty() {
+            recording: Default::default(), music_id: if hash.is_empty() {
                 None
             } else {
                 Some(hash.clone())
@@ -7237,7 +7237,7 @@ mod tests {
             album: String::new(),
             pic_url: String::new(),
             duration: 0.0,
-            music_id: None,
+            recording: Default::default(), music_id: None,
             start_ms: None,
             end_ms: None,
         }

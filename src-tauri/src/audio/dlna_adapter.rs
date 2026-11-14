@@ -865,7 +865,7 @@ mod tests {
             album: String::new(),
             pic_url: String::new(),
             duration: 1.0,
-            music_id: None,
+            recording: Default::default(), music_id: None,
             start_ms: None,
             end_ms: None,
         }

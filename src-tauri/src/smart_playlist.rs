@@ -276,7 +276,7 @@ pub(crate) fn resolve(
 
     let mut sql = String::from(
         "SELECT substr(t.id, instr(t.id, ':') + 1) AS sid, t.platform, t.title, t.singer,
-                t.album, t.pic_url, t.duration_ms, t.music_id, t.start_ms, t.end_ms
+                t.album, t.pic_url, t.duration_ms, t.music_id, t.start_ms, t.end_ms, t.recording_version, t.isrc, t.duration_reliable
            FROM tracks t
            LEFT JOIN play_stats ps ON ps.track_id = t.id
            LEFT JOIN track_ratings r ON r.key = t.id
@@ -485,7 +485,7 @@ mod tests {
                 album: "专辑".to_string(),
                 pic_url: String::new(),
                 duration: 200.0,
-                music_id: None,
+                recording: Default::default(), music_id: None,
                 start_ms: None,
                 end_ms: None,
             };

@@ -37,6 +37,9 @@ export interface Track {
   /** 秒（移动端同口径） */
   duration: number;
   musicId?: string | null;
+  version?: string;
+  isrc?: string;
+  durationReliable?: boolean;
   /** 本地曲目：文件大小（字节）；在线曲目无。供本地库按大小排序 */
   fileSize?: number | null;
   /** 本地曲目：文件修改时间（秒）；在线曲目无。供本地库按修改时间排序 */
@@ -351,6 +354,7 @@ export interface Playlist {
   description: string | null;
   /** 仅详情接口填充 */
   tracks?: Track[];
+  complete?: boolean;
 }
 
 /** 歌手（搜索歌手结果） */
@@ -402,6 +406,8 @@ export interface PlayTarget {
 export interface QueueCommitReply {
   applied: boolean;
   target: PlayTarget | null;
+  /** Applied structural queue ownership; omitted by legacy/rejected receipts. */
+  queueRevision?: number;
 }
 
 /** 对齐 Rust `PlaybackState`（DESIGN §7.2 全量快照） */
@@ -528,12 +534,14 @@ export interface RegistrySource {
    * 无损——flac 档只是最高档 AAC，就不展示 flac）。未声明（旧包）= 全部档位。
    */
   qualities?: string[];
+  /** Account-specific upstream recommendations. Missing/false means unsupported (old packs). */
+  accountRecommendations?: { daily?: boolean; fm?: boolean };
   /** 歌单广场排序选项（v5 契约；id 原样透传给 recommendations；空 = 不支持） */
   playlistSorts?: { id: string; name: string }[];
   /**
    * 账号登录能力自述（v9 契约）：该源支不支持登录、用什么方式
    * （qrcode = 官方扫码；cookie = 手动导入 Cookie）。宿主据此显隐
-   * 「设置 → 音源包 → 音源账号」里该源的登录入口；未声明（旧包）= 不支持，
+   * 「音源平台管理」页（侧边栏，/source-accounts）里该源的登录入口；未声明（旧包）= 不支持，
    * 整个账号区块只显示已存账号的退出入口。domains 是凭据注入的域名范围，
    * 纯展示用途（真正的注入表在数据包内）。
    */
@@ -599,6 +607,7 @@ export interface RegistryQuality {
 export interface SourceRegistry {
   sources: RegistrySource[];
   qualities: RegistryQuality[];
+  sourcePolicyVersion?: number;
 }
 
 /** 外观偏好（DESIGN §9.2 AppearancePreference，存 SQLite settings 表） */

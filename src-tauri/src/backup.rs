@@ -1021,7 +1021,7 @@ mod tests {
 
     #[test]
     fn public_import_v25_into_nonempty_merge_preserves_conflicts_and_source() {
-        assert_eq!(crate::db::migrations::CURRENT_VERSION, 28, "fixture removes only the known v26-v28 podcast additions");
+        assert_eq!(crate::db::migrations::CURRENT_VERSION, 29, "fixture removes known v26-v29 additions");
         let directory = OwnedImportDirectory::new("v25-merge");
         let backup_path = directory.0.join("old-v25.db");
         {
@@ -1035,6 +1035,7 @@ mod tests {
             let old = Connection::open(&backup_path).unwrap();
             // Build the actual pre-podcast schema, not a current database with a renamed version stamp.
             old.execute_batch("DROP TABLE podcast_subtitles; DROP TABLE podcast_episodes; DROP TABLE podcast_shows;
+                ALTER TABLE tracks DROP COLUMN recording_version; ALTER TABLE tracks DROP COLUMN isrc; ALTER TABLE tracks DROP COLUMN duration_reliable;
                 DELETE FROM schema_migrations WHERE version >= 26; PRAGMA journal_mode = DELETE;").unwrap();
             assert_eq!(old.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 25);
             assert_eq!(old.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('podcast_shows', 'podcast_episodes', 'podcast_subtitles', 'idx_podcast_episodes_show')", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
@@ -1076,7 +1077,7 @@ mod tests {
 
     #[test]
     fn public_import_v25_into_nonempty_replace_keeps_actual_safety_snapshot() {
-        assert_eq!(crate::db::migrations::CURRENT_VERSION, 28, "fixture removes only the known v26-v28 podcast additions");
+        assert_eq!(crate::db::migrations::CURRENT_VERSION, 29, "fixture removes known v26-v29 additions");
         let directory = OwnedImportDirectory::new("v25-replace");
         let backup_path = directory.0.join("old-v25.db");
         {
@@ -1089,6 +1090,7 @@ mod tests {
         {
             let old = Connection::open(&backup_path).unwrap();
             old.execute_batch("DROP TABLE podcast_subtitles; DROP TABLE podcast_episodes; DROP TABLE podcast_shows;
+                ALTER TABLE tracks DROP COLUMN recording_version; ALTER TABLE tracks DROP COLUMN isrc; ALTER TABLE tracks DROP COLUMN duration_reliable;
                 DELETE FROM schema_migrations WHERE version >= 26; PRAGMA journal_mode = DELETE;").unwrap();
             assert_eq!(old.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 25);
             assert_eq!(old.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('podcast_shows', 'podcast_episodes', 'podcast_subtitles', 'idx_podcast_episodes_show')", [], |row| row.get::<_, i64>(0)).unwrap(), 0);

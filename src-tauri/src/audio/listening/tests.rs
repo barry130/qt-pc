@@ -98,7 +98,7 @@ fn track(platform: &str, title: &str) -> Track {
         album: "owned album".into(),
         pic_url: String::new(),
         duration: 60.0,
-        music_id: None,
+        recording: Default::default(), music_id: None,
         start_ms: None,
         end_ms: None,
     }

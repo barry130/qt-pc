@@ -31,7 +31,7 @@ pub(crate) fn sample_track_with(title: &str, singer: &str) -> Track {
         album: "测试专辑".to_string(),
         pic_url: String::new(),
         duration: 210.0,
-        music_id: None,
+        recording: Default::default(), music_id: None,
         start_ms: None,
         end_ms: None,
     }
@@ -46,9 +46,36 @@ fn track(id: &str, title: &str) -> Track {
         album: "测试专辑".to_string(),
         pic_url: String::new(),
         duration: 210.0,
-        music_id: None,
+        recording: Default::default(), music_id: None,
         start_ms: None,
         end_ms: None,
+    }
+}
+
+#[test]
+fn recording_evidence_survives_persistence_and_legacy_sync() {
+    let conn = test_conn();
+    let mut t = track("recording", "Song");
+    t.recording.version = Some("Live".into());
+    t.recording.isrc = Some("TEST0001".into());
+    t.recording.duration_reliable = Some(false);
+    let pid = create_playlist(&conn, "Recordings").unwrap();
+    add_tracks_to_playlist(&conn, &pid, std::slice::from_ref(&t)).unwrap();
+    record_play_history(&conn, &t).unwrap();
+    save_queue(&conn, std::slice::from_ref(&t)).unwrap();
+    create_download_task(&conn, &t, "320", None, None).unwrap();
+    let mut legacy = t.clone();
+    legacy.recording = Default::default();
+    upsert_tracks(&conn, &[&legacy]).unwrap();
+    let results = [get_playlist_tracks(&conn, &pid).unwrap()[0].clone(),
+        list_play_history(&conn, 10).unwrap()[0].track.clone(),
+        load_session(&conn).unwrap().unwrap().tracks[0].clone(),
+        list_download_tasks(&conn).unwrap()[0].track.clone()];
+    for saved in results {
+        let value = serde_json::to_value(&saved).unwrap();
+        assert_eq!(value["version"], "Live");
+        assert_eq!(value["isrc"], "TEST0001");
+        assert_eq!(value["durationReliable"], false);
     }
 }
 
@@ -934,7 +961,7 @@ fn play_stats_skips_local_track_missing_from_library() {
         album: String::new(),
         pic_url: String::new(),
         duration: 180.0,
-        music_id: None,
+        recording: Default::default(), music_id: None,
         start_ms: None,
         end_ms: None,
     };
@@ -956,7 +983,7 @@ fn lists_keep_track_cover_url() {
         album: "测试专辑".to_string(),
         pic_url: COVER.to_string(),
         duration: 210.0,
-        music_id: None,
+        recording: Default::default(), music_id: None,
         start_ms: None,
         end_ms: None,
     };
@@ -1012,7 +1039,7 @@ fn foreign_local_song_lands_in_liked_playlist() {
         album: "某专辑".to_string(),
         pic_url: String::new(),
         duration: 0.0,
-        music_id: None,
+        recording: Default::default(), music_id: None,
         start_ms: None,
         end_ms: None,
     };

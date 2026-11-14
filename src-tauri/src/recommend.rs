@@ -237,7 +237,7 @@ mod tests {
             album: "测试专辑".to_string(),
             pic_url: pic_url.to_string(),
             duration: 210.0,
-            music_id: None,
+            recording: Default::default(), music_id: None,
             start_ms: None,
             end_ms: None,
         }

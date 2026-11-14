@@ -266,7 +266,8 @@ fn query_report(
              SELECT substr(t.id, instr(t.id, ':') + 1), t.platform, t.title,
                     t.singer, t.album, t.pic_url, t.duration_ms, t.music_id,
                     t.start_ms, t.end_ms,
-                    t.id, s.play_count, s.total_played_ms, s.last_played_at
+                    t.id, s.play_count, s.total_played_ms, s.last_played_at,
+                    t.recording_version, t.isrc, t.duration_reliable
                {FROM_SOURCE}
               {filter}
               ORDER BY {} LIMIT ?3 OFFSET ?4",

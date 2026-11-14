@@ -95,7 +95,7 @@ pub(crate) fn list_play_history(
     let limit = if limit == 0 { 100 } else { limit };
     let mut stmt = conn.prepare(
         "SELECT h.played_at, t.id, t.platform, t.title, t.singer, t.album,
-                t.pic_url, t.duration_ms, t.music_id, t.start_ms, t.end_ms
+                t.pic_url, t.duration_ms, t.music_id, t.start_ms, t.end_ms, t.recording_version, t.isrc, t.duration_reliable
            FROM play_history h
            JOIN tracks t ON t.id = h.track_id
           WHERE t.missing = 0
@@ -118,7 +118,7 @@ pub(crate) fn list_play_history(
                 album: row.get(5)?,
                 pic_url: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                 duration: row.get::<_, Option<i64>>(7)?.unwrap_or(0) as f64 / 1000.0,
-                music_id: row.get(8)?,
+                recording: recording_from_row(row)?, music_id: row.get(8)?,
                 start_ms: row.get::<_, Option<i64>>(9)?.and_then(|v| u64::try_from(v).ok()),
                 end_ms: row.get::<_, Option<i64>>(10)?.and_then(|v| u64::try_from(v).ok()),
             },

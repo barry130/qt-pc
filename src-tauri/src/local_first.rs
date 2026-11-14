@@ -387,7 +387,7 @@ pub async fn find_local_substitute(
                 album: broken.album.clone(),
                 pic_url: String::new(),
                 duration: if hit.duration_ms > 0 { hit.duration_ms as f64 / 1000.0 } else { broken.duration },
-                music_id: None,
+                recording: Default::default(), music_id: None,
                 start_ms: None,
                 end_ms: None,
             };
@@ -499,7 +499,7 @@ mod tests {
             album: String::new(),
             pic_url: String::new(),
             duration,
-            music_id: None,
+            recording: Default::default(), music_id: None,
             start_ms: None,
             end_ms: None,
         }
