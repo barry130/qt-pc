@@ -149,6 +149,7 @@ pub struct RangeShared {
     /// 403 text/html，表现为"取链成功、播放打不开"。
     referer: String,
     file_path: PathBuf,
+    _cache_guard: crate::cache::ActiveCacheFile,
     supports_ranges: bool,
     ready: Mutex<ReadySpans>,
     ready_cv: Condvar,
@@ -296,12 +297,13 @@ pub fn open(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
 
-    let (file_path, file) = create_buffer_file(cache_dir, url)?;
+    let (file_path, file, cache_guard) = create_buffer_file(cache_dir, url)?;
 
     let shared = Arc::new(RangeShared {
         url: url.to_string(),
         referer: referer.to_string(),
         file_path: file_path.clone(),
+        _cache_guard: cache_guard,
         supports_ranges,
         ready: Mutex::new(ReadySpans::default()),
         ready_cv: Condvar::new(),
@@ -771,10 +773,11 @@ impl HttpRangeReader {
 
 /// Each decoder needs its own bytes and readiness map. Gapless OneLoop can
 /// prepare the same URL while the current decoder is still reading it.
-fn create_buffer_file(cache_dir: &Path, url: &str) -> io::Result<(PathBuf, File)> {
+fn create_buffer_file(cache_dir: &Path, url: &str) -> io::Result<(PathBuf, File, crate::cache::ActiveCacheFile)> {
     let hash = sha1_hex(url);
     loop {
         let path = cache_dir.join(format!("{hash}-{:016x}.part", fastrand::u64(..)));
+        let guard = crate::cache::ActiveCacheFile::protect(&path);
         let mut options = OpenOptions::new();
         options.read(true).write(true).create_new(true);
         // Cache pruning also runs while a successor is queued. Keep both active
@@ -787,7 +790,7 @@ fn create_buffer_file(cache_dir: &Path, url: &str) -> io::Result<(PathBuf, File)
             options.share_mode(FILE_SHARE_READ_WRITE);
         }
         match options.open(&path) {
-            Ok(file) => return Ok((path, file)),
+            Ok(file) => return Ok((path, file, guard)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
         }
@@ -917,10 +920,10 @@ mod tests {
     #[test]
     fn repeated_url_buffers_preserve_independent_bytes() {
         let dir = OwnedTestDir::new();
-        let (first_path, mut first) =
+        let (first_path, mut first, _first_guard) =
             create_buffer_file(&dir.0, "https://audio.test/same.flac").unwrap();
         first.write_all(b"current audio bytes").unwrap();
-        let (next_path, mut next) =
+        let (next_path, mut next, _next_guard) =
             create_buffer_file(&dir.0, "https://audio.test/same.flac").unwrap();
         next.write_all(b"preloaded audio").unwrap();
         assert_ne!(first_path, next_path);

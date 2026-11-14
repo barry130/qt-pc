@@ -7,6 +7,46 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
+fn active_files() -> &'static Mutex<HashMap<PathBuf, usize>> {
+    static ACTIVE: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn file_key(path: &Path) -> PathBuf {
+    path.parent().and_then(|p| p.canonicalize().ok())
+        .zip(path.file_name()).map(|(p, name)| p.join(name))
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+/// Held by the shared reader/downloader state, including gapless preload.
+pub struct ActiveCacheFile(PathBuf);
+impl ActiveCacheFile {
+    pub fn protect(path: &Path) -> Self {
+        let key = file_key(path);
+        *active_files().lock().unwrap_or_else(|p| p.into_inner()).entry(key.clone()).or_default() += 1;
+        Self(key)
+    }
+}
+impl Drop for ActiveCacheFile {
+    fn drop(&mut self) {
+        let mut active = active_files().lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(count) = active.get_mut(&self.0) {
+            *count -= 1;
+            if *count == 0 { active.remove(&self.0); }
+        }
+    }
+}
+
+/// Check and deletion share the registration lock; a new writer cannot race cleanup.
+fn remove_inactive(path: &Path) -> io::Result<bool> {
+    let active = active_files().lock().unwrap_or_else(|p| p.into_inner());
+    if active.contains_key(&file_key(path)) { return Ok(false); }
+    std::fs::remove_file(path)?;
+    Ok(true)
+}
 
 /// settings 键：播放缓存上限（MB；"0" = 不限）。引擎侧写入（SetCacheLimit），
 /// 设置页读它做回显。
@@ -70,12 +110,13 @@ pub fn prune_audio_cache(dir: &Path, limit_mb: u64, keep: Option<&Path>) -> (u64
         if keep.is_some_and(|k| k == f.path) {
             continue;
         }
-        match std::fs::remove_file(&f.path) {
-            Ok(()) => {
+        match remove_inactive(&f.path) {
+            Ok(true) => {
                 remaining -= f.size;
                 freed += f.size;
                 removed += 1;
             }
+            Ok(false) => {}
             Err(e) => {
                 log::warn!("[cache] 跳过删除失败文件 {}: {e}", f.path.display());
             }
@@ -101,12 +142,14 @@ fn collect_files(dir: &Path) -> io::Result<Vec<CacheFile>> {
             let path = entry.path();
             if ft.is_dir() {
                 stack.push(path);
-            } else if let Ok(meta) = entry.metadata() {
-                out.push(CacheFile {
-                    size: meta.len(),
-                    modified: meta.modified().ok(),
-                    path,
-                });
+            } else if ft.is_file() {
+                if let Ok(meta) = entry.metadata() {
+                    out.push(CacheFile {
+                        size: meta.len(),
+                        modified: meta.modified().ok(),
+                        path,
+                    });
+                }
             }
         }
     }
@@ -148,13 +191,15 @@ pub fn clear_dir_files(dir: &Path, skip: Option<&Path>) -> (u64, u64) {
                 stack.push(path);
                 continue;
             }
+            if !ft.is_file() { continue; }
             // 元数据先读再删：删掉后就查不到大小了
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             if skip.is_some_and(|s| s == path) {
                 continue;
             }
-            match std::fs::remove_file(&path) {
-                Ok(()) => freed += size,
+            match remove_inactive(&path) {
+                Ok(true) => freed += size,
+                Ok(false) => {}
                 Err(e) => {
                     // 文件可能刚好被并发使用：计入失败，不算错误
                     log::warn!("[cache] 跳过删除失败文件 {}: {e}", path.display());
@@ -191,6 +236,25 @@ pub fn dir_stats(dir: &Path) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_readers_preload_and_writers_survive_clear_until_last_guard_drops() {
+        let dir = crate::lyric_access::native_fixture::NativeFixture::new("active-cache");
+        let current = write_file(&dir, "current.part", 600 * 1024);
+        let next = write_file(&dir, "next.part", 600 * 1024);
+        let current_guard = ActiveCacheFile::protect(&current);
+        let next_reader = ActiveCacheFile::protect(&next);
+        let next_writer = ActiveCacheFile::protect(&next);
+        assert_eq!(prune_audio_cache(&dir, 1, None), (0, 0));
+        assert_eq!(clear_dir_files(&dir, None), (0, 0));
+        drop(next_reader);
+        assert_eq!(clear_dir_files(&dir, None), (0, 0));
+        drop(next_writer);
+        assert_eq!(clear_dir_files(&dir, None), (600 * 1024, 0));
+        assert!(current.exists());
+        drop(current_guard);
+        assert_eq!(clear_dir_files(&dir, None), (600 * 1024, 0));
+    }
 
     fn write_file(dir: &Path, name: &str, len: usize) -> PathBuf {
         let path = dir.join(name);
