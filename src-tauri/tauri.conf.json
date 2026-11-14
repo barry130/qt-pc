@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "QuietMusic",
-  "version": "3.0.9",
+  "version": "3.1.0",
   "identifier": "com.qt.quietmusic",
   "build": {
     "beforeDevCommand": "pnpm dev",
