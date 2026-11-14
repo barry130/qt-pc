@@ -201,6 +201,10 @@
 .qt-gallery-caption > :first-child { flex-shrink: 0; }
 .qt-gallery-caption > :last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .qt-focus-lyrics {
+  position: relative;
+  overflow: hidden;
+  overscroll-behavior: contain;
+  touch-action: pan-x;
   display: flex;
   height: 100%;
   min-height: 0;
@@ -226,7 +230,22 @@
   transition: color var(--motion-fast);
 }
 .qt-focus-neighbor button:hover { color: var(--foreground); }
-.qt-focus-current { min-height: 0; overflow-y: auto; scrollbar-width: thin; }
+.qt-focus-current { min-height: 0; overflow-y: auto; scrollbar-width: none; }
+.qt-focus-current::-webkit-scrollbar { display: none; }
+.qt-focus-seek { width: 100%; color: inherit; font: inherit; text-align: inherit; }
+.qt-focus-resume {
+  position: absolute;
+  bottom: 0.75rem;
+  left: 50%;
+  transform: translateX(-50%);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.25rem 0.75rem;
+  background: var(--background);
+  color: var(--muted-foreground);
+  font-size: 0.75rem;
+}
+.qt-focus-resume:hover { color: var(--foreground); }
 .qt-focus-text {
   font-size: clamp(1.5rem, calc(var(--focus-font-size) * 2.4), 5rem);
   font-weight: 600;

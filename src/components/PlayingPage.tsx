@@ -801,9 +801,13 @@ const PlaybackLyrics = memo(function PlaybackLyrics(props: {
   return style === "rhythm" ? (
     <RhythmLyrics lines={lines} activeIndex={activeIndex} positionMs={position} durationMs={durationMs - offsetMs}
       playing={playing} fontSize={fontSize} onSeekMs={seek} />
-  ) : style === "gallery" || style === "focus" ? (
-    <FocusLyrics lines={lines} activeIndex={activeIndex} positionMs={position} fontSize={fontSize} variant={style} onSeekMs={seek} />
+  ) : style === "focus" ? (
+    // 纯净保留原三句视窗；滚轮/触摸翻阅整首歌词，不复用经典列表布局。
+    <FocusLyrics lines={lines} activeIndex={activeIndex} positionMs={position} fontSize={fontSize} variant="focus" onSeekMs={seek} />
   ) : (
+    // classic 与 gallery（2026-11-14 用户：专辑画廊也显示全部歌词，并保留经典
+    // 唱片的歌词操作——拖动定位、点行跳播、手动翻词后的「回到当前行」、逐字
+    // 染色全都来自同一个 LyricScroller）。
     <LyricScroller lines={lines} activeIndex={activeIndex} positionMs={position} seekOffsetMs={offsetMs}
       fontSize={fontSize} onSeekMs={seek} />
   );

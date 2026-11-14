@@ -169,7 +169,7 @@ describe("播放页背景独立保存", () => {
 });
 
 describe("画廊和纯净歌词", () => {
-  it.each(["gallery", "focus"] as const)("%s 同步当前句和译文，支持跳转上下句、前奏与间奏", (variant) => {
+  it.each(["gallery", "focus"] as const)("%s 保留三句布局、逐字染色、译文及上下句跳播", (variant) => {
     // jsdom 不解析包含 CSS 变量的渐变，直接观察交给浏览器的词内填充值。
     const gradients = vi.spyOn(CSSStyleDeclaration.prototype, "backgroundImage", "set");
     const lines = [{ timeMs: 1000, text: "开头" }, { timeMs: 3000, text: "" },
@@ -179,17 +179,25 @@ describe("画廊和纯净歌词", () => {
     const base = { lines, fontSize: 20, variant, onSeekMs: seek };
     const view = render(<FocusLyrics {...base} activeIndex={-1} positionMs={0} />);
     expect(screen.getByRole("group", { name: "开头" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "跳到下一句：你好" })).toBeTruthy();
+    expect(screen.queryByText("世界")).toBeNull();
+    // 焦点行巨字 + 逐字染色 + 译文/罗马音。
     view.rerender(<FocusLyrics {...base} activeIndex={2} positionMs={6000} />);
+    expect(screen.getByRole("group", { name: "你好" })).toBeTruthy();
     expect(screen.getByText("Hello")).toBeTruthy();
     expect(screen.getByText("nǐ hǎo")).toBeTruthy();
     expect(gradients).toHaveBeenCalledWith(expect.stringContaining("var(--lyric-highlight) 50%"));
+    expect(view.container.querySelectorAll(".qt-focus-neighbor")).toHaveLength(2);
+    // 保留原来的上下句跳播，不把全曲渲染成等大小字列表。
     fireEvent.click(screen.getByRole("button", { name: "跳到上一句：开头" }));
     fireEvent.click(screen.getByRole("button", { name: "跳到下一句：世界" }));
     expect(seek.mock.calls).toEqual([[1000], [9000]]);
+    // 焦点行切到间奏：group 报「间奏」，旧焦点行的译文随之消失。
     view.rerender(<FocusLyrics {...base} activeIndex={1} positionMs={4000} />);
     expect(screen.getByRole("group", { name: "间奏" })).toBeTruthy();
     expect(screen.queryByText("Hello")).toBeNull();
     view.rerender(<FocusLyrics {...base} activeIndex={3} positionMs={10000} />);
+    expect(screen.getByRole("group", { name: "世界" })).toBeTruthy();
     expect(screen.getByText("尾声")).toBeTruthy();
     gradients.mockRestore();
   });
