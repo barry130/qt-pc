@@ -4,6 +4,9 @@ import { type MessageKey, useT } from "@/lib/i18n";
 import { errMsg } from "@/lib/utils";
 import * as ipc from "@/services/ipc";
 import { type EqParams, type FxState } from "@/types";
+import { PitchControls } from "@/components/player/PitchControl";
+import { usePitchSync } from "@/hooks/usePitchSync";
+import { usePlayerStore } from "@/stores/player";
 import { Segmented, SettingRow, Switch } from "../controls";
 
 /** 预设名在 lib/fx.ts 里是中文标识（下拉 value 必须与之一致），显示时再查词条 */
@@ -22,17 +25,13 @@ export function SoundSection(): React.JSX.Element {
   const tr = useT();
   const [fx, setFx] = useState<FxState | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const casting = usePlayerStore((state) => state.state?.cast != null);
+  usePitchSync(setFx, setError);
   // 滑条拖动会高频触发，统一走本地状态 + 120ms 防抖下发
   const eqTimerRef = useRef<number | null>(null);
 
-  useEffect(() => {
-    void ipc
-      .getFxState()
-      .then(setFx)
-      .catch((err) => setError(errMsg(err)));
-    return () => {
-      if (eqTimerRef.current !== null) window.clearTimeout(eqTimerRef.current);
-    };
+  useEffect(() => () => {
+    if (eqTimerRef.current !== null) window.clearTimeout(eqTimerRef.current);
   }, []);
 
   const pushEq = useCallback((next: EqParams): void => {
@@ -92,6 +91,12 @@ export function SoundSection(): React.JSX.Element {
             void ipc.setReplayGainMode(next).catch((err) => setError(errMsg(err)));
           }}
         />
+      </SettingRow>
+      <SettingRow
+        title={tr("settings.sound.pitch.title")}
+        description={tr(casting ? "settings.sound.pitch.localOnly" : "settings.sound.pitch.desc")}
+      >
+        <PitchControls className="w-64" />
       </SettingRow>
       <SettingRow
         title={tr("settings.sound.fade.title")}

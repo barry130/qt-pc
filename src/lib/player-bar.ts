@@ -120,6 +120,13 @@ export const PLAYER_BAR_BUTTONS: PlayerBarButtonMeta[] = [
     slot: "inline",
   },
   {
+    id: "pitch",
+    label: "升降调",
+    hint: "控制独立变调（-12..+12 半音），不改变播放速度",
+    adminOnly: false,
+    slot: "inline",
+  },
+  {
     id: "share",
     label: "分享",
     hint: "复制歌曲信息（歌名 / 歌手 / 链接）",

@@ -39,6 +39,8 @@ export const messages = defineFragment({
     "settings.playerBar.buttons.artist.hint": "打开当前歌曲的歌手页（按歌手名搜作品）",
     "settings.playerBar.buttons.spectrum.label": "频谱",
     "settings.playerBar.buttons.spectrum.hint": "播放页频谱背景开关",
+    "settings.playerBar.buttons.pitch.label": "升降调",
+    "settings.playerBar.buttons.pitch.hint": "调整本机音高而不改变速度（-12..+12 半音）",
     "settings.playerBar.buttons.equalizer.label": "均衡器",
     "settings.playerBar.buttons.equalizer.hint": "打开均衡器 / 音效设置面板",
     "settings.playerBar.buttons.share.label": "分享",
@@ -88,6 +90,8 @@ export const messages = defineFragment({
     "settings.playerBar.buttons.spectrum.label": "Spectrum",
     "settings.playerBar.buttons.spectrum.hint":
       "Toggle the spectrum background on the playing page",
+    "settings.playerBar.buttons.pitch.label": "Pitch",
+    "settings.playerBar.buttons.pitch.hint": "Adjust local pitch without changing speed (-12..+12 semitones)",
     "settings.playerBar.buttons.equalizer.label": "Equalizer",
     "settings.playerBar.buttons.equalizer.hint": "Open the equalizer / sound settings panel",
     "settings.playerBar.buttons.share.label": "Share",

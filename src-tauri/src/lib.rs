@@ -598,6 +598,7 @@ pub fn run() {
             cmd_set_gapless,
             cmd_set_sleep_timer,
             cmd_get_fx_state,
+            cmd_set_pitch,
             cmd_set_eq,
             cmd_set_loudnorm,
             cmd_set_replay_gain_mode,

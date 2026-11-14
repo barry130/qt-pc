@@ -157,27 +157,83 @@ describe("本地歌单编辑弹窗（改名 + 换封面）", () => {
     expect(screen.getByRole("heading", { level: 2, name: "编辑歌单" })).toBeTruthy();
   });
 
-  it("云端同步失败（每日配额上限）：本地封面生效，弹窗里亮出后端原因", async () => {
+  it("云端同步失败（配额/超限）：本机不更新，预览与缓存保持原样，亮出后端原因", async () => {
+    const old = "data:image/jpeg;base64,T0xE";
+    setCachedPlaylistCover("pl1", old);
+    mocks.getPlaylistCover.mockResolvedValue(old);
     mocks.pickImage.mockResolvedValue("D:/pics/cover.png");
     mocks.setPlaylistCover.mockResolvedValue({
-      path: "data/covers/pl1.png",
+      path: "",
       cloud: "failed",
-      message: "Astral 业务错误(300): 今日上传次数已达上限",
+      message: "Astral 业务错误(300): 上传请求校验失败: 文件大小超过上限（最大 1 MB），请压缩后重试",
     });
-    mocks.getPlaylistCover.mockResolvedValue("data:image/png;base64,QUI=");
     await openEditDialog();
-    const buttons = screen.getAllByRole("button", { name: "更换封面" });
+    const dialog = screen.getByRole("dialog", { name: "编辑歌单" });
+    const preview = within(dialog).getByAltText("");
+    expect(preview.getAttribute("src")).toBe(old);
+    const readsBeforeReplace = mocks.getPlaylistCover.mock.calls.length;
+    const buttons = within(dialog).getAllByRole("button", { name: "更换封面" });
     fireEvent.click(buttons[buttons.length - 1]);
 
     await waitFor(() =>
       expect(mocks.setPlaylistCover).toHaveBeenCalledWith("pl1", "D:/pics/cover.png"),
     );
-    // 本地已生效：走完了读回封面的链路（getPlaylistCover 被调）……
-    await waitFor(() => expect(mocks.getPlaylistCover).toHaveBeenCalledWith("pl1"));
-    // ……同时 alert 里带出云端失败原因，不再静默吞掉
+    // 本机未更新（与头像上传同口径）：预览不动、实际缓存不废、也不读回新封面
+    expect(preview.getAttribute("src")).toBe(old);
+    expect(cachedPlaylistCover("pl1")).toBe(old);
+    expect(mocks.getPlaylistCover.mock.calls.length).toBe(readsBeforeReplace);
+    expect(within(dialog).getByRole("alert").textContent).toBe(
+      "封面未更改，同步云端失败：Astral 业务错误(300): 上传请求校验失败: 文件大小超过上限（最大 1 MB），请压缩后重试",
+    );
+  });
+
+  it("上传过程中有动作反馈：按钮变「上传中…」并禁用，结束后恢复可点", async () => {
+    mocks.pickImage.mockResolvedValue("D:/pics/cover.png");
+    let resolveCover!: (value: { path: string; cloud: string }) => void;
+    mocks.setPlaylistCover.mockImplementationOnce(
+      () => new Promise((resolve) => { resolveCover = resolve; }),
+    );
+    await openEditDialog();
+    const dialog = screen.getByRole("dialog", { name: "编辑歌单" });
+    const change = within(dialog).getByRole("button", { name: "更换封面" });
+    const restore = within(dialog).getByRole("button", { name: "恢复默认封面" });
+    fireEvent.click(change);
+
+    // 进行中：更换按钮显示「上传中…」，两个封面按钮都禁用，防重复请求
+    await waitFor(() =>
+      expect(within(dialog).getByRole("button", { name: "上传中…" })).toBeTruthy(),
+    );
+    expect(restore.hasAttribute("disabled")).toBe(true);
+    await act(async () => { resolveCover({ path: "data/covers/pl1.png", cloud: "synced" }); });
+    await waitFor(() =>
+      expect(within(dialog).getByRole("button", { name: "更换封面" })).toBeTruthy(),
+    );
     expect(
-      screen.getByText(/同步云端失败：Astral 业务错误\(300\): 今日上传次数已达上限/),
-    ).toBeTruthy();
+      within(dialog).getByRole("button", { name: "恢复默认封面" }).hasAttribute("disabled"),
+    ).toBe(false);
+  });
+
+  it("云端清除失败：本机不恢复默认，预览与缓存保持原样，亮出原因", async () => {
+    const old = "data:image/jpeg;base64,T0xE";
+    setCachedPlaylistCover("pl1", old);
+    mocks.getPlaylistCover.mockResolvedValue(old);
+    mocks.clearPlaylistCover.mockResolvedValue({
+      cloud: "failed",
+      message: "Astral 业务错误(500): 云端抖动",
+    });
+    await openEditDialog();
+    const dialog = screen.getByRole("dialog", { name: "编辑歌单" });
+    const preview = within(dialog).getByAltText("");
+    expect(preview.getAttribute("src")).toBe(old);
+    fireEvent.click(within(dialog).getByRole("button", { name: "恢复默认封面" }));
+
+    await waitFor(() => expect(mocks.clearPlaylistCover).toHaveBeenCalledWith("pl1"));
+    // 本机未更新：预览仍是旧封面，缓存不废
+    expect(preview.getAttribute("src")).toBe(old);
+    expect(cachedPlaylistCover("pl1")).toBe(old);
+    expect(within(dialog).getByRole("alert").textContent).toBe(
+      "封面未恢复默认，云端清除失败：Astral 业务错误(500): 云端抖动",
+    );
   });
 
   it("恢复默认封面：调 clearPlaylistCover", async () => {

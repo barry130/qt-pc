@@ -22,6 +22,17 @@ export const messages = defineFragment({
     "settings.sound.replayGain.track": "单曲",
     "settings.sound.replayGain.album": "专辑",
 
+    "settings.sound.pitch.title": "升降调",
+    "settings.sound.pitch.desc": "独立变调不变速，±12 半音；0 为原调，立即应用并记忆",
+    "settings.sound.pitch.slider": "升降调（半音）",
+    "settings.sound.pitch.lower": "降低一个半音",
+    "settings.sound.pitch.raise": "升高一个半音",
+    "settings.sound.pitch.reset": "恢复原调",
+    "settings.sound.pitch.current": "升降调：{value} 半音",
+    "settings.sound.pitch.localOnly": "仅本机播放；DLNA 远端不变调，设定将在下次本机播放时应用",
+    "settings.sound.pitch.unit": "半音",
+    "settings.sound.pitch.close": "关闭升降调菜单",
+
     "settings.sound.fade.title": "淡入淡出",
     "settings.sound.fade.desc": "暂停淡出、恢复淡入",
 
@@ -58,6 +69,17 @@ export const messages = defineFragment({
     "settings.sound.replayGain.off": "Off",
     "settings.sound.replayGain.track": "Track",
     "settings.sound.replayGain.album": "Album",
+
+    "settings.sound.pitch.title": "Pitch",
+    "settings.sound.pitch.desc": "Independent pitch shift without changing speed; ±12 semitones, 0 is original. Applies immediately and persists.",
+    "settings.sound.pitch.slider": "Pitch shift (semitones)",
+    "settings.sound.pitch.lower": "Lower by one semitone",
+    "settings.sound.pitch.raise": "Raise by one semitone",
+    "settings.sound.pitch.reset": "Reset to original pitch",
+    "settings.sound.pitch.current": "Pitch: {value} semitones",
+    "settings.sound.pitch.localOnly": "Local playback only. DLNA audio is not pitch-shifted; this setting applies next time you play locally.",
+    "settings.sound.pitch.unit": "semitones",
+    "settings.sound.pitch.close": "Close pitch menu",
 
     "settings.sound.fade.title": "Fade",
     "settings.sound.fade.desc": "Fade out on pause, fade in on resume",

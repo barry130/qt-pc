@@ -1049,9 +1049,14 @@ export async function setSleepTimer(
   return invoke("set_sleep_timer", { remainingMs, afterTrack });
 }
 
-/** 当前音效设置（均衡器 / 响度归一化 / 淡入淡出） */
+/** 当前音效设置（均衡器 / 响度归一化 / 淡入淡出 / 独立变调） */
 export async function getFxState(): Promise<FxState> {
   return invoke("get_fx_state");
+}
+
+/** 独立变调（-12..+12 整数半音），立即应用并持久化，返回后端规范化后的实际值。 */
+export async function setPitch(semitones: number): Promise<number> {
+  return invoke<number>("set_pitch", { semitones });
 }
 
 /** 整体替换均衡器参数并持久化 */
@@ -1553,13 +1558,13 @@ export interface PlaylistCoverCloudResult {
   message?: string | null;
 }
 
-/** set_playlist_cover 回执：本地封面已生效，cloud 说明云端同步结果 */
+/** set_playlist_cover 回执：cloud 说明云端同步结果；failed 时本机未更新 */
 export interface PlaylistCoverSetResult extends PlaylistCoverCloudResult {
-  /** 本地封面文件路径 */
+  /** 本地封面文件路径（云端失败时为空——本机未更新） */
   path: string;
 }
 
-/** 设置本地自建歌单封面：选中的图片复制进应用数据目录并登记；云端失败不回滚本地，见回执 */
+/** 设置本地自建歌单封面：登录态下先上传云端、成功才落本机（与头像上传同口径）；云端失败本机不更新 */
 export async function setPlaylistCover(
   pid: string,
   filePath: string,
@@ -1572,7 +1577,7 @@ export async function getPlaylistCover(pid: string): Promise<string | null> {
   return invoke("get_playlist_cover", { pid });
 }
 
-/** 清除本地歌单封面（回默认封面链）：清登记 + 删封面文件；登录时顺带清云端，结果见回执 */
+/** 清除本地歌单封面（回默认封面链）：登录态下先清云端、成功才清本机；云端失败本机不更新 */
 export async function clearPlaylistCover(pid: string): Promise<PlaylistCoverCloudResult> {
   return invoke("clear_playlist_cover", { pid });
 }

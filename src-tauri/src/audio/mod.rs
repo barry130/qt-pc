@@ -6,6 +6,8 @@
 
 pub mod engine;
 pub mod fx;
+mod pitch;
+pub mod pitch_setting;
 pub mod listening;
 pub mod play_intent;
 pub mod playback_commit;

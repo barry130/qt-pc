@@ -57,6 +57,17 @@ describe("撤销 Toast", () => {
     await waitFor(() => expect(screen.queryByRole("button", { name: "撤销" })).toBeNull());
   });
 
+  it.each(["info", "success", "error"] as const)("%s 通知使用成对浮层颜色，避免播放页浅字与应用浅色卡片底混搭", (kind) => {
+    useToastStore.getState().push("通知配色回执", kind);
+    render(<ToastHost />);
+
+    const card = screen.getByRole(kind === "error" ? "alert" : "status");
+    expect(card.classList.contains("bg-popover/95")).toBe(true);
+    expect(card.classList.contains("text-popover-foreground")).toBe(true);
+    // 正文继承通知的前景色，不能单独取播放器页面的 --foreground。
+    expect(screen.getByText("通知配色回执").classList.contains("text-foreground")).toBe(false);
+  });
+
   it("普通提示不带按钮（只有 toastUndo 才有撤销入口）", async () => {
     render(<ToastHost />);
     toast("已清空播放记录");

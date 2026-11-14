@@ -791,6 +791,8 @@ export interface FxState {
   spectrum: boolean;
   /** ReplayGain 静态增益模式（A1）：off / track / album */
   replayGain: "off" | "track" | "album";
+  /** 独立变调，整数半音，-12..+12；不改变播放速度 */
+  pitchSemitones: number;
 }
 
 /** 缓存统计：audio = 播放流缓存，web = 网页缓存（WebView2 封面/脚本等可再生内容） */

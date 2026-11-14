@@ -12,7 +12,7 @@ vi.mock("@/source-scripts", () => ({
 }));
 
 import { getLyric } from "@/source-scripts";
-import { getPlaybackLyric, LYRIC_CACHE_CAP } from "@/lib/localOnline";
+import { getPlaybackLyric, LYRIC_CACHE_CAP, onPlaybackLyricCached, peekCachedPlaybackLyric } from "@/lib/localOnline";
 import type { Lyric, Track } from "@/types";
 
 const getLyricMock = vi.mocked(getLyric);
@@ -39,6 +39,24 @@ beforeEach(() => {
 });
 
 describe("getPlaybackLyric 缓存", () => {
+  it("成功歌词可通知桌面桥并直接补发缓存，读取缓存和退订均不重新请求源站", async () => {
+    const t = track();
+    const received = vi.fn();
+    const off = onPlaybackLyricCached(received);
+    try {
+      getLyricMock.mockResolvedValue(lyric("[00:01]同步正文"));
+      expect(peekCachedPlaybackLyric(t)).toBeUndefined();
+      await getPlaybackLyric(t);
+      expect(received).toHaveBeenCalledWith(t, null, lyric("[00:01]同步正文"));
+      await expect(peekCachedPlaybackLyric(t)).resolves.toEqual(lyric("[00:01]同步正文"));
+      expect(getLyricMock).toHaveBeenCalledTimes(1);
+      off();
+      received.mockClear();
+      await getPlaybackLyric(track());
+      expect(received).not.toHaveBeenCalled();
+    } finally { off(); }
+  });
+
   it("同一首命中缓存，只取一次词", async () => {
     const t = track();
     getLyricMock.mockResolvedValue(lyric("[00:01]hi"));

@@ -5,13 +5,18 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
+const accountMetaEntry = process.env.QT_ACCOUNT_META_ENTRY;
 
 export default defineConfig({
   // 测试不发现真实 .env*；缓存只落到当前仓库的忽略目录。
   envDir: false,
   cacheDir: path.resolve(root, "_tmp/vitest-cache"),
   // 无 API 监听的 Vitest 仍解析 host；数字地址避免 localhost DNS，不开启监听。
-  server: { host: "127.0.0.1" },
+  server: {
+    host: "127.0.0.1",
+    // Only the explicit integration command grants access to external source TS.
+    ...(accountMetaEntry ? { fs: { allow: [root, path.dirname(path.resolve(root, "tests", accountMetaEntry))] } } : {}),
+  },
   resolve: {
     alias: {
       "@": path.resolve(root, "./src"),

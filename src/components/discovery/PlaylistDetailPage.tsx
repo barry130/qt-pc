@@ -732,10 +732,12 @@ function PlaylistDetailContent(props: PlaylistDetailPageProps): React.JSX.Elemen
 /**
  * 本地歌单编辑弹窗（改名 + 换封面，UPDATE_DESIGN §5.3 的「同一编辑入口」）。
  *
- * 换封面：pickImage 选图 → Rust 复制进应用数据目录并登记 cover_path（远程
- * 同步来的卡片歌单后端会先认领成本地行），登录态下 Rust 顺带把封面上传云端
- * （配额每日 2 次，失败只警告不阻塞本地）。「恢复默认封面」清掉自设封面，
- * 回落回退链（首曲封面 → 占位）；登录态下连云端封面一起清。
+ * 换封面：pickImage 选图 → 登录态下 Rust 先把封面上传云端、成功才落本机
+ * （与头像上传同口径，2026-11-14 用户口径：远程上传失败前台不得更新）；
+ * 未登录只存本机。配额每日 2 次，失败时本机保持原封面、原因亮在弹窗里。
+ * 上传全程按钮显示「上传中…」并禁用，防重复请求。「恢复默认封面」登录态
+ * 下先清云端、成功才清本机，失败同样不动本机；清掉后回落回退链（首曲
+ * 封面 → 占位）。
  * 改名：走 renamePlaylist，Rust 会把新名上送云端，他端同步跟随。
  * 保存只在名字真的变了时才调改名接口 —— 封面操作是即时生效的，不需要等保存。
  */
@@ -748,45 +750,68 @@ function PlaylistEditDialog(props: {
 }): React.JSX.Element {
   const [draftName, setDraftName] = useState(props.name);
   const [busy, setBusy] = useState(false);
+  /** 封面操作进行中（change=换封面 restore=恢复默认）：按钮禁用并显示进行中文案 */
+  const [coverBusy, setCoverBusy] = useState<"change" | "restore" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [preview, setPreview] = useState<string | null>(props.coverUrl);
   const tr = useT();
 
   const pickCover = async (): Promise<void> => {
+    if (coverBusy) return;
+    setCoverBusy("change");
     setError(null);
-    const path = await ipc.pickImage(tr("playlist.edit.pickCover"));
-    if (!path) return;
     try {
+      const path = await ipc.pickImage(tr("playlist.edit.pickCover"));
+      if (!path) return;
       const result = await ipc.setPlaylistCover(props.pid, path);
+      // 云端失败本机不更新（与头像上传同口径）：预览/缓存保持原样，只亮原因
+      if (result.cloud === "failed") {
+        setError(
+          tr("playlist.edit.coverCloudSyncFailed", {
+            error: result.message ?? tr("playlist.edit.unknownError"),
+          }),
+        );
+        return;
+      }
       invalidatePlaylistCoverCache(props.pid);
       // 复制完读回 data URL 当预览（返回的只是文件路径，渲染不了）
       const url = await ipc.getPlaylistCover(props.pid).catch(() => null);
       setPreview(url);
-      // 云端失败不回滚本地，但要把原因亮出来（每日配额 2 次等）
-      if (result.cloud === "failed") {
-        setError(tr("playlist.edit.coverUpdatedCloudFailed", { error: result.message ?? tr("playlist.edit.unknownError") }));
-      } else if (result.cloud === "offline") {
+      if (result.cloud === "offline") {
         setError(tr("playlist.edit.coverOffline"));
       }
     } catch (err) {
       setError(tr("playlist.edit.coverChangeFailed", { error: errMsg(err) }));
+    } finally {
+      setCoverBusy(null);
     }
   };
 
   const clearCover = async (): Promise<void> => {
+    if (coverBusy) return;
+    setCoverBusy("restore");
     setError(null);
     try {
       const result = await ipc.clearPlaylistCover(props.pid);
+      // 云端清除失败本机不更新：预览/缓存保持原样，只亮原因
+      if (result.cloud === "failed") {
+        setError(
+          tr("playlist.edit.coverRestoreCloudFailed", {
+            error: result.message ?? tr("playlist.edit.unknownError"),
+          }),
+        );
+        return;
+      }
       invalidatePlaylistCoverCache(props.pid);
       // 预览先落回占位；真正的回退链（首曲封面）由关闭后的静默重载重算
       setPreview(null);
-      if (result.cloud === "failed") {
-        setError(tr("playlist.edit.coverRestoredCloudFailed", { error: result.message ?? tr("playlist.edit.unknownError") }));
-      } else if (result.message) {
+      if (result.message) {
         setError(result.message);
       }
     } catch (err) {
       setError(tr("playlist.edit.coverRestoreFailed", { error: errMsg(err) }));
+    } finally {
+      setCoverBusy(null);
     }
   };
 
@@ -823,11 +848,25 @@ function PlaylistEditDialog(props: {
           </div>
           <div className="flex flex-col gap-2">
             <div className="flex gap-2">
-              <Button variant="outline" size="xs" onClick={() => void pickCover()}>
-                {tr("playlist.edit.changeCover")}
+              <Button
+                variant="outline"
+                size="xs"
+                disabled={coverBusy !== null}
+                onClick={() => void pickCover()}
+              >
+                {coverBusy === "change"
+                  ? tr("playlist.edit.coverUploading")
+                  : tr("playlist.edit.changeCover")}
               </Button>
-              <Button variant="ghost" size="xs" onClick={() => void clearCover()}>
-                {tr("playlist.edit.restoreCover")}
+              <Button
+                variant="ghost"
+                size="xs"
+                disabled={coverBusy !== null}
+                onClick={() => void clearCover()}
+              >
+                {coverBusy === "restore"
+                  ? tr("playlist.edit.coverRestoring")
+                  : tr("playlist.edit.restoreCover")}
               </Button>
             </div>
             <p className="text-xs text-muted-foreground">

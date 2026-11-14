@@ -13,7 +13,7 @@ import {
   SkipForward,
   X,
 } from "lucide-react";
-import type { DesktopLyricState, Track } from "@/types";
+import type { DesktopLyricState, Lyric, Track } from "@/types";
 import { MarqueeLine } from "./MarqueeLine";
 import { LyricOffsetControl } from "./LyricOffsetControl";
 import { useLyricOffset } from "@/hooks/useLyricOffset";
@@ -45,8 +45,10 @@ import {
   parseWordByWordLrc,
   type LyricLine,
 } from "@/lib/lrc";
-import { crossSourceHitFromLine, dropCachedLyric, getPlaybackLyric } from "@/lib/localOnline";
+import { crossSourceHitFromLine, dropCachedLyric, getPlaybackLyric, playbackLyricKey } from "@/lib/localOnline";
+import { PLAYBACK_LYRIC_UPDATE, requestPlaybackLyric, type PlaybackLyricSnapshot } from "@/lib/playback-lyric-sync";
 import { requestPlayUrlLine } from "@/lib/play-url-broadcast";
+import { log } from "@/lib/logger";
 import { useSourceRegistryStore } from "@/stores/sourceRegistry";
 import type { PlayUrlLine } from "@/source-engine/client";
 import { desktopActiveIndex, desktopSubtitleLines, PODCAST_SUBTITLE_UPDATE, requestPodcastSubtitles, type DesktopSubtitleLine, type PodcastSubtitleSnapshot } from "@/lib/podcast-subtitle-sync";
@@ -104,6 +106,12 @@ const LINE_MODES: DesktopLyricState["lineMode"][] = [
 
 const FONT_STACK = '"Microsoft YaHei", "PingFang SC", "Noto Sans SC", sans-serif';
 
+function songLyricLines(lyric: Lyric): LyricLine[] {
+  const wbw = lyric.wordByWord ?? "";
+  const base = wbw.length > 0 ? parseWordByWordLrc(wbw) : parseLrc(lyric.lrc);
+  return mergeRomanization(mergeTranslation(base, lyric.translation), lyric.romanization ?? "");
+}
+
 export function LyricWindow(): React.JSX.Element {
   const [ui, setUi] = useState<DesktopLyricState>(DEFAULT_STATE);
   const [lines, setLines] = useState<LyricLine[]>([]);
@@ -116,6 +124,7 @@ export function LyricWindow(): React.JSX.Element {
   // 其余逻辑仍走 currentTrackRef（回调里读最新值，不受渲染时序影响）。
   const [currentTrack, setCurrentTrack] = useState<Track | null>(null);
   const [podcastMessage, setPodcastMessage] = useState("正在等待播客字幕…");
+  const [songMessage, setSongMessage] = useState("正在加载歌词…");
   const podcastRevision = useRef(-1);
   // 工具条：悬停即现；右键可固定（再次右键收起）
   const [hovered, setHovered] = useState(false);
@@ -163,6 +172,13 @@ export function LyricWindow(): React.JSX.Element {
   const crossLineByTrack = useRef(new Map<string, PlayUrlLine | null>());
   const currentTrackRef = useRef<Track | null>(null);
   const lyricSeq = useRef(0);
+  const sharedLyricRef = useRef<PlaybackLyricSnapshot | null>(null);
+  const lyricRetry = useRef({ key: "", attempts: 0, failed: false, retryAt: 0 });
+  const lyricRetryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearLyricRetryTimer = useCallback((): void => {
+    if (lyricRetryTimer.current !== null) clearTimeout(lyricRetryTimer.current);
+    lyricRetryTimer.current = null;
+  }, []);
 
   /**
    * 整篇歌词的唯一写入口（换歌 / 换词 / 取词失败）。
@@ -189,10 +205,13 @@ export function LyricWindow(): React.JSX.Element {
   }, []);
 
   // 曲目变化 → 一次性拉整篇歌词（含换源兜底：按目标源取词）
-  const loadLyricFor = useCallback(async (track: Track | null): Promise<void> => {
+  const loadLyricFor = useCallback(async function load(track: Track | null): Promise<void> {
+    clearLyricRetryTimer();
     currentTrackRef.current = track;
     setCurrentTrack(track);
     const seq = ++lyricSeq.current;
+    // registry ensure 尚未完成时也先标记已开始，避免连续心跳重复排队重试。
+    lyricRetry.current.failed = false;
     const key = trackKey(track);
     if (!track || key.length === 0) {
       setHasTrack(false);
@@ -200,6 +219,7 @@ export function LyricWindow(): React.JSX.Element {
       return;
     }
     setHasTrack(true);
+    setSongMessage("正在加载歌词…");
     if (track.platform === "podcast") {
       podcastRevision.current = -1;
       setPodcastMessage("正在等待播客字幕…");
@@ -213,7 +233,21 @@ export function LyricWindow(): React.JSX.Element {
     // 会把合法的跨源命中当成「目标源已下线」丢掉 → 只能按原平台取词、时间轴
     // 偏掉（C08）。ensure 幂等，就绪后立即 resolve；失败也只退回原平台取词。
     await useSourceRegistryStore.getState().ensure().catch(() => {});
+    if (seq !== lyricSeq.current) return;
     const cross = crossSourceHitFromLine(crossLineByTrack.current.get(key) ?? null, track.platform);
+    const lyricKey = playbackLyricKey(track, cross);
+    if (lyricRetry.current.key !== lyricKey) lyricRetry.current = { key: lyricKey, attempts: 0, failed: false, retryAt: 0 };
+    const retry = lyricRetry.current;
+    retry.failed = false;
+    retry.attempts += 1;
+    const shared = sharedLyricRef.current;
+    requestPlaybackLyric();
+    if (shared?.lyricKey === lyricKey) {
+      const next = songLyricLines(shared.lyric);
+      setSongMessage(next.length ? "… 间奏 …" : "暂无歌词");
+      applyLines(next);
+      return;
+    }
     try {
       const lyric = await getPlaybackLyric(track, cross);
       // 过期取词不应用（换源后旧源的慢响应不得回填，最后应用的必须是对应源的）
@@ -221,15 +255,26 @@ export function LyricWindow(): React.JSX.Element {
       // 有逐字就按逐字行渲染（自带时间轴），没有就解析普通 LRC——与播放页同口径。
       // 逐字在这里用于主行的整行卡拉 OK 填充（rAF 里按词时间轴推进渐变分界，
       // 不逐词拆 span：桌面歌词字小、带描边/阴影/跑马灯，按词渲染得不偿失）。
-      const wbw = lyric.wordByWord ?? "";
-      const base = wbw.length > 0 ? parseWordByWordLrc(wbw) : parseLrc(lyric.lrc);
-      const merged = mergeRomanization(mergeTranslation(base, lyric.translation), lyric.romanization ?? "");
-      applyLines(merged);
-    } catch {
+      const next = songLyricLines(lyric);
+      setSongMessage(next.length ? "… 间奏 …" : "暂无歌词");
+      applyLines(next);
+    } catch (error: unknown) {
       if (seq !== lyricSeq.current) return;
+      log.warn("[桌面歌词] 取词失败，进入重试", error);
+      retry.failed = true;
+      retry.retryAt = Date.now() + 5_000;
+      setSongMessage("歌词加载失败，等待恢复…");
       applyLines([]);
+      // 暂停后没有进度心跳也要恢复；切歌/换词/卸载会清掉此任务。
+      if (retry.attempts < 3) {
+        lyricRetryTimer.current = setTimeout(() => {
+          lyricRetryTimer.current = null;
+          if (seq !== lyricSeq.current || !retry.failed) return;
+          void load(track);
+        }, 5_000);
+      }
     }
-  }, [applyLines]);
+  }, [applyLines, clearLyricRetryTimer]);
 
   // The subtitle task and this window live in separate WebViews. A snapshot is
   // sent after every saved segment/translation and requested again on opening.
@@ -252,124 +297,129 @@ export function LyricWindow(): React.JSX.Element {
     return () => { disposed = true; off?.(); };
   }, [applyLines]);
 
-  // —— 订阅与初始化（一次） ——
+  // 先监听、后读快照；实时事件优先于迟到的初始化响应。
   useEffect(() => {
     let disposed = false;
-    const unlisten: Array<() => void> = [];
-
+    let stateEventApplied = false;
+    let positionEventApplied = false;
+    let uiEventApplied = false;
+    let authoritativeTrack = false;
+    const unlisteners: Array<() => void> = [];
+    const subscribe = async (pending: Promise<() => void>): Promise<void> => {
+      const off = await pending;
+      if (disposed) off(); else unlisteners.push(off);
+    };
+    const retryCurrentTrack = (track: Track | null): void => {
+      if (trackKey(track) !== loadedTrackKey.current) return;
+      const retry = lyricRetry.current;
+      if (retry.failed && retry.attempts < 3 && Date.now() >= retry.retryAt) void loadLyricFor(track);
+    };
+    const selectTrack = (track: Track | null): void => {
+      const key = trackKey(track);
+      if (key === loadedTrackKey.current) {
+        retryCurrentTrack(track);
+        return;
+      }
+      loadedTrackKey.current = key;
+      // 不把上一首的内容留到新请求结束。
+      applyLines([]);
+      void loadLyricFor(track);
+    };
+    const applySnapshot = (payload: Awaited<ReturnType<typeof getPlaybackState>>, updatePosition = true): void => {
+      playingRef.current = payload.status === "playing";
+      setPaused(payload.status !== "playing");
+      if (updatePosition) baseRef.current = { positionMs: payload.positionMs, receivedAt: performance.now() };
+      if (payload.track !== undefined) {
+        authoritativeTrack = true;
+        selectTrack(payload.track);
+      }
+    };
     void (async () => {
-      // 初始状态（Rust setup 已对 visible 的窗口做过 show）
-      try {
-        const s = await getDesktopLyricState();
-        if (!disposed) setUi(s);
-      } catch {
-        /* 状态读取失败按默认值渲染 */
-      }
-
-      // 初始曲目 + 播放状态
-      try {
-        const q = await getQueue();
-        const track = q.index !== null ? (q.tracks[q.index] ?? null) : null;
-        loadedTrackKey.current = trackKey(track);
-        void loadLyricFor(track);
-        const st = await getPlaybackState();
-        playingRef.current = st.status === "playing";
-        setPaused(st.status !== "playing");
-        baseRef.current = { positionMs: st.positionMs, receivedAt: performance.now() };
-      } catch {
-        /* 主窗口尚未就绪时事件订阅会兜底 */
-      }
-
-      // 五路订阅：任一注册失败都不能让这个初始化 IIFE 以"未处理拒绝"收场 ——
-      // 那会弹一个说不清来源的致命浮层，而且后面的订阅静默缺失，
-      // 桌面歌词从此不跟随播放（2026-10-02 收口：全局兜底只印 String(reason)，
-      // 事后无从定位，所以这里补上上下文再交给全局兜底）。
-      try {
-        unlisten.push(
-          await onQueueChanged((payload) => {
-            const track =
-              payload.index !== null ? (payload.tracks[payload.index] ?? null) : null;
-            const key = trackKey(track);
-            if (key === loadedTrackKey.current) return;
-            loadedTrackKey.current = key;
-            void loadLyricFor(track);
-          }),
-        );
-        unlisten.push(
-          await onPositionChanged((payload) => {
-            baseRef.current = {
-              positionMs: payload.positionMs,
-              receivedAt: performance.now(),
-            };
-          }),
-        );
-        unlisten.push(
-          await onPlaybackStateChanged((payload) => {
-            playingRef.current = payload.status === "playing";
-            setPaused(payload.status !== "playing");
-            baseRef.current = {
-              positionMs: payload.positionMs,
-              receivedAt: performance.now(),
-            };
-            // 曲目以快照为准（与播放页同源）。queue-changed 在个别切歌路径下可能
-            // 滞后或缺失，只认它会让桌面歌词慢一拍 —— 表现是显示上一首的词。
-            const snapTrack = payload.track ?? null;
-            if (snapTrack) {
-              const key = trackKey(snapTrack);
-              if (key !== loadedTrackKey.current) {
-                loadedTrackKey.current = key;
-                void loadLyricFor(snapTrack);
+      await Promise.all([
+        subscribe(onQueueChanged((payload) => {
+          // 队列可先于/晚于在播曲目变化；拿到播放快照后不再用它猜正文。
+          if (disposed || authoritativeTrack) return;
+          selectTrack(payload.index !== null ? (payload.tracks[payload.index] ?? null) : null);
+        })),
+        subscribe(onPositionChanged((payload) => {
+          if (disposed) return;
+          positionEventApplied = true;
+          baseRef.current = { positionMs: payload.positionMs, receivedAt: performance.now() };
+          // 周期心跳是 position-changed；播放状态只在切歌/暂停等变化时发布。
+          retryCurrentTrack(currentTrackRef.current);
+        })),
+        subscribe(onPlaybackStateChanged((payload) => {
+          if (disposed) return;
+          stateEventApplied = true;
+          applySnapshot(payload);
+        })),
+        subscribe(onLyricWindowChanged((payload) => {
+          if (disposed) return;
+          uiEventApplied = true;
+          setUi(payload);
+        })),
+        subscribe(listen<{ platform: string; id: string; line: PlayUrlLine | null }>("play-url-line", ({ payload }) => {
+          if (disposed) return;
+          const key = `${payload.platform}:${payload.id}`;
+          crossLineByTrack.current.set(key, payload.line);
+          if (key === loadedTrackKey.current && currentTrackRef.current?.platform !== "podcast") {
+            void loadLyricFor(currentTrackRef.current);
+          }
+        })),
+        subscribe(listen<PlaybackLyricSnapshot>(PLAYBACK_LYRIC_UPDATE, ({ payload }) => {
+          const track = currentTrackRef.current;
+          if (disposed || !track || track.platform === "podcast" || payload.trackId !== trackKey(track)) return;
+          const cross = crossSourceHitFromLine(crossLineByTrack.current.get(trackKey(track)) ?? null, track.platform);
+          if (payload.lyricKey !== playbackLyricKey(track, cross)) return;
+          // 主窗口正文是最终版本：废弃桌面 WebView 里同键的旧在途任务，
+          // 防止旧自动词稍后完成时重新落库覆盖主窗口刚选的版本。
+          dropCachedLyric(track, cross);
+          sharedLyricRef.current = payload;
+          lyricSeq.current += 1;
+          clearLyricRetryTimer();
+          lyricRetry.current.failed = false;
+          const next = songLyricLines(payload.lyric);
+          setSongMessage(next.length ? "… 间奏 …" : "暂无歌词");
+          applyLines(next);
+        })),
+        subscribe(onLyricManuallyPicked((payload) => {
+          const track = currentTrackRef.current;
+          if (disposed || track === null || payload.trackId !== trackKey(track)) return;
+          sharedLyricRef.current = null;
+          dropCachedLyric(track, crossSourceHitFromLine(crossLineByTrack.current.get(trackKey(track)) ?? null, track.platform));
+          void loadLyricFor(track);
+        })),
+      ]);
+      if (disposed) return;
+      requestPlayUrlLine();
+      await Promise.all([
+        getDesktopLyricState().then((state) => { if (!disposed && !uiEventApplied) setUi(state); }).catch(() => {}),
+        (async () => {
+          try {
+            const state = await getPlaybackState();
+            if (disposed || stateEventApplied) return;
+            applySnapshot(state, !positionEventApplied);
+            // 旧宿主/测试快照可能省略 track，只有这一种情况才退回队列。
+            if (state.track === undefined) {
+              const queue = await getQueue();
+              if (!disposed && !stateEventApplied && !authoritativeTrack) {
+                selectTrack(queue.index !== null ? (queue.tracks[queue.index] ?? null) : null);
               }
             }
-          }),
-        );
-        unlisten.push(
-          await onLyricWindowChanged((payload) => {
-            setUi(payload);
-          }),
-        );
-        // 取链桥广播的命中线路：当前曲目被跨源兜底接走时按目标源重取歌词
-        //（曲目 id/platform 不变，queue/state 事件不会触发重取，必须自己听）
-        unlisten.push(
-          await listen<{ platform: string; id: string; line: PlayUrlLine | null }>("play-url-line", (e) => {
-            const key = `${e.payload.platform}:${e.payload.id}`;
-            crossLineByTrack.current.set(key, e.payload.line);
-            if (key === loadedTrackKey.current && currentTrackRef.current?.platform !== "podcast") {
-              void loadLyricFor(currentTrackRef.current);
-            }
-          }),
-        );
-        // 用户在播放页手动挑了一份歌词：本窗口那份进程内缓存已经是旧词，
-        // 丢掉再按同一个 key 重取 —— 取词链路会回读到刚落库的新词
-        //（仅 React 侧重渲染是不够的，两边是独立 WebView，各持一份 lyricCache）
-        unlisten.push(
-          await onLyricManuallyPicked((payload) => {
-            const track = currentTrackRef.current;
-            if (track === null || payload.trackId !== trackKey(track)) return;
-            const key = trackKey(track);
-            dropCachedLyric(
-              track,
-              crossSourceHitFromLine(crossLineByTrack.current.get(key) ?? null, track.platform),
-            );
-            void loadLyricFor(track);
-          }),
-        );
-      } catch (e) {
-        // cause 保留原始异常，ErrorBoundary / 日志能看到完整失败链路
-        throw new Error(`桌面歌词事件订阅注册失败：${String(e)}`, { cause: e });
-      }
-
-      // 订阅齐了才向主窗口要「当前命中线路」的补发：本窗口可能是在取链**之后**
-      // 才打开的（事件早已发过），只等事件会让 crossLineByTrack 一直是空的，
-      // 于是桌面歌词永远按原平台取词 —— 用户报的「换了源歌词没换」。
-      // 放在所有 listen 注册之后，避免主窗口的应答比监听更早到达而丢掉。
-      requestPlayUrlLine();    })();
-
+          } catch { /* 实时事件继续兜底 */ }
+        })(),
+      ]);
+    })().catch((error: unknown) => {
+      if (!disposed) console.error("桌面歌词事件订阅注册失败", error);
+    });
     return () => {
       disposed = true;
-      for (const off of unlisten) off();
+      lyricSeq.current += 1;
+      loadedTrackKey.current = "";
+      clearLyricRetryTimer();
+      for (const off of unlisteners) off();
     };
-  }, [loadLyricFor]);
+  }, [applyLines, clearLyricRetryTimer, loadLyricFor]);
 
   // —— rAF 插值：仅可见时运行（R4） ——
   useEffect(() => {
@@ -547,7 +597,7 @@ export function LyricWindow(): React.JSX.Element {
   const nextLine = safeIdx >= 0 && safeIdx + 1 < lines.length ? lines[safeIdx + 1] : null;
   const showSecond = ui.lineMode === "two-lines";
   const showThird = ui.lineMode === "three-lines";
-  const mainText = hasTrack ? (current?.text || (currentTrack?.platform === "podcast" ? podcastMessage : "… 间奏 …")) : "轻听 · 桌面歌词";
+  const mainText = hasTrack ? (current?.text || (currentTrack?.platform === "podcast" ? podcastMessage : songMessage)) : "轻听 · 桌面歌词";
   // 第二行：有罗马音（日文歌假名注音）就显示罗马音，否则仍是译文，都没有才退下一句
   const secondText = hasTrack
     ? current?.romanization ||

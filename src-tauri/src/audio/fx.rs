@@ -13,7 +13,7 @@
 //! 拿不到锁就用上一块的参数快照继续（参数变化最多晚一块生效，约 25ms）。
 //! rodio 自己在渲染线程上也用 Mutex 同步音量/倍速（5ms 周期），先例一致。
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -34,6 +34,10 @@ pub const EQ_GAIN_LIMIT_DB: f32 = 12.0;
 
 /// 前置放大夹紧范围（dB）。
 pub const EQ_PREAMP_LIMIT_DB: f32 = 12.0;
+
+/// 保持播放时长的变调范围（半音）。
+pub const PITCH_SEMITONES_MIN: i32 = -12;
+pub const PITCH_SEMITONES_MAX: i32 = 12;
 
 // ---------- 可持久化参数（serde camelCase，与前端 types 对齐） ----------
 
@@ -81,6 +85,8 @@ impl Default for FadeParams {
 #[serde(rename_all = "camelCase")]
 pub struct FxState {
     pub eq: EqParams,
+    /// 独立变调（半音），不改变播放速度和总时长。
+    pub pitch_semitones: i32,
     pub loudnorm: bool,
     pub fade: FadeParams,
     /// 播放条频谱背景（前端画方块，数据来自 SpectrumTap 的实时频谱）
@@ -110,6 +116,7 @@ struct FadeCommand {
 /// 改均衡器不该跟改响度归一化互相排队。
 pub struct AudioFx {
     eq: RwLock<EqParams>,
+    pitch_semitones: AtomicI32,
     loudnorm: AtomicBool,
     /// ReplayGain 静态增益（线性系数，1.0 = 不处理）。存 f32 的位模式：
     /// 音频线程每次挂载曲目读一次，原子读比 RwLock 便宜且不可能阻塞。
@@ -124,6 +131,7 @@ impl AudioFx {
     pub fn new() -> Self {
         Self {
             eq: RwLock::new(EqParams::default()),
+            pitch_semitones: AtomicI32::new(0),
             loudnorm: AtomicBool::new(false),
             static_gain: AtomicU32::new(1.0f32.to_bits()),
             spectrum: AtomicBool::new(false),
@@ -144,6 +152,17 @@ impl AudioFx {
 
     pub fn eq_params(&self) -> EqParams {
         self.eq.read().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// 设置变调半音并返回夹紧后的值；音频线程在下一个分析块边界读取。
+    pub fn set_pitch_semitones(&self, semitones: i32) -> i32 {
+        let normalized = semitones.clamp(PITCH_SEMITONES_MIN, PITCH_SEMITONES_MAX);
+        self.pitch_semitones.store(normalized, Ordering::Release);
+        normalized
+    }
+
+    pub fn pitch_semitones(&self) -> i32 {
+        self.pitch_semitones.load(Ordering::Acquire)
     }
 
     pub fn set_loudnorm(&self, on: bool) {
@@ -234,6 +253,7 @@ impl AudioFx {
     pub fn state(&self) -> FxState {
         FxState {
             eq: self.eq_params(),
+            pitch_semitones: self.pitch_semitones(),
             loudnorm: self.loudnorm(),
             fade: self.fade_params(),
             spectrum: self.spectrum_enabled(),
@@ -749,6 +769,7 @@ impl DspSource {
         spectrum: Option<SpectrumTap>,
     ) -> Self {
         let spectrum_on = fx.spectrum_enabled();
+        let inner = Box::new(super::pitch::PitchSource::new(inner, Arc::clone(&fx)));
         Self {
             inner,
             fx,

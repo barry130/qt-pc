@@ -43,12 +43,14 @@ use std::path::{Path, PathBuf};
 
 use crate::provider::types::Track;
 
-/// 歌词窗口允许经 `get_setting` 读取的 settings 键（恰好 8 个）。
+/// 歌词窗口允许经 `get_setting` 读取的 settings 键（恰好 9 个）。
 ///
 /// `sourceAuth.*` 是既有的前端账号业务键（登录态开关 / 账号表）：歌词窗口的
 /// 音源注册表迁移需要读它们；但**只读**，见 [`LYRIC_WRITE_SETTING_KEYS`]。
 /// `quality` / `downloadQuality` 是旧全局音质键，迁移回落时读一次。
-pub const LYRIC_READ_SETTING_KEYS: [&str; 8] = [
+/// 平台总开关策略键（source-policy）同样只读：桌面歌词取词前要按本机策略
+/// 断言当前曲目平台是否启用，读不到会被前端防御语义判成「全部源已关闭」。
+pub const LYRIC_READ_SETTING_KEYS: [&str; 9] = [
     "sourceAuth.accounts",
     "sourceAuth.toggles",
     "sourceAuth.useMeta",
@@ -57,6 +59,7 @@ pub const LYRIC_READ_SETTING_KEYS: [&str; 8] = [
     "download.sourceQualities",
     "quality",
     "downloadQuality",
+    crate::source_policy::SETTING_KEY,
 ];
 
 /// 歌词窗口允许经 `set_setting` 写入的 settings 键（恰好 2 个）。
@@ -491,11 +494,19 @@ mod tests {
         }
     }
 
-    // ---------- settings：8 READ / 2 WRITE ----------
+    // ---------- settings：9 READ / 2 WRITE ----------
 
     #[test]
-    fn setting_read_allows_exactly_the_eight_lyric_keys() {
-        assert_eq!(LYRIC_READ_SETTING_KEYS.len(), 8);
+    fn setting_read_allows_the_nine_keys_including_source_policy() {
+        // 桌面歌词取词前要按本机策略断言当前曲目平台是否启用（assertSourceEnabled）；
+        // 策略键读不到时，前端防御语义会把读失败当成「全部源已关闭」。
+        assert_eq!(LYRIC_READ_SETTING_KEYS.len(), 9);
+        assert!(LYRIC_READ_SETTING_KEYS.contains(&crate::source_policy::SETTING_KEY));
+        assert_eq!(
+            setting_read_key(crate::source_policy::SETTING_KEY),
+            Ok(crate::source_policy::SETTING_KEY),
+            "平台总开关策略键应可读"
+        );
         for key in LYRIC_READ_SETTING_KEYS {
             assert_eq!(setting_read_key(key), Ok(key), "{key} 应可读");
         }

@@ -194,12 +194,12 @@ export function MyPlaylistsPage(): React.JSX.Element {
   };
 
   /**
-   * 换本地歌单封面：选图 → Rust 复制进应用数据目录 → 登记 cover_path。
-   * 成功后本页乐观替换 picUrl（即新封面路径），下次读列表以本地库为准。
+   * 换本地歌单封面：选图 → 登录态下 Rust 先上传云端、成功才落本机（与头像
+   * 上传同口径，2026-11-14 用户口径：远程上传失败前台不得更新）。成功后本页
+   * 乐观替换 picUrl（即新封面路径），下次读列表以本地库为准。
    * 本地组的全部歌单都可换（含远程同步来的卡片歌单，后端会先认领成
    * 本地行）；在线歌单封面归音源/云端所有，不提供入口。
-   * 云端同步失败（每日配额 2 次等）不回滚本地，但要把原因亮出来，
-   * 别让用户查库才发现没同步（用户 2026-11-02 反馈踩中配额上限）。
+   * 云端同步失败（每日配额 2 次/超限等）本机不更新，原因亮在页首提示里。
    */
   const changeCover = async (p: MyPlaylistSummary): Promise<void> => {
     const path = await ipc.pickImage("选择歌单封面");
@@ -207,6 +207,15 @@ export function MyPlaylistsPage(): React.JSX.Element {
     setError(null);
     try {
       const result = await ipc.setPlaylistCover(p.pid, path);
+      // 云端失败本机不更新：列表与封面缓存保持原样，只亮原因
+      if (result.cloud === "failed") {
+        setError(
+          tr("playlist.edit.coverCloudSyncFailed", {
+            error: result.message ?? tr("playlist.edit.unknownError"),
+          }),
+        );
+        return;
+      }
       // 封面换了：废掉这张的封面缓存，让 PlaylistCoverImage 重新读文件
       invalidatePlaylistCoverCache(p.pid);
       setList((prev) =>
@@ -216,13 +225,7 @@ export function MyPlaylistsPage(): React.JSX.Element {
             : it,
         ),
       );
-      if (result.cloud === "failed") {
-        setError(
-          tr("playlist.edit.coverUpdatedCloudFailed", {
-            error: result.message ?? tr("playlist.edit.unknownError"),
-          }),
-        );
-      } else if (result.cloud === "offline") {
+      if (result.cloud === "offline") {
         setError(tr("playlist.edit.coverOffline"));
       }
     } catch (err) {

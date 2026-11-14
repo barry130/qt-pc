@@ -24,11 +24,13 @@ export const messages = defineFragment({
     "playlist.edit.nameEmpty": "歌单名不能为空",
     "playlist.edit.cancel": "取消",
     "playlist.edit.save": "保存",
-    // 封面/改名的结果提示（云同步失败不阻塞本地，但要亮出原因）
-    "playlist.edit.coverUpdatedCloudFailed": "封面已更新（本机），但同步云端失败：{error}",
+    // 封面/改名的结果提示（2026-11-14 口径：云端失败本机不更新，只亮原因）
+    "playlist.edit.coverUploading": "上传中…",
+    "playlist.edit.coverRestoring": "恢复中…",
+    "playlist.edit.coverCloudSyncFailed": "封面未更改，同步云端失败：{error}",
     "playlist.edit.coverOffline": "未登录：封面只保存在本机，登录后更换才会同步云端",
     "playlist.edit.coverChangeFailed": "更换封面失败：{error}",
-    "playlist.edit.coverRestoredCloudFailed": "本地已恢复默认封面，但云端清除失败：{error}",
+    "playlist.edit.coverRestoreCloudFailed": "封面未恢复默认，云端清除失败：{error}",
     "playlist.edit.coverRestoreFailed": "恢复默认封面失败：{error}",
     "playlist.edit.saveFailed": "保存失败：{error}",
     "playlist.edit.unknownError": "未知错误",
@@ -46,11 +48,13 @@ export const messages = defineFragment({
     "playlist.edit.nameEmpty": "Playlist name can't be empty",
     "playlist.edit.cancel": "Cancel",
     "playlist.edit.save": "Save",
-    "playlist.edit.coverUpdatedCloudFailed": "Cover updated locally, but cloud sync failed: {error}",
+    "playlist.edit.coverUploading": "Uploading…",
+    "playlist.edit.coverRestoring": "Restoring…",
+    "playlist.edit.coverCloudSyncFailed": "The cover was not changed; cloud sync failed: {error}",
     "playlist.edit.coverOffline": "Not signed in: the cover stays on this device until you sign in",
     "playlist.edit.coverChangeFailed": "Failed to change the cover: {error}",
-    "playlist.edit.coverRestoredCloudFailed":
-      "Default cover restored locally, but clearing it in the cloud failed: {error}",
+    "playlist.edit.coverRestoreCloudFailed":
+      "The cover was not restored; clearing the cloud copy failed: {error}",
     "playlist.edit.coverRestoreFailed": "Failed to restore the default cover: {error}",
     "playlist.edit.saveFailed": "Failed to save: {error}",
     "playlist.edit.unknownError": "Unknown error",

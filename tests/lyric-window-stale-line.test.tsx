@@ -17,7 +17,7 @@
  *
  * 这里锁两条路径（都是真机上会发生的）：
  * 1. 换到行数更少的歌词：不许抛错，主行按新歌词定位（而不是残留上一首的行号）；
- * 2. 取词失败（`lines` 变空）：不许抛错，主行回落「… 间奏 …」。
+ * 2. 取词失败（`lines` 变空）：不许抛错，明确显示加载失败，后续同曲心跳限次重试。
  *
  * 复现要点：必须真把 `activeIdx` 推到高处（走位置事件 + 手动推进一帧 rAF），
  * 否则 `activeIdx` 停在 -1，越界根本不会发生。
@@ -42,6 +42,8 @@ const h = vi.hoisted(() => {
     listeners,
     events: new Map<string, (event: { payload: unknown }) => void>(),
     track,
+    getPlaybackState: vi.fn(async () => ({ status: "playing", positionMs: 0, track: track("a") })),
+    getQueue: vi.fn(async () => ({ index: 0, tracks: [track("a")] })),
     on: (key: string) => (cb: (payload: unknown) => void): (() => void) => {
       listeners.set(key, cb);
       return () => listeners.delete(key);
@@ -96,8 +98,8 @@ vi.mock("@/services/ipc", async () => {
   return {
     ...actual,
     getDesktopLyricState: async () => h.uiState,
-    getPlaybackState: async () => ({ status: "playing", positionMs: 0 }),
-    getQueue: async () => ({ index: 0, tracks: [h.track("a")] }),
+    getPlaybackState: h.getPlaybackState,
+    getQueue: h.getQueue,
     onQueueChanged: h.on("queue"),
     onPositionChanged: h.on("position"),
     onPlaybackStateChanged: h.on("playback"),
@@ -140,6 +142,7 @@ vi.mock("@/lib/localOnline", () => ({
   getPlaybackLyric: h.getPlaybackLyric,
   dropCachedLyric: vi.fn(),
   crossSourceHitFromLine: () => null,
+  playbackLyricKey: (track: { platform: string; id: string }, cross: { target: string; song: { id: string } | null } | null = null) => `${track.platform}:${track.id}:${cross?.target ?? ""}:${cross?.song?.id ?? ""}`,
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(async () => ({})) }));
@@ -165,6 +168,7 @@ vi.mock("@tauri-apps/api/window", () => ({
 }));
 
 import { LyricWindow } from "@/components/lyric/LyricWindow";
+import { dropCachedLyric } from "@/lib/localOnline";
 import { PODCAST_SUBTITLE_UPDATE } from "@/lib/podcast-subtitle-sync";
 
 const pad = (n: number): string => String(n).padStart(2, "0");
@@ -204,6 +208,8 @@ beforeEach(() => {
   h.listeners.clear();
   h.events.clear();
   h.frames.length = 0;
+  h.getPlaybackState.mockReset().mockResolvedValue({ status: "playing", positionMs: 0, track: h.track("a") });
+  h.getQueue.mockReset().mockResolvedValue({ index: 0, tracks: [h.track("a")] });
   h.getPlaybackLyric.mockReset();
   h.getPlaybackLyric.mockResolvedValue({
     lrc: LONG_LRC,
@@ -232,6 +238,62 @@ afterEach(() => {
 });
 
 describe("桌面歌词当前行越界", () => {
+  it("打开窗口时队列仍是上一首，按当前播放快照的曲目和进度显示歌词", async () => {
+    h.getPlaybackState.mockResolvedValue({ status: "paused", positionMs: 41_000, track: h.track("b") });
+    h.getPlaybackLyric.mockImplementation(async (...args: unknown[]) => ({
+      lrc: (args[0] as { id: string }).id === "b"
+        ? "[00:00.00]新歌开始\n[00:40.00]走过荒芜的沙丘"
+        : "[00:00.00]上一首歌词",
+      wordByWord: "", translation: "", romanization: "",
+    }));
+    render(<LyricWindow />);
+    await settle();
+    await frame();
+    expect(mainLine()).toBe("走过荒芜的沙丘");
+    expect(h.getPlaybackLyric).toHaveBeenCalledWith(h.track("b"), null);
+  });
+
+  it("初始化慢快照返回时，新切歌和进度事件已显示的歌词保持不变", async () => {
+    let resolveSnapshot!: (value: Awaited<ReturnType<typeof h.getPlaybackState>>) => void;
+    h.getPlaybackState.mockReturnValueOnce(new Promise((resolve) => { resolveSnapshot = resolve; }));
+    render(<LyricWindow />);
+    await settle();
+    await act(async () => {
+      h.emit("playback", { status: "paused", positionMs: 50_000, track: h.track("b") });
+    });
+    await settle();
+    expect(mainLine()).toBe("第 50 行");
+    await act(async () => resolveSnapshot({ status: "paused", positionMs: 0, track: h.track("a") }));
+    await settle();
+    await frame();
+    expect(mainLine()).toBe("第 50 行");
+    expect(h.getPlaybackLyric).not.toHaveBeenCalledWith(h.track("a"), null);
+  });
+
+  it("主窗口词快照恢复桌面内容，旧取词失败或同曲旧源快照不覆盖正确歌词", async () => {
+    let failOldRequest!: (error: Error) => void;
+    h.getPlaybackLyric.mockReturnValueOnce(new Promise((_resolve, reject) => { failOldRequest = reject; }));
+    render(<LyricWindow />);
+    await settle();
+    await act(async () => h.emit("position", { positionMs: 41_000 }));
+    const shared = { trackId: "wyy:a", lyricKey: "wyy:a::", lyric: {
+      lrc: "[00:00.00]新歌开始\n[00:40.00]走过荒芜的沙丘", translation: "", wordByWord: "", romanization: "",
+    } };
+    await act(async () => h.events.get("playback-lyric-updated")?.({ payload: shared }));
+    expect(mainLine()).toBe("走过荒芜的沙丘");
+    expect(dropCachedLyric).toHaveBeenCalledWith(h.track("a"), null);
+    await act(async () => failOldRequest(new Error("旧取词超时")));
+    await settle();
+    expect(mainLine()).toBe("走过荒芜的沙丘");
+    await act(async () => {
+      h.events.get("playback-lyric-updated")?.({ payload: { ...shared, trackId: "wyy:old", lyric: { lrc: "[00:00.00]上一首", translation: "" } } });
+      h.events.get("playback-lyric-updated")?.({ payload: { ...shared, lyricKey: "wyy:a:kw:wrong", lyric: { lrc: "[00:00.00]旧源", translation: "" } } });
+      h.events.get("play-url-line")?.({ payload: { platform: "wyy", id: "a", line: null } });
+    });
+    await settle();
+    expect(mainLine()).toBe("走过荒芜的沙丘");
+  });
+
   it("播客字幕更新立即显示当前句和译文，换集或迟到更新不串集，空档不悬挂旧句", async () => {
     render(<LyricWindow />);
     await settle();
@@ -287,7 +349,7 @@ describe("桌面歌词当前行越界", () => {
     expect(mainLine()).toBe("新歌 C");
   });
 
-  it("取词失败（lines 变空）：不打崩窗口，主行回落间奏", async () => {
+  it("取词失败（lines 变空）：不打崩窗口，明确显示加载失败而不是间奏", async () => {
     render(<LyricWindow />);
     await settle();
     await playToLine50();
@@ -304,7 +366,196 @@ describe("桌面歌词当前行越界", () => {
     await settle();
 
     expect(screen.getByTestId("lyric-window-root")).toBeTruthy();
+    expect(mainLine()).toContain("歌词加载失败");
+    expect(mainLine()).not.toContain("间奏");
+  });
+
+  it("手动换词通知使旧共享词失效，主窗口补发未到也能回读新词", async () => {
+    render(<LyricWindow />);
+    await settle();
+    await act(async () => h.events.get("playback-lyric-updated")?.({ payload: {
+      trackId: "wyy:a", lyricKey: "wyy:a::", lyric: { lrc: "[00:00.00]旧共享词", translation: "" },
+    } }));
+    expect(mainLine()).toBe("旧共享词");
+    h.getPlaybackLyric.mockResolvedValue({ lrc: "[00:00.00]手动新词", wordByWord: "", translation: "", romanization: "" });
+    await act(async () => h.emit("picked", { trackId: "wyy:a" }));
+    await settle();
+    expect(mainLine()).toBe("手动新词");
+  });
+
+  it("换曲未取回时清除旧句，成功空词与真正前奏分别提示", async () => {
+    render(<LyricWindow />);
+    await settle();
+    await playToLine50();
+    let resolveLyric!: (value: Awaited<ReturnType<typeof h.getPlaybackLyric>>) => void;
+    h.getPlaybackLyric.mockReturnValueOnce(new Promise((resolve) => { resolveLyric = resolve; }));
+    await act(async () => h.emit("playback", { status: "paused", positionMs: 0, track: h.track("b") }));
+    await settle();
+    expect(mainLine()).toBe("正在加载歌词…");
+    await act(async () => resolveLyric({ lrc: "", wordByWord: "", translation: "", romanization: "" }));
+    expect(mainLine()).toBe("暂无歌词");
+    h.getPlaybackLyric.mockResolvedValue({ lrc: "[00:40.00]尚未开唱", wordByWord: "", translation: "", romanization: "" });
+    await act(async () => h.emit("playback", { status: "paused", positionMs: 0, track: h.track("c") }));
+    await settle();
     expect(mainLine()).toBe("… 间奏 …");
+  });
+
+  it("失败重试等待至少五秒且每个曲目来源最多三次，不随心跳重复请求", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    try {
+      h.getPlaybackLyric.mockRejectedValue(new Error("持续超时"));
+      render(<LyricWindow />);
+      await settle();
+      const heartbeat = async (): Promise<void> => {
+        await act(async () => h.emit("playback", { status: "paused", positionMs: 41_000, track: h.track("a") }));
+        await settle();
+      };
+      now.mockReturnValue(5_999);
+      await heartbeat();
+      expect(h.getPlaybackLyric).toHaveBeenCalledTimes(1);
+      now.mockReturnValue(6_000);
+      await heartbeat();
+      await heartbeat();
+      expect(h.getPlaybackLyric).toHaveBeenCalledTimes(2);
+      now.mockReturnValue(11_000);
+      await heartbeat();
+      now.mockReturnValue(60_000);
+      await heartbeat();
+      expect(h.getPlaybackLyric).toHaveBeenCalledTimes(3);
+    } finally { now.mockRestore(); }
+  });
+
+  it("下一首暂时取词失败，只有进度心跳也会按时重取并恢复歌词", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    const view = render(<LyricWindow />);
+    try {
+      await settle();
+      h.getPlaybackLyric.mockRejectedValueOnce(new Error("下一首暂时超时"));
+      await act(async () => h.emit("playback", { status: "playing", positionMs: 0, track: h.track("b") }));
+      await settle();
+      expect(mainLine()).toContain("歌词加载失败");
+      expect(h.getPlaybackLyric).toHaveBeenCalledTimes(2);
+      // 真实引擎的周期通知只有 position-changed，不会重复发布播放状态。
+      now.mockReturnValue(5_999);
+      await act(async () => h.emit("position", { positionMs: 41_000 }));
+      await settle();
+      expect(h.getPlaybackLyric).toHaveBeenCalledTimes(2);
+      now.mockReturnValue(6_000);
+      await act(async () => h.emit("position", { positionMs: 41_000 }));
+      await settle();
+      expect(h.getPlaybackLyric).toHaveBeenCalledTimes(3);
+      await frame();
+      expect(mainLine()).toBe("第 41 行");
+      now.mockReturnValue(60_000);
+      await act(async () => h.emit("position", { positionMs: 41_000 }));
+      await settle();
+      expect(h.getPlaybackLyric).toHaveBeenCalledTimes(3);
+    } finally {
+      view.unmount();
+      now.mockRestore();
+    }
+  });
+
+  it("下一首暂停且没有任何后续事件时，五秒后仍自动恢复歌词", async () => {
+    const view = render(<LyricWindow />);
+    await settle();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      h.getPlaybackLyric.mockRejectedValueOnce(new Error("下一首暂时超时"));
+      await act(async () => {
+        h.emit("playback", { status: "paused", positionMs: 41_000, track: h.track("b") });
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(mainLine()).toContain("歌词加载失败");
+      expect(h.getPlaybackLyric).toHaveBeenCalledTimes(2);
+      await act(async () => { await vi.advanceTimersByTimeAsync(4_999); });
+      expect(h.getPlaybackLyric).toHaveBeenCalledTimes(2);
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      expect(h.getPlaybackLyric).toHaveBeenCalledTimes(3);
+      expect(mainLine()).toBe("第 41 行");
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+      expect(h.getPlaybackLyric).toHaveBeenCalledTimes(3);
+    } finally {
+      view.unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it("定时和进度重试合并为同一次请求，持续失败最多尝试三次", async () => {
+    const view = render(<LyricWindow />);
+    await settle();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      h.getPlaybackLyric.mockRejectedValue(new Error("持续超时"));
+      await act(async () => {
+        h.emit("playback", { status: "playing", positionMs: 0, track: h.track("b") });
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      for (const expected of [3, 4]) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(5_000);
+          h.emit("position", { positionMs: 41_000 });
+        });
+        expect(h.getPlaybackLyric).toHaveBeenCalledTimes(expected);
+      }
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000);
+        h.emit("position", { positionMs: 41_000 });
+        h.emit("playback", { status: "paused", positionMs: 41_000, track: h.track("b") });
+      });
+      expect(h.getPlaybackLyric).toHaveBeenCalledTimes(4);
+      expect(mainLine()).toContain("歌词加载失败");
+    } finally {
+      view.unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(["切歌", "停止", "播客", "主窗口正文", "关闭"])("%s后废弃上首待重试任务，旧失败不覆盖新内容", async (action) => {
+    const view = render(<LyricWindow />);
+    await settle();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      h.getPlaybackLyric.mockRejectedValueOnce(new Error("下一首暂时超时"));
+      await act(async () => {
+        h.emit("playback", { status: "paused", positionMs: 0, track: h.track("b") });
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(mainLine()).toContain("歌词加载失败");
+      await act(async () => {
+        if (action === "切歌") h.emit("playback", { status: "paused", positionMs: 41_000, track: h.track("c") });
+        else if (action === "停止") h.emit("playback", { status: "stopped", positionMs: 0, track: null });
+        else if (action === "播客") h.emit("playback", { status: "paused", positionMs: 0, track: { ...h.track("episode"), platform: "podcast" } });
+        else if (action === "主窗口正文") h.events.get("playback-lyric-updated")?.({ payload: {
+          trackId: "wyy:b", lyricKey: "wyy:b::", lyric: { lrc: "[00:00.00]主窗口正确歌词", translation: "" },
+        } });
+        else view.unmount();
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      const requests = h.getPlaybackLyric.mock.calls.length;
+      const text = action === "关闭" ? null : mainLine();
+      await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+      expect(h.getPlaybackLyric).toHaveBeenCalledTimes(requests);
+      if (text !== null) expect(mainLine()).toBe(text);
+    } finally {
+      view.unmount();
+      vi.useRealTimers();
+    }
+  });
+
+  it("同曲取词失败后在播放心跳里限次恢复，不会一次失败后整首空词", async () => {
+    const now = vi.spyOn(Date, "now").mockReturnValue(1_000);
+    try {
+      h.getPlaybackLyric.mockRejectedValueOnce(new Error("暂时超时"));
+      render(<LyricWindow />);
+      await settle();
+      expect(mainLine()).toContain("歌词加载失败");
+      now.mockReturnValue(7_000);
+      await act(async () => h.emit("playback", { status: "paused", positionMs: 41_000, track: h.track("a") }));
+      await settle();
+      expect(h.getPlaybackLyric).toHaveBeenCalledTimes(2);
+      expect(mainLine()).toBe("第 41 行");
+    } finally { now.mockRestore(); }
   });
 
   /**

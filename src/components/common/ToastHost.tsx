@@ -83,14 +83,15 @@ function Toast({ item }: { item: ToastItem }): React.JSX.Element {
     <div
       role={item.kind === "error" ? "alert" : "status"}
       className={cn(
+        // 成对使用浮层颜色：播放页背景会覆盖 popover，但不会覆盖应用的 card。
         // 进场动画（右侧滑入）在 .qt-toast 上；退场走下面这组 transition
-        "qt-toast relative flex w-72 max-w-[22rem] items-start gap-2.5 overflow-hidden rounded-xl border px-3.5 py-2.5 shadow-overlay backdrop-blur-xl transition-[opacity,transform] duration-base ease-expo",
+        "qt-toast relative flex w-72 max-w-[22rem] items-start gap-2.5 overflow-hidden rounded-xl border bg-popover/95 px-3.5 py-2.5 text-popover-foreground shadow-overlay backdrop-blur-xl transition-[opacity,transform] duration-base ease-expo",
         leaving && "translate-x-3 scale-95 opacity-0",
         item.kind === "error"
-          ? "border-destructive/40 bg-card/95"
+          ? "border-destructive/40"
           : item.kind === "success"
-            ? "border-success/30 bg-card/95"
-            : "border-border bg-card/95",
+            ? "border-success/30"
+            : "border-border",
       )}
     >
       <span
@@ -103,7 +104,7 @@ function Toast({ item }: { item: ToastItem }): React.JSX.Element {
         <Icon className="h-3 w-3" strokeWidth={2.5} />
       </span>
       {/* line-clamp 兜底超长文案（歌单名 + 歌名可能很长），不给无限高 */}
-      <p className="min-w-0 flex-1 py-px text-xs leading-relaxed break-words text-foreground line-clamp-3">
+      <p className="min-w-0 flex-1 py-px text-xs leading-relaxed break-words line-clamp-3">
         {item.text}
       </p>
       {item.action && (

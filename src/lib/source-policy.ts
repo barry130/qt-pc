@@ -61,7 +61,9 @@ export async function readSourcePolicy(): Promise<SourcePolicy> {
     if (token !== readEpoch) return readSourcePolicy();
     // Preserve a usable management catalog so the user can repair this preference.
     // A failed read must never expand the enabled set.
-    accept({ version: 1, enabled: [], order: [] }, "音乐源设置无法读取，请在音源包管理中重新选择");
+    accept({ version: 1, enabled: [], order: [] }, "音乐源设置无法读取，请稍后重试");
+    // A failed read is not a durable all-off preference. Allow the next read to recover.
+    loaded = false;
     return policy;
   }).finally(() => { if (loading === task) loading = null; });
   loading = task;

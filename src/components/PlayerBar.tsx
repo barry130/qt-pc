@@ -77,6 +77,9 @@ import {
 import { setSourcePlayQuality } from "@/lib/source-quality";
 import { toastSuccess } from "@/stores/toast";
 import { DlnaButton } from "@/components/player/DlnaButton";
+import { PitchControls } from "@/components/player/PitchControl";
+import { usePitchStore } from "@/stores/pitch";
+import { usePitchSync } from "@/hooks/usePitchSync";
 
 /**
  * 子组件的 memo 版本。
@@ -88,6 +91,7 @@ import { DlnaButton } from "@/components/player/DlnaButton";
  */
 const SpectrumBackgroundMemo = memo(SpectrumBackground);
 const VolumeControlMemo = memo(VolumeControl);
+const PitchMenuMemo = memo(PitchMenu);
 const DesktopLyricButtonMemo = memo(DesktopLyricButton);
 const MiniModeButtonMemo = memo(MiniModeButton);
 const SpectrumButtonMemo = memo(SpectrumButton);
@@ -315,6 +319,8 @@ export function PlayerBar(): React.JSX.Element {
       // 频谱背景开关：与设置页频谱开关同一个引擎侧后端（setSpectrum）
       case "spectrum":
         return <SpectrumButtonMemo key="spectrum" />;
+      case "pitch":
+        return <PitchMenuMemo key="pitch" />;
       // 均衡器入口：跳设置页音效节（引擎侧 DSP 的 EQ / 响度归一化都在那）
       case "equalizer":
         return <EqualizerButtonMemo key="equalizer" />;
@@ -1057,6 +1063,46 @@ function SpeedMenu(props: { current: number }): React.JSX.Element {
   );
 }
 
+/** 独立变调入口：远端投屏仍保留设置，用于下一次本机播放。 */
+function PitchMenu(): React.JSX.Element {
+  const tr = useT();
+  const current = usePitchStore((state) => state.semitones);
+  const casting = usePlayerStore((state) => state.state?.cast != null);
+  usePitchSync();
+  const value = current > 0 ? `+${current}` : String(current);
+  const label = tr("settings.sound.pitch.current", { value });
+  return (
+    <Popover
+      trigger={({ open, toggle }) => (
+        <ControlButton
+          label={casting ? `${label} · ${tr("settings.sound.pitch.localOnly")}` : label}
+          ariaHasPopup="dialog"
+          ariaExpanded={open}
+          onClick={toggle}
+        >
+          <span className="text-xs font-medium tabular-nums">{value}</span>
+        </ControlButton>
+      )}
+    >
+      {(close) => (
+        <div
+          role="dialog"
+          aria-label={tr("settings.sound.pitch.title")}
+          className="absolute bottom-full right-0 z-30 mb-2 w-72 rounded-xl border border-border bg-popover/95 p-3 text-popover-foreground shadow-raised backdrop-blur-xl"
+        >
+          <p className="mb-2 text-xs text-muted-foreground">
+            {casting ? tr("settings.sound.pitch.localOnly") : tr("settings.sound.pitch.desc")}
+          </p>
+          <PitchControls />
+          <button type="button" className="sr-only focus:not-sr-only" onClick={close}>
+            {tr("settings.sound.pitch.close")}
+          </button>
+        </div>
+      )}
+    </Popover>
+  );
+}
+
 /** 睡眠定时档位：分钟档 + 「播完当前歌后停止」，与移动端口径一致 */
 const SLEEP_MINUTE_OPTIONS = [15, 30, 60];
 
@@ -1562,7 +1608,7 @@ function ControlButton(props: {
   disabled?: boolean;
   onClick?: (e: ReactMouseEvent) => void;
   /** 透传给底层 button 的 menu 语义（带弹出菜单的按钮用） */
-  ariaHasPopup?: "menu";
+  ariaHasPopup?: "menu" | "dialog";
   ariaExpanded?: boolean;
   children: React.ReactNode;
 }): React.JSX.Element {

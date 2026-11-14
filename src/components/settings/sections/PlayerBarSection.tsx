@@ -29,6 +29,7 @@ const BUTTON_KEYS = {
     "settings.playerBar.buttons.spectrum.label",
     "settings.playerBar.buttons.spectrum.hint",
   ],
+  pitch: ["settings.playerBar.buttons.pitch.label", "settings.playerBar.buttons.pitch.hint"],
   equalizer: [
     "settings.playerBar.buttons.equalizer.label",
     "settings.playerBar.buttons.equalizer.hint",
@@ -79,6 +80,7 @@ export function PlayerBarSection(): React.JSX.Element {
               description={keys ? tr(keys[1]) : b.hint}
             >
               <Switch
+                label={keys ? tr(keys[0]) : b.label}
                 checked={checked}
                 disabled={!checked && counted && full}
                 onToggle={() => toggle(b.id)}

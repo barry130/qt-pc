@@ -338,8 +338,26 @@ export const LYRIC_CACHE_CAP = 50;
  */
 const lyricCache = new Map<string, Promise<Lyric>>();
 
-function lyricCacheKey(track: Track, cross: CrossSourceHit | null): string {
+export function playbackLyricKey(track: Track, cross: CrossSourceHit | null = null): string {
   return `${track.platform}:${track.id}:${cross?.target ?? ""}:${cross?.song?.id ?? ""}`;
+}
+
+/** 主窗口桥只镜像已有的词：窥缓存不发起网络请求，也不改变 LRU 顺序。 */
+export function peekCachedPlaybackLyric(track: Track, cross: CrossSourceHit | null = null): Promise<Lyric> | undefined {
+  return lyricCache.get(playbackLyricKey(track, cross));
+}
+
+type PlaybackLyricListener = (track: Track, cross: CrossSourceHit | null, lyric: Lyric) => void;
+const playbackLyricListeners = new Set<PlaybackLyricListener>();
+export function onPlaybackLyricCached(listener: PlaybackLyricListener): () => void {
+  playbackLyricListeners.add(listener);
+  return () => { playbackLyricListeners.delete(listener); };
+}
+
+function notifyPlaybackLyricCached(track: Track, cross: CrossSourceHit | null, lyric: Lyric): void {
+  for (const listener of playbackLyricListeners) {
+    try { listener(track, cross, lyric); } catch { /* 镜像失败不影响本窗口取词 */ }
+  }
 }
 
 /**
@@ -358,13 +376,14 @@ function putLyricCache(key: string, task: Promise<Lyric>): Promise<Lyric> {
 
 /** 把一份已知的歌词塞进缓存（同步生效），键口径与 getPlaybackLyric 完全一致 */
 function cacheLyric(track: Track, cross: CrossSourceHit | null, lyric: Lyric): void {
-  putLyricCache(lyricCacheKey(track, cross), Promise.resolve(lyric));
+  putLyricCache(playbackLyricKey(track, cross), Promise.resolve(lyric));
+  notifyPlaybackLyricCached(track, cross, lyric);
 }
 
 export function getPlaybackLyric(track: Track, cross: CrossSourceHit | null = null): Promise<Lyric> {
   // 播客有独立字幕时间轴；不能把节目标题送到歌曲音源搜索歌词。
   if (track.platform === "podcast") return Promise.resolve({ lrc: "", translation: "" });
-  const key = lyricCacheKey(track, cross);
+  const key = playbackLyricKey(track, cross);
   const hit = lyricCache.get(key);
   if (hit !== undefined) {
     // 命中后移到最新端（Map 迭代按插入序，最旧的总在第一个）
@@ -374,6 +393,9 @@ export function getPlaybackLyric(track: Track, cross: CrossSourceHit | null = nu
   }
   const task = fetchPlaybackLyric(track, cross)
     .then(({ lyric: lyr, fromSaved }) => {
+      // 在途请求可能已被手动选词替换；旧响应既不落库，也不广播覆盖用户新选的词。
+      if (lyricCache.get(key) !== task) return lyr;
+      notifyPlaybackLyricCached(track, cross, lyr);
       // 取词成功顺手落库：网络失败时（换源、断网、源站抽风）还能回读到上一次的词，
       // 而不是整页空白。写入失败一律忽略 —— 歌词是锦上添花，不该影响播放。
       // try/catch 是必要的：非 Tauri 环境（单测 / 浏览器直开）里 invoke 会同步抛，
@@ -587,5 +609,5 @@ export async function applyPickedLyric(
  * 「换了没反应」，跟播放页那份错位。
  */
 export function dropCachedLyric(track: Track, cross: CrossSourceHit | null): void {
-  lyricCache.delete(lyricCacheKey(track, cross));
+  lyricCache.delete(playbackLyricKey(track, cross));
 }

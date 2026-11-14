@@ -24,7 +24,7 @@ import {
   sourceDownloadQualityOf,
   sourcePlayQualityOf,
 } from "@/lib/source-quality";
-import { policyOrder, readSourcePolicy, sourcePolicySnapshot, SOURCE_POLICY_CHANGED_EVENT, type SourcePolicy } from "@/lib/source-policy";
+import { policyOrder, readSourcePolicy, sourcePolicyError, sourcePolicySnapshot, SOURCE_POLICY_CHANGED_EVENT, type SourcePolicy } from "@/lib/source-policy";
 import { defaultSourcePolicy, policySourceEnabled } from "@/lib/source-policy-model";
 
 /**
@@ -77,6 +77,29 @@ interface SourceRegistryStore {
 }
 
 let inflight: Promise<void> | null = null;
+let disposed = false;
+const cleanup: Array<() => void> = [];
+const retryTimers = new Set<number>();
+function registerCleanup(fn: (() => void) | void): void {
+  if (!fn) return;
+  // Native listen() can finish registering after the module was replaced.
+  if (disposed) fn(); else cleanup.push(fn);
+}
+function scheduleRetry(retry: () => void, delay: number): void {
+  if (disposed) return;
+  const timer = window.setTimeout(() => {
+    retryTimers.delete(timer);
+    if (!disposed) retry();
+  }, delay);
+  retryTimers.add(timer);
+}
+import.meta.hot?.dispose?.(() => {
+  disposed = true;
+  for (const dispose of cleanup.splice(0)) dispose();
+  for (const timer of retryTimers) window.clearTimeout(timer);
+  retryTimers.clear();
+  if (profileRefreshTimer !== null) window.clearTimeout(profileRefreshTimer);
+});
 let policyListenerBound = false;
 function enabledCatalog(catalog: RegistrySource[], policy: SourcePolicy): RegistrySource[] {
   return policyOrder(policy, catalog).filter(source => policySourceEnabled(policy, source.id));
@@ -87,13 +110,16 @@ function catalogSources(state: SourceRegistryStore): RegistrySource[] {
 function bindPolicyListener(): void {
   if (policyListenerBound) return;
   policyListenerBound = true;
-  window.addEventListener(SOURCE_POLICY_CHANGED_EVENT, () => {
+  const onPolicyChanged = (): void => {
+    if (disposed) return;
     const state = useSourceRegistryStore.getState();
     const policy = sourcePolicySnapshot();
     const sources = enabledCatalog(state.catalog, policy);
     useSourceRegistryStore.setState({ policy, sources, generation: state.generation + 1 });
     if (state.ready) validateActiveSource(sources);
-  });
+  };
+  window.addEventListener(SOURCE_POLICY_CHANGED_EVENT, onPolicyChanged);
+  registerCleanup(() => window.removeEventListener(SOURCE_POLICY_CHANGED_EVENT, onPolicyChanged));
 }
 
 /** 播放包安装/切换/卸载会热切换引擎页：若注册表还没取到（首次 ensure 时
@@ -107,9 +133,9 @@ function bindPackListener(): void {
     const retry = (): void => {
       void useSourceRegistryStore.getState().ensure();
     };
-    window.setTimeout(retry, 800);
-    window.setTimeout(retry, 2500);
-  }).catch(() => {
+    scheduleRetry(retry, 800);
+    scheduleRetry(retry, 2500);
+  }).then(registerCleanup).catch(() => {
     packListenerBound = false;
   });
 }
@@ -126,9 +152,9 @@ function bindMetaListener(): void {
     const retry = (): void => {
       void useSourceRegistryStore.getState().refresh();
     };
-    window.setTimeout(retry, 800);
-    window.setTimeout(retry, 2500);
-  }).catch(() => {
+    scheduleRetry(retry, 800);
+    scheduleRetry(retry, 2500);
+  }).then(registerCleanup).catch(() => {
     metaListenerBound = false;
   });
 }
@@ -140,14 +166,15 @@ let phaseHookBound = false;
 function bindPhaseHook(): void {
   if (phaseHookBound) return;
   phaseHookBound = true;
-  onEnginePhaseChange((p) => {
-    if (p !== "ready") return;
-    if (useSourceRegistryStore.getState().ready) return;
+  registerCleanup(onEnginePhaseChange((p) => {
+    if (disposed || p !== "ready") return;
+    if (useSourceRegistryStore.getState().ready && !sourcePolicyError()) return;
     void useSourceRegistryStore.getState().ensure();
-  });
+  }));
 }
 
 async function load(set: (partial: Partial<SourceRegistryStore>) => void): Promise<void> {
+  if (disposed) return;
   bindPackListener();
   bindMetaListener();
   bindPhaseHook();
@@ -155,7 +182,9 @@ async function load(set: (partial: Partial<SourceRegistryStore>) => void): Promi
   bindPolicyListener();
   try {
     await readSourcePolicy();
+    if (disposed) return;
     const registry = await getSourceRegistry();
+    if (disposed) return;
     const before = useSourceRegistryStore.getState();
     if (registry === null) {
       // 引擎未就绪 / 旧版数据包无入口 / 包被卸载：清空并保持未就绪。
@@ -201,6 +230,9 @@ async function load(set: (partial: Partial<SourceRegistryStore>) => void): Promi
 /** 注册表加载后纠正全局音源：换包后原音源可能已下线（存档里也可能存着
  *  脏值），回退到数据包声明的第一个音源，避免页面拿死 id 请求。 */
 function validateActiveSource(sources: RegistrySource[]): void {
+  // Unreadable settings temporarily hide online sources; they are not a user selection.
+  // Never persist a fallback until an authoritative policy has been read.
+  if (disposed || sourcePolicyError()) return;
   const music = useMusicSourceStore.getState();
   const current = music.activeSourceId;
   if (current === "local") return;
@@ -218,7 +250,10 @@ export const useSourceRegistryStore = create<SourceRegistryStore>()((set, get) =
   generation: 0,
   profiles: {},
   ensure: () => {
-    if (get().ready) return Promise.resolve();
+    // A catalog can be ready while the policy read failed transiently. In that
+    // state the next ensure must retry instead of treating the empty view as
+    // a stable all-off configuration.
+    if (get().ready && !sourcePolicyError()) return Promise.resolve();
     if (inflight) return inflight;
     inflight = load(set);
     return inflight;
@@ -230,7 +265,7 @@ export const useSourceRegistryStore = create<SourceRegistryStore>()((set, get) =
   },
   refreshQualityProfiles: async () => {
     const sources = get().sources;
-    if (sources.length === 0) return;
+    if (disposed || sources.length === 0) return;
     const entries = await Promise.all(
       sources.map(async (s): Promise<[string, SourceQualityProfile] | null> => {
         try {
@@ -243,6 +278,7 @@ export const useSourceRegistryStore = create<SourceRegistryStore>()((set, get) =
         }
       }),
     );
+    if (disposed) return;
     const profiles: Record<string, SourceQualityProfile> = {};
     for (const entry of entries) {
       if (entry !== null) profiles[entry[0]] = entry[1];
@@ -289,6 +325,7 @@ function bindProfileListeners(): void {
   if (profileListenersBound) return;
   profileListenersBound = true;
   const debouncedRefresh = (): void => {
+    if (disposed) return;
     if (profileRefreshTimer !== null) window.clearTimeout(profileRefreshTimer);
     profileRefreshTimer = window.setTimeout(() => {
       profileRefreshTimer = null;
@@ -296,6 +333,7 @@ function bindProfileListeners(): void {
     }, 250);
   };
   window.addEventListener(SOURCE_PLAY_LOGIN_CHANGED_EVENT, debouncedRefresh);
+  registerCleanup(() => window.removeEventListener(SOURCE_PLAY_LOGIN_CHANGED_EVENT, debouncedRefresh));
 }
 
 // ---------- 非响应式读取（事件/工具层用；组件请用下面的 hook 版本） ----------

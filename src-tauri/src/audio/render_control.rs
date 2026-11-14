@@ -361,6 +361,12 @@ impl Drop for BoundSeekPending {
 }
 
 impl BoundSeekRequest {
+    /// The original startup reservation already committed this cue under Gate/State/Mounts.
+    /// No decoder exists yet; the ordinary pending receipt still rechecks source authority.
+    pub(super) fn complete_deferred(self) {
+        let receipt = BoundSeekReceipt { stamp: self.stamp.clone(), content_position_ms: self.position_ms() };
+        let _ = self.reply.send(Ok(receipt));
+    }
     pub(super) fn external_ready(&self) -> bool {
         !self.cancelled.load(Ordering::Acquire) && self.port.is_ready()
             && self.port.is_live() && self.port.has_authority()

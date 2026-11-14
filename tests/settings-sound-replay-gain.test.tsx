@@ -25,6 +25,7 @@ function fxState(over: Partial<FxState> = {}): FxState {
     fade: { enabled: false, durationMs: 300 },
     spectrum: false,
     replayGain: "off",
+    pitchSemitones: 0,
     ...over,
   };
 }

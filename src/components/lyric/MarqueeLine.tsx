@@ -44,9 +44,14 @@ export function MarqueeLine(props: {
     const outer = outerRef.current;
     const text = textRef.current;
     if (!outer || !text) return;
-    // 文本保持 max-content 宽度，因此其 scrollWidth 是稳定的自然文本宽度；
-    // 与外层可用宽度比较即可得到真实溢出距离，不受 transform 动画影响。
-    const nextOverflow = Math.max(0, text.scrollWidth - outer.clientWidth);
+    // clientWidth 包含两侧 padding，文本只能使用内容区的宽度。
+    // 把 px-4 的留白算进去会少滚 32px，让末字停在右侧裁剪 / 渐隐区。
+    const style = window.getComputedStyle(outer);
+    const contentWidth = Math.max(0, outer.clientWidth
+      - (Number.parseFloat(style.paddingLeft) || 0)
+      - (Number.parseFloat(style.paddingRight) || 0));
+    // max-content 的自然文本宽度不受 transform 动画影响。
+    const nextOverflow = Math.max(0, text.scrollWidth - contentWidth);
     setOverflow((current) => current === nextOverflow ? current : nextOverflow);
   }, []);
 

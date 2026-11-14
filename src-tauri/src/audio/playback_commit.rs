@@ -68,6 +68,13 @@ pub struct PlaybackCommitPlan {
     pub retired_snapshot: PlaybackStateSnapshot,
 }
 
+impl PlaybackCommitPlan {
+    /// Only startup restores commit Paused; ordinary paused reload plans remain Loading.
+    pub fn dispatch_load(self, dispatch: impl FnOnce(Self)) {
+        if self.snapshot.status != PlaybackStatus::Paused || self.autoplay { dispatch(self); }
+    }
+}
+
 /// Actual automatic queue/loading mutations, before device or persistence effects.
 pub struct AutomaticAdvance {
     pub sleep_fired: bool,
@@ -217,6 +224,12 @@ impl PlaybackCommitter {
         let mut prepared = self.prepare(
             generation, queue, false, session.position_ms, Some(session.quality),
         );
+        // 启动恢复只恢复队列/进度，不代表用户要求立即联网播放；播放入口
+        // 会在用户明确点击播放时使用这个保留的 source reservation 取链。
+        if let Some(track) = &prepared.track {
+            prepared.snapshot.status = PlaybackStatus::Paused;
+            prepared.snapshot.duration_ms = (track.duration.max(0.0) * 1000.0) as u64;
+        }
         prepared.snapshot.play_mode = session.play_mode;
         prepared.snapshot.volume = session.volume.clamp(0.0, 1.0);
         prepared.snapshot.muted = session.muted;

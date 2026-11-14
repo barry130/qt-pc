@@ -2103,6 +2103,14 @@ rodio 无内置 EQ，实现为 `EqSource`：10 段 `biquad` peaking filter 串�
 | 预设 | 流行 / 摇滚 / 古典 / 人声 / 低音增强 / 自定义，存 `settings` 表 |
 | 音量归一化 | 优先读文件内 ReplayGain / `R128_TRACK_GAIN` 标签（lofty 可读）；无标签则不做实时分析（实时 LUFS 计算成本过高，v1 不做） |
 
+### 7.8.1 独立升降调（2026-11-14）
+
+- 设置 → 音效提供 −12～+12 整数半音和恢复原调；设置 → 播放条可打开默认隐藏的「升降调」按钮，占用既有最多 10 个行内按钮名额，不改变默认布局。
+- 本机解码的在线／本地歌曲均经 `PitchSource`（`pitch_shift 2.1.0` 相位声码器，每声道独立状态）；0 半音逐样本直通，非零保留输入采样率、声道和内容样本总数，补偿处理延迟并排空曲尾，seek 成功后清理旧窗口。
+- 生产链为 `decoder → PitchSource → 其他 DspSource 音效 → TrackedSource → SourceRate → SeekTargetGuard`；进度和首次输出回执按处理后的实际内容计数，禁止把算法预读算成已播放。普通挂载、预载与兼容路径同样接入；原 target／port／mount nonce 不变，改半音不取链、不重挂源、不改倍速。
+- `set_pitch { semitones }` 由音频 actor 串行执行，先保存 `settings["fx.pitchSemitones"]`，再更新共享原子参数；成功返回实际半音并广播 `pitch-changed`，保存失败保留原值。`get_fx_state.pitchSemitones` 是回读真源，启动缺失／损坏值按 0、越界值钳至范围。
+- 两处控件共享最后目标写入队列与事件回读，关闭弹层仍提交最后值；DLNA 远端播放绕过本机 DSP，界面注明仅本机生效。原始文件、下载文件与播放 URL 均不改写。
+
 ## 7.9 输出设备切换
 
 cpal 无法在既有流上换设备，必须重建：

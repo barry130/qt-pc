@@ -27,6 +27,8 @@ vi.mock("@/services/ipc", () => ({
 import { getLyric, searchMusic } from "@/source-scripts";
 import {
   applyPickedLyric,
+  dropCachedLyric,
+  onPlaybackLyricCached,
   getPlaybackLyric,
   searchLyricCandidates,
   type LyricCandidate,
@@ -180,6 +182,23 @@ describe("applyPickedLyric", () => {
 });
 
 describe("取词失败的剔除只针对自己那一条", () => {
+  it("桌面接受共享正文并废弃旧请求后，旧成功响应不再落库或广播", async () => {
+    const t = track();
+    const received = vi.fn();
+    const off = onPlaybackLyricCached(received);
+    let resolveOld!: (value: Lyric) => void;
+    getLyricMock.mockReturnValueOnce(new Promise((resolve) => { resolveOld = resolve; }));
+    try {
+      const pending = getPlaybackLyric(t);
+      await vi.waitFor(() => expect(getLyricMock).toHaveBeenCalledWith(t));
+      dropCachedLyric(t, null);
+      resolveOld(lyric("[00:01.00]迟到旧词"));
+      await pending;
+      expect(saveLyricIpc).not.toHaveBeenCalled();
+      expect(received).not.toHaveBeenCalled();
+    } finally { off(); }
+  });
+
   it("在飞请求失败时不会把用户刚选好的词抹掉", async () => {
     const t = track();
     let rejectLyric!: (err: Error) => void;

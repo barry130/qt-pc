@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Track } from "@/types";
 import {
   defaultSourcePolicy, movePolicySource, policyOrder, policySourceEnabled, togglePolicySource,
@@ -8,6 +8,7 @@ import {
 const host = vi.hoisted(() => ({
   stored: null as string | null,
   failWrite: false,
+  failRead: false,
   active: "wyy",
   catalog: ["wyy", "qq", "kw"],
   calls: [] as { name: string; args: unknown }[],
@@ -34,7 +35,10 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 vi.mock("@/services/ipc", async importOriginal => ({
   ...await importOriginal<typeof import("@/services/ipc")>(),
-  getSetting: vi.fn(async () => host.stored),
+  getSetting: vi.fn(async () => {
+    if (host.failRead) throw new Error("settings temporarily unavailable");
+    return host.stored;
+  }),
   playUrlCacheEpoch: vi.fn(async () => 1),
 }));
 vi.mock("@/source-engine/client", () => ({
@@ -64,11 +68,21 @@ vi.mock("@/stores/musicSource", () => ({
   },
 }));
 
+const removeWindowListeners: Array<() => void> = [];
 beforeEach(() => {
+  const addEventListener = window.addEventListener.bind(window);
+  vi.spyOn(window, "addEventListener").mockImplementation((type, listener, options) => {
+    addEventListener(type, listener, options);
+    removeWindowListeners.push(() => window.removeEventListener(type, listener, options));
+  });
   vi.resetModules();
-  host.stored = null; host.failWrite = false; host.active = "wyy";
+  host.stored = null; host.failWrite = false; host.failRead = false; host.active = "wyy";
   host.catalog = ["wyy", "qq", "kw"]; host.calls = []; host.recommendation = null;
   host.resolveError = ""; host.listeners.clear();
+});
+afterEach(() => {
+  for (const remove of removeWindowListeners.splice(0)) remove();
+  vi.restoreAllMocks();
 });
 
 describe("device platform settings at the storage, facade and registry boundaries", () => {
@@ -114,6 +128,43 @@ describe("device platform settings at the storage, facade and registry boundarie
     await policy.saveSourcePolicy({ version: 1, enabled: ["wyy"], order: [] });
     expect(policy.sourceEnabled("wyy")).toBe(true);
     expect(policy.sourcePolicyError()).toBe("");
+  });
+
+  it("a failed settings read blocks requests without overwriting the selected source, then recovers on retry", async () => {
+    host.stored = JSON.stringify({ version: 1, enabled: ["qq"], order: ["qq"] });
+    host.active = "qq";
+    host.failRead = true;
+    const policy = await import("@/lib/source-policy");
+    const { useSourceRegistryStore } = await import("@/stores/sourceRegistry");
+    await useSourceRegistryStore.getState().ensure();
+
+    expect(policy.sourceEnabled("qq")).toBe(false);
+    expect(policy.sourcePolicyError()).toContain("无法读取");
+    expect(useSourceRegistryStore.getState().sources).toEqual([]);
+    expect(host.active).toBe("qq");
+    expect(JSON.parse(host.stored).enabled).toEqual(["qq"]);
+
+    host.failRead = false;
+    await useSourceRegistryStore.getState().refresh();
+    expect(policy.sourcePolicyError()).toBe("");
+    expect(useSourceRegistryStore.getState().sources.map(s => s.id)).toEqual(["qq"]);
+    expect(host.active).toBe("qq");
+  });
+
+  it("ensure retries unreadable settings even when the package catalog was already loaded", async () => {
+    host.failRead = true;
+    const policy = await import("@/lib/source-policy");
+    const { useSourceRegistryStore } = await import("@/stores/sourceRegistry");
+    await useSourceRegistryStore.getState().ensure();
+    expect(useSourceRegistryStore.getState().ready).toBe(true);
+    expect(useSourceRegistryStore.getState().sources).toEqual([]);
+    expect(host.active).toBe("wyy");
+
+    host.failRead = false;
+    await useSourceRegistryStore.getState().ensure();
+    expect(policy.sourcePolicyError()).toBe("");
+    expect(useSourceRegistryStore.getState().sources.map(s => s.id)).toEqual(["wyy", "qq", "kw"]);
+    expect(host.active).toBe("wyy");
   });
 
   it("native settings changes invalidate an already mounted client", async () => {

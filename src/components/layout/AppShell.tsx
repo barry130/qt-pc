@@ -15,6 +15,7 @@ import { useFramelessWindow } from "@/hooks/useFramelessWindow";
 import { usePlaybackEvents } from "@/hooks/usePlaybackEvents";
 import { usePodcastAutoSubtitles } from "@/hooks/usePodcastAutoSubtitles";
 import { usePodcastSubtitleBroadcast } from "@/hooks/usePodcastSubtitleBroadcast";
+import { usePlaybackLyricBroadcast } from "@/hooks/usePlaybackLyricBroadcast";
 import { usePlayUrlBridge } from "@/hooks/usePlayUrlBridge";
 import { useAppearanceEffect } from "@/hooks/useAppearanceEffect";
 import { useCoverColor } from "@/hooks/useCoverColor";
@@ -69,6 +70,7 @@ export function AppShell(): React.JSX.Element {
   usePlaybackEvents();
   usePodcastAutoSubtitles();
   usePodcastSubtitleBroadcast();
+  usePlaybackLyricBroadcast();
   // 引擎→前端取链桥：聚合/脚本方案覆盖引擎主导的换歌（自动切歌/随机/重取）
   usePlayUrlBridge();
   useAppearanceEffect();

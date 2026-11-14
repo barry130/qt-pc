@@ -1,9 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { RequestBuiltin, SourceResponse } from "../../qt-sources/src/contract";
+import type { RequestBuiltin, SourceResponse } from "@/source-scripts/qt-contract/contract";
+import type { AccountMetaHost } from "./fixtures/account-meta";
 
-// Agreed seam: real PC auth, recommendation helper, facade and engine client +
-// real registered source handlers. Only Tauri/native transport and host HTTP
-// are synthetic; no private settings, live account, network or player is used.
+// Seam: real PC auth, recommendation helper, facade and engine client.
+// Default CI uses a test-only protocol peer; test:account-integration runs the
+// same cases against real source handlers. Neither mode uses live accounts or HTTP.
+const integrationEntry = process.env.QT_ACCOUNT_META_ENTRY;
+const registerMeta = integrationEntry
+  ? (await import(/* @vite-ignore */ integrationEntry) as { registerQtEntries: (host: AccountMetaHost) => void }).registerQtEntries
+  : (await import("./fixtures/account-meta")).registerQtEntries;
 type EventListener = (event: { payload: unknown }) => void;
 type EngineRequest = { requestId: number; kind: string; entry?: string; args?: Record<string, unknown> };
 type Entries = Record<string, (args: Record<string, unknown>) => string | Promise<string>>;
@@ -122,8 +127,7 @@ beforeEach(async () => {
     if (!options?.headers?.Cookie?.endsWith(acceptedCookie)) throw new Error("Synthetic HTTP account session mismatch");
     return typeof fixture === "function" ? fixture() : fixture;
   };
-  const { registerQtEntries } = await import("../../qt-sources/src/meta-entries");
-  registerQtEntries({ request, platform: 1103 });
+  registerMeta({ request, platform: 1103 });
   entries = (globalThis as unknown as { __qtEntries: Entries }).__qtEntries;
   entries.clearAuth({ scope: "meta" });
   entries.clearAuth({ scope: "play" });
@@ -164,7 +168,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("account metadata session sharing through real registered handlers", () => {
+describe(`account metadata session sharing through ${integrationEntry ? "real registered handlers" : "the protocol fixture"}`, () => {
   it("the first successful save observes a metadata reset before any recommendation context is prepared", async () => {
     // beforeEach used the public save API, but no preparation or ensure API yet.
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });

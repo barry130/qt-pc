@@ -127,6 +127,7 @@ vi.mock("@/lib/localOnline", () => ({
     return { lrc: "[00:00.00]词", wordByWord: "", translation: "", romanization: "" };
   },
   dropCachedLyric: vi.fn(),
+  playbackLyricKey: (track: { platform: string; id: string }, cross: { target: string; song: { id: string } | null } | null = null) => `${track.platform}:${track.id}:${cross?.target ?? ""}:${cross?.song?.id ?? ""}`,
   crossSourceHitFromLine: () => {
     h.events.push("cross");
     return h.cross.hit;

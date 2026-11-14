@@ -48,6 +48,8 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # 0.22 起 Decoder::builder().with_byte_len() 会把总字节数透传给 symphonia 的
 # MediaSource，FLAC 的二分定位不再因 byte_len 缺失而报 Unseekable（进度条拖拽修复）
 rodio = { version = "0.22.2", features = ["symphonia-all"] }
+# 固定纯 Rust/MIT 相位声码器：128 帧 hop，保持采样率和播放时长不变。
+pitch_shift = "=2.1.0"
 # 音频输出设备枚举 / 默认设备变化检测（与 rodio 0.22.2 内置的 cpal 0.17 对齐，不引入新副本）
 cpal = "0.17"
 # 本地音乐库元数据读取（DESIGN §13）：与 rodio 0.22.2 内置的 symphonia 0.5.5 同版本，不引入新副本
