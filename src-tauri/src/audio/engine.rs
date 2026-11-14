@@ -123,9 +123,9 @@ pub enum AudioCmd {
     Seek(u64),
     SetVolume(f32),
     SetMuted(bool),
-    /// 整表替换队列并从 index 开始播放
     /// Retire speculative playback after source preferences change, leaving the current stream alone.
     SourcePolicyChanged,
+    /// 整表替换队列并从 index 开始播放
     SetQueue {
         tracks: Vec<Track>,
         index: usize,
@@ -3286,6 +3286,11 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
             }
             maybe_preload(inner);
         }
+        AudioCmd::SourcePolicyChanged => {
+            invalidate_preload(inner);
+            // Resume speculative work on the next real track transition, after policy application.
+            inner.preload.retries = PRELOAD_RETRY_LIMIT;
+        }
         AudioCmd::PreloadFailed { gen } => {
             // 预载失败立刻作废槽位并记一次重试：下一圈预热会重新选目标
             // （随机模式重新掷骰），不必再死等到曲末才由 advance() 现场取链。
@@ -3358,6 +3363,7 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                 log::debug!("[queue] 丢弃过期的失败回执 track={track_id}");
             } else {
                 log::error!("[queue] 曲目 {track_id} 播放失败: {message}");
+                let policy_blocked = crate::source_policy::is_policy_error(&message);
                 inner.mutate(|st| {
                     st.status = PlaybackStatus::Error;
                     st.error = Some(message);
@@ -3389,11 +3395,6 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
                             skip_if_recoverable(inner, &track_id, autoplay);
                         }
                     }
-        AudioCmd::SourcePolicyChanged => {
-            invalidate_preload(inner);
-            // Resume speculative work on the next real track transition, after policy application.
-            inner.preload.retries = PRELOAD_RETRY_LIMIT;
-        }
                 }
             }
         }
@@ -3466,7 +3467,6 @@ fn handle_cmd(inner: &mut EngineInner, cmd: AudioCmd) -> bool {
     // 每条命令处理完立刻补一次预热：挂载完成（LoadReady）/ 恢复播放 / 重新开
     // 无缝，都在这一条命令里把状态推到可预热，不必再等播放圈的下一次轮询
     // （非播放态那一圈要等满 1s，等于白等一秒才开始预取）。
-                let policy_blocked = crate::source_policy::is_policy_error(&message);
     maybe_preload(inner);
     false
 }
@@ -4389,6 +4389,10 @@ impl LoadJob {
             }
             Err(e) => {
                 // 弱网（Stalled）与「音源没这首」（NoPlayableUrl）分开走：
+                if let crate::provider::types::ProviderError::SourcePolicy { message } = &e {
+                    self.dispatch_failed_message("source-policy", message.clone(), false);
+                    return;
+                }
                 // 前者不拉黑本首、不计熔断，只提示网络慢并原地重试。
                 let stalled = e.is_stalled();
                 if stalled {
@@ -4492,10 +4496,6 @@ impl LoadJob {
         }
         // Original source receipts publish only after the actor's shared admission.
         // Keep the existing targetless/legacy notification path unchanged.
-                if let crate::provider::types::ProviderError::SourcePolicy { message } = &e {
-                    self.dispatch_failed_message("source-policy", message.clone(), false);
-                    return;
-                }
         if self.port.is_none() {
             let _ = self.app.emit(
                 "audio-error",

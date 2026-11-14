@@ -200,6 +200,8 @@ pub enum ProviderError {
     Unsupported,
     #[error("无可用播放地址")]
     NoPlayableUrl,
+    #[error("{message}")]
+    SourcePolicy { message: String },
     #[error("无结果")]
     Empty,
     /// 取链链路**等待超时**（前端应答 / 引擎窗口 / 打开流都没在预算内答完）。
@@ -208,8 +210,6 @@ pub enum ProviderError {
     /// 给不出地址」，是内容问题；本变体是「网络慢/引擎卡」，等一会儿可能就好。
     /// 早期实现两者都报 `NoPlayableUrl`，于是弱网时每首都被记成「歌坏了」——
     /// 连续 5 首打满熔断把自动切歌关掉，弱网反而变成永久不可用。
-    #[error("{message}")]
-    SourcePolicy { message: String },
     #[error("网络较慢，取链超时")]
     ResolveStalled,
 }

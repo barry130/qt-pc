@@ -84,8 +84,8 @@ pub mod webview_mem;
 pub mod smtc;
 pub mod source_bundle;
 pub mod source_engine_policy;
-pub mod source_install;
 pub mod source_policy;
+pub mod source_install;
 pub mod source_pack_header;
 pub mod source_window;
 pub mod taskbar;
@@ -160,13 +160,13 @@ pub(crate) async fn resolve_play_url_script(
     if let Some(hit) = cache.get(&key) {
         return Ok(hit);
     }
+    let generation = cache.generation();
     let reply = match crate::playurl_bridge::ask_frontend(app, track, quality).await {
         crate::playurl_bridge::AskOutcome::Url {
             url,
             referer,
             size,
             actual_quality,
-    let generation = cache.generation();
         } => crate::provider::url_cache::ResolvedPlayUrl {
             url,
             referer,
@@ -175,13 +175,13 @@ pub(crate) async fn resolve_play_url_script(
             fetched_at: 0,
         },
         crate::playurl_bridge::AskOutcome::NoUrl => return Err(ProviderError::NoPlayableUrl),
+        crate::playurl_bridge::AskOutcome::PolicyBlocked(message) => return Err(ProviderError::SourcePolicy { message }),
         crate::playurl_bridge::AskOutcome::Stalled => return Err(ProviderError::ResolveStalled),
     };
     if !cache.set_if_current(key.clone(), reply, generation) { return Err(ProviderError::ResolveStalled); }
     // fetched_at 由 set 写入当前时间；这里再读一次拿到真实时间戳
     cache.get(&key).ok_or(ProviderError::NoPlayableUrl)
 }
-        crate::playurl_bridge::AskOutcome::PolicyBlocked(message) => return Err(ProviderError::SourcePolicy { message }),
 
 pub(crate) fn quality_str(q: &Quality) -> &str {
     q.as_str()
@@ -530,24 +530,24 @@ pub fn run() {
             dlna::cmd_disconnect,
             cmd_builtin_request,
             cmd_set_resolved_play_url,
+            cmd_play_url_cache_epoch,
             cmd_script_bridge_ready,
             cmd_resolve_play_url_reply,
             cmd_search_substitute_reply,
             cmd_get_local_first,
             cmd_set_local_first,
             cmd_resolve_local_file,
-            cmd_play_url_cache_epoch,
             cmd_invalidate_play_url,
             source_bundle::cmd_source_chain_overlay,
             source_install::cmd_source_state,
+            source_policy::cmd_source_policy_get,
+            source_policy::cmd_source_policy_set,
             source_install::cmd_source_discover_updates,
             source_install::cmd_source_apply_update,
             source_install::cmd_source_install_from_url,
             source_install::cmd_source_install_from_text,
             source_install::cmd_source_install_local_file,
             source_install::cmd_source_stage_from_url,
-            source_policy::cmd_source_policy_get,
-            source_policy::cmd_source_policy_set,
             source_install::cmd_source_stage_from_file,
             source_install::cmd_source_install_staged,
             source_install::cmd_source_activate_pack,
