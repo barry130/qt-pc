@@ -10,11 +10,19 @@ pub(super) struct RemotePlayback {
     last_poll: Instant,
     uri: String,
     was_playing: bool,
+    natural_end: dlna::NaturalEndTracker,
     last_position_ms: u64,
     duration_ms: u64,
     failures: u8,
     desired_volume: f32,
     loaded_at: Instant,
+}
+
+impl RemotePlayback {
+    pub(super) fn invalidate_playback_sample(&mut self) {
+        self.was_playing = false;
+        self.natural_end.reset();
+    }
 }
 
 pub struct LoadResult {
@@ -25,6 +33,7 @@ pub struct LoadResult {
 pub struct PollResult {
     session_id: u64,
     generation: u64,
+    revision: u64,
     result: Result<Poll, String>,
 }
 pub struct DisconnectResult {
@@ -120,12 +129,15 @@ fn action(
     action: Action,
     seek: Option<super::super::render_control::BoundSeekRequest>,
 ) {
-    let Some(remote) = &inner.remote else {
+    let Some(remote) = &mut inner.remote else {
         if let Some(seek) = seek {
             seek.external_complete(false);
         }
         return;
     };
+    if !matches!(action, Action::Volume(_)) {
+        remote.invalidate_playback_sample();
+    }
     let connection = remote.connection.clone();
     let generation = inner.load_gen;
     let session_id = connection.id;
@@ -151,6 +163,7 @@ fn action(
 fn remote_error(inner: &mut EngineInner, message: String) {
     if let Some(remote) = &mut inner.remote {
         remote.connection.change_intent(false);
+        remote.invalidate_playback_sample();
         remote.loaded = false;
         remote.poll_pending = false;
         if let Some(request) = remote.pending_seek.take() { request.external_complete(false); }
@@ -189,6 +202,7 @@ pub(super) fn route(inner: &mut EngineInner, cmd: AudioCmd) -> Option<AudioCmd> 
                         last_poll: Instant::now(),
                         uri: String::new(),
                         was_playing: false,
+                        natural_end: dlna::NaturalEndTracker::default(),
                         last_position_ms: 0,
                         duration_ms: 0,
                         failures: 0,
@@ -343,8 +357,12 @@ pub(super) fn route(inner: &mut EngineInner, cmd: AudioCmd) -> Option<AudioCmd> 
                     }
                     if let Some(remote) = &mut inner.remote {
                         remote.loaded = true;
+                        // A retired generation's in-flight poll will be ignored. It
+                        // must not keep the replacement media's poll loop blocked.
+                        remote.poll_pending = false;
                         remote.uri = loaded.uri;
                         remote.was_playing = false;
+                        remote.natural_end.reset();
                         remote.last_position_ms = loaded.position_ms;
                         remote.duration_ms = duration_ms;
                         remote.failures = 0;
@@ -395,6 +413,7 @@ pub(super) fn route(inner: &mut EngineInner, cmd: AudioCmd) -> Option<AudioCmd> 
             let PollResult {
                 session_id,
                 generation,
+                revision,
                 result,
             } = *result;
             if !current(inner, session_id, generation) {
@@ -402,6 +421,9 @@ pub(super) fn route(inner: &mut EngineInner, cmd: AudioCmd) -> Option<AudioCmd> 
             }
             if let Some(remote) = &mut inner.remote {
                 remote.poll_pending = false;
+                if revision != remote.connection.revision.load(Ordering::Acquire) {
+                    return None;
+                }
             }
             match result {
                 Ok(poll) => {
@@ -419,16 +441,18 @@ pub(super) fn route(inner: &mut EngineInner, cmd: AudioCmd) -> Option<AudioCmd> 
                         .duration_ms
                         .filter(|duration| *duration > 0)
                         .unwrap_or(remote.duration_ms);
-                    let ended = dlna::natural_end(
-                        remote.was_playing,
-                        &poll.phase,
-                        remote.last_position_ms,
+                    // An empty URI is compatible, not proof of EOF. The tracker also
+                    // requires a recent, owned PLAYING sample from this control revision.
+                    let ended = remote.natural_end.observe(
+                        &poll,
+                        &remote.uri,
                         duration_ms,
                         remote.connection.desired_play.load(Ordering::Acquire),
-                        same_uri,
+                        remote.connection.revision.load(Ordering::Acquire),
+                        Instant::now(),
                     );
                     let unconfirmed_stop = !ended
-                        && poll.phase == "STOPPED"
+                        && matches!(poll.phase.as_str(), "STOPPED" | "NO_MEDIA_PRESENT")
                         && remote.connection.desired_play.load(Ordering::Acquire)
                         && (remote.was_playing
                             || remote.loaded_at.elapsed() >= Duration::from_secs(3));
@@ -489,6 +513,7 @@ pub(super) fn route(inner: &mut EngineInner, cmd: AudioCmd) -> Option<AudioCmd> 
                 }
                 Err(error) => {
                     let remote = inner.remote.as_mut().expect("qualified remote");
+                    remote.invalidate_playback_sample();
                     remote.failures = remote.failures.saturating_add(1);
                     if remote.failures >= 3 {
                         remote_error(inner, format!("投屏设备连接中断：{error}"));
@@ -541,6 +566,7 @@ pub(super) fn route(inner: &mut EngineInner, cmd: AudioCmd) -> Option<AudioCmd> 
                                 port.external_position(position_ms);
                             }
                             if let Some(remote) = &mut inner.remote {
+                                remote.invalidate_playback_sample();
                                 remote.last_position_ms = position_ms;
                             }
                             inner.mutate(|state| state.position_ms = position_ms);
@@ -728,12 +754,14 @@ pub(super) fn tick(inner: &mut EngineInner) {
     let connection = remote.connection.clone();
     let session_id = connection.id;
     let generation = inner.load_gen;
+    let revision = connection.revision.load(Ordering::Acquire);
     let tx = inner.tx.clone();
     tauri::async_runtime::spawn_blocking(move || {
         let result = connection.poll(generation);
         let _ = tx.send(AudioCmd::DlnaPoll(Box::new(PollResult {
             session_id,
             generation,
+            revision,
             result,
         })));
     });
@@ -919,6 +947,118 @@ mod tests {
         ));
         assert_eq!(engine.queue_snapshot().index, Some(1));
     }
+    #[test]
+    fn dlna_delayed_terminal_poll_advances_original_queue_once() {
+        let (engine, inbox, port, mut generation) = mounted();
+        let mut tracker = dlna::NaturalEndTracker::default();
+        let uri = "http://127.0.0.1/media/current";
+        let now = Instant::now();
+        let playing = Poll {
+            phase: "PLAYING".into(), position_ms: Some(58_000),
+            duration_ms: Some(60_000), uri: uri.into(), revision: 1,
+        };
+        assert!(!tracker.observe(&playing, uri, 60_000, true, 1, now));
+        let stopped = Poll {
+            phase: "STOPPED".into(), position_ms: Some(0),
+            duration_ms: Some(0), uri: uri.into(), revision: 1,
+        };
+        let ended_at = now + Duration::from_millis(1500);
+        assert!(tracker.observe(&stopped, uri, 60_000, true, 1, ended_at),
+            "delayed terminal poll must compensate the last device position");
+        port.external_position(60_000);
+        assert!(port.external_finished());
+        engine.source_finished(port);
+        let AudioDelivery::AutomaticPlayback { advance, .. } = inbox
+            .recv_timeout(Duration::from_secs(1), &mut generation).unwrap()
+        else { panic!("automatic queue commit after terminal poll"); };
+        assert_eq!(advance.track.unwrap().id, "second");
+        assert_eq!(engine.queue_snapshot().index, Some(1));
+        assert!(!tracker.observe(&stopped, uri, 60_000, true, 1, ended_at));
+    }
+
+    #[test]
+    fn dlna_soap_terminal_matrix_advances_original_queue_once() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let uri = "http://127.0.0.1/media/current";
+        for phase in ["STOPPED", "NO_MEDIA_PRESENT"] {
+            for terminal_uri in [uri, ""] {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.set_nonblocking(true).unwrap();
+                let url = tauri::Url::parse(&format!("http://{}/control", listener.local_addr().unwrap())).unwrap();
+                let bodies = [
+                    "<CurrentTransportState>PLAYING</CurrentTransportState>".to_string(),
+                    format!("<RelTime>00:00:58</RelTime><TrackDuration>00:01:00</TrackDuration><TrackURI>{uri}</TrackURI>"),
+                    format!("<CurrentTransportState>{phase}</CurrentTransportState>"),
+                    format!("<RelTime>00:00:00</RelTime><TrackDuration>00:00:00</TrackDuration><TrackURI>{terminal_uri}</TrackURI>"),
+                    format!("<CurrentTransportState>{phase}</CurrentTransportState>"),
+                    format!("<RelTime>00:00:00</RelTime><TrackDuration>00:00:00</TrackDuration><TrackURI>{terminal_uri}</TrackURI>"),
+                ];
+                let renderer = std::thread::spawn(move || {
+                    for (index, payload) in bodies.iter().enumerate() {
+                        let started = Instant::now();
+                        let mut socket = loop {
+                            match listener.accept() {
+                                Ok((socket, _)) => break socket,
+                                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                    assert!(started.elapsed() < Duration::from_secs(5), "missing SOAP request {index}");
+                                    std::thread::sleep(Duration::from_millis(5));
+                                }
+                                Err(error) => panic!("accept: {error}"),
+                            }
+                        };
+                        socket.set_nonblocking(false).unwrap();
+                        socket.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                        socket.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+                        let mut reader = BufReader::new(&socket);
+                        let mut headers = String::new();
+                        let mut length = 0;
+                        loop {
+                            let mut line = String::new();
+                            assert!(reader.read_line(&mut line).unwrap() > 0);
+                            if line == "\r\n" { break; }
+                            if let Some((name, value)) = line.split_once(':') {
+                                if name.eq_ignore_ascii_case("content-length") {
+                                    length = value.trim().parse::<usize>().unwrap();
+                                }
+                            }
+                            headers.push_str(&line);
+                        }
+                        assert!(headers.contains(if index % 2 == 0 { "#GetTransportInfo" } else { "#GetPositionInfo" }));
+                        let mut request = vec![0; length];
+                        reader.read_exact(&mut request).unwrap();
+                        drop(reader);
+                        let body = format!("<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\"><s:Body><Response>{payload}</Response></s:Body></s:Envelope>");
+                        write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    }
+                });
+                let (connection, _run) = dlna::loopback_test_connection(true, url);
+                connection.begin_load(1, true);
+                let polls: Vec<_> = (0..3).map(|_| connection.poll(1)).collect();
+                renderer.join().unwrap();
+                let (engine, inbox, port, mut generation) = mounted();
+                let mut tracker = dlna::NaturalEndTracker::default();
+                let mut completions = 0;
+                let now = Instant::now();
+                for (index, poll) in polls.into_iter().enumerate() {
+                    let poll = poll.unwrap();
+                    if tracker.observe(&poll, uri, 60_000, true, connection.revision.load(Ordering::Acquire),
+                        now + Duration::from_millis(index as u64 * 1500)) {
+                        completions += 1;
+                        port.external_position(60_000);
+                        assert!(port.external_finished());
+                        engine.source_finished(port.clone());
+                        let AudioDelivery::AutomaticPlayback { advance, .. } = inbox
+                            .recv_timeout(Duration::from_secs(1), &mut generation).unwrap()
+                        else { panic!("automatic queue commit"); };
+                        assert_eq!(advance.track.unwrap().id, "second");
+                    }
+                }
+                assert_eq!(completions, 1, "{phase}/{terminal_uri}");
+                assert_eq!(engine.queue_snapshot().index, Some(1));
+            }
+        }
+    }
+
     #[test]
     fn dlna_late_bound_seek_cannot_touch_a_new_queue_target() {
         let (engine, inbox, port, mut generation) = mounted();

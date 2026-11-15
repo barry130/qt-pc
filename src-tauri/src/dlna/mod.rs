@@ -553,20 +553,70 @@ pub fn metadata(track: &Track, uri: &str, mime: &str, cover: &str) -> String {
         protocol::escape(&track.title), protocol::escape(&track.singer), protocol::escape(&track.album), protocol::escape(uri))
 }
 
-/// A pause, fresh load, missing duration, foreign URI or network failure is never EOF.
+/// Tracks the last device-reported PLAYING sample, not the UI's extrapolated time.
+/// The caller scopes this to one media load and clears it on failed transport I/O.
+#[derive(Default)]
+pub struct NaturalEndTracker {
+    playing: Option<(u64, std::time::Instant, u64)>,
+}
+
+impl NaturalEndTracker {
+    pub fn reset(&mut self) {
+        self.playing = None;
+    }
+
+    /// Stale control receipts are ignored without consuming current evidence.
+    pub fn observe(
+        &mut self,
+        poll: &Poll,
+        expected_uri: &str,
+        duration_ms: u64,
+        desired_play: bool,
+        current_revision: u64,
+        now: std::time::Instant,
+    ) -> bool {
+        if poll.revision != current_revision {
+            return false;
+        }
+        let same_uri = !expected_uri.is_empty() && poll.uri == expected_uri;
+        let previous = self.playing.take();
+        let ended = previous.is_some_and(|(position_ms, received_at, revision)| {
+            let Some(elapsed) = now.checked_duration_since(received_at) else {
+                return false;
+            };
+            // A lost/very slow poll is not evidence that playback kept moving.
+            if revision != current_revision || elapsed > Duration::from_millis(5000) {
+                return false;
+            }
+            let estimated = position_ms.saturating_add(elapsed.as_millis() as u64);
+            let candidate = estimated.max(poll.position_ms.unwrap_or(0)).min(duration_ms);
+            natural_end(true, &poll.phase, candidate, duration_ms,
+                desired_play, same_uri || poll.uri.is_empty())
+        });
+        if desired_play && same_uri && poll.phase == "PLAYING" {
+            if let Some(position_ms) = poll.position_ms.filter(|position| *position > 0) {
+                self.playing = Some((position_ms, now, current_revision));
+            }
+        }
+        ended
+    }
+}
+
+/// Terminal state and URI compatibility alone do not establish natural completion.
+/// Callers also require fresh, current-control PLAYING evidence.
 pub fn natural_end(
     was_playing: bool,
     phase: &str,
     previous_ms: u64,
     duration_ms: u64,
     desired_play: bool,
-    same_uri: bool,
+    uri_owned: bool,
 ) -> bool {
     was_playing
         && desired_play
-        && same_uri
-        && phase == "STOPPED"
-        && duration_ms > 0
+        && uri_owned
+        && matches!(phase, "STOPPED" | "NO_MEDIA_PRESENT")
+        && duration_ms > 2000
         && previous_ms > 0
         && previous_ms.saturating_add(1800) >= duration_ms
 }
@@ -635,6 +685,7 @@ mod tests {
         assert!(!natural_end(false, "STOPPED", 29_000, 30_000, true, true));
         assert!(!natural_end(true, "STOPPED", 0, 30_000, true, true));
         assert!(!natural_end(true, "STOPPED", 29_000, 30_000, false, true));
+        // uri_owned=false（外来内容）不是自然结束。
         assert!(!natural_end(true, "STOPPED", 29_000, 30_000, true, false));
         assert!(!natural_end(true, "STOPPED", 29_000, 0, true, true));
         assert!(!natural_end(
@@ -645,6 +696,125 @@ mod tests {
             true,
             true
         ));
+    }
+
+    /// Predicate-only checks; URI mapping and timed evidence are tested below.
+    #[test]
+    fn compatible_terminal_states_require_near_end_evidence() {
+        // STOPPED 与 NO_MEDIA_PRESENT 同为终态，near-end 时都算自然结束。
+        assert!(natural_end(true, "NO_MEDIA_PRESENT", 29_000, 30_000, true, true));
+        assert!(natural_end(true, "STOPPED", 30_000, 30_000, true, true));
+        assert!(natural_end(true, "NO_MEDIA_PRESENT", 29_500, 30_000, true, true));
+        // 终态但远离结尾（如手动停止后位置归零）不算自然结束。
+        assert!(!natural_end(true, "NO_MEDIA_PRESENT", 1_000, 30_000, true, true));
+        assert!(!natural_end(true, "NO_MEDIA_PRESENT", 0, 30_000, true, true));
+        // 非终态相位即便 near-end 也不算。
+        assert!(!natural_end(true, "TRANSITIONING", 29_000, 30_000, true, true));
+        assert!(!natural_end(true, "PLAYING", 29_000, 30_000, true, true));
+        // 外来内容（uri_owned=false）即便 NO_MEDIA_PRESENT 也不算。
+        assert!(!natural_end(true, "NO_MEDIA_PRESENT", 29_000, 30_000, true, false));
+        // 暂停意图 / 时长未知仍被否决。
+        assert!(!natural_end(true, "NO_MEDIA_PRESENT", 29_000, 30_000, false, true));
+        assert!(!natural_end(true, "NO_MEDIA_PRESENT", 29_000, 0, true, true));
+    }
+
+    fn sample(phase: &str, uri: &str, position_ms: u64, revision: u64) -> Poll {
+        Poll { phase: phase.into(), uri: uri.into(), position_ms: Some(position_ms),
+            duration_ms: Some(60_000), revision }
+    }
+
+    #[test]
+    fn natural_end_tracker_requires_a_meaningful_duration() {
+        let uri = "http://127.0.0.1/media/current";
+        for duration in [0, 1, 1000, 2000] {
+            let mut tracker = NaturalEndTracker::default();
+            let now = std::time::Instant::now();
+            assert!(!tracker.observe(&sample("PLAYING", uri, 900, 1), uri, duration, true, 1, now));
+            assert!(!tracker.observe(&sample("STOPPED", "", 0, 1), uri, duration, true, 1,
+                now + Duration::from_millis(100)), "duration={duration}");
+        }
+    }
+
+    #[test]
+    fn natural_end_tracker_accepts_owned_or_empty_terminal_uri_once() {
+        let uri = "http://127.0.0.1/media/current";
+        let now = std::time::Instant::now();
+        for phase in ["STOPPED", "NO_MEDIA_PRESENT"] {
+            for terminal_uri in [uri, ""] {
+                let mut tracker = NaturalEndTracker::default();
+                assert!(!tracker.observe(&sample("PLAYING", uri, 58_000, 1), uri, 60_000, true, 1, now));
+                let terminal = sample(phase, terminal_uri, 0, 1);
+                let at = now + Duration::from_millis(1500);
+                assert!(tracker.observe(&terminal, uri, 60_000, true, 1, at), "{phase}/{terminal_uri}");
+                assert!(!tracker.observe(&terminal, uri, 60_000, true, 1, at), "consumed once");
+            }
+        }
+    }
+
+    #[test]
+    fn natural_end_tracker_requires_fresh_owned_device_playing_evidence() {
+        let uri = "http://127.0.0.1/media/current";
+        let now = std::time::Instant::now();
+        for (first_phase, first_uri, first_position, terminal_uri, intent, elapsed) in [
+            ("PLAYING", uri, 59_000, uri, true, 5001),
+            ("PLAYING", uri, 59_000, "http://127.0.0.1/foreign", true, 100),
+            ("PLAYING", uri, 59_000, uri, false, 100),
+            ("PLAYING", uri, 10_000, uri, true, 1500),
+            ("PLAYING", uri, 0, uri, true, 1500),
+            ("PLAYING", "", 59_000, "", true, 100),
+            ("PLAYING", "http://127.0.0.1/foreign", 59_000, "", true, 100),
+            ("PAUSED_PLAYBACK", uri, 59_000, "", true, 100),
+            ("TRANSITIONING", uri, 59_000, "", true, 100),
+        ] {
+            let mut tracker = NaturalEndTracker::default();
+            assert!(!tracker.observe(&sample(first_phase, first_uri, first_position, 1), uri, 60_000, true, 1, now));
+            assert!(!tracker.observe(&sample("STOPPED", terminal_uri, 0, 1), uri, 60_000, intent, 1,
+                now + Duration::from_millis(elapsed)), "{first_phase}/{first_uri}/{first_position}/{terminal_uri}/{intent}/{elapsed}");
+        }
+        let mut tracker = NaturalEndTracker::default();
+        assert!(!tracker.observe(&sample("STOPPED", "", 59_000, 1), uri, 60_000, true, 1, now), "fresh load");
+    }
+
+    #[test]
+    fn natural_end_tracker_invalidates_on_nonplaying_error_and_control_changes() {
+        let uri = "http://127.0.0.1/media/current";
+        let now = std::time::Instant::now();
+        for phase in ["PAUSED_PLAYBACK", "TRANSITIONING", "UNKNOWN", "PLAYING"] {
+            let mut tracker = NaturalEndTracker::default();
+            tracker.observe(&sample("PLAYING", uri, 59_000, 1), uri, 60_000, true, 1, now);
+            // Even PLAYING with no usable raw position cannot preserve older evidence.
+            tracker.observe(&sample(phase, uri, 0, 1), uri, 60_000, true, 1, now);
+            assert!(!tracker.observe(&sample("STOPPED", "", 0, 1), uri, 60_000, true, 1, now));
+        }
+        let mut tracker = NaturalEndTracker::default();
+        tracker.observe(&sample("PLAYING", uri, 59_000, 1), uri, 60_000, true, 1, now);
+        tracker.reset(); // A failed transport poll or new load revokes the sample.
+        assert!(!tracker.observe(&sample("STOPPED", "", 0, 1), uri, 60_000, true, 1, now));
+        tracker.observe(&sample("PLAYING", uri, 59_000, 1), uri, 60_000, true, 1, now);
+        assert!(!tracker.observe(&sample("STOPPED", "", 0, 2), uri, 60_000, true, 2, now), "new play/seek revision");
+        tracker.observe(&sample("PLAYING", uri, 59_000, 2), uri, 60_000, true, 2, now);
+        assert!(!tracker.observe(&sample("STOPPED", "", 0, 1), uri, 60_000, true, 2, now), "stale receipt");
+        assert!(tracker.observe(&sample("STOPPED", "", 0, 2), uri, 60_000, true, 2, now), "stale receipt did not consume newer sample");
+    }
+
+    #[test]
+    fn natural_end_tracker_uses_current_position_and_bounded_monotonic_time() {
+        let uri = "http://127.0.0.1/media/current";
+        let now = std::time::Instant::now();
+        for (previous, current, elapsed, expected) in [
+            (58_000, 59_500, 0, true), (58_000, 0, 199, false),
+            (58_000, 0, 200, true), (53_200, 0, 5000, true),
+            (53_200, 0, 5001, false), (59_000, u64::MAX, 100, true),
+        ] {
+            let mut tracker = NaturalEndTracker::default();
+            tracker.observe(&sample("PLAYING", uri, previous, 1), uri, 60_000, true, 1, now);
+            assert_eq!(tracker.observe(&sample("STOPPED", uri, current, 1), uri, 60_000, true, 1,
+                now + Duration::from_millis(elapsed)), expected, "{previous}/{current}/{elapsed}");
+        }
+        let mut tracker = NaturalEndTracker::default();
+        tracker.observe(&sample("PLAYING", uri, 59_000, 1), uri, 60_000, true, 1, now);
+        assert!(!tracker.observe(&sample("STOPPED", uri, 0, 1), uri, 60_000, true, 1,
+            now - Duration::from_millis(1)), "clock moved backwards");
     }
 
     #[test]

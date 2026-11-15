@@ -4327,6 +4327,7 @@ fn spawn_resolve_and_load(
 fn spawn_prepared_source_load(inner: &mut EngineInner, request: SourceLoadRequest) {
     if let Some(remote) = &mut inner.remote {
         remote.connection.begin_load(request.gen, request.autoplay);
+        remote.invalidate_playback_sample();
         remote.loaded = false;
         if let Some(request) = remote.pending_seek.take() { request.external_complete(false); }
     }
