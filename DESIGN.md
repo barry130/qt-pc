@@ -1001,6 +1001,7 @@ WebviewWindowBuilder::new(app, "lyrics", WebviewUrl::App("lyric.html".into()))
     .shadow(false)           // 透明窗口保留阴影会出现灰色矩形
     .resizable(true)
     .focused(false)          // 创建时不抢焦点，避免打断用户输入
+    .focusable(false)        // 点击歌词也不激活窗口，避免游戏全屏被切出
     .visible(false)          // 首帧就绪后再 show()
     .build()?;
 ```
@@ -1009,14 +1010,14 @@ Windows 平台注意事项（原文未覆盖，均为实测坑点）：
 
 1. **`transparent: true` 必须搭配 `decorations: false`**，否则 Windows 下会出现黑色背景块。
 2. 透明窗口内**不能**使用 `backdrop-filter` 做毛玻璃，Win 上 WebView2 对透明层的 backdrop 支持不稳定；需要毛玻璃时改用 `window_effects` 的 Acrylic，且此时 `transparent` 需要让位。**桌面歌词默认走全透明 + 文字描边，不用毛玻璃**。
-3. `always_on_top` 会被其他应用的全屏独占（游戏、视频全屏）覆盖，这是系统行为，不视为缺陷；可选提供「检测到前台全屏时自动隐藏」开关（P3）。
+3. 用户的 `always_on_top` 不因前台程序、游戏窗口或全屏状态被自动改写。`focusable(false)` 让点击歌词不激活它；TOPMOST 维护统一使用 `SWP_NOACTIVATE`，避免显示歌词时抢游戏焦点。普通层叠窗口由 DWM 合成；独占 DirectX 交换链可不经过桌面 HWND 合成，本次 HWND 实现不包含另一个进程的渲染注入，不能把普通窗口测试外推为独占全屏画面验收。
 4. 多显示器下 `x/y` 是虚拟桌面坐标，可能为负值；恢复位置前必须校验落点仍在某个显示器可见区域内。
 5. DPI 变化（跨屏拖动）时窗口尺寸按逻辑像素保持，字体不需要额外缩放。
-6. 歌词保持独立顶层窗口，**不把 owner 设置为 `Shell_TrayWnd`**。截图或通知栏触发 Shell 层级重排后，由 `lyric_window/topmost.rs` 监听前台切换及主/副任务栏的 reorder 事件，在主线程恢复 TOPMOST，保留位置、尺寸和焦点。恢复前重读当前窗口的可见性与置顶开关，不使用 `SWP_SHOWWINDOW`，避免迟到事件重新显示已隐藏的歌词。
-7. 隐藏歌词会关闭 WebView 以释放内存，下次打开重新创建；置顶维护必须在窗口创建后启动，并按 `lyrics` label 查找当前窗口，不能用 `OnceLock<HWND>` 保存首次句柄。每个进程仅一个事件线程，相关事件后最多约一秒的短时重试，事件合并后再交给主线程；空闲时没有轮询计时器，也不逐事件创建线程。
+6. 歌词保持独立顶层窗口，**不把 owner 设置为 `Shell_TrayWnd`**。截图或通知栏触发 Shell 层级重排后，由 `lyric_window/topmost.rs` 监听前台切换及主/副任务栏的 reorder 事件，在主线程恢复 TOPMOST，保留位置、尺寸和焦点。恢复前读取当前窗口可见性与单独保存的用户置顶意图，不使用 `SWP_SHOWWINDOW`，避免迟到事件重新显示已隐藏的歌词。
+7. 隐藏歌词会关闭 WebView 以释放内存，下次打开重新创建；顶层维护按 `lyrics` label 取得当前窗口，不保存首次 HWND。每个进程仅一个 WinEvent 消息线程：窗口事件触发及时恢复，同一消息线程上的固定 250ms Win32 timer 持续补漏；不逐事件创建线程、不重建定时器。维护仅恢复可见且用户已开启置顶的歌词窗口，其他情况不执行 `SetWindowPos`；不使用 `SWP_SHOWWINDOW`，迟到事件不会重新显示隐藏窗口。
 8. 歌词窗口的 capability 单独授权，只允许桌面歌词显示和控制所需的 IPC（§17.4）。
 
-Windows 回归：`node scripts/check-native.mjs test --lib lyric_window::` 使用完全透明、不可激活的测试窗口检查被另一置顶窗口遮挡后恢复、位置/焦点不变、隐藏/关闭置顶后不再抬升，以及关闭重建。真实截图工具需另行复测：将歌词拖到任务栏区域，截图并结束/取消、切换应用，再关闭重开歌词；开启置顶时应恢复原位置的显示，关闭置顶时不应被自动抬升。
+Windows 回归：`node scripts/check-native.mjs test --lib lyric_window::` 使用完全透明、不可激活的测试窗口检查被另一置顶窗口遮挡后仍能恢复至它之上、位置/焦点不变、隐藏时不再抬升，以及关闭重建后有效。周期定时器负责持续维护，不包含全屏例外。真实截图工具需另行复测拖动到任务栏区域、截图并结束/取消、切换应用、关闭重开歌词。以上 Win32 测试与 Windows 打包均不是 CS2 运行实测；本机未安装 CS2，真实游戏普通 FSO/层叠画面以及独占 DirectX 交换链画面仍待专门验收。
 
 ## 4.3 迷你播放器窗口
 

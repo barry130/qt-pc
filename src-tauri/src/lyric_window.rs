@@ -21,7 +21,7 @@ use crate::AppState;
 fn apply_topmost(win: &tauri::WebviewWindow, enabled: bool) -> Result<(), String> {
     win.set_always_on_top(enabled).map_err(|e| format!("{e}"))?;
     #[cfg(target_os = "windows")]
-    topmost::request_restore(win.app_handle());
+    topmost::request_restore(win.app_handle(), enabled);
     Ok(())
 }
 
@@ -126,8 +126,7 @@ fn load_state(db: Option<&Database>) -> LyricWindowState {
 fn save_state(db: Option<&Database>, state: &LyricWindowState) {
     if let Some(db) = db {
         if let Ok(json) = serde_json::to_string(state) {
-            let _ =
-                db.with(|c| set_setting(c, crate::settings_keys::SETTING_LYRIC_WINDOW, &json));
+            let _ = db.with(|c| set_setting(c, crate::settings_keys::SETTING_LYRIC_WINDOW, &json));
         }
     }
 }
@@ -172,6 +171,8 @@ fn build_window(app: &AppHandle, state: &LyricWindowState) -> tauri::Result<taur
     .shadow(false)
     .resizable(true)
     .focused(false)
+    // 点击歌词不激活窗口，避免游戏/全屏视频因焦点被抢而黑屏或最小化。
+    .focusable(false)
     .visible(false)
     // 见 mini_window::build_window 的同一处注释
     .additional_browser_args(crate::webview_mem::BROWSER_ARGS)

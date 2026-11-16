@@ -12,7 +12,8 @@ export const messages = defineFragment({
     "settings.desktopLyric.show": "显示桌面歌词",
     "settings.desktopLyric.showHint": "桌面置顶显示逐行歌词",
     "settings.desktopLyric.alwaysOnTop": "总在最前",
-    "settings.desktopLyric.alwaysOnTopHint": "始终置顶；关闭后会被遮挡",
+    "settings.desktopLyric.alwaysOnTopHint":
+      "保持歌词窗口在其他窗口上方，切换应用或进入游戏不会自动取消置顶；点击歌词不抢焦点",
     "settings.desktopLyric.lock": "锁定歌词位置",
     "settings.desktopLyric.lockHint": "不能拖动，点击穿透，隐藏工具条；Ctrl+Alt+K 解锁",
     // 字体与字号
@@ -72,7 +73,8 @@ export const messages = defineFragment({
     "settings.desktopLyric.show": "Show desktop lyrics",
     "settings.desktopLyric.showHint": "Line-by-line lyrics pinned above the desktop",
     "settings.desktopLyric.alwaysOnTop": "Always on top",
-    "settings.desktopLyric.alwaysOnTopHint": "Stays above other windows; leave it off and they can be covered",
+    "settings.desktopLyric.alwaysOnTopHint":
+      "Keeps lyrics above other windows across app switches and games without automatically disabling the preference; clicking lyrics never takes focus",
     "settings.desktopLyric.lock": "Lock lyric position",
     "settings.desktopLyric.lockHint":
       "No dragging, clicks pass through, toolbar hidden. Press Ctrl+Alt+K to unlock",
