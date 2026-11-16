@@ -306,9 +306,9 @@ mod tests {
         assert!(!needs_restore(false, false));
         assert!(!needs_restore(true, true));
         assert!(!needs_restore(false, true));
-        // 单一消息的周期决定维护不会在 RETRY_COUNT 后终止。
-        assert!(WATCH_INTERVAL_MS > 0 && WATCH_INTERVAL_MS <= 1_000);
-        assert_eq!(TIMER_ID, 1);
+        // 配置不变量在编译期检查，同时保留对定时器维护周期的显式约束。
+        const _: () = assert!(WATCH_INTERVAL_MS > 0 && WATCH_INTERVAL_MS <= 1_000);
+        const _: () = assert!(TIMER_ID == 1);
     }
 
     #[test]
